@@ -2648,13 +2648,15 @@ pub fn activate_held_fork(
     );
     let receipt = format!("{}/activation", smolvm_protocol::forkpoint::STATE_DIR);
     let script = build_activation_script(
-        smolvm_protocol::forkpoint::READY_PATH,
-        smolvm_protocol::forkpoint::RELEASE_PATH,
-        smolvm_protocol::forkpoint::WORKER_READY_PATH,
-        &receipt,
+        ActivationScriptPaths {
+            ready: smolvm_protocol::forkpoint::READY_PATH,
+            release: smolvm_protocol::forkpoint::RELEASE_PATH,
+            worker_ready: smolvm_protocol::forkpoint::WORKER_READY_PATH,
+            receipt: &receipt,
+            env: &env_path,
+            branch_env: &branch_env_path,
+        },
         &ensure_env_parent,
-        &env_path,
-        &branch_env_path,
         &activation_token,
     );
     let socket = vm_data_dir(clone).join("agent.sock");
@@ -2826,16 +2828,28 @@ fn build_worker_ready_wait_script(worker_ready: &str) -> String {
     )
 }
 
+struct ActivationScriptPaths<'a> {
+    ready: &'a str,
+    release: &'a str,
+    worker_ready: &'a str,
+    receipt: &'a str,
+    env: &'a str,
+    branch_env: &'a str,
+}
+
 fn build_activation_script(
-    ready: &str,
-    release: &str,
-    worker_ready: &str,
-    receipt: &str,
+    paths: ActivationScriptPaths<'_>,
     ensure_env_parent: &str,
-    env_path: &str,
-    branch_env_path: &str,
     activation_token: &str,
 ) -> String {
+    let ActivationScriptPaths {
+        ready,
+        release,
+        worker_ready,
+        receipt,
+        env: env_path,
+        branch_env: branch_env_path,
+    } = paths;
     format!(
         "set -e; \
          if [ -f '{release}' ]; then \
@@ -3503,13 +3517,15 @@ mod tests {
         let token = "0123456789abcdef";
         std::fs::write(&worker_ready, b"stale\n").unwrap();
         let script = build_activation_script(
-            ready.to_str().unwrap(),
-            release.to_str().unwrap(),
-            worker_ready.to_str().unwrap(),
-            receipt.to_str().unwrap(),
+            ActivationScriptPaths {
+                ready: ready.to_str().unwrap(),
+                release: release.to_str().unwrap(),
+                worker_ready: worker_ready.to_str().unwrap(),
+                receipt: receipt.to_str().unwrap(),
+                env: env_path.to_str().unwrap(),
+                branch_env: branch_env_path.to_str().unwrap(),
+            },
             &ensure_parent,
-            env_path.to_str().unwrap(),
-            branch_env_path.to_str().unwrap(),
             token,
         );
 
@@ -3552,13 +3568,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
 
         let other = build_activation_script(
-            ready.to_str().unwrap(),
-            release.to_str().unwrap(),
-            worker_ready.to_str().unwrap(),
-            receipt.to_str().unwrap(),
+            ActivationScriptPaths {
+                ready: ready.to_str().unwrap(),
+                release: release.to_str().unwrap(),
+                worker_ready: worker_ready.to_str().unwrap(),
+                receipt: receipt.to_str().unwrap(),
+                env: env_path.to_str().unwrap(),
+                branch_env: branch_env_path.to_str().unwrap(),
+            },
             &ensure_parent,
-            env_path.to_str().unwrap(),
-            branch_env_path.to_str().unwrap(),
             "fedcba9876543210",
         );
         assert_eq!(
@@ -3585,13 +3603,15 @@ mod tests {
         let token = "0123456789abcdef";
         std::fs::write(&receipt, format!("{token}\n")).unwrap();
         let script = build_activation_script(
-            ready.to_str().unwrap(),
-            release.to_str().unwrap(),
-            worker_ready.to_str().unwrap(),
-            receipt.to_str().unwrap(),
+            ActivationScriptPaths {
+                ready: ready.to_str().unwrap(),
+                release: release.to_str().unwrap(),
+                worker_ready: worker_ready.to_str().unwrap(),
+                receipt: receipt.to_str().unwrap(),
+                env: env_path.to_str().unwrap(),
+                branch_env: branch_env_path.to_str().unwrap(),
+            },
             &ensure_parent,
-            env_path.to_str().unwrap(),
-            branch_env_path.to_str().unwrap(),
             token,
         );
 
