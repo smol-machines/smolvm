@@ -48,6 +48,18 @@ pub struct WsStream<S> {
     closed: bool,
 }
 
+impl WsStream<std::net::TcpStream> {
+    /// A second `WsStream` over the same socket, for the writing half of a
+    /// connection whose reader and writer run on separate threads.
+    ///
+    /// Safe to hand out because WebSocket framing state is per-direction: the
+    /// fields this type carries (`pending`, `read_at`) belong to decoding, and
+    /// the returned half only ever writes.
+    pub fn writer_half(&self) -> Result<Self> {
+        Ok(Self::new(self.inner.try_clone()?))
+    }
+}
+
 impl<S: Read + Write> WsStream<S> {
     pub fn new(inner: S) -> Self {
         Self {

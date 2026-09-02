@@ -132,6 +132,10 @@ pub struct DisplayFramebuffer {
     trace: Option<Mutex<std::fs::File>>,
     /// Monotonic counter so trace lines are ordered and countable.
     traced_calls: std::sync::atomic::AtomicU64,
+    /// Origin for trace timestamps. Ordering alone cannot distinguish "the
+    /// guest stopped presenting" from "the guest kept presenting the same
+    /// pixels", which is the whole question a display stall poses.
+    trace_start: std::time::Instant,
 }
 
 // SAFETY: `staging` is only accessed from the single thread libkrun uses for
@@ -170,6 +174,7 @@ impl DisplayFramebuffer {
             presented: Condvar::new(),
             trace,
             traced_calls: std::sync::atomic::AtomicU64::new(0),
+            trace_start: std::time::Instant::now(),
         }
     }
 
@@ -181,12 +186,15 @@ impl DisplayFramebuffer {
         if self.trace.is_none() {
             return;
         }
-        const MAX_TRACED_CALLS: u64 = 2000;
+        // Enough to cover a multi-minute stall hunt at 60fps without letting
+        // the file grow without bound.
+        const MAX_TRACED_CALLS: u64 = 500_000;
         let n = self
             .traced_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < MAX_TRACED_CALLS {
-            self.trace(&format!("{n:05} {what}"));
+            let ms = self.trace_start.elapsed().as_secs_f64() * 1000.0;
+            self.trace(&format!("{n:06} {ms:11.3} {what}"));
         } else if n == MAX_TRACED_CALLS {
             self.trace("... trace limit reached, further calls not logged");
         }

@@ -31,17 +31,17 @@ const SECURITY_NONE: u8 = 1;
 /// How long a client's incremental update request waits for a new frame
 /// before we answer with the current one. Without a bound, a client would
 /// hang for as long as the desktop is idle and look disconnected.
+/// How long the writing half may wait for a new frame before answering an
+/// outstanding request with an empty update.
 ///
-/// This also bounds INPUT latency, which is why it is short. A session is one
-/// loop: read a message, act on it, repeat. While it is parked in
-/// `wait_for_frame` nothing is reading the socket, so a keystroke that arrives
-/// mid-wait is not seen until the wait ends. With a two-second bound — the
-/// value this started at — typing into a still screen stalled for up to two
-/// seconds per keypress, because a still screen is exactly the case that runs
-/// the wait to its full length. A frame arriving still wakes the wait
-/// immediately via the condvar, so shortening it costs only an empty
-/// four-byte reply per tick on an idle desktop.
-const UPDATE_WAIT: Duration = Duration::from_millis(15);
+/// This is a keepalive, not a latency knob. Client input is read on a separate
+/// thread, so waiting here delays nothing else -- which is exactly what the
+/// reader/writer split bought. Before the split this same wait was on the only
+/// thread that read KeyEvent and PointerEvent, so a quiet screen stalled the
+/// keyboard and mouse for its full duration, and the stalled input kept the
+/// screen quiet: at two seconds that was a hard freeze whenever a user paused
+/// and resumed.
+const UPDATE_WAIT: Duration = Duration::from_secs(1);
 
 /// Pseudo-encoding letting us tell the client the desktop changed size, which
 /// happens when the compositor sets a mode different from the initial one.
@@ -404,11 +404,74 @@ fn respond<W: Write>(
 /// Drive one RFB session. Generic over the transport so the very same
 /// protocol code serves a native viewer on a raw socket and a browser over a
 /// WebSocket — the two differ only in how bytes are framed beneath this.
-fn handle_client<S: Read + Write>(
+/// A connection whose reading and writing halves can run independently.
+///
+/// The server must never let waiting for a frame delay reading client input:
+/// the input it has not read yet is usually exactly what would have produced
+/// the frame it is waiting for. Splitting the connection makes responsiveness
+/// structural instead of something a timeout has to trade against.
+trait SplitConnection: Sized {
+    type Reader: Read + Send + 'static;
+    type Writer: Write + Send + 'static;
+    fn split(self) -> std::io::Result<(Self::Reader, Self::Writer)>;
+}
+
+impl SplitConnection for TcpStream {
+    type Reader = TcpStream;
+    type Writer = TcpStream;
+    fn split(self) -> std::io::Result<(Self::Reader, Self::Writer)> {
+        let writer = self.try_clone()?;
+        Ok((self, writer))
+    }
+}
+
+impl SplitConnection for super::websocket::WsStream<TcpStream> {
+    type Reader = Self;
+    type Writer = Self;
+    fn split(self) -> std::io::Result<(Self::Reader, Self::Writer)> {
+        // WebSocket framing state is per-direction, so a second WsStream over
+        // the same socket shares nothing with the reading half.
+        let writer = self.writer_half()?;
+        Ok((self, writer))
+    }
+}
+
+/// Everything the reading half tells the writing half.
+///
+/// Kept behind one mutex that is only ever held for a few field assignments —
+/// never across a socket write or a frame wait — so neither half can delay the
+/// other.
+struct ClientState {
+    /// The client asked for an update and has not been answered yet. RFB lets
+    /// that answer come later, which is what frees the reader to keep
+    /// servicing input while no new frame exists.
+    update_outstanding: bool,
+    incremental: bool,
+    closed: bool,
+    /// Set by SetPixelFormat on the reader, used by the writer.
+    fmt: PixelFormat,
+    /// Set by SetEncodings on the reader, used by the writer.
+    supports_resize: bool,
+    /// Current desktop geometry. The writer updates it when the guest changes
+    /// mode; the reader scales absolute pointer coordinates against it.
+    width: u32,
+    height: u32,
+}
+
+type SharedState = Arc<(std::sync::Mutex<ClientState>, std::sync::Condvar)>;
+
+fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, ClientState> {
+    state.0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn handle_client<S>(
     mut s: S,
     fb: Arc<DisplayFramebuffer>,
     input: Option<super::input::VncInput>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: Read + Write + SplitConnection,
+{
     // --- handshake -------------------------------------------------------
     s.write_all(RFB_VERSION)?;
     let mut version = [0u8; 12];
@@ -437,12 +500,12 @@ fn handle_client<S: Read + Write>(
     // presented anything. Fall back to the configured display size so a client
     // that connects during boot still gets a sane desktop rather than 0x0.
     let first = fb.latest();
-    let (mut width, mut height) = first
+    let (width, height) = first
         .as_ref()
         .map(|f| (f.width, f.height))
         .unwrap_or((1280, 800));
 
-    let mut fmt = PixelFormat::bgrx();
+    let fmt = PixelFormat::bgrx();
     let name = b"smolvm";
     let mut init = Vec::with_capacity(32);
     init.extend_from_slice(&(width as u16).to_be_bytes());
@@ -454,17 +517,62 @@ fn handle_client<S: Read + Write>(
 
     tracing::info!(width, height, "vnc client connected");
 
-    // --- message loop ----------------------------------------------------
-    let mut last_generation = 0u64;
-    // BGRX pixels of the last frame this client was sent, for damage diffing.
-    let mut last_sent: Option<Vec<u8>> = None;
-    let mut client_supports_resize = false;
-    let mut last_button_mask = 0u8;
+    // --- reader / writer split -------------------------------------------
+    // From here the reading half never writes and the writing half never
+    // reads, so the socket needs no lock and the two cannot block each other.
+    let state: SharedState = Arc::new((
+        std::sync::Mutex::new(ClientState {
+            update_outstanding: false,
+            incremental: false,
+            closed: false,
+            fmt,
+            supports_resize: false,
+            width,
+            height,
+        }),
+        std::sync::Condvar::new(),
+    ));
 
+    let (mut reader, writer) = s.split()?;
+    let writer_thread = {
+        let state = Arc::clone(&state);
+        let fb = Arc::clone(&fb);
+        std::thread::Builder::new()
+            .name("smolvm-vnc-writer".into())
+            .spawn(move || write_updates(writer, fb, state))
+    };
+
+    let result = read_client_messages(&mut reader, input, &state);
+
+    // Release the writer whichever way the reader ended.
+    {
+        let (lock, cv) = &*state;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        cv.notify_all();
+    }
+    if let Ok(handle) = writer_thread {
+        let _ = handle.join();
+    }
+    result
+}
+
+/// Read client messages forever, dispatching input the moment it arrives.
+///
+/// This half must never block on anything but the socket. A FramebufferUpdate
+/// request is recorded and handed to the writer rather than waited on here.
+fn read_client_messages<R: Read>(
+    s: &mut R,
+    input: Option<super::input::VncInput>,
+    state: &SharedState,
+) -> std::io::Result<()> {
+    let mut last_button_mask = 0u8;
     loop {
         let mut kind = [0u8; 1];
         if s.read_exact(&mut kind).is_err() {
             return Ok(()); // client hung up
+        }
+        if lock_state(state).closed {
+            return Ok(()); // the writer gave up on this connection
         }
         match kind[0] {
             0 => {
@@ -474,18 +582,20 @@ fn handle_client<S: Read + Write>(
                 let mut pf = [0u8; 16];
                 pf.copy_from_slice(&rest[3..19]);
                 let requested = PixelFormat::parse(&pf);
-                if requested.is_supported() {
-                    fmt = requested;
-                } else {
-                    // Keep our format rather than emit pixels the client will
-                    // misread; say so, because wrong colours are otherwise a
-                    // baffling symptom.
-                    tracing::warn!(
-                        bpp = requested.bits_per_pixel,
-                        true_colour = requested.true_colour,
-                        "vnc client asked for an unsupported pixel format; \
-                         continuing with 32-bit true colour"
-                    );
+                {
+                    if requested.is_supported() {
+                        lock_state(state).fmt = requested;
+                    } else {
+                        // Keep our format rather than emit pixels the client will
+                        // misread; say so, because wrong colours are otherwise a
+                        // baffling symptom.
+                        tracing::warn!(
+                            bpp = requested.bits_per_pixel,
+                            true_colour = requested.true_colour,
+                            "vnc client asked for an unsupported pixel format; \
+                             continuing with 32-bit true colour"
+                        );
+                    }
                 }
             }
             2 => {
@@ -496,59 +606,30 @@ fn handle_client<S: Read + Write>(
                 let mut encodings = vec![0u8; count * 4];
                 s.read_exact(&mut encodings)?;
                 let (encodings, _) = encodings.as_chunks::<4>();
-                client_supports_resize = encodings
+                let supports_resize = encodings
                     .iter()
                     .any(|c| i32::from_be_bytes(*c) == ENCODING_DESKTOP_SIZE);
+                lock_state(state).supports_resize = supports_resize;
             }
             3 => {
-                // FramebufferUpdateRequest: incremental + x,y,w,h
+                // FramebufferUpdateRequest: incremental + x,y,w,h.
+                // Recorded, not waited on -- that is the whole point of the
+                // split. The writer answers when there is something to send.
                 let mut req = [0u8; 9];
                 s.read_exact(&mut req)?;
                 let incremental = req[0] != 0;
-
-                let frame = if incremental {
-                    fb.wait_for_frame(last_generation, UPDATE_WAIT)
-                        .or_else(|| fb.latest())
+                let (lock, cv) = &**state;
+                let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if g.update_outstanding {
+                    // Coalesce: a full update already asked for must not be
+                    // downgraded by an incremental request arriving behind it.
+                    g.incremental &= incremental;
                 } else {
-                    fb.latest()
-                };
-
-                let Some(frame) = frame else {
-                    // Nothing presented yet. Answer with an empty update so the
-                    // client stays in its request loop instead of stalling.
-                    s.write_all(&[0u8, 0, 0, 0])?;
-                    continue;
-                };
-
-                if incremental && frame.generation == last_generation {
-                    s.write_all(&[0u8, 0, 0, 0])?;
-                    continue;
+                    g.update_outstanding = true;
+                    g.incremental = incremental;
                 }
-                last_generation = frame.generation;
-
-                if (frame.width, frame.height) != (width, height) {
-                    width = frame.width;
-                    height = frame.height;
-                    if client_supports_resize {
-                        send_resize(&mut s, width, height)?;
-                    } else {
-                        tracing::warn!(
-                            width,
-                            height,
-                            "guest changed mode but the vnc client cannot resize; \
-                             reconnect to pick up the new size"
-                        );
-                    }
-                }
-
-                let bgrx = display::to_bgrx(&frame);
-                match last_sent.as_ref() {
-                    Some(prev) if incremental && prev.len() == bgrx.len() => {
-                        send_frame_diff(&mut s, &frame, &bgrx, prev, &fmt)?;
-                    }
-                    _ => send_frame(&mut s, &frame, &bgrx, &fmt)?,
-                }
-                last_sent = Some(bgrx.into_owned());
+                drop(g);
+                cv.notify_all();
             }
             4 => {
                 // KeyEvent: down-flag, 2 bytes padding, u32 keysym.
@@ -575,6 +656,10 @@ fn handle_client<S: Read + Write>(
                     let mask = buf[0];
                     let x = u16::from_be_bytes([buf[1], buf[2]]) as u32;
                     let y = u16::from_be_bytes([buf[3], buf[4]]) as u32;
+                    let (width, height) = {
+                        let g = lock_state(state);
+                        (g.width, g.height)
+                    };
 
                     // Absolute axes use a fixed virtual range; scale from the
                     // framebuffer size the client is looking at so a guest
@@ -666,6 +751,94 @@ fn handle_client<S: Read + Write>(
                 );
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Answer outstanding update requests as frames become available.
+///
+/// This half may block on a frame for as long as it likes: it owes the client
+/// nothing but pixels, and the reader goes on delivering input the whole time.
+fn write_updates<W: Write>(mut s: W, fb: Arc<DisplayFramebuffer>, state: SharedState) {
+    let (lock, cv) = &*state;
+    let mut last_generation = 0u64;
+    // BGRX pixels of the last frame this client was sent, for damage diffing.
+    let mut last_sent: Option<Vec<u8>> = None;
+
+    loop {
+        // Wait until the client actually wants an update.
+        let (incremental, fmt, supports_resize) = {
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while !g.update_outstanding && !g.closed {
+                g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            if g.closed {
+                return;
+            }
+            // Take the request here, not after sending it. A request that
+            // arrives while we are writing a frame must re-arm the flag rather
+            // than be swallowed by a later clear -- that lost wakeup parks the
+            // writer and the client waiting on each other forever.
+            g.update_outstanding = false;
+            (g.incremental, g.fmt, g.supports_resize)
+        };
+
+        let frame = if incremental {
+            fb.wait_for_frame(last_generation, UPDATE_WAIT)
+                .or_else(|| fb.latest())
+        } else {
+            fb.latest()
+        };
+
+        let sent = match frame {
+            // Nothing presented yet, or nothing new: answer with an empty
+            // update so the client stays in its request loop.
+            None => s.write_all(&[0u8, 0, 0, 0]),
+            Some(ref frame) if incremental && frame.generation == last_generation => {
+                s.write_all(&[0u8, 0, 0, 0])
+            }
+            Some(frame) => {
+                last_generation = frame.generation;
+                let geometry_changed = {
+                    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let changed = (frame.width, frame.height) != (g.width, g.height);
+                    if changed {
+                        g.width = frame.width;
+                        g.height = frame.height;
+                    }
+                    changed
+                };
+                let mut outcome = Ok(());
+                if geometry_changed {
+                    if supports_resize {
+                        outcome = send_resize(&mut s, frame.width, frame.height);
+                    } else {
+                        tracing::warn!(
+                            width = frame.width,
+                            height = frame.height,
+                            "guest changed mode but the vnc client cannot resize; \
+                             reconnect to pick up the new size"
+                        );
+                    }
+                }
+                if outcome.is_ok() {
+                    let bgrx = display::to_bgrx(&frame);
+                    outcome = match last_sent.as_ref() {
+                        Some(prev) if incremental && prev.len() == bgrx.len() => {
+                            send_frame_diff(&mut s, &frame, &bgrx, prev, &fmt)
+                        }
+                        _ => send_frame(&mut s, &frame, &bgrx, &fmt),
+                    };
+                    last_sent = Some(bgrx.into_owned());
+                }
+                outcome
+            }
+        };
+
+        if sent.is_err() {
+            // The connection is gone; make the reader stop too.
+            lock.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+            return;
         }
     }
 }
@@ -1055,35 +1228,49 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_incremental_request_returns_promptly_so_input_is_not_starved() {
-        // A session is one loop: read a message, act on it, repeat. While it
-        // is parked in `wait_for_frame` nothing is reading the socket, so a
-        // keystroke arriving mid-wait is not seen until the wait ends — and a
-        // still screen is exactly what runs the wait to its full length.
-        // Bounding the wait is therefore what keeps typing responsive, so
-        // assert the bound rather than the constant.
-        let mut s = connect(serve_a_test_desktop());
-        drive_rfb_session(&mut s); // consume the first, full-frame update
+    fn an_idle_incremental_request_does_not_starve_input() {
+        // Intent preserved from the bounded-wait version of this test: typing
+        // must stay responsive while the screen is still. The mechanism it
+        // asserted has changed. Bounding the wait kept input flowing only by
+        // returning an empty update every tick, so responsiveness scaled with
+        // how short the bound was and an idle desktop paid a poll for it.
+        //
+        // Reading and writing now run on separate threads, so an outstanding
+        // request may simply stay outstanding until there is something to send
+        // -- which RFB permits -- while input is serviced the whole time. The
+        // property worth asserting is therefore that the reader keeps
+        // consuming, not that a reply comes back quickly; see
+        // `client_messages_are_read_while_no_frame_is_available`, which drives
+        // more client data than a socket buffer holds while a request is
+        // pending and can only pass if something is draining it.
+        let addr = serve_a_test_desktop();
+        let mut s = connect(addr);
+        let _ = drive_rfb_session(&mut s);
 
-        // Nothing has changed since, so this request exercises the wait path.
-        let mut req = vec![3u8, 1]; // incremental
+        let mut req = vec![3u8, 1]; // incremental, against a still screen
         req.extend_from_slice(&0u16.to_be_bytes());
         req.extend_from_slice(&0u16.to_be_bytes());
         req.extend_from_slice(&(TEST_W as u16).to_be_bytes());
         req.extend_from_slice(&(TEST_H as u16).to_be_bytes());
-
-        let started = std::time::Instant::now();
         s.write_all(&req).unwrap();
-        let mut head = [0u8; 4];
-        s.read_exact(&mut head).unwrap();
-        let waited = started.elapsed();
 
+        // A keystroke sent while that request is pending must still be read.
+        let mut key = vec![4u8, 1, 0, 0];
+        key.extend_from_slice(&0x0061u32.to_be_bytes()); // 'a'
+        s.write_all(&key).unwrap();
+
+        // The session is alive and still answering: a full update comes back
+        // even though the incremental one is waiting on a frame.
+        let mut full = vec![3u8, 0];
+        full.extend_from_slice(&0u16.to_be_bytes());
+        full.extend_from_slice(&0u16.to_be_bytes());
+        full.extend_from_slice(&(TEST_W as u16).to_be_bytes());
+        full.extend_from_slice(&(TEST_H as u16).to_be_bytes());
+        s.write_all(&full).unwrap();
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head)
+            .expect("input and further requests must be serviced while a request waits");
         assert_eq!(head[0], 0, "expected a FramebufferUpdate");
-        assert!(
-            waited < Duration::from_millis(500),
-            "an idle incremental request took {waited:?}; input would stall for \
-             that long behind it"
-        );
     }
 
     #[test]
@@ -1247,6 +1434,96 @@ mod tests {
         s.read_exact(&mut head)
             .expect("server closed after SetDesktopSize instead of ignoring it");
         assert_eq!(head[0], 0, "expected a FramebufferUpdate");
+    }
+
+    /// Every update request must be answered, including ones that arrive while
+    /// the server is still writing the previous frame.
+    ///
+    /// Regression: the writer used to clear the "update outstanding" flag
+    /// *after* sending, so a request that arrived mid-send was swallowed by
+    /// that clear. Reader and writer then parked on each other and the session
+    /// died after exactly one frame.
+    #[test]
+    fn successive_update_requests_are_each_answered() {
+        let addr = serve_a_test_desktop();
+        let mut s = connect(addr);
+        let _ = drive_rfb_session(&mut s); // handshake + first full update
+
+        for round in 0..5 {
+            // Non-incremental, so an answer does not depend on a new frame.
+            let mut req = vec![3u8, 0];
+            req.extend_from_slice(&0u16.to_be_bytes());
+            req.extend_from_slice(&0u16.to_be_bytes());
+            req.extend_from_slice(&(TEST_W as u16).to_be_bytes());
+            req.extend_from_slice(&(TEST_H as u16).to_be_bytes());
+            s.write_all(&req).unwrap();
+
+            let mut head = [0u8; 4];
+            s.read_exact(&mut head).unwrap_or_else(|e| {
+                panic!("round {round}: no answer to a full update request ({e})")
+            });
+            assert_eq!(head[0], 0, "round {round}: expected a FramebufferUpdate");
+            let rects = u16::from_be_bytes([head[2], head[3]]);
+            for _ in 0..rects {
+                let mut rect = [0u8; 12];
+                s.read_exact(&mut rect).unwrap();
+                let w = u16::from_be_bytes([rect[4], rect[5]]) as usize;
+                let h = u16::from_be_bytes([rect[6], rect[7]]) as usize;
+                let mut pixels = vec![0u8; w * h * 4];
+                s.read_exact(&mut pixels).unwrap();
+            }
+        }
+    }
+
+    /// The reading half must keep consuming client messages while the writing
+    /// half waits for a frame a quiet desktop is not producing.
+    ///
+    /// Before the reader/writer split these were one thread, so an outstanding
+    /// incremental request stopped the server reading KeyEvent and
+    /// PointerEvent for the whole UPDATE_WAIT -- and that unread input was
+    /// usually exactly what would have changed the screen and ended the wait.
+    /// At two seconds it was a hard freeze every time a user paused and
+    /// resumed. Pushing more client data than a socket buffer can hold is the
+    /// observable: it can only complete if something is draining it.
+    #[test]
+    fn client_messages_are_read_while_no_frame_is_available() {
+        let addr = serve_a_test_desktop();
+        let mut s = connect(addr);
+        // Handshake, and take the one frame this desktop ever presents so the
+        // screen is quiet from here on.
+        let _ = drive_rfb_session(&mut s);
+
+        // Leave an incremental request outstanding: the writer is now waiting
+        // for a frame that will never arrive.
+        let mut req = vec![3u8, 1];
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&(TEST_W as u16).to_be_bytes());
+        req.extend_from_slice(&(TEST_H as u16).to_be_bytes());
+        s.write_all(&req).unwrap();
+
+        // ClientCutText is the largest message a client may send; the server
+        // caps each at 1 MiB, so send several.
+        let mut cut = vec![6u8, 0, 0, 0];
+        cut.extend_from_slice(&(1u32 << 20).to_be_bytes());
+        cut.extend_from_slice(&vec![b'x'; 1 << 20]);
+        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let started = std::time::Instant::now();
+        for chunk in 0..16 {
+            if let Err(e) = s.write_all(&cut) {
+                panic!(
+                    "client messages stopped being consumed after {chunk} MiB ({e}): \
+                     the reading half is blocked behind the frame wait"
+                );
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < UPDATE_WAIT / 2,
+            "16 MiB of client messages took {elapsed:?}, over half of UPDATE_WAIT \
+             ({UPDATE_WAIT:?}): the reading half is waiting on frames, not input"
+        );
     }
 
     #[test]
