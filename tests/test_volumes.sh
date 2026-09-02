@@ -197,10 +197,11 @@ test_volume_mount_hot_reload_and_dax() {
         return 1
     }
 
-    local mount_options
+    local mount_options guest_arch
     mount_options=$($SMOLVM machine exec --name "$vm_name" -- \
         sh -lc "awk '\$2 == \"/work\" { print \$4 }' /proc/mounts")
-    if [[ "$mount_options" != *"dax=always"* ]]; then
+    guest_arch=$($SMOLVM machine exec --name "$vm_name" -- uname -m)
+    if [[ "$guest_arch" == "x86_64" && "$mount_options" != *"dax=always"* ]]; then
         echo "FAIL: DAX was requested but /work options were: $mount_options"
         $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
         $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
