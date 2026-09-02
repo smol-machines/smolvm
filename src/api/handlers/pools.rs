@@ -150,8 +150,8 @@ fn validate_rollout_access_target(
     golden: &crate::config::VmRecord,
     guest_host_service: Option<smolvm_network::GatewayHostService>,
 ) -> Result<(), ApiError> {
-    if !guest_host_service
-        .is_some_and(|service| service.guest_port == crate::api::guest_rollout::GUEST_ROLLOUT_PORT)
+    if guest_host_service
+        .is_none_or(|service| service.guest_port != crate::api::guest_rollout::GUEST_ROLLOUT_PORT)
     {
         return Err(ApiError::Conflict(
             "rolloutAccess is unavailable because guest rollout ingress is not enabled on this node"

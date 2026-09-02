@@ -40,14 +40,6 @@ use super::{KrunFunctions, PortMapping, VmResources};
 /// a host resolves to many IPs across many refresh cycles.
 const EGRESS_CIDR_CAP: usize = 512;
 
-/// Hidden benchmark knob for root virtiofs DAX.
-///
-/// Default configures the root virtiofs device with a 512 MB DAX window (the
-/// same default the removed `krun_set_root` used). Set `SMOLVM_ROOTFS_DAX=0` to
-/// use `krun_add_virtiofs3("/dev/root", ..., shm_size=0, read_only=false)`,
-/// disabling the root DAX region for benchmarking.
-const ENV_SMOLVM_ROOTFS_DAX: &str = "SMOLVM_ROOTFS_DAX";
-
 /// Stable tmpfs directory used by one VM's CUDA file-ring transport.
 ///
 /// The path is derived from the full per-VM runtime directory rather than its
@@ -137,14 +129,6 @@ fn create_owned_directory(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(0o700).create(path)
 }
-
-/// Root virtiofs DAX window (512 MB), matching the default the removed
-/// `krun_set_root` configured. DAX gives the host a coherent shared mapping of
-/// the root fs so the guest agent's ready-marker write is visible to the host
-/// immediately. Plain `krun_add_virtiofs` passes shm_size=0 (no DAX), dropping
-/// virtiofs to writeback caching — the marker isn't seen until the multi-second
-/// socket-probe grace, regressing boot time from ~hundreds of ms to ~5 s.
-const ROOTFS_DAX_WINDOW: u64 = 1 << 29;
 
 /// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
 type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
@@ -754,6 +738,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_create_ctx = krun.create_ctx;
         let krun_free_ctx = krun.free_ctx;
         let krun_set_vm_config = krun.set_vm_config;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let krun_set_cpu_template = krun.set_cpu_template;
         let krun_set_workdir = krun.set_workdir;
         let krun_set_exec = krun.set_exec;
         let krun_add_disk2 = krun.add_disk2;
@@ -785,6 +771,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let cpu_profile_result = krun_set_cpu_template(ctx, 1);
+            if cpu_profile_result < 0 && cpu_profile_result != -libc::ENOTSUP {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure vm",
+                    "libkrun does not support the portable CPU profile",
+                ));
+            }
         }
 
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
@@ -913,7 +910,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         }
                     };
                     match super::vnc::serve(&bind, framebuffer, input) {
-                        Ok(addr) => tracing::info!(%addr, "vnc server listening"),
+                        Ok(addr) => tracing::info!(
+                            %addr,
+                            url = %super::vnc::browser_url(addr),
+                            "vnc server listening"
+                        ),
                         Err(e) => {
                             // A failed viewer must not take down the VM: the
                             // display itself is already working without it.
@@ -941,17 +942,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Set root filesystem via the root virtiofs tag ("/dev/root").
         //
         // Upstream libkrun removed krun_set_root in favor of krun_add_virtiofs*
-        // with KRUN_FS_ROOT_TAG. Default path: krun_add_virtiofs, preserving the
-        // established rootfs DAX defaults. Benchmark path: SMOLVM_ROOTFS_DAX=0
-        // uses krun_add_virtiofs3 with shm_size=0, disabling the root DAX region
-        // while keeping the root read-write.
+        // with KRUN_FS_ROOT_TAG. Use virtiofs3 for both policy states so every
+        // launcher interprets the shared rootfs DAX setting identically.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
         let root_tag = cstr("/dev/root");
-        if rootfs_dax_disabled() {
+        let rootfs_dax_window = super::virtiofs::rootfs_dax_window();
+        if rootfs_dax_window == 0 {
             let Some(add_virtiofs3) = krun_add_virtiofs3 else {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
@@ -984,7 +984,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ctx,
                 root_tag.as_ptr(),
                 root.as_ptr(),
-                ROOTFS_DAX_WINDOW,
+                rootfs_dax_window,
                 false,
             ) < 0
             {
@@ -1623,14 +1623,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // a failed boot. See launcher_dynamic::truncate_console_log.
             super::launcher_dynamic::truncate_console_log(log_path);
             if krun.console_output_to_file(ctx, log_path) < 0 {
-                // Expected on Windows (fd-based console redirection is a no-op
-                // there); don't let a benign WARN mask the real boot failure the
-                // readiness monitor reports. See `boot_failure_reason`.
-                #[cfg(windows)]
-                tracing::debug!(
-                    "guest console not captured on Windows (fd redirection unsupported)"
-                );
-                #[cfg(not(windows))]
                 tracing::warn!("failed to set console output");
             }
         }
@@ -1736,18 +1728,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // host page-cache pages into the guest), which is the transport
             // for CLONE rings — clone guest RAM is COW-private, but the DAX
             // window is device memory, re-established per-VM, so it dodges
-            // the COW wall entirely. libkrun supports per-device windows
-            // (ShmManager::create_fs_region per fs index); the old code just
-            // never asked (shm_size=0 here while launcher_dynamic asked for
-            // 2 GiB — the source of the "only root has DAX" misdiagnosis).
-            let is_ring_mount = mount.target == std::path::Path::new("/opt/smolvm-ring");
-            let dax_window: u64 = match std::env::var("SMOLVM_MOUNT_DAX").as_deref() {
-                Ok("1") => 1 << 29,
-                // The implicit CUDA ring mount ALWAYS gets a window — it exists
-                // solely to be dax-mmap'd (512 MB, the proven window size).
-                _ if is_ring_mount => 1 << 29,
-                _ => 0,
-            };
+            // the COW wall entirely. The shared policy keeps this launcher,
+            // packed VMs, and the direct backend on the same window size.
+            let dax_window = super::virtiofs::user_mount_dax_window(&mount.target);
             // Read-only mounts must be enforced host-side by the virtiofs
             // device (krun_add_virtiofs3's read_only flag), not only by the
             // guest's bind-remount: a root process in the guest can undo a
@@ -1763,18 +1746,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             "read-only mounts require libkrun with krun_add_virtiofs3",
                         ));
                     }
-                    // DAX requested but symbol missing: fall back to plain.
-                    if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
-                        krun_free_ctx(ctx);
-                        return Err(Error::agent(
-                            "add virtiofs mount",
-                            format!(
-                                "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
-                                mount.source.display()
-                            ),
-                        ));
-                    }
-                    continue;
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        "DAX mounts require libkrun with krun_add_virtiofs3",
+                    ));
                 };
                 if add_virtiofs3(
                     ctx,
@@ -1792,6 +1768,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             mount.source.display()
                         ),
                     ));
+                }
+                if dax_window > 0 {
+                    tracing::info!(
+                        tag = %mount_tag,
+                        dax_window_mib = dax_window >> 20,
+                        "virtiofs DAX enabled"
+                    );
                 }
             } else if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
                 krun_free_ctx(ctx);
@@ -1812,11 +1795,25 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             if layers_dir.exists() {
                 let tag = cstr("smolvm_layers");
                 let host_path = path_to_cstring(layers_dir)?;
-                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                let Some(add_virtiofs3) = krun_add_virtiofs3 else {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
                         "add packed layers virtiofs",
-                        "krun_add_virtiofs failed for packed layers",
+                        "packed-layer DAX requires libkrun with krun_add_virtiofs3",
+                    ));
+                };
+                if add_virtiofs3(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    super::virtiofs::DATA_DAX_WINDOW,
+                    false,
+                ) < 0
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add packed layers virtiofs",
+                        "krun_add_virtiofs3 failed for packed layers",
                     ));
                 }
             } else {
@@ -2132,6 +2129,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Start VM (this replaces the process on success)
         boot_timing!("entering vm");
         let ret = krun_start_enter(ctx);
+        let start_error_detail = krun.last_error_message();
 
         // If we get here, something went wrong — free the context before returning
         krun_free_ctx(ctx);
@@ -2140,7 +2138,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         drop(netns_bridge);
         Err(Error::agent(
             "start vm",
-            super::launcher_dynamic::describe_krun_start_error(ret),
+            super::launcher_dynamic::describe_krun_start_error_with_detail(
+                ret,
+                start_error_detail.as_deref(),
+            ),
         ))
     }
 }
@@ -2154,17 +2155,6 @@ fn cstr(s: &str) -> CString {
 fn path_to_cstring(path: &Path) -> Result<CString> {
     CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| Error::agent("convert path", "path contains null byte"))
-}
-
-fn rootfs_dax_disabled() -> bool {
-    std::env::var(ENV_SMOLVM_ROOTFS_DAX)
-        .map(|value| {
-            matches!(
-                value.as_str(),
-                "0" | "false" | "False" | "FALSE" | "no" | "off"
-            )
-        })
-        .unwrap_or(false)
 }
 
 // Unix-only: virtio-net is the sole caller and is itself unix-gated.

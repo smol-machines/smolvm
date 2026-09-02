@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-s3fs"
-version = "1.13.0"
+version = "1.13.1"
 edition = "2021"
 description = "POSIX filesystem over S3-compatible object storage, mounted through FUSE without libfuse or a helper binary"
 license = "Apache-2.0"

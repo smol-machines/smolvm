@@ -19,41 +19,50 @@ echo "  Port Mapping Tests"
 echo "=========================================="
 echo ""
 
-test_machine_port_mapping_http() {
+test_machine_port_range_mapping_http() {
     local vm_name="test-vm-portmap"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
-    # Create and start VM with port mapping (host 18199 -> guest 8080)
-    $SMOLVM machine create --name "$vm_name" -p 18199:8080 2>&1 || return 1
+    # Create and start VM with one-to-one port mappings:
+    # host 18199 -> guest 8080 and host 18200 -> guest 8081.
+    $SMOLVM machine create --name "$vm_name" -p 18199-18200:8080-8081 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
-    # Start a simple HTTP responder inside the VM (background exec)
+    # Each nc responder serves one request. Avoid readiness probes because they
+    # would consume that request before curl reaches the published port.
     $SMOLVM machine exec --name "$vm_name" -- \
-        sh -c 'echo -e "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 8080 -w 5' &
-    local server_pid=$!
-    # nc serves exactly one connection; any TCP probe would consume it before
-    # curl gets a chance. A fixed sleep is the right wait here.
+        sh -c 'echo -e "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none" | nc -l -p 8080 -w 5' &
+    local first_server_pid=$!
+    $SMOLVM machine exec --name "$vm_name" -- \
+        sh -c 'echo -e "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo" | nc -l -p 8081 -w 5' &
+    local second_server_pid=$!
     sleep 1
 
-    # Curl the mapped port from the host
-    local output
-    output=$(curl -s --connect-timeout 5 http://127.0.0.1:18199/ 2>&1)
-    local curl_rc=$?
+    local first_output
+    local first_curl_rc
+    first_output=$(curl -s --connect-timeout 5 http://127.0.0.1:18199/ 2>&1)
+    first_curl_rc=$?
 
-    kill "$server_pid" 2>/dev/null || true
-    wait "$server_pid" 2>/dev/null || true
+    local second_output
+    local second_curl_rc
+    second_output=$(curl -s --connect-timeout 5 http://127.0.0.1:18200/ 2>&1)
+    second_curl_rc=$?
+
+    kill "$first_server_pid" "$second_server_pid" 2>/dev/null || true
+    wait "$first_server_pid" "$second_server_pid" 2>/dev/null || true
 
     # Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
-    [[ $curl_rc -eq 0 ]] && [[ "$output" == *"ok"* ]]
+    [[ $first_curl_rc -eq 0 ]] && [[ "$first_output" == *"one"* ]] &&
+        [[ $second_curl_rc -eq 0 ]] && [[ "$second_output" == *"two"* ]]
 }
 
 test_port_conflict_across_vms() {
@@ -84,7 +93,7 @@ test_port_conflict_across_vms() {
 }
 
 
-run_test "Port: mapping host to guest HTTP" test_machine_port_mapping_http || true
+run_test "Port: range mappings reach distinct guest HTTP servers" test_machine_port_range_mapping_http || true
 run_test "Port: cross-VM conflict detected" test_port_conflict_across_vms || true
 
 print_summary "Port Tests"

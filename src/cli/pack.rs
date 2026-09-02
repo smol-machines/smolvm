@@ -61,6 +61,62 @@ impl PackCmd {
     }
 }
 
+/// Persist one running machine, including RAM and execution state, as a
+/// portable `.smolcheckpoint` artifact.
+#[derive(Args, Debug)]
+pub struct CheckpointCmd {
+    /// Running machine to checkpoint.
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: String,
+
+    /// Destination `.smolcheckpoint` file.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// Directory under which large temporary checkpoint assets are staged.
+    #[arg(long = "staging-dir", value_name = "DIR")]
+    pub staging_dir: Option<PathBuf>,
+
+    /// Path to library directory containing libkrun and libkrunfw.
+    #[arg(long, value_name = "DIR", hide = true)]
+    pub lib_dir: Option<PathBuf>,
+
+    /// Path to agent rootfs directory.
+    #[arg(long, value_name = "DIR", hide = true)]
+    pub rootfs_dir: Option<PathBuf>,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
+}
+
+impl CheckpointCmd {
+    /// Capture and package a live machine at one RAM/disk consistency boundary.
+    pub fn run(self) -> smolvm::Result<()> {
+        let result = smolvm::portable_checkpoint::capture_to_path(
+            &self.name,
+            &self.output,
+            &smolvm::portable_checkpoint::CaptureOptions {
+                staging_dir: self.staging_dir,
+                lib_dir: self.lib_dir,
+                rootfs_dir: self.rootfs_dir,
+            },
+        )?;
+        println!(
+            "Source resumed after {:.3}s; packaging continued in the background",
+            result.source_pause.as_secs_f64()
+        );
+        println!(
+            "Checkpointed '{}' to {} ({} MiB compressed, {:.3}s total, {:.3}s source pause)",
+            self.name,
+            self.output.display(),
+            result.size_bytes / (1024 * 1024),
+            result.elapsed.as_secs_f64(),
+            result.source_pause.as_secs_f64()
+        );
+        Ok(())
+    }
+}
+
 /// Package an OCI image or VM snapshot into a self-contained executable.
 ///
 /// Creates a single binary that can be distributed and run without smolvm installed.

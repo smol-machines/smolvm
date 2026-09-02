@@ -318,7 +318,7 @@ fn mark_file_sparse(file: &std::fs::File) -> std::io::Result<()> {
 /// Clone a file using the platform-optimal copy method.
 ///
 /// - macOS: `clonefile()` for instant APFS copy-on-write
-/// - Linux: sparse copy via `SEEK_HOLE`/`SEEK_DATA` (copies only data regions)
+/// - Linux: `FICLONE` reflink, then sparse `SEEK_HOLE`/`SEEK_DATA` fallback
 /// - Fallback: `fs::copy`
 ///
 /// Disk templates are sparse files (~500KB actual data in a 512MB logical file).
@@ -353,10 +353,43 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        // TODO(reflink): try a FICLONE ioctl before sparse_copy for true
-        // copy-on-write on btrfs/XFS hosts. (Fork clones already get
-        // filesystem-independent block CoW via qcow2 overlays; this would only
-        // speed up the remaining full-copy callers on reflink-capable hosts.)
+        use std::os::fd::AsRawFd;
+
+        // FICLONE snapshots the file's extents without copying payload bytes.
+        // This is especially important for durable live checkpoints: the VM is
+        // paused only while its disks become immutable, not while tens of GiB
+        // are flattened and packed. Unsupported filesystems return EXDEV /
+        // EOPNOTSUPP and fall through to the portable sparse copier.
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        if dst.exists() {
+            let _ = std::fs::remove_file(dst);
+        }
+        let reflink = (|| -> std::io::Result<()> {
+            let source = std::fs::File::open(src)?;
+            let destination = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dst)?;
+            // Safety: both descriptors are live regular files owned by this
+            // scope; FICLONE reads the source fd and clones into destination.
+            let result =
+                unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            destination.sync_all()?;
+            Ok(())
+        })();
+        match reflink {
+            Ok(()) => {
+                tracing::debug!(src = %src.display(), dst = %dst.display(), "FICLONE reflink succeeded");
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(dst);
+                tracing::debug!(src = %src.display(), %error, "FICLONE unavailable, falling back to sparse copy");
+            }
+        }
         match sparse_copy(src, dst) {
             Ok(bytes) => {
                 tracing::debug!(

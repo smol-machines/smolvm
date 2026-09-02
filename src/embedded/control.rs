@@ -213,6 +213,8 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
         AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
+    let restoring_checkpoint =
+        crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(&record.name)).is_some();
     let freshly_started = manager
         .ensure_running_with_full_config(
             record.host_mounts(),
@@ -222,9 +224,20 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
         )
         .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
+    if restoring_checkpoint {
+        if let Err(error) = crate::portable_checkpoint::finalize_live_restore(&record.name, record)
+            .and_then(|()| {
+                crate::portable_checkpoint::consume(&crate::agent::vm_data_dir(&record.name))
+            })
+        {
+            let _ = manager.stop();
+            return Err(error);
+        }
+    }
+
     Ok(StartedVm {
         handle: VmHandle::new(manager, None),
-        freshly_started,
+        freshly_started: freshly_started && !restoring_checkpoint,
     })
 }
 

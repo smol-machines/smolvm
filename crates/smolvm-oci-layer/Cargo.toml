@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-oci-layer"
-version = "1.13.0"
+version = "1.13.1"
 edition = "2021"
 description = "Pure-Rust OCI image-layer extraction: decompress a layer blob and unpack it into an overlayfs lowerdir, translating OCI whiteouts"
 license = "Apache-2.0"

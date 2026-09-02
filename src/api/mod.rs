@@ -251,6 +251,11 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     let logs_route = Router::new()
         .route("/{id}/logs", get(handlers::exec::stream_logs))
         .route(
+            "/{id}/checkpoint",
+            post(handlers::machines::capture_portable_checkpoint)
+                .put(handlers::machines::restore_portable_checkpoint),
+        )
+        .route(
             "/{id}/exec/interactive",
             get(handlers::exec::exec_interactive),
         );

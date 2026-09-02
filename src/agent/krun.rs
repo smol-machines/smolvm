@@ -28,6 +28,7 @@ pub struct KrunFunctions {
     pub create_ctx: unsafe extern "C" fn() -> i32,
     pub free_ctx: unsafe extern "C" fn(u32),
     pub set_vm_config: unsafe extern "C" fn(u32, u8, u32) -> i32,
+    pub set_cpu_template: unsafe extern "C" fn(u32, u32) -> i32,
     pub set_workdir: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
     pub set_exec: unsafe extern "C" fn(
         u32,
@@ -44,11 +45,21 @@ pub struct KrunFunctions {
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool) -> i32,
     >,
     pub start_enter: unsafe extern "C" fn(u32) -> i32,
+    pub get_last_error: Option<unsafe extern "C" fn() -> *const libc::c_char>,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     /// Add a virtio-console device (the upstream replacement for the removed
     /// `krun_set_console_output`). Unix: input/output/err file descriptors.
+    #[cfg(unix)]
     pub add_virtio_console_default:
         unsafe extern "C" fn(u32, libc::c_int, libc::c_int, libc::c_int) -> i32,
+    /// Windows takes the same three streams as handles rather than descriptors.
+    #[cfg(windows)]
+    pub add_virtio_console_default: unsafe extern "C" fn(
+        u32,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+    ) -> i32,
     pub set_egress_policy: Option<
         unsafe extern "C" fn(
             u32,
@@ -160,6 +171,7 @@ impl KrunFunctions {
         let create_ctx = load_sym!(krun_create_ctx);
         let free_ctx = load_sym!(krun_free_ctx);
         let set_vm_config = load_sym!(krun_set_vm_config);
+        let set_cpu_template = load_sym!(krun_set_cpu_template);
         let set_workdir = load_sym!(krun_set_workdir);
         let set_exec = load_sym!(krun_set_exec);
         let set_port_map = load_sym!(krun_set_port_map);
@@ -168,6 +180,7 @@ impl KrunFunctions {
         let add_virtiofs = load_sym!(krun_add_virtiofs);
         let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
         let start_enter = load_sym!(krun_start_enter);
+        let get_last_error = load_optional_sym!("krun_get_last_error");
         let add_vsock = load_sym!(krun_add_vsock);
         let add_virtio_console_default = load_sym!(krun_add_virtio_console_default);
         let set_egress_policy = load_optional_sym!("krun_set_egress_policy");
@@ -190,6 +203,7 @@ impl KrunFunctions {
             create_ctx,
             free_ctx,
             set_vm_config,
+            set_cpu_template,
             set_workdir,
             set_exec,
             set_port_map,
@@ -198,6 +212,7 @@ impl KrunFunctions {
             add_virtiofs,
             add_virtiofs3,
             start_enter,
+            get_last_error,
             add_vsock,
             add_virtio_console_default,
             set_egress_policy,
@@ -216,6 +231,23 @@ impl KrunFunctions {
 }
 
 impl KrunFunctions {
+    /// Copy libkrun's thread-local diagnostic before another FFI call can
+    /// replace it. Older compatible libraries simply return no detail.
+    pub fn last_error_message(&self) -> Option<String> {
+        let get_last_error = self.get_last_error?;
+        // SAFETY: libkrun owns a NUL-terminated thread-local string whose
+        // lifetime extends until the next error update; copy it immediately.
+        let ptr = unsafe { get_last_error() };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
     /// Validate the optional host libraries needed by libkrun's Vulkan path.
     ///
     /// Linux release artifacts deliberately remove libkrun's hard
@@ -264,16 +296,39 @@ impl KrunFunctions {
         unsafe { (self.add_virtio_console_default)(ctx, null_fd, out_fd, out_fd) }
     }
 
-    /// Windows stub: the virtio-console redirection relies on POSIX file
-    /// descriptors passed to libkrun. The Windows libkrun ABI/console wiring is
-    /// not implemented here, so this is a no-op that reports failure.
+    /// Redirect the guest console output to `path` on Windows, where libkrun
+    /// takes handles instead of file descriptors.
+    ///
+    /// Without this a Windows guest's console goes nowhere, so a machine that
+    /// fails to boot leaves no record of why -- the log the other platforms
+    /// write is simply absent.
+    ///
+    /// The opened handles are intentionally leaked, for the same reason as on
+    /// Unix: the console device holds them for the VM's lifetime, and
+    /// `krun_start_enter` runs the VM in this process.
     ///
     /// # Safety
-    /// `unsafe` only to match the Unix signature (which dereferences libkrun
-    /// function pointers). This stub touches nothing and is always sound to call.
-    #[cfg(not(unix))]
-    pub unsafe fn console_output_to_file(&self, _ctx: u32, _path: &Path) -> i32 {
-        -1
+    /// `ctx` must be a valid libkrun context that has not yet been started.
+    #[cfg(windows)]
+    pub unsafe fn console_output_to_file(&self, ctx: u32, path: &Path) -> i32 {
+        use std::os::windows::io::IntoRawHandle;
+
+        let Ok(out) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return -1;
+        };
+        // Console input comes from the null device (the agent talks over vsock,
+        // not the console); output and stderr both go to the log file.
+        let Ok(null) = std::fs::OpenOptions::new().read(true).open("NUL") else {
+            return -1;
+        };
+
+        let out_handle = out.into_raw_handle();
+        let null_handle = null.into_raw_handle();
+        unsafe { (self.add_virtio_console_default)(ctx, null_handle, out_handle, out_handle) }
     }
 }
 

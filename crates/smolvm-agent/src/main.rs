@@ -1406,12 +1406,57 @@ fn sync_and_unmount_storage() {
         libc::sync();
     }
 
-    // Note: We don't unmount /storage here because:
-    // 1. The overlay filesystem uses /storage/layers and /storage/overlays
-    // 2. Unmounting /storage while overlay is active causes issues
-    // 3. The sync() call ensures all pending writes are flushed to disk
-    // 4. When the VM terminates, the kernel will clean up mounts
+    // Flushing is not enough on its own: ext4 clears its recovery flag only
+    // when the filesystem is taken read-only or unmounted, so a machine that
+    // was merely synced leaves a journal for the next boot to replay. Replaying
+    // one that still holds metadata for recent writes can leave the image
+    // manifest unreadable, and the machine then starts with "image not found"
+    // even though nothing was lost.
+    //
+    // /storage cannot be unmounted -- the overlay sits on top of it -- but a
+    // read-only remount checkpoints the journal just the same and leaves the
+    // filesystem clean for the next mount.
+    remount_storage_read_only();
 }
+
+/// Takes /storage read-only so ext4 checkpoints its journal.
+#[cfg(target_os = "linux")]
+fn remount_storage_read_only() {
+    let Ok(target) = std::ffi::CString::new(paths::STORAGE_ROOT) else {
+        return;
+    };
+
+    // SAFETY: a remount needs only the target path; the source, filesystem type
+    // and options are unused and may be null.
+    let ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+
+    if ret == 0 {
+        info!(
+            "remounted {} read-only; journal checkpointed",
+            paths::STORAGE_ROOT
+        );
+    } else {
+        // Something still holds it writable. The sync above already flushed the
+        // data, so the next boot replays the journal as it did before.
+        warn!(
+            "could not remount {} read-only: {}; the next boot will replay the journal instead",
+            paths::STORAGE_ROOT,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn remount_storage_read_only() {}
 
 /// Stub for non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
@@ -3380,6 +3425,18 @@ fn handle_interactive_run(
         return Ok(());
     }
 
+    // SSH agent forwarding: mirror `handle_run`'s injection. The #542 fix wired
+    // SSH_AUTH_SOCK into the exec/run env because the keep-alive `crun exec` path
+    // builds a fresh process env rather than inheriting the container's — but it
+    // only did so for the non-interactive handler. Interactive sessions reach the
+    // same keep-alive container (an ephemeral `machine run` also carries a
+    // persistent overlay id, so `-i`/`-t` joins it too), so without this the
+    // variable is silently absent for every interactive session and the
+    // container-spec injection alone never reaches it. No-op when forwarding is
+    // off; never overrides a user-supplied value.
+    let mut env = env;
+    ssh_agent::inject_into_env(&mut env);
+
     // Resolve the container's launch settings from the image's OCI config (with
     // request overrides). Required to call spawn_interactive_command, so the
     // interactive path can't drop the image's Env/WorkingDir/User either.
@@ -3831,11 +3888,13 @@ fn handle_run_detached(
     match create_output {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             send_response(
                 stream,
                 &AgentResponse::error(
-                    format!("crun create failed: {}", stderr.trim()),
+                    format!(
+                        "crun create failed: {}",
+                        crun::create_failure_reason(&container_id, &output)
+                    ),
                     error_codes::SPAWN_FAILED,
                 ),
             )?;
@@ -4504,7 +4563,7 @@ fn ensure_main_container(
     if !create.status.success() {
         return Err(format!(
             "keep-alive crun create failed: {}",
-            String::from_utf8_lossy(&create.stderr).trim()
+            crun::create_failure_reason(&container_id, &create)
         )
         .into());
     }

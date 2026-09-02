@@ -160,6 +160,67 @@ impl Packer {
         })
     }
 
+    /// Pack a standalone artifact containing assets, manifest, and footer.
+    ///
+    /// Unlike [`Self::pack`], this writes no launcher stub and includes runtime
+    /// libraries in the compressed assets. It is used for portable checkpoints,
+    /// which are consumed by an installed smolvm rather than executed directly.
+    pub fn pack_artifact(self, output: impl AsRef<Path>) -> Result<PackedInfo> {
+        let output = output.as_ref();
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let temp = tempfile::NamedTempFile::new_in(parent)?;
+        let temp_path = temp.into_temp_path();
+        let assets_temp = tempfile::NamedTempFile::new_in(parent)?;
+        let assets_path = assets_temp.into_temp_path();
+
+        let assets_size = if let Some(collector) = &self.asset_collector {
+            collector.compress(&assets_path, false)?
+        } else {
+            let empty_file = File::create(&assets_path)?;
+            let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
+            let tar_builder = tar::Builder::new(encoder);
+            let encoder = tar_builder.into_inner()?;
+            encoder.finish()?;
+            fs::metadata(&assets_path)?.len()
+        };
+
+        let mut artifact = File::create(&temp_path)?;
+        std::io::copy(&mut File::open(&assets_path)?, &mut artifact)?;
+        let manifest_json = self.manifest.to_json()?;
+        let manifest_offset = assets_size;
+        let manifest_size = manifest_json.len() as u64;
+        artifact.write_all(&manifest_json)?;
+        artifact.flush()?;
+        drop(artifact);
+
+        let checksum = crc32_file_range(&temp_path, 0, assets_size + manifest_size)?;
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size,
+            manifest_offset,
+            manifest_size,
+            checksum,
+        };
+        let mut artifact = fs::OpenOptions::new().append(true).open(&temp_path)?;
+        artifact.write_all(&footer.to_bytes())?;
+        artifact.sync_all()?;
+        drop(artifact);
+
+        temp_path
+            .persist_noclobber(output)
+            .map_err(|error| error.error)?;
+        Ok(PackedInfo {
+            stub_size: 0,
+            assets_size,
+            manifest_size,
+            total_size: assets_size + manifest_size + FOOTER_SIZE as u64,
+            checksum,
+            sidecar_path: Some(output.to_path_buf()),
+        })
+    }
+
     /// Pack everything into a single executable file (embedded format).
     ///
     /// On macOS, this uses Mach-O section manipulation to embed assets inside
@@ -897,6 +958,58 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&layer_file).unwrap(),
             "embedded layer content"
+        );
+    }
+
+    #[test]
+    fn test_pack_standalone_artifact_roundtrip_and_no_clobber() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        let collector = AssetCollector::new(staging.clone()).unwrap();
+        fs::create_dir(staging.join("checkpoint")).unwrap();
+        fs::write(staging.join("checkpoint/memory.bin"), b"guest memory").unwrap();
+
+        let manifest = PackManifest::new(
+            "vm://saved".to_string(),
+            "none".to_string(),
+            "linux/amd64".to_string(),
+            "linux/amd64".to_string(),
+        );
+        let output = temp_dir.path().join("saved.smolcheckpoint");
+        let info = Packer::new(manifest)
+            .with_asset_collector(collector)
+            .pack_artifact(&output)
+            .unwrap();
+        assert_eq!(info.stub_size, 0);
+        assert_eq!(info.sidecar_path.as_deref(), Some(output.as_path()));
+        let footer = read_footer_from_sidecar(&output).unwrap();
+        assert!(verify_sidecar_checksum(&output, &footer).unwrap());
+        assert_eq!(
+            read_manifest_from_sidecar(&output).unwrap().image,
+            "vm://saved"
+        );
+
+        let extracted = temp_dir.path().join("extracted");
+        crate::extract::extract_sidecar(&output, &extracted, &footer, false, false).unwrap();
+        assert_eq!(
+            fs::read(extracted.join("checkpoint/memory.bin")).unwrap(),
+            b"guest memory"
+        );
+
+        let second = AssetCollector::new(temp_dir.path().join("second")).unwrap();
+        let manifest = PackManifest::new(
+            "vm://replacement".to_string(),
+            "none".to_string(),
+            "linux/amd64".to_string(),
+            "linux/amd64".to_string(),
+        );
+        assert!(Packer::new(manifest)
+            .with_asset_collector(second)
+            .pack_artifact(&output)
+            .is_err());
+        assert_eq!(
+            read_manifest_from_sidecar(&output).unwrap().image,
+            "vm://saved"
         );
     }
 

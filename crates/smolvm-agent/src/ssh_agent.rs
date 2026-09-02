@@ -330,6 +330,30 @@ mod tests {
         assert_eq!(env[0].1, "/custom.sock");
     }
 
+    // Regression guard for the interactive half of the same gap: every handler
+    // that launches a container command has to put SSH_AUTH_SOCK into the launch
+    // env itself, because the keep-alive `crun exec` path builds a fresh process
+    // env. #542 fixed the non-interactive handler and missed the interactive one,
+    // which left `--ssh-agent` silently broken for every `-i`/`-t` session. Pin
+    // both call sites so the pair can't drift apart again.
+    #[test]
+    fn both_run_handlers_inject_ssh_auth_sock_into_the_launch_env() {
+        const AGENT_MAIN: &str = include_str!("main.rs");
+
+        for handler in ["fn handle_run(", "fn handle_interactive_run("] {
+            let start = AGENT_MAIN
+                .find(handler)
+                .unwrap_or_else(|| panic!("{handler} not found in main.rs"));
+            let body = &AGENT_MAIN[start..];
+            let end = body.find("\nfn ").unwrap_or(body.len());
+            assert!(
+                body[..end].contains("ssh_agent::inject_into_env("),
+                "{handler} must call ssh_agent::inject_into_env(..) - without it, \
+                 --ssh-agent forwarding silently fails for commands taking this path"
+            );
+        }
+    }
+
     #[test]
     fn inject_is_noop_when_disabled() {
         let mut spec = OciSpec::new(

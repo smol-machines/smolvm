@@ -592,8 +592,9 @@ pub struct CreateMachineRequest {
     /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
-    /// Path to a .smolmachine sidecar file. Creates the machine from pre-packed
-    /// layers instead of pulling from a registry. Mutually exclusive with `image`.
+    /// Path to a `.smolmachine` or `.smolcheckpoint` artifact. Creates from
+    /// pre-packed layers or restores the artifact's captured live state.
+    /// Mutually exclusive with `image`.
     #[serde(default)]
     pub from: Option<String>,
     /// Registry reference to a .smolmachine artifact (e.g., "myapp:v1").
@@ -823,7 +824,8 @@ pub struct ResizeMachineRequest {
 pub struct StartMachineQuery {
     /// Start as a fork base: back the guest RAM with a memfd (copy-on-write
     /// cloneable) and expose a control socket so the machine can later be forked
-    /// with `POST /machines/{name}/fork`. The golden freezes after its first fork.
+    /// with `POST /machines/{name}/fork`. Linux/x86_64 keeps the source running;
+    /// other hosts retain it as the frozen copy-on-write base.
     #[serde(default)]
     pub forkable: bool,
     /// Number of runnable CUDA fork clones planned for this golden. Supplying

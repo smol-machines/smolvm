@@ -88,6 +88,8 @@ pub mod network;
 pub mod pack_export;
 pub mod platform;
 pub mod pool;
+/// Portable live-checkpoint compatibility and one-shot restore support.
+pub mod portable_checkpoint;
 pub mod process;
 pub mod registry;
 pub mod remote_volume;

@@ -65,6 +65,10 @@ pub struct TcpPortListeners {
 
 impl TcpPortListeners {
     /// Start one non-blocking listener thread per published port.
+    ///
+    /// The CLI caps published mappings because every mapping creates this thread
+    /// and normally a second IPv6 thread. Raise that cap only after replacing
+    /// this per-listener model with multiplexed listeners or a bounded worker pool.
     pub fn start(
         port_mappings: &[PortMapping],
         tcp_sender: SyncSender<AcceptedTcpConnection>,

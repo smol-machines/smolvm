@@ -396,6 +396,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+dependencies = [
+ "bincode_derive",
+ "unty",
+]
+
+[[package]]
+name = "bincode_derive"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+dependencies = [
+ "virtue",
+]
+
+[[package]]
 name = "bit-vec"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1605,6 +1624,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "imago"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "404f567d70cd6d288e43f95ea8f2d6e8fe6156dd07df7da955cb9b147c4ab2a5"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "cfg-if 1.0.4",
+ "futures",
+ "libc",
+ "maybe-async",
+ "miniz_oxide",
+ "nix 0.30.1",
+ "page_size",
+ "rustc_version",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1852,6 +1892,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "maybe-async"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "746873a384ad60adc5db74471dfaba74bd278afbdcfd81db93fafcdfc8b5ca0c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2009,6 +2060,18 @@ dependencies = [
 
 [[package]]
 name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if 1.0.4",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
@@ -2107,6 +2170,16 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "page_size"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -2691,6 +2764,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2996,7 +3078,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smolfile"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "serde",
  "smolvm-protocol",
@@ -3022,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -3034,6 +3116,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "humantime",
+ "imago",
  "ipnet",
  "landlock",
  "libc",
@@ -3053,6 +3136,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha1",
  "sha2",
  "smolfile",
  "smolvm-cuda",
@@ -3081,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-agent"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "flate2",
  "lazy_static",
@@ -3104,7 +3188,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -3113,11 +3197,11 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.13.0"
+version = "1.13.1"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -3125,7 +3209,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3134,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3143,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "crossbeam-queue",
  "humantime",
@@ -3157,14 +3241,14 @@ dependencies = [
 
 [[package]]
 name = "smolvm-nvml-shim"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "smolvm-oci-layer"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "flate2",
  "libc",
@@ -3177,7 +3261,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-pack"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "crc32fast",
  "dirs",
@@ -3196,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-protocol"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "base64",
  "serde",
@@ -3206,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-registry"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "bytes",
  "dirs",
@@ -3228,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-s3fs"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "hmac",
  "libc",
@@ -3893,6 +3977,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
+
+[[package]]
 name = "ureq"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4028,6 +4118,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vsock"

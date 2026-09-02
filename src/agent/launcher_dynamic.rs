@@ -191,6 +191,13 @@ pub fn launch_agent_vm_dynamic(
     {
         free_ctx_on_err!("krun_set_vm_config failed");
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let cpu_profile_result = unsafe { (krun.set_cpu_template)(ctx, 1) };
+        if cpu_profile_result < 0 && cpu_profile_result != -libc::ENOTSUP {
+            free_ctx_on_err!("libkrun does not support the portable CPU profile");
+        }
+    }
 
     // Enable GPU (virtio-gpu / Venus Vulkan) when requested by the manifest.
     // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
@@ -294,9 +301,11 @@ pub fn launch_agent_vm_dynamic(
                                     }
                                 };
                                 match crate::agent::vnc::serve(&bind, framebuffer, input) {
-                                    Ok(addr) => {
-                                        tracing::info!(%addr, "vnc server listening")
-                                    }
+                                    Ok(addr) => tracing::info!(
+                                        %addr,
+                                        url = %crate::agent::vnc::browser_url(addr),
+                                        "vnc server listening"
+                                    ),
                                     // A failed viewer must not take down the
                                     // VM; the display works without it.
                                     Err(e) => tracing::warn!(
@@ -339,7 +348,16 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("root DAX requires libkrun with krun_add_virtiofs3");
     };
     // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
-    if unsafe { add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 1 << 29, false) } < 0 {
+    if unsafe {
+        add_virtiofs3(
+            ctx,
+            root_tag.as_ptr(),
+            root.as_ptr(),
+            super::virtiofs::rootfs_dax_window(),
+            false,
+        )
+    } < 0
+    {
         free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
     }
 
@@ -662,15 +680,6 @@ pub fn launch_agent_vm_dynamic(
     // upstream virtio-console API (krun_set_console_output was removed).
     // SAFETY: ctx is a valid, not-yet-started libkrun context.
     if unsafe { krun.console_output_to_file(ctx, &config.console_log) } < 0 {
-        // On Windows the fd-based virtio-console redirection isn't wired (the
-        // wrapper is a known no-op that always returns < 0), so this is expected
-        // — NOT a boot failure. Keep it out of the startup error log at WARN so a
-        // benign line can't become what the readiness monitor surfaces as "the
-        // error" when the boot later fails for a real reason (see
-        // `boot_failure_reason`).
-        #[cfg(windows)]
-        tracing::debug!("guest console not captured on Windows (fd redirection unsupported)");
-        #[cfg(not(windows))]
         tracing::warn!("failed to set console output");
     }
 
@@ -780,15 +789,8 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_exec failed");
     }
 
-    // Every virtiofs mount gets a DAX window (like the root fs above): without
-    // DAX, virtiofs falls back to writeback caching where each file access is a
-    // FUSE round-trip over the virtio queue — pathological for read-heavy mounts
-    // with many files (a multi-GB Python venv took minutes just to import, and a
-    // single file larger than the window stalled entirely). 2 GiB exceeds any
-    // realistic single mapped file; the window is virtual host address space
-    // backed on demand, so oversizing costs nothing until touched.
-    const VIRTIOFS_DAX_WINDOW: u64 = 1 << 31;
-
+    // Packed image layers always use the shared data DAX window. User mounts
+    // follow the same explicit policy as every other launch path below.
     // Add virtiofs mount for packed layers (AFTER set_exec)
     if config.layers_dir.exists() {
         let layers_tag = cstr("smolvm_layers");
@@ -802,7 +804,7 @@ pub fn launch_agent_vm_dynamic(
                 ctx,
                 layers_tag.as_ptr(),
                 layers_path.as_ptr(),
-                VIRTIOFS_DAX_WINDOW,
+                super::virtiofs::DATA_DAX_WINDOW,
                 false,
             )
         } < 0
@@ -822,13 +824,14 @@ pub fn launch_agent_vm_dynamic(
             "mount path contains null byte"
         );
 
+        let dax_window = super::virtiofs::user_mount_dax_window(Path::new(&mount.guest_path));
         // SAFETY: ctx is valid, tag and host_path are valid C strings
         if unsafe {
             add_virtiofs3(
                 ctx,
                 tag.as_ptr(),
                 host_path.as_ptr(),
-                VIRTIOFS_DAX_WINDOW,
+                dax_window,
                 mount.read_only,
             )
         } < 0
@@ -837,6 +840,13 @@ pub fn launch_agent_vm_dynamic(
                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
                 mount.tag
             ));
+        }
+        if dax_window > 0 {
+            tracing::info!(
+                tag = %mount.tag,
+                dax_window_mib = dax_window >> 20,
+                "virtiofs DAX enabled"
+            );
         }
     }
 
@@ -861,12 +871,16 @@ pub fn launch_agent_vm_dynamic(
     // Start VM (never returns on success)
     // SAFETY: ctx is valid, all configuration has been set
     let ret = unsafe { (krun.start_enter)(ctx) };
+    let start_error_detail = krun.last_error_message();
 
     // If we get here, something went wrong — free the context before returning
     // SAFETY: ctx is a valid context from krun_create_ctx
     unsafe { (krun.free_ctx)(ctx) };
     drop(virtio_network_runtime);
-    Err(describe_krun_start_error(ret))
+    Err(describe_krun_start_error_with_detail(
+        ret,
+        start_error_detail.as_deref(),
+    ))
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.
@@ -915,6 +929,14 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
     }
 
     describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+pub(crate) fn describe_krun_start_error_with_detail(ret: i32, detail: Option<&str>) -> String {
+    let summary = describe_krun_start_error(ret);
+    match detail.map(str::trim).filter(|detail| !detail.is_empty()) {
+        Some(detail) => format!("{summary}; libkrun detail: {detail}"),
+        None => summary,
+    }
 }
 
 /// Whether the running binary carries the macOS hypervisor entitlement.
@@ -1088,6 +1110,20 @@ mod tests {
         let eio = describe_start_error_with_probe(-5, Some("should be ignored"));
         assert!(eio.contains("EIO"));
         assert!(!eio.contains("privilege drop"));
+    }
+
+    #[test]
+    fn describe_krun_start_error_appends_library_detail() {
+        let message = describe_krun_start_error_with_detail(
+            -22,
+            Some("build microVM: vCPU rejected checkpoint state"),
+        );
+        assert!(message.contains("krun_start_enter returned: -22"));
+        assert!(message.contains("vCPU rejected checkpoint state"));
+        assert_eq!(
+            describe_krun_start_error_with_detail(-5, Some("  ")),
+            describe_krun_start_error(-5)
+        );
     }
 
     // cargo's test binaries are ad-hoc signed without entitlements, so a

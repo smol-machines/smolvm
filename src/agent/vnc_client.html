@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smolvm desktop</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center;
+         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #ddd; }
+  canvas { max-width: 100vw; max-height: 100vh; image-rendering: pixelated;
+           display: none; touch-action: none; outline: none; }
+  #status { position: fixed; inset: 0; display: flex; align-items: center;
+            justify-content: center; text-align: center; padding: 2rem; }
+  #status.error { color: #ff8a8a; white-space: pre-wrap; }
+  #status.hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="status">connecting…</div>
+<canvas id="screen" tabindex="0"></canvas>
+<script>
+"use strict";
+
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d", { alpha: false });
+const statusEl = document.getElementById("status");
+
+let fbWidth = 0, fbHeight = 0, buttonMask = 0;
+let rawStarted = false, videoStarted = false, videoSocket = null, decoder = null;
+
+function setStatus(text, isError) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle("error", !!isError);
+  statusEl.classList.remove("hidden");
+  if (isError) canvas.style.display = "none";
+}
+function clearStatus() {
+  statusEl.classList.add("hidden");
+  canvas.style.display = "block";
+}
+
+// ---------------------------------------------------------------- transport
+// The socket delivers arbitrarily-sized chunks; RFB wants exact byte counts.
+// Buffer whatever arrives and hand it out in the sizes the protocol asks for.
+const ws = new WebSocket(
+  (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/websockify"
+);
+ws.binaryType = "arraybuffer";
+
+let chunks = [], available = 0, waiter = null;
+
+ws.onmessage = (ev) => {
+  chunks.push(new Uint8Array(ev.data));
+  available += ev.data.byteLength;
+  if (waiter && available >= waiter.need) {
+    const { need, resolve } = waiter;
+    waiter = null;
+    resolve(take(need));
+  }
+};
+ws.onerror = () => setStatus("connection failed", true);
+ws.onclose = () => setStatus("disconnected", true);
+ws.onopen = () => { session().catch((e) => setStatus(String(e && e.message || e), true)); };
+
+function take(n) {
+  const out = new Uint8Array(n);
+  let off = 0;
+  while (off < n) {
+    const head = chunks[0];
+    const used = Math.min(head.length, n - off);
+    out.set(head.subarray(0, used), off);
+    if (used === head.length) chunks.shift(); else chunks[0] = head.subarray(used);
+    off += used;
+  }
+  available -= n;
+  return out;
+}
+function recv(n) {
+  if (n === 0) return Promise.resolve(new Uint8Array(0));
+  if (available >= n) return Promise.resolve(take(n));
+  return new Promise((resolve) => { waiter = { need: n, resolve }; });
+}
+function send(bytes) { if (ws.readyState === WebSocket.OPEN) ws.send(bytes); }
+
+const u16 = (b, o) => (b[o] << 8) | b[o + 1];
+const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+const i32 = (b, o) => (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3];
+function putU16(b, o, v) { b[o] = v >> 8; b[o + 1] = v & 0xff; }
+function putI32(b, o, v) { b[o] = (v >> 24) & 0xff; b[o + 1] = (v >> 16) & 0xff;
+                           b[o + 2] = (v >> 8) & 0xff; b[o + 3] = v & 0xff; }
+
+// ------------------------------------------------------------------ session
+async function session() {
+  await recv(12);                                             // ServerVersion
+  send(new TextEncoder().encode("RFB 003.008\n"));
+
+  const count = (await recv(1))[0];
+  if (count === 0) {
+    const reason = await recv(u32(await recv(4), 0));
+    throw new Error(new TextDecoder().decode(reason));
+  }
+  const types = await recv(count);
+  if (!types.includes(1)) throw new Error("server does not offer None security");
+  send(new Uint8Array([1]));                                  // choose None
+  if (u32(await recv(4), 0) !== 0) throw new Error("security handshake rejected");
+
+  send(new Uint8Array([1]));                                  // ClientInit: shared
+  const init = await recv(24);                                // ServerInit
+  await recv(u32(init, 20));                                  // desktop name
+  resize(u16(init, 0), u16(init, 2));
+  clearStatus();
+  canvas.focus();
+
+  // Keep RFB connected for keyboard and pointer input in both modes.  A
+  // second WebSocket carries encoded H.264 when the browser and host support
+  // it; otherwise this same session falls back to ordinary Raw rectangles.
+  const enc = new Uint8Array(12);
+  enc[0] = 2; putU16(enc, 2, 2); putI32(enc, 4, -223); putI32(enc, 8, 0);
+  send(enc);
+
+  if ("VideoDecoder" in window) {
+    try {
+      await startVideo();
+      return;
+    } catch (e) {
+      console.info("encoded video unavailable; using Raw RFB", e);
+    }
+  }
+  startRaw();
+}
+
+function startRaw() {
+  if (rawStarted) return;
+  rawStarted = true;
+  if (videoSocket) { videoSocket.onclose = null; videoSocket.close(); }
+  if (decoder) { try { decoder.close(); } catch (_) {} decoder = null; }
+  rawLoop().catch((e) => setStatus(String(e && e.message || e), true));
+}
+
+async function rawLoop() {
+  requestUpdate(false);
+  for (;;) {
+    const type = (await recv(1))[0];
+    if (type !== 0) throw new Error("unexpected server message " + type);
+    await recv(1);                                            // padding
+    const rects = u16(await recv(2), 0);
+    for (let i = 0; i < rects; i++) {
+      const r = await recv(12);
+      const x = u16(r, 0), y = u16(r, 2), w = u16(r, 4), h = u16(r, 6);
+      const encoding = i32(r, 8);
+      if (encoding === 0) {
+        draw(x, y, w, h, await recv(w * h * 4));
+      } else if (encoding === -223) {
+        resize(w, h);                                         // DesktopSize
+      } else {
+        throw new Error("unsupported encoding " + encoding);
+      }
+    }
+    requestUpdate(true);
+  }
+}
+
+// H.264 access units arrive in Annex-B form, one per WebSocket message.  With
+// no AVCDecoderConfigurationRecord in `description`, WebCodecs interprets AVC
+// chunks as Annex-B, so SPS/PPS stay in-band and reconnects are self-contained.
+function startVideo() {
+  return new Promise((resolve, reject) => {
+    let configured = false, settled = false;
+    const url = (location.protocol === "https:" ? "wss://" : "ws://") +
+                location.host + "/video";
+    const vws = videoSocket = new WebSocket(url);
+    vws.binaryType = "arraybuffer";
+    const timer = setTimeout(() => fail(new Error("encoded video timed out")), 5000);
+
+    function fail(error) {
+      clearTimeout(timer);
+      if (!settled) { settled = true; reject(error); }
+      else if (videoStarted) startRaw();
+      try { vws.close(); } catch (_) {}
+    }
+
+    decoder = new VideoDecoder({
+      output: (frame) => {
+        resize(frame.displayWidth || frame.codedWidth, frame.displayHeight || frame.codedHeight);
+        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        frame.close();
+        clearStatus();
+        if (!settled) {
+          settled = true; videoStarted = true; clearTimeout(timer); resolve();
+        }
+      },
+      error: (e) => fail(e),
+    });
+
+    vws.onerror = () => fail(new Error("encoded video connection failed"));
+    vws.onclose = () => fail(new Error("encoded video disconnected"));
+    vws.onmessage = (event) => {
+      const bytes = new Uint8Array(event.data);
+      if (bytes.length === 12 && bytes[0] === 0) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        resize(view.getUint32(1), view.getUint32(5));
+        decoder.configure({
+          codec: "avc1.4D002A",
+          codedWidth: fbWidth,
+          codedHeight: fbHeight,
+          hardwareAcceleration: "prefer-hardware",
+          optimizeForLatency: true,
+        });
+        configured = true;
+        return;
+      }
+      if (!configured || bytes.length < 10 || (bytes[0] !== 1 && bytes[0] !== 2)) {
+        fail(new Error("invalid encoded video packet"));
+        return;
+      }
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const timestamp = Number(view.getBigUint64(1));
+      try {
+        decoder.decode(new EncodedVideoChunk({
+          type: bytes[0] === 1 ? "key" : "delta",
+          timestamp,
+          data: bytes.subarray(9),
+        }));
+      } catch (e) {
+        fail(e);
+      }
+    };
+  });
+}
+
+function resize(w, h) {
+  if (w === fbWidth && h === fbHeight) return;
+  fbWidth = w; fbHeight = h;
+  canvas.width = w; canvas.height = h;
+}
+
+// The server sends BGRX; canvas wants RGBA.
+function draw(x, y, w, h, pixels) {
+  const img = ctx.createImageData(w, h);
+  const out = img.data;
+  for (let i = 0; i < w * h; i++) {
+    const p = i * 4;
+    out[p] = pixels[p + 2];
+    out[p + 1] = pixels[p + 1];
+    out[p + 2] = pixels[p];
+    out[p + 3] = 255;
+  }
+  ctx.putImageData(img, x, y);
+}
+
+function requestUpdate(incremental) {
+  const m = new Uint8Array(10);
+  m[0] = 3; m[1] = incremental ? 1 : 0;
+  putU16(m, 6, fbWidth); putU16(m, 8, fbHeight);
+  send(m);
+}
+
+// -------------------------------------------------------------------- input
+function at(ev) {
+  const r = canvas.getBoundingClientRect();
+  const x = Math.round((ev.clientX - r.left) * fbWidth / r.width);
+  const y = Math.round((ev.clientY - r.top) * fbHeight / r.height);
+  const clamp = (v, hi) => Math.max(0, Math.min(hi - 1, v));
+  return [clamp(x, fbWidth), clamp(y, fbHeight)];
+}
+function sendPointer(mask, x, y) {
+  const m = new Uint8Array(6);
+  m[0] = 5; m[1] = mask; putU16(m, 2, x); putU16(m, 4, y);
+  send(m);
+}
+// DOM buttons are left=1, right=2, middle=4; RFB wants left, middle, right.
+function maskOf(ev) {
+  return (ev.buttons & 1 ? 1 : 0) | (ev.buttons & 4 ? 2 : 0) | (ev.buttons & 2 ? 4 : 0);
+}
+function onPointer(ev) {
+  if (!fbWidth) return;
+  buttonMask = maskOf(ev);
+  const [x, y] = at(ev);
+  sendPointer(buttonMask, x, y);
+}
+canvas.addEventListener("mousemove", onPointer);
+canvas.addEventListener("mousedown", (ev) => { canvas.focus(); onPointer(ev); });
+canvas.addEventListener("mouseup", onPointer);
+canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+canvas.addEventListener("wheel", (ev) => {
+  if (!fbWidth) return;
+  ev.preventDefault();
+  // Wheel notches are a press and release of bit 3 (up) or 4 (down).
+  const bit = ev.deltaY < 0 ? 8 : 16;
+  const [x, y] = at(ev);
+  sendPointer(buttonMask | bit, x, y);
+  sendPointer(buttonMask, x, y);
+}, { passive: false });
+
+const KEYSYMS = {
+  Backspace: 0xff08, Tab: 0xff09, Enter: 0xff0d, Escape: 0xff1b,
+  Insert: 0xff63, Delete: 0xffff, Home: 0xff50, End: 0xff57,
+  PageUp: 0xff55, PageDown: 0xff56, CapsLock: 0xffe5,
+  ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
+  Shift: 0xffe1, Control: 0xffe3, Alt: 0xffe9, Meta: 0xffeb,
+  F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2, F6: 0xffc3,
+  F7: 0xffc4, F8: 0xffc5, F9: 0xffc6, F10: 0xffc7, F11: 0xffc8, F12: 0xffc9,
+};
+function keysymOf(ev) {
+  if (KEYSYMS[ev.key] !== undefined) return KEYSYMS[ev.key];
+  // Latin-1 keysyms are the code point itself, which covers printable keys.
+  return ev.key.length === 1 ? ev.key.codePointAt(0) : null;
+}
+function sendKey(down, keysym) {
+  const m = new Uint8Array(8);
+  m[0] = 4; m[1] = down ? 1 : 0;
+  putI32(m, 4, keysym);
+  send(m);
+}
+for (const [type, down] of [["keydown", true], ["keyup", false]]) {
+  canvas.addEventListener(type, (ev) => {
+    // A held key repeats in the browser AND again in the guest, because the
+    // guest runs its own evdev auto-repeat. Forwarding the browser's repeats
+    // stacks the two, which doubles characters and makes a held backspace run
+    // away. Send the press once and let the guest repeat it.
+    if (ev.repeat) { ev.preventDefault(); return; }
+    const keysym = keysymOf(ev);
+    if (keysym === null) return;
+    ev.preventDefault();
+    sendKey(down, keysym);
+  });
+}
+</script>
+</body>
+</html>

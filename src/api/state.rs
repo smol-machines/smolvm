@@ -20,6 +20,33 @@ struct CpuSample {
     cpu_time_ns: u64,
 }
 
+/// Records whose disk state must survive startup reconciliation. A stopped or
+/// live clone keeps every ancestor in its qcow2 lineage alive even when an
+/// ancestor VMM process died; deleting that ancestor's data directory would
+/// silently break the child's backing chain.
+fn retained_fork_lineage(vms: &[(String, VmRecord)]) -> HashSet<String> {
+    let mut retained = vms
+        .iter()
+        .filter(|(_, record)| record.pid.is_none() || record.is_process_alive())
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+
+    loop {
+        let mut changed = false;
+        for (name, record) in vms {
+            if retained.contains(name) {
+                if let Some(parent) = &record.golden {
+                    changed |= retained.insert(parent.clone());
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    retained
+}
+
 /// Shared API server state.
 pub struct ApiState {
     /// Registry of machine managers by name.
@@ -139,6 +166,10 @@ pub struct MachineRegistration {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Whether ordinary starts should preserve file-backed, forkable RAM.
+    pub forkable: bool,
+    /// Whether image pull and init were already completed in captured state.
+    pub init_completed: bool,
     /// Whether to expose the guest Docker daemon socket to the host.
     pub docker_socket: bool,
     /// OCI image reference (e.g., "alpine:latest").
@@ -153,6 +184,10 @@ pub struct MachineRegistration {
     pub env: Vec<(String, String)>,
     /// Working directory (from manifest).
     pub workdir: Option<String>,
+    /// Container user captured with a live image workload.
+    pub user: Option<String>,
+    /// Persistent overlay identifier inherited by a restored image workload.
+    pub fork_overlay_owner: Option<String>,
     /// Secret refs to attach to this machine (from a Smolfile or
     /// `CreateMachineRequest.secrets`).
     pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
@@ -375,32 +410,58 @@ impl ApiState {
             }
         };
 
+        let retained_lineage = retained_fork_lineage(&vms);
         let mut loaded = Vec::new();
 
-        for (name, record) in vms {
+        for (name, mut record) in vms {
             // Only clean up machines that have a PID (were started) but whose
             // process is no longer alive.  Machines in "created" state (pid=None)
             // have never been started and must be preserved — they are valid
             // configs waiting for a start call.
             if record.pid.is_some() && !record.is_process_alive() {
-                tracing::info!(machine = %name, "cleaning up dead machine from database");
-                if let Err(e) = self.db.remove_vm(&name) {
-                    tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
-                }
-                // Reclaim the data dir too. Removing only the DB record leaks the
-                // machine's storage + overlay images (multi-GB sparse files) — and
-                // since the record is gone, nothing will ever clean them up later.
-                // On a long-lived node that churns/crashes machines this is a slow
-                // disk-fill across server restarts. The `pid.is_some()` guard above
-                // means we only touch machines that were started and then died, not
-                // intentionally-stopped (pid=None) machines whose disks must persist.
-                let dir = crate::agent::vm_data_dir(&name);
-                if dir.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&dir) {
-                        tracing::warn!(machine = %name, error = %e, "failed to remove dead machine data dir");
+                if retained_lineage.contains(&name) {
+                    tracing::warn!(
+                        machine = %name,
+                        "machine process died but a retained fork descendant still depends on its disks; preserving it as stopped"
+                    );
+                    record.pid = None;
+                    record.pid_start_time = None;
+                    record.state = RecordState::Stopped;
+                    match self.db.update_vm(&name, |stored| {
+                        stored.pid = None;
+                        stored.pid_start_time = None;
+                        stored.state = RecordState::Stopped;
+                    }) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            tracing::warn!(machine = %name, "fork ancestor disappeared during startup reconciliation");
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(machine = %name, error = %e, "failed to preserve dead fork ancestor; leaving its data untouched");
+                            continue;
+                        }
                     }
+                } else {
+                    tracing::info!(machine = %name, "cleaning up dead machine from database");
+                    if let Err(e) = self.db.remove_vm(&name) {
+                        tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
+                    }
+                    // Reclaim the data dir too. Removing only the DB record leaks the
+                    // machine's storage + overlay images (multi-GB sparse files) — and
+                    // since the record is gone, nothing will ever clean them up later.
+                    // On a long-lived node that churns/crashes machines this is a slow
+                    // disk-fill across server restarts. The `pid.is_some()` guard above
+                    // means we only touch machines that were started and then died, not
+                    // intentionally-stopped (pid=None) machines whose disks must persist.
+                    let dir = crate::agent::vm_data_dir(&name);
+                    if dir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&dir) {
+                            tracing::warn!(machine = %name, error = %e, "failed to remove dead machine data dir");
+                        }
+                    }
+                    continue;
                 }
-                continue;
             }
 
             // Convert VmRecord to MachineEntry
@@ -913,6 +974,8 @@ impl ApiState {
         // silently lost CUDA/GPU on restart).
         record.gpu = reg.resources.gpu;
         record.cuda = reg.resources.cuda.unwrap_or(false);
+        record.forkable = reg.forkable;
+        record.init_completed = reg.init_completed;
         record.docker_socket = reg.docker_socket;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
@@ -920,6 +983,8 @@ impl ApiState {
         record.cmd = reg.cmd;
         record.env = reg.env;
         record.workdir = reg.workdir;
+        record.user = reg.user;
+        record.fork_overlay_owner = reg.fork_overlay_owner;
         record.secret_refs = reg.secret_refs.clone();
         record.remote_volumes = reg.remote_volumes.clone();
         record
@@ -959,7 +1024,7 @@ impl ApiState {
                         network: reg.network,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: reg.source_smolmachine,
-                        forkable: false,
+                        forkable: reg.forkable,
                         cuda_fork_pool_size: None,
                         cuda_vram_limit_mib: None,
                         forkpoint_held: false,
@@ -1688,6 +1753,15 @@ mod tests {
         };
         assert!(!HostMount::try_from(&spec).unwrap().read_only);
 
+        // The trusted system-mount escape hatch is local-CLI-only. An HTTP
+        // caller cannot turn a read-only flag into access to the server host.
+        let system_spec = MountSpec {
+            source: "/etc".into(),
+            target: "/host/etc".into(),
+            readonly: true,
+        };
+        assert!(HostMount::try_from(&system_spec).is_err());
+
         // ResourceSpec with None uses defaults
         let spec = ResourceSpec {
             cpus: None,
@@ -1907,6 +1981,52 @@ mod tests {
         // Name should be available for reuse
         let token = SmolvmDb::create_reservation_token();
         assert!(state.reserve_machine_name("dead-machine", &token).is_ok());
+    }
+
+    #[test]
+    fn test_load_preserves_dead_ancestor_of_retained_clone() {
+        let (_dir, state) = temp_api_state();
+
+        let mut base = VmRecord::new("dead-base".into(), 1, 512, vec![], vec![], false);
+        base.pid = Some(i32::MAX);
+        base.state = RecordState::Running;
+        state.db.insert_vm("dead-base", &base).unwrap();
+        let base_dir = crate::agent::vm_data_dir("dead-base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(base_dir.join("storage.raw"), b"base").unwrap();
+
+        let mut child = VmRecord::new("retained-child".into(), 1, 512, vec![], vec![], false);
+        child.golden = Some("dead-base".to_string());
+        child.state = RecordState::Stopped;
+        state.db.insert_vm("retained-child", &child).unwrap();
+
+        let loaded = state.load_persisted_machines();
+        let preserved = state.db.get_vm("dead-base").unwrap().unwrap();
+        assert_eq!(preserved.state, RecordState::Stopped);
+        assert_eq!(preserved.pid, None);
+        assert_eq!(preserved.pid_start_time, None);
+        assert!(base_dir.join("storage.raw").is_file());
+        assert!(loaded.contains(&"dead-base".to_string()));
+        assert!(loaded.contains(&"retained-child".to_string()));
+    }
+
+    #[test]
+    fn test_load_removes_fully_dead_fork_lineage() {
+        let (_dir, state) = temp_api_state();
+        let mut base = VmRecord::new("dead-tree-base".into(), 1, 512, vec![], vec![], false);
+        base.pid = Some(i32::MAX);
+        base.state = RecordState::Running;
+        state.db.insert_vm("dead-tree-base", &base).unwrap();
+        let mut child = VmRecord::new("dead-tree-child".into(), 1, 512, vec![], vec![], false);
+        child.pid = Some(i32::MAX - 1);
+        child.state = RecordState::Running;
+        child.golden = Some("dead-tree-base".to_string());
+        state.db.insert_vm("dead-tree-child", &child).unwrap();
+
+        state.load_persisted_machines();
+
+        assert!(state.db.get_vm("dead-tree-base").unwrap().is_none());
+        assert!(state.db.get_vm("dead-tree-child").unwrap().is_none());
     }
 
     #[test]

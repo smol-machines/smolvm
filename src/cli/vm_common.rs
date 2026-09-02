@@ -78,12 +78,19 @@ pub fn ensure_running_and_connect(
         // so a typo in the name gives a clear error rather than the
         // generic "not running / use start" message.
         if let Some(ref n) = name {
-            let exists = SmolvmDb::open()
+            let record = SmolvmDb::open()
                 .ok()
-                .and_then(|db| db.get_vm(n).ok().flatten())
-                .is_some();
-            if !exists {
+                .and_then(|db| db.get_vm(n).ok().flatten());
+            let Some(record) = record else {
                 return Err(smolvm::Error::vm_not_found(n));
+            };
+            if smolvm::agent::state_probe::resolve_state(n, &record) == RecordState::Frozen {
+                return Err(smolvm::Error::agent(
+                    "connect",
+                    format!(
+                        "machine '{n}' is frozen as a reusable fork base; fork it again, or delete its descendants and stop it before restarting"
+                    ),
+                ));
             }
         }
 
@@ -171,6 +178,12 @@ fn mark_unreachable_if_zombie(name: &str) {
     }
     if !record.is_process_alive() {
         // PID dead → next list will see Stopped without our help.
+        return;
+    }
+    // A fork base is intentionally paused and cannot answer its agent socket.
+    // Treating that expected silence as a zombie corrupts the source record to
+    // Unreachable and makes later retained-checkpoint forks inherit bad state.
+    if smolvm::agent::state_probe::is_frozen_fork_base(name, record) {
         return;
     }
     // PID alive + ensure_running_and_connect failed → zombie. Persist
@@ -429,6 +442,8 @@ pub struct CreateVmParams {
     pub cpus: u8,
     pub mem: u32,
     pub volume: Vec<String>,
+    /// Permit selected protected host trees as explicit read-only `/host/*` mounts.
+    pub allow_system_mounts: bool,
     pub port: Vec<PortMapping>,
     pub net: bool,
     pub network_backend: Option<NetworkBackend>,
@@ -591,10 +606,11 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
 
     // Parse and validate volume mounts
-    let mounts: Vec<(String, String, bool)> = HostMount::parse(&host_volume_specs)?
-        .into_iter()
-        .map(|m| m.to_storage_tuple())
-        .collect();
+    let mounts: Vec<(String, String, bool)> =
+        HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?
+            .into_iter()
+            .map(|m| m.to_storage_tuple())
+            .collect();
     for volume in &remote_volumes {
         if mounts.iter().any(|(_, target, _)| target == &volume.target) {
             return Err(smolvm::Error::config(
@@ -762,6 +778,9 @@ pub struct ForkLaunch {
     pub pool_size: Option<u32>,
     /// Optional explicit logical VRAM limit per golden/clone session.
     pub vram_limit_mib: Option<u64>,
+    /// Leave a restored process registered but defer its Running transition so
+    /// a batch caller can publish all prepared clones atomically.
+    pub defer_running_persistence: bool,
 }
 
 /// Fork parameters for starting a machine as a forkable base (memfd RAM), so
@@ -775,6 +794,7 @@ pub fn forkable_launch() -> ForkLaunch {
         preload_modules: false,
         pool_size: None,
         vram_limit_mib: None,
+        defer_running_persistence: false,
     }
 }
 
@@ -821,7 +841,11 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
     // The launch-agnostic mechanics live in the lib (`agent::fork`) so the CLI
     // and the serve API share one implementation.
-    eprintln!("Freezing golden '{golden}' as fork base...");
+    if smolvm::agent::fork::fork_continue_enabled() {
+        eprintln!("Checkpointing '{golden}' while keeping it running...");
+    } else {
+        eprintln!("Freezing golden '{golden}' as fork base...");
+    }
     let prep = if options.hold {
         smolvm::agent::fork::prepare_held_fork(
             &db,
@@ -876,6 +900,8 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             "Forked '{golden}' -> held slot '{clone}'. Release it with \
              `smolvm machine fork-release --name {clone}`."
         );
+    } else if smolvm::agent::fork::fork_continue_enabled() {
+        eprintln!("Forked '{golden}' -> '{clone}'. Source continues running.");
     } else {
         eprintln!(
             "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \
@@ -931,10 +957,17 @@ pub fn fork_vm_batch(
             hold,
         })
         .collect();
-    eprintln!(
-        "Freezing golden '{golden}' once for {} clones...",
-        clones.len()
-    );
+    if smolvm::agent::fork::fork_continue_enabled() {
+        eprintln!(
+            "Checkpointing '{golden}' once for {} clones while keeping it running...",
+            clones.len()
+        );
+    } else {
+        eprintln!(
+            "Freezing golden '{golden}' once for {} clones...",
+            clones.len()
+        );
+    }
     let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs)?;
     let snapshot_dir = prepared[0].snapshot_dir.clone();
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
@@ -1016,23 +1049,16 @@ pub fn fork_vm_batch(
     }
 
     if first_error.is_none() {
-        for name in &all_names {
-            if let Err(error) = persist_batch_clone_running(&db, name) {
-                first_error = Some(error);
-                break;
-            }
+        if let Err(error) = persist_batch_clones_running(&db, &all_names) {
+            first_error = Some(error);
         }
     }
 
     if first_error.is_none() && wait_ready.is_some() && !hold {
-        for name in &all_names {
-            if let Err(error) = smolvm::agent::fork::release_forkpoint(name) {
-                first_error = Some(smolvm::Error::agent(
-                    "batch fork",
-                    format!("clone '{name}' release failed: {error}"),
-                ));
-                break;
-            }
+        if let Err(error) = run_bounded_clone_jobs(&all_names, width, |name| {
+            smolvm::agent::fork::release_forkpoint(name)
+        }) {
+            first_error = Some(error);
         }
     }
 
@@ -1135,6 +1161,7 @@ fn boot_prepared_fork(
                 snapshot_dir: Some(prep.snapshot_dir.clone()),
                 share_weights,
                 preload_modules,
+                defer_running_persistence: retry_gate.is_some(),
                 ..Default::default()
             },
         )
@@ -1197,29 +1224,121 @@ fn retain_failed_fork(
     snapshot_dir: &std::path::Path,
     error: smolvm::Error,
 ) -> smolvm::Result<()> {
+    let source_state = if snapshot_dir.join("source-continues-v1").is_file() {
+        "continues running"
+    } else {
+        "remains frozen"
+    };
     Err(smolvm::Error::agent(
         "fork clone boot",
         format!(
-            "{error}; source '{golden}' remains frozen at retained checkpoint {} so the fork can be retried safely",
+            "{error}; source '{golden}' {source_state} with retained checkpoint {} so the fork can be retried safely",
             snapshot_dir.display()
         ),
     ))
 }
 
-fn persist_batch_clone_running(db: &SmolvmDb, clone: &str) -> smolvm::Result<()> {
-    let manager = AgentManager::for_vm(clone)
-        .map_err(|error| smolvm::Error::agent("batch fork", error.to_string()))?;
-    let (pid, pid_start_time) = manager.pid_and_start_time().ok_or_else(|| {
-        smolvm::Error::agent(
-            "batch fork",
-            format!("clone '{clone}' has no running process after boot"),
-        )
-    })?;
-    db.update_vm(clone, |record| {
+fn persist_batch_clones_running(db: &SmolvmDb, clones: &[String]) -> smolvm::Result<()> {
+    let mut processes = std::collections::HashMap::with_capacity(clones.len());
+    for clone in clones {
+        let manager = AgentManager::for_vm(clone)
+            .map_err(|error| smolvm::Error::agent("batch fork", error.to_string()))?;
+        let identity = manager.pid_and_start_time().ok_or_else(|| {
+            smolvm::Error::agent(
+                "batch fork",
+                format!("clone '{clone}' has no running process after boot"),
+            )
+        })?;
+        processes.insert(clone.as_str(), identity);
+    }
+    db.update_vms(clones, |name, record| {
+        let (pid, pid_start_time) = processes[name];
         record.state = RecordState::Running;
         record.pid = Some(pid);
         record.pid_start_time = pid_start_time;
     })?;
+    Ok(())
+}
+
+/// Run one fail-closed batch phase with bounded concurrency. After the first
+/// failure no new job starts; already-running jobs finish so their agent
+/// connections are not abandoned midway through a protocol exchange.
+fn run_bounded_clone_jobs<F>(clones: &[String], parallel: usize, operation: F) -> smolvm::Result<()>
+where
+    F: Fn(&str) -> smolvm::Result<()> + Sync,
+{
+    if clones.is_empty() {
+        return Ok(());
+    }
+    let width = parallel.max(1).min(clones.len());
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
+        clones.iter().cloned().enumerate().collect::<Vec<_>>(),
+    ));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let results = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..width)
+            .map(|_| {
+                let queue = &queue;
+                let stop = &stop;
+                let operation = &operation;
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        let job = queue
+                            .lock()
+                            .expect("batch clone job queue poisoned")
+                            .pop_front();
+                        let Some((index, clone)) = job else {
+                            break;
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            operation(&clone)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(smolvm::Error::agent(
+                                "batch fork",
+                                format!("clone '{clone}' worker panicked"),
+                            ))
+                        });
+                        if result.is_err() {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        results.push((index, clone, result));
+                    }
+                    results
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(results) => results,
+                Err(_) => vec![(
+                    usize::MAX,
+                    "unknown".to_string(),
+                    Err(smolvm::Error::agent(
+                        "batch fork",
+                        "clone worker terminated unexpectedly",
+                    )),
+                )],
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut results = results;
+    results.sort_by_key(|(index, _, _)| *index);
+    if let Some((_, clone, error)) = results
+        .into_iter()
+        .find_map(|(index, clone, result)| result.err().map(|error| (index, clone, error)))
+    {
+        return Err(smolvm::Error::agent(
+            "batch fork",
+            format!("clone '{clone}' release failed: {error}"),
+        ));
+    }
     Ok(())
 }
 
@@ -1272,6 +1391,12 @@ fn start_vm_named_with_db(
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    // A durable checkpoint restores the already-running guest and workload just
+    // like an in-memory fork snapshot. Capture this before finalization consumes
+    // the one-shot payload, so the workload is not launched twice.
+    let restoring_checkpoint =
+        smolvm::portable_checkpoint::pending_dir(&smolvm::agent::vm_data_dir(name)).is_some();
+    let from_snapshot = from_snapshot || restoring_checkpoint;
     // A Smolfile-declared fork base starts forkable without requiring the user
     // to repeat `--forkable`. Older records that persisted a CUDA pool before
     // the explicit field existed get the same behavior, but clones remain
@@ -1420,7 +1545,11 @@ fn start_vm_named_with_db(
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
         // 0700 data dir.
-        uid_share_dir: record.golden.as_deref().map(smolvm::agent::vm_data_dir),
+        uid_share_dir: record
+            .fork_overlay_owner
+            .as_deref()
+            .or(record.golden.as_deref())
+            .map(smolvm::agent::vm_data_dir),
         ..Default::default()
     }
     .with_packed_layers(
@@ -1477,6 +1606,15 @@ fn start_vm_named_with_db(
     // image's filesystem (package managers, distro-specific paths)
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+
+    if restoring_checkpoint {
+        if let Err(error) = smolvm::portable_checkpoint::finalize_live_restore(name, &record)
+            .and_then(|()| smolvm::portable_checkpoint::consume(&smolvm::agent::vm_data_dir(name)))
+        {
+            let _ = manager.stop();
+            return Err(error);
+        }
+    }
 
     // Resolve secret refs to plaintext on the host and inject them only into
     // the env handed to guest commands (init + workload entrypoint). Only the
@@ -1619,15 +1757,17 @@ fn start_vm_named_with_db(
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     }
 
-    // Persist running state. The 15s busy_timeout handles SQLite contention
-    // from concurrent starts — no application-level retry needed.
-    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    if let Err(e) = db.update_vm(name, |r| {
-        r.state = RecordState::Running;
-        r.pid = pid;
-        r.pid_start_time = pid_start_time;
-    }) {
-        tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+    if !fork.defer_running_persistence {
+        // Persist running state. The 15s busy_timeout handles SQLite contention
+        // from concurrent starts — no application-level retry needed.
+        let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+        if let Err(e) = db.update_vm(name, |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+            r.pid_start_time = pid_start_time;
+        }) {
+            tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+        }
     }
 
     // Keep VM running (persistent)
@@ -1862,6 +2002,10 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
 /// Stop a named machine that has a config record (or fall back to
 /// agent-only stop if the name is not in config).
 pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
+    // Serialize against fork capture in this or another process. Stopping the
+    // VMM between snapshot preparation and clone registration can otherwise
+    // strand an ambiguous generation.
+    let _fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let mut config = SmolvmConfig::load()?;
 
     // Check config for the named VM
@@ -2324,6 +2468,11 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
         println!("Cleaning up data directory for vm: {}", name);
+        // A stopped/crashed live-fork source can still own raw-forked RAM
+        // guardians under its snapshot tree. Stop and authenticate those
+        // processes before removing their manifests; deleting the directory
+        // first loses the only safe PID/token identity and leaks the RAM.
+        smolvm::agent::cleanup_dead_vm_runtime(name)?;
         // Release this VM's per-VM uid (if any) before the dir holding its
         // `.vm-uid` record is removed. See process::free_vm_uid.
         smolvm::process::free_vm_uid(&smolvm::agent::vm_uid_registry_dir(), &data_dir);
@@ -2852,6 +3001,47 @@ mod init_runner_tests {
     use super::*;
 
     #[test]
+    fn bounded_clone_jobs_run_every_successful_job() {
+        let names: Vec<_> = (0..16).map(|index| format!("clone-{index}")).collect();
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+
+        run_bounded_clone_jobs(&names, 4, |_| {
+            let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 16);
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 4);
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn bounded_clone_jobs_stop_queued_work_after_failure() {
+        let names = ["bad", "must-not-run"].map(str::to_string);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let error = run_bounded_clone_jobs(&names, 1, |name| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if name == "bad" {
+                Err(smolvm::Error::agent("injected", "release failed"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("the batch must fail closed");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("clone 'bad' release failed"));
+    }
+
+    #[test]
     fn batch_boot_retry_is_skipped_after_success() {
         let gate = std::sync::Mutex::new(());
         let mut attempts = 0;
@@ -3342,6 +3532,27 @@ mod delete_lineage_tests {
         assert!(checkpoint.exists(), "the retry checkpoint must survive");
         assert!(error.to_string().contains("remains frozen"));
         assert!(error.to_string().contains("retried safely"));
+    }
+
+    #[test]
+    fn failed_fork_continue_boot_reports_that_source_is_running() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("checkpoint.bin"), b"checkpoint").unwrap();
+        std::fs::write(
+            temp.path().join("source-continues-v1"),
+            b"source-continues-v1\n",
+        )
+        .unwrap();
+
+        let error = retain_failed_fork(
+            "root",
+            temp.path(),
+            smolvm::Error::agent("clone boot", "injected failure"),
+        )
+        .expect_err("the original boot failure must be returned");
+
+        assert!(error.to_string().contains("continues running"));
+        assert!(!error.to_string().contains("remains frozen"));
     }
 }
 

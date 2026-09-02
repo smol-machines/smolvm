@@ -87,14 +87,17 @@ pub fn launch_image_workload(
     // first instruction and its command is never rewritten.
     let _ticker =
         WaitTicker::start("preparing the workload (a first start unpacks the machine image)");
-    match client.run_container_detached(
-        RunConfig::new(image, command)
-            .with_workdir(record.workdir.clone())
-            .with_user(record.user.clone())
-            .with_mounts(record_mounts_to_bindings(&record.mounts))
-            .in_machine(record, machine_name, &exec_env)
-            .with_env(exec_env),
-    ) {
+    let launch = |client: &mut AgentClient| {
+        client.run_container_detached(
+            RunConfig::new(image, command.clone())
+                .with_workdir(record.workdir.clone())
+                .with_user(record.user.clone())
+                .with_mounts(record_mounts_to_bindings(&record.mounts))
+                .in_machine(record, machine_name, &exec_env)
+                .with_env(exec_env.clone()),
+        )
+    };
+    match launch(client) {
         Ok(_) => Ok(true),
         Err(e) if is_missing_launch_metadata(&e.to_string()) => {
             tracing::info!(
@@ -103,6 +106,26 @@ pub fn launch_image_workload(
                 "image defines no entrypoint or cmd and none was given; booting bare agent without a workload"
             );
             Ok(false)
+        }
+        Err(e) if is_image_missing(&e.to_string()) => {
+            // The agent discards a cached image whose layers no longer verify
+            // — an unclean shutdown can leave a layer without its completion
+            // marker — and then reports the image as missing. It has no way to
+            // fetch a replacement on its own, so pull it again here and launch
+            // once more. Without this a machine whose host was killed mid-run
+            // stays permanently unstartable, reporting only "image not found"
+            // for an image it holds a record of.
+            tracing::info!(
+                machine = machine_name,
+                image = %image,
+                "cached image is no longer usable; pulling it again before launching"
+            );
+            client
+                .pull_with_registry_config(image)
+                .map_err(|e| crate::Error::agent("start background CMD", format!("{e}")))?;
+            launch(client)
+                .map(|_| true)
+                .map_err(|e| crate::Error::agent("start background CMD", format!("{e}")))
         }
         Err(e) => Err(crate::Error::agent("start background CMD", format!("{e}"))),
     }
@@ -114,6 +137,13 @@ pub fn launch_image_workload(
 /// on its side for this match — is the reliable signal.
 fn is_missing_launch_metadata(message: &str) -> bool {
     message.contains("defines no entrypoint or cmd")
+}
+
+/// Whether a detached-run failure means the guest no longer holds the image.
+/// Matched on the agent's message for the same reason as
+/// [`is_missing_launch_metadata`]: only the guest knows its image store.
+fn is_image_missing(message: &str) -> bool {
+    message.contains("image not found")
 }
 
 /// Progress heartbeat for a long workload launch.
@@ -191,6 +221,23 @@ impl Drop for WaitTicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An image the guest dropped (its layers stopped verifying after an
+    // unclean shutdown) must be recognised so the launcher re-pulls it
+    // instead of leaving the machine unstartable. The agent's own
+    // "defines no entrypoint or cmd" case must not be mistaken for it.
+    #[test]
+    fn missing_image_is_told_apart_from_a_commandless_image() {
+        assert!(is_image_missing(
+            "run container detached: image not found: docker.io/library/ubuntu:latest"
+        ));
+        assert!(!is_image_missing(
+            "run container detached: image defines no entrypoint or cmd"
+        ));
+        assert!(!is_missing_launch_metadata(
+            "run container detached: image not found: docker.io/library/ubuntu:latest"
+        ));
+    }
 
     // A plain machine's overlay is keyed by its own name; a fork clone's by
     // its golden's name, so clone execs land in the CoW-inherited overlay

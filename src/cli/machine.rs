@@ -18,7 +18,7 @@ use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
-use smolvm::data::network::PortMapping;
+use smolvm::data::network::{PortMapping, PortMappingSpec, MAX_PORT_MAPPINGS};
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
@@ -334,6 +334,9 @@ pub enum MachineCmd {
     /// Fork a running forkable machine into a new clone (CoW memory + disks)
     Fork(ForkCmd),
 
+    /// Save a running machine, including RAM, as a portable checkpoint
+    Checkpoint(super::pack::CheckpointCmd),
+
     /// Assign parameters and release one held fork-pool slot
     ForkRelease(ForkReleaseCmd),
 
@@ -410,6 +413,7 @@ impl MachineCmd {
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
+            MachineCmd::Checkpoint(cmd) => cmd.run(),
             MachineCmd::ForkRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -520,18 +524,29 @@ pub struct RunCmd {
     )]
     pub oci_platform: Option<String>,
 
-    /// Mount host directory into container (can be used multiple times)
+    /// Mount host directory into container (can be used multiple times). Also
+    /// accepts S3-compatible object storage, mounted inside the container:
+    /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
+    /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
+    /// for R2/MinIO; anonymous without them). Nothing is required of the
+    /// image: the agent performs the mount itself.
     #[arg(
         short = 'v',
         long = "volume",
-        value_name = "HOST:CONTAINER[:ro]",
+        value_name = "HOST|REMOTE:CONTAINER[:ro]",
         help_heading = "Container"
     )]
     pub volume: Vec<String>,
 
-    /// Expose port from container to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
-    pub port: Vec<PortMapping>,
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    /// This exposes sensitive host data to the guest and must not be used for
+    /// untrusted workloads.
+    #[arg(long, help_heading = "Container")]
+    pub allow_system_mounts: bool,
+
+    /// Expose port from container to host (single port or one-to-one range, repeatable)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]", help_heading = "Network")]
+    pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
     #[arg(long, help_heading = "Network")]
@@ -953,6 +968,9 @@ fn ensure_init_layer(
             create.push("-e".into());
             create.push(e.clone());
         }
+        if params.allow_system_mounts {
+            create.push("--allow-system-mounts".into());
+        }
         // Forward the run's network config so the bake's one-time in-guest pull can
         // reach the registry. The cached artifact carries the layers, so later runs
         // from it need no network to source the image.
@@ -1066,6 +1084,8 @@ impl RunCmd {
         // flags pass through. Flags the sidecar runner can't honor are rejected
         // at parse time via `conflicts_with_all` on `from`.
         if let Some(from) = self.from {
+            let port = PortMappingSpec::expand_all(&self.port)
+                .map_err(|e| smolvm::Error::config("machine run ports", e))?;
             let mut env = self.env;
             if self.auto_graph {
                 smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
@@ -1079,7 +1099,8 @@ impl RunCmd {
                 workdir: self.workdir,
                 env,
                 volume: self.volume,
-                port: self.port,
+                allow_system_mounts: self.allow_system_mounts,
+                port: port.into_iter().map(PortMappingSpec::from).collect(),
                 net: self.net,
                 net_backend: self.net_backend,
                 cpus: (self.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(self.cpus),
@@ -1160,6 +1181,7 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -1215,7 +1237,13 @@ impl RunCmd {
                     workdir: params.workdir.clone(),
                     env: params.env.clone(),
                     volume: params.volume.clone(),
-                    port: params.port.clone(),
+                    allow_system_mounts: params.allow_system_mounts,
+                    port: params
+                        .port
+                        .iter()
+                        .copied()
+                        .map(PortMappingSpec::from)
+                        .collect(),
                     net: params.net,
                     net_backend: params.network_backend,
                     cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
@@ -1326,7 +1354,13 @@ impl RunCmd {
                 workdir: params.workdir.clone(),
                 env: params.env.clone(),
                 volume: params.volume.clone(),
-                port: params.port.clone(),
+                allow_system_mounts: params.allow_system_mounts,
+                port: params
+                    .port
+                    .iter()
+                    .copied()
+                    .map(PortMappingSpec::from)
+                    .collect(),
                 net: params.net,
                 net_backend: params.network_backend,
                 cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
@@ -1357,7 +1391,8 @@ impl RunCmd {
         // source as a missing directory.
         let (host_volume_specs, remote_volumes) =
             smolvm::remote_volume::split_specs(&params.volume)?;
-        let mut mounts = HostMount::parse(&host_volume_specs)?;
+        let mut mounts =
+            HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?;
         if !remote_volumes.is_empty() && !params.net {
             return Err(Error::config(
                 "machine run",
@@ -2297,6 +2332,30 @@ mod tests {
     }
 
     #[test]
+    fn create_accepts_port_ranges() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "range-test",
+            "--port",
+            "5173-5175:6173-6175",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+
+        assert_eq!(
+            PortMappingSpec::expand_all(&cmd.port).unwrap(),
+            vec![
+                PortMapping::new(5173, 6173),
+                PortMapping::new(5174, 6174),
+                PortMapping::new(5175, 6175),
+            ]
+        );
+    }
+
+    #[test]
     fn run_detach_accepts_name_flag() {
         let cli = TestMachineCli::parse_from([
             "machine", "run", "-d", "--name", "foo", "--image", "alpine",
@@ -3023,9 +3082,15 @@ pub struct CreateCmd {
     #[arg(short = 'v', long = "volume", value_name = "HOST|REMOTE:GUEST[:ro]")]
     pub volume: Vec<String>,
 
-    /// Expose port from VM to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
-    pub port: Vec<PortMapping>,
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    /// This exposes sensitive host data to the guest and must not be used for
+    /// untrusted workloads.
+    #[arg(long)]
+    pub allow_system_mounts: bool,
+
+    /// Expose port from VM to host (single port or one-to-one range, repeatable)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
     #[arg(long)]
@@ -3129,8 +3194,7 @@ pub struct CreateCmd {
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
 
-    /// Create machine from a packed .smolmachine artifact.
-    /// Uses pre-extracted layers instead of pulling from a registry.
+    /// Create from a `.smolmachine` pack or restore a `.smolcheckpoint`.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
 
@@ -3242,6 +3306,7 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+        params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -3323,6 +3388,36 @@ impl CreateCmd {
         // Read manifest from the sidecar to get image metadata.
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
+        let checkpoint = manifest.checkpoint.clone();
+        if let Some(ref checkpoint) = checkpoint {
+            smolvm::portable_checkpoint::validate_compatibility(checkpoint)?;
+            let topology_overridden = !self.volume.is_empty()
+                || !self.port.is_empty()
+                || self.net
+                || self.net_backend.is_some()
+                || self.dns.is_some()
+                || self.network_name.is_some()
+                || !self.allow_cidr.is_empty()
+                || !self.allow_host.is_empty()
+                || self.outbound_localhost_only
+                || self.gpu
+                || self.gpu_vram_mib.is_some()
+                || self.rosetta
+                || !self.expose_socket.is_empty()
+                || !self.mount_socket.is_empty()
+                || self.ssh_agent
+                || self.cuda
+                || self.auto_graph
+                || self.docker_socket
+                || self.storage.is_some()
+                || self.overlay.is_some();
+            if topology_overridden {
+                return Err(smolvm::Error::config(
+                    "create from .smolcheckpoint",
+                    "a live checkpoint must restore its captured CPU, memory, disk, and device topology; topology-changing create flags are not supported",
+                ));
+            }
+        }
 
         // Reject a cross-architecture artifact up front: a packed VM/image carries
         // native binaries and cannot boot under a different-arch guest kernel. Only
@@ -3346,7 +3441,8 @@ impl CreateCmd {
             overlay_logical_size: Option<u64>,
             storage_logical_size: Option<u64>,
         }
-        let vm_seed = if manifest.mode == smolvm_pack::format::PackMode::Vm {
+        let vm_seed = if checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm
+        {
             Some(VmModeSeed {
                 overlay_template: manifest
                     .assets
@@ -3391,6 +3487,17 @@ impl CreateCmd {
         } else {
             manifest.mem
         };
+        if let Some(ref checkpoint) = checkpoint {
+            if cpus != checkpoint.cpus || mem != checkpoint.memory_mib {
+                return Err(smolvm::Error::config(
+                    "create from .smolcheckpoint",
+                    format!(
+                        "checkpoint requires {} vCPU(s) and {} MiB memory (requested {cpus} and {mem})",
+                        checkpoint.cpus, checkpoint.memory_mib
+                    ),
+                ));
+            }
+        }
 
         let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr.clone(),
@@ -3404,6 +3511,18 @@ impl CreateCmd {
             cli_network,
             cli_dns_filter_hosts,
         );
+        let checkpoint_network = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.network.as_ref());
+        let network = checkpoint_network
+            .map(|captured| captured.enabled)
+            .unwrap_or(network);
+        let allowed_cidrs = checkpoint_network
+            .and_then(|captured| captured.allowed_cidrs.clone())
+            .or(allowed_cidrs);
+        let dns_filter_hosts = checkpoint_network
+            .and_then(|captured| captured.dns_filter_hosts.clone())
+            .or(dns_filter_hosts);
 
         // A .smolmachine is an untrusted, portable artifact: validate its secret
         // refs under the Untrusted scope, which rejects every source kind. A
@@ -3421,6 +3540,20 @@ impl CreateCmd {
             )?;
         }
 
+        let ports = if checkpoint.is_some() && self.port.is_empty() {
+            checkpoint_network
+                .into_iter()
+                .flat_map(|network| network.ports.iter())
+                .map(|port| PortMapping::new(port.host, port.guest))
+                .collect()
+        } else {
+            PortMappingSpec::expand_all(&self.port)
+                .map_err(|e| smolvm::Error::config("create from .smolmachine ports", e))?
+        };
+        let checkpoint_backend = match checkpoint.as_ref() {
+            Some(checkpoint) => smolvm::portable_checkpoint::restored_network_backend(checkpoint)?,
+            None => None,
+        };
         let params = vm_common::CreateVmParams {
             secret_refs: manifest.secret_refs,
             name,
@@ -3428,7 +3561,12 @@ impl CreateCmd {
             // label would make exec/start/re-pack treat it as a pullable image
             // (the /bin/sh-not-found bug). None routes every `image.is_some()`
             // consumer to VM behavior; provenance is in `source_smolmachine`.
-            image: if vm_seed.is_some() {
+            image: if let Some(workload) = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+            {
+                Some(workload.image.clone())
+            } else if vm_seed.is_some() || checkpoint.is_some() {
                 None
             } else {
                 Some(manifest.image)
@@ -3449,9 +3587,10 @@ impl CreateCmd {
             cpus,
             mem,
             volume: self.volume.clone(),
-            port: self.port.clone(),
+            allow_system_mounts: self.allow_system_mounts,
+            port: ports,
             net: network,
-            network_backend: self.net_backend,
+            network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
             network_name: self.network_name.clone(),
             init: self.init.clone(),
@@ -3464,12 +3603,31 @@ impl CreateCmd {
                 env
             },
             workdir: manifest.workdir,
-            storage_gb: self.storage,
-            overlay_gb: self.overlay,
+            storage_gb: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.storage_gib)
+                .or(self.storage),
+            overlay_gb: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.overlay_gib)
+                .or(self.overlay),
             allowed_cidrs,
-            restart_policy: None,
-            restart_max_retries: None,
-            restart_max_backoff_secs: None,
+            restart_policy: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .map(|workload| workload.restart_policy.parse())
+                .transpose()
+                .map_err(|error: String| {
+                    smolvm::Error::config("restore checkpoint restart policy", error)
+                })?,
+            restart_max_retries: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .map(|workload| workload.restart_max_retries),
+            restart_max_backoff_secs: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .map(|workload| workload.restart_max_backoff_secs),
             labels: smolvm::util::parse_labels(&self.labels)?,
             health_cmd: None,
             health_interval_secs: None,
@@ -3478,7 +3636,9 @@ impl CreateCmd {
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
             cuda: self.cuda || self.auto_graph,
-            forkable: false,
+            // A restored durable checkpoint remains eligible to become a new
+            // fork/checkpoint source without a topology-changing restart.
+            forkable: checkpoint.is_some(),
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
@@ -3487,7 +3647,13 @@ impl CreateCmd {
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
-            source_smolmachine: Some(canonical_path),
+            // A live checkpoint uses the pack only as a transport envelope.
+            // Its block devices and running guest state are restored from the
+            // checkpoint payload, so treating the artifact as an OCI-layer
+            // source would attach an extra virtiofs device and change the
+            // captured device topology. The payload is private to the machine
+            // after install and no longer depends on the original artifact.
+            source_smolmachine: checkpoint.is_none().then_some(canonical_path),
         };
 
         let resources = VmResources {
@@ -3512,7 +3678,21 @@ impl CreateCmd {
             params.port.len(),
         )?;
 
-        let record = vm_common::build_vm_record(&params)?;
+        let mut record = vm_common::build_vm_record(&params)?;
+        if checkpoint.is_some() {
+            // The restored RAM already contains the initialized guest and its
+            // running workload. Re-running image pull/init after resume would
+            // duplicate side effects and violate checkpoint semantics.
+            record.init_completed = true;
+            record.user = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .and_then(|workload| workload.user.clone());
+            record.fork_overlay_owner = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .map(|workload| workload.overlay_owner.clone());
+        }
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
 
         // Create the machine data dir while the DB reservation is held, then
@@ -3598,6 +3778,12 @@ impl CreateCmd {
                     },
                 )
                 .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
+            }
+
+            if let Some(ref checkpoint) = checkpoint {
+                let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
+                smolvm::portable_checkpoint::install(&pack_content_dir, &vm_data_dir, checkpoint)?;
+                smolvm::portable_checkpoint::discard_transport_pack(&vm_data_dir)?;
             }
 
             reservation.commit(&record)?;
@@ -3701,10 +3887,10 @@ impl StartCmd {
 
 /// Fork a running forkable machine into a new clone.
 ///
-/// Freezes the source (the "golden") via its control socket, copy-on-write
-/// clones its disks, and boots the new machine from the golden's in-memory
-/// snapshot instead of cold-booting — so the clone comes up already warm
-/// (same processes, same filesystem state), in well under a second.
+/// Captures the source (the "golden") through its control socket, copy-on-write
+/// clones its disks, and boots the new machine from the source's in-memory
+/// snapshot instead of cold-booting. Linux/x86_64 resumes the source after the
+/// boundary; other hosts retain it as the frozen copy-on-write base.
 ///
 /// The golden must have been started with `--forkable`.
 #[derive(Args, Debug)]
@@ -3759,10 +3945,10 @@ pub struct ForkCmd {
     #[arg(long, visible_alias = "checkpointable")]
     pub forkable: bool,
 
-    /// Pin the clone's inbound port forwards (repeatable). Without this, the
-    /// golden's forwards are remapped to freshly-allocated host ports.
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
-    pub port: Vec<PortMapping>,
+    /// Pin the clone's inbound port forwards (single port or one-to-one range, repeatable).
+    /// Without this, the golden's forwards are remapped to freshly-allocated host ports.
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]", help_heading = "Network")]
+    pub port: Vec<PortMappingSpec>,
 
     /// Share the golden's loaded CUDA weights with this clone instead of
     /// copying them — sibling clones then keep ONE copy of the base model in
@@ -3804,7 +3990,11 @@ pub struct ForkCmd {
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+        let ports: Vec<(u16, u16)> = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("fork ports", e))?
+            .into_iter()
+            .map(|port| port.to_tuple())
+            .collect();
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
@@ -4248,17 +4438,22 @@ pub struct UpdateCmd {
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     pub volume: Vec<String>,
 
+    /// Allow adding trusted read-only host `/etc` and `/var/log` mounts below
+    /// `/host`. This exposes sensitive host data to the guest.
+    #[arg(long)]
+    pub allow_system_mounts: bool,
+
     /// Remove volume mount (HOST:GUEST)
     #[arg(long, value_name = "HOST:GUEST")]
     pub remove_volume: Vec<String>,
 
-    /// Add port mapping (HOST:GUEST)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
-    pub port: Vec<PortMapping>,
+    /// Add port mapping or one-to-one range
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    pub port: Vec<PortMappingSpec>,
 
-    /// Remove port mapping (HOST:GUEST)
-    #[arg(long, value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
-    pub remove_port: Vec<PortMapping>,
+    /// Remove port mapping or one-to-one range
+    #[arg(long, value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    pub remove_port: Vec<PortMappingSpec>,
 
     /// Set vCPU count
     #[arg(long, value_name = "N")]
@@ -4360,28 +4555,37 @@ impl UpdateCmd {
 
         // Parse and validate new mounts (after state check so
         // "machine is running" takes priority over "directory not found")
-        let new_mounts = HostMount::parse(&self.volume)?;
+        let new_mounts =
+            HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
+        let add_ports = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("update ports", e))?;
+        let remove_ports = PortMappingSpec::expand_all(&self.remove_port)
+            .map_err(|e| smolvm::Error::config("update remove ports", e))?;
 
         // Validate no duplicate host ports after proposed changes
         {
             let mut final_ports: Vec<PortMapping> = record
                 .ports
                 .iter()
-                .filter(|&&(h, g)| {
-                    !self
-                        .remove_port
-                        .iter()
-                        .any(|rm| rm.host == h && rm.guest == g)
-                })
+                .filter(|&&(h, g)| !remove_ports.iter().any(|rm| rm.host == h && rm.guest == g))
                 .map(|&(h, g)| PortMapping::new(h, g))
                 .collect();
-            for p in &self.port {
+            for p in &add_ports {
                 if !final_ports
                     .iter()
                     .any(|existing| existing.host == p.host && existing.guest == p.guest)
                 {
                     final_ports.push(*p);
                 }
+            }
+            if final_ports.len() > MAX_PORT_MAPPINGS {
+                return Err(smolvm::Error::config(
+                    "update",
+                    format!(
+                        "port mappings expand to {} entries; the maximum per machine is {MAX_PORT_MAPPINGS}",
+                        final_ports.len()
+                    ),
+                ));
             }
             PortMapping::check_duplicates(&final_ports)
                 .map_err(|e| smolvm::Error::config("update", e))?;
@@ -4485,14 +4689,14 @@ impl UpdateCmd {
             }
 
             // Ports: add new, remove specified
-            for rm in &self.remove_port {
+            for rm in &remove_ports {
                 let before = r.ports.len();
                 r.ports.retain(|&(h, g)| h != rm.host || g != rm.guest);
                 if r.ports.len() < before {
                     changes.push(format!("  removed port: {}:{}", rm.host, rm.guest));
                 }
             }
-            for p in &self.port {
+            for p in &add_ports {
                 let tuple = p.to_tuple();
                 if !r.ports.contains(&tuple) {
                     changes.push(format!("  added port: {}:{}", tuple.0, tuple.1));

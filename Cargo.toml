@@ -21,7 +21,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.13.0"
+version = "1.13.1"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
@@ -60,6 +60,7 @@ libloading = "0.8"
 # on Windows 10 1809+. See src/platform/uds.rs.
 socket2 = "0.6"
 dirs = "5"
+sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 getrandom = "0.3"
@@ -76,6 +77,8 @@ base64 = { workspace = true }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 humantime = "2"
 tempfile = "3"
+# Inspect and safely rebase qcow2 backing chains in portable checkpoints.
+imago = { version = "0.2.3", features = ["sync-wrappers"] }
 
 # HTTP API server
 tokio = { version = "1", features = ["full"] }
