@@ -14,6 +14,7 @@ mod launcher;
 pub mod launcher_dynamic;
 mod manager;
 pub mod pod_net;
+pub mod rootfs;
 pub mod state_probe;
 pub mod terminal;
 #[cfg(unix)]

@@ -937,36 +937,9 @@ impl PackCreateCmd {
     /// `target/agent-rootfs` is NOT checked — it can contain stale builds.
     /// Use `--rootfs-dir` or `SMOLVM_AGENT_ROOTFS` env var to override.
     fn find_rootfs_dir(&self) -> smolvm::Result<PathBuf> {
-        if let Some(ref dir) = self.rootfs_dir {
-            return Ok(dir.clone());
-        }
-
-        let candidates = [
-            // SMOLVM_AGENT_ROOTFS env var
-            std::env::var("SMOLVM_AGENT_ROOTFS").ok().map(PathBuf::from),
-            // Installed location (canonical)
-            dirs::data_dir().map(|d| d.join("smolvm/agent-rootfs")),
-            // Next to the executable (for distribution tarballs)
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("agent-rootfs"))),
-        ];
-
-        for candidate in candidates.into_iter().flatten() {
-            // Use symlink_metadata instead of exists() because sbin/init
-            // is a symlink to a guest-only path (/usr/local/bin/smolvm-agent)
-            // that doesn't exist on the host. exists() follows symlinks and
-            // returns false for broken symlinks.
-            if std::fs::symlink_metadata(candidate.join("sbin/init")).is_ok() {
-                debug!(rootfs_dir = %candidate.display(), "found agent rootfs");
-                return Ok(candidate);
-            }
-        }
-
-        Err(Error::agent(
-            "find agent rootfs",
-            "could not find agent rootfs. Use --rootfs-dir to specify the location.",
-        ))
+        // The same search `machine start` uses, so the agent packed here is the
+        // one the machine was running.
+        smolvm::agent::rootfs::resolve(self.rootfs_dir.as_deref())
     }
 
     /// Find the smolvm binary to embed as the packed runtime.
