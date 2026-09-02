@@ -24,7 +24,7 @@ Install
 # install (macOS + Linux)
 curl -sSL https://smolmachines.com/install.sh | bash
 
-# for coding agents — install + discover all commands
+# for coding agents: install + discover all commands
 curl -sSL https://smolmachines.com/install.sh | bash && smolvm --help
 ```
 
@@ -47,7 +47,7 @@ smolvm machine run --net -it --image alpine -- /bin/sh
 Smolfile
 --------
 
-A Smolfile declares a machine in TOML — the equivalent of a `Dockerfile` or a
+A Smolfile declares a machine in TOML, the equivalent of a `Dockerfile` or a
 cloud-init file, but for a whole VM: image, resources, network policy, mounts,
 ports, and setup commands in one checked-in file.
 
@@ -85,7 +85,7 @@ Common keys: `image`, `cpus`, `memory`, `net`, `ports`, `volumes`, `env`,
 ### Snapshot a machine into a reusable image
 
 You don't need a Dockerfile to keep an environment. Set a machine up however you
-like — by hand, or from a Smolfile — then pack the stopped machine into a
+like (by hand, or from a Smolfile), then pack the stopped machine into a
 `.smolmachine` artifact and push it to any OCI registry:
 
 ```bash
@@ -106,30 +106,30 @@ Working Smolfiles: [python](https://github.com/smol-machines/smolvm/tree/main/ex
 Use This For
 ------------
 
-**Sandbox untrusted code** — run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
+**Sandbox untrusted code.** Run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
 
 ```bash
-# network is off by default — untrusted code can't phone home
+# network is off by default, so untrusted code can't phone home
 smolvm machine run --image alpine -- nslookup example.com
-# fails — no network access
+# fails: no network access
 
-# lock down egress — only allow specific hosts
+# lock down egress: only allow specific hosts
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://registry.npmjs.org
-# works — allowed host
+# works: allowed host
 
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://google.com
-# fails — not in allow list
+# fails: not in allow list
 ```
 
-**Pack into portable executables** — turn any workload into a self-contained binary. All dependencies are pre-baked — no install step, no runtime downloads, boots in <200ms.
+**Pack into portable executables.** Turn any workload into a self-contained binary. All dependencies are pre-baked, so there is no install step and no runtime downloads, and it boots in <200ms.
 
 ```bash
 smolvm pack create --image python:3.12-alpine -o ./python312
 ./python312 run -- python3 --version
-# Python 3.12.x — isolated, no pyenv/venv/conda needed
+# Python 3.12.x, isolated: no pyenv/venv/conda needed
 ```
 
-**Use local container images** — for CI, air-gapped hosts, and fast iteration. Feed `--image` a `docker save` / `podman save` archive, pipe one on stdin, or point it at an unpacked rootfs directory. Image work is delegated to your container tooling; smolvm just boots the result.
+**Use local container images** for CI, air-gapped hosts, and fast iteration. Feed `--image` a `docker save` / `podman save` archive, pipe one on stdin, or point it at an unpacked rootfs directory. Image work is delegated to your container tooling; smolvm just boots the result.
 
 ```bash
 # build locally, run in the VM with no push/pull
@@ -143,14 +143,14 @@ smolvm machine run --image ./myapp.tar -- ./app
 smolvm machine run --image ./rootfs/ -- ./app
 ```
 
-**Persistent machines for development** — create, stop, start. Installed packages survive restarts.
+**Persistent machines for development.** Create, stop, start. Installed packages survive restarts.
 
 ```bash
 smolvm machine create --net --name myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add sl
 smolvm machine exec --name myvm -it -- /bin/sh
-# inside: sl, ls, uname -a — type 'exit' to leave
+# inside: sl, ls, uname -a. Type 'exit' to leave
 smolvm machine stop --name myvm
 ```
 
@@ -175,7 +175,7 @@ smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh
 smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```
 
-**Declare environments in a file** — see [Smolfile](#smolfile) above for
+**Declare environments in a file.** See [Smolfile](#smolfile) above for
 reproducible machine config, and for snapshotting a configured machine into a
 reusable `.smolmachine` image without writing a Dockerfile.
 
@@ -184,9 +184,9 @@ How It Works
 
 Each workload runs in a hardware-virtualized VM with its own guest kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) is the VMM and [libkrunfw](https://github.com/smol-machines/libkrunfw) supplies the guest kernel. Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
 
-Images use the [OCI](https://opencontainers.org/) format — the same open standard Docker uses. Any image on Docker Hub, ghcr.io, or other OCI registries can be pulled and booted as a microVM. No Docker daemon required.
+Images use the [OCI](https://opencontainers.org/) format, the same open standard Docker uses. Any image on Docker Hub, ghcr.io, or other OCI registries can be pulled and booted as a microVM. No Docker daemon required.
 
-Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest automatically. vCPU threads sleep in the hypervisor when idle, so over-provisioning has near-zero cost. Override with `--cpus` and `--mem`.
+Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon, so the host only commits what the guest actually uses and reclaims the rest automatically. vCPU threads sleep in the hypervisor when idle, so over-provisioning has near-zero cost. Override with `--cpus` and `--mem`.
 
 Security Model
 --------------
@@ -231,7 +231,7 @@ Known Limitations
 -----------------
 
 * Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
-* Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace — your host directory is used instead.
+* Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace, so your host directory is used instead.
 * macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
@@ -248,16 +248,16 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 ### Host requirements
 
-**macOS** — virglrenderer and MoltenVK are bundled in the smolvm distribution. No extra installs needed.
+**macOS**: virglrenderer and MoltenVK are bundled in the smolvm distribution. No extra installs needed.
 
-**Linux** — virglrenderer and a host Vulkan driver must be installed from the system package manager:
+**Linux**: virglrenderer and a host Vulkan driver must be installed from the system package manager:
 
 | Distro | Packages |
 |--------|----------|
 | Alpine | `apk add virglrenderer mesa-vulkan-intel` (or `mesa-vulkan-ati` for AMD) |
 | Debian/Ubuntu | `apt install virglrenderer0 mesa-vulkan-drivers` |
 
-> virglrenderer depends on libEGL and libdrm from the host GPU driver stack — these are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
+> virglrenderer depends on libEGL and libdrm from the host GPU driver stack. These are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
 
 ### Usage
 
