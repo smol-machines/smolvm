@@ -460,7 +460,7 @@ mod mount_tests {
     #[test]
     fn container_injection_overlays_mount_socket_after_user_volume() {
         let mut spec = spec();
-        spec.add_bind_mount("/mnt/virtiofs/shared", "/run/control", false);
+        spec.add_bind_mount("/run/smolvm/virtiofs/shared", "/run/control", false);
         let volume_index = spec.mounts.len() - 1;
 
         inject_sockets_into_container(&mut spec, &[mount_sock(6100, "/run/control/engine.sock")]);

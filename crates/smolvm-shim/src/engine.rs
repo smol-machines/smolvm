@@ -54,7 +54,7 @@ const POD_SHARE_GUEST_PATH: &str = "/podshare";
 /// Where the agent's pod handlers resolve `PodCreate.rootfs_rel` from:
 /// `paths::VIRTIOFS_MOUNT_ROOT` + `pod::POD_SHARE_TAG` in smolvm-agent. Must
 /// stay in lockstep with those constants.
-const POD_SHARE_GUEST_MOUNT: &str = "/mnt/virtiofs/podshare";
+const POD_SHARE_GUEST_MOUNT: &str = "/run/smolvm/virtiofs/podshare";
 
 /// Default sandbox VM sizing until pod-overhead plumbing lands.
 const SANDBOX_CPUS: u8 = 2;
@@ -280,7 +280,7 @@ fn expect_ok(resp: AgentResponse, op: &str) -> Result<(), String> {
 }
 
 /// Mount the sandbox's shared virtiofs directory where the agent's pod
-/// handlers expect it: `/mnt/virtiofs/podshare` (the agent's
+/// handlers expect it: `/run/smolvm/virtiofs/podshare` (the agent's
 /// `paths::VIRTIOFS_MOUNT_ROOT` + `pod::POD_SHARE_TAG`).
 ///
 /// Two conventions are bridged here. The launcher tags virtiofs devices
