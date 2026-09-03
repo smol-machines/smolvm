@@ -2364,7 +2364,7 @@ fn ensure_fork_base_delete_is_safe(
 
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
-    let _fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
+    let fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let config = SmolvmConfig::load()?;
 
     // Check if exists
@@ -2487,6 +2487,20 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // orphaned by a crash/kill) now that this VM's data dir is gone, so the
     // rootfs doesn't accumulate stale markers (which also broke `pack create`).
     smolvm::agent::prune_orphaned_ready_markers();
+
+    // The fork-source lock is a *sibling* of the data dir, not a child, so the
+    // removal above cannot take it either -- see prune_orphaned_fork_source_locks
+    // for why it is placed there. Without this sweep a node accumulates one
+    // zero-byte lock per machine name it has ever forked.
+    //
+    // Release this delete's own guard first. The sweep only removes a lock it can
+    // take without blocking, and flock conflicts with the holding *process* even
+    // across a second descriptor -- so holding it here would veto the very file
+    // the sweep exists to remove. Everything the guard protects (the record and
+    // the data directory) is already gone, so a fork acquiring it now fails on a
+    // missing machine instead of racing us.
+    drop(fork_source_lock);
+    smolvm::agent::fork::prune_orphaned_fork_source_locks();
 
     println!("Deleted machine: {}", name);
     Ok(())

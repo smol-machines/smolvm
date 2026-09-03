@@ -111,6 +111,100 @@ fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
     }
 }
 
+/// Non-blocking [`lock_file_exclusive`]: fails immediately when the lock is held
+/// instead of waiting for it. Lets a cleanup sweep tell "no fork is running for
+/// this machine" from "one is in flight" without ever stalling behind a fork.
+#[cfg(unix)]
+fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The machine name a fork-source lock file belongs to, or `None` when the path
+/// is not one. The inverse of the name [`fork_source_lock_path`] builds.
+fn fork_source_lock_owner(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let source = file_name
+        .strip_prefix('.')?
+        .strip_suffix(".fork-operation.lock")?;
+    (!source.is_empty()).then(|| source.to_string())
+}
+
+/// Remove fork-source lock files whose machine no longer exists.
+///
+/// [`fork_source_lock_path`] deliberately puts the lock file *beside* the
+/// machine's data directory rather than inside it, so deleting a machine cannot
+/// unlink the inode a live fork holds and let the next fork create a fresh file
+/// and run in parallel with it. The cost of that choice is that removing the
+/// data directory no longer removes the lock, so a node that creates and deletes
+/// machines accumulates one zero-byte file per machine name, forever.
+///
+/// Sweeping is safe here only because both conditions must hold: the machine's
+/// data directory is gone, *and* the lock can be taken without blocking, which
+/// no in-flight fork or checkpoint would permit. A file failing either check is
+/// left for a later sweep rather than raced against.
+///
+/// Best-effort by design, like [`crate::agent::prune_orphaned_ready_markers`]:
+/// a lock this process cannot open or unlink is simply left in place.
+pub fn prune_orphaned_fork_source_locks() {
+    prune_orphaned_fork_source_locks_in(&crate::agent::vm_cache_root());
+}
+
+fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(vms_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(source) = fork_source_lock_owner(&path) else {
+            continue;
+        };
+        if vms_dir.join(crate::agent::vm_dir_hash(&source)).is_dir() {
+            continue;
+        }
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+            continue;
+        };
+        if try_lock_file_exclusive(&file).is_err() {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
 pub fn control_socket_path(name: &str) -> PathBuf {
     vm_data_dir(name).join("control.sock")
@@ -3102,6 +3196,99 @@ mod tests {
         drop(first);
         acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         waiter.join().unwrap();
+    }
+
+    /// A lock file names its machine, and the sweep must recover that name the
+    /// same way the path builds it -- including names containing dots, which the
+    /// `.<name>.fork-operation.lock` shape makes ambiguous to a naive split.
+    #[test]
+    fn a_lock_files_owner_round_trips_through_its_path() {
+        for source in ["golden", "worker.one", "a.b.c", "trailing.lock"] {
+            assert_eq!(
+                fork_source_lock_owner(&fork_source_lock_path(source)).as_deref(),
+                Some(source)
+            );
+        }
+        assert_eq!(fork_source_lock_owner(Path::new("/vms/notalock")), None);
+        assert_eq!(
+            fork_source_lock_owner(Path::new("/vms/.fork-operation.lock")),
+            None
+        );
+    }
+
+    /// The leak this sweep exists to stop: the lock outlives its machine because
+    /// it is deliberately a sibling of the data directory, so deleting the
+    /// machine never takes it.
+    #[test]
+    fn an_orphaned_lock_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".gone.fork-operation.lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(
+            !lock.exists(),
+            "a lock whose machine is gone must be removed"
+        );
+    }
+
+    /// A machine that still exists is still forkable, so its lock must survive.
+    /// The data directory is hash-named, so the sweep has to hash the recovered
+    /// name rather than look for a directory called after it.
+    #[test]
+    fn a_live_machines_lock_survives_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".alive.fork-operation.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::agent::vm_dir_hash("alive"))).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(lock.exists(), "a live machine's lock must not be swept");
+    }
+
+    /// The race the sibling placement exists to prevent: unlinking a lock that a
+    /// fork is holding would let the next fork create a fresh inode and run in
+    /// parallel. Holding it must therefore veto the sweep even when the machine
+    /// directory is already gone -- which is exactly the ordering a delete
+    /// racing an in-flight fork produces.
+    ///
+    /// Note this holds *within* one process too: flock conflicts with the holder
+    /// across a second descriptor, not just across processes. `delete_vm` takes
+    /// this same lock for its whole transaction, so it must drop the guard before
+    /// sweeping or it vetoes the very file it is trying to clean up.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_lock_is_never_swept_even_without_its_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".busy.fork-operation.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let held = ForkSourceLock::acquire_at(&lock).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(lock.exists(), "an in-flight fork's lock must not be swept");
+        drop(held);
+        prune_orphaned_fork_source_locks_in(dir.path());
+        assert!(!lock.exists(), "once released it is sweepable");
+    }
+
+    /// Unrelated files sharing the directory must be left alone -- the sweep
+    /// runs in the VM cache root, which holds every machine's data directory.
+    #[test]
+    fn the_sweep_touches_nothing_but_lock_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let bystanders = [".hidden", "machine-dir-ish", "name.lock", "_shared"];
+        for f in bystanders {
+            std::fs::write(dir.path().join(f), b"x").unwrap();
+        }
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        for f in bystanders {
+            assert!(dir.path().join(f).exists(), "{f} must survive the sweep");
+        }
     }
 
     #[test]
