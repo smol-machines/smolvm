@@ -597,32 +597,84 @@
  }
  
  static void
-@@ -112,6 +219,24 @@
-    struct vkr_device *dev = vkr_device_from_handle(args->device);
-    struct vn_device_proc_table *vk = &dev->proc_table;
+@@ -93,27 +200,74 @@
+                                          args->pSparseMemoryRequirements);
+ }
  
 +#ifdef __APPLE__
-+   /* Remember which image ends up in which allocation: a scanout read starts
-+    * from the resource, and the resource only knows its memory.
-+    */
-+   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
-+      struct vkr_image *img = vkr_image_from_handle(args->pBindInfos[i].image);
-+      struct vkr_device_memory *mem =
-+         vkr_device_memory_from_handle(args->pBindInfos[i].memory);
-+      if (img && mem) {
-+         if (img->bound_mem)
-+            list_del(&img->mem_head);
-+         img->bound_mem = mem;
-+         list_addtail(&img->mem_head, &mem->bound_images);
-+         mem->bound_image = img;
-+      }
-+   }
++/* Remember which image ends up in which allocation: a scanout read starts
++ * from the resource, and the resource only knows its memory. Recorded only
++ * after the bind really happened, under the scanout lock, so a read on the
++ * other thread never picks an image that is not backed yet.
++ */
++static void
++vkr_image_record_binding(struct vkr_context *ctx,
++                         struct vkr_image *img,
++                         struct vkr_device_memory *mem)
++{
++   if (!img || !mem)
++      return;
++   mtx_lock(&ctx->scanout_mutex);
++   if (img->bound_mem)
++      list_del(&img->mem_head);
++   img->bound_mem = mem;
++   list_addtail(&img->mem_head, &mem->bound_images);
++   mem->bound_image = img;
++   mtx_unlock(&ctx->scanout_mutex);
++}
 +#endif
 +
+ static void
+-vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
++vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkBindImageMemory *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
++#ifdef __APPLE__
++   struct vkr_image *img = vkr_image_from_handle(args->image);
++   struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
++#endif
+ 
+    vn_replace_vkBindImageMemory_args_handle(args);
+    args->ret =
+       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
++#ifdef __APPLE__
++   if (args->ret == VK_SUCCESS)
++      vkr_image_record_binding(dispatch->data, img, mem);
++#endif
+ }
+ 
+ static void
+-vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
++vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkBindImageMemory2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
++#ifdef __APPLE__
++   /* the bind infos carry host handles after vn_replace, so resolve first */
++   const uint32_t bind_count = args->bindInfoCount < 8 ? args->bindInfoCount : 8;
++   struct vkr_image *imgs[8];
++   struct vkr_device_memory *mems[8];
++   for (uint32_t i = 0; i < bind_count; i++) {
++      imgs[i] = vkr_image_from_handle(args->pBindInfos[i].image);
++      mems[i] = vkr_device_memory_from_handle(args->pBindInfos[i].memory);
++   }
++#endif
+ 
     vn_replace_vkBindImageMemory2_args_handle(args);
     args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
++#ifdef __APPLE__
++   if (args->ret == VK_SUCCESS) {
++      for (uint32_t i = 0; i < bind_count; i++)
++         vkr_image_record_binding(dispatch->data, imgs[i], mems[i]);
++   }
++#endif
  }
-@@ -124,6 +249,29 @@
+ 
+ static void
+@@ -124,6 +278,29 @@
     struct vkr_device *dev = vkr_device_from_handle(args->device);
     struct vn_device_proc_table *vk = &dev->proc_table;
  
@@ -652,7 +704,7 @@
     vn_replace_vkGetImageSubresourceLayout_args_handle(args);
     vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
                                   args->pLayout);
-@@ -134,12 +282,23 @@
+@@ -134,12 +311,23 @@
     UNUSED struct vn_dispatch_context *dispatch,
     struct vn_command_vkGetImageDrmFormatModifierPropertiesEXT *args)
  {
