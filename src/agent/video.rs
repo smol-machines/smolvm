@@ -434,6 +434,12 @@ fn feed_frames<W: Write>(
     // One duplicate after activity flushes the final changed frame; after
     // that an idle desktop sends no raw pixels at all.
     let mut needs_flush = true;
+    // Hardware encoders hold a few frames before emitting the first access
+    // unit, so an idle desktop would leave the viewer with nothing and the
+    // page would give up on video. Repeating the unchanged frame slowly
+    // keeps the pipeline primed for a few hundred bytes a second.
+    const IDLE_INTERVAL: Duration = Duration::from_secs(1);
+    let mut last_written = Instant::now();
     write_raw_frame(out, &frame)?;
     loop {
         next += interval;
@@ -456,9 +462,11 @@ fn feed_frames<W: Write>(
             generation = newer.generation;
             frame = newer;
             write_raw_frame(out, &frame)?;
+            last_written = Instant::now();
             needs_flush = true;
-        } else if needs_flush {
+        } else if needs_flush || last_written.elapsed() >= IDLE_INTERVAL {
             write_raw_frame(out, &frame)?;
+            last_written = Instant::now();
             needs_flush = false;
         }
     }

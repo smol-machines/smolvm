@@ -122,9 +122,11 @@ async function session() {
   if ("VideoDecoder" in window) {
     try {
       setEncodings([-313, -239, -223]);                       // pointer only, no pixels
-      await startVideo();
+      // The pointer and pushed updates start now, so the cursor is right
+      // even while the first encoded frame is still on its way.
       requestUpdate(false);
       updateLoop().catch((e) => setStatus(String(e && e.message || e), true));
+      await startVideo();
       return;
     } catch (e) {
       console.info("encoded video unavailable; using Raw RFB", e);
