@@ -237,17 +237,22 @@ function resize(w, h) {
 }
 
 // The server sends BGRX; canvas wants RGBA.
+// Reuse one ImageData per rectangle size and swizzle 32 bits at a time: a
+// fresh allocation and a per-byte copy for every rectangle at tens of MB/s
+// is what made the raw path stall the page and back up the socket.
+let drawImg = null, drawW = 0, drawH = 0;
 function draw(x, y, w, h, pixels) {
-  const img = ctx.createImageData(w, h);
-  const out = img.data;
-  for (let i = 0; i < w * h; i++) {
-    const p = i * 4;
-    out[p] = pixels[p + 2];
-    out[p + 1] = pixels[p + 1];
-    out[p + 2] = pixels[p];
-    out[p + 3] = 255;
+  if (!drawImg || drawW !== w || drawH !== h) {
+    drawImg = ctx.createImageData(w, h); drawW = w; drawH = h;
   }
-  ctx.putImageData(img, x, y);
+  if (pixels.byteOffset & 3) pixels = pixels.slice();          // Uint32 view needs alignment
+  const src = new Uint32Array(pixels.buffer, pixels.byteOffset, w * h);
+  const dst = new Uint32Array(drawImg.data.buffer);
+  for (let i = 0; i < src.length; i++) {
+    const v = src[i];                                            // little-endian B,G,R,X
+    dst[i] = 0xff000000 | ((v & 0xff) << 16) | (v & 0xff00) | ((v >>> 16) & 0xff);
+  }
+  ctx.putImageData(drawImg, x, y);
 }
 
 function requestUpdate(incremental) {
@@ -274,11 +279,25 @@ function sendPointer(mask, x, y) {
 function maskOf(ev) {
   return (ev.buttons & 1 ? 1 : 0) | (ev.buttons & 4 ? 2 : 0) | (ev.buttons & 2 ? 4 : 0);
 }
+// Motion is coalesced to one position per animation frame: forwarding every
+// mousemove event made the guest re-render (and the server re-encode) for each
+// one, hundreds of times a second. Button changes are sent at once.
+let pendingMove = null, moveScheduled = false;
+function flushMove() {
+  moveScheduled = false;
+  if (pendingMove) { sendPointer(pendingMove[0], pendingMove[1], pendingMove[2]); pendingMove = null; }
+}
 function onPointer(ev) {
   if (!fbWidth) return;
-  buttonMask = maskOf(ev);
+  const mask = maskOf(ev);
   const [x, y] = at(ev);
-  sendPointer(buttonMask, x, y);
+  if (ev.type !== "mousemove" || mask !== buttonMask) {
+    buttonMask = mask; pendingMove = null;
+    sendPointer(mask, x, y);
+    return;
+  }
+  pendingMove = [mask, x, y];
+  if (!moveScheduled) { moveScheduled = true; requestAnimationFrame(flushMove); }
 }
 canvas.addEventListener("mousemove", onPointer);
 canvas.addEventListener("mousedown", (ev) => { canvas.focus(); onPointer(ev); });

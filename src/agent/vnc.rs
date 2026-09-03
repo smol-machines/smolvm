@@ -712,41 +712,78 @@ fn send_frame_diff<S: Write>(
     fmt: &PixelFormat,
 ) -> std::io::Result<()> {
     const BAND_ROWS: usize = 16;
-    let row = frame.width as usize * 4;
+    const TILE_COLS: usize = 64;
+    let width = frame.width as usize;
     let height = frame.height as usize;
+    let row = width * 4;
 
-    // Dirty 16-row bands, with adjacent bands merged into one rectangle.
-    let mut rects: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0;
-    while start < height {
-        let rows = BAND_ROWS.min(height - start);
-        if bgrx[start * row..(start + rows) * row] != prev[start * row..(start + rows) * row] {
-            match rects.last_mut() {
-                Some(last) if last.0 + last.1 == start => last.1 += rows,
-                _ => rects.push((start, rows)),
+    // Dirty 64x16 tiles, merged horizontally within a band and then
+    // vertically across bands. Full-width bands made pointer-sized damage
+    // cost ~160 KB per frame at 1280 wide; a tile run costs a few KB.
+    struct Rect {
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    }
+    let mut rects: Vec<Rect> = Vec::new();
+    let mut y = 0;
+    while y < height {
+        let h = BAND_ROWS.min(height - y);
+        let mut x = 0;
+        while x < width {
+            let w = TILE_COLS.min(width - x);
+            let dirty = (y..y + h).any(|r| {
+                let a = r * row + x * 4;
+                bgrx[a..a + w * 4] != prev[a..a + w * 4]
+            });
+            if dirty {
+                match rects.last_mut() {
+                    Some(last) if last.y == y && last.x + last.w == x => last.w += w,
+                    _ => rects.push(Rect { x, y, w, h }),
+                }
             }
+            x += w;
         }
-        start += rows;
+        y += h;
+    }
+    // Merge a rect with the one directly above it when they span the same
+    // columns, so a scrolling window is still one rectangle, not sixteen.
+    let mut merged: Vec<Rect> = Vec::new();
+    for r in rects {
+        match merged
+            .iter_mut()
+            .rev()
+            .find(|m| m.x == r.x && m.w == r.w && m.y + m.h == r.y)
+        {
+            Some(m) => m.h += r.h,
+            None => merged.push(r),
+        }
     }
 
-    if rects.is_empty() {
+    if merged.is_empty() {
         // The frame generation moved but the pixels did not.
         return s.write_all(&[0u8, 0, 0, 0]);
     }
 
     let mut header = vec![0u8, 0];
-    header.extend_from_slice(&(rects.len() as u16).to_be_bytes());
+    header.extend_from_slice(&(merged.len() as u16).to_be_bytes());
     s.write_all(&header)?;
-    for (band_start, band_rows) in rects {
+    let mut pixels = Vec::new();
+    for r in merged {
         let mut rect = Vec::with_capacity(12);
-        rect.extend_from_slice(&0u16.to_be_bytes());
-        rect.extend_from_slice(&(band_start as u16).to_be_bytes());
-        rect.extend_from_slice(&(frame.width as u16).to_be_bytes());
-        rect.extend_from_slice(&(band_rows as u16).to_be_bytes());
+        rect.extend_from_slice(&(r.x as u16).to_be_bytes());
+        rect.extend_from_slice(&(r.y as u16).to_be_bytes());
+        rect.extend_from_slice(&(r.w as u16).to_be_bytes());
+        rect.extend_from_slice(&(r.h as u16).to_be_bytes());
         rect.extend_from_slice(&ENCODING_RAW.to_be_bytes());
         s.write_all(&rect)?;
-        let band = &bgrx[band_start * row..(band_start + band_rows) * row];
-        s.write_all(&encode_pixels(band, fmt))?;
+        pixels.clear();
+        for line in r.y..r.y + r.h {
+            let a = line * row + r.x * 4;
+            pixels.extend_from_slice(&bgrx[a..a + r.w * 4]);
+        }
+        s.write_all(&encode_pixels(&pixels, fmt))?;
     }
     Ok(())
 }
