@@ -462,6 +462,18 @@
     if (args->ret != VK_SUCCESS) {
        free(exts);
        free(dev);
+@@ -295,7 +350,11 @@
+    if (!dev)
+       return;
+ 
++   /* a device teardown frees every image and memory at once; no scanout
++    * read may be copying out of one meanwhile */
++   mtx_lock(&ctx->scanout_mutex);
+    vkr_device_destroy(ctx, dev);
++   mtx_unlock(&ctx->scanout_mutex);
+ }
+ 
+ static void
 --- a/src/venus/vkr_image.c
 +++ b/src/venus/vkr_image.c
 @@ -5,9 +5,51 @@
@@ -753,6 +765,18 @@
  };
  VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
  
+--- a/src/venus/vkr_instance.c
++++ b/src/venus/vkr_instance.c
+@@ -259,7 +259,9 @@
+       return;
+    }
+ 
++   mtx_lock(&ctx->scanout_mutex);
+    vkr_instance_destroy(ctx, instance);
++   mtx_unlock(&ctx->scanout_mutex);
+ }
+ 
+ void
 --- a/src/venus/vkr_physical_device.c
 +++ b/src/venus/vkr_physical_device.c
 @@ -3,6 +3,8 @@
