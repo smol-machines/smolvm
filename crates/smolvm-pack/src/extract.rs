@@ -265,6 +265,14 @@ fn how_host_unpack_loses_ownership() -> &'static str {
 /// staged tars leaves `/packed_layers` with nothing it can use and the machine
 /// dies with "no layer directories found in /packed_layers" — an error that
 /// describes the host's staging area and says nothing about the real mismatch.
+///
+/// Falling back to host extraction is therefore forced, and it carries a known,
+/// unfixable-in-place limitation: such a pack cannot reproduce the image's
+/// ownership. Unprivileged the owners follow the current user; as root they reach
+/// disk and are then mapped to the overflow uid by the count-1 idmapped mount.
+/// #1095 is fixed for packs at or above this version by staging, and only by
+/// re-packing below it — the extraction path warns and points at
+/// `docs/pack-layer-ownership.md`.
 const MIN_STAGED_LAYERS_VERSION: (u64, u64, u64) = (1, 8, 1);
 
 /// Whether the agent baked into a pack built by `version` can unpack staged
@@ -1524,7 +1532,10 @@ fn extract_sidecar_inner(
         eprintln!(
             "warning: this pack was built by smolvm {}, whose in-guest agent cannot unpack \
              staged layers; extracting them on the host instead.\n\
-             warning: {}. Re-pack with smolvm {}.{}.{} or later to restore it.",
+             warning: {}.\n\
+             warning: re-pack with smolvm {}.{}.{} or later to restore the image's \
+             ownership. A pack this old cannot carry it, so re-packing is the only fix \
+             -- see docs/pack-layer-ownership.md and smol-machines/smolvm#1095.",
             pack_version
                 .filter(|v| !v.is_empty())
                 .unwrap_or("an unknown version"),
