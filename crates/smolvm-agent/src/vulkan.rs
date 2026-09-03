@@ -23,6 +23,16 @@ const CONTAINER_BUNDLE_DIR: &str = "/opt/smolvm-vulkan";
 const DRIVER: &str = "libvulkan_virtio.so";
 /// The ICD manifest inside the bundle.
 const ICD_JSON: &str = "virtio_icd.json";
+/// The bundle keeps the Vulkan loader in its own subdirectory so an image that
+/// ships none can be pointed at the loader alone. Nothing else in the bundle
+/// may ever land on `LD_LIBRARY_PATH`: its libzstd, libexpat, libz and libdrm
+/// are older than any current distro's and would shadow them for every
+/// process in the container. The driver and its closure carry
+/// `RUNPATH=$ORIGIN` instead (scripts/fetch-vulkan-guest-driver.sh), so they
+/// resolve each other only when the driver itself is loaded.
+const LOADER_SUBDIR: &str = "loader";
+/// The loader's soname; its presence is what "the image has a loader" means.
+const LOADER: &str = "libvulkan.so.1";
 /// Request-level opt-out (set via `--env`).
 const OPT_OUT_ENV: &str = "SMOLVM_NO_VULKAN_INJECT";
 
@@ -78,23 +88,27 @@ fn inject_into_container_if(
         );
     }
 
-    // Loader fallback for images without libvulkan.so.1 — appended, so an
-    // image-provided loader earlier on the path still wins.
-    // 🔴 Only for images that ship no Vulkan loader of their own.
-    //
-    // Every LD_LIBRARY_PATH entry outranks the system paths, so exposing the
-    // whole bundle also shadows the libdrm and libexpat it carries -- against
-    // which the image's own Mesa was not built. Measured on Arch: with the
-    // bundle on the path, `eglInitialize` fails outright and every GL client in
-    // the container falls back to software. The injection meant to add Vulkan
-    // was silently removing OpenGL.
-    //
-    // The bundled driver resolves its dependencies from any normal image
-    // (verified: Venus enumerates with LD_LIBRARY_PATH unset), so the path is
-    // only needed when there is no loader to resolve against.
-    if !image_has_vulkan_loader(rootfs) {
-        append_ld_library_path(&mut spec.process.env, CONTAINER_BUNDLE_DIR);
+    // Loader fallback for images without libvulkan.so.1: only the loader's own
+    // directory, appended so an image-provided one earlier on the path still
+    // wins. The driver never needs the path -- the manifest names it by
+    // absolute path and its closure resolves via RUNPATH -- and exposing the
+    // whole bundle shadowed the image's libzstd, libexpat, libz and libdrm for
+    // every process (tar --zstd, pacman hooks and python's expat all broke,
+    // and eglInitialize failed so GL fell back to software).
+    if !image_has_vulkan_loader(rootfs) && bundle_has_loader(bundle_dir) {
+        append_ld_library_path(&mut spec.process.env, &container_loader_dir());
     }
+}
+/// `CONTAINER_BUNDLE_DIR/loader` -- where the bundle's loader is inside the
+/// container.
+fn container_loader_dir() -> String {
+    format!("{CONTAINER_BUNDLE_DIR}/{LOADER_SUBDIR}")
+}
+/// Does the bundle (seen from the agent or from inside the container) carry
+/// the loader in its own directory? Older bundles kept it flat; those are
+/// never exposed, since the flat layout is exactly what shadowed the image.
+fn bundle_has_loader(bundle_dir: &std::path::Path) -> bool {
+    bundle_dir.join(LOADER_SUBDIR).join(LOADER).is_file()
 }
 
 /// Append the Vulkan loader pin (and the bundle's loader path) to an explicit
@@ -150,16 +164,20 @@ fn augment_exec_env_in(
             format!("{}/{}", CONTAINER_BUNDLE_DIR, ICD_JSON),
         ));
     }
-    match env.iter_mut().find(|(k, _)| k == "LD_LIBRARY_PATH") {
-        Some((_, v)) => {
-            if !v.split(':').any(|p| p == CONTAINER_BUNDLE_DIR) {
-                *v = format!("{v}:{CONTAINER_BUNDLE_DIR}");
+    // Same rule as the inject path, judged against the container as it is
+    // now rather than the image it was created from: once the workload has
+    // installed a loader of its own, execs stop pointing at ours.
+    let mounted_bundle = root.join(CONTAINER_BUNDLE_DIR.trim_start_matches('/'));
+    if !image_has_vulkan_loader(root) && bundle_has_loader(&mounted_bundle) {
+        let loader_dir = container_loader_dir();
+        match env.iter_mut().find(|(k, _)| k == "LD_LIBRARY_PATH") {
+            Some((_, v)) => {
+                if !v.split(':').any(|p| p == loader_dir) {
+                    *v = format!("{v}:{loader_dir}");
+                }
             }
+            None => env.push(("LD_LIBRARY_PATH".to_string(), loader_dir)),
         }
-        None => env.push((
-            "LD_LIBRARY_PATH".to_string(),
-            CONTAINER_BUNDLE_DIR.to_string(),
-        )),
     }
     env
 }
@@ -196,7 +214,7 @@ fn image_has_vulkan_loader(rootfs: &std::path::Path) -> bool {
         "usr/lib/aarch64-linux-gnu",
     ]
     .iter()
-    .any(|dir| rootfs.join(dir).join("libvulkan.so.1").exists())
+    .any(|dir| rootfs.join(dir).join(LOADER).exists())
 }
 
 /// Append `dir` to the spec's `LD_LIBRARY_PATH`, preserving an image-provided
@@ -240,7 +258,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(DRIVER), b"").unwrap();
         std::fs::write(dir.path().join(ICD_JSON), b"{}").unwrap();
+        std::fs::create_dir(dir.path().join(LOADER_SUBDIR)).unwrap();
+        std::fs::write(dir.path().join(LOADER_SUBDIR).join(LOADER), b"").unwrap();
         dir
+    }
+    fn ld_library_path(s: &OciSpec) -> Option<String> {
+        s.process
+            .env
+            .iter()
+            .find_map(|e| e.strip_prefix("LD_LIBRARY_PATH=").map(str::to_string))
     }
 
     fn glibc_rootfs() -> tempfile::TempDir {
@@ -264,11 +290,34 @@ mod tests {
             .env
             .iter()
             .any(|e| e == "VK_DRIVER_FILES=/opt/smolvm-vulkan/virtio_icd.json"));
-        assert!(s
-            .process
-            .env
-            .iter()
-            .any(|e| e.starts_with("LD_LIBRARY_PATH=") && e.contains(CONTAINER_BUNDLE_DIR)));
+        // An image without a loader gets the loader's directory and nothing
+        // else: the bundle root on the path shadowed the image's own libraries.
+        assert_eq!(
+            ld_library_path(&s).as_deref(),
+            Some("/opt/smolvm-vulkan/loader")
+        );
+    }
+    #[test]
+    fn image_with_its_own_loader_gets_no_library_path() {
+        let bundle = bundle_fixture();
+        let rootfs = glibc_rootfs();
+        std::fs::create_dir_all(rootfs.path().join("usr/lib")).unwrap();
+        std::fs::write(rootfs.path().join("usr/lib").join(LOADER), b"").unwrap();
+        let mut s = spec();
+        inject_into_container_if(&mut s, rootfs.path(), true, bundle.path());
+        assert!(bundle_mounted(&s));
+        assert_eq!(ld_library_path(&s), None);
+    }
+    #[test]
+    fn flat_bundle_without_loader_dir_is_never_put_on_the_path() {
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::write(bundle.path().join(DRIVER), b"").unwrap();
+        std::fs::write(bundle.path().join(ICD_JSON), b"{}").unwrap();
+        let rootfs = glibc_rootfs();
+        let mut s = spec();
+        inject_into_container_if(&mut s, rootfs.path(), true, bundle.path());
+        assert!(bundle_mounted(&s));
+        assert_eq!(ld_library_path(&s), None);
     }
 
     #[test]
@@ -344,6 +393,8 @@ mod tests {
         std::fs::create_dir_all(&mounted).unwrap();
         std::fs::write(mounted.join(ICD_JSON), b"{}").unwrap();
         std::fs::write(mounted.join(DRIVER), b"").unwrap();
+        std::fs::create_dir(mounted.join(LOADER_SUBDIR)).unwrap();
+        std::fs::write(mounted.join(LOADER_SUBDIR).join(LOADER), b"").unwrap();
         dir
     }
 
@@ -359,7 +410,36 @@ mod tests {
             value(&env, "VK_DRIVER_FILES"),
             Some("/opt/smolvm-vulkan/virtio_icd.json")
         );
-        assert_eq!(value(&env, "LD_LIBRARY_PATH"), Some(CONTAINER_BUNDLE_DIR));
+        assert_eq!(
+            value(&env, "LD_LIBRARY_PATH"),
+            Some("/opt/smolvm-vulkan/loader")
+        );
+    }
+    /// A workload that installed its own loader after creation must not be
+    /// pointed at ours any more; the exec path judges the container as it is.
+    #[test]
+    fn exec_env_drops_the_loader_path_once_the_container_has_a_loader() {
+        let root = container_root_with_bundle();
+        std::fs::create_dir_all(root.path().join("usr/lib")).unwrap();
+        std::fs::write(root.path().join("usr/lib").join(LOADER), b"").unwrap();
+        let env = augment_exec_env_in(vec![], Some(root.path()));
+        assert_eq!(
+            value(&env, "VK_DRIVER_FILES"),
+            Some("/opt/smolvm-vulkan/virtio_icd.json")
+        );
+        assert_eq!(value(&env, "LD_LIBRARY_PATH"), None);
+    }
+    #[test]
+    fn exec_env_never_exposes_the_bundle_root() {
+        let root = container_root_with_bundle();
+        let env = augment_exec_env_in(
+            vec![("LD_LIBRARY_PATH".to_string(), "/app/lib".to_string())],
+            Some(root.path()),
+        );
+        assert_eq!(
+            value(&env, "LD_LIBRARY_PATH"),
+            Some("/app/lib:/opt/smolvm-vulkan/loader")
+        );
     }
 
     /// #1050: a musl image skips the mount on the inject path, so the exec path
@@ -401,7 +481,10 @@ mod tests {
         let env = augment_exec_env_in(chosen, Some(root.path()));
         assert!(value(&env, "VK_DRIVER_FILES").is_none());
         // The loader path is still added — only the driver pin defers.
-        assert_eq!(value(&env, "LD_LIBRARY_PATH"), Some(CONTAINER_BUNDLE_DIR));
+        assert_eq!(
+            value(&env, "LD_LIBRARY_PATH"),
+            Some("/opt/smolvm-vulkan/loader")
+        );
     }
 
     #[test]
@@ -413,12 +496,12 @@ mod tests {
         );
         assert_eq!(
             value(&env, "LD_LIBRARY_PATH"),
-            Some(format!("/usr/lib:{CONTAINER_BUNDLE_DIR}").as_str())
+            Some("/usr/lib:/opt/smolvm-vulkan/loader")
         );
         let twice = augment_exec_env_in(env, Some(root.path()));
         assert_eq!(
             value(&twice, "LD_LIBRARY_PATH"),
-            Some(format!("/usr/lib:{CONTAINER_BUNDLE_DIR}").as_str())
+            Some("/usr/lib:/opt/smolvm-vulkan/loader")
         );
     }
 

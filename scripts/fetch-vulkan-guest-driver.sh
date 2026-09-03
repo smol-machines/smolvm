@@ -19,8 +19,18 @@
 #
 # Usage: fetch-vulkan-guest-driver.sh <aarch64|x86_64> <output-dir>
 # The bundle lands in <output-dir>/ as flat lib*.so* files plus
-# virtio_icd.json (library_path pointing at the container mount path).
+# virtio_icd.json (library_path pointing at the container mount path), with
+# the Vulkan loader alone in <output-dir>/loader/.
 # Downloads are cached in .vulkan-rpm-cache/ next to the output dir.
+#
+# Nothing in the bundle may reach a workload through LD_LIBRARY_PATH: the
+# closure carries a libzstd, libexpat, libz and libdrm older than any current
+# distro's, and every LD_LIBRARY_PATH entry outranks the system paths, so
+# exposing the bundle that way shadowed them for every process in the
+# container (tar --zstd, pacman hooks and python's expat all broke). Instead
+# the driver and its closure get RUNPATH=$ORIGIN, so they resolve each other
+# from the bundle only when the driver itself is loaded, and the loader lives
+# in its own directory so an image without one can be pointed at exactly that.
 set -euo pipefail
 
 ARCH="${1:?arch (aarch64|x86_64)}"
@@ -99,15 +109,29 @@ for pin in "${PINS[@]}"; do
     extract_rpm "$f" "$WORK"
 done
 
+command -v patchelf &>/dev/null || {
+    echo "patchelf is required to make the bundle self-contained (brew install patchelf / apt-get install patchelf)" >&2
+    exit 1
+}
 # Flatten the shared libraries (preserving soname symlinks) into the bundle.
 # Only usr/lib64 matters; the rpms ship nothing else we need.
-rm -f "$OUT"/lib*.so* "$OUT"/virtio_icd.json
+rm -rf "$OUT"/lib*.so* "$OUT"/virtio_icd.json "$OUT"/loader
 cp -a "$WORK"/usr/lib64/lib*.so* "$OUT"/
+# The loader is the one library an image may legitimately lack; keep it apart
+# so the agent can expose it alone.
+mkdir -p "$OUT/loader"
+mv "$OUT"/libvulkan.so.1* "$OUT/loader/"
 # Drop the other mesa vulkan drivers and layers — Venus only, smaller bundle,
 # and no chance of the loader probing an ICD we didn't intend to ship.
 find "$OUT" -name 'libvulkan_*.so' ! -name 'libvulkan_virtio.so' -delete
 find "$OUT" -name 'libVkLayer_*.so' -delete
 find "$OUT" -name 'libpowervr_rogue.so' -delete
+# Self-contained resolution: each real library looks next to itself first.
+for lib in "$OUT"/lib*.so*; do
+    [[ -L "$lib" ]] && continue
+    patchelf --set-rpath '$ORIGIN' "$lib"
+done
+patchelf --print-rpath "$OUT/libvulkan_virtio.so" | grep -qx '$ORIGIN'
 
 # The ICD manifest is the rpm's own (correct api_version) with library_path
 # rewritten to the CONTAINER path the agent bind-mounts the bundle to
