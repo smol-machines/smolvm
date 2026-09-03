@@ -121,7 +121,7 @@ async function session() {
   // CSS cursor, so pointer motion never waits on a frame at all.
   if ("VideoDecoder" in window) {
     try {
-      setEncodings([-239, -223]);                             // pointer only, no pixels
+      setEncodings([-313, -239, -223]);                       // pointer only, no pixels
       await startVideo();
       requestUpdate(false);
       updateLoop().catch((e) => setStatus(String(e && e.message || e), true));
@@ -145,7 +145,7 @@ function startRaw() {
   rawStarted = true;
   if (videoSocket) { videoSocket.onclose = null; videoSocket.close(); }
   if (decoder) { try { decoder.close(); } catch (_) {} decoder = null; }
-  setEncodings([-239, -223, 0]);
+  setEncodings([-313, -239, -223, 0]);
   requestUpdate(false);
   updateLoop().catch((e) => setStatus(String(e && e.message || e), true));
 }
@@ -173,12 +173,26 @@ function applyCursor(hotX, hotY, w, h, pixels, mask) {
   canvas.style.cursor = `url(${c.toDataURL()}) ${hotX} ${hotY}, default`;
 }
 
+// Ask the server to push updates as the display changes (RFB
+// ContinuousUpdates, -313) instead of answering one request at a time. The
+// server confirms support with an EndOfContinuousUpdates message.
+let continuous = false;
+function enableContinuousUpdates() {
+  const m = new Uint8Array(10);
+  m[0] = 150; m[1] = 1; putU16(m, 2, 0); putU16(m, 4, 0); putU16(m, 6, 0xffff); putU16(m, 8, 0xffff);
+  send(m);
+  continuous = true;
+}
 let loopRunning = false;
 async function updateLoop() {
   if (loopRunning) return;
   loopRunning = true;
   for (;;) {
     const type = (await recv(1))[0];
+    if (type === 150) {                                         // EndOfContinuousUpdates
+      if (!continuous) enableContinuousUpdates();
+      continue;
+    }
     if (type !== 0) throw new Error("unexpected server message " + type);
     await recv(1);                                            // padding
     const rects = u16(await recv(2), 0);
@@ -198,7 +212,7 @@ async function updateLoop() {
         throw new Error("unsupported encoding " + encoding);
       }
     }
-    requestUpdate(true);
+    if (!continuous) requestUpdate(true);
   }
 }
 

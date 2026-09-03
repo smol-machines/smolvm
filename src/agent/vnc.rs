@@ -20,6 +20,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +51,11 @@ const ENCODING_DESKTOP_SIZE: i32 = -223;
 /// The Cursor pseudo-encoding: the client draws the pointer itself from an
 /// image the server sends, so pointer motion costs no pixels at all.
 const ENCODING_CURSOR: i32 = -239;
+/// The ContinuousUpdates pseudo-encoding: once enabled, updates are pushed as
+/// the display changes instead of answering one request at a time.
+const ENCODING_CONTINUOUS_UPDATES: i32 = -313;
+const MSG_ENABLE_CONTINUOUS_UPDATES: u8 = 150;
+const MSG_END_OF_CONTINUOUS_UPDATES: u8 = 150;
 const ENCODING_RAW: i32 = 0;
 
 /// The pixel layout a client asked for. Defaults to what we natively hold, so
@@ -220,7 +227,8 @@ fn handle_connection(
     if speaks_http(&s) {
         serve_http(s, fb, input)
     } else {
-        handle_client(s, fb, input)
+        let writer = s.try_clone()?;
+        handle_client(s, writer, fb, input)
     }
 }
 
@@ -319,7 +327,8 @@ fn serve_http(
             return super::video::serve_browser(super::websocket::WsStream::new(s), fb);
         }
         tracing::info!("vnc browser client connected");
-        return handle_client(super::websocket::WsStream::new(s), fb, input);
+        let (reader, writer) = super::websocket::WsStream::new(s).split()?;
+        return handle_client(reader, writer, fb, input);
     }
 
     match request.path.as_str() {
@@ -407,21 +416,62 @@ fn respond<W: Write>(
 /// Drive one RFB session. Generic over the transport so the very same
 /// protocol code serves a native viewer on a raw socket and a browser over a
 /// WebSocket — the two differ only in how bytes are framed beneath this.
-fn handle_client<S: Read + Write>(
-    mut s: S,
+/// The write half of a client connection, which must also be able to close
+/// the whole connection so the reader thread unblocks when the session ends.
+trait CloseWrite: Write {
+    fn close(&self);
+}
+
+impl CloseWrite for TcpStream {
+    fn close(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl CloseWrite for super::websocket::WsWriter {
+    fn close(&self) {
+        self.close();
+    }
+}
+
+/// What the reader thread forwards to the update loop; keyboard and pointer
+/// events are injected by the reader itself and never wait on a frame.
+enum ClientMsg {
+    SetPixelFormat([u8; 16]),
+    SetEncodings(Vec<i32>),
+    UpdateRequest { incremental: bool },
+    ContinuousUpdates { enable: bool },
+}
+
+fn handle_client<R: Read + Send + 'static, W: CloseWrite>(
+    reader: R,
+    mut s: W,
     fb: Arc<DisplayFramebuffer>,
     input: Option<super::input::VncInput>,
 ) -> std::io::Result<()> {
+    let result = run_client(reader, &mut s, fb, input);
+    // Closing the connection is what unblocks the reader thread.
+    s.close();
+    result
+}
+
+fn run_client<R: Read + Send + 'static, W: Write>(
+    mut r: R,
+    s: &mut W,
+    fb: Arc<DisplayFramebuffer>,
+    input: Option<super::input::VncInput>,
+) -> std::io::Result<()> {
+    let mut s = s;
     // --- handshake -------------------------------------------------------
     s.write_all(RFB_VERSION)?;
     let mut version = [0u8; 12];
-    s.read_exact(&mut version)?;
+    r.read_exact(&mut version)?;
 
     // Offer only "None"; this port is expected to be bound to loopback or a
     // trusted interface by the caller.
     s.write_all(&[1, SECURITY_NONE])?;
     let mut chosen = [0u8; 1];
-    s.read_exact(&mut chosen)?;
+    r.read_exact(&mut chosen)?;
     if chosen[0] != SECURITY_NONE {
         // SecurityResult: failure, plus a reason string (3.8 requires one).
         let reason = b"only the None security type is offered";
@@ -434,7 +484,7 @@ fn handle_client<S: Read + Write>(
     s.write_all(&0u32.to_be_bytes())?; // SecurityResult: OK
 
     let mut shared = [0u8; 1];
-    s.read_exact(&mut shared)?; // ClientInit
+    r.read_exact(&mut shared)?; // ClientInit
 
     // Geometry has to be committed at ServerInit, before the guest may have
     // presented anything. Fall back to the configured display size so a client
@@ -445,7 +495,7 @@ fn handle_client<S: Read + Write>(
         .map(|f| (f.width, f.height))
         .unwrap_or((1280, 800));
 
-    let mut fmt = PixelFormat::bgrx();
+    let fmt = PixelFormat::bgrx();
     let name = b"smolvm";
     let mut init = Vec::with_capacity(32);
     init.extend_from_slice(&(width as u16).to_be_bytes());
@@ -461,17 +511,208 @@ fn handle_client<S: Read + Write>(
     let mut last_generation = 0u64;
     // BGRX pixels of the last frame this client was sent, for damage diffing.
     let mut last_sent: Option<Vec<u8>> = None;
-    let mut client_supports_resize = false;
-    // A client that lists the Cursor pseudo-encoding draws the pointer itself;
-    // any other client gets the pointer composited into the frames.
-    let mut client_supports_cursor = false;
-    // A client that lists no pixel encoding at all (only pseudo-encodings)
-    // is here for input and the pointer image, not for pixels.
-    let mut client_wants_pixels = true;
+    let mut fmt_state = ClientState {
+        fmt,
+        supports_resize: false,
+        supports_cursor: false,
+        wants_pixels: true,
+        pending: None,
+        continuous: false,
+    };
     let mut last_cursor_generation = 0u64;
     let mut last_cursor_image_generation = 0u64;
-    let mut last_button_mask = 0u8;
 
+    // The reader thread owns the socket's read half: input is injected the
+    // moment it arrives, and control messages reach this loop by channel, so
+    // waiting for a frame never delays a keystroke or a pointer move.
+    let size = Arc::new((AtomicU32::new(width), AtomicU32::new(height)));
+    let (tx, rx) = std::sync::mpsc::channel::<ClientMsg>();
+    {
+        let input = input.clone();
+        let size = Arc::clone(&size);
+        std::thread::Builder::new()
+            .name("smolvm-vnc-read".into())
+            .spawn(move || {
+                if let Err(e) = read_client_messages(&mut r, input, size, tx) {
+                    tracing::debug!(error = %e, "vnc reader ended");
+                }
+            })?;
+    }
+
+    loop {
+        // Everything the client has said so far, without blocking.
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => apply_client_msg(msg, &mut fmt_state, &mut s)?,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+        if fmt_state.pending.is_none() && !fmt_state.continuous {
+            // Nothing to send until the client asks (or enables pushing).
+            match rx.recv() {
+                Ok(msg) => {
+                    apply_client_msg(msg, &mut fmt_state, &mut s)?;
+                    continue;
+                }
+                Err(_) => return Ok(()),
+            }
+        }
+        let incremental = fmt_state.pending.unwrap_or(true);
+
+        let (new_frame, new_cursor) = if incremental {
+            fb.wait_for_change(last_generation, last_cursor_generation, UPDATE_WAIT)
+        } else {
+            (fb.latest(), Some(fb.cursor()))
+        };
+        let frame_changed = new_frame.is_some();
+        let cursor_changed = new_cursor.is_some();
+        if !frame_changed && !cursor_changed {
+            if fmt_state.pending.is_some() && !fmt_state.continuous {
+                // A request the classic way: answer promptly, even if with
+                // nothing, so the client's request loop keeps turning.
+                s.write_all(&[0u8, 0, 0, 0])?;
+                fmt_state.pending = None;
+            }
+            continue;
+        }
+        let cursor = new_cursor.unwrap_or_else(|| fb.cursor());
+
+        let mut rects: Vec<Vec<u8>> = Vec::new();
+        // A client that draws the pointer itself needs pixels only for a new
+        // frame; one that does not needs them whenever the pointer moved,
+        // because the pointer lives in the pixels.
+        let need_pixels = fmt_state.wants_pixels
+            && (frame_changed || (cursor_changed && !fmt_state.supports_cursor));
+        if need_pixels {
+            let Some(frame) = new_frame.clone().or_else(|| fb.latest()) else {
+                if !fmt_state.continuous {
+                    s.write_all(&[0u8, 0, 0, 0])?;
+                    fmt_state.pending = None;
+                }
+                continue;
+            };
+            if (frame.width, frame.height) != (width, height) {
+                width = frame.width;
+                height = frame.height;
+                size.0.store(width, Ordering::Relaxed);
+                size.1.store(height, Ordering::Relaxed);
+                if fmt_state.supports_resize {
+                    send_resize(&mut s, width, height)?;
+                } else {
+                    tracing::warn!(
+                        width,
+                        height,
+                        "guest changed mode but the vnc client cannot resize; \
+                         reconnect to pick up the new size"
+                    );
+                }
+                last_sent = None;
+            }
+            let mut bgrx = display::to_bgrx(&frame).into_owned();
+            if !fmt_state.supports_cursor {
+                composite_cursor(&mut bgrx, frame.width, frame.height, &cursor);
+            }
+            match last_sent.as_ref() {
+                Some(prev) if incremental && prev.len() == bgrx.len() => {
+                    rects.extend(frame_diff_rects(&frame, &bgrx, prev, &fmt_state.fmt));
+                }
+                _ => rects.push(frame_rect(&frame, &bgrx, &fmt_state.fmt)),
+            }
+            last_sent = Some(bgrx);
+            last_generation = frame.generation;
+        } else if let Some(frame) = new_frame.as_ref() {
+            last_generation = frame.generation;
+        }
+        if fmt_state.supports_cursor
+            && (cursor.image_generation != last_cursor_image_generation || !incremental)
+        {
+            rects.push(cursor_rect(&cursor, &fmt_state.fmt));
+            last_cursor_image_generation = cursor.image_generation;
+        }
+        if cursor_changed {
+            last_cursor_generation = cursor.generation;
+        }
+        if rects.is_empty() && fmt_state.continuous {
+            // A pointer move for a client drawing its own pointer: nothing
+            // to push.
+            continue;
+        }
+        write_update(&mut s, &rects)?;
+        fmt_state.pending = None;
+    }
+}
+
+/// Per-client negotiated state that client messages change.
+struct ClientState {
+    fmt: PixelFormat,
+    supports_resize: bool,
+    supports_cursor: bool,
+    /// A client that lists no pixel encoding at all (only pseudo-encodings)
+    /// is here for input and the pointer image, not for pixels.
+    wants_pixels: bool,
+    /// An unanswered FramebufferUpdateRequest, `Some(incremental)`.
+    pending: Option<bool>,
+    /// ContinuousUpdates is on: push as the display changes.
+    continuous: bool,
+}
+
+fn apply_client_msg<W: Write>(
+    msg: ClientMsg,
+    st: &mut ClientState,
+    s: &mut W,
+) -> std::io::Result<()> {
+    match msg {
+        ClientMsg::SetPixelFormat(pf) => {
+            let requested = PixelFormat::parse(&pf);
+            if requested.is_supported() {
+                st.fmt = requested;
+            } else {
+                // Keep our format rather than emit pixels the client will
+                // misread; say so, because wrong colours are otherwise a
+                // baffling symptom.
+                tracing::warn!(
+                    bpp = requested.bits_per_pixel,
+                    true_colour = requested.true_colour,
+                    "vnc client asked for an unsupported pixel format; \
+                     continuing with 32-bit true colour"
+                );
+            }
+        }
+        ClientMsg::SetEncodings(listed) => {
+            st.supports_resize = listed.contains(&ENCODING_DESKTOP_SIZE);
+            st.supports_cursor = listed.contains(&ENCODING_CURSOR);
+            // Raw is implicit for ordinary clients, so only a client that
+            // asked for the pointer and for no real encoding is pixel-free.
+            st.wants_pixels = listed.iter().any(|e| *e >= 0) || !st.supports_cursor;
+            if listed.contains(&ENCODING_CONTINUOUS_UPDATES) {
+                // Tells the client the extension is available.
+                s.write_all(&[MSG_END_OF_CONTINUOUS_UPDATES])?;
+            }
+        }
+        ClientMsg::UpdateRequest { incremental } => {
+            // A full request outranks a pending incremental one.
+            st.pending = Some(st.pending.unwrap_or(true) && incremental);
+        }
+        ClientMsg::ContinuousUpdates { enable } => {
+            st.continuous = enable;
+            if !enable {
+                s.write_all(&[MSG_END_OF_CONTINUOUS_UPDATES])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse client messages until the connection ends. Keyboard and pointer
+/// events go straight into the guest; the rest goes to the update loop.
+fn read_client_messages<R: Read>(
+    s: &mut R,
+    input: Option<super::input::VncInput>,
+    size: Arc<(AtomicU32, AtomicU32)>,
+    tx: Sender<ClientMsg>,
+) -> std::io::Result<()> {
+    let mut last_button_mask = 0u8;
     loop {
         let mut kind = [0u8; 1];
         if s.read_exact(&mut kind).is_err() {
@@ -484,19 +725,8 @@ fn handle_client<S: Read + Write>(
                 s.read_exact(&mut rest)?;
                 let mut pf = [0u8; 16];
                 pf.copy_from_slice(&rest[3..19]);
-                let requested = PixelFormat::parse(&pf);
-                if requested.is_supported() {
-                    fmt = requested;
-                } else {
-                    // Keep our format rather than emit pixels the client will
-                    // misread; say so, because wrong colours are otherwise a
-                    // baffling symptom.
-                    tracing::warn!(
-                        bpp = requested.bits_per_pixel,
-                        true_colour = requested.true_colour,
-                        "vnc client asked for an unsupported pixel format; \
-                         continuing with 32-bit true colour"
-                    );
+                if tx.send(ClientMsg::SetPixelFormat(pf)).is_err() {
+                    return Ok(());
                 }
             }
             2 => {
@@ -508,84 +738,27 @@ fn handle_client<S: Read + Write>(
                 s.read_exact(&mut encodings)?;
                 let (encodings, _) = encodings.as_chunks::<4>();
                 let listed: Vec<i32> = encodings.iter().map(|c| i32::from_be_bytes(*c)).collect();
-                client_supports_resize = listed.contains(&ENCODING_DESKTOP_SIZE);
-                client_supports_cursor = listed.contains(&ENCODING_CURSOR);
-                // Raw is implicit for ordinary clients, so only a client that
-                // asked for the pointer and for no real encoding is pixel-free.
-                client_wants_pixels = listed.iter().any(|e| *e >= 0) || !client_supports_cursor;
+                if tx.send(ClientMsg::SetEncodings(listed)).is_err() {
+                    return Ok(());
+                }
             }
             3 => {
                 // FramebufferUpdateRequest: incremental + x,y,w,h
                 let mut req = [0u8; 9];
                 s.read_exact(&mut req)?;
                 let incremental = req[0] != 0;
-
-                let (new_frame, new_cursor) = if incremental {
-                    fb.wait_for_change(last_generation, last_cursor_generation, UPDATE_WAIT)
-                } else {
-                    (fb.latest(), Some(fb.cursor()))
-                };
-                let frame_changed = new_frame.is_some();
-                let cursor_changed = new_cursor.is_some();
-                if !frame_changed && !cursor_changed {
-                    // Nothing new (or nothing presented yet): answer with an
-                    // empty update so the client stays in its request loop.
-                    s.write_all(&[0u8, 0, 0, 0])?;
-                    continue;
+                if tx.send(ClientMsg::UpdateRequest { incremental }).is_err() {
+                    return Ok(());
                 }
-                let cursor = new_cursor.unwrap_or_else(|| fb.cursor());
-
-                let mut rects: Vec<Vec<u8>> = Vec::new();
-                // A client that draws the pointer itself needs pixels only for
-                // a new frame; one that does not needs them whenever the
-                // pointer moved, because the pointer lives in the pixels.
-                let need_pixels = client_wants_pixels
-                    && (frame_changed || (cursor_changed && !client_supports_cursor));
-                if need_pixels {
-                    let Some(frame) = new_frame.clone().or_else(|| fb.latest()) else {
-                        s.write_all(&[0u8, 0, 0, 0])?;
-                        continue;
-                    };
-                    if (frame.width, frame.height) != (width, height) {
-                        width = frame.width;
-                        height = frame.height;
-                        if client_supports_resize {
-                            send_resize(&mut s, width, height)?;
-                        } else {
-                            tracing::warn!(
-                                width,
-                                height,
-                                "guest changed mode but the vnc client cannot resize; \
-                                 reconnect to pick up the new size"
-                            );
-                        }
-                        last_sent = None;
-                    }
-                    let mut bgrx = display::to_bgrx(&frame).into_owned();
-                    if !client_supports_cursor {
-                        composite_cursor(&mut bgrx, frame.width, frame.height, &cursor);
-                    }
-                    match last_sent.as_ref() {
-                        Some(prev) if incremental && prev.len() == bgrx.len() => {
-                            rects.extend(frame_diff_rects(&frame, &bgrx, prev, &fmt));
-                        }
-                        _ => rects.push(frame_rect(&frame, &bgrx, &fmt)),
-                    }
-                    last_sent = Some(bgrx);
-                    last_generation = frame.generation;
-                } else if let Some(frame) = new_frame.as_ref() {
-                    last_generation = frame.generation;
+            }
+            MSG_ENABLE_CONTINUOUS_UPDATES => {
+                // EnableContinuousUpdates: enable flag + x,y,w,h
+                let mut req = [0u8; 9];
+                s.read_exact(&mut req)?;
+                let enable = req[0] != 0;
+                if tx.send(ClientMsg::ContinuousUpdates { enable }).is_err() {
+                    return Ok(());
                 }
-                if client_supports_cursor
-                    && (cursor.image_generation != last_cursor_image_generation || !incremental)
-                {
-                    rects.push(cursor_rect(&cursor, &fmt));
-                    last_cursor_image_generation = cursor.image_generation;
-                }
-                if cursor_changed {
-                    last_cursor_generation = cursor.generation;
-                }
-                write_update(&mut s, &rects)?;
             }
             4 => {
                 // KeyEvent: down-flag, 2 bytes padding, u32 keysym.
@@ -612,7 +785,8 @@ fn handle_client<S: Read + Write>(
                     let mask = buf[0];
                     let x = u16::from_be_bytes([buf[1], buf[2]]) as u32;
                     let y = u16::from_be_bytes([buf[3], buf[4]]) as u32;
-
+                    let width = size.0.load(Ordering::Relaxed);
+                    let height = size.1.load(Ordering::Relaxed);
                     // Absolute axes use a fixed virtual range; scale from the
                     // framebuffer size the client is looking at so a guest
                     // mode change never needs new absinfo.

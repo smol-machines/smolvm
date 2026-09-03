@@ -531,15 +531,26 @@ unsafe extern "C" fn display_set_cursor(
     if !hidden && (bgra.is_null() || bgra_size < needed || width > 512 || height > 512) {
         return ERR_INVALID_PARAM;
     }
-    let pixels = if hidden {
-        Vec::new()
+    let (width, height, hot_x, hot_y, pixels) = if hidden {
+        (0, 0, hot_x, hot_y, Vec::new())
     } else {
         // Safe: libkrun promises `bgra_size` readable bytes for the call.
-        unsafe { std::slice::from_raw_parts(bgra, needed) }.to_vec()
+        let full = unsafe { std::slice::from_raw_parts(bgra, needed) };
+        crop_cursor(full, width, height, hot_x, hot_y)
     };
     fb.cursor_changed(|c| {
-        c.width = if hidden { 0 } else { width };
-        c.height = if hidden { 0 } else { height };
+        // Compositors re-send the same image on every move; only a real
+        // change should make viewers re-fetch it.
+        let same = c.width == width
+            && c.height == height
+            && c.hot_x == hot_x
+            && c.hot_y == hot_y
+            && c.bgra == pixels;
+        if same {
+            return;
+        }
+        c.width = width;
+        c.height = height;
         c.hot_x = hot_x;
         c.hot_y = hot_y;
         c.bgra = pixels;
@@ -547,6 +558,51 @@ unsafe extern "C" fn display_set_cursor(
     });
     fb.trace_seq("set_cursor");
     0
+}
+
+/// Trim the transparent border off a pointer image and shift the hot spot to
+/// match. Compositors hand over the same pointer drawn at different offsets
+/// in a fixed 64x64 buffer; trimmed, those compare equal, so viewers are not
+/// sent a "new" image on every move, and the image itself gets much smaller.
+fn crop_cursor(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+) -> (u32, u32, u32, u32, Vec<u8>) {
+    let (w, h) = (width as usize, height as usize);
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if bgra[(y * w + x) * 4 + 3] != 0 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return (0, 0, hot_x, hot_y, Vec::new());
+    }
+    // Keep the hot spot inside the trimmed image.
+    let x0 = x0.min(hot_x as usize);
+    let y0 = y0.min(hot_y as usize);
+    let x1 = x1.max(hot_x as usize + 1).min(w);
+    let y1 = y1.max(hot_y as usize + 1).min(h);
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    let mut out = Vec::with_capacity(cw * ch * 4);
+    for y in y0..y1 {
+        out.extend_from_slice(&bgra[(y * w + x0) * 4..(y * w + x1) * 4]);
+    }
+    (
+        cw as u32,
+        ch as u32,
+        hot_x - x0 as u32,
+        hot_y - y0 as u32,
+        out,
+    )
 }
 
 unsafe extern "C" fn display_move_cursor(
