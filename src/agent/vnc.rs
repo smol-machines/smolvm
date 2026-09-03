@@ -439,8 +439,18 @@ impl CloseWrite for super::websocket::WsWriter {
 enum ClientMsg {
     SetPixelFormat([u8; 16]),
     SetEncodings(Vec<i32>),
-    UpdateRequest { incremental: bool },
-    ContinuousUpdates { enable: bool },
+    UpdateRequest {
+        incremental: bool,
+    },
+    ContinuousUpdates {
+        enable: bool,
+    },
+    /// Where the client just put its pointer, for compositing: the guest
+    /// follows it one-to-one, and this is known before the guest says so.
+    Pointer {
+        x: u32,
+        y: u32,
+    },
 }
 
 fn handle_client<R: Read + Send + 'static, W: CloseWrite>(
@@ -518,6 +528,8 @@ fn run_client<R: Read + Send + 'static, W: Write>(
         wants_pixels: true,
         pending: None,
         continuous: false,
+        pointer: None,
+        pointer_moved: false,
     };
     let mut last_cursor_generation = 0u64;
     let mut last_cursor_image_generation = 0u64;
@@ -566,7 +578,10 @@ fn run_client<R: Read + Send + 'static, W: Write>(
             (fb.latest(), Some(fb.cursor()))
         };
         let frame_changed = new_frame.is_some();
-        let cursor_changed = new_cursor.is_some();
+        // For a client that cannot draw the pointer, its own pointer move is
+        // a change too: the pointer is composited where the client put it.
+        let cursor_changed =
+            new_cursor.is_some() || (fmt_state.pointer_moved && !fmt_state.supports_cursor);
         if !frame_changed && !cursor_changed {
             if fmt_state.pending.is_some() && !fmt_state.continuous {
                 // A request the classic way: answer promptly, even if with
@@ -576,7 +591,13 @@ fn run_client<R: Read + Send + 'static, W: Write>(
             }
             continue;
         }
-        let cursor = new_cursor.unwrap_or_else(|| fb.cursor());
+        let guest_cursor_generation = new_cursor.as_ref().map(|c| c.generation);
+        let mut cursor = new_cursor.unwrap_or_else(|| fb.cursor());
+        if let (Some((x, y)), false) = (fmt_state.pointer, fmt_state.supports_cursor) {
+            cursor.x = x;
+            cursor.y = y;
+        }
+        fmt_state.pointer_moved = false;
 
         let mut rects: Vec<Vec<u8>> = Vec::new();
         // A client that draws the pointer itself needs pixels only for a new
@@ -630,8 +651,8 @@ fn run_client<R: Read + Send + 'static, W: Write>(
             rects.push(cursor_rect(&cursor, &fmt_state.fmt));
             last_cursor_image_generation = cursor.image_generation;
         }
-        if cursor_changed {
-            last_cursor_generation = cursor.generation;
+        if let Some(generation) = guest_cursor_generation {
+            last_cursor_generation = generation;
         }
         if rects.is_empty() && fmt_state.continuous {
             // A pointer move for a client drawing its own pointer: nothing
@@ -655,6 +676,10 @@ struct ClientState {
     pending: Option<bool>,
     /// ContinuousUpdates is on: push as the display changes.
     continuous: bool,
+    /// The client's own pointer position, if it has sent one.
+    pointer: Option<(u32, u32)>,
+    /// The client moved its pointer since the last update it was sent.
+    pointer_moved: bool,
 }
 
 fn apply_client_msg<W: Write>(
@@ -698,6 +723,12 @@ fn apply_client_msg<W: Write>(
             st.continuous = enable;
             if !enable {
                 s.write_all(&[MSG_END_OF_CONTINUOUS_UPDATES])?;
+            }
+        }
+        ClientMsg::Pointer { x, y } => {
+            if st.pointer != Some((x, y)) {
+                st.pointer = Some((x, y));
+                st.pointer_moved = true;
             }
         }
     }
@@ -787,6 +818,9 @@ fn read_client_messages<R: Read>(
                     let y = u16::from_be_bytes([buf[3], buf[4]]) as u32;
                     let width = size.0.load(Ordering::Relaxed);
                     let height = size.1.load(Ordering::Relaxed);
+                    if tx.send(ClientMsg::Pointer { x, y }).is_err() {
+                        return Ok(());
+                    }
                     // Absolute axes use a fixed virtual range; scale from the
                     // framebuffer size the client is looking at so a guest
                     // mode change never needs new absinfo.
