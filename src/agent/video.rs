@@ -61,10 +61,15 @@ struct VideoConfig {
 
 impl VideoConfig {
     fn from_env() -> Result<Option<Self>, String> {
-        let Some(raw) = std::env::var_os("SMOLVM_VIDEO") else {
-            return Ok(None);
+        // Unset means "use it when the host can": encoded video is on by
+        // default wherever an ffmpeg is on the PATH, since a browser then
+        // gets frames at a fraction of the raw cost and the raw path stays
+        // the fallback. `SMOLVM_VIDEO=off` disables it outright.
+        let raw = match std::env::var_os("SMOLVM_VIDEO") {
+            Some(raw) => raw.to_string_lossy().trim().to_ascii_lowercase(),
+            None if ffmpeg_on_path() => "auto".to_string(),
+            None => return Ok(None),
         };
-        let raw = raw.to_string_lossy().trim().to_ascii_lowercase();
         if raw.is_empty() || matches!(raw.as_str(), "0" | "off" | "false" | "disabled") {
             return Ok(None);
         }
@@ -108,6 +113,21 @@ where
         return Err(format!("{name} must be between {min} and {max}"));
     }
     Ok(value)
+}
+
+/// Whether an `ffmpeg` binary can be found on the PATH.
+fn ffmpeg_on_path() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        });
+        candidate.is_file()
+    })
 }
 
 fn auto_encoder() -> Encoder {
