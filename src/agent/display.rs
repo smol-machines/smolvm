@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 
 /// `KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER`.
 const FEATURE_BASIC_FRAMEBUFFER: u64 = 1;
+const FEATURE_CURSOR: u64 = 2;
 
 const ERR_INVALID_SCANOUT_ID: i32 = -3;
 const ERR_INVALID_PARAM: i32 = -4;
@@ -74,11 +75,19 @@ struct BasicFramebufferVtable {
 }
 
 #[repr(C)]
+struct CursorVtable {
+    set_cursor:
+        Option<unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, *const u8, usize) -> i32>,
+    move_cursor: Option<unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> i32>,
+}
+
+#[repr(C)]
 struct KrunDisplayBackend {
     features: u64,
     create_userdata: *const c_void,
     create: Option<unsafe extern "C" fn(*mut *mut c_void, *const c_void, *const c_void) -> i32>,
     vtable: BasicFramebufferVtable,
+    cursor: CursorVtable,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +110,41 @@ pub struct Frame {
     pub generation: u64,
 }
 
+/// The guest's pointer as the VMM hands it over: the image the guest put on
+/// its hardware cursor plane and where the hot spot is. With the pointer on
+/// that plane the guest no longer draws it into frames, so viewers either
+/// draw it themselves or composite it onto the frames they send.
+#[derive(Clone, Default)]
+pub struct Cursor {
+    /// Image width in pixels; 0 when hidden.
+    pub width: u32,
+    /// Image height in pixels; 0 when hidden.
+    pub height: u32,
+    /// Hot spot x offset inside the image.
+    pub hot_x: u32,
+    /// Hot spot y offset inside the image.
+    pub hot_y: u32,
+    /// `width * height * 4` bytes, B,G,R,A with straight alpha; empty when
+    /// the pointer is hidden.
+    pub bgra: Vec<u8>,
+    /// Hot spot x position on the scanout.
+    pub x: u32,
+    /// Hot spot y position on the scanout.
+    pub y: u32,
+    /// Bumped on every image change or move.
+    pub generation: u64,
+    /// Bumped only when the image changes, so a viewer that draws the pointer
+    /// itself resends the image only when it has to.
+    pub image_generation: u64,
+}
+
+impl Cursor {
+    /// Whether there is an image to show at all.
+    pub fn is_visible(&self) -> bool {
+        self.width > 0 && self.height > 0 && !self.bgra.is_empty()
+    }
+}
+
 /// The buffer libkrun writes into. Deliberately *not* behind the mutex: the
 /// contract in `libkrun_display.h` is that every backend method is called from
 /// one and the same thread, so this is single-threaded state, and holding the
@@ -121,6 +165,9 @@ pub struct DisplayFramebuffer {
     staging: std::cell::UnsafeCell<Staging>,
     front: Mutex<Frame>,
     presented: Condvar,
+    cursor: Mutex<Cursor>,
+    /// Mirrors `cursor.generation` so waiters can test it under `front`.
+    cursor_generation: std::sync::atomic::AtomicU64,
     /// Optional call trace, enabled by `SMOLVM_DISPLAY_TRACE=<path>`.
     ///
     /// libkrun's own logging goes through `env_logger` in a process whose
@@ -168,6 +215,8 @@ impl DisplayFramebuffer {
                 generation: 0,
             }),
             presented: Condvar::new(),
+            cursor: Mutex::new(Cursor::default()),
+            cursor_generation: std::sync::atomic::AtomicU64::new(0),
             trace,
             traced_calls: std::sync::atomic::AtomicU64::new(0),
         }
@@ -235,6 +284,56 @@ impl DisplayFramebuffer {
             front.generation = 1;
         }
         fb
+    }
+
+    /// The pointer as last reported by the guest.
+    pub fn cursor(&self) -> Cursor {
+        self.cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Block until a frame newer than `since_frame` is presented or the
+    /// pointer changes past `since_cursor`, or `timeout` elapses. Returns
+    /// whichever of the two is new.
+    pub fn wait_for_change(
+        &self,
+        since_frame: u64,
+        since_cursor: u64,
+        timeout: std::time::Duration,
+    ) -> (Option<Frame>, Option<Cursor>) {
+        use std::sync::atomic::Ordering;
+        let guard = self.front.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .presented
+            .wait_timeout_while(guard, timeout, |f| {
+                f.generation <= since_frame
+                    && self.cursor_generation.load(Ordering::Acquire) <= since_cursor
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        let frame = (guard.generation > since_frame).then(|| guard.clone());
+        drop(guard);
+        let cursor = {
+            let c = self.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            (c.generation > since_cursor).then(|| c.clone())
+        };
+        (frame, cursor)
+    }
+
+    /// Record a pointer change and wake viewers. Taken under `front` so a
+    /// viewer between its generation check and its wait cannot miss it.
+    fn cursor_changed(&self, apply: impl FnOnce(&mut Cursor)) {
+        use std::sync::atomic::Ordering;
+        let _front = self.front.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut c = self.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            apply(&mut c);
+            c.generation = c.generation.wrapping_add(1);
+            self.cursor_generation
+                .store(c.generation, Ordering::Release);
+        }
+        self.presented.notify_all();
     }
 
     /// Block until a frame newer than `since` is presented, or `timeout`
@@ -411,6 +510,64 @@ unsafe extern "C" fn display_present_frame(
     0
 }
 
+unsafe extern "C" fn display_set_cursor(
+    instance: *mut c_void,
+    scanout_id: u32,
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+    bgra: *const u8,
+    bgra_size: usize,
+) -> i32 {
+    if scanout_id != 0 {
+        return ERR_INVALID_SCANOUT_ID;
+    }
+    let Some(fb) = (unsafe { fb(instance) }) else {
+        return ERR_INVALID_PARAM;
+    };
+    let hidden = width == 0 || height == 0;
+    let needed = width as usize * height as usize * BYTES_PER_PIXEL;
+    if !hidden && (bgra.is_null() || bgra_size < needed || width > 512 || height > 512) {
+        return ERR_INVALID_PARAM;
+    }
+    let pixels = if hidden {
+        Vec::new()
+    } else {
+        // Safe: libkrun promises `bgra_size` readable bytes for the call.
+        unsafe { std::slice::from_raw_parts(bgra, needed) }.to_vec()
+    };
+    fb.cursor_changed(|c| {
+        c.width = if hidden { 0 } else { width };
+        c.height = if hidden { 0 } else { height };
+        c.hot_x = hot_x;
+        c.hot_y = hot_y;
+        c.bgra = pixels;
+        c.image_generation = c.image_generation.wrapping_add(1);
+    });
+    fb.trace_seq("set_cursor");
+    0
+}
+
+unsafe extern "C" fn display_move_cursor(
+    instance: *mut c_void,
+    scanout_id: u32,
+    x: u32,
+    y: u32,
+) -> i32 {
+    if scanout_id != 0 {
+        return ERR_INVALID_SCANOUT_ID;
+    }
+    let Some(fb) = (unsafe { fb(instance) }) else {
+        return ERR_INVALID_PARAM;
+    };
+    fb.cursor_changed(|c| {
+        c.x = x;
+        c.y = y;
+    });
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Installation
 // ---------------------------------------------------------------------------
@@ -431,7 +588,7 @@ pub fn install(
     let raw = Arc::into_raw(Arc::clone(&state));
 
     let backend = KrunDisplayBackend {
-        features: FEATURE_BASIC_FRAMEBUFFER,
+        features: FEATURE_BASIC_FRAMEBUFFER | FEATURE_CURSOR,
         create_userdata: raw as *const c_void,
         create: Some(display_create),
         vtable: BasicFramebufferVtable {
@@ -440,6 +597,10 @@ pub fn install(
             configure_scanout: Some(display_configure_scanout),
             alloc_frame: Some(display_alloc_frame),
             present_frame: Some(display_present_frame),
+        },
+        cursor: CursorVtable {
+            set_cursor: Some(display_set_cursor),
+            move_cursor: Some(display_move_cursor),
         },
     };
 

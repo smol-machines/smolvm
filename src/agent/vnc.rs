@@ -23,7 +23,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::display::{self, DisplayFramebuffer, Frame};
+use super::display::{self, Cursor, DisplayFramebuffer, Frame};
 
 const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
 const SECURITY_NONE: u8 = 1;
@@ -46,6 +46,9 @@ const UPDATE_WAIT: Duration = Duration::from_millis(15);
 /// Pseudo-encoding letting us tell the client the desktop changed size, which
 /// happens when the compositor sets a mode different from the initial one.
 const ENCODING_DESKTOP_SIZE: i32 = -223;
+/// The Cursor pseudo-encoding: the client draws the pointer itself from an
+/// image the server sends, so pointer motion costs no pixels at all.
+const ENCODING_CURSOR: i32 = -239;
 const ENCODING_RAW: i32 = 0;
 
 /// The pixel layout a client asked for. Defaults to what we natively hold, so
@@ -459,6 +462,14 @@ fn handle_client<S: Read + Write>(
     // BGRX pixels of the last frame this client was sent, for damage diffing.
     let mut last_sent: Option<Vec<u8>> = None;
     let mut client_supports_resize = false;
+    // A client that lists the Cursor pseudo-encoding draws the pointer itself;
+    // any other client gets the pointer composited into the frames.
+    let mut client_supports_cursor = false;
+    // A client that lists no pixel encoding at all (only pseudo-encodings)
+    // is here for input and the pointer image, not for pixels.
+    let mut client_wants_pixels = true;
+    let mut last_cursor_generation = 0u64;
+    let mut last_cursor_image_generation = 0u64;
     let mut last_button_mask = 0u8;
 
     loop {
@@ -496,9 +507,12 @@ fn handle_client<S: Read + Write>(
                 let mut encodings = vec![0u8; count * 4];
                 s.read_exact(&mut encodings)?;
                 let (encodings, _) = encodings.as_chunks::<4>();
-                client_supports_resize = encodings
-                    .iter()
-                    .any(|c| i32::from_be_bytes(*c) == ENCODING_DESKTOP_SIZE);
+                let listed: Vec<i32> = encodings.iter().map(|c| i32::from_be_bytes(*c)).collect();
+                client_supports_resize = listed.contains(&ENCODING_DESKTOP_SIZE);
+                client_supports_cursor = listed.contains(&ENCODING_CURSOR);
+                // Raw is implicit for ordinary clients, so only a client that
+                // asked for the pointer and for no real encoding is pixel-free.
+                client_wants_pixels = listed.iter().any(|e| *e >= 0) || !client_supports_cursor;
             }
             3 => {
                 // FramebufferUpdateRequest: incremental + x,y,w,h
@@ -506,49 +520,72 @@ fn handle_client<S: Read + Write>(
                 s.read_exact(&mut req)?;
                 let incremental = req[0] != 0;
 
-                let frame = if incremental {
-                    fb.wait_for_frame(last_generation, UPDATE_WAIT)
-                        .or_else(|| fb.latest())
+                let (new_frame, new_cursor) = if incremental {
+                    fb.wait_for_change(last_generation, last_cursor_generation, UPDATE_WAIT)
                 } else {
-                    fb.latest()
+                    (fb.latest(), Some(fb.cursor()))
                 };
-
-                let Some(frame) = frame else {
-                    // Nothing presented yet. Answer with an empty update so the
-                    // client stays in its request loop instead of stalling.
-                    s.write_all(&[0u8, 0, 0, 0])?;
-                    continue;
-                };
-
-                if incremental && frame.generation == last_generation {
+                let frame_changed = new_frame.is_some();
+                let cursor_changed = new_cursor.is_some();
+                if !frame_changed && !cursor_changed {
+                    // Nothing new (or nothing presented yet): answer with an
+                    // empty update so the client stays in its request loop.
                     s.write_all(&[0u8, 0, 0, 0])?;
                     continue;
                 }
-                last_generation = frame.generation;
+                let cursor = new_cursor.unwrap_or_else(|| fb.cursor());
 
-                if (frame.width, frame.height) != (width, height) {
-                    width = frame.width;
-                    height = frame.height;
-                    if client_supports_resize {
-                        send_resize(&mut s, width, height)?;
-                    } else {
-                        tracing::warn!(
-                            width,
-                            height,
-                            "guest changed mode but the vnc client cannot resize; \
-                             reconnect to pick up the new size"
-                        );
+                let mut rects: Vec<Vec<u8>> = Vec::new();
+                // A client that draws the pointer itself needs pixels only for
+                // a new frame; one that does not needs them whenever the
+                // pointer moved, because the pointer lives in the pixels.
+                let need_pixels = client_wants_pixels
+                    && (frame_changed || (cursor_changed && !client_supports_cursor));
+                if need_pixels {
+                    let Some(frame) = new_frame.clone().or_else(|| fb.latest()) else {
+                        s.write_all(&[0u8, 0, 0, 0])?;
+                        continue;
+                    };
+                    if (frame.width, frame.height) != (width, height) {
+                        width = frame.width;
+                        height = frame.height;
+                        if client_supports_resize {
+                            send_resize(&mut s, width, height)?;
+                        } else {
+                            tracing::warn!(
+                                width,
+                                height,
+                                "guest changed mode but the vnc client cannot resize; \
+                                 reconnect to pick up the new size"
+                            );
+                        }
+                        last_sent = None;
                     }
-                }
-
-                let bgrx = display::to_bgrx(&frame);
-                match last_sent.as_ref() {
-                    Some(prev) if incremental && prev.len() == bgrx.len() => {
-                        send_frame_diff(&mut s, &frame, &bgrx, prev, &fmt)?;
+                    let mut bgrx = display::to_bgrx(&frame).into_owned();
+                    if !client_supports_cursor {
+                        composite_cursor(&mut bgrx, frame.width, frame.height, &cursor);
                     }
-                    _ => send_frame(&mut s, &frame, &bgrx, &fmt)?,
+                    match last_sent.as_ref() {
+                        Some(prev) if incremental && prev.len() == bgrx.len() => {
+                            rects.extend(frame_diff_rects(&frame, &bgrx, prev, &fmt));
+                        }
+                        _ => rects.push(frame_rect(&frame, &bgrx, &fmt)),
+                    }
+                    last_sent = Some(bgrx);
+                    last_generation = frame.generation;
+                } else if let Some(frame) = new_frame.as_ref() {
+                    last_generation = frame.generation;
                 }
-                last_sent = Some(bgrx.into_owned());
+                if client_supports_cursor
+                    && (cursor.image_generation != last_cursor_image_generation || !incremental)
+                {
+                    rects.push(cursor_rect(&cursor, &fmt));
+                    last_cursor_image_generation = cursor.image_generation;
+                }
+                if cursor_changed {
+                    last_cursor_generation = cursor.generation;
+                }
+                write_update(&mut s, &rects)?;
             }
             4 => {
                 // KeyEvent: down-flag, 2 bytes padding, u32 keysym.
@@ -681,36 +718,101 @@ fn send_resize<S: Write>(s: &mut S, width: u32, height: u32) -> std::io::Result<
     s.write_all(&msg)
 }
 
-fn send_frame<S: Write>(
-    s: &mut S,
-    frame: &Frame,
-    bgrx: &[u8],
-    fmt: &PixelFormat,
-) -> std::io::Result<()> {
-    let pixels = encode_pixels(bgrx, fmt);
-
-    let mut header = vec![0u8, 0];
-    header.extend_from_slice(&1u16.to_be_bytes()); // one rectangle
-    header.extend_from_slice(&0u16.to_be_bytes()); // x
-    header.extend_from_slice(&0u16.to_be_bytes()); // y
-    header.extend_from_slice(&(frame.width as u16).to_be_bytes());
-    header.extend_from_slice(&(frame.height as u16).to_be_bytes());
-    header.extend_from_slice(&ENCODING_RAW.to_be_bytes());
-    s.write_all(&header)?;
-    s.write_all(&pixels)
+/// One FramebufferUpdate carrying the given already-encoded rectangles.
+fn write_update<S: Write>(s: &mut S, rects: &[Vec<u8>]) -> std::io::Result<()> {
+    let mut msg = vec![0u8, 0];
+    msg.extend_from_slice(&(rects.len() as u16).to_be_bytes());
+    for r in rects {
+        msg.extend_from_slice(r);
+    }
+    s.write_all(&msg)
 }
 
-/// Send only the row bands that changed since the frame this client last
-/// received. Raw encoding ships every pixel of a rectangle, so cursor-sized
-/// damage would otherwise cost a full-frame update (~5 MB at 1440x900) on
-/// every pointer movement.
-fn send_frame_diff<S: Write>(
-    s: &mut S,
-    frame: &Frame,
-    bgrx: &[u8],
-    prev: &[u8],
-    fmt: &PixelFormat,
-) -> std::io::Result<()> {
+fn rect_header(x: u32, y: u32, w: u32, h: u32, encoding: i32) -> Vec<u8> {
+    let mut rect = Vec::with_capacity(12);
+    rect.extend_from_slice(&(x as u16).to_be_bytes());
+    rect.extend_from_slice(&(y as u16).to_be_bytes());
+    rect.extend_from_slice(&(w as u16).to_be_bytes());
+    rect.extend_from_slice(&(h as u16).to_be_bytes());
+    rect.extend_from_slice(&encoding.to_be_bytes());
+    rect
+}
+
+/// The whole frame as one Raw rectangle.
+fn frame_rect(frame: &Frame, bgrx: &[u8], fmt: &PixelFormat) -> Vec<u8> {
+    let mut rect = rect_header(0, 0, frame.width, frame.height, ENCODING_RAW);
+    rect.extend_from_slice(&encode_pixels(bgrx, fmt));
+    rect
+}
+
+/// The pointer as a Cursor pseudo-rectangle: the image in the client's pixel
+/// format followed by a one-bit-per-pixel mask, hot spot in the position
+/// fields. An empty (hidden) pointer is a 0x0 rectangle.
+fn cursor_rect(cursor: &Cursor, fmt: &PixelFormat) -> Vec<u8> {
+    if !cursor.is_visible() {
+        return rect_header(0, 0, 0, 0, ENCODING_CURSOR);
+    }
+    let (w, h) = (cursor.width as usize, cursor.height as usize);
+    let mut rect = rect_header(
+        cursor.hot_x,
+        cursor.hot_y,
+        cursor.width,
+        cursor.height,
+        ENCODING_CURSOR,
+    );
+    // The default format is a byte-for-byte pass-through, so the alpha
+    // channel survives for clients that can use it; other formats get the
+    // mask only.
+    rect.extend_from_slice(&encode_pixels(&cursor.bgra, fmt));
+    let row_bytes = w.div_ceil(8);
+    let mut mask = vec![0u8; row_bytes * h];
+    for y in 0..h {
+        for x in 0..w {
+            if cursor.bgra[(y * w + x) * 4 + 3] >= 0x80 {
+                mask[y * row_bytes + x / 8] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    rect.extend_from_slice(&mask);
+    rect
+}
+
+/// Draw the pointer into a B,G,R,X frame for a client that cannot draw it
+/// itself, straight-alpha blended and clipped to the frame.
+fn composite_cursor(bgrx: &mut [u8], width: u32, height: u32, cursor: &Cursor) {
+    if !cursor.is_visible() {
+        return;
+    }
+    let (fw, fh) = (width as i64, height as i64);
+    let left = cursor.x as i64 - cursor.hot_x as i64;
+    let top = cursor.y as i64 - cursor.hot_y as i64;
+    for cy in 0..cursor.height as i64 {
+        let y = top + cy;
+        if y < 0 || y >= fh {
+            continue;
+        }
+        for cx in 0..cursor.width as i64 {
+            let x = left + cx;
+            if x < 0 || x >= fw {
+                continue;
+            }
+            let src =
+                &cursor.bgra[((cy as usize) * cursor.width as usize + cx as usize) * 4..][..4];
+            let a = src[3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let dst = &mut bgrx[((y as usize) * width as usize + x as usize) * 4..][..4];
+            for c in 0..3 {
+                dst[c] = ((src[c] as u32 * a + dst[c] as u32 * (255 - a)) / 255) as u8;
+            }
+        }
+    }
+}
+
+/// Only the changed tiles since `prev`, as Raw rectangles; empty when the
+/// pixels did not change.
+fn frame_diff_rects(frame: &Frame, bgrx: &[u8], prev: &[u8], fmt: &PixelFormat) -> Vec<Vec<u8>> {
     const BAND_ROWS: usize = 16;
     const TILE_COLS: usize = 64;
     let width = frame.width as usize;
@@ -761,31 +863,19 @@ fn send_frame_diff<S: Write>(
         }
     }
 
-    if merged.is_empty() {
-        // The frame generation moved but the pixels did not.
-        return s.write_all(&[0u8, 0, 0, 0]);
-    }
-
-    let mut header = vec![0u8, 0];
-    header.extend_from_slice(&(merged.len() as u16).to_be_bytes());
-    s.write_all(&header)?;
+    let mut out = Vec::with_capacity(merged.len());
     let mut pixels = Vec::new();
     for r in merged {
-        let mut rect = Vec::with_capacity(12);
-        rect.extend_from_slice(&(r.x as u16).to_be_bytes());
-        rect.extend_from_slice(&(r.y as u16).to_be_bytes());
-        rect.extend_from_slice(&(r.w as u16).to_be_bytes());
-        rect.extend_from_slice(&(r.h as u16).to_be_bytes());
-        rect.extend_from_slice(&ENCODING_RAW.to_be_bytes());
-        s.write_all(&rect)?;
+        let mut rect = rect_header(r.x as u32, r.y as u32, r.w as u32, r.h as u32, ENCODING_RAW);
         pixels.clear();
         for line in r.y..r.y + r.h {
             let a = line * row + r.x * 4;
             pixels.extend_from_slice(&bgrx[a..a + r.w * 4]);
         }
-        s.write_all(&encode_pixels(&pixels, fmt))?;
+        rect.extend_from_slice(&encode_pixels(&pixels, fmt));
+        out.push(rect);
     }
-    Ok(())
+    out
 }
 
 /// The URL to open in a browser for a server bound to `addr`. A wildcard
