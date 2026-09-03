@@ -106,10 +106,10 @@ if [ ! -d /usr/share/omarchy ]; then
   # after its defaults (the Lua parser rejects `hyprctl keyword`).
   cat >> /home/omar/.config/hypr/looknfeel.lua <<'LUA'
 
--- Software rendering: effects multiply the pixels redrawn per frame, and
--- the host scanout path has no composited cursor plane.
+-- Software rendering: effects multiply the pixels redrawn per frame. The
+-- pointer goes on the cursor plane, which the host hands to viewers directly.
 hl.config({
-  cursor = { no_hardware_cursors = true },
+  cursor = { no_hardware_cursors = false },
   animations = { enabled = false },
   decoration = {
     blur = { enabled = false },
