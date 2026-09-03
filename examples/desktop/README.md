@@ -38,6 +38,34 @@ must be bridged before it starts (both handled by `omarchy.sh`):
 Both are opt-in. A connector changes guest topology, and existing GPU workloads
 (CUDA remoting, headless Vulkan) neither need nor want one.
 
+## GPU acceleration on macOS hosts
+
+The virglrenderer bundled with the macOS build is Venus (Vulkan) only, so a
+guest gets OpenGL through Zink, Mesa's GL-on-Vulkan driver. That needs a
+guest Mesa built for it: the Venus driver has to allocate on the host's 16 KiB
+pages (two commits from the krunkit Mesa branch), Zink has to be a version
+that does not require `VK_KHR_maintenance5` (26.0 is the newest), and the
+loader has to let Zink claim a virtio-gpu that offers no virgl. The
+aarch64 Omarchy recipe installs such a build from a tarball when it finds
+one, and `build-mesa-zink-aarch64.sh` reproduces the tarball inside a guest.
+
+The session then runs Hyprland with:
+
+```
+MESA_VIRTIO_ZINK=1 MESA_LOADER_DRIVER_OVERRIDE=zink
+MESA_GLES_VERSION_OVERRIDE=3.2 MESA_GLSL_VERSION_OVERRIDE=320
+```
+
+The first two select Zink for the virtio-gpu. The last two matter because the
+host has no transform feedback, which Mesa treats as a hard requirement for
+OpenGL ES 3.0; compositors never use it, and without the override Hyprland
+gets `EGL_BAD_MATCH` on every context and falls back to software.
+
+On an M4 Max, glmark2 off-screen scores 300 on Zink against 205 on llvmpipe,
+and the scenes that matter for a desktop are where the gap is: terrain runs
+170 FPS against 5, desktop 271 against 35. The host scanout shows the
+composited frames directly, through the blob scanout.
+
 ## The one thing the guest must do
 
 Run `seatd` with **`SEATD_VTBOUND=0`**:

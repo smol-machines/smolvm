@@ -1,0 +1,23 @@
+Fall back to zink for a virtio-gpu that offers no virgl and no DRM native
+context, such as a Venus-only renderer, instead of failing screen creation
+with the virtio_gpu gallium driver. Gated on MESA_VIRTIO_ZINK so virgl hosts
+keep their driver.
+
+--- a/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
++++ b/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
+@@ -165,6 +165,15 @@ pipe_loader_drm_probe_fd_nodup(struct pipe_loader_device **dev, int fd, bool zin
+       }
+    }
+ 
++   /* A Venus-only virtio-gpu (no virgl, no DRM native-context driver) cannot
++    * create a screen with the virtio_gpu gallium driver; fall back to zink,
++    * like powervr above. Env-gated so virtio-gpu+virgl hosts are unaffected. */
++   if (getenv("MESA_VIRTIO_ZINK") &&
++       strcmp(ddev->base.driver_name, "virtio_gpu") == 0) {
++      FREE(ddev->base.driver_name);
++      ddev->base.driver_name = strdup("zink");
++   }
++
+    ddev->dd = get_driver_descriptor(ddev->base.driver_name);
+ 
+    /* vgem is a virtual device; don't try using it with kmsro */
