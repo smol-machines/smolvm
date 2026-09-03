@@ -140,10 +140,16 @@ pub struct Cursor {
     /// Compositors hide and re-show the pointer around every buffer flip,
     /// so a hide only counts once it has lasted a moment.
     pub hidden_since: Option<std::time::Instant>,
+    /// When the guest last showed the pointer.
+    pub shown_at: Option<std::time::Instant>,
 }
 
 /// How long a hide must last before viewers stop showing the pointer.
 const HIDE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+/// A hide this soon after a show is the tail of a buffer flip, not a hide:
+/// some compositors show the new pointer buffer and then hide the old one,
+/// leaving the plane hidden until the next move. Those are dropped outright.
+const FLIP_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
 
 impl Cursor {
     /// Whether there is an image to show right now.
@@ -550,6 +556,9 @@ unsafe extern "C" fn display_set_cursor(
     };
     fb.cursor_changed(|c| {
         if hidden {
+            if c.shown_at.is_some_and(|t| t.elapsed() < FLIP_WINDOW) {
+                return;
+            }
             // Keep the image; the hide takes effect only if it lasts.
             if c.hidden_since.is_none() {
                 c.hidden_since = Some(std::time::Instant::now());
@@ -557,6 +566,7 @@ unsafe extern "C" fn display_set_cursor(
             return;
         }
         c.hidden_since = None;
+        c.shown_at = Some(std::time::Instant::now());
         // Compositors re-send the same image on every move; only a real
         // change should make viewers re-fetch it.
         let same = c.width == width
