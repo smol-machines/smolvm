@@ -136,12 +136,22 @@ pub struct Cursor {
     /// Bumped only when the image changes, so a viewer that draws the pointer
     /// itself resends the image only when it has to.
     pub image_generation: u64,
+    /// When the guest last hid the pointer while an image was still known.
+    /// Compositors hide and re-show the pointer around every buffer flip,
+    /// so a hide only counts once it has lasted a moment.
+    pub hidden_since: Option<std::time::Instant>,
 }
 
+/// How long a hide must last before viewers stop showing the pointer.
+const HIDE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl Cursor {
-    /// Whether there is an image to show at all.
+    /// Whether there is an image to show right now.
     pub fn is_visible(&self) -> bool {
-        self.width > 0 && self.height > 0 && !self.bgra.is_empty()
+        self.width > 0
+            && self.height > 0
+            && !self.bgra.is_empty()
+            && self.hidden_since.is_none_or(|t| t.elapsed() < HIDE_GRACE)
     }
 }
 
@@ -539,6 +549,14 @@ unsafe extern "C" fn display_set_cursor(
         crop_cursor(full, width, height, hot_x, hot_y)
     };
     fb.cursor_changed(|c| {
+        if hidden {
+            // Keep the image; the hide takes effect only if it lasts.
+            if c.hidden_since.is_none() {
+                c.hidden_since = Some(std::time::Instant::now());
+            }
+            return;
+        }
+        c.hidden_since = None;
         // Compositors re-send the same image on every move; only a real
         // change should make viewers re-fetch it.
         let same = c.width == width
