@@ -267,7 +267,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // drop and Landlock/seccomp; the broker independently drops to the same
     // per-VM uid; hardware modes retain only render/video device groups while
     // software mode retains none. Any failure leaves Raw VNC intact.
-    if std::env::var_os("SMOLVM_VIDEO").is_some()
+    if smolvm::agent::video::is_configured()
         && std::env::var_os("SMOLVM_DISPLAY").is_some()
         && std::env::var_os("SMOLVM_VNC").is_some()
     {

@@ -249,6 +249,12 @@ fn helper_socket_path() -> PathBuf {
     ))
 }
 
+/// Whether encoded video is configured for this VMM, explicitly or by
+/// default because an ffmpeg is on the PATH.
+pub fn is_configured() -> bool {
+    VideoConfig::from_env().ok().flatten().is_some()
+}
+
 /// Whether this VMM has an enabled, pre-started encoder helper.
 pub fn is_available() -> bool {
     VideoConfig::from_env().ok().flatten().is_some() && std::env::var_os(SOCKET_ENV).is_some()
