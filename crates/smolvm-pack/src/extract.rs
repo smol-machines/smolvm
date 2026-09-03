@@ -202,11 +202,59 @@ fn per_vm_uid_drop_active() -> bool {
 fn host_unpack_preserves_ownership() -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::geteuid() == 0 && !per_vm_uid_drop_active() }
+        let is_root = unsafe { libc::geteuid() == 0 };
+        host_unpack_preserves_ownership_for(is_root, per_vm_uid_drop_active())
     }
     #[cfg(not(unix))]
     {
         false
+    }
+}
+
+/// The decision above, separated from the ambient state it reads.
+///
+/// Reading `geteuid` inside the predicate meant a test could only ever observe
+/// the one (privilege, uid-drop) combination its own process happened to run
+/// under. Under CI's unprivileged uid both operands are false, so an assertion
+/// written against the live functions held whether or not the #1095 guard was
+/// present -- it could not fail on the bug it was meant to pin. Taking both
+/// inputs as arguments lets the whole table be checked at any privilege level.
+/// See [`host_unpack_is_faithful_only_as_root_without_the_uid_drop`].
+#[cfg(unix)]
+fn host_unpack_preserves_ownership_for(is_root: bool, uid_drop_active: bool) -> bool {
+    is_root && !uid_drop_active
+}
+
+/// How host extraction loses the archive's ownership, phrased for the operator
+/// reading the warning.
+///
+/// Which failure actually happens depends on privilege, and naming the wrong one
+/// sends the reader hunting the wrong symptom. Unprivileged, `set_owner`'s chown
+/// fails with EPERM and every entry lands owned by the current user. As root the
+/// chown succeeds -- `set_owner` is deliberately not gated by
+/// [`host_unpack_preserves_ownership`] -- so the archived owners do reach disk,
+/// and then meet the count-1 idmapped mount, which maps only on-disk uid 0:
+/// every other owner surfaces inside the machine as the overflow uid instead.
+fn ownership_loss_wording(uid_drop_active: bool) -> &'static str {
+    if uid_drop_active {
+        "archived owners will surface inside the machine as the overflow uid \
+         (65534/nobody), because this run presents the store through a count-1 \
+         idmapped mount that maps only on-disk uid 0"
+    } else {
+        "file ownership inside the machine will follow the current user rather \
+         than the image"
+    }
+}
+
+/// [`ownership_loss_wording`] for the run in progress.
+fn how_host_unpack_loses_ownership() -> &'static str {
+    #[cfg(unix)]
+    {
+        ownership_loss_wording(per_vm_uid_drop_active())
+    }
+    #[cfg(not(unix))]
+    {
+        ownership_loss_wording(false)
     }
 }
 
@@ -1476,11 +1524,11 @@ fn extract_sidecar_inner(
         eprintln!(
             "warning: this pack was built by smolvm {}, whose in-guest agent cannot unpack \
              staged layers; extracting them on the host instead.\n\
-             warning: file ownership inside the machine will follow the current user rather \
-             than the image. Re-pack with smolvm {}.{}.{} or later to restore it.",
+             warning: {}. Re-pack with smolvm {}.{}.{} or later to restore it.",
             pack_version
                 .filter(|v| !v.is_empty())
                 .unwrap_or("an unknown version"),
+            how_host_unpack_loses_ownership(),
             MIN_STAGED_LAYERS_VERSION.0,
             MIN_STAGED_LAYERS_VERSION.1,
             MIN_STAGED_LAYERS_VERSION.2,
@@ -2866,23 +2914,85 @@ mod tests {
         );
     }
 
-    /// The #1095 invariant: the per-VM uid drop and "host extraction preserves
-    /// ownership" can never both hold. When the drop is active the shared copy
-    /// reaches the guest through a count-1 idmapped mount that maps only on-disk
-    /// id 0, so any host-preserved owner is corrupted (non-zero -> overflow uid,
-    /// zero -> the raw VM uid). Host-side extraction must therefore never be
-    /// treated as faithful under the drop; the layers stage for in-guest unpack.
-    /// Deterministic at any privilege level and without mutating the environment.
-    /// Unix-only for the same reason as the function it exercises: the uid drop
-    /// does not exist on Windows. Linux and macOS CI both run it.
+    /// Host extraction is faithful only as root *and* only without the per-VM
+    /// uid drop -- the whole table, not just the row this process happens to run
+    /// under. The root+drop row is #1095 itself: the shared copy reaches the
+    /// guest through a count-1 idmapped mount that maps only on-disk id 0, so a
+    /// preserved owner is corrupted (non-zero -> overflow uid, zero -> the raw
+    /// VM uid), and the layers must stage for in-guest unpack instead.
+    ///
+    /// Checking the pure decision rather than the live functions is what gives
+    /// this test teeth: reverting the guard to a bare `is_root` flips the second
+    /// row and fails here even when the suite runs unprivileged, which is how CI
+    /// runs it. Deterministic at any privilege level, and it mutates nothing.
+    /// Unix-only for the same reason as the function it exercises: there is no
+    /// uid drop on Windows. Linux and macOS CI both run it.
     #[cfg(unix)]
     #[test]
-    fn uid_drop_and_host_preserved_ownership_are_mutually_exclusive() {
-        assert!(
-            !(per_vm_uid_drop_active() && host_unpack_preserves_ownership()),
-            "under the per-VM uid drop, host extraction must stage layers rather \
-             than claim to preserve ownership (see smol-machines/smolvm#1095)"
+    fn host_unpack_is_faithful_only_as_root_without_the_uid_drop() {
+        for (is_root, uid_drop_active, expected, why) in [
+            (
+                true,
+                false,
+                true,
+                "root without the drop reproduces archived owners",
+            ),
+            (
+                true,
+                true,
+                false,
+                "root under the drop must stage instead (#1095)",
+            ),
+            (
+                false,
+                false,
+                false,
+                "unprivileged chown cannot set foreign owners",
+            ),
+            (
+                false,
+                true,
+                false,
+                "unprivileged is never faithful, drop or not",
+            ),
+        ] {
+            assert_eq!(
+                host_unpack_preserves_ownership_for(is_root, uid_drop_active),
+                expected,
+                "is_root={is_root} uid_drop_active={uid_drop_active}: {why}"
+            );
+        }
+    }
+
+    /// The live predicate must stay a pure function of the two inputs the table
+    /// above pins, so a future edit cannot drift the shipped decision away from
+    /// the tested one while leaving that test green.
+    #[cfg(unix)]
+    #[test]
+    fn the_live_decision_matches_the_table() {
+        let is_root = unsafe { libc::geteuid() == 0 };
+        assert_eq!(
+            host_unpack_preserves_ownership(),
+            host_unpack_preserves_ownership_for(is_root, per_vm_uid_drop_active())
         );
+    }
+
+    /// The warning must name the failure the run will actually hit. Under the
+    /// uid drop `set_owner`'s chown succeeds -- it is not gated by
+    /// [`host_unpack_preserves_ownership`] -- so owners reach disk and are then
+    /// mapped to the overflow uid; saying they "follow the current user" there
+    /// describes a different bug and sends the reader hunting the wrong symptom.
+    #[test]
+    fn the_ownership_warning_names_the_failure_this_run_will_hit() {
+        assert!(
+            ownership_loss_wording(true).contains("overflow uid"),
+            "under the uid drop the warning must name the overflow uid"
+        );
+        assert!(
+            ownership_loss_wording(false).contains("current user"),
+            "without the drop the warning must name the current user"
+        );
+        assert_ne!(ownership_loss_wording(true), ownership_loss_wording(false));
     }
 
     /// Build a tar archive carrying a single symlink entry whose link target
