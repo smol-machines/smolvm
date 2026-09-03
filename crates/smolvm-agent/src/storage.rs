@@ -4863,7 +4863,6 @@ mod tests {
         assert!(err.to_string().contains("does not exist"), "got: {err}");
     }
 
-    use super::*;
     // OCI layer helpers now live in the shared crate; these tests exercise them
     // through its public API (the crate also unit-tests them independently).
     use smolvm_oci_layer::{classify_layer_entry, jailed_join, LayerEntry};
