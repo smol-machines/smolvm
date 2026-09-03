@@ -1,5 +1,5 @@
---- a/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h	2026-08-30 14:00:38.662398556 -0700
+--- a/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h
++++ b/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h
 @@ -555,6 +555,7 @@
      vn_decode_VkCommandTypeEXT(ctx->decoder, &cmd_type);
      vn_decode_VkFlags(ctx->decoder, &cmd_flags);
@@ -8,8 +8,8 @@
      {
  #ifdef DEBUG
          TRACE_SCOPE_SLOW(vn_dispatch_command_name(cmd_type));
---- a/src/venus/vkr_common.h	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_common.h	2026-08-30 13:42:55.611913702 -0700
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
 @@ -54,6 +54,50 @@
        return obj;                                                                        \
     }
@@ -61,8 +61,8 @@
  /* vkr_region_is_valid should be used to check for overflows */
  #define VKR_REGION_INIT(offset, size)                                                    \
     {                                                                                     \
---- a/src/venus/vkr_context.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_context.c	2026-08-30 13:44:21.861454921 -0700
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
 @@ -324,7 +324,14 @@
      * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
      */
@@ -78,7 +78,7 @@
        res_fd = os_dupfd_cloexec(blob.u.fd);
        if (res_fd < 0) {
           close(blob.u.fd);
-@@ -332,14 +339,28 @@
+@@ -332,14 +339,29 @@
        }
     }
  
@@ -102,15 +102,42 @@
 +      struct vkr_resource *res = vkr_context_get_resource(ctx, res_id);
 +      if (res)
 +         res->mem = mem;
++         res->mem_id = mem->base.id;
 +   }
 +#endif
 +
     *out_blob = blob;
  
     return true;
---- a/src/venus/vkr_context.h	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_context.h	2026-08-30 13:44:21.860721208 -0700
-@@ -20,6 +20,12 @@
+@@ -605,6 +627,7 @@
+ 
+    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
+    mtx_destroy(&ctx->object_mutex);
++   mtx_destroy(&ctx->scanout_mutex);
+ 
+    vkr_cs_encoder_fini(&ctx->encoder);
+    vkr_cs_decoder_fini(&ctx->decoder);
+@@ -664,6 +687,8 @@
+    if (!vkr_context_wait_ring_init(ctx))
+       goto err_ctx_wait_ring_init;
+ 
++   if (mtx_init(&ctx->scanout_mutex, mtx_plain) != thrd_success)
++      goto err_scanout_mutex;
+    if (mtx_init(&ctx->object_mutex, mtx_plain) != thrd_success)
+       goto err_ctx_object_mutex;
+ 
+@@ -703,6 +728,8 @@
+ err_ctx_object_table:
+    mtx_destroy(&ctx->object_mutex);
+ err_ctx_object_mutex:
++   mtx_destroy(&ctx->scanout_mutex);
++err_scanout_mutex:
+    vkr_context_wait_ring_fini(ctx);
+ err_ctx_wait_ring_init:
+    free(ctx->debug_name);
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -20,6 +20,15 @@
  struct vkr_resource {
     uint32_t res_id;
  
@@ -118,23 +145,37 @@
 +   /* the allocation this resource was exported from, so a scanout read can
 +    * find the image bound to it */
 +   struct vkr_device_memory *mem;
++   /* its object id: the memory can die with its device without this
++    * resource hearing about it, so a reader checks the id still resolves */
++   vkr_object_id mem_id;
 +#endif
 +
     enum virgl_resource_fd_type fd_type;
  
     union {
---- a/src/venus/vkr_device_memory.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_device_memory.c	2026-08-30 14:00:38.660112292 -0700
-@@ -3,6 +3,8 @@
+@@ -78,6 +87,8 @@
+    } ring_monitor;
+ 
+    mtx_t object_mutex;
++   /* held across a scanout readback and across image/memory destruction */
++   mtx_t scanout_mutex;
+    struct hash_table *object_table;
+ 
+    mtx_t resource_mutex;
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -3,7 +3,10 @@
   * SPDX-License-Identifier: MIT
   */
  
 +#include <stdio.h>
 +
  #include "vkr_device_memory.h"
++#include "vkr_image.h"
  
  #include "venus-protocol/vn_protocol_renderer_transport.h"
-@@ -149,17 +151,101 @@
+ 
+@@ -149,17 +152,102 @@
     struct vkr_physical_device *physical_dev = dev->physical_device;
  
     VkMemoryAllocateInfo *alloc_info = (VkMemoryAllocateInfo *)args->pAllocateInfo;
@@ -223,6 +264,7 @@
 +            return;
 +
 +         host_mem->device = dev;
++         list_inithead(&host_mem->bound_images);
 +         host_mem->property_flags =
 +            physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
 +         host_mem->valid_fd_types = 0;
@@ -237,7 +279,43 @@
     if (prev_of_res_info) {
        res_info = (VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
        if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
-@@ -382,6 +468,10 @@
+@@ -252,6 +340,7 @@
+    }
+ 
+    mem->device = dev;
++   list_inithead(&mem->bound_images);
+    mem->property_flags = property_flags;
+    mem->valid_fd_types = valid_fd_types;
+    mem->gbm_bo = gbm_bo;
+@@ -263,6 +352,18 @@
+ vkr_dispatch_vkFreeMemory(struct vn_dispatch_context *dispatch,
+                           struct vn_command_vkFreeMemory *args)
+ {
++   struct vkr_context *scanout_ctx = dispatch->data;
++   mtx_lock(&scanout_ctx->scanout_mutex);
++   {
++      struct vkr_device_memory *freeing = vkr_device_memory_from_handle(args->memory);
++      if (freeing && freeing->bound_images.next) {
++         list_for_each_entry_safe (struct vkr_image, bimg, &freeing->bound_images, mem_head) {
++            list_del(&bimg->mem_head);
++            bimg->bound_mem = NULL;
++         }
++         freeing->bound_image = NULL;
++      }
++   }
+    struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
+    if (!mem)
+       return;
+@@ -275,6 +376,8 @@
+ 
+    vkr_device_memory_release(mem);
+    vkr_device_memory_destroy_and_remove(dispatch->data, args);
++out:
++   mtx_unlock(&scanout_ctx->scanout_mutex);
+ }
+ 
+ static void
+@@ -382,6 +485,10 @@
      * to the same storage.
      */
     if (mem->exported) {
@@ -248,7 +326,7 @@
        vkr_log("mem has been exported");
        return false;
     }
-@@ -406,11 +496,7 @@
+@@ -406,11 +513,7 @@
     enum virgl_resource_fd_type fd_type;
     VkExternalMemoryHandleTypeFlagBits handle_type;
     struct virgl_resource_vulkan_info vulkan_info;
@@ -261,7 +339,7 @@
        fd_type = VIRGL_RESOURCE_FD_DMABUF;
        handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     } else if (can_export_dma_buf) {
-@@ -435,8 +521,17 @@
+@@ -435,8 +538,17 @@
     } else {
  #ifdef __APPLE__
        void *ptr;
@@ -281,22 +359,24 @@
           vkr_log("vkMapMemory failed");
           return false;
        }
---- a/src/venus/vkr_device_memory.h	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_device_memory.h	2026-08-30 13:43:45.750770108 -0700
-@@ -13,6 +13,11 @@
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -13,6 +13,13 @@
  struct vkr_device_memory {
     struct vkr_object base;
  
 +#ifdef __APPLE__
-+   /* the image bound here, if any -- see vkr_dispatch_vkBindImageMemory2 */
++   /* the image bound here most recently, and every image bound here --
++    * see vkr_dispatch_vkBindImageMemory2 */
 +   struct vkr_image *bound_image;
++   struct list_head bound_images;
 +#endif
 +
     struct vkr_device *device;
     uint32_t property_flags;
     uint32_t valid_fd_types;
---- a/src/venus/vkr_device.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_device.c	2026-08-30 13:42:55.614686094 -0700
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
 @@ -84,12 +84,34 @@
     struct vkr_physical_device *physical_dev =
        vkr_physical_device_from_handle(args->physicalDevice);
@@ -382,8 +462,8 @@
     if (args->ret != VK_SUCCESS) {
        free(exts);
        free(dev);
---- a/src/venus/vkr_image.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_image.c	2026-08-30 13:43:45.749799564 -0700
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
 @@ -5,9 +5,51 @@
  
  #include "vkr_image.h"
@@ -436,7 +516,7 @@
  static void
  vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                             struct vn_command_vkCreateImage *args)
-@@ -31,7 +73,56 @@
+@@ -31,14 +73,79 @@
      * situation because the app does not consider the memory external.
      */
  
@@ -494,7 +574,30 @@
  }
  
  static void
-@@ -112,6 +203,19 @@
+ vkr_dispatch_vkDestroyImage(struct vn_dispatch_context *dispatch,
+                             struct vn_command_vkDestroyImage *args)
+ {
++   struct vkr_context *ctx = dispatch->data;
++   mtx_lock(&ctx->scanout_mutex);
++#ifdef __APPLE__
++   {
++      struct vkr_image *dying = vkr_image_from_handle(args->image);
++      if (dying && dying->bound_mem) {
++         struct vkr_device_memory *mem = dying->bound_mem;
++         list_del(&dying->mem_head);
++         dying->bound_mem = NULL;
++         if (mem->bound_image == dying)
++            mem->bound_image = list_is_empty(&mem->bound_images) ? NULL
++               : list_last_entry(&mem->bound_images, struct vkr_image, mem_head);
++      }
++   }
++#endif
+    vkr_image_destroy_and_remove(dispatch->data, args);
++   mtx_unlock(&ctx->scanout_mutex);
+ }
+ 
+ static void
+@@ -112,6 +219,24 @@
     struct vkr_device *dev = vkr_device_from_handle(args->device);
     struct vn_device_proc_table *vk = &dev->proc_table;
  
@@ -506,15 +609,20 @@
 +      struct vkr_image *img = vkr_image_from_handle(args->pBindInfos[i].image);
 +      struct vkr_device_memory *mem =
 +         vkr_device_memory_from_handle(args->pBindInfos[i].memory);
-+      if (img && mem)
++      if (img && mem) {
++         if (img->bound_mem)
++            list_del(&img->mem_head);
++         img->bound_mem = mem;
++         list_addtail(&img->mem_head, &mem->bound_images);
 +         mem->bound_image = img;
++      }
 +   }
 +#endif
 +
     vn_replace_vkBindImageMemory2_args_handle(args);
     args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
  }
-@@ -124,6 +228,29 @@
+@@ -124,6 +249,29 @@
     struct vkr_device *dev = vkr_device_from_handle(args->device);
     struct vn_device_proc_table *vk = &dev->proc_table;
  
@@ -544,7 +652,7 @@
     vn_replace_vkGetImageSubresourceLayout_args_handle(args);
     vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
                                   args->pLayout);
-@@ -134,12 +261,23 @@
+@@ -134,12 +282,23 @@
     UNUSED struct vn_dispatch_context *dispatch,
     struct vn_command_vkGetImageDrmFormatModifierPropertiesEXT *args)
  {
@@ -568,9 +676,9 @@
  }
  
  static void
---- a/src/venus/vkr_image.h	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_image.h	2026-08-29 13:36:47.953493834 -0700
-@@ -10,6 +10,18 @@
+--- a/src/venus/vkr_image.h
++++ b/src/venus/vkr_image.h
+@@ -10,6 +10,22 @@
  
  struct vkr_image {
     struct vkr_object base;
@@ -582,6 +690,10 @@
 +    * answers from these instead.
 +    */
 +   bool drm_modifier;
++   /* every image bound to a memory is kept on that memory's list, so a
++    * scanout read can pick one that matches the picture it wants */
++   struct list_head mem_head;
++   struct vkr_device_memory *bound_mem;
 +   uint32_t width;
 +   uint32_t height;
 +   uint32_t bytes_per_pixel;
@@ -589,8 +701,8 @@
  };
  VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
  
---- a/src/venus/vkr_physical_device.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_physical_device.c	2026-08-30 13:42:55.614047840 -0700
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
 @@ -3,6 +3,8 @@
   * SPDX-License-Identifier: MIT
   */
@@ -921,8 +1033,8 @@
     vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
     vkGetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
                                                    args->pExternalSemaphoreInfo,
---- a/src/venus/vkr_physical_device.h	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_physical_device.h	2026-08-30 13:42:55.613467753 -0700
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
 @@ -25,6 +25,14 @@
     bool EXT_external_memory_dma_buf;
  
@@ -948,8 +1060,8 @@
 +#endif
 +
  #endif /* VKR_PHYSICAL_DEVICE_H */
---- a/src/venus/vkr_queue.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_queue.c	2026-08-30 02:54:21.795544482 -0700
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
 @@ -479,6 +479,16 @@
  
     vn_replace_vkResetFenceResourceMESA_args_handle(args);
@@ -1026,15 +1138,18 @@
  }
  
  static void
---- a/src/venus/vkr_renderer.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_renderer.c	2026-08-30 14:10:44.643682501 -0700
-@@ -8,7 +8,13 @@
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -8,7 +8,16 @@
  #include "venus-protocol/vn_protocol_renderer_info.h"
  #include "virglrenderer_hw.h"
  
 +#include <stdio.h>
 +
++#include <unistd.h>
++
  #include "vkr_context.h"
++#include "vkr_ring.h"
 +#include "vkr_device.h"
 +#include "vkr_device_memory.h"
 +#include "vkr_image.h"
@@ -1042,43 +1157,68 @@
  
  struct vkr_renderer_state {
     const struct vkr_renderer_callbacks *cbs;
-@@ -233,6 +239,142 @@
+@@ -233,6 +242,200 @@
     return vkr_context_import_resource(ctx, res_id, fd_type, fd, size);
  }
  
 +#ifdef __APPLE__
-+bool
-+vkr_renderer_read_resource_pixels(uint32_t ctx_id,
-+                                  uint32_t res_id,
-+                                  void *dst,
-+                                  uint32_t dst_stride,
-+                                  uint32_t width,
-+                                  uint32_t height)
++static bool
++vkr_renderer_read_resource_pixels_locked(struct vkr_context *ctx,
++                                         const struct vkr_resource *res,
++                                         uint32_t res_id,
++                                         void *dst,
++                                         uint32_t dst_stride,
++                                         uint32_t width,
++                                         uint32_t height)
 +{
-+   /* A scanout is issued on the control queue, which carries no context id, so
-+    * find whichever context owns the resource instead of trusting the caller's.
++   /* A device teardown frees the memory behind a resource without telling the
++    * resource, so trust the object table rather than the cached pointer.
 +    */
-+   struct vkr_context *ctx = ctx_id ? vkr_renderer_lookup_context(ctx_id) : NULL;
-+   const struct vkr_resource *res = ctx ? vkr_context_get_resource(ctx, res_id) : NULL;
-+   if (!res) {
-+      list_for_each_entry (struct vkr_context, candidate, &vkr_state.contexts, head) {
-+         const struct vkr_resource *found = vkr_context_get_resource(candidate, res_id);
-+         if (found) {
-+            ctx = candidate;
-+            res = found;
-+            break;
-+         }
++   if (res && res->mem) {
++      mtx_lock(&ctx->object_mutex);
++      const struct hash_entry *live =
++         _mesa_hash_table_search(ctx->object_table, &res->mem_id);
++      const bool ok = live && live->data == res->mem;
++      mtx_unlock(&ctx->object_mutex);
++      if (!ok) {
++         vkr_log("read_resource_pixels: res %u memory is gone", res_id);
++         return false;
 +      }
-+   }
-+   if (!ctx || !res) {
-+      return false;
 +   }
 +   if (!res || !res->mem || !res->mem->bound_image) {
 +      vkr_log("read_resource_pixels: res %u has no image bound", res_id);
 +      return false;
 +   }
 +
-+   const struct vkr_image *img = res->mem->bound_image;
++   /* The memory may carry several images (a buffer imported more than once,
++    * or a small image reusing an allocation); copying a full frame out of a
++    * smaller one reads past its texture. Take the most recently bound image
++    * that covers the requested picture.
++    */
++   const struct vkr_image *img = NULL;
++   if (res->mem->bound_images.next) {
++      list_for_each_entry_rev (struct vkr_image, cand, &res->mem->bound_images, mem_head) {
++         if (cand->drm_modifier && cand->width >= width && cand->height >= height) {
++            img = cand;
++            break;
++         }
++      }
++   }
++   if (!img) {
++      vkr_log("read_resource_pixels: res %u has no image covering %ux%u", res_id, width, height);
++      return false;
++   }
++   {
++      mtx_lock(&ctx->object_mutex);
++      const struct hash_entry *live =
++         _mesa_hash_table_search(ctx->object_table, &img->base.id);
++      const bool ok = live && live->data == img;
++      mtx_unlock(&ctx->object_mutex);
++      if (!ok) {
++         vkr_log("read_resource_pixels: res %u image is gone", res_id);
++         return false;
++      }
++   }
 +   struct vkr_device *dev = res->mem->device;
 +   if (!dev || !dev->physical_device->EXT_host_image_copy)
 +      return false;
@@ -1180,13 +1320,46 @@
 +   vkr_log("read_resource_pixels: copy failed for res %u", res_id);
 +   return false;
 +}
++
++bool
++vkr_renderer_read_resource_pixels(uint32_t ctx_id,
++                                  uint32_t res_id,
++                                  void *dst,
++                                  uint32_t dst_stride,
++                                  uint32_t width,
++                                  uint32_t height)
++{
++   /* A scanout is issued on the control queue, which carries no context id, so
++    * find whichever context owns the resource instead of trusting the caller's.
++    */
++   struct vkr_context *ctx = ctx_id ? vkr_renderer_lookup_context(ctx_id) : NULL;
++   const struct vkr_resource *res = ctx ? vkr_context_get_resource(ctx, res_id) : NULL;
++   if (!res) {
++      list_for_each_entry (struct vkr_context, candidate, &vkr_state.contexts, head) {
++         const struct vkr_resource *found = vkr_context_get_resource(candidate, res_id);
++         if (found) {
++            ctx = candidate;
++            res = found;
++            break;
++         }
++      }
++   }
++   if (!ctx || !res) {
++      return false;
++   }
++   mtx_lock(&ctx->scanout_mutex);
++   const bool ok = vkr_renderer_read_resource_pixels_locked(ctx, res, res_id, dst, dst_stride, width, height);
++   mtx_unlock(&ctx->scanout_mutex);
++   return ok;
++}
++
 +#endif /* __APPLE__ */
 +
  void
  vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id)
  {
---- a/src/venus/vkr_renderer.h	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus/vkr_renderer.h	2026-08-30 13:44:21.862270467 -0700
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
 @@ -72,6 +72,16 @@
                               int fd,
                               uint64_t size);
@@ -1204,8 +1377,8 @@
  void
  vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id);
  
---- a/src/venus_context.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/venus_context.c	2026-08-30 14:00:38.658511199 -0700
+--- a/src/venus_context.c
++++ b/src/venus_context.c
 @@ -1,3 +1,5 @@
 +#include <stdio.h>
 +
@@ -1277,8 +1450,8 @@
        return -1;
     }
  
---- a/src/virglrenderer.c	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/virglrenderer.c	2026-08-30 14:00:38.659594581 -0700
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
 @@ -47,6 +47,7 @@
  #include "vrend_winsys.h"
  
@@ -1321,8 +1494,8 @@
  void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
  {
     TRACE_FUNC();
---- a/src/virglrenderer.h	2025-10-28 03:45:33.000000000 -0700
-+++ b/src/virglrenderer.h	2026-08-30 13:48:52.862726524 -0700
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
 @@ -311,6 +311,16 @@
  
  VIRGL_EXPORT void virgl_renderer_force_ctx_0(void);
