@@ -739,12 +739,21 @@ fn ffmpeg_command(config: VideoConfig, width: u32, height: u32) -> std::process:
             ]);
         }
         Encoder::VideoToolbox => {
+            // Baseline with no B-frames: VideoToolbox writes no VUI, so a
+            // decoder cannot learn the reorder depth from the stream and
+            // buffers frames before showing the first one; browsers treat
+            // Baseline itself as reorder-free and display each frame as it
+            // arrives.
             command.args([
                 "-c:v",
                 "h264_videotoolbox",
                 "-realtime",
                 "1",
                 "-allow_sw",
+                "0",
+                "-profile:v",
+                "baseline",
+                "-bf",
                 "0",
                 "-pix_fmt",
                 "yuv420p",

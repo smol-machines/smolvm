@@ -258,7 +258,7 @@ function startVideo() {
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         resize(view.getUint32(1), view.getUint32(5));
         decoder.configure({
-          codec: "avc1.4D002A",
+          codec: "avc1.42E02A",                                 // Constrained Baseline 4.2
           codedWidth: fbWidth,
           codedHeight: fbHeight,
           hardwareAcceleration: "prefer-hardware",
