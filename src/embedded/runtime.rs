@@ -393,6 +393,7 @@ impl EmbeddedRuntime {
     pub fn stop_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
             let _source_lock = crate::agent::fork::lock_fork_source(name)?;
+            let record = control::get_record(&self.db, name)?;
             let dependents = self.db.dependent_clones(name)?;
             if !dependents.is_empty() {
                 return Err(Error::agent(
@@ -404,7 +405,11 @@ impl EmbeddedRuntime {
                 ));
             }
             if let Some(handle) = self.remove_cached_handle(name)? {
-                lock_handle(&handle)?.stop()?;
+                let mut handle = lock_handle(&handle)?;
+                if !record.staged_mounts.is_empty() {
+                    handle.sync_staged_mounts(&record)?;
+                }
+                handle.stop()?;
                 control::mark_stopped(&self.db, name)?;
                 return Ok(());
             }
@@ -447,9 +452,13 @@ impl EmbeddedRuntime {
                 self.remove_cached_handle(name)?;
                 crate::agent::state_probe::recover_unreachable_machine_in_db(&record, &self.db)?;
             } else if let Some(handle) = self.remove_cached_handle(name)? {
-                let _ = lock_handle(&handle)?.stop();
+                let mut handle = lock_handle(&handle)?;
+                if !record.staged_mounts.is_empty() {
+                    handle.sync_staged_mounts(&record)?;
+                }
+                handle.stop()?;
             } else {
-                let _ = control::stop_vm(&self.db, name);
+                control::stop_vm(&self.db, name)?;
             }
 
             // Idempotent: deleting an already-deleted machine is a no-op success
@@ -461,6 +470,21 @@ impl EmbeddedRuntime {
             }
             self.remove_name_lock(name)?;
             Ok(())
+        })
+    }
+
+    /// Copy guest-local staged mounts back to their host sources without
+    /// stopping the machine.
+    pub fn sync_machine(&self, name: &str) -> Result<()> {
+        self.with_name_lock(name, || {
+            let _source_lock = crate::agent::fork::lock_fork_source(name)?;
+            let record = control::get_record(&self.db, name)?;
+            if record.staged_mounts.is_empty() {
+                return Ok(());
+            }
+            let handle = self.started_handle(name)?;
+            let result = lock_handle(&handle)?.sync_staged_mounts(&record);
+            result
         })
     }
 

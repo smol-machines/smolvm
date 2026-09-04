@@ -563,6 +563,10 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
     manager.try_connect_existing();
+    if !record.staged_mounts.is_empty() {
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+        crate::staged_mount::sync_staged_mounts(&record, &mut client)?;
+    }
     manager.stop()?;
     // Detach the per-machine layers volume if a (possibly cross-tool) bundle start
     // left it mounted. Unconditional on purpose: the embedded record may carry no

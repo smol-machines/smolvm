@@ -154,6 +154,11 @@ impl VmHandle {
         self.client_mut()?.run_streaming_with(config, on_event)
     }
 
+    /// Copy every guest-local staged mount back to its host source.
+    pub fn sync_staged_mounts(&mut self, record: &crate::config::VmRecord) -> Result<()> {
+        crate::staged_mount::sync_staged_mounts(record, self.client_mut()?)
+    }
+
     /// Stop the VM and drop the cached agent client.
     pub fn stop(&mut self) -> Result<()> {
         self.client = None;
