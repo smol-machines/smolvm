@@ -261,7 +261,13 @@ function startVideo() {
           codec: "avc1.42E02A",                                 // Constrained Baseline 4.2
           codedWidth: fbWidth,
           codedHeight: fbHeight,
-          hardwareAcceleration: "prefer-hardware",
+          // The hardware decoder on macOS holds several frames before it
+          // outputs anything, whatever the latency hint says, which both
+          // delays the first picture past the fallback timeout on an idle
+          // desktop and adds a constant lag. Software decode of a desktop-
+          // sized stream costs a few milliseconds a frame and outputs each
+          // chunk as it arrives.
+          hardwareAcceleration: "prefer-software",
           optimizeForLatency: true,
         });
         configured = true;
