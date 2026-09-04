@@ -71,11 +71,22 @@ if [ ! -d /usr/share/omarchy ]; then
   log "installing ${#OK[@]}/${#PKGS[@]} base packages available on aarch64"
   ok=0
   for _ in 1 2 3; do
+    # Mirrors rotate package versions under a stale database, so refresh
+    # before every attempt or the install fails on 404s.
+    pacman -Syy --noconfirm >/dev/null 2>&1
     pacman -S --noconfirm --needed --disable-download-timeout "${OK[@]}" \
       foot grim wayvnc swaybg ttf-nerd-fonts-symbols ttf-jetbrains-mono-nerd \
-      noto-fonts >/tmp/pac.log 2>&1 && { ok=1; break; }
+      noto-fonts waybar mako swayosd hypridle hyprlock alacritty wofi \
+      >/tmp/pac.log 2>&1 && { ok=1; break; }
     sleep 20
   done
+  # Omarchy's launcher (walker) has no aarch64 package; wofi stands in.
+  command -v walker >/dev/null 2>&1 || printf '#!/bin/sh\nexec wofi --show drun "$@"\n' > /usr/local/bin/walker
+  chmod +x /usr/local/bin/walker
+  # Omarchy starts its shell through systemd-cat; there is no journal here,
+  # so a shim drops the logging options and runs the command directly.
+  printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do case $1 in --) shift; break;; -*) shift; [ $# -gt 0 ] && case $1 in -*) ;; *) shift;; esac;; *) break;; esac; done\nexec "$@"\n' > /usr/local/bin/systemd-cat
+  chmod +x /usr/local/bin/systemd-cat
   [ "$ok" = 1 ] || { tail -10 /tmp/pac.log; exit 1; }
 
   # seatd owns the seat group; if its package did not land the groups are
@@ -233,7 +244,7 @@ SEATD_VTBOUND=0 seatd -g wheel >/tmp/seatd.log 2>&1 &
 sleep 2
 
 sudo -u omar env HOME=/home/omar XDG_RUNTIME_DIR=$RT XDG_SESSION_TYPE=wayland \
-  LIBSEAT_BACKEND=seatd AQ_NO_ATOMIC=1 DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus PATH=/usr/local/bin:/usr/bin:/usr/sbin \
+  LIBSEAT_BACKEND=seatd AQ_NO_ATOMIC=1 DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus OMARCHY_PATH=/usr/share/omarchy PATH=/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/usr/sbin \
   $GPU_ENV \
   bash -s <<'INNER'
 set -o pipefail
