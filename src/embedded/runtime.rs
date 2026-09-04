@@ -451,6 +451,13 @@ impl EmbeddedRuntime {
                 // response that cannot arrive.
                 self.remove_cached_handle(name)?;
                 crate::agent::state_probe::recover_unreachable_machine_in_db(&record, &self.db)?;
+            } else if matches!(
+                state,
+                crate::config::RecordState::Stopped | crate::config::RecordState::Created
+            ) {
+                // A graceful stop already synchronized staged mounts. Do not
+                // reconnect to the now-absent agent and fail a subsequent delete.
+                self.remove_cached_handle(name)?;
             } else if let Some(handle) = self.remove_cached_handle(name)? {
                 let mut handle = lock_handle(&handle)?;
                 if !record.staged_mounts.is_empty() {
@@ -1073,6 +1080,19 @@ mod tests {
             .read()
             .expect("name locks should not be poisoned")
             .contains_key("runtime-delete-lock"));
+    }
+
+    #[test]
+    fn delete_already_stopped_staged_machine_does_not_reconnect() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        let mut record = test_spec("delete-stopped-staged", true).to_record();
+        record.state = crate::config::RecordState::Stopped;
+        record.staged_mounts = vec![(0, "/host/work".into(), "/work".into())];
+        db.insert_vm("delete-stopped-staged", &record).unwrap();
+
+        runtime.delete_machine("delete-stopped-staged").unwrap();
+        assert!(db.get_vm("delete-stopped-staged").unwrap().is_none());
     }
 
     #[test]
