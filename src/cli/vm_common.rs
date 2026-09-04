@@ -2663,10 +2663,18 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
         println!("{}", json);
     } else {
         println!(
-            "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
-            "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS", "STORAGE", "OVERLAY"
+            "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}  {:<18}",
+            "NAME",
+            "STATE",
+            "CPUS",
+            "MEMORY",
+            "MOUNTS",
+            "PORTS",
+            "STORAGE",
+            "OVERLAY",
+            "BRANCHED FROM"
         );
-        println!("{}", "-".repeat(88));
+        println!("{}", "-".repeat(108));
 
         for (name, record) in vms {
             let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
@@ -2677,8 +2685,15 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
             };
             let storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
             let overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+            // A branch's source, so a tree of clones reads as a tree rather than
+            // a flat list of unrelated machines.
+            let branched_from = record
+                .golden
+                .as_deref()
+                .map(|g| truncate(g, 16))
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
+                "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}  {:<18}",
                 truncate(name, 18),
                 state_display,
                 record.cpus,
@@ -2687,6 +2702,7 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                 record.ports.len(),
                 format!("{} GiB", storage_gb),
                 format!("{} GiB", overlay_gb),
+                branched_from,
             );
 
             if verbose {
