@@ -511,6 +511,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
+                    .with_mounts(self.mount_bindings_for(name)?)
                     .with_s3_volumes(self.s3_volumes_for(name)?)
                     .with_persistent_overlay(Some(overlay_owner));
                 handle.run_config(config)
@@ -530,9 +531,24 @@ impl EmbeddedRuntime {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let (_, overlay_owner) = self.image_and_overlay_owner(name)?;
+        let mount_bindings = self.mount_bindings_for(name)?;
+        let s3_volumes = self.s3_volumes_for(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.run(image, command, env, workdir, timeout)
+        if mount_bindings.is_empty() && s3_volumes.is_empty() {
+            return handle.run(image, command, env, workdir, timeout);
+        }
+        handle.pull_image(image)?;
+        handle.run_config(
+            RunConfig::new(image, command)
+                .with_env(env)
+                .with_workdir(workdir)
+                .with_timeout(timeout)
+                .with_mounts(mount_bindings)
+                .with_s3_volumes(s3_volumes)
+                .with_persistent_overlay(Some(overlay_owner)),
+        )
     }
 
     /// Pull an OCI image into the machine's storage.
@@ -558,18 +574,20 @@ impl EmbeddedRuntime {
         mode: Option<u32>,
     ) -> Result<()> {
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+        let mount_bindings = self.mount_bindings_for(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        Self::activate_image_overlay(&mut handle, image, overlay_owner)?;
+        Self::activate_image_overlay(&mut handle, image, overlay_owner, mount_bindings)?;
         handle.write_file(path, &data, mode)
     }
 
     /// Read a file from the machine.
     pub fn read_file(&self, name: &str, path: &str) -> Result<Vec<u8>> {
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+        let mount_bindings = self.mount_bindings_for(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        Self::activate_image_overlay(&mut handle, image, overlay_owner)?;
+        Self::activate_image_overlay(&mut handle, image, overlay_owner, mount_bindings)?;
         handle.read_file(path)
     }
 
@@ -580,12 +598,14 @@ impl EmbeddedRuntime {
         handle: &mut VmHandle,
         image: Option<String>,
         overlay_owner: String,
+        mount_bindings: Vec<(String, String, bool)>,
     ) -> Result<()> {
         let Some(image) = image else {
             return Ok(());
         };
         let (code, _, stderr) = handle.run_config(
             RunConfig::new(image, vec!["/bin/true".to_string()])
+                .with_mounts(mount_bindings)
                 .with_persistent_overlay(Some(overlay_owner)),
         )?;
         if code == 0 {
@@ -641,6 +661,11 @@ impl EmbeddedRuntime {
         ))
     }
 
+    fn mount_bindings_for(&self, name: &str) -> Result<Vec<(String, String, bool)>> {
+        let record = control::get_record(&self.db, name)?;
+        Ok(crate::workload::record_mounts_to_bindings(&record))
+    }
+
     /// The machine's image, if it is an image (container-workload) machine.
     /// Streamed execs on such a machine must run inside its persistent container
     /// overlay so their writes survive — matching non-streaming exec.
@@ -692,6 +717,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
+                    .with_mounts(self.mount_bindings_for(name)?)
                     .with_s3_volumes(self.s3_volumes_for(name)?)
                     .with_persistent_overlay(Some(overlay_owner));
                 handle.run_streaming_with(config, on_event)
