@@ -751,10 +751,6 @@ fn ffmpeg_command(config: VideoConfig, width: u32, height: u32) -> std::process:
                 "1",
                 "-allow_sw",
                 "0",
-                "-profile:v",
-                "baseline",
-                "-bf",
-                "0",
                 "-pix_fmt",
                 "yuv420p",
             ]);
@@ -793,9 +789,16 @@ fn ffmpeg_command(config: VideoConfig, width: u32, height: u32) -> std::process:
         (config.bitrate_kbps / u32::from(config.fps)).max(1) * 2
     );
     let gop = config.fps.to_string();
+    // VideoToolbox writes no VUI, so a decoder cannot learn the reorder depth
+    // from the stream and buffers frames before showing the first; browsers
+    // treat Baseline itself as reorder-free and show each frame on arrival.
+    let profile = match config.encoder {
+        Encoder::VideoToolbox => "baseline",
+        _ => "main",
+    };
     command.args([
         "-profile:v",
-        "main",
+        profile,
         "-b:v",
         &bitrate,
         "-maxrate",
