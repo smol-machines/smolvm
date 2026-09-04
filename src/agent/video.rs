@@ -433,11 +433,16 @@ fn feed_frames<W: Write>(
     // The Annex-B parser uses the next AUD as the prior frame's boundary.
     // One duplicate after activity flushes the final changed frame; after
     // that an idle desktop sends no raw pixels at all.
-    let mut needs_flush = true;
-    // Hardware encoders hold a few frames before emitting the first access
-    // unit, so an idle desktop would leave the viewer with nothing and the
-    // page would give up on video. Repeating the unchanged frame slowly
-    // keeps the pipeline primed for a few hundred bytes a second.
+    // Hardware encoders hold several frames before emitting one (VideoToolbox
+    // emits its first access unit after the seventh input), so a lone change
+    // such as a typed character would sit in the encoder until enough later
+    // frames arrive. After every change the unchanged frame is repeated at
+    // the full cadence for this many ticks, which pushes the change through
+    // in a few tens of milliseconds for a few small delta frames.
+    const FLUSH_TICKS: u32 = 8;
+    let mut flush_ticks = FLUSH_TICKS;
+    // Once quiet, the unchanged frame is still repeated slowly so a viewer
+    // that connects to an idle desktop gets a picture at all.
     const IDLE_INTERVAL: Duration = Duration::from_secs(1);
     let mut last_written = Instant::now();
     write_raw_frame(out, &frame)?;
@@ -463,11 +468,11 @@ fn feed_frames<W: Write>(
             frame = newer;
             write_raw_frame(out, &frame)?;
             last_written = Instant::now();
-            needs_flush = true;
-        } else if needs_flush || last_written.elapsed() >= IDLE_INTERVAL {
+            flush_ticks = FLUSH_TICKS;
+        } else if flush_ticks > 0 || last_written.elapsed() >= IDLE_INTERVAL {
             write_raw_frame(out, &frame)?;
             last_written = Instant::now();
-            needs_flush = false;
+            flush_ticks = flush_ticks.saturating_sub(1);
         }
     }
 }
