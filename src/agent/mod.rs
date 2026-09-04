@@ -41,6 +41,12 @@ pub mod video {
         }
     }
 
+    /// Encoded video is never configured on a non-Unix host, so the caller
+    /// does not try to start a helper that cannot exist here.
+    pub fn is_configured() -> bool {
+        false
+    }
+
     /// Non-Unix hosts always serve Raw VNC.
     pub fn is_available() -> bool {
         false
