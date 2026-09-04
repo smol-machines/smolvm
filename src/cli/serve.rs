@@ -28,6 +28,7 @@ API ENDPOINTS:
   POST   /api/v1/machines/:id/start   Start machine
   POST   /api/v1/machines/:id/branches Create a copy-on-write child
   POST   /api/v1/machines/:id/checkpoint Capture a durable checkpoint
+  POST   /api/v1/machines/:id/sync    Synchronize staged mounts
   POST   /api/v1/machines/:id/stop    Stop machine
   POST   /api/v1/machines/:id/exec    Execute command
   DELETE /api/v1/machines/:id         Delete machine

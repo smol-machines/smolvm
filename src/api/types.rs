@@ -44,6 +44,9 @@ pub struct MountSpec {
     /// Read-only mount.
     #[serde(default)]
     pub readonly: bool,
+    /// Use a guest-local working copy and synchronize it in batches.
+    #[serde(default)]
+    pub staged: bool,
 }
 
 /// Mount information (for responses, includes virtiofs tag).
@@ -60,6 +63,8 @@ pub struct MountInfo {
     pub target: String,
     /// Read-only mount.
     pub readonly: bool,
+    /// Whether this is a guest-local staged mount.
+    pub staged: bool,
 }
 
 /// Port mapping specification.

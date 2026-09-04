@@ -465,15 +465,7 @@ impl ApiState {
             }
 
             // Convert VmRecord to MachineEntry
-            let mounts: Vec<MountSpec> = record
-                .mounts
-                .iter()
-                .map(|(source, target, readonly)| MountSpec {
-                    source: source.clone(),
-                    target: target.clone(),
-                    readonly: *readonly,
-                })
-                .collect();
+            let mounts: Vec<MountSpec> = record.host_mounts().iter().map(MountSpec::from).collect();
 
             let ports: Vec<PortSpec> = record
                 .ports
@@ -949,20 +941,25 @@ impl ApiState {
         reg: MachineRegistration,
     ) -> Result<(), ApiError> {
         // Persist to database (with conflict detection)
+        let host_mounts = reg
+            .mounts
+            .iter()
+            .map(HostMount::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        let (mounts, staged_mounts) = HostMount::split_storage_tuples(&host_mounts);
         let mut record = VmRecord::new_with_restart(
             name.clone(),
             reg.resources.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
             reg.resources
                 .memory_mb
                 .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
-            reg.mounts
-                .iter()
-                .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
-                .collect(),
+            mounts,
             reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
             reg.network,
             reg.restart.clone(),
         );
+        record.staged_mounts = staged_mounts;
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
         // Persist egress policy + backend selection from the request (previously
@@ -1375,15 +1372,7 @@ pub async fn ensure_running_and_persist(
     // one, ensure_machine_running early-returns before the config matters.
     if let Ok(Some(record)) = state.lookup_vm(name).await {
         let mut e = entry.lock();
-        e.mounts = record
-            .mounts
-            .iter()
-            .map(|(source, target, readonly)| MountSpec {
-                source: source.clone(),
-                target: target.clone(),
-                readonly: *readonly,
-            })
-            .collect();
+        e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
         e.ports = record
             .ports
             .iter()
@@ -1522,6 +1511,12 @@ impl TryFrom<&MountSpec> for HostMount {
     /// allows relative host paths that are canonicalized against the current
     /// working directory.
     fn try_from(spec: &MountSpec) -> Result<Self, Self::Error> {
+        if spec.readonly && spec.staged {
+            return Err(crate::Error::mount(
+                "validate mount mode",
+                "a mount cannot be both readonly and staged",
+            ));
+        }
         let source = Path::new(&spec.source);
         if !source.is_absolute() {
             return Err(crate::Error::mount(
@@ -1530,7 +1525,9 @@ impl TryFrom<&MountSpec> for HostMount {
             ));
         }
 
-        HostMount::new(&spec.source, &spec.target, spec.readonly)
+        let mut mount = HostMount::new(&spec.source, &spec.target, spec.readonly)?;
+        mount.staged = spec.staged;
+        Ok(mount)
     }
 }
 
@@ -1540,6 +1537,7 @@ impl From<&HostMount> for MountSpec {
             source: mount.source.to_string_lossy().to_string(),
             target: mount.target.to_string_lossy().to_string(),
             readonly: mount.read_only,
+            staged: mount.staged,
         }
     }
 }
@@ -1667,6 +1665,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
                 source: m.source.clone(),
                 target: m.target.clone(),
                 readonly: m.readonly,
+                staged: m.staged,
             })
             .collect(),
         ports: entry.ports.clone(),
@@ -1749,6 +1748,7 @@ mod tests {
             source: "/tmp".into(),
             target: "/guest".into(),
             readonly: true,
+            staged: false,
         };
         assert!(HostMount::try_from(&spec).unwrap().read_only);
 
@@ -1756,6 +1756,7 @@ mod tests {
             source: "/tmp".into(),
             target: "/guest".into(),
             readonly: false,
+            staged: false,
         };
         assert!(!HostMount::try_from(&spec).unwrap().read_only);
 
@@ -1765,6 +1766,7 @@ mod tests {
             source: "/etc".into(),
             target: "/host/etc".into(),
             readonly: true,
+            staged: false,
         };
         assert!(HostMount::try_from(&system_spec).is_err());
 

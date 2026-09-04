@@ -694,6 +694,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         source: dir,
                         target: std::path::PathBuf::from("/opt/smolvm-ring"),
                         read_only: false,
+                        staged: false,
                     });
                 }
             }
@@ -1909,14 +1910,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
         for (i, mount) in mounts.iter().enumerate() {
-            let mount_tag = HostMount::mount_tag(i);
-            let ro_flag = if mount.read_only { "ro" } else { "rw" };
+            let mount_tag = mount.runtime_mount_tag(i);
+            let mode = if mount.staged {
+                "staged"
+            } else if mount.read_only {
+                "ro"
+            } else {
+                "rw"
+            };
             let env_val = format!(
                 "SMOLVM_MOUNT_{}={}:{}:{}",
                 i,
                 mount_tag,
                 mount.target.display(),
-                ro_flag
+                mode
             );
             if let Ok(cstr) = CString::new(env_val) {
                 env_strings.push(cstr);

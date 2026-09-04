@@ -62,17 +62,16 @@ pub struct MachineSpec {
 impl MachineSpec {
     /// Convert the embedded-machine spec into the canonical DB record.
     pub fn to_record(&self) -> VmRecord {
+        let (mounts, staged_mounts) = HostMount::split_storage_tuples(&self.mounts);
         let mut record = VmRecord::new(
             self.name.clone(),
             self.resources.cpus,
             self.resources.memory_mib,
-            self.mounts
-                .iter()
-                .map(HostMount::to_storage_tuple)
-                .collect(),
+            mounts,
             self.ports.iter().map(PortMapping::to_tuple).collect(),
             self.resources.network,
         );
+        record.staged_mounts = staged_mounts;
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();

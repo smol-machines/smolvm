@@ -34,12 +34,16 @@ use super::VmResources;
 pub struct PackedMount {
     /// Virtiofs tag (e.g., "smolvm0").
     pub tag: String,
+    /// Agent/container tag, including staged working-copy identity when used.
+    pub runtime_tag: String,
     /// Host source path (passed to `krun_add_virtiofs`).
     pub host_path: String,
     /// Guest mount path (passed to agent via `SMOLVM_MOUNT_*` env).
     pub guest_path: String,
     /// Whether the mount is read-only.
     pub read_only: bool,
+    /// Whether the guest uses a local staged working copy.
+    pub staged: bool,
 }
 
 /// Configuration for launching a packed VM.
@@ -702,10 +706,16 @@ pub fn launch_agent_vm_dynamic(
 
     // Pass mount info to the agent via environment
     for (i, mount) in config.mounts.iter().enumerate() {
-        let ro_flag = if mount.read_only { "ro" } else { "rw" };
+        let mode = if mount.staged {
+            "staged"
+        } else if mount.read_only {
+            "ro"
+        } else {
+            "rw"
+        };
         let env_val = format!(
             "SMOLVM_MOUNT_{}={}:{}:{}",
-            i, mount.tag, mount.guest_path, ro_flag
+            i, mount.runtime_tag, mount.guest_path, mode
         );
         if let Ok(cstr) = CString::new(env_val) {
             env_strings.push(cstr);

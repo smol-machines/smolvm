@@ -80,6 +80,10 @@ impl FsNotifyWatcher {
             mounts
                 .iter()
                 .enumerate()
+                // A staged mount intentionally has no live host/guest
+                // coherence. Watching it would promise invalidations that the
+                // guest-local working copy cannot observe.
+                .filter(|(_, mount)| !mount.staged)
                 .map(|(i, mount)| (mount.source.clone(), HostMount::mount_tag(i))),
         )
     }

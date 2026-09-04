@@ -559,6 +559,14 @@ pub enum AgentRequest {
         path: String,
     },
 
+    /// Stream a tar archive of a guest directory without creating a guest-side
+    /// temporary file. Used by staged mounts to batch many small files across
+    /// vsock instead of paying one virtiofs round trip per file.
+    ArchiveDirectory {
+        /// Absolute directory path in the VM filesystem.
+        path: String,
+    },
+
     /// Create (without starting) a Kubernetes pod container whose rootfs is a
     /// virtiofs-shared host directory (containerd snapshotter output) and whose
     /// process definition comes from the host's OCI config. The agent builds
@@ -687,6 +695,7 @@ impl AgentRequest {
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
+            AgentRequest::ArchiveDirectory { .. } => "ArchiveDirectory".into(),
             // Pod requests: spec/process JSON may carry env secrets — emit ids only.
             AgentRequest::PodCreate { id, .. } => format!("PodCreate {{ id: {id} }}"),
             AgentRequest::PodStart { id, exec_id } => match exec_id {

@@ -606,13 +606,15 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
 
     // Parse and validate volume mounts
-    let mounts: Vec<(String, String, bool)> =
-        HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?
-            .into_iter()
-            .map(|m| m.to_storage_tuple())
-            .collect();
+    let parsed_mounts =
+        HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?;
+    let (mounts, staged_mounts) = HostMount::split_storage_tuples(&parsed_mounts);
     for volume in &remote_volumes {
-        if mounts.iter().any(|(_, target, _)| target == &volume.target) {
+        if mounts.iter().any(|(_, target, _)| target == &volume.target)
+            || staged_mounts
+                .iter()
+                .any(|(_, _, target)| target == &volume.target)
+        {
             return Err(smolvm::Error::config(
                 "create machine",
                 format!(
@@ -683,6 +685,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
         params.net,
         restart,
     );
+    record.staged_mounts = staged_mounts;
     record.init = params.init.clone();
     record.remote_volumes = remote_volumes;
     record.env = env;
@@ -1806,6 +1809,7 @@ pub fn persist_named_running(
                 r.cpus = o.cpus;
                 r.mem = o.mem;
                 r.mounts = o.mounts.clone();
+                r.staged_mounts = o.staged_mounts.clone();
                 r.ports = o.ports.clone();
                 r.network = o.network;
                 r.network_backend = o.network_backend;
@@ -1847,6 +1851,7 @@ pub struct DefaultVmOverrides {
     pub cpus: u8,
     pub mem: u32,
     pub mounts: Vec<(String, String, bool)>,
+    pub staged_mounts: Vec<(usize, String, String)>,
     pub ports: Vec<(u16, u16)>,
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
@@ -2097,6 +2102,10 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
 
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
+    if !record.staged_mounts.is_empty() {
+        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+        smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
+    }
     manager.stop()?;
 
     // Detach the machine's case-sensitive layers volume now that its process is
@@ -2174,10 +2183,21 @@ fn kill_orphaned_boot_process(name: &str) {
 pub fn stop_vm_default() -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
+    let record = SmolvmConfig::load()
+        .ok()
+        .and_then(|config| config.get_vm("default").cloned());
+
     // try_connect_existing sets internal state if agent is reachable;
     // stop() handles both responsive agents and orphans via PID file.
     manager.try_connect_existing();
     println!("Stopping machine 'default'...");
+    if let Some(record) = record
+        .as_ref()
+        .filter(|record| !record.staged_mounts.is_empty())
+    {
+        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+        smolvm::staged_mount::sync_staged_mounts(record, &mut client)?;
+    }
     manager.stop()?;
 
     // Update database record if it exists
@@ -2405,6 +2425,11 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             RecordState::Running => {
                 let manager = AgentManager::for_vm(name)?;
                 println!("Stopping machine '{}'...", name);
+                if !record.staged_mounts.is_empty() {
+                    let mut client =
+                        smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+                    smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
+                }
                 manager.stop()?;
                 if record.pid.is_some_and(smolvm::process::is_alive) {
                     return Err(smolvm::Error::agent(
@@ -2575,7 +2600,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "cpus": record.cpus,
         "memory_mib": record.mem,
         "pid": record.pid,
-        "mounts": record.mounts.len(),
+        "mounts": record.mounts.len() + record.staged_mounts.len(),
         "ports": record.ports.len(),
         "created_at": record.created_at,
         "storage_gb": record.storage_gb,
@@ -2683,7 +2708,7 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                 state_display,
                 record.cpus,
                 format!("{} MiB", record.mem),
-                record.mounts.len(),
+                record.mounts.len() + record.staged_mounts.len(),
                 record.ports.len(),
                 format!("{} GiB", storage_gb),
                 format!("{} GiB", overlay_gb),
@@ -2907,8 +2932,11 @@ pub fn register_ephemeral_vm(
     mem: u32,
     network: bool,
     image: Option<String>,
+    mounts: &[HostMount],
 ) {
-    let mut record = VmRecord::new(name.to_string(), cpus, mem, vec![], vec![], network);
+    let (live_mounts, staged_mounts) = HostMount::split_storage_tuples(mounts);
+    let mut record = VmRecord::new(name.to_string(), cpus, mem, live_mounts, vec![], network);
+    record.staged_mounts = staged_mounts;
     record.ephemeral = true;
     record.state = RecordState::Running;
     record.pid = pid;

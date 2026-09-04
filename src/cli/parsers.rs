@@ -59,14 +59,20 @@ pub use smolvm::util::{parse_env_list, parse_env_spec};
 /// thin wrappers below ([`mounts_to_virtiofs_bindings`] and
 /// [`record_mounts_to_runconfig_bindings`]) preserve the caller-side
 /// ergonomics.
-fn assign_virtiofs_tags<I>(items: I) -> Vec<(String, String, bool)>
+fn assign_virtiofs_tags<'a, I>(items: I) -> Vec<(String, String, bool)>
 where
-    I: IntoIterator<Item = (String, bool)>,
+    I: IntoIterator<Item = &'a HostMount>,
 {
     items
         .into_iter()
         .enumerate()
-        .map(|(i, (target, ro))| (HostMount::mount_tag(i), target, ro))
+        .map(|(i, mount)| {
+            (
+                mount.runtime_mount_tag(i),
+                mount.target.to_string_lossy().into_owned(),
+                mount.read_only,
+            )
+        })
         .collect()
 }
 
@@ -75,11 +81,7 @@ where
 /// Used by `machine run` paths that already hold the validated, parsed
 /// mount type. See [`assign_virtiofs_tags`] for the tag rule.
 pub fn mounts_to_virtiofs_bindings(mounts: &[HostMount]) -> Vec<(String, String, bool)> {
-    assign_virtiofs_tags(
-        mounts
-            .iter()
-            .map(|m| (m.target.to_string_lossy().into_owned(), m.read_only)),
-    )
+    assign_virtiofs_tags(mounts.iter())
 }
 
 /// Convert a `VmRecord`-style mount list to virtiofs binding format.
@@ -91,11 +93,13 @@ pub fn mounts_to_virtiofs_bindings(mounts: &[HostMount]) -> Vec<(String, String,
 pub fn record_mounts_to_runconfig_bindings(
     mounts: &[(String, String, bool)],
 ) -> Vec<(String, String, bool)> {
-    assign_virtiofs_tags(
-        mounts
-            .iter()
-            .map(|(_host, target, ro)| (target.clone(), *ro)),
-    )
+    let host_mounts = mounts
+        .iter()
+        .map(|(source, target, read_only)| {
+            HostMount::from_storage_tuple(source.clone(), target.clone(), *read_only)
+        })
+        .collect::<Vec<_>>();
+    assign_virtiofs_tags(host_mounts.iter())
 }
 
 // Network helpers delegated to the library.
@@ -212,11 +216,12 @@ mod tests {
         // around this — pin the indexing rule here so neither wrapper
         // can drift away from the canonical "smolvm{i}" naming or from
         // preserving caller order.
-        let out = assign_virtiofs_tags(vec![
-            ("/a".to_string(), false),
-            ("/b".to_string(), true),
-            ("/c".to_string(), false),
-        ]);
+        let mounts = [
+            HostMount::from_storage_tuple("/tmp".into(), "/a".into(), false),
+            HostMount::from_storage_tuple("/tmp".into(), "/b".into(), true),
+            HostMount::from_storage_tuple("/tmp".into(), "/c".into(), false),
+        ];
+        let out = assign_virtiofs_tags(mounts.iter());
         assert_eq!(
             out,
             vec![
@@ -238,11 +243,38 @@ mod tests {
             source: PathBuf::from("/tmp"), // any existing dir; not validated by the converter
             target: PathBuf::from("/app"),
             read_only: true,
+            staged: false,
         };
         let from_parsed = mounts_to_virtiofs_bindings(&[host_mount]);
         let from_record =
             record_mounts_to_runconfig_bindings(&[("/tmp".to_string(), "/app".to_string(), true)]);
         assert_eq!(from_parsed, from_record);
+    }
+
+    #[test]
+    fn staged_binding_keeps_device_index_and_marks_guest_local_mode() {
+        use std::path::PathBuf;
+        let mounts = vec![
+            HostMount {
+                source: PathBuf::from("/tmp"),
+                target: PathBuf::from("/live"),
+                read_only: false,
+                staged: false,
+            },
+            HostMount {
+                source: PathBuf::from("/tmp"),
+                target: PathBuf::from("/staged"),
+                read_only: false,
+                staged: true,
+            },
+        ];
+        assert_eq!(
+            mounts_to_virtiofs_bindings(&mounts),
+            vec![
+                ("smolvm0".into(), "/live".into(), false),
+                (mounts[1].runtime_mount_tag(1), "/staged".into(), false),
+            ]
+        );
     }
 
     #[test]

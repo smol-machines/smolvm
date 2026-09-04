@@ -379,6 +379,9 @@ pub enum MachineCmd {
     /// Copy files between host and machine
     Cp(CpCmd),
 
+    /// Synchronize guest-local staged mounts back to their host directories
+    Sync(SyncCmd),
+
     /// Monitor a machine with health checks and restart policy
     Monitor(MonitorCmd),
 
@@ -428,6 +431,7 @@ impl MachineCmd {
             MachineCmd::Prune(cmd) => cmd.run(),
             MachineCmd::Shell(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
+            MachineCmd::Sync(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
             MachineCmd::DataDir(cmd) => cmd.run(),
@@ -531,11 +535,13 @@ pub struct RunCmd {
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
     /// for R2/MinIO; anonymous without them). Nothing is required of the
-    /// image: the agent performs the mount itself.
+    /// image: the agent performs the mount itself. `:staged` runs from a
+    /// guest-local copy for metadata-heavy workloads; `machine sync` and
+    /// graceful stop copy it back, so do not modify its host source concurrently.
     #[arg(
         short = 'v',
         long = "volume",
-        value_name = "HOST|REMOTE:CONTAINER[:ro]",
+        value_name = "HOST|REMOTE:CONTAINER[:ro|rw|staged]",
         help_heading = "Container"
     )]
     pub volume: Vec<String>,
@@ -1633,6 +1639,7 @@ impl RunCmd {
                 params.mem,
                 params.net,
                 image.clone(),
+                &mounts,
             );
         }
 
@@ -1703,16 +1710,7 @@ impl RunCmd {
             // tuples the runner expects. This is a thin local conversion;
             // the runner does its own tag assignment internally so call
             // sites don't have to track which form the agent wants.
-            let record_mounts: Vec<(String, String, bool)> = mounts
-                .iter()
-                .map(|m| {
-                    (
-                        m.source.to_string_lossy().into_owned(),
-                        m.target.to_string_lossy().into_owned(),
-                        m.read_only,
-                    )
-                })
-                .collect();
+            let (record_mounts, _) = HostMount::split_storage_tuples(&mounts);
             let mut init_env = parse_env_list(&params.env);
             init_env.extend(resolved_secrets.iter().cloned());
             // Use the machine name as the overlay ID so any rootfs changes
@@ -1805,16 +1803,7 @@ impl RunCmd {
                 {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
-                    let mount_tuples: Vec<(String, String, bool)> = mounts
-                        .iter()
-                        .map(|m| {
-                            (
-                                m.source.to_string_lossy().to_string(),
-                                m.target.to_string_lossy().to_string(),
-                                m.read_only,
-                            )
-                        })
-                        .collect();
+                    let (mount_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
                     let persist_result = SmolvmConfig::load().and_then(|mut config| {
@@ -1830,6 +1819,7 @@ impl RunCmd {
                                 cpus: params.cpus,
                                 mem: params.mem,
                                 mounts: mount_tuples,
+                                staged_mounts,
                                 ports: port_tuples,
                                 network: params.net,
                                 network_backend: params.network_backend,
@@ -1935,6 +1925,21 @@ impl RunCmd {
                     exit_code
                 };
 
+                if mounts.iter().any(|mount| mount.staged) {
+                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                        // Preserve the VM and its ephemeral DB record so the
+                        // guest-local copy remains recoverable and sync can be
+                        // retried by machine name.
+                        manager.detach();
+                        return Err(Error::agent(
+                            "sync staged mounts",
+                            format!(
+                                "{error}; machine '{vm_name}' was left running so synchronization can be retried"
+                            ),
+                        ));
+                    }
+                }
+
                 // Ephemeral run — tear down VM and its data directory.
                 // Spawn a detached helper so the parent exits immediately after
                 // flushing output. Falls back to synchronous cleanup if spawn fails.
@@ -1971,16 +1976,7 @@ impl RunCmd {
                 {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
-                    let mount_tuples: Vec<(String, String, bool)> = mounts
-                        .iter()
-                        .map(|m| {
-                            (
-                                m.source.to_string_lossy().to_string(),
-                                m.target.to_string_lossy().to_string(),
-                                m.read_only,
-                            )
-                        })
-                        .collect();
+                    let (mount_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
                     let mut config = SmolvmConfig::load()?;
@@ -1995,6 +1991,7 @@ impl RunCmd {
                             cpus: params.cpus,
                             mem: params.mem,
                             mounts: mount_tuples,
+                            staged_mounts,
                             ports: port_tuples,
                             network: params.net,
                             network_backend: params.network_backend,
@@ -2090,6 +2087,17 @@ impl RunCmd {
                     flush_output();
                     exit_code
                 };
+                if mounts.iter().any(|mount| mount.staged) {
+                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                        manager.detach();
+                        return Err(Error::agent(
+                            "sync staged mounts",
+                            format!(
+                                "{error}; machine '{vm_name}' was left running so synchronization can be retried"
+                            ),
+                        ));
+                    }
+                }
                 // Ephemeral run — tear down VM and its data directory.
                 // Spawn a detached helper so the parent exits immediately after
                 // flushing output. Falls back to synchronous cleanup if spawn fails.
@@ -3101,8 +3109,14 @@ pub struct CreateCmd {
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
     /// for R2/MinIO; anonymous without them). Nothing is required of the
-    /// image: the agent performs the mount itself.
-    #[arg(short = 'v', long = "volume", value_name = "HOST|REMOTE:GUEST[:ro]")]
+    /// image: the agent performs the mount itself. `:staged` runs from a
+    /// guest-local copy for metadata-heavy workloads; `machine sync` and
+    /// graceful stop copy it back, so do not modify its host source concurrently.
+    #[arg(
+        short = 'v',
+        long = "volume",
+        value_name = "HOST|REMOTE:GUEST[:ro|rw|staged]"
+    )]
     pub volume: Vec<String>,
 
     /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
@@ -4475,8 +4489,9 @@ pub struct UpdateCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: String,
 
-    /// Add volume mount (HOST:GUEST[:ro])
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Add volume mount. A staged mount is guest-local until sync or graceful stop;
+    /// do not modify its host source concurrently.
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     pub volume: Vec<String>,
 
     /// Allow adding trusted read-only host `/etc` and `/var/log` mounts below
@@ -4632,47 +4647,39 @@ impl UpdateCmd {
                 .map_err(|e| smolvm::Error::config("update", e))?;
         }
 
-        // Validate no duplicate guest mount targets after proposed changes. The
-        // merge below only skips an exact (source,target) re-add, so a new mount
-        // whose guest target collides with a DIFFERENT existing source would
-        // otherwise leave two virtiofs mounts at one guest path — the ambiguous
-        // config create-time validation rejects. Mirror the port check above by
-        // computing the final mount set exactly as the DB closure does, then
-        // rejecting duplicate targets.
-        {
-            let mut final_mounts: Vec<(String, String, bool)> = record.mounts.clone();
-            for rm in &self.remove_volume {
-                let canonical_rm = if let Some((rm_src, rm_tgt)) = rm.split_once(':') {
-                    let resolved = std::fs::canonicalize(rm_src)
-                        .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
-                    format!("{}:{}", resolved.display(), rm_tgt)
-                } else {
-                    rm.clone()
-                };
-                final_mounts.retain(|(src, tgt, _)| {
-                    let spec = format!("{}:{}", src, tgt);
-                    spec != canonical_rm && spec != *rm
-                });
-            }
-            for m in &new_mounts {
-                let tuple = m.to_storage_tuple();
-                if !final_mounts
-                    .iter()
-                    .any(|(s, t, _)| *s == tuple.0 && *t == tuple.1)
-                {
-                    final_mounts.push(tuple);
-                }
-            }
-            let mut seen = std::collections::HashSet::new();
-            for (_, tgt, _) in &final_mounts {
-                if !seen.insert(tgt.clone()) {
-                    return Err(smolvm::Error::config(
-                        "update",
-                        format!("duplicate mount target: {tgt} is specified more than once"),
-                    ));
-                }
+        // Compute the complete mount set in its rich form so changing a stopped
+        // machine cannot lose the staged/live distinction or mount order.
+        let mut final_mounts = record.host_mounts();
+        for rm in &self.remove_volume {
+            let rm_without_mode = rm
+                .strip_suffix(":ro")
+                .or_else(|| rm.strip_suffix(":rw"))
+                .or_else(|| rm.strip_suffix(":staged"))
+                .unwrap_or(rm);
+            let canonical_rm = if let Some((rm_src, rm_tgt)) = rm_without_mode.rsplit_once(':') {
+                let resolved = std::fs::canonicalize(rm_src)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
+                Some((resolved, std::path::PathBuf::from(rm_tgt)))
+            } else {
+                None
+            };
+            final_mounts.retain(|mount| {
+                canonical_rm.as_ref().is_none_or(|(source, target)| {
+                    mount.source != *source || mount.target != *target
+                })
+            });
+        }
+        for mount in &new_mounts {
+            if !final_mounts
+                .iter()
+                .any(|current| current.source == mount.source && current.target == mount.target)
+            {
+                final_mounts.push(mount.clone());
             }
         }
+        HostMount::ensure_unique_targets(&final_mounts)?;
+        let (final_live_mounts, final_staged_mounts) =
+            HostMount::split_storage_tuples(&final_mounts);
 
         // Expand physical disk files before the DB write. If expansion fails,
         // no DB changes are made — the record stays consistent.
@@ -4692,41 +4699,27 @@ impl UpdateCmd {
             if let Some(o) = self.overlay {
                 r.overlay_gb = Some(o);
             }
-            // Volumes: add new, remove specified.
-            // Canonicalize the remove spec's source path so ./src matches
-            // the stored /absolute/path/to/src.
-            for rm in &self.remove_volume {
-                let canonical_rm = if let Some((rm_src, rm_tgt)) = rm.split_once(':') {
-                    let resolved = std::fs::canonicalize(rm_src)
-                        .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
-                    format!("{}:{}", resolved.display(), rm_tgt)
-                } else {
-                    rm.clone()
-                };
-                let before = r.mounts.len();
-                r.mounts.retain(|(src, tgt, _)| {
-                    let spec = format!("{}:{}", src, tgt);
-                    spec != canonical_rm && spec != *rm
-                });
-                if r.mounts.len() < before {
-                    changes.push(format!("  removed volume: {}", rm));
+            if !self.remove_volume.is_empty() || !new_mounts.is_empty() {
+                for rm in &self.remove_volume {
+                    changes.push(format!("  removed volume: {rm}"));
                 }
-            }
-            for m in &new_mounts {
-                let tuple = m.to_storage_tuple();
-                if !r
-                    .mounts
-                    .iter()
-                    .any(|(s, t, _)| *s == tuple.0 && *t == tuple.1)
-                {
+                for mount in &new_mounts {
+                    let mode = if mount.staged {
+                        ":staged"
+                    } else if mount.read_only {
+                        ":ro"
+                    } else {
+                        ""
+                    };
                     changes.push(format!(
                         "  added volume: {}:{}{}",
-                        tuple.0,
-                        tuple.1,
-                        if tuple.2 { ":ro" } else { "" }
+                        mount.source.display(),
+                        mount.target.display(),
+                        mode
                     ));
-                    r.mounts.push(tuple);
                 }
+                r.mounts = final_live_mounts.clone();
+                r.staged_mounts = final_staged_mounts.clone();
             }
 
             // Ports: add new, remove specified
@@ -5289,6 +5282,41 @@ impl CpCmd {
             bar.finish(size);
         }
 
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Sync Command
+// ============================================================================
+
+/// Synchronize staged mounts from a running machine to their host sources.
+#[derive(Args, Debug)]
+pub struct SyncCmd {
+    /// Machine to synchronize (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl SyncCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = self.name.unwrap_or_else(|| "default".to_string());
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db
+            .get_vm(&name)?
+            .ok_or_else(|| smolvm::Error::vm_not_found(&name))?;
+        if record.staged_mounts.is_empty() {
+            println!("Machine '{name}' has no staged mounts");
+            return Ok(());
+        }
+
+        let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
+        let (manager, mut client) = vm_common::ensure_running_and_connect(&Some(name.clone()))?;
+        // This command observes an existing persistent VM; a failed sync must
+        // leave it running so the user can fix the cause and retry.
+        manager.detach();
+        smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
+        println!("Synchronized staged mounts for '{name}'");
         Ok(())
     }
 }

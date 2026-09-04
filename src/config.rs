@@ -394,6 +394,13 @@ pub struct VmRecord {
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
 
+    /// Guest-local working trees synchronized with host directories in
+    /// batches. Kept separate from `mounts` so existing records retain their
+    /// tuple encoding and cannot accidentally reinterpret a staged mount as a
+    /// live writable virtiofs mount.
+    #[serde(default)]
+    pub staged_mounts: Vec<(usize, String, String)>,
+
     /// Port mappings (host_port, guest_port).
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
@@ -675,6 +682,7 @@ impl VmRecord {
             cpus,
             mem,
             mounts,
+            staged_mounts: Vec::new(),
             ports,
             published_sockets: Vec::new(),
             network,
@@ -743,6 +751,7 @@ impl VmRecord {
             cpus,
             mem,
             mounts,
+            staged_mounts: Vec::new(),
             ports,
             published_sockets: Vec::new(),
             network,
@@ -819,14 +828,42 @@ impl VmRecord {
 
     /// Convert stored mounts to HostMount format.
     pub fn host_mounts(&self) -> Vec<crate::data::storage::HostMount> {
-        self.mounts
+        let mut live = self
+            .mounts
             .iter()
             .map(|(host, guest, ro)| crate::data::storage::HostMount {
                 source: std::path::PathBuf::from(host),
                 target: std::path::PathBuf::from(guest),
                 read_only: *ro,
+                staged: false,
             })
-            .collect()
+            .collect::<std::collections::VecDeque<_>>();
+        let staged = self
+            .staged_mounts
+            .iter()
+            .map(|(index, host, guest)| {
+                (
+                    *index,
+                    crate::data::storage::HostMount::from_staged_storage_tuple(
+                        host.clone(),
+                        guest.clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let total = live.len() + staged.len();
+        let mut mounts = Vec::with_capacity(total);
+        for index in 0..total {
+            if let Some(mount) = staged.get(&index) {
+                mounts.push(mount.clone());
+            } else if let Some(mount) = live.pop_front() {
+                mounts.push(mount);
+            }
+        }
+        // Malformed records with duplicate/out-of-range staged indices remain
+        // inspectable rather than silently dropping their live mounts.
+        mounts.extend(live);
+        mounts
     }
 
     /// Convert stored ports to PortMapping format.

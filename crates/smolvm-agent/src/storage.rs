@@ -327,6 +327,35 @@ static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Global state for boot-time volume mounts.
 /// Set at startup if SMOLVM_MOUNT_COUNT env var is present.
 static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new();
+static BOOT_VOLUME_MOUNTS_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Prefix used only inside the guest agent's mount table. Runtime tags are
+/// `staged+<stable-id>+<device-tag>`: the virtiofs device keeps `device-tag`,
+/// while `stable-id` prevents reordered/replaced mounts from reusing stale data.
+const STAGED_MOUNT_TAG_PREFIX: &str = "staged+";
+const STAGED_MOUNT_ROOT: &str = "/storage/staged-mounts";
+
+fn split_staged_mount_tag(tag: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = tag.strip_prefix(STAGED_MOUNT_TAG_PREFIX) {
+        if let Some((working_id, device_tag)) = rest.split_once('+') {
+            return (device_tag, Some(working_id));
+        }
+    }
+    (tag, None)
+}
+
+/// Path a workload container should bind for a prepared mount.
+/// Staged mounts bind the guest-local working copy; live mounts bind the
+/// virtiofs staging directory.
+pub fn volume_bind_source(tag: &str) -> PathBuf {
+    let (device_tag, staged_id) = split_staged_mount_tag(tag);
+    if let Some(staged_id) = staged_id {
+        Path::new(STAGED_MOUNT_ROOT).join(staged_id)
+    } else {
+        Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(device_tag)
+    }
+}
 
 /// Mount a virtiofs device with one policy for every host-backed filesystem:
 /// request DAX first, then fall back to the normal buffered data path when the
@@ -437,6 +466,25 @@ pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
     PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
 }
 
+/// Whether any boot-time mount needs the persistent guest storage disk.
+///
+/// Live virtiofs mounts can be initialized before `/storage` is available, but
+/// staged mounts place their working copy there and must not race the deferred
+/// storage mount.
+pub fn staged_boot_mount_requested() -> bool {
+    let count = std::env::var("SMOLVM_MOUNT_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    (0..count).any(|index| {
+        std::env::var(format!("SMOLVM_MOUNT_{index}")).is_ok_and(|value| value.ends_with(":staged"))
+    })
+}
+
+pub fn boot_volume_mounts_failed() -> bool {
+    BOOT_VOLUME_MOUNTS_FAILED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Initialize volume mounts at boot by reading SMOLVM_MOUNT_* env vars.
 ///
 /// The host launcher sets:
@@ -478,18 +526,36 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
                 continue;
             }
 
+            let staged = parts[2] == "staged";
+            if staged && split_staged_mount_tag(parts[0]).1.is_none() {
+                BOOT_VOLUME_MOUNTS_FAILED.store(true, std::sync::atomic::Ordering::Release);
+                warn!(key = %env_key, "staged mount is missing its stable working-copy identity");
+                continue;
+            }
             let tag = parts[0].to_string();
             let guest_path = parts[1].to_string();
             let read_only = parts[2] == "ro";
 
-            info!(tag = %tag, guest_path = %guest_path, read_only = read_only, "boot volume mount");
+            info!(tag = %tag, guest_path = %guest_path, read_only, staged, "boot volume mount");
             mounts.push((tag, guest_path, read_only));
+        }
+
+        if mounts
+            .iter()
+            .any(|(tag, _, _)| split_staged_mount_tag(tag).1.is_some())
+        {
+            if let Err(error) = prune_staged_working_copies(&mounts) {
+                BOOT_VOLUME_MOUNTS_FAILED.store(true, std::sync::atomic::Ordering::Release);
+                warn!(error = %error, "failed to prune stale staged working copies");
+                return mounts;
+            }
         }
 
         // Mount using existing logic with empty rootfs prefix so bind mounts
         // go to absolute guest paths (e.g., "/data"), visible to VmExec.
         if !mounts.is_empty() {
             if let Err(e) = setup_volume_mounts("/", &mounts) {
+                BOOT_VOLUME_MOUNTS_FAILED.store(true, std::sync::atomic::Ordering::Release);
                 warn!(error = %e, "failed to setup boot volume mounts");
             }
         }
@@ -520,7 +586,8 @@ pub fn repair_boot_volume_mounts() -> Result<()> {
 
     for mount in &missing {
         let (tag, target, _) = mount;
-        let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let (device_tag, _) = split_staged_mount_tag(tag);
+        let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(device_tag);
         if is_mountpoint(&staging) {
             detach_mount(&staging);
         }
@@ -531,7 +598,7 @@ pub fn repair_boot_volume_mounts() -> Result<()> {
                 tag, target
             )));
         }
-        info!(tag = %tag, target = %target, "restored boot volume mount after clone resume");
+        info!(tag = %device_tag, target = %target, "restored boot volume mount after clone resume");
     }
     Ok(())
 }
@@ -3311,7 +3378,7 @@ pub fn run_command(
             let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
             spec.add_gpu_devices_if_available();
             for (tag, container_path, read_only) in mounts {
-                let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+                let virtiofs_mount = volume_bind_source(tag);
                 spec.add_bind_mount(
                     &virtiofs_mount.to_string_lossy(),
                     container_path,
@@ -3435,7 +3502,7 @@ pub fn spawn_in_overlay(
     let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
 
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = volume_bind_source(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,
@@ -3537,12 +3604,14 @@ where
 /// Request mounts merged with the BOOT env mounts (SMOLVM_MOUNT_*): boot-time
 /// binds land in a rootfs the workload's overlay later mounts OVER, so
 /// launcher-injected mounts (e.g. the CUDA ring mount) must ride every
-/// container's own mount list. Request entries win on target collision.
+/// container's own mount list. Boot entries win on target collision because
+/// they retain the launch-time positional tag and staged/live mode; a caller
+/// rebuilding bindings from an older persisted shape may not have either.
 pub fn merged_with_boot_mounts(mounts: &[(String, String, bool)]) -> Vec<(String, String, bool)> {
-    let mut v: Vec<(String, String, bool)> = mounts.to_vec();
-    for bm in init_volume_mounts() {
-        if !v.iter().any(|(_, t, _)| t == &bm.1) {
-            v.push(bm.clone());
+    let mut v = init_volume_mounts().to_vec();
+    for mount in mounts {
+        if !v.iter().any(|(_, target, _)| target == &mount.1) {
+            v.push(mount.clone());
         }
     }
     v
@@ -3560,26 +3629,40 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     let rootfs_path = Path::new(rootfs);
 
     for (tag, container_path, read_only) in mounts {
-        validate_storage_id(tag, "mount tag")?;
-        debug!(tag = %tag, container_path = %container_path, read_only = %read_only, "setting up volume mount");
+        let (device_tag, staged_id) = split_staged_mount_tag(tag);
+        let staged = staged_id.is_some();
+        validate_storage_id(device_tag, "mount tag")?;
+        if let Some(staged_id) = staged_id {
+            validate_storage_id(staged_id, "staged mount identity")?;
+        }
+        debug!(tag = %device_tag, container_path = %container_path, read_only = %read_only, staged, "setting up volume mount");
 
         // First, mount the virtiofs device at a staging location
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(device_tag);
         std::fs::create_dir_all(&virtiofs_mount)?;
 
         // Check if already mounted
         if !is_mountpoint(&virtiofs_mount) {
-            info!(tag = %tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
+            info!(tag = %device_tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
 
-            let dax = match mount_virtiofs(tag, &virtiofs_mount) {
+            let dax = match mount_virtiofs(device_tag, &virtiofs_mount) {
                 Ok(dax) => dax,
                 Err(err) => {
-                    warn!(error = %err, tag = %tag, "failed to mount virtiofs device");
+                    warn!(error = %err, tag = %device_tag, "failed to mount virtiofs device");
+                    if staged {
+                        return Err(err.into());
+                    }
                     continue;
                 }
             };
-            info!(tag = %tag, dax, "virtiofs mount active");
+            info!(tag = %device_tag, dax, "virtiofs mount active");
         }
+
+        let bind_source = if staged {
+            ensure_staged_working_copy(staged_id.expect("checked staged id"), &virtiofs_mount)?
+        } else {
+            virtiofs_mount.clone()
+        };
 
         // Now bind-mount into the container rootfs
         let target_path = ensure_mount_target_under_root(rootfs_path, container_path)?;
@@ -3587,16 +3670,18 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         // Check if already bind-mounted
         if !is_mountpoint(&target_path) {
             info!(
-                source = %virtiofs_mount.display(),
+                source = %bind_source.display(),
                 target = %target_path.display(),
                 read_only = %read_only,
                 "bind-mounting into container"
             );
 
             // Bind mount using direct syscall
-            let bind_src = std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref())
-                .map_err(|e| StorageError::Internal {
-                    message: format!("invalid source: {}", e),
+            let bind_src =
+                std::ffi::CString::new(bind_source.to_string_lossy().as_ref()).map_err(|e| {
+                    StorageError::Internal {
+                        message: format!("invalid source: {}", e),
+                    }
                 })?;
             let bind_dst =
                 std::ffi::CString::new(target_path.to_string_lossy().as_ref()).map_err(|e| {
@@ -3617,6 +3702,13 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 warn!(error = %err, target = %target_path.display(), "failed to bind-mount");
+                if staged {
+                    return Err(StorageError::new(format!(
+                        "failed to bind staged mount '{}' at '{}': {err}",
+                        device_tag,
+                        target_path.display()
+                    )));
+                }
                 continue;
             }
 
@@ -3639,6 +3731,87 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     }
 
     Ok(mounted_paths)
+}
+
+/// Materialize a host share once into the guest storage disk. The temporary
+/// directory and atomic rename mean an interrupted first boot can never leave
+/// a partially seeded working tree looking complete on the next start.
+#[cfg(target_os = "linux")]
+fn ensure_staged_working_copy(tag: &str, source: &Path) -> Result<PathBuf> {
+    use std::process::{Command, Stdio};
+
+    validate_storage_id(tag, "staged mount tag")?;
+    let root = Path::new(STAGED_MOUNT_ROOT);
+    std::fs::create_dir_all(root)?;
+    let destination = root.join(tag);
+    if destination.exists() {
+        return Ok(destination);
+    }
+
+    let temporary = root.join(format!(".{tag}.seed-{}", std::process::id()));
+    if temporary.exists() {
+        std::fs::remove_dir_all(&temporary)?;
+    }
+    std::fs::create_dir(&temporary)?;
+
+    let mut producer = Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(source)
+        .arg(".")
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| StorageError::new(format!("start staged mount archive: {error}")))?;
+    let producer_stdout = producer
+        .stdout
+        .take()
+        .ok_or_else(|| StorageError::new("staged mount archive stdout was not captured"))?;
+    let consumer_status = Command::new("tar")
+        .args(["-xf", "-", "-C"])
+        .arg(&temporary)
+        .stdin(Stdio::from(producer_stdout))
+        .status()
+        .map_err(|error| StorageError::new(format!("extract staged mount archive: {error}")))?;
+    let producer_status = producer
+        .wait()
+        .map_err(|error| StorageError::new(format!("wait for staged mount archive: {error}")))?;
+    if !producer_status.success() || !consumer_status.success() {
+        let _ = std::fs::remove_dir_all(&temporary);
+        return Err(StorageError::new(format!(
+            "staged mount seed failed (archive={producer_status}, extract={consumer_status})"
+        )));
+    }
+    std::fs::rename(&temporary, &destination)?;
+    Ok(destination)
+}
+
+#[cfg(target_os = "linux")]
+pub fn prune_staged_working_copies(mounts: &[(String, String, bool)]) -> Result<()> {
+    let root = Path::new(STAGED_MOUNT_ROOT);
+    if !root.exists() {
+        return Ok(());
+    }
+    let wanted = mounts
+        .iter()
+        .filter_map(|(tag, _, _)| split_staged_mount_tag(tag).1)
+        .collect::<std::collections::HashSet<_>>();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !wanted.contains(name.to_string_lossy().as_ref()) {
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn prune_staged_working_copies(_mounts: &[(String, String, bool)]) -> Result<()> {
+    Ok(())
 }
 
 /// Stub for non-Linux platforms.

@@ -27,7 +27,7 @@
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
 //! | `ports` | string[] | No | Port mappings (`"host:guest"` or equal-length `"host-start-host-end:guest-start-guest-end"` ranges). Prefer `[dev] ports`. |
-//! | `volumes` | string[] | No | Volume mounts (`"host:guest"`). Prefer `[dev] volumes`. |
+//! | `volumes` | string[] | No | Volume mounts (`"host:guest[:ro|rw|staged]"`). Prefer `[dev] volumes`. |
 //! | `init` | string[] | No | Commands run on every VM start. Prefer `[dev] init`. |
 //!
 //! ## Sections
@@ -38,7 +38,7 @@
 //!
 //! | Field | Type | Description |
 //! |-------|------|-------------|
-//! | `volumes` | string[] | Bind mounts (`"./src:/app"`) |
+//! | `volumes` | string[] | Mounts (`"./src:/app[:ro|rw|staged]"`) |
 //! | `env` | string[] | Dev-only environment variables |
 //! | `init` | string[] | Bootstrap commands run on start |
 //! | `workdir` | string | Dev working directory override |

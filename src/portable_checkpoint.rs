@@ -838,7 +838,7 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
 pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     let mut unsupported = Vec::new();
-    if !vm.mounts.is_empty() {
+    if !vm.mounts.is_empty() || !vm.staged_mounts.is_empty() {
         unsupported.push("host mounts");
     }
     if !vm.published_sockets.is_empty() {

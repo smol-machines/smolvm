@@ -1508,6 +1508,12 @@ pub(crate) fn prepare_forks_reusing(
     let golden_rec = db
         .get_vm(golden)?
         .ok_or_else(|| Error::vm_not_found(golden))?;
+    if !golden_rec.staged_mounts.is_empty() {
+        return Err(Error::config(
+            "fork",
+            "staged mounts cannot be branched yet because multiple descendants would synchronize into the same host directory; use a live rw mount or remove the staged mount first",
+        ));
+    }
     let child_depth = db
         .fork_lineage_depth(golden)?
         .checked_add(1)

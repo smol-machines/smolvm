@@ -98,6 +98,7 @@ use state::ApiState;
         handlers::machines::fork_machine,
         handlers::machines::release_held_fork,
         handlers::machines::stop_machine,
+        handlers::machines::sync_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
         handlers::machines::export_machine,
@@ -282,6 +283,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             post(handlers::machines::release_held_fork),
         )
         .route("/{id}/stop", post(handlers::machines::stop_machine))
+        .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
