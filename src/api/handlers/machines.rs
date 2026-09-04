@@ -344,6 +344,43 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
     }
 }
 
+/// Reconcile both control-plane representations after a VM process is confirmed dead.
+///
+/// `ApiState` keeps a long-lived `AgentManager` whose open `vm.lock` file owns the
+/// per-machine flock, while SQLite is shared with out-of-process CLI commands. A CLI
+/// stop or an unexpected process exit can therefore make the database truthful while
+/// leaving the serve process's cached manager in `Running`. Callers must hold the
+/// machine lifecycle and fork-source locks and must have confirmed process exit before
+/// entering here; releasing the cached flock for a live process would permit a second
+/// VMM to start with the same disks.
+async fn reconcile_confirmed_stopped_machine(
+    state: &Arc<ApiState>,
+    name: &str,
+    explicitly_stopped: bool,
+) -> Result<VmRecord, ApiError> {
+    if let Ok(entry) = state.get_machine(name) {
+        entry.lock().manager.mark_stopped();
+    }
+
+    state
+        .update_vm(name, move |record| {
+            record.state = RecordState::Stopped;
+            record.pid = None;
+            record.pid_start_time = None;
+            if explicitly_stopped {
+                // An explicit stop must suppress the restart supervisor even when
+                // the process had already exited before this request arrived.
+                record.restart.user_stopped = true;
+            }
+        })
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "machine '{name}' disappeared from database while reconciling its stopped state"
+            ))
+        })
+}
+
 /// Attempt graceful shutdown, then force-terminate if still running.
 ///
 /// Uses verified signals to prevent killing an unrelated process if the
@@ -1406,6 +1443,7 @@ pub async fn start_machine(
         )));
     }
 
+    let mut recovered_unreachable = false;
     if resolved == RecordState::Unreachable {
         // Zombie: verified-kill the VMM and clear the DB record
         // before falling through to a clean fresh start. Any stale
@@ -1414,7 +1452,7 @@ pub async fn start_machine(
         // cannot be confirmed dead, refuse the start instead of
         // booting on top of it.
         let name_recover = name.clone();
-        tokio::task::spawn_blocking(move || {
+        recovered_unreachable = tokio::task::spawn_blocking(move || {
             crate::agent::state_probe::recover_if_unreachable(&name_recover)
         })
         .await
@@ -1424,6 +1462,27 @@ pub async fn start_machine(
                 "machine '{name}' is unreachable and zombie cleanup failed: {e}"
             ))
         })?;
+        if !recovered_unreachable {
+            // Reachability changed between the two probes. Do not release the
+            // cached manager's flock based on an observation that is no longer
+            // true, and do not risk launching a second VMM over a recovered one.
+            return Err(ApiError::Conflict(format!(
+                "machine '{name}' changed state while unreachable recovery was in progress; retry start"
+            )));
+        }
+    }
+
+    // A successful unreachable recovery, a Running record resolved Stopped by
+    // PID+agent probing, or a durable Stopped record written by an out-of-process
+    // CLI stop all prove that no VMM should still own this machine. Reconcile the
+    // serve process's cached manager before constructing a fresh manager below.
+    // Without this, the cached manager retains vm.lock and every restart wedges
+    // until the API server itself is restarted (issue #1124).
+    if recovered_unreachable
+        || (record.state == RecordState::Running && resolved == RecordState::Stopped)
+        || record.state == RecordState::Stopped
+    {
+        record = reconcile_confirmed_stopped_machine(&state, &name, false).await?;
     }
 
     if let Some(pool_size) = query.fork_pool_size {
@@ -2443,6 +2502,16 @@ pub async fn stop_machine(
             .await
             .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
         }
+        // The process is confirmed dead. This also handles an out-of-process
+        // CLI stop: SQLite already says Stopped, but the serve process may still
+        // cache the manager that owns vm.lock. Reconcile before the idempotent
+        // return so either this request or a later start repairs the lifecycle.
+        let record = if record.state == RecordState::Running || record.state == RecordState::Stopped
+        {
+            reconcile_confirmed_stopped_machine(&state, &name, true).await?
+        } else {
+            record
+        };
         return Ok(Json(record_to_info(&name, &record)));
     }
 
@@ -2507,31 +2576,9 @@ pub async fn stop_machine(
         )));
     }
 
-    // The VM process is confirmed dead, but the long-lived registry manager for
-    // this machine still holds the per-VM `vm.lock` flock in this serve process.
-    // Release it so a subsequent start can re-acquire the lock; otherwise start
-    // fails with "another process is already starting or running this VM".
-    if let Ok(entry) = state.get_machine(&name) {
-        entry.lock().manager.mark_stopped();
-    }
-
-    // Persist state to database and get updated record — only after confirmed stop
-    let record = state
-        .update_vm(&name, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-            // Record the explicit stop so the restart supervisor does not
-            // resurrect this machine (any policy) until an explicit start.
-            r.restart.user_stopped = true;
-        })
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "machine '{}' disappeared from database during stop",
-                name
-            ))
-        })?;
+    // Persist stopped state and release the long-lived registry manager's flock
+    // through the same path used for already-dead and out-of-process stops.
+    let record = reconcile_confirmed_stopped_machine(&state, &name, true).await?;
 
     Ok(Json(record_to_info(&name, &record)))
 }

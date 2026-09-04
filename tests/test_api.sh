@@ -27,6 +27,7 @@ SERVER_LOG="$(mktemp -t smolvm-api-test-server)"
 SERVER_PID=""
 MACHINE_NAME="api-test-machine"
 REGISTRY_TEST_NAME="registry-coherence-test"
+OUT_OF_BAND_STOP_NAME="api-out-of-band-stop-test"
 
 # API client shortcut
 CURL=(curl --unix-socket "$API_SOCKET")
@@ -72,6 +73,7 @@ cleanup() {
     if "${CURL[@]}" -s "$API_URL/health" >/dev/null 2>&1; then
         "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME" >/dev/null 2>&1 || true
         "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME" >/dev/null 2>&1 || true
+        "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME" >/dev/null 2>&1 || true
     fi
     stop_server
 
@@ -244,6 +246,71 @@ test_registry_cleanup() {
     [[ "$status" == "200" ]]
 }
 
+# Regression for issue #1124. The API server owns a cached AgentManager while
+# the CLI changes the same machine through SQLite in a separate process. Both a
+# direct restart and an idempotent API stop must release the cached vm.lock.
+test_out_of_band_stop_reconciliation() {
+    local status response
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$OUT_OF_BAND_STOP_NAME\", \"cpus\": 1, \"mem\": 512}")
+    [[ "$status" == "200" ]] || { echo "create failed: $status"; return 1; }
+
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/start")
+    [[ "$response" == *'"state":"running"'* ]] || { echo "first start failed: $response"; return 1; }
+
+    $SMOLVM machine stop --name "$OUT_OF_BAND_STOP_NAME" >/dev/null 2>&1 || {
+        echo "out-of-band CLI stop failed"
+        return 1
+    }
+
+    # Before the fix this returned 500 because serve's cached manager still
+    # held vm.lock even though the CLI had stopped the process and updated DB.
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/start")
+    [[ "$response" == *'"state":"running"'* ]] || { echo "restart after CLI stop failed: $response"; return 1; }
+
+    $SMOLVM machine stop --name "$OUT_OF_BAND_STOP_NAME" >/dev/null 2>&1 || {
+        echo "second out-of-band CLI stop failed"
+        return 1
+    }
+
+    # Exercise stop's already-dead early return as well. It must reconcile the
+    # cached manager, not merely echo SQLite's stopped record.
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/stop")
+    [[ "$response" == *'"state":"stopped"'* ]] || { echo "idempotent API stop failed: $response"; return 1; }
+
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/start")
+    [[ "$response" == *'"state":"running"'* ]] || { echo "restart after reconciled stop failed: $response"; return 1; }
+
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/exec" \
+        -H "Content-Type: application/json" \
+        -d '{"command": ["echo", "out-of-band-restart-ok"]}')
+    [[ "$response" == *"out-of-band-restart-ok"* ]] || { echo "exec after restart failed: $response"; return 1; }
+
+    # The same stale-manager state occurs when the VMM exits unexpectedly and
+    # the supervisor records it as stopped. Terminate only the PID returned for
+    # this throwaway machine, then prove idempotent stop and restart recover it.
+    response=$("${CURL[@]}" -s "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME")
+    local vm_pid
+    vm_pid=$(printf '%s' "$response" | sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p')
+    [[ "$vm_pid" =~ ^[0-9]+$ ]] || { echo "could not read test VM pid: $response"; return 1; }
+    [[ "$vm_pid" != "$SERVER_PID" ]] || { echo "refusing to signal API server pid"; return 1; }
+    kill -9 "$vm_pid" || return 1
+    for _ in $(seq 1 100); do
+        kill -0 "$vm_pid" >/dev/null 2>&1 || break
+        sleep 0.05
+    done
+
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/stop")
+    [[ "$response" == *'"state":"stopped"'* ]] || { echo "stop after unexpected exit failed: $response"; return 1; }
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/start")
+    [[ "$response" == *'"state":"running"'* ]] || { echo "restart after unexpected exit failed: $response"; return 1; }
+
+    "${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/stop" >/dev/null || return 1
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X DELETE "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME")
+    [[ "$status" == "200" ]]
+}
+
 # =============================================================================
 # Run Tests
 # =============================================================================
@@ -271,6 +338,7 @@ run_test "Error: bad request (400)" test_error_bad_request || true
 run_test "Registry: create→start→exec in one session" test_registry_create_start_exec || true
 run_test "Registry: get machine after create" test_registry_get_machine || true
 run_test "Registry: cleanup test machine" test_registry_cleanup || true
+run_test "Lifecycle: reconcile out-of-band stop and restart" test_out_of_band_stop_reconciliation || true
 
 # Auto-generated names via API
 test_api_auto_generated_names() {
