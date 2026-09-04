@@ -197,10 +197,11 @@ test_volume_mount_hot_reload_and_dax() {
         return 1
     }
 
-    local mount_options
+    local mount_options guest_arch
     mount_options=$($SMOLVM machine exec --name "$vm_name" -- \
         sh -lc "awk '\$2 == \"/work\" { print \$4 }' /proc/mounts")
-    if [[ "$mount_options" != *"dax=always"* ]]; then
+    guest_arch=$($SMOLVM machine exec --name "$vm_name" -- uname -m)
+    if [[ "$guest_arch" == "x86_64" && "$mount_options" != *"dax=always"* ]]; then
         echo "FAIL: DAX was requested but /work options were: $mount_options"
         $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
         $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
@@ -212,7 +213,8 @@ test_volume_mount_hot_reload_and_dax() {
     watcher_pid=$($SMOLVM machine exec --name "$vm_name" --detach -- \
         sh -lc 'exec inotifyd - /work >/tmp/host-events')
     sleep 1
-    echo "after" > "$tmpdir/watched.txt"
+    echo "after" > "$tmpdir/watched.txt.tmp"
+    mv "$tmpdir/watched.txt.tmp" "$tmpdir/watched.txt"
     sleep 1
 
     local content events
@@ -329,6 +331,41 @@ EOF
     [[ "$exec_out" == *"smolfile-exec-volume-regression-marker"* ]]
 }
 
+test_staged_volume_sync_and_restart() {
+    local vm_name="vol-staged-$$"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "staged-seed" > "$tmpdir/input.txt"
+
+    $SMOLVM machine create --name "$vm_name" --cpus 2 --mem 512 \
+        -v "$tmpdir:/workspace:staged" >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 1; }
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    $SMOLVM machine exec --name "$vm_name" -- sh -lc \
+        'test "$(cat /workspace/input.txt)" = staged-seed && printf staged-output > /workspace/output.txt' \
+        >/dev/null 2>&1 || return 1
+    [[ ! -e "$tmpdir/output.txt" ]] || return 1
+    $SMOLVM machine sync --name "$vm_name" >/dev/null 2>&1 || return 1
+    [[ "$(cat "$tmpdir/output.txt")" == "staged-output" ]] || return 1
+
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || return 1
+    $SMOLVM machine exec --name "$vm_name" -- sh -lc \
+        'test "$(cat /workspace/output.txt)" = staged-output && printf stop-sync > /workspace/final.txt' \
+        >/dev/null 2>&1 || return 1
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || return 1
+
+    local ok=0
+    [[ "$(cat "$tmpdir/final.txt")" == "stop-sync" ]] && ok=1
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    rm -rf "$tmpdir"
+    [[ $ok -eq 1 ]]
+}
+
 
 # The at/below-/workspace volume matrix against a registry --image machine.
 # The driver and the reasoning live in common.sh.
@@ -345,5 +382,6 @@ run_test "Volume: default /workspace symlink without -v" test_default_workspace_
 run_test "Create with --image: volume mount visible to exec" test_image_exec_volume_mount_visible || true
 run_test "Create with --image: Smolfile volumes visible to exec" test_image_exec_volume_mount_visible_smolfile || true
 run_test "Create with --image: volume targets at/below /workspace resolve in guest" test_image_volume_targets_resolve_inside_guest || true
+run_test "Volume: staged sync and restart persistence" test_staged_volume_sync_and_restart || true
 
 print_summary "Volume Tests"

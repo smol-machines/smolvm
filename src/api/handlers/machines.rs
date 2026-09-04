@@ -82,14 +82,15 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         mem: record.mem,
         pid,
         mounts: record
-            .mounts
+            .host_mounts()
             .iter()
             .enumerate()
-            .map(|(i, (source, target, readonly))| MountInfo {
+            .map(|(i, mount)| MountInfo {
                 tag: HostMount::mount_tag(i),
-                source: source.clone(),
-                target: target.clone(),
-                readonly: *readonly,
+                source: mount.source.to_string_lossy().into_owned(),
+                target: mount.target.to_string_lossy().into_owned(),
+                readonly: mount.read_only,
+                staged: mount.staged,
             })
             .collect(),
         ports: record
@@ -114,9 +115,13 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        branchable: record.forkable_on_start(),
         forkable: record.forkable_on_start(),
+        parent_machine: record.golden.clone(),
+        cuda_branch_pool_size: record.cuda_fork_pool_size,
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
+        branchpoint_held: record.forkpoint_held,
         forkpoint_held: record.forkpoint_held,
         // Cumulative egress, read from the per-VM telemetry file the subprocess
         // flushes. Surfaced here so the control plane reads it from the machine
@@ -309,15 +314,7 @@ pub async fn restore_portable_checkpoint(
 /// or during registry repair. Centralizes the record→entry conversion
 /// so the two branches don't drift.
 fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> MachineEntry {
-    let mounts = record
-        .mounts
-        .iter()
-        .map(|(s, t, ro)| MountSpec {
-            source: s.clone(),
-            target: t.clone(),
-            readonly: *ro,
-        })
-        .collect();
+    let mounts = record.host_mounts().iter().map(MountSpec::from).collect();
     let ports = record
         .ports
         .iter()
@@ -345,6 +342,43 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
         forkpoint_held: record.forkpoint_held,
     }
+}
+
+/// Reconcile both control-plane representations after a VM process is confirmed dead.
+///
+/// `ApiState` keeps a long-lived `AgentManager` whose open `vm.lock` file owns the
+/// per-machine flock, while SQLite is shared with out-of-process CLI commands. A CLI
+/// stop or an unexpected process exit can therefore make the database truthful while
+/// leaving the serve process's cached manager in `Running`. Callers must hold the
+/// machine lifecycle and fork-source locks and must have confirmed process exit before
+/// entering here; releasing the cached flock for a live process would permit a second
+/// VMM to start with the same disks.
+async fn reconcile_confirmed_stopped_machine(
+    state: &Arc<ApiState>,
+    name: &str,
+    explicitly_stopped: bool,
+) -> Result<VmRecord, ApiError> {
+    if let Ok(entry) = state.get_machine(name) {
+        entry.lock().manager.mark_stopped();
+    }
+
+    state
+        .update_vm(name, move |record| {
+            record.state = RecordState::Stopped;
+            record.pid = None;
+            record.pid_start_time = None;
+            if explicitly_stopped {
+                // An explicit stop must suppress the restart supervisor even when
+                // the process had already exited before this request arrived.
+                record.restart.user_stopped = true;
+            }
+        })
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "machine '{name}' disappeared from database while reconciling its stopped state"
+            ))
+        })
 }
 
 /// Attempt graceful shutdown, then force-terminate if still running.
@@ -1409,6 +1443,7 @@ pub async fn start_machine(
         )));
     }
 
+    let mut recovered_unreachable = false;
     if resolved == RecordState::Unreachable {
         // Zombie: verified-kill the VMM and clear the DB record
         // before falling through to a clean fresh start. Any stale
@@ -1417,7 +1452,7 @@ pub async fn start_machine(
         // cannot be confirmed dead, refuse the start instead of
         // booting on top of it.
         let name_recover = name.clone();
-        tokio::task::spawn_blocking(move || {
+        recovered_unreachable = tokio::task::spawn_blocking(move || {
             crate::agent::state_probe::recover_if_unreachable(&name_recover)
         })
         .await
@@ -1427,6 +1462,27 @@ pub async fn start_machine(
                 "machine '{name}' is unreachable and zombie cleanup failed: {e}"
             ))
         })?;
+        if !recovered_unreachable {
+            // Reachability changed between the two probes. Do not release the
+            // cached manager's flock based on an observation that is no longer
+            // true, and do not risk launching a second VMM over a recovered one.
+            return Err(ApiError::Conflict(format!(
+                "machine '{name}' changed state while unreachable recovery was in progress; retry start"
+            )));
+        }
+    }
+
+    // A successful unreachable recovery, a Running record resolved Stopped by
+    // PID+agent probing, or a durable Stopped record written by an out-of-process
+    // CLI stop all prove that no VMM should still own this machine. Reconcile the
+    // serve process's cached manager before constructing a fresh manager below.
+    // Without this, the cached manager retains vm.lock and every restart wedges
+    // until the API server itself is restarted (issue #1124).
+    if recovered_unreachable
+        || (record.state == RecordState::Running && resolved == RecordState::Stopped)
+        || record.state == RecordState::Stopped
+    {
+        record = reconcile_confirmed_stopped_machine(&state, &name, false).await?;
     }
 
     if let Some(pool_size) = query.fork_pool_size {
@@ -1752,6 +1808,31 @@ pub async fn fork_machine(
     Json(req): Json<ForkRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     fork_machine_inner(state, golden, req).await.map(Json)
+}
+
+/// Branch a running, branchable source machine into a new independent child.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/branches",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Branch source machine name")
+    ),
+    request_body = ForkRequest,
+    responses(
+        (status = 200, description = "Child branched and running", body = MachineInfo),
+        (status = 400, description = "Invalid or unsupported branch request", body = ApiErrorResponse),
+        (status = 404, description = "Source machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Source is not branchable, or child name already exists", body = ApiErrorResponse),
+        (status = 500, description = "Branch failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn branch_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(source): Path<String>,
+    Json(req): Json<ForkRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    fork_machine_inner(state, source, req).await.map(Json)
 }
 
 /// Internal fork entry point shared by the HTTP handler and pool reconciler.
@@ -2421,7 +2502,35 @@ pub async fn stop_machine(
             .await
             .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
         }
+        // The process is confirmed dead. This also handles an out-of-process
+        // CLI stop: SQLite already says Stopped, but the serve process may still
+        // cache the manager that owns vm.lock. Reconcile before the idempotent
+        // return so either this request or a later start repairs the lifecycle.
+        let record = if record.state == RecordState::Running || record.state == RecordState::Stopped
+        {
+            reconcile_confirmed_stopped_machine(&state, &name, true).await?
+        } else {
+            record
+        };
         return Ok(Json(record_to_info(&name, &record)));
+    }
+
+    // A staged mount makes its guest-local copy authoritative while the VM is
+    // running. Flush it before graceful shutdown; if synchronization fails,
+    // leave the VM alive so the caller can retry instead of silently losing
+    // the only current copy. An unreachable agent cannot be synchronized, but
+    // its persistent storage disk remains available for a later restart.
+    if !record.staged_mounts.is_empty() && resolved != RecordState::Unreachable {
+        let sync_name = name.clone();
+        let sync_record = record.clone();
+        tokio::task::spawn_blocking(move || {
+            let manager = AgentManager::for_vm(&sync_name)?;
+            let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+            crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("task error: {error}")))?
+        .map_err(|error| ApiError::internal(format!("sync staged mounts: {error}")))?;
     }
 
     // Get PID and start time from database record - this is the source of truth
@@ -2467,31 +2576,55 @@ pub async fn stop_machine(
         )));
     }
 
-    // The VM process is confirmed dead, but the long-lived registry manager for
-    // this machine still holds the per-VM `vm.lock` flock in this serve process.
-    // Release it so a subsequent start can re-acquire the lock; otherwise start
-    // fails with "another process is already starting or running this VM".
-    if let Ok(entry) = state.get_machine(&name) {
-        entry.lock().manager.mark_stopped();
+    // Persist stopped state and release the long-lived registry manager's flock
+    // through the same path used for already-dead and out-of-process stops.
+    let record = reconcile_confirmed_stopped_machine(&state, &name, true).await?;
+
+    Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Synchronize guest-local staged mounts without stopping the machine.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/sync",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Machine name")),
+    responses(
+        (status = 200, description = "Staged mounts synchronized", body = MachineInfo),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not running", body = ApiErrorResponse)
+    )
+)]
+pub async fn sync_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+    let _source_lock = acquire_fork_source_lock(name.clone()).await?;
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+    if record.staged_mounts.is_empty() {
+        return Ok(Json(record_to_info(&name, &record)));
+    }
+    if crate::agent::state_probe::resolve_state(&name, &record) != RecordState::Running {
+        return Err(ApiError::Conflict(format!(
+            "machine '{name}' must be running to synchronize staged mounts"
+        )));
     }
 
-    // Persist state to database and get updated record — only after confirmed stop
-    let record = state
-        .update_vm(&name, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-            // Record the explicit stop so the restart supervisor does not
-            // resurrect this machine (any policy) until an explicit start.
-            r.restart.user_stopped = true;
-        })
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "machine '{}' disappeared from database during stop",
-                name
-            ))
-        })?;
+    let sync_name = name.clone();
+    let sync_record = record.clone();
+    tokio::task::spawn_blocking(move || {
+        let manager = AgentManager::for_vm(&sync_name)?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+        crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("task error: {error}")))?
+    .map_err(|error| ApiError::internal(error.to_string()))?;
 
     Ok(Json(record_to_info(&name, &record)))
 }
@@ -2516,11 +2649,10 @@ pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::Statu
 /// the control plane can reschedule. Best-effort, concurrent, and bounded so it
 /// fits inside the host's termination grace period.
 pub async fn drain_machines(state: &Arc<ApiState>) {
-    let running: Vec<(String, Option<i32>, Option<u64>)> = match state.list_vm_records().await {
+    let running: Vec<(String, VmRecord)> = match state.list_vm_records().await {
         Ok(vms) => vms
             .into_iter()
             .filter(|(_, r)| r.actual_state() == RecordState::Running && r.is_process_alive())
-            .map(|(name, r)| (name, r.pid, r.pid_start_time))
             .collect(),
         Err(e) => {
             tracing::error!(error = ?e, "drain: failed to list machines");
@@ -2536,37 +2668,62 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
     );
 
     let mut handles = Vec::with_capacity(running.len());
-    for (name, pid, pid_start_time) in running {
+    for (name, record) in running {
         let state = state.clone();
         handles.push(tokio::spawn(async move {
             let name_for_kill = name.clone();
             let entry = state.get_machine(&name).ok();
             let stopped = tokio::task::spawn_blocking(move || {
+                let _source_lock = match crate::agent::fork::lock_fork_source(&name_for_kill) {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        tracing::warn!(machine = %name_for_kill, error = %error, "drain: failed to lock machine");
+                        return false;
+                    }
+                };
+                if !record.staged_mounts.is_empty() {
+                    let sync_result = AgentManager::for_vm(&name_for_kill).and_then(|manager| {
+                        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+                        crate::staged_mount::sync_staged_mounts(&record, &mut client)
+                    });
+                    if let Err(error) = sync_result {
+                        tracing::warn!(machine = %name_for_kill, error = %error, "drain: staged mount sync failed; leaving machine running");
+                        return false;
+                    }
+                }
                 // Prefer the registered manager (holds the flock); fall back to a
                 // PID-verified signal — same path as the stop handler.
                 let via_manager = entry
                     .as_ref()
                     .map(|e| e.lock().manager.stop().is_ok())
                     .unwrap_or(false);
-                via_manager || shutdown_machine_process(&name_for_kill, pid, pid_start_time, true)
+                via_manager
+                    || shutdown_machine_process(
+                        &name_for_kill,
+                        record.pid,
+                        record.pid_start_time,
+                        true,
+                    )
             })
             .await
             .unwrap_or(false);
-            if let Ok(entry) = state.get_machine(&name) {
-                entry.lock().manager.mark_stopped();
+            if stopped {
+                if let Ok(entry) = state.get_machine(&name) {
+                    entry.lock().manager.mark_stopped();
+                }
+                let _ = state
+                    .update_vm(&name, |r| {
+                        r.state = RecordState::Stopped;
+                        r.pid = None;
+                        r.pid_start_time = None;
+                        // A drain is a deliberate decommission: mark the machine
+                        // user-stopped so the restart supervisor does not resurrect it
+                        // in the window before the host is terminated (or if drain is
+                        // used standalone). An explicit start elsewhere clears this.
+                        r.restart.user_stopped = true;
+                    })
+                    .await;
             }
-            let _ = state
-                .update_vm(&name, |r| {
-                    r.state = RecordState::Stopped;
-                    r.pid = None;
-                    r.pid_start_time = None;
-                    // A drain is a deliberate decommission: mark the machine
-                    // user-stopped so the restart supervisor does not resurrect it
-                    // in the window before the host is terminated (or if drain is
-                    // used standalone). An explicit start elsewhere clears this.
-                    r.restart.user_stopped = true;
-                })
-                .await;
             tracing::info!(machine = %name, stopped, "drain: machine stopped");
         }));
     }
@@ -2667,6 +2824,32 @@ pub(crate) async fn delete_one(
                 clones.len(),
                 clones.join(", ")
             )));
+        }
+    }
+
+    // A running staged mount owns state that is newer than its host source.
+    // Flush it before delete; on failure leave both the VM and its data dir
+    // intact so the caller can repair and retry.
+    if !record.staged_mounts.is_empty() {
+        match crate::agent::state_probe::resolve_state(&name, &record) {
+            RecordState::Running => {
+                let sync_name = name.clone();
+                let sync_record = record.clone();
+                tokio::task::spawn_blocking(move || {
+                    let manager = AgentManager::for_vm(&sync_name)?;
+                    let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+                    crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
+                })
+                .await
+                .map_err(|error| ApiError::internal(format!("task error: {error}")))?
+                .map_err(|error| ApiError::internal(format!("sync staged mounts: {error}")))?;
+            }
+            RecordState::Unreachable => {
+                return Err(ApiError::Conflict(format!(
+                    "machine '{name}' has unsynchronized staged mounts but its agent is unreachable"
+                )));
+            }
+            _ => {}
         }
     }
 
@@ -3540,6 +3723,8 @@ mod tests {
         );
         record.gpu = Some(true);
         record.cuda = true;
+        record.forkable = true;
+        record.golden = Some("parent-vm".to_string());
 
         let info = record_to_info("test-vm", &record);
 
@@ -3552,6 +3737,11 @@ mod tests {
         assert!(!info.network);
         assert!(info.gpu);
         assert!(info.cuda);
+        assert!(info.branchable);
+        assert!(info.forkable);
+        assert_eq!(info.parent_machine.as_deref(), Some("parent-vm"));
+        assert_eq!(info.cuda_branch_pool_size, info.cuda_fork_pool_size);
+        assert_eq!(info.branchpoint_held, info.forkpoint_held);
         assert!(info.pid.is_none());
     }
 

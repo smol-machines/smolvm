@@ -2300,15 +2300,47 @@ impl AgentClient {
         guest_path: &str,
         local_path: &std::path::Path,
         cap: u64,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<u64> {
-        use std::io::Write;
         const FILE_READ_TIMEOUT: Duration = Duration::from_secs(600);
 
         let _timeout_guard = self.set_extended_read_timeout(FILE_READ_TIMEOUT)?;
         self.send_raw(&AgentRequest::FileRead {
             path: guest_path.to_string(),
         })?;
+        self.receive_stream_to_path(local_path, cap, on_progress, "read file")
+    }
+
+    /// Stream a guest directory as a tar archive directly into a host file.
+    /// The archive is generated on demand and never materialized in the guest.
+    pub fn archive_directory_to_path<F: FnMut(u64)>(
+        &mut self,
+        guest_path: &str,
+        local_path: &std::path::Path,
+        on_progress: F,
+    ) -> Result<u64> {
+        const ARCHIVE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+        let _timeout_guard = self.set_extended_read_timeout(ARCHIVE_READ_TIMEOUT)?;
+        self.send_raw(&AgentRequest::ArchiveDirectory {
+            path: guest_path.to_string(),
+        })?;
+        self.receive_stream_to_path(
+            local_path,
+            file_transfer_max_total(),
+            on_progress,
+            "archive directory",
+        )
+    }
+
+    fn receive_stream_to_path<F: FnMut(u64)>(
+        &mut self,
+        local_path: &std::path::Path,
+        cap: u64,
+        mut on_progress: F,
+        operation: &str,
+    ) -> Result<u64> {
+        use std::io::Write;
 
         let mut file = std::fs::File::create(local_path).map_err(|e| {
             Error::agent(
@@ -2325,7 +2357,7 @@ impl AgentClient {
                     if next_total > cap {
                         let _ = std::fs::remove_file(local_path);
                         return Err(Error::agent(
-                            "read file",
+                            operation,
                             format!(
                                 "guest streamed {} bytes, exceeding the {} byte cap",
                                 next_total, cap
@@ -2346,11 +2378,11 @@ impl AgentClient {
                 }
                 AgentResponse::Error { message, .. } => {
                     let _ = std::fs::remove_file(local_path);
-                    return Err(Error::agent("read file", message));
+                    return Err(Error::agent(operation, message));
                 }
                 _ => {
                     let _ = std::fs::remove_file(local_path);
-                    return Err(Error::agent("read file", "unexpected response"));
+                    return Err(Error::agent(operation, "unexpected response"));
                 }
             }
         }

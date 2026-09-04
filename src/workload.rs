@@ -8,17 +8,22 @@
 
 use crate::agent::{AgentClient, RunConfig};
 use crate::config::VmRecord;
-use crate::data::storage::HostMount;
 
-/// Convert a `VmRecord` mount list (`(host_source, guest_target, read_only)`
-/// triples) to the agent's virtiofs binding format. The host source is
-/// dropped — the agent only needs the guest-facing target and the positional
-/// `smolvm{i}` tag.
-pub fn record_mounts_to_bindings(mounts: &[(String, String, bool)]) -> Vec<(String, String, bool)> {
-    mounts
+/// Convert a record's live and staged host mounts to the agent's binding form.
+/// Reconstructing the rich list preserves original device order, while staged
+/// mounts use their stable runtime identity instead of a plain virtiofs tag.
+pub fn record_mounts_to_bindings(record: &VmRecord) -> Vec<(String, String, bool)> {
+    record
+        .host_mounts()
         .iter()
         .enumerate()
-        .map(|(i, (_host, target, ro))| (HostMount::mount_tag(i), target.clone(), *ro))
+        .map(|(i, mount)| {
+            (
+                mount.runtime_mount_tag(i),
+                mount.target.to_string_lossy().into_owned(),
+                mount.read_only,
+            )
+        })
         .collect()
 }
 
@@ -92,7 +97,7 @@ pub fn launch_image_workload(
             RunConfig::new(image, command.clone())
                 .with_workdir(record.workdir.clone())
                 .with_user(record.user.clone())
-                .with_mounts(record_mounts_to_bindings(&record.mounts))
+                .with_mounts(record_mounts_to_bindings(record))
                 .in_machine(record, machine_name, &exec_env)
                 .with_env(exec_env.clone()),
         )
@@ -253,6 +258,27 @@ mod tests {
             persistent_overlay_owner_with_lineage("grandchild", Some("child"), Some("root")),
             "root"
         );
+    }
+
+    #[test]
+    fn bindings_preserve_staged_mount_order_and_identity() {
+        let mut record = VmRecord::new(
+            "test".into(),
+            1,
+            256,
+            vec![("/host/live".into(), "/live".into(), true)],
+            Vec::new(),
+            false,
+        );
+        record.staged_mounts = vec![(0, "/host/staged".into(), "/work".into())];
+
+        let bindings = record_mounts_to_bindings(&record);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings[0].0.starts_with("staged+"));
+        assert!(bindings[0].0.ends_with("+smolvm0"));
+        assert_eq!(bindings[0].1, "/work");
+        assert!(!bindings[0].2);
+        assert_eq!(bindings[1], ("smolvm1".into(), "/live".into(), true));
     }
 
     // Only the agent's metadata-less-image failure downgrades a machine start

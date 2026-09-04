@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 
 /// `KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER`.
 const FEATURE_BASIC_FRAMEBUFFER: u64 = 1;
+const FEATURE_CURSOR: u64 = 2;
 
 const ERR_INVALID_SCANOUT_ID: i32 = -3;
 const ERR_INVALID_PARAM: i32 = -4;
@@ -74,11 +75,19 @@ struct BasicFramebufferVtable {
 }
 
 #[repr(C)]
+struct CursorVtable {
+    set_cursor:
+        Option<unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, *const u8, usize) -> i32>,
+    move_cursor: Option<unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> i32>,
+}
+
+#[repr(C)]
 struct KrunDisplayBackend {
     features: u64,
     create_userdata: *const c_void,
     create: Option<unsafe extern "C" fn(*mut *mut c_void, *const c_void, *const c_void) -> i32>,
     vtable: BasicFramebufferVtable,
+    cursor: CursorVtable,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +110,57 @@ pub struct Frame {
     pub generation: u64,
 }
 
+/// The guest's pointer as the VMM hands it over: the image the guest put on
+/// its hardware cursor plane and where the hot spot is. With the pointer on
+/// that plane the guest no longer draws it into frames, so viewers either
+/// draw it themselves or composite it onto the frames they send.
+#[derive(Clone, Default)]
+pub struct Cursor {
+    /// Image width in pixels; 0 when hidden.
+    pub width: u32,
+    /// Image height in pixels; 0 when hidden.
+    pub height: u32,
+    /// Hot spot x offset inside the image.
+    pub hot_x: u32,
+    /// Hot spot y offset inside the image.
+    pub hot_y: u32,
+    /// `width * height * 4` bytes, B,G,R,A with straight alpha; empty when
+    /// the pointer is hidden.
+    pub bgra: Vec<u8>,
+    /// Hot spot x position on the scanout.
+    pub x: u32,
+    /// Hot spot y position on the scanout.
+    pub y: u32,
+    /// Bumped on every image change or move.
+    pub generation: u64,
+    /// Bumped only when the image changes, so a viewer that draws the pointer
+    /// itself resends the image only when it has to.
+    pub image_generation: u64,
+    /// When the guest last hid the pointer while an image was still known.
+    /// Compositors hide and re-show the pointer around every buffer flip,
+    /// so a hide only counts once it has lasted a moment.
+    pub hidden_since: Option<std::time::Instant>,
+    /// When the guest last showed the pointer.
+    pub shown_at: Option<std::time::Instant>,
+}
+
+/// How long a hide must last before viewers stop showing the pointer.
+const HIDE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+/// A hide this soon after a show is the tail of a buffer flip, not a hide:
+/// some compositors show the new pointer buffer and then hide the old one,
+/// leaving the plane hidden until the next move. Those are dropped outright.
+const FLIP_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+impl Cursor {
+    /// Whether there is an image to show right now.
+    pub fn is_visible(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && !self.bgra.is_empty()
+            && self.hidden_since.is_none_or(|t| t.elapsed() < HIDE_GRACE)
+    }
+}
+
 /// The buffer libkrun writes into. Deliberately *not* behind the mutex: the
 /// contract in `libkrun_display.h` is that every backend method is called from
 /// one and the same thread, so this is single-threaded state, and holding the
@@ -121,6 +181,9 @@ pub struct DisplayFramebuffer {
     staging: std::cell::UnsafeCell<Staging>,
     front: Mutex<Frame>,
     presented: Condvar,
+    cursor: Mutex<Cursor>,
+    /// Mirrors `cursor.generation` so waiters can test it under `front`.
+    cursor_generation: std::sync::atomic::AtomicU64,
     /// Optional call trace, enabled by `SMOLVM_DISPLAY_TRACE=<path>`.
     ///
     /// libkrun's own logging goes through `env_logger` in a process whose
@@ -168,6 +231,8 @@ impl DisplayFramebuffer {
                 generation: 0,
             }),
             presented: Condvar::new(),
+            cursor: Mutex::new(Cursor::default()),
+            cursor_generation: std::sync::atomic::AtomicU64::new(0),
             trace,
             traced_calls: std::sync::atomic::AtomicU64::new(0),
         }
@@ -235,6 +300,56 @@ impl DisplayFramebuffer {
             front.generation = 1;
         }
         fb
+    }
+
+    /// The pointer as last reported by the guest.
+    pub fn cursor(&self) -> Cursor {
+        self.cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Block until a frame newer than `since_frame` is presented or the
+    /// pointer changes past `since_cursor`, or `timeout` elapses. Returns
+    /// whichever of the two is new.
+    pub fn wait_for_change(
+        &self,
+        since_frame: u64,
+        since_cursor: u64,
+        timeout: std::time::Duration,
+    ) -> (Option<Frame>, Option<Cursor>) {
+        use std::sync::atomic::Ordering;
+        let guard = self.front.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .presented
+            .wait_timeout_while(guard, timeout, |f| {
+                f.generation <= since_frame
+                    && self.cursor_generation.load(Ordering::Acquire) <= since_cursor
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        let frame = (guard.generation > since_frame).then(|| guard.clone());
+        drop(guard);
+        let cursor = {
+            let c = self.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            (c.generation > since_cursor).then(|| c.clone())
+        };
+        (frame, cursor)
+    }
+
+    /// Record a pointer change and wake viewers. Taken under `front` so a
+    /// viewer between its generation check and its wait cannot miss it.
+    fn cursor_changed(&self, apply: impl FnOnce(&mut Cursor)) {
+        use std::sync::atomic::Ordering;
+        let _front = self.front.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut c = self.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            apply(&mut c);
+            c.generation = c.generation.wrapping_add(1);
+            self.cursor_generation
+                .store(c.generation, Ordering::Release);
+        }
+        self.presented.notify_all();
     }
 
     /// Block until a frame newer than `since` is presented, or `timeout`
@@ -411,6 +526,132 @@ unsafe extern "C" fn display_present_frame(
     0
 }
 
+unsafe extern "C" fn display_set_cursor(
+    instance: *mut c_void,
+    scanout_id: u32,
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+    bgra: *const u8,
+    bgra_size: usize,
+) -> i32 {
+    if scanout_id != 0 {
+        return ERR_INVALID_SCANOUT_ID;
+    }
+    let Some(fb) = (unsafe { fb(instance) }) else {
+        return ERR_INVALID_PARAM;
+    };
+    let hidden = width == 0 || height == 0;
+    let needed = width as usize * height as usize * BYTES_PER_PIXEL;
+    if !hidden && (bgra.is_null() || bgra_size < needed || width > 512 || height > 512) {
+        return ERR_INVALID_PARAM;
+    }
+    let (width, height, hot_x, hot_y, pixels) = if hidden {
+        (0, 0, hot_x, hot_y, Vec::new())
+    } else {
+        // Safe: libkrun promises `bgra_size` readable bytes for the call.
+        let full = unsafe { std::slice::from_raw_parts(bgra, needed) };
+        crop_cursor(full, width, height, hot_x, hot_y)
+    };
+    fb.cursor_changed(|c| {
+        if hidden {
+            if c.shown_at.is_some_and(|t| t.elapsed() < FLIP_WINDOW) {
+                return;
+            }
+            // Keep the image; the hide takes effect only if it lasts.
+            if c.hidden_since.is_none() {
+                c.hidden_since = Some(std::time::Instant::now());
+            }
+            return;
+        }
+        c.hidden_since = None;
+        c.shown_at = Some(std::time::Instant::now());
+        // Compositors re-send the same image on every move; only a real
+        // change should make viewers re-fetch it.
+        let same = c.width == width
+            && c.height == height
+            && c.hot_x == hot_x
+            && c.hot_y == hot_y
+            && c.bgra == pixels;
+        if same {
+            return;
+        }
+        c.width = width;
+        c.height = height;
+        c.hot_x = hot_x;
+        c.hot_y = hot_y;
+        c.bgra = pixels;
+        c.image_generation = c.image_generation.wrapping_add(1);
+    });
+    fb.trace_seq("set_cursor");
+    0
+}
+
+/// Trim the transparent border off a pointer image and shift the hot spot to
+/// match. Compositors hand over the same pointer drawn at different offsets
+/// in a fixed 64x64 buffer; trimmed, those compare equal, so viewers are not
+/// sent a "new" image on every move, and the image itself gets much smaller.
+fn crop_cursor(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+) -> (u32, u32, u32, u32, Vec<u8>) {
+    let (w, h) = (width as usize, height as usize);
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if bgra[(y * w + x) * 4 + 3] != 0 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return (0, 0, hot_x, hot_y, Vec::new());
+    }
+    // Keep the hot spot inside the trimmed image.
+    let x0 = x0.min(hot_x as usize);
+    let y0 = y0.min(hot_y as usize);
+    let x1 = x1.max(hot_x as usize + 1).min(w);
+    let y1 = y1.max(hot_y as usize + 1).min(h);
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    let mut out = Vec::with_capacity(cw * ch * 4);
+    for y in y0..y1 {
+        out.extend_from_slice(&bgra[(y * w + x0) * 4..(y * w + x1) * 4]);
+    }
+    (
+        cw as u32,
+        ch as u32,
+        hot_x - x0 as u32,
+        hot_y - y0 as u32,
+        out,
+    )
+}
+
+unsafe extern "C" fn display_move_cursor(
+    instance: *mut c_void,
+    scanout_id: u32,
+    x: u32,
+    y: u32,
+) -> i32 {
+    if scanout_id != 0 {
+        return ERR_INVALID_SCANOUT_ID;
+    }
+    let Some(fb) = (unsafe { fb(instance) }) else {
+        return ERR_INVALID_PARAM;
+    };
+    fb.cursor_changed(|c| {
+        c.x = x;
+        c.y = y;
+    });
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Installation
 // ---------------------------------------------------------------------------
@@ -431,7 +672,7 @@ pub fn install(
     let raw = Arc::into_raw(Arc::clone(&state));
 
     let backend = KrunDisplayBackend {
-        features: FEATURE_BASIC_FRAMEBUFFER,
+        features: FEATURE_BASIC_FRAMEBUFFER | FEATURE_CURSOR,
         create_userdata: raw as *const c_void,
         create: Some(display_create),
         vtable: BasicFramebufferVtable {
@@ -440,6 +681,10 @@ pub fn install(
             configure_scanout: Some(display_configure_scanout),
             alloc_frame: Some(display_alloc_frame),
             present_frame: Some(display_present_frame),
+        },
+        cursor: CursorVtable {
+            set_cursor: Some(display_set_cursor),
+            move_cursor: Some(display_move_cursor),
         },
     };
 

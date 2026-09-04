@@ -27,7 +27,10 @@ pub const CRUN_CGROUP_MANAGER: &str = "disabled";
 // =============================================================================
 
 /// Root directory for virtiofs mounts from the host.
-pub const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
+// Keep internal staging outside `/mnt`: users commonly mount a host directory
+// at `/mnt`, and bind-mounting it there must not hide the virtio-fs source that
+// backs the bind itself.
+pub const VIRTIOFS_MOUNT_ROOT: &str = "/run/smolvm/virtiofs";
 
 /// Guest path at which the shared workspace is exposed inside containers.
 /// Used both when mounting /storage/workspace as the fallback workspace and
@@ -118,5 +121,12 @@ mod tests {
             main_container_id_path("persistent-myvm"),
             PathBuf::from("/storage/overlays/persistent-myvm/main_container_id")
         );
+    }
+
+    #[test]
+    fn virtiofs_staging_is_not_below_the_user_mount_tree() {
+        let staging = std::path::Path::new(VIRTIOFS_MOUNT_ROOT);
+        assert!(staging.starts_with("/run/smolvm"));
+        assert!(!staging.starts_with("/mnt"));
     }
 }

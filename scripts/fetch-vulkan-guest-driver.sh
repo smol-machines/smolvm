@@ -11,16 +11,26 @@
 # Every artifact is pinned by URL + sha256:
 #   - libvulkan_virtio.so from the slp/mesa-krunkit COPR (the patched Mesa;
 #     also correct on 4 KiB-page Linux hosts — same upstream code path).
-#   - Its DT_NEEDED closure (libdrm, xcb/wayland client libs, zstd, expat,
-#     zlib) and the Vulkan loader from the immutable AlmaLinux 9.6 vault, so
-#     the driver dlopens on images that ship none of these. glibc >= 2.34
+#   - Its DT_NEEDED closure (libdrm, xcb/wayland client libs and libXau, zstd,
+#     expat, zlib) and the Vulkan loader from the immutable AlmaLinux 9.6
+#     vault, so the driver dlopens on images that ship none of these. glibc >= 2.34
 #     (el9) is required of the workload image; older images degrade to
 #     no-Vulkan exactly as they do today.
 #
 # Usage: fetch-vulkan-guest-driver.sh <aarch64|x86_64> <output-dir>
 # The bundle lands in <output-dir>/ as flat lib*.so* files plus
-# virtio_icd.json (library_path pointing at the container mount path).
+# virtio_icd.json (library_path pointing at the container mount path), with
+# the Vulkan loader alone in <output-dir>/loader/.
 # Downloads are cached in .vulkan-rpm-cache/ next to the output dir.
+#
+# Nothing in the bundle may reach a workload through LD_LIBRARY_PATH: the
+# closure carries a libzstd, libexpat, libz and libdrm older than any current
+# distro's, and every LD_LIBRARY_PATH entry outranks the system paths, so
+# exposing the bundle that way shadowed them for every process in the
+# container (tar --zstd, pacman hooks and python's expat all broke). Instead
+# the driver and its closure get RUNPATH=$ORIGIN, so they resolve each other
+# from the bundle only when the driver itself is loaded, and the loader lives
+# in its own directory so an image without one can be pointed at exactly that.
 set -euo pipefail
 
 ARCH="${1:?arch (aarch64|x86_64)}"
@@ -42,6 +52,7 @@ aarch64) PINS=(
   "libxcb-1.13.1-9.el9.aarch64.rpm|$VAULT/AppStream/aarch64/os/Packages/libxcb-1.13.1-9.el9.aarch64.rpm|d2b2e4a348c5582bb200db666a5b1d3899a173beaa519cef4fcfe1bd4cca26f9"
   "libX11-xcb-1.7.0-11.el9.aarch64.rpm|$VAULT/AppStream/aarch64/os/Packages/libX11-xcb-1.7.0-11.el9.aarch64.rpm|f9188fc7ca1012bbcb80d932214d839539a6d7deb39f45d19887b1757aec16e4"
   "libxshmfence-1.3-10.el9.aarch64.rpm|$VAULT/AppStream/aarch64/os/Packages/libxshmfence-1.3-10.el9.aarch64.rpm|90ee9fc68c9a44090cdc4b27e2caed640832cdc0b852caa8bb3e0479b5e198ca"
+  "libXau-1.0.9-8.el9.aarch64.rpm|$VAULT/AppStream/aarch64/os/Packages/libXau-1.0.9-8.el9.aarch64.rpm|a1282770290f708acf01fa3c7bb35d6d4c05389e24aee6a62bcd4d37ddeac119"
   "libwayland-client-1.21.0-1.el9.aarch64.rpm|$VAULT/AppStream/aarch64/os/Packages/libwayland-client-1.21.0-1.el9.aarch64.rpm|9cee7c9f55019668dbf6dd8e2031e23a6e16f773bf308ed126ba5e4acfccbd57"
 ) ;;
 x86_64) PINS=(
@@ -54,6 +65,7 @@ x86_64) PINS=(
   "libxcb-1.13.1-9.el9.x86_64.rpm|$VAULT/AppStream/x86_64/os/Packages/libxcb-1.13.1-9.el9.x86_64.rpm|840ea71fb8beb52093e9f6d23dd0bc7de86f9d6da8c48888d766b0915cf1e1bc"
   "libX11-xcb-1.7.0-11.el9.x86_64.rpm|$VAULT/AppStream/x86_64/os/Packages/libX11-xcb-1.7.0-11.el9.x86_64.rpm|1f26334e50951a561defc9163cdbdaa7f8229fa7dc893b8198ff58e87b654ff8"
   "libxshmfence-1.3-10.el9.x86_64.rpm|$VAULT/AppStream/x86_64/os/Packages/libxshmfence-1.3-10.el9.x86_64.rpm|c13f4ee9d273bdac9977f1dd6ae9a31303a3ee0aa96996a17db997ff7162f74b"
+  "libXau-1.0.9-8.el9.x86_64.rpm|$VAULT/AppStream/x86_64/os/Packages/libXau-1.0.9-8.el9.x86_64.rpm|ad207494161e9404e2a44b1907d605de54842d1b6897c82c475df3ed0ee9701b"
   "libwayland-client-1.21.0-1.el9.x86_64.rpm|$VAULT/AppStream/x86_64/os/Packages/libwayland-client-1.21.0-1.el9.x86_64.rpm|8c08d9da5462a30a506a8d6714eddab540300edcec63017cd41920fb40ded06a"
 ) ;;
 *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
@@ -99,15 +111,29 @@ for pin in "${PINS[@]}"; do
     extract_rpm "$f" "$WORK"
 done
 
+command -v patchelf &>/dev/null || {
+    echo "patchelf is required to make the bundle self-contained (brew install patchelf / apt-get install patchelf)" >&2
+    exit 1
+}
 # Flatten the shared libraries (preserving soname symlinks) into the bundle.
 # Only usr/lib64 matters; the rpms ship nothing else we need.
-rm -f "$OUT"/lib*.so* "$OUT"/virtio_icd.json
+rm -rf "$OUT"/lib*.so* "$OUT"/virtio_icd.json "$OUT"/loader
 cp -a "$WORK"/usr/lib64/lib*.so* "$OUT"/
+# The loader is the one library an image may legitimately lack; keep it apart
+# so the agent can expose it alone.
+mkdir -p "$OUT/loader"
+mv "$OUT"/libvulkan.so.1* "$OUT/loader/"
 # Drop the other mesa vulkan drivers and layers — Venus only, smaller bundle,
 # and no chance of the loader probing an ICD we didn't intend to ship.
 find "$OUT" -name 'libvulkan_*.so' ! -name 'libvulkan_virtio.so' -delete
 find "$OUT" -name 'libVkLayer_*.so' -delete
 find "$OUT" -name 'libpowervr_rogue.so' -delete
+# Self-contained resolution: each real library looks next to itself first.
+for lib in "$OUT"/lib*.so*; do
+    [[ -L "$lib" ]] && continue
+    patchelf --set-rpath '$ORIGIN' "$lib"
+done
+patchelf --print-rpath "$OUT/libvulkan_virtio.so" | grep -qx '$ORIGIN'
 
 # The ICD manifest is the rpm's own (correct api_version) with library_path
 # rewritten to the CONTAINER path the agent bind-mounts the bundle to

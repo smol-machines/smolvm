@@ -3145,6 +3145,7 @@ dependencies = [
  "smolvm-protocol",
  "smolvm-registry",
  "socket2",
+ "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

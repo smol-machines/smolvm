@@ -1,5 +1,6 @@
 use crate::data::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Default size for the rootfs overlay disk (10 GiB sparse).
@@ -18,6 +19,12 @@ pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
 /// Storage disk filename.
 pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
 
+/// Persisted live-mount tuple: host source, guest target, read-only flag.
+pub type StoredHostMount = (String, String, bool);
+
+/// Persisted staged-mount tuple: original position, host source, guest target.
+pub type StoredStagedMount = (usize, String, String);
+
 /// Host directory mount.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostMount {
@@ -29,6 +36,13 @@ pub struct HostMount {
 
     /// Read-only mount (default: true per DESIGN.md).
     pub read_only: bool,
+
+    /// Keep the working copy on the guest storage disk and synchronize it in
+    /// batches instead of forwarding every filesystem operation over
+    /// virtiofs. Staged mounts are writable and deliberately trade live
+    /// host/guest coherence for metadata-heavy workload performance.
+    #[serde(default)]
+    pub staged: bool,
 }
 
 impl HostMount {
@@ -102,6 +116,7 @@ impl HostMount {
             source: source.into(),
             target: target.into(),
             read_only,
+            staged: false,
         };
 
         if !mount.source.exists() {
@@ -143,17 +158,21 @@ impl HostMount {
         // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
         // colon, and the optional trailing mode is `ro`/`rw`; everything before
         // the guest path is the host source.
-        let (rest, read_only) = match spec.rsplit_once(':') {
-            Some((head, "ro")) => (head, true),
-            Some((head, "rw")) => (head, false),
-            _ => (spec, false),
+        let (rest, read_only, staged) = match spec.rsplit_once(':') {
+            Some((head, "ro")) => (head, true, false),
+            Some((head, "rw")) => (head, false, false),
+            Some((head, "staged")) => (head, false, true),
+            _ => (spec, false, false),
         };
         match rest.rsplit_once(':') {
             Some((source, target)) if !source.is_empty() && !target.is_empty() => {
-                Self::new_with_system_mounts(source, target, read_only, allow_system_mounts)
+                let mut mount =
+                    Self::new_with_system_mounts(source, target, read_only, allow_system_mounts)?;
+                mount.staged = staged;
+                Ok(mount)
             }
             _ => Err(Error::invalid_mount_path(format!(
-                "invalid format '{}' (expected host:guest[:ro|:rw])",
+                "invalid format '{}' (expected host:guest[:ro|:rw|:staged])",
                 spec
             ))),
         }
@@ -301,6 +320,23 @@ impl HostMount {
         format!("smolvm{}", index)
     }
 
+    /// Tag carried in agent/container mount metadata. Live mounts use their
+    /// virtiofs device tag directly; staged mounts add a stable identity so a
+    /// reordered or replaced mount can never reuse another source's guest-local
+    /// working copy.
+    pub fn runtime_mount_tag(&self, index: usize) -> String {
+        let device_tag = Self::mount_tag(index);
+        if !self.staged {
+            return device_tag;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(self.source.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        hasher.update(self.target.as_os_str().as_encoded_bytes());
+        let digest = hex::encode(hasher.finalize());
+        format!("staged+{}+{}", &digest[..16], device_tag)
+    }
+
     /// Create without validation (for loading from database).
     ///
     /// Use this only when loading persisted mounts that were previously validated.
@@ -309,6 +345,17 @@ impl HostMount {
             source: PathBuf::from(source),
             target: PathBuf::from(target),
             read_only,
+            staged: false,
+        }
+    }
+
+    /// Create a staged mount from its persisted representation.
+    pub fn from_staged_storage_tuple(source: String, target: String) -> Self {
+        Self {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only: false,
+            staged: true,
         }
     }
 
@@ -319,6 +366,30 @@ impl HostMount {
             self.target.to_string_lossy().to_string(),
             self.read_only,
         )
+    }
+
+    /// Convert this staged mount to its compact persistence representation.
+    pub fn to_staged_storage_tuple(&self) -> (String, String) {
+        (
+            self.source.to_string_lossy().to_string(),
+            self.target.to_string_lossy().to_string(),
+        )
+    }
+
+    /// Split validated mounts into their backward-compatible live-mount tuples
+    /// and staged-mount tuples for [`crate::config::VmRecord`].
+    pub fn split_storage_tuples(mounts: &[Self]) -> (Vec<StoredHostMount>, Vec<StoredStagedMount>) {
+        let mut live = Vec::new();
+        let mut staged = Vec::new();
+        for (index, mount) in mounts.iter().enumerate() {
+            if mount.staged {
+                let (source, target) = mount.to_staged_storage_tuple();
+                staged.push((index, source, target));
+            } else {
+                live.push(mount.to_storage_tuple());
+            }
+        }
+        (live, staged)
     }
 }
 
@@ -345,6 +416,28 @@ mod tests {
         );
         // Distinct targets are fine.
         assert!(HostMount::parse(&[format!("{a}:/app"), format!("{b}:/data")]).is_ok());
+    }
+
+    #[test]
+    fn parse_staged_mount_is_writable_and_persists_separately() {
+        let source = std::env::temp_dir().join("smolvm_staged_parse");
+        std::fs::create_dir_all(&source).unwrap();
+        let mounts =
+            HostMount::parse(&[format!("{}:/workspace:staged", source.display())]).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].staged);
+        assert!(!mounts[0].read_only);
+
+        let (live, staged) = HostMount::split_storage_tuples(&mounts);
+        assert!(live.is_empty());
+        assert_eq!(
+            staged,
+            vec![(
+                0,
+                source.canonicalize().unwrap().display().to_string(),
+                "/workspace".into()
+            )]
+        );
     }
 
     #[test]
@@ -473,6 +566,7 @@ mod tests {
                 source: PathBuf::from(path),
                 target: PathBuf::from("/guest/path"),
                 read_only: true,
+                staged: false,
             };
             let err = HostMount::validate(&mount).unwrap_err().to_string();
             assert!(
@@ -503,6 +597,25 @@ mod tests {
         assert_eq!(mount.source, PathBuf::from("/tmp").canonicalize().unwrap());
         assert_eq!(mount.target, PathBuf::from("/guest/path"));
         assert!(!mount.read_only);
+    }
+
+    #[test]
+    fn staged_runtime_tag_is_stable_across_device_reordering_and_unique_by_source() {
+        let first = HostMount::from_staged_storage_tuple("/tmp/a".into(), "/workspace".into());
+        let second = HostMount::from_staged_storage_tuple("/tmp/b".into(), "/workspace".into());
+        let first_at_zero = first.runtime_mount_tag(0);
+        let first_at_three = first.runtime_mount_tag(3);
+        assert!(first_at_zero.starts_with("staged+"));
+        assert_eq!(
+            first_at_zero.split('+').nth(1),
+            first_at_three.split('+').nth(1)
+        );
+        assert_ne!(
+            first_at_zero.split('+').nth(1),
+            second.runtime_mount_tag(0).split('+').nth(1)
+        );
+        assert!(first_at_zero.ends_with("+smolvm0"));
+        assert!(first_at_three.ends_with("+smolvm3"));
     }
 
     #[test]

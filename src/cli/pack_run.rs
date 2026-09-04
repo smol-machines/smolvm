@@ -148,9 +148,11 @@ fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMo
         .enumerate()
         .map(|(i, m)| PackedMount {
             tag: HostMount::mount_tag(i),
+            runtime_tag: m.runtime_mount_tag(i),
             host_path: m.source.to_string_lossy().to_string(),
             guest_path: m.target.to_string_lossy().to_string(),
             read_only: m.read_only,
+            staged: m.staged,
         })
         .collect()
 }
@@ -589,6 +591,7 @@ impl PackRunCmd {
                     config
                         .mounts
                         .iter()
+                        .filter(|mount| !mount.staged)
                         .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
                 );
 
@@ -1223,8 +1226,8 @@ struct PackedRunArgs {
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
 
-    /// Mount a volume (HOST:GUEST[:ro])
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Mount a volume (HOST:GUEST[:ro|rw|staged])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     volume: Vec<String>,
 
     /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
@@ -1284,8 +1287,8 @@ struct PackedStartArgs {
     #[arg(long, value_name = "GiB")]
     overlay: Option<u64>,
 
-    /// Mount a volume (HOST:GUEST[:ro])
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Mount a volume (HOST:GUEST[:ro|rw|staged])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     volume: Vec<String>,
 
     /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
@@ -1642,6 +1645,7 @@ fn run_from_cache(
             config
                 .mounts
                 .iter()
+                .filter(|mount| !mount.staged)
                 .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
         );
 
@@ -2089,6 +2093,7 @@ fn daemon_start(
             config
                 .mounts
                 .iter()
+                .filter(|mount| !mount.staged)
                 .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
         );
 

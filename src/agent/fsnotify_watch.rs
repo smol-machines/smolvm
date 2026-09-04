@@ -39,7 +39,7 @@ use tracing::{debug, info, warn};
 /// `paths::VIRTIOFS_MOUNT_ROOT` — the agent stages each `-v` device at
 /// `<root>/smolvm{index}` and binds it into the container, so events fired on
 /// that path reach the container's bind of the same inode.
-const GUEST_VIRTIOFS_ROOT: &str = "/mnt/virtiofs";
+const GUEST_VIRTIOFS_ROOT: &str = "/run/smolvm/virtiofs";
 
 /// How long to coalesce a burst of change events before sending. An editor save
 /// typically emits several events (write, close, attrib); batching de-dupes them
@@ -55,7 +55,7 @@ const CONNECT_RETRY_LIMIT: usize = 200;
 /// A single watched mount: host source directory → guest virtiofs staging base.
 struct WatchTarget {
     host_source: PathBuf,
-    /// e.g. `/mnt/virtiofs/smolvm0`
+    /// e.g. `/run/smolvm/virtiofs/smolvm0`
     guest_base: String,
 }
 
@@ -80,6 +80,10 @@ impl FsNotifyWatcher {
             mounts
                 .iter()
                 .enumerate()
+                // A staged mount intentionally has no live host/guest
+                // coherence. Watching it would promise invalidations that the
+                // guest-local working copy cannot observe.
+                .filter(|(_, mount)| !mount.staged)
                 .map(|(i, mount)| (mount.source.clone(), HostMount::mount_tag(i))),
         )
     }
@@ -246,9 +250,14 @@ fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotify
                 mask: mask_for(&event.kind, host_path),
             });
         } else if let Some(parent) = rel.parent() {
-            // Deleted / moved away: the exact path no longer resolves in the
-            // guest, so fire a MODIFY on the (still-present) parent directory.
-            // Directory watchers re-scan and observe the removal.
+            // The guest may still cache the removed path. Send the exact name
+            // so the kernel can expire that entry and preserve the filename in
+            // directory-watch events, plus the surviving parent as a fallback
+            // when the guest had never looked the path up.
+            out.push(FsNotifyEvent {
+                path: join_guest(&t.guest_base, rel),
+                mask: fsnotify_mask::FS_DELETE,
+            });
             out.push(FsNotifyEvent {
                 path: join_guest(&t.guest_base, parent),
                 mask: fsnotify_mask::FS_MODIFY | fsnotify_mask::FS_ISDIR,
@@ -309,25 +318,24 @@ mod tests {
     fn target() -> WatchTarget {
         WatchTarget {
             host_source: PathBuf::from("/host/project"),
-            guest_base: "/mnt/virtiofs/smolvm0".to_string(),
+            guest_base: "/run/smolvm/virtiofs/smolvm0".to_string(),
         }
     }
 
     #[test]
     fn join_guest_maps_relative_paths() {
         assert_eq!(
-            join_guest("/mnt/virtiofs/smolvm0", Path::new("src/app.js")),
-            "/mnt/virtiofs/smolvm0/src/app.js"
+            join_guest("/run/smolvm/virtiofs/smolvm0", Path::new("src/app.js")),
+            "/run/smolvm/virtiofs/smolvm0/src/app.js"
         );
         assert_eq!(
-            join_guest("/mnt/virtiofs/smolvm0", Path::new("")),
-            "/mnt/virtiofs/smolvm0"
+            join_guest("/run/smolvm/virtiofs/smolvm0", Path::new("")),
+            "/run/smolvm/virtiofs/smolvm0"
         );
     }
 
     #[test]
-    fn deleted_path_fires_parent_dir_modify() {
-        // A path that does not exist on disk maps to a MODIFY on its parent.
+    fn deleted_path_expires_exact_name_and_wakes_parent() {
         let targets = vec![target()];
         let ev = Event {
             kind: EventKind::Remove(notify::event::RemoveKind::File),
@@ -336,10 +344,12 @@ mod tests {
         };
         let mut out = Vec::new();
         collect_events(&ev, &targets, &mut out);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].path, "/mnt/virtiofs/smolvm0/src");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, "/run/smolvm/virtiofs/smolvm0/src/gone.js");
+        assert_eq!(out[0].mask, fsnotify_mask::FS_DELETE);
+        assert_eq!(out[1].path, "/run/smolvm/virtiofs/smolvm0/src");
         assert_eq!(
-            out[0].mask & fsnotify_mask::FS_MODIFY,
+            out[1].mask & fsnotify_mask::FS_MODIFY,
             fsnotify_mask::FS_MODIFY
         );
     }
@@ -380,12 +390,12 @@ mod tests {
         let targets = vec![
             WatchTarget {
                 host_source: PathBuf::from("/host/project/vendor"),
-                guest_base: "/mnt/virtiofs/smolvm1".into(),
+                guest_base: "/run/smolvm/virtiofs/smolvm1".into(),
             },
             target(),
         ];
         let selected = matching_target(Path::new("/host/project/vendor/lib.js"), &targets)
             .expect("nested path should match");
-        assert_eq!(selected.guest_base, "/mnt/virtiofs/smolvm1");
+        assert_eq!(selected.guest_base, "/run/smolvm/virtiofs/smolvm1");
     }
 }

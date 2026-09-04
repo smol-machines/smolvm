@@ -185,6 +185,11 @@ jobs:
 
       - name: Build rootfs
         run: |
+          # patchelf: fetch-vulkan-guest-driver.sh gives the bundled Venus
+          # driver and its closure RUNPATH=$ORIGIN so nothing in the bundle
+          # has to be exposed to workloads through LD_LIBRARY_PATH.
+          sudo apt-get update
+          sudo apt-get install -y patchelf
           chmod +x /tmp/agent/smolvm-agent /tmp/cuda/smolvm-cuda-run
           AGENT_BINARY=/tmp/agent/smolvm-agent \
           CUDA_GUEST_BINARY=/tmp/cuda/smolvm-cuda-run \

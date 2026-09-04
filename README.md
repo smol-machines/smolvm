@@ -82,6 +82,21 @@ Common keys: `image`, `cpus`, `memory`, `net`, `ports`, `volumes`, `env`,
 `init`, `workdir`, `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
 `[network]`, `[dev]`, `[auth]`, `[health]`, `[restart]`, `[service]` tables.
 
+### Branch a running machine
+
+Start a prepared machine as branchable, then create independent copy-on-write
+children from its live RAM and disk state:
+
+```bash
+smolvm machine start --name source --branchable
+smolvm machine branch --from source --name child
+smolvm machine branch --from source --count 8 --name-prefix worker --parallel 8
+```
+
+Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
+`--forkable` remain compatibility aliases; `checkpoint` is reserved for a
+durable `.smolcheckpoint` artifact that can be restored later or elsewhere.
+
 ### Snapshot a machine into a reusable image
 
 You don't need a Dockerfile to keep an environment. Set a machine up however you
@@ -235,7 +250,7 @@ Known Limitations
 * macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
-* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine fork` / snapshot. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
+* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine branch` / snapshot. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
 
 GPU Acceleration
 ----------------
@@ -301,5 +316,16 @@ Development
 -----------
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+Documentation
+-------------
+
+The user documentation at [smolmachines.com/docs](https://smolmachines.com/docs/) is written in
+[smol-machines/docs](https://github.com/smol-machines/docs), and corrections and new pages are
+welcome there. It is Markdown only, with no build to run; its
+[CONTRIBUTING.md](https://github.com/smol-machines/docs/blob/main/CONTRIBUTING.md) covers the
+page format and how a change reaches the site.
+
+Bugs and feature requests for the runtime stay here.
 
 [Apache-2.0](LICENSE) · made by [@binsquare](https://github.com/BinSquare) · [twitter](https://x.com/binsquares) · [github](https://github.com/smol-machines/smolvm)

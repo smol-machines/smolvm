@@ -331,14 +331,16 @@ pub enum MachineCmd {
     /// Start a machine
     Start(StartCmd),
 
-    /// Fork a running forkable machine into a new clone (CoW memory + disks)
-    Fork(ForkCmd),
+    /// Branch a running branchable machine into an independent child (CoW memory + disks)
+    #[command(name = "branch", visible_alias = "fork")]
+    Branch(ForkCmd),
 
     /// Save a running machine, including RAM, as a portable checkpoint
     Checkpoint(super::pack::CheckpointCmd),
 
-    /// Assign parameters and release one held fork-pool slot
-    ForkRelease(ForkReleaseCmd),
+    /// Assign parameters and release one held branch-pool slot
+    #[command(name = "branch-release", visible_alias = "fork-release")]
+    BranchRelease(ForkReleaseCmd),
 
     /// Stop a running machine
     Stop(StopCmd),
@@ -377,6 +379,9 @@ pub enum MachineCmd {
     /// Copy files between host and machine
     Cp(CpCmd),
 
+    /// Synchronize guest-local staged mounts back to their host directories
+    Sync(SyncCmd),
+
     /// Monitor a machine with health checks and restart policy
     Monitor(MonitorCmd),
 
@@ -412,9 +417,9 @@ impl MachineCmd {
             MachineCmd::Exec(cmd) => cmd.run(),
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
-            MachineCmd::Fork(cmd) => cmd.run(),
+            MachineCmd::Branch(cmd) => cmd.run(),
             MachineCmd::Checkpoint(cmd) => cmd.run(),
-            MachineCmd::ForkRelease(cmd) => cmd.run(),
+            MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
@@ -426,6 +431,7 @@ impl MachineCmd {
             MachineCmd::Prune(cmd) => cmd.run(),
             MachineCmd::Shell(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
+            MachineCmd::Sync(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
             MachineCmd::DataDir(cmd) => cmd.run(),
@@ -529,11 +535,13 @@ pub struct RunCmd {
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
     /// for R2/MinIO; anonymous without them). Nothing is required of the
-    /// image: the agent performs the mount itself.
+    /// image: the agent performs the mount itself. `:staged` runs from a
+    /// guest-local copy for metadata-heavy workloads; `machine sync` and
+    /// graceful stop copy it back, so do not modify its host source concurrently.
     #[arg(
         short = 'v',
         long = "volume",
-        value_name = "HOST|REMOTE:CONTAINER[:ro]",
+        value_name = "HOST|REMOTE:CONTAINER[:ro|rw|staged]",
         help_heading = "Container"
     )]
     pub volume: Vec<String>,
@@ -1631,6 +1639,7 @@ impl RunCmd {
                 params.mem,
                 params.net,
                 image.clone(),
+                &mounts,
             );
         }
 
@@ -1701,16 +1710,7 @@ impl RunCmd {
             // tuples the runner expects. This is a thin local conversion;
             // the runner does its own tag assignment internally so call
             // sites don't have to track which form the agent wants.
-            let record_mounts: Vec<(String, String, bool)> = mounts
-                .iter()
-                .map(|m| {
-                    (
-                        m.source.to_string_lossy().into_owned(),
-                        m.target.to_string_lossy().into_owned(),
-                        m.read_only,
-                    )
-                })
-                .collect();
+            let (record_mounts, _) = HostMount::split_storage_tuples(&mounts);
             let mut init_env = parse_env_list(&params.env);
             init_env.extend(resolved_secrets.iter().cloned());
             // Use the machine name as the overlay ID so any rootfs changes
@@ -1803,16 +1803,7 @@ impl RunCmd {
                 {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
-                    let mount_tuples: Vec<(String, String, bool)> = mounts
-                        .iter()
-                        .map(|m| {
-                            (
-                                m.source.to_string_lossy().to_string(),
-                                m.target.to_string_lossy().to_string(),
-                                m.read_only,
-                            )
-                        })
-                        .collect();
+                    let (mount_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
                     let persist_result = SmolvmConfig::load().and_then(|mut config| {
@@ -1828,6 +1819,7 @@ impl RunCmd {
                                 cpus: params.cpus,
                                 mem: params.mem,
                                 mounts: mount_tuples,
+                                staged_mounts,
                                 ports: port_tuples,
                                 network: params.net,
                                 network_backend: params.network_backend,
@@ -1933,6 +1925,21 @@ impl RunCmd {
                     exit_code
                 };
 
+                if mounts.iter().any(|mount| mount.staged) {
+                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                        // Preserve the VM and its ephemeral DB record so the
+                        // guest-local copy remains recoverable and sync can be
+                        // retried by machine name.
+                        manager.detach();
+                        return Err(Error::agent(
+                            "sync staged mounts",
+                            format!(
+                                "{error}; machine '{vm_name}' was left running so synchronization can be retried"
+                            ),
+                        ));
+                    }
+                }
+
                 // Ephemeral run — tear down VM and its data directory.
                 // Spawn a detached helper so the parent exits immediately after
                 // flushing output. Falls back to synchronous cleanup if spawn fails.
@@ -1969,16 +1976,7 @@ impl RunCmd {
                 {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
-                    let mount_tuples: Vec<(String, String, bool)> = mounts
-                        .iter()
-                        .map(|m| {
-                            (
-                                m.source.to_string_lossy().to_string(),
-                                m.target.to_string_lossy().to_string(),
-                                m.read_only,
-                            )
-                        })
-                        .collect();
+                    let (mount_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
                     let mut config = SmolvmConfig::load()?;
@@ -1993,6 +1991,7 @@ impl RunCmd {
                             cpus: params.cpus,
                             mem: params.mem,
                             mounts: mount_tuples,
+                            staged_mounts,
                             ports: port_tuples,
                             network: params.net,
                             network_backend: params.network_backend,
@@ -2088,6 +2087,17 @@ impl RunCmd {
                     flush_output();
                     exit_code
                 };
+                if mounts.iter().any(|mount| mount.staged) {
+                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                        manager.detach();
+                        return Err(Error::agent(
+                            "sync staged mounts",
+                            format!(
+                                "{error}; machine '{vm_name}' was left running so synchronization can be retried"
+                            ),
+                        ));
+                    }
+                }
                 // Ephemeral run — tear down VM and its data directory.
                 // Spawn a detached helper so the parent exits immediately after
                 // flushing output. Falls back to synchronous cleanup if spawn fails.
@@ -2398,11 +2408,11 @@ mod tests {
     }
 
     #[test]
-    fn fork_accepts_single_and_batch_forms() {
+    fn branch_accepts_single_batch_and_legacy_fork_forms() {
         let single =
-            TestMachineCli::parse_from(["machine", "fork", "--golden", "base", "--name", "worker"]);
-        let MachineCmd::Fork(single) = single.command else {
-            panic!("expected machine fork command");
+            TestMachineCli::parse_from(["machine", "branch", "--from", "base", "--name", "worker"]);
+        let MachineCmd::Branch(single) = single.command else {
+            panic!("expected machine branch command");
         };
         assert_eq!(single.clone.as_deref(), Some("worker"));
         assert_eq!(single.count.get(), 1);
@@ -2410,8 +2420,8 @@ mod tests {
 
         let batch = TestMachineCli::parse_from([
             "machine",
-            "fork",
-            "--golden",
+            "branch",
+            "--from",
             "base",
             "--count",
             "8",
@@ -2422,8 +2432,8 @@ mod tests {
             "--ready-timeout",
             "2m",
         ]);
-        let MachineCmd::Fork(batch) = batch.command else {
-            panic!("expected machine fork command");
+        let MachineCmd::Branch(batch) = batch.command else {
+            panic!("expected machine branch command");
         };
         assert_eq!(batch.count.get(), 8);
         assert_eq!(batch.name_prefix.as_deref(), Some("worker"));
@@ -2450,17 +2460,32 @@ mod tests {
 
         let release = TestMachineCli::parse_from([
             "machine",
-            "fork-release",
+            "branch-release",
             "--name",
             "worker-0",
             "--env",
             "LR=3e-4",
         ]);
-        let MachineCmd::ForkRelease(release) = release.command else {
-            panic!("expected fork-release command");
+        let MachineCmd::BranchRelease(release) = release.command else {
+            panic!("expected branch-release command");
         };
         assert_eq!(release.name, "worker-0");
         assert_eq!(release.env, vec!["LR=3e-4"]);
+
+        let legacy = TestMachineCli::parse_from([
+            "machine",
+            "fork",
+            "--golden",
+            "base",
+            "--name",
+            "legacy-worker",
+            "--forkable",
+        ]);
+        let MachineCmd::Branch(legacy) = legacy.command else {
+            panic!("expected legacy fork alias to resolve to branch command");
+        };
+        assert_eq!(legacy.golden, "base");
+        assert!(legacy.forkable);
     }
 
     #[test]
@@ -2486,8 +2511,12 @@ mod tests {
             vec![
                 ("TRIAL".to_string(), "3".to_string()),
                 ("OUTPUT".to_string(), "/runs/worker-3".to_string()),
+                ("SMOLVM_BRANCH_INDEX".to_string(), "3".to_string()),
+                ("SMOLVM_BRANCH_NAME".to_string(), "worker-3".to_string()),
                 ("SMOLVM_FORK_INDEX".to_string(), "3".to_string()),
                 ("SMOLVM_FORK_NAME".to_string(), "worker-3".to_string()),
+                ("SMOLVM_BRANCH_BATCH_ID".to_string(), "batch-1".to_string()),
+                ("SMOLVM_BRANCH_BATCH_SIZE".to_string(), "8".to_string()),
                 ("SMOLVM_FORK_BATCH_ID".to_string(), "batch-1".to_string()),
                 ("SMOLVM_FORK_BATCH_SIZE".to_string(), "8".to_string()),
             ]
@@ -2497,6 +2526,8 @@ mod tests {
             vec![
                 ("TRIAL".to_string(), "3".to_string()),
                 ("OUTPUT".to_string(), "/runs/worker-3".to_string()),
+                ("SMOLVM_BRANCH_INDEX".to_string(), "3".to_string()),
+                ("SMOLVM_BRANCH_NAME".to_string(), "worker-3".to_string()),
                 ("SMOLVM_FORK_INDEX".to_string(), "3".to_string()),
                 ("SMOLVM_FORK_NAME".to_string(), "worker-3".to_string()),
             ]
@@ -3078,8 +3109,14 @@ pub struct CreateCmd {
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
     /// for R2/MinIO; anonymous without them). Nothing is required of the
-    /// image: the agent performs the mount itself.
-    #[arg(short = 'v', long = "volume", value_name = "HOST|REMOTE:GUEST[:ro]")]
+    /// image: the agent performs the mount itself. `:staged` runs from a
+    /// guest-local copy for metadata-heavy workloads; `machine sync` and
+    /// graceful stop copy it back, so do not modify its host source concurrently.
+    #[arg(
+        short = 'v',
+        long = "volume",
+        value_name = "HOST|REMOTE:GUEST[:ro|rw|staged]"
+    )]
     pub volume: Vec<String>,
 
     /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
@@ -3200,7 +3237,7 @@ pub struct CreateCmd {
 
     /// Command to run as the machine's persistent workload (image machines).
     /// Launched as a detached container on every `start`, so it stays running
-    /// (e.g. a pre-warmed browser to be forked). Without this, the image's own
+    /// (e.g. a pre-warmed browser to be branched). Without this, the image's own
     /// ENTRYPOINT/CMD is launched instead; if the image defines neither (e.g.
     /// a bare rootfs directory), the machine boots to just the agent and
     /// commands come from `exec`/`shell`.
@@ -3826,20 +3863,24 @@ pub struct StartCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Start as a fork base: back guest RAM with a memfd (CoW-cloneable) and
-    /// expose a control socket so the machine can be forked with `machine fork`.
-    #[arg(long)]
+    /// Start as a branch source: back guest RAM with a memfd (CoW-cloneable) and
+    /// expose a control socket so the running machine can later be branched.
+    #[arg(long = "branchable", visible_alias = "forkable")]
     pub forkable: bool,
 
-    /// Plan a CUDA fork pool with this many runnable clones. Smolvm reports a
-    /// safe per-session VRAM share before the golden initializes, so vLLM and
+    /// Plan a CUDA branch pool with this many runnable children. Smolvm reports a
+    /// safe per-session VRAM share before the source initializes, so vLLM and
     /// similar runtimes size private caches without workload changes. Implies
-    /// --forkable.
-    #[arg(long, value_name = "CLONES")]
+    /// --branchable.
+    #[arg(
+        long = "branch-pool-size",
+        visible_alias = "fork-pool-size",
+        value_name = "CHILDREN"
+    )]
     pub fork_pool_size: Option<std::num::NonZeroU32>,
 
-    /// Override the automatic logical VRAM budget for each golden/clone CUDA
-    /// session. The workload still needs no changes. Requires --fork-pool-size.
+    /// Override the automatic logical VRAM budget for each source/child CUDA
+    /// session. The workload still needs no changes. Requires --branch-pool-size.
     #[arg(long, value_name = "MIB", requires = "fork_pool_size")]
     pub cuda_vram_limit_mib: Option<std::num::NonZeroU64>,
 
@@ -3885,53 +3926,53 @@ impl StartCmd {
 // Fork Command
 // ============================================================================
 
-/// Fork a running forkable machine into a new clone.
+/// Branch a running branchable machine into a new independent child.
 ///
-/// Captures the source (the "golden") through its control socket, copy-on-write
-/// clones its disks, and boots the new machine from the source's in-memory
+/// Captures the source through its control socket, copy-on-write
+/// branches its disks, and boots the new machine from the source's in-memory
 /// snapshot instead of cold-booting. Linux/x86_64 resumes the source after the
 /// boundary; other hosts retain it as the frozen copy-on-write base.
 ///
-/// The golden must have been started with `--forkable`.
+/// The source must have been started with `--branchable`.
 #[derive(Args, Debug)]
 pub struct ForkCmd {
-    /// The running, forkable source machine to clone from.
-    #[arg(long, visible_alias = "from", value_name = "NAME")]
+    /// The running, branchable source machine to branch from.
+    #[arg(long = "from", visible_alias = "golden", value_name = "NAME")]
     pub golden: String,
 
-    /// Name for the new clone machine.
+    /// Name for the new child machine.
     #[arg(short = 'n', long = "name", value_name = "NAME")]
     pub clone: Option<String>,
 
-    /// Number of clones to create from one snapshot. Batch forks wait for the
-    /// standard `smolvm-fork-ready` boundary automatically. Direct batches
-    /// receive one shared `SMOLVM_FORK_BATCH_ID` and `SMOLVM_FORK_BATCH_SIZE`;
+    /// Number of children to create from one snapshot. Batch branches wait for the
+    /// standard `smolvm-branch-ready` boundary automatically. Direct batches
+    /// receive one shared `SMOLVM_BRANCH_BATCH_ID` and `SMOLVM_BRANCH_BATCH_SIZE`;
     /// held slots remain independent until assigned by their controller.
     #[arg(long, default_value = "1", value_name = "COUNT")]
     pub count: std::num::NonZeroU32,
 
-    /// Name batch clones PREFIX-0 through PREFIX-(COUNT-1).
+    /// Name batch children PREFIX-0 through PREFIX-(COUNT-1).
     #[arg(long, value_name = "PREFIX")]
     pub name_prefix: Option<String>,
 
-    /// Maximum number of clone boots in flight during a batch fork.
+    /// Maximum number of child boots in flight during a batch branch.
     #[arg(long, default_value = "4", value_name = "COUNT")]
     pub parallel: std::num::NonZeroU32,
 
-    /// Wait for `smolvm-fork-ready` in a single-clone fork. Batch forks always
-    /// wait; unless held, they release clones only after identity and fork env
+    /// Wait for `smolvm-branch-ready` in a single-child branch. Batch branches always
+    /// wait; unless held, they release children only after identity and branch env
     /// are installed.
     #[arg(long)]
     pub wait_ready: bool,
 
-    /// Keep each clone parked at the inherited forkpoint as an already-booted
-    /// pool slot. Assign and release a slot later with `machine fork-release`.
-    /// A consumed slot is disposable; delete and replenish it from the golden
+    /// Keep each child parked at the inherited branch point as an already-booted
+    /// pool slot. Assign and release a slot later with `machine branch-release`.
+    /// A consumed slot is disposable; delete and replenish it from the source
     /// rather than reusing mutated training state.
     #[arg(long)]
     pub hold: bool,
 
-    /// Maximum time to wait for the golden workload's forkpoint.
+    /// Maximum time to wait for the source workload's branch boundary.
     #[arg(
         long,
         default_value = "10m",
@@ -3940,36 +3981,39 @@ pub struct ForkCmd {
     )]
     pub ready_timeout: Duration,
 
-    /// Make the clone itself forkable (memfd RAM + control socket), so it can
-    /// in turn be forked.
-    #[arg(long, visible_alias = "checkpointable")]
+    /// Make the child itself branchable (memfd RAM + control socket), so it can
+    /// in turn be branched.
+    #[arg(
+        long = "branchable",
+        visible_aliases = ["forkable", "checkpointable"]
+    )]
     pub forkable: bool,
 
-    /// Pin the clone's inbound port forwards (single port or one-to-one range, repeatable).
-    /// Without this, the golden's forwards are remapped to freshly-allocated host ports.
+    /// Pin the child's inbound port forwards (single port or one-to-one range, repeatable).
+    /// Without this, the source's forwards are remapped to freshly-allocated host ports.
     #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]", help_heading = "Network")]
     pub port: Vec<PortMappingSpec>,
 
-    /// Share the golden's loaded CUDA weights with this clone instead of
-    /// copying them — sibling clones then keep ONE copy of the base model in
+    /// Share the source's loaded CUDA weights with this child instead of
+    /// copying them — sibling children then keep ONE copy of the base model in
     /// VRAM. Correct when the base stays frozen (LoRA/QLoRA fine-tuning,
-    /// inference); use a plain fork when the clone trains the base weights.
+    /// inference); use a plain branch when the child trains the base weights.
     #[arg(long)]
     pub share_weights: bool,
 
-    /// Per-fork parameter (repeatable, KEY=VALUE). Delivered to the clone as
-    /// `/etc/smolvm/fork-env` (dotenv format) for the already-running workload
-    /// to read, and merged into the clone's env for later `machine exec`
-    /// sessions. This is how sweep/rollout clones learn which variant they
+    /// Per-branch parameter (repeatable, KEY=VALUE). Delivered to the child as
+    /// `/etc/smolvm/branch-env` (dotenv format) for the already-running workload
+    /// to read, and merged into the child's env for later `machine exec`
+    /// sessions. This is how sweep/rollout children learn which variant they
     /// are — no shared-mount claim files needed.
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
-    /// Inject a per-fork secret from a host env var (GUEST_VAR=HOST_VAR),
-    /// resolved fresh on every `exec` in the clone. Unlike `--env`, the value is
-    /// never written to the clone's record, the overlay/pack, or the fork-env
-    /// guest file — and each clone's secrets are its own, invisible to the
-    /// golden and sibling clones.
+    /// Inject a per-branch secret from a host env var (GUEST_VAR=HOST_VAR),
+    /// resolved fresh on every `exec` in the child. Unlike `--env`, the value is
+    /// never written to the child's record, the overlay/pack, or the branch-env
+    /// guest file — and each child's secrets are its own, invisible to the
+    /// source and siblings.
     #[arg(
         long = "secret-env",
         value_name = "GUEST_VAR=HOST_VAR",
@@ -3977,9 +4021,9 @@ pub struct ForkCmd {
     )]
     pub secret_env: Vec<String>,
 
-    /// Inject a per-fork secret from a host file (GUEST_VAR=/abs/path), resolved
-    /// fresh on every `exec` in the clone. Never persisted to the record,
-    /// overlay/pack, or fork-env guest file. See `--secret-env`.
+    /// Inject a per-branch secret from a host file (GUEST_VAR=/abs/path), resolved
+    /// fresh on every `exec` in the child. Never persisted to the record,
+    /// overlay/pack, or branch-env guest file. See `--secret-env`.
     #[arg(
         long = "secret-file",
         value_name = "GUEST_VAR=PATH",
@@ -3991,7 +4035,7 @@ pub struct ForkCmd {
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = PortMappingSpec::expand_all(&self.port)
-            .map_err(|e| smolvm::Error::config("fork ports", e))?
+            .map_err(|e| smolvm::Error::config("branch ports", e))?
             .into_iter()
             .map(|port| port.to_tuple())
             .collect();
@@ -4002,14 +4046,14 @@ impl ForkCmd {
         let wait_ready = forkpoint_timeout(count, self.wait_ready, self.hold, self.ready_timeout);
         if count > 1024 {
             return Err(smolvm::Error::config(
-                "fork",
-                "--count cannot exceed 1024 clones per batch",
+                "branch",
+                "--count cannot exceed 1024 children per batch",
             ));
         }
         if self.hold && self.forkable {
             return Err(smolvm::Error::config(
-                "fork",
-                "--hold cannot be combined with --forkable; pool slots are disposable leaves",
+                "branch",
+                "--hold cannot be combined with --branchable; pool slots are disposable leaves",
             ));
         }
 
@@ -4019,14 +4063,14 @@ impl ForkCmd {
                 (None, Some(prefix)) => format!("{prefix}-0"),
                 (Some(_), Some(_)) => {
                     return Err(smolvm::Error::config(
-                        "fork",
+                        "branch",
                         "use either --name or --name-prefix, not both",
                     ));
                 }
                 (None, None) => {
                     return Err(smolvm::Error::config(
-                        "fork",
-                        "--name is required for one clone; use --name-prefix with --count for a batch",
+                        "branch",
+                        "--name is required for one child; use --name-prefix with --count for a batch",
                     ));
                 }
             };
@@ -4048,25 +4092,25 @@ impl ForkCmd {
 
         if self.clone.is_some() {
             return Err(smolvm::Error::config(
-                "fork",
+                "branch",
                 "--name cannot be used with --count greater than 1; use --name-prefix",
             ));
         }
         let prefix = self.name_prefix.ok_or_else(|| {
             smolvm::Error::config(
-                "fork",
+                "branch",
                 "--name-prefix is required with --count greater than 1",
             )
         })?;
         if self.forkable {
             return Err(smolvm::Error::config(
-                "fork",
-                "--forkable is not supported for batch clones",
+                "branch",
+                "--branchable is not supported for batch children",
             ));
         }
         if !ports.is_empty() {
             return Err(smolvm::Error::config(
-                "fork",
+                "branch",
                 "pinned --port mappings are not supported for a batch; inherited ports are remapped automatically",
             ));
         }
@@ -4094,10 +4138,10 @@ impl ForkCmd {
     }
 }
 
-/// Assign job-specific parameters and release one held fork-pool slot.
+/// Assign job-specific parameters and release one held branch-pool slot.
 #[derive(Args, Debug)]
 pub struct ForkReleaseCmd {
-    /// Held clone to assign and release.
+    /// Held child to assign and release.
     #[arg(short = 'n', long = "name", value_name = "NAME")]
     pub name: String,
 
@@ -4131,15 +4175,26 @@ fn render_indexed_fork_env(
         env.retain(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "SMOLVM_FORK_INDEX"
+                "SMOLVM_BRANCH_INDEX"
+                    | "SMOLVM_BRANCH_NAME"
+                    | "SMOLVM_BRANCH_BATCH_ID"
+                    | "SMOLVM_BRANCH_BATCH_SIZE"
+                    | "SMOLVM_FORK_INDEX"
                     | "SMOLVM_FORK_NAME"
                     | "SMOLVM_FORK_BATCH_ID"
                     | "SMOLVM_FORK_BATCH_SIZE"
             )
         });
+        env.push(("SMOLVM_BRANCH_INDEX".to_string(), index.to_string()));
+        env.push(("SMOLVM_BRANCH_NAME".to_string(), name.to_string()));
         env.push(("SMOLVM_FORK_INDEX".to_string(), index.to_string()));
         env.push(("SMOLVM_FORK_NAME".to_string(), name.to_string()));
         if let Some(batch) = batch {
+            env.push(("SMOLVM_BRANCH_BATCH_ID".to_string(), batch.id.clone()));
+            env.push((
+                "SMOLVM_BRANCH_BATCH_SIZE".to_string(),
+                batch.size.to_string(),
+            ));
             env.push(("SMOLVM_FORK_BATCH_ID".to_string(), batch.id.clone()));
             env.push(("SMOLVM_FORK_BATCH_SIZE".to_string(), batch.size.to_string()));
         }
@@ -4218,9 +4273,9 @@ pub struct DeleteCmd {
     #[arg(short, long)]
     pub force: bool,
 
-    /// Also delete any clones forked from this machine. A fork base cannot be
-    /// removed while its clones' disks depend on it; --cascade removes the
-    /// clones first (children before the base). Implies no confirmation.
+    /// Also delete any children branched from this machine. A branch source
+    /// cannot be removed while its children's disks depend on it; --cascade
+    /// removes children first. Implies no confirmation.
     #[arg(long)]
     pub cascade: bool,
 }
@@ -4434,8 +4489,9 @@ pub struct UpdateCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: String,
 
-    /// Add volume mount (HOST:GUEST[:ro])
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Add volume mount. A staged mount is guest-local until sync or graceful stop;
+    /// do not modify its host source concurrently.
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     pub volume: Vec<String>,
 
     /// Allow adding trusted read-only host `/etc` and `/var/log` mounts below
@@ -4591,47 +4647,39 @@ impl UpdateCmd {
                 .map_err(|e| smolvm::Error::config("update", e))?;
         }
 
-        // Validate no duplicate guest mount targets after proposed changes. The
-        // merge below only skips an exact (source,target) re-add, so a new mount
-        // whose guest target collides with a DIFFERENT existing source would
-        // otherwise leave two virtiofs mounts at one guest path — the ambiguous
-        // config create-time validation rejects. Mirror the port check above by
-        // computing the final mount set exactly as the DB closure does, then
-        // rejecting duplicate targets.
-        {
-            let mut final_mounts: Vec<(String, String, bool)> = record.mounts.clone();
-            for rm in &self.remove_volume {
-                let canonical_rm = if let Some((rm_src, rm_tgt)) = rm.split_once(':') {
-                    let resolved = std::fs::canonicalize(rm_src)
-                        .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
-                    format!("{}:{}", resolved.display(), rm_tgt)
-                } else {
-                    rm.clone()
-                };
-                final_mounts.retain(|(src, tgt, _)| {
-                    let spec = format!("{}:{}", src, tgt);
-                    spec != canonical_rm && spec != *rm
-                });
-            }
-            for m in &new_mounts {
-                let tuple = m.to_storage_tuple();
-                if !final_mounts
-                    .iter()
-                    .any(|(s, t, _)| *s == tuple.0 && *t == tuple.1)
-                {
-                    final_mounts.push(tuple);
-                }
-            }
-            let mut seen = std::collections::HashSet::new();
-            for (_, tgt, _) in &final_mounts {
-                if !seen.insert(tgt.clone()) {
-                    return Err(smolvm::Error::config(
-                        "update",
-                        format!("duplicate mount target: {tgt} is specified more than once"),
-                    ));
-                }
+        // Compute the complete mount set in its rich form so changing a stopped
+        // machine cannot lose the staged/live distinction or mount order.
+        let mut final_mounts = record.host_mounts();
+        for rm in &self.remove_volume {
+            let rm_without_mode = rm
+                .strip_suffix(":ro")
+                .or_else(|| rm.strip_suffix(":rw"))
+                .or_else(|| rm.strip_suffix(":staged"))
+                .unwrap_or(rm);
+            let canonical_rm = if let Some((rm_src, rm_tgt)) = rm_without_mode.rsplit_once(':') {
+                let resolved = std::fs::canonicalize(rm_src)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
+                Some((resolved, std::path::PathBuf::from(rm_tgt)))
+            } else {
+                None
+            };
+            final_mounts.retain(|mount| {
+                canonical_rm.as_ref().is_none_or(|(source, target)| {
+                    mount.source != *source || mount.target != *target
+                })
+            });
+        }
+        for mount in &new_mounts {
+            if !final_mounts
+                .iter()
+                .any(|current| current.source == mount.source && current.target == mount.target)
+            {
+                final_mounts.push(mount.clone());
             }
         }
+        HostMount::ensure_unique_targets(&final_mounts)?;
+        let (final_live_mounts, final_staged_mounts) =
+            HostMount::split_storage_tuples(&final_mounts);
 
         // Expand physical disk files before the DB write. If expansion fails,
         // no DB changes are made — the record stays consistent.
@@ -4651,41 +4699,27 @@ impl UpdateCmd {
             if let Some(o) = self.overlay {
                 r.overlay_gb = Some(o);
             }
-            // Volumes: add new, remove specified.
-            // Canonicalize the remove spec's source path so ./src matches
-            // the stored /absolute/path/to/src.
-            for rm in &self.remove_volume {
-                let canonical_rm = if let Some((rm_src, rm_tgt)) = rm.split_once(':') {
-                    let resolved = std::fs::canonicalize(rm_src)
-                        .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
-                    format!("{}:{}", resolved.display(), rm_tgt)
-                } else {
-                    rm.clone()
-                };
-                let before = r.mounts.len();
-                r.mounts.retain(|(src, tgt, _)| {
-                    let spec = format!("{}:{}", src, tgt);
-                    spec != canonical_rm && spec != *rm
-                });
-                if r.mounts.len() < before {
-                    changes.push(format!("  removed volume: {}", rm));
+            if !self.remove_volume.is_empty() || !new_mounts.is_empty() {
+                for rm in &self.remove_volume {
+                    changes.push(format!("  removed volume: {rm}"));
                 }
-            }
-            for m in &new_mounts {
-                let tuple = m.to_storage_tuple();
-                if !r
-                    .mounts
-                    .iter()
-                    .any(|(s, t, _)| *s == tuple.0 && *t == tuple.1)
-                {
+                for mount in &new_mounts {
+                    let mode = if mount.staged {
+                        ":staged"
+                    } else if mount.read_only {
+                        ":ro"
+                    } else {
+                        ""
+                    };
                     changes.push(format!(
                         "  added volume: {}:{}{}",
-                        tuple.0,
-                        tuple.1,
-                        if tuple.2 { ":ro" } else { "" }
+                        mount.source.display(),
+                        mount.target.display(),
+                        mode
                     ));
-                    r.mounts.push(tuple);
                 }
+                r.mounts = final_live_mounts.clone();
+                r.staged_mounts = final_staged_mounts.clone();
             }
 
             // Ports: add new, remove specified
@@ -5248,6 +5282,41 @@ impl CpCmd {
             bar.finish(size);
         }
 
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Sync Command
+// ============================================================================
+
+/// Synchronize staged mounts from a running machine to their host sources.
+#[derive(Args, Debug)]
+pub struct SyncCmd {
+    /// Machine to synchronize (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl SyncCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = self.name.unwrap_or_else(|| "default".to_string());
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db
+            .get_vm(&name)?
+            .ok_or_else(|| smolvm::Error::vm_not_found(&name))?;
+        if record.staged_mounts.is_empty() {
+            println!("Machine '{name}' has no staged mounts");
+            return Ok(());
+        }
+
+        let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
+        let (manager, mut client) = vm_common::ensure_running_and_connect(&Some(name.clone()))?;
+        // This command observes an existing persistent VM; a failed sync must
+        // leave it running so the user can fix the cause and retry.
+        manager.detach();
+        smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
+        println!("Synchronized staged mounts for '{name}'");
         Ok(())
     }
 }

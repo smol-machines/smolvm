@@ -606,13 +606,15 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
 
     // Parse and validate volume mounts
-    let mounts: Vec<(String, String, bool)> =
-        HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?
-            .into_iter()
-            .map(|m| m.to_storage_tuple())
-            .collect();
+    let parsed_mounts =
+        HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?;
+    let (mounts, staged_mounts) = HostMount::split_storage_tuples(&parsed_mounts);
     for volume in &remote_volumes {
-        if mounts.iter().any(|(_, target, _)| target == &volume.target) {
+        if mounts.iter().any(|(_, target, _)| target == &volume.target)
+            || staged_mounts
+                .iter()
+                .any(|(_, _, target)| target == &volume.target)
+        {
             return Err(smolvm::Error::config(
                 "create machine",
                 format!(
@@ -683,6 +685,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
         params.net,
         restart,
     );
+    record.staged_mounts = staged_mounts;
     record.init = params.init.clone();
     record.remote_volumes = remote_volumes;
     record.env = env;
@@ -826,7 +829,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             return Err(smolvm::Error::config(
                 "machine fork",
                 format!(
-                    "machine '{golden}' has remote volumes, which cannot be forked yet: \
+                    "machine '{golden}' has remote volumes, which cannot be branched yet: \
                      a mounted remote filesystem does not survive the freeze/restore"
                 ),
             ));
@@ -834,7 +837,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     }
 
     if let Some(timeout) = options.wait_ready {
-        eprintln!("Waiting for golden '{golden}' to reach its forkpoint...");
+        eprintln!("Waiting for source '{golden}' to reach its branchpoint...");
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
     }
 
@@ -844,7 +847,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     if smolvm::agent::fork::fork_continue_enabled() {
         eprintln!("Checkpointing '{golden}' while keeping it running...");
     } else {
-        eprintln!("Freezing golden '{golden}' as fork base...");
+        eprintln!("Freezing source '{golden}' as branch base...");
     }
     let prep = if options.hold {
         smolvm::agent::fork::prepare_held_fork(
@@ -869,7 +872,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     for (golden_host, guest, clone_host) in &prep.port_remaps {
         if options.pinned_ports.is_empty() {
             eprintln!(
-                "  port {golden_host}->{guest} (golden) remapped to {clone_host}->{guest} (clone)"
+                "  port {golden_host}->{guest} (source) remapped to {clone_host}->{guest} (child)"
             );
         } else {
             eprintln!("  port {clone_host}->{guest} (pinned)");
@@ -897,15 +900,15 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     }
     if options.hold {
         eprintln!(
-            "Forked '{golden}' -> held slot '{clone}'. Release it with \
-             `smolvm machine fork-release --name {clone}`."
+            "Branched '{golden}' -> held slot '{clone}'. Release it with \
+             `smolvm machine branch-release --name {clone}`."
         );
     } else if smolvm::agent::fork::fork_continue_enabled() {
-        eprintln!("Forked '{golden}' -> '{clone}'. Source continues running.");
+        eprintln!("Branched '{golden}' -> '{clone}'. Source continues running.");
     } else {
         eprintln!(
-            "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \
-             (do not start it again while clones exist)."
+            "Branched '{golden}' -> '{clone}'. Source stays frozen as the branch base \
+             (do not start it again while children exist)."
         );
     }
     Ok(())
@@ -934,7 +937,7 @@ pub fn fork_vm_batch(
             return Err(smolvm::Error::config(
                 "machine fork",
                 format!(
-                    "machine '{golden}' has remote volumes, which cannot be forked yet: \
+                    "machine '{golden}' has remote volumes, which cannot be branched yet: \
                      a mounted remote filesystem does not survive the freeze/restore"
                 ),
             ));
@@ -942,7 +945,7 @@ pub fn fork_vm_batch(
     }
 
     if let Some(timeout) = wait_ready {
-        eprintln!("Waiting for golden '{golden}' to reach its forkpoint...");
+        eprintln!("Waiting for source '{golden}' to reach its branchpoint...");
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
     }
 
@@ -964,7 +967,7 @@ pub fn fork_vm_batch(
         );
     } else {
         eprintln!(
-            "Freezing golden '{golden}' once for {} clones...",
+            "Freezing source '{golden}' once for {} children...",
             clones.len()
         );
     }
@@ -1043,7 +1046,7 @@ pub fn fork_vm_batch(
     for (name, result) in results {
         if let Err(error) = result {
             first_error.get_or_insert_with(|| {
-                smolvm::Error::agent("batch fork", format!("clone '{name}' failed: {error}"))
+                smolvm::Error::agent("batch branch", format!("child '{name}' failed: {error}"))
             });
         }
     }
@@ -1071,12 +1074,12 @@ pub fn fork_vm_batch(
 
     if hold {
         eprintln!(
-            "Provisioned {} held slots from '{golden}' with one snapshot.",
+            "Provisioned {} held branch slots from '{golden}' with one snapshot.",
             all_names.len()
         );
     } else {
         eprintln!(
-            "Forked {} clones from '{golden}' with one snapshot.",
+            "Branched {} children from '{golden}' with one snapshot.",
             all_names.len()
         );
     }
@@ -1094,13 +1097,13 @@ pub fn release_held_fork(clone: &str, assignment: &[(String, String)]) -> smolvm
     if record.golden.is_none() {
         return Err(smolvm::Error::agent(
             "release held fork",
-            format!("machine '{clone}' is not a fork clone"),
+            format!("machine '{clone}' is not a branch child"),
         ));
     }
     if !record.forkpoint_held {
         return Err(smolvm::Error::agent(
             "release held fork",
-            format!("clone '{clone}' is not a held pool slot"),
+            format!("child '{clone}' is not a held branch-pool slot"),
         ));
     }
 
@@ -1117,7 +1120,7 @@ pub fn release_held_fork(clone: &str, assignment: &[(String, String)]) -> smolvm
     if !claimed.get() {
         return Err(smolvm::Error::agent(
             "release held fork",
-            format!("clone '{clone}' was already claimed"),
+            format!("child '{clone}' was already claimed"),
         ));
     }
     let activated = smolvm::agent::fork::activate_held_fork(clone, &record, assignment).map_err(
@@ -1132,8 +1135,8 @@ pub fn release_held_fork(clone: &str, assignment: &[(String, String)]) -> smolvm
     )?;
     debug_assert_eq!(activated, merged);
     eprintln!(
-        "Released held slot '{clone}'. Replace it from '{}' after the workload completes.",
-        record.golden.as_deref().unwrap_or("its golden")
+        "Released held branch slot '{clone}'. Replace it from '{}' after the workload completes.",
+        record.golden.as_deref().unwrap_or("its source")
     );
     Ok(())
 }
@@ -1148,7 +1151,7 @@ fn boot_prepared_fork(
 ) -> smolvm::Result<()> {
     let preload_modules = prep.clone_record.cuda_preload_modules;
     let clone_forkable = prep.clone_record.forkable;
-    eprintln!("Booting clone '{clone}' from snapshot...");
+    eprintln!("Booting child '{clone}' from snapshot...");
     let mut start = || {
         start_vm_named_with_db(
             db,
@@ -1168,7 +1171,7 @@ fn boot_prepared_fork(
     };
     let started = match retry_gate {
         Some(gate) => retry_once_serialized(gate, &mut start, |error| {
-            eprintln!("Clone '{clone}' boot failed once; retrying serially: {error}");
+            eprintln!("Child '{clone}' boot failed once; retrying serially: {error}");
             std::thread::sleep(std::time::Duration::from_millis(100));
         })
         .map_err(|(first, retry)| {
@@ -1242,7 +1245,7 @@ fn persist_batch_clones_running(db: &SmolvmDb, clones: &[String]) -> smolvm::Res
     let mut processes = std::collections::HashMap::with_capacity(clones.len());
     for clone in clones {
         let manager = AgentManager::for_vm(clone)
-            .map_err(|error| smolvm::Error::agent("batch fork", error.to_string()))?;
+            .map_err(|error| smolvm::Error::agent("batch branch", error.to_string()))?;
         let identity = manager.pid_and_start_time().ok_or_else(|| {
             smolvm::Error::agent(
                 "batch fork",
@@ -1430,7 +1433,7 @@ fn start_vm_named_with_db(
                     .to_string()
             } else {
                 format!(
-                    "it is the fork base for {} live clone(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the clones first",
+                    "it is the branch source for {} live child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
                     clones.len(),
                     clones.join(", ")
                 )
@@ -1452,7 +1455,7 @@ fn start_vm_named_with_db(
         if !record.cuda {
             return Err(Error::config(
                 "fork pool",
-                "--fork-pool-size requires a CUDA-enabled machine",
+                "--branch-pool-size requires a CUDA-enabled machine",
             ));
         }
         record.cuda_fork_pool_size = Some(pool_size);
@@ -1806,6 +1809,7 @@ pub fn persist_named_running(
                 r.cpus = o.cpus;
                 r.mem = o.mem;
                 r.mounts = o.mounts.clone();
+                r.staged_mounts = o.staged_mounts.clone();
                 r.ports = o.ports.clone();
                 r.network = o.network;
                 r.network_backend = o.network_backend;
@@ -1847,6 +1851,7 @@ pub struct DefaultVmOverrides {
     pub cpus: u8,
     pub mem: u32,
     pub mounts: Vec<(String, String, bool)>,
+    pub staged_mounts: Vec<(usize, String, String)>,
     pub ports: Vec<(u16, u16)>,
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
@@ -2097,6 +2102,10 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
 
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
+    if !record.staged_mounts.is_empty() {
+        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+        smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
+    }
     manager.stop()?;
 
     // Detach the machine's case-sensitive layers volume now that its process is
@@ -2174,10 +2183,21 @@ fn kill_orphaned_boot_process(name: &str) {
 pub fn stop_vm_default() -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
+    let record = SmolvmConfig::load()
+        .ok()
+        .and_then(|config| config.get_vm("default").cloned());
+
     // try_connect_existing sets internal state if agent is reachable;
     // stop() handles both responsive agents and orphans via PID file.
     manager.try_connect_existing();
     println!("Stopping machine 'default'...");
+    if let Some(record) = record
+        .as_ref()
+        .filter(|record| !record.staged_mounts.is_empty())
+    {
+        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+        smolvm::staged_mount::sync_staged_mounts(record, &mut client)?;
+    }
     manager.stop()?;
 
     // Update database record if it exists
@@ -2384,7 +2404,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         // Delete the full lineage deepest-first. Every qcow2 overlay must
         // disappear before the parent image that backs it.
         for clone in db.dependent_descendants_postorder(name)? {
-            println!("Deleting dependent clone '{clone}' (cascade)...");
+            println!("Deleting dependent child '{clone}' (cascade)...");
             delete_vm(
                 &clone,
                 true, // no per-clone confirmation during a cascade
@@ -2405,6 +2425,11 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             RecordState::Running => {
                 let manager = AgentManager::for_vm(name)?;
                 println!("Stopping machine '{}'...", name);
+                if !record.staged_mounts.is_empty() {
+                    let mut client =
+                        smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+                    smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
+                }
                 manager.stop()?;
                 if record.pid.is_some_and(smolvm::process::is_alive) {
                     return Err(smolvm::Error::agent(
@@ -2575,7 +2600,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "cpus": record.cpus,
         "memory_mib": record.mem,
         "pid": record.pid,
-        "mounts": record.mounts.len(),
+        "mounts": record.mounts.len() + record.staged_mounts.len(),
         "ports": record.ports.len(),
         "created_at": record.created_at,
         "storage_gb": record.storage_gb,
@@ -2587,9 +2612,13 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
         "cuda": record.cuda,
+        "branchable": record.forkable_on_start(),
         "forkable": record.forkable_on_start(),
+        "parent_machine": record.golden,
+        "cuda_branch_pool_size": record.cuda_fork_pool_size,
         "cuda_fork_pool_size": record.cuda_fork_pool_size,
         "cuda_vram_limit_mib": record.cuda_vram_limit_mib,
+        "branchpoint_held": record.forkpoint_held,
         "forkpoint_held": record.forkpoint_held,
         "labels": record.labels,
         "restart_policy": record.restart.policy.to_string(),
@@ -2659,10 +2688,18 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
         println!("{}", json);
     } else {
         println!(
-            "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
-            "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS", "STORAGE", "OVERLAY"
+            "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}  {:<18}",
+            "NAME",
+            "STATE",
+            "CPUS",
+            "MEMORY",
+            "MOUNTS",
+            "PORTS",
+            "STORAGE",
+            "OVERLAY",
+            "BRANCHED FROM"
         );
-        println!("{}", "-".repeat(88));
+        println!("{}", "-".repeat(108));
 
         for (name, record) in vms {
             let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
@@ -2673,16 +2710,24 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
             };
             let storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
             let overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+            // A branch's source, so a tree of clones reads as a tree rather than
+            // a flat list of unrelated machines.
+            let branched_from = record
+                .golden
+                .as_deref()
+                .map(|g| truncate(g, 16))
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
+                "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}  {:<18}",
                 truncate(name, 18),
                 state_display,
                 record.cpus,
                 format!("{} MiB", record.mem),
-                record.mounts.len(),
+                record.mounts.len() + record.staged_mounts.len(),
                 record.ports.len(),
                 format!("{} GiB", storage_gb),
                 format!("{} GiB", overlay_gb),
+                branched_from,
             );
 
             if verbose {
@@ -2706,16 +2751,16 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                     }
                 }
                 if record.forkable_on_start() {
-                    println!("  Forkable: enabled");
+                    println!("  Branchable: enabled");
                 }
                 if let Some(pool_size) = record.cuda_fork_pool_size {
-                    println!("  CUDA fork pool: {} clone(s)", pool_size);
+                    println!("  CUDA branch pool: {} child machine(s)", pool_size);
                 }
                 if let Some(limit_mib) = record.cuda_vram_limit_mib {
                     println!("  CUDA VRAM limit: {} MiB per session", limit_mib);
                 }
                 if record.forkpoint_held {
-                    println!("  Fork slot: held");
+                    println!("  Branch slot: held");
                 }
                 for cmd in &record.init {
                     println!("  Init: {}", cmd);
@@ -2903,8 +2948,11 @@ pub fn register_ephemeral_vm(
     mem: u32,
     network: bool,
     image: Option<String>,
+    mounts: &[HostMount],
 ) {
-    let mut record = VmRecord::new(name.to_string(), cpus, mem, vec![], vec![], network);
+    let (live_mounts, staged_mounts) = HostMount::split_storage_tuples(mounts);
+    let mut record = VmRecord::new(name.to_string(), cpus, mem, live_mounts, vec![], network);
+    record.staged_mounts = staged_mounts;
     record.ephemeral = true;
     record.state = RecordState::Running;
     record.pid = pid;

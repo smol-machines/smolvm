@@ -209,6 +209,7 @@ pub fn docker_config_mount() -> Option<HostMount> {
         source: docker_dir,
         target: PathBuf::from("/root/.docker"),
         read_only: true,
+        staged: false,
     })
 }
 

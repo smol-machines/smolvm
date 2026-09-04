@@ -158,6 +158,13 @@ impl<S: Read + Write> WsStream<S> {
 
     /// Write one frame. Server frames are never masked.
     fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
+        write_frame(&mut self.inner, opcode, payload)
+    }
+}
+
+/// Frame `payload` as one message on `w`.
+fn write_frame<W: Write>(w: &mut W, opcode: u8, payload: &[u8]) -> Result<()> {
+    {
         let mut header = Vec::with_capacity(10);
         header.push(0x80 | opcode); // FIN + opcode
         match payload.len() {
@@ -171,8 +178,40 @@ impl<S: Read + Write> WsStream<S> {
                 header.extend_from_slice(&(n as u64).to_be_bytes());
             }
         }
-        self.inner.write_all(&header)?;
-        self.inner.write_all(payload)
+        w.write_all(&header)?;
+        w.write_all(payload)
+    }
+}
+
+/// The write half of a split WebSocket connection: frames what it is given
+/// and can close the whole socket.
+pub struct WsWriter {
+    inner: std::net::TcpStream,
+}
+
+impl WsWriter {
+    pub fn close(&self) {
+        let _ = self.inner.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Write for WsWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        write_frame(&mut self.inner, OP_BINARY, buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl WsStream<std::net::TcpStream> {
+    /// Split into a reading half (this stream) and an independent writing
+    /// half, so one thread can read input while another pushes frames.
+    pub fn split(self) -> Result<(Self, WsWriter)> {
+        let inner = self.inner.try_clone()?;
+        Ok((self, WsWriter { inner }))
     }
 }
 

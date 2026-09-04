@@ -61,10 +61,15 @@ struct VideoConfig {
 
 impl VideoConfig {
     fn from_env() -> Result<Option<Self>, String> {
-        let Some(raw) = std::env::var_os("SMOLVM_VIDEO") else {
-            return Ok(None);
+        // Unset means "use it when the host can": encoded video is on by
+        // default wherever an ffmpeg is on the PATH, since a browser then
+        // gets frames at a fraction of the raw cost and the raw path stays
+        // the fallback. `SMOLVM_VIDEO=off` disables it outright.
+        let raw = match std::env::var_os("SMOLVM_VIDEO") {
+            Some(raw) => raw.to_string_lossy().trim().to_ascii_lowercase(),
+            None if ffmpeg_on_path() => "auto".to_string(),
+            None => return Ok(None),
         };
-        let raw = raw.to_string_lossy().trim().to_ascii_lowercase();
         if raw.is_empty() || matches!(raw.as_str(), "0" | "off" | "false" | "disabled") {
             return Ok(None);
         }
@@ -108,6 +113,21 @@ where
         return Err(format!("{name} must be between {min} and {max}"));
     }
     Ok(value)
+}
+
+/// Whether an `ffmpeg` binary can be found on the PATH.
+fn ffmpeg_on_path() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        });
+        candidate.is_file()
+    })
 }
 
 fn auto_encoder() -> Encoder {
@@ -227,6 +247,12 @@ fn helper_socket_path() -> PathBuf {
         "smolvm-video-{}-{nonce:08x}.sock",
         std::process::id()
     ))
+}
+
+/// Whether encoded video is configured for this VMM, explicitly or by
+/// default because an ffmpeg is on the PATH.
+pub fn is_configured() -> bool {
+    VideoConfig::from_env().ok().flatten().is_some()
 }
 
 /// Whether this VMM has an enabled, pre-started encoder helper.
@@ -407,7 +433,18 @@ fn feed_frames<W: Write>(
     // The Annex-B parser uses the next AUD as the prior frame's boundary.
     // One duplicate after activity flushes the final changed frame; after
     // that an idle desktop sends no raw pixels at all.
-    let mut needs_flush = true;
+    // Hardware encoders hold several frames before emitting one (VideoToolbox
+    // emits its first access unit after the seventh input), so a lone change
+    // such as a typed character would sit in the encoder until enough later
+    // frames arrive. After every change the unchanged frame is repeated at
+    // the full cadence for this many ticks, which pushes the change through
+    // in a few tens of milliseconds for a few small delta frames.
+    const FLUSH_TICKS: u32 = 8;
+    let mut flush_ticks = FLUSH_TICKS;
+    // Once quiet, the unchanged frame is still repeated slowly so a viewer
+    // that connects to an idle desktop gets a picture at all.
+    const IDLE_INTERVAL: Duration = Duration::from_secs(1);
+    let mut last_written = Instant::now();
     write_raw_frame(out, &frame)?;
     loop {
         next += interval;
@@ -430,10 +467,12 @@ fn feed_frames<W: Write>(
             generation = newer.generation;
             frame = newer;
             write_raw_frame(out, &frame)?;
-            needs_flush = true;
-        } else if needs_flush {
+            last_written = Instant::now();
+            flush_ticks = FLUSH_TICKS;
+        } else if flush_ticks > 0 || last_written.elapsed() >= IDLE_INTERVAL {
             write_raw_frame(out, &frame)?;
-            needs_flush = false;
+            last_written = Instant::now();
+            flush_ticks = flush_ticks.saturating_sub(1);
         }
     }
 }
@@ -705,6 +744,11 @@ fn ffmpeg_command(config: VideoConfig, width: u32, height: u32) -> std::process:
             ]);
         }
         Encoder::VideoToolbox => {
+            // Baseline with no B-frames: VideoToolbox writes no VUI, so a
+            // decoder cannot learn the reorder depth from the stream and
+            // buffers frames before showing the first one; browsers treat
+            // Baseline itself as reorder-free and display each frame as it
+            // arrives.
             command.args([
                 "-c:v",
                 "h264_videotoolbox",
@@ -750,9 +794,16 @@ fn ffmpeg_command(config: VideoConfig, width: u32, height: u32) -> std::process:
         (config.bitrate_kbps / u32::from(config.fps)).max(1) * 2
     );
     let gop = config.fps.to_string();
+    // VideoToolbox writes no VUI, so a decoder cannot learn the reorder depth
+    // from the stream and buffers frames before showing the first; browsers
+    // treat Baseline itself as reorder-free and show each frame on arrival.
+    let profile = match config.encoder {
+        Encoder::VideoToolbox => "baseline",
+        _ => "main",
+    };
     command.args([
         "-profile:v",
-        "main",
+        profile,
         "-b:v",
         &bitrate,
         "-maxrate",

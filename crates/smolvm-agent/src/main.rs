@@ -427,12 +427,25 @@ fn main() {
         );
     }
 
+    // Staged mounts keep their working copy on the persistent storage disk.
+    // Mount it before volume initialization instead of using the normal
+    // post-ready overlap, otherwise the later /storage mount can hide a newly
+    // seeded working tree and lose it across restart.
+    if storage::staged_boot_mount_requested() && !ensure_storage_mounted() {
+        error!("staged volume mount requires the guest storage disk");
+        std::process::exit(1);
+    }
+
     // Initialize volume mounts from SMOLVM_MOUNT_* env vars.
     // MUST run before the /workspace symlink below — if the user passed
     // `-v host:/workspace`, the bind mount claims /workspace first and
     // the symlink's `!exists()` guard correctly skips creation.
     let t0 = uptime_ms();
     let boot_mounts = storage::init_volume_mounts();
+    if storage::staged_boot_mount_requested() && storage::boot_volume_mounts_failed() {
+        error!("failed to initialize staged volume mount");
+        std::process::exit(1);
+    }
     if !boot_mounts.is_empty() {
         info!(
             duration_ms = uptime_ms() - t0,
@@ -535,6 +548,9 @@ fn main() {
     // ensure_storage_mounted() also guards any concurrent call from a request
     // that races in the brief window on very fast hosts.
     ensure_storage_mounted();
+    if let Err(error) = storage::prune_staged_working_copies(storage::init_volume_mounts()) {
+        warn!(error = %error, "failed to clean stale staged working copies");
+    }
 
     // With the disks mounted, start reclaiming freed blocks back to the host
     // sparse files so disk footprint tracks live data (see disk_trim).
@@ -2196,6 +2212,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if let AgentRequest::ArchiveDirectory { ref path } = request {
+            handle_streaming_archive_directory(stream, path)?;
+            continue;
+        }
+
         // Streaming file upload: Begin opens a session, Chunk appends
         // or finalizes. Any other request type closes the session
         // implicitly (Drop runs on the Option assignment to None).
@@ -2512,10 +2533,12 @@ fn handle_request(
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
-        AgentRequest::FileRead { .. } => AgentResponse::error(
-            "streaming file read must be handled at connection level",
-            error_codes::INTERNAL_ERROR,
-        ),
+        AgentRequest::FileRead { .. } | AgentRequest::ArchiveDirectory { .. } => {
+            AgentResponse::error(
+                "streaming read must be handled at connection level",
+                error_codes::INTERNAL_ERROR,
+            )
+        }
 
         // Pod-container lifecycle (containerd shim v2 datapath, see pod.rs).
         AgentRequest::PodCreate {
@@ -3197,6 +3220,26 @@ fn send_data_chunks<R: Read>(
     error_context: &str,
     error_code: &'static str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    send_data_chunks_body(stream, reader, chunk_size, error_context, error_code)?;
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: vec![],
+            done: true,
+        },
+    )?;
+    Ok(())
+}
+
+/// Send data chunks without the terminal frame so a producer can verify its
+/// final status before reporting a successful end-of-stream.
+fn send_data_chunks_body<R: Read>(
+    stream: &mut impl Write,
+    reader: &mut R,
+    chunk_size: usize,
+    error_context: &str,
+    error_code: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; chunk_size];
     loop {
         // Fill as much of the buffer as possible in one chunk.
@@ -3220,14 +3263,6 @@ fn send_data_chunks<R: Read>(
         }
 
         if pending == 0 {
-            // EOF — emit the terminator frame.
-            send_response(
-                stream,
-                &AgentResponse::DataChunk {
-                    data: vec![],
-                    done: true,
-                },
-            )?;
             return Ok(());
         }
 
@@ -3335,6 +3370,91 @@ fn handle_streaming_file_read(
         "failed to read file",
         error_codes::FILE_IO_FAILED,
     )
+}
+
+/// Stream a tar archive of a directory directly over vsock.
+///
+/// This deliberately runs in the agent namespace: boot-time staged mounts are
+/// visible there even when an image workload is active, and no temporary
+/// archive needs to traverse virtiofs or occupy the guest disk.
+fn handle_streaming_archive_directory(
+    stream: &mut impl ReadWrite,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let normalized = match normalize_guest_path(path) {
+        Ok(path) => path,
+        Err(response) => {
+            send_response(stream, &response)?;
+            return Ok(());
+        }
+    };
+    let directory = std::path::Path::new(&normalized);
+    if !directory.is_dir() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("not a directory: {path}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let mut child = match std::process::Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(directory)
+        .arg(".")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to start directory archive: {error}"),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let mut stdout = child.stdout.take().expect("piped tar stdout");
+    let result = send_data_chunks_body(
+        stream,
+        &mut stdout,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read directory archive",
+        error_codes::FILE_IO_FAILED,
+    );
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    result?;
+    match child.wait() {
+        Ok(status) if status.success() => send_response(
+            stream,
+            &AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+        ),
+        Ok(status) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("directory archive exited with {status}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        ),
+        Err(error) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("failed to wait for directory archive: {error}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        ),
+    }
 }
 
 /// Handle an interactive run session with streaming I/O.
@@ -3622,8 +3742,6 @@ fn write_oci_bundle(
     unprivileged: bool,
     container_init: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use std::path::Path;
-
     let workdir_str = launch.workdir.as_deref().unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
     let mut spec = oci::OciSpec::new(
@@ -3658,7 +3776,7 @@ fn write_oci_bundle(
     }
 
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = storage::volume_bind_source(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,
@@ -4870,7 +4988,7 @@ fn spawn_interactive_command(
     spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = storage::volume_bind_source(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,

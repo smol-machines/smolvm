@@ -116,12 +116,16 @@ async function session() {
   // Keep RFB connected for keyboard and pointer input in both modes.  A
   // second WebSocket carries encoded H.264 when the browser and host support
   // it; otherwise this same session falls back to ordinary Raw rectangles.
-  const enc = new Uint8Array(12);
-  enc[0] = 2; putU16(enc, 2, 2); putI32(enc, 4, -223); putI32(enc, 8, 0);
-  send(enc);
-
+  // The Cursor pseudo-encoding (-239) makes the server hand over the pointer
+  // image instead of drawing it into frames; this page then shows it as the
+  // CSS cursor, so pointer motion never waits on a frame at all.
   if ("VideoDecoder" in window) {
     try {
+      setEncodings([-313, -239, -223]);                       // pointer only, no pixels
+      // The pointer and pushed updates start now, so the cursor is right
+      // even while the first encoded frame is still on its way.
+      requestUpdate(false);
+      updateLoop().catch((e) => setStatus(String(e && e.message || e), true));
       await startVideo();
       return;
     } catch (e) {
@@ -131,18 +135,66 @@ async function session() {
   startRaw();
 }
 
+function setEncodings(list) {
+  const enc = new Uint8Array(4 + 4 * list.length);
+  enc[0] = 2; putU16(enc, 2, list.length);
+  list.forEach((e, i) => putI32(enc, 4 + 4 * i, e));
+  send(enc);
+}
+
 function startRaw() {
   if (rawStarted) return;
   rawStarted = true;
   if (videoSocket) { videoSocket.onclose = null; videoSocket.close(); }
   if (decoder) { try { decoder.close(); } catch (_) {} decoder = null; }
-  rawLoop().catch((e) => setStatus(String(e && e.message || e), true));
+  setEncodings([-313, -239, -223, 0]);
+  requestUpdate(false);
+  updateLoop().catch((e) => setStatus(String(e && e.message || e), true));
 }
 
-async function rawLoop() {
-  requestUpdate(false);
+// Turn a Cursor pseudo-rectangle (B,G,R,A pixels plus a 1-bit mask) into the
+// page's CSS cursor, hot spot included. A 0x0 rectangle hides the pointer.
+function applyCursor(hotX, hotY, w, h, pixels, mask) {
+  if (!w || !h) { canvas.style.cursor = "none"; return; }
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const cctx = c.getContext("2d");
+  const img = cctx.createImageData(w, h);
+  const rowBytes = (w + 7) >> 3;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const on = (mask[y * rowBytes + (x >> 3)] >> (7 - (x & 7))) & 1;
+      img.data[i] = pixels[i + 2];
+      img.data[i + 1] = pixels[i + 1];
+      img.data[i + 2] = pixels[i];
+      img.data[i + 3] = on ? (pixels[i + 3] || 255) : 0;
+    }
+  }
+  cctx.putImageData(img, 0, 0);
+  canvas.style.cursor = `url(${c.toDataURL()}) ${hotX} ${hotY}, default`;
+}
+
+// Ask the server to push updates as the display changes (RFB
+// ContinuousUpdates, -313) instead of answering one request at a time. The
+// server confirms support with an EndOfContinuousUpdates message.
+let continuous = false;
+function enableContinuousUpdates() {
+  const m = new Uint8Array(10);
+  m[0] = 150; m[1] = 1; putU16(m, 2, 0); putU16(m, 4, 0); putU16(m, 6, 0xffff); putU16(m, 8, 0xffff);
+  send(m);
+  continuous = true;
+}
+let loopRunning = false;
+async function updateLoop() {
+  if (loopRunning) return;
+  loopRunning = true;
   for (;;) {
     const type = (await recv(1))[0];
+    if (type === 150) {                                         // EndOfContinuousUpdates
+      if (!continuous) enableContinuousUpdates();
+      continue;
+    }
     if (type !== 0) throw new Error("unexpected server message " + type);
     await recv(1);                                            // padding
     const rects = u16(await recv(2), 0);
@@ -154,11 +206,15 @@ async function rawLoop() {
         draw(x, y, w, h, await recv(w * h * 4));
       } else if (encoding === -223) {
         resize(w, h);                                         // DesktopSize
+      } else if (encoding === -239) {
+        const pixels = w && h ? await recv(w * h * 4) : new Uint8Array(0);
+        const mask = w && h ? await recv(((w + 7) >> 3) * h) : new Uint8Array(0);
+        applyCursor(x, y, w, h, pixels, mask);
       } else {
         throw new Error("unsupported encoding " + encoding);
       }
     }
-    requestUpdate(true);
+    if (!continuous) requestUpdate(true);
   }
 }
 
@@ -202,10 +258,16 @@ function startVideo() {
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         resize(view.getUint32(1), view.getUint32(5));
         decoder.configure({
-          codec: "avc1.4D002A",
+          codec: "avc1.42E02A",                                 // Constrained Baseline 4.2
           codedWidth: fbWidth,
           codedHeight: fbHeight,
-          hardwareAcceleration: "prefer-hardware",
+          // The hardware decoder on macOS holds several frames before it
+          // outputs anything, whatever the latency hint says, which both
+          // delays the first picture past the fallback timeout on an idle
+          // desktop and adds a constant lag. Software decode of a desktop-
+          // sized stream costs a few milliseconds a frame and outputs each
+          // chunk as it arrives.
+          hardwareAcceleration: "prefer-software",
           optimizeForLatency: true,
         });
         configured = true;
@@ -237,17 +299,22 @@ function resize(w, h) {
 }
 
 // The server sends BGRX; canvas wants RGBA.
+// Reuse one ImageData per rectangle size and swizzle 32 bits at a time: a
+// fresh allocation and a per-byte copy for every rectangle at tens of MB/s
+// is what made the raw path stall the page and back up the socket.
+let drawImg = null, drawW = 0, drawH = 0;
 function draw(x, y, w, h, pixels) {
-  const img = ctx.createImageData(w, h);
-  const out = img.data;
-  for (let i = 0; i < w * h; i++) {
-    const p = i * 4;
-    out[p] = pixels[p + 2];
-    out[p + 1] = pixels[p + 1];
-    out[p + 2] = pixels[p];
-    out[p + 3] = 255;
+  if (!drawImg || drawW !== w || drawH !== h) {
+    drawImg = ctx.createImageData(w, h); drawW = w; drawH = h;
   }
-  ctx.putImageData(img, x, y);
+  if (pixels.byteOffset & 3) pixels = pixels.slice();          // Uint32 view needs alignment
+  const src = new Uint32Array(pixels.buffer, pixels.byteOffset, w * h);
+  const dst = new Uint32Array(drawImg.data.buffer);
+  for (let i = 0; i < src.length; i++) {
+    const v = src[i];                                            // little-endian B,G,R,X
+    dst[i] = 0xff000000 | ((v & 0xff) << 16) | (v & 0xff00) | ((v >>> 16) & 0xff);
+  }
+  ctx.putImageData(drawImg, x, y);
 }
 
 function requestUpdate(incremental) {
@@ -274,11 +341,25 @@ function sendPointer(mask, x, y) {
 function maskOf(ev) {
   return (ev.buttons & 1 ? 1 : 0) | (ev.buttons & 4 ? 2 : 0) | (ev.buttons & 2 ? 4 : 0);
 }
+// Motion is coalesced to one position per animation frame: forwarding every
+// mousemove event made the guest re-render (and the server re-encode) for each
+// one, hundreds of times a second. Button changes are sent at once.
+let pendingMove = null, moveScheduled = false;
+function flushMove() {
+  moveScheduled = false;
+  if (pendingMove) { sendPointer(pendingMove[0], pendingMove[1], pendingMove[2]); pendingMove = null; }
+}
 function onPointer(ev) {
   if (!fbWidth) return;
-  buttonMask = maskOf(ev);
+  const mask = maskOf(ev);
   const [x, y] = at(ev);
-  sendPointer(buttonMask, x, y);
+  if (ev.type !== "mousemove" || mask !== buttonMask) {
+    buttonMask = mask; pendingMove = null;
+    sendPointer(mask, x, y);
+    return;
+  }
+  pendingMove = [mask, x, y];
+  if (!moveScheduled) { moveScheduled = true; requestAnimationFrame(flushMove); }
 }
 canvas.addEventListener("mousemove", onPointer);
 canvas.addEventListener("mousedown", (ev) => { canvas.focus(); onPointer(ev); });

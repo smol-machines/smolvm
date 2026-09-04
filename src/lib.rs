@@ -96,6 +96,8 @@ pub mod remote_volume;
 pub mod secrets;
 pub mod settings;
 pub mod smolfile;
+/// Guest-local staged mount synchronization.
+pub mod staged_mount;
 pub mod storage;
 pub mod systemd_scope;
 pub mod util;

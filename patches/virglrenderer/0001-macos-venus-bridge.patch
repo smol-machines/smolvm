@@ -1,0 +1,1591 @@
+--- a/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h
++++ b/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h
+@@ -555,6 +555,7 @@
+     vn_decode_VkCommandTypeEXT(ctx->decoder, &cmd_type);
+     vn_decode_VkFlags(ctx->decoder, &cmd_flags);
+ 
++
+     {
+ #ifdef DEBUG
+         TRACE_SCOPE_SLOW(vn_dispatch_command_name(cmd_type));
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -54,6 +54,50 @@
+       return obj;                                                                        \
+    }
+ 
++#ifdef __APPLE__
++/* VK_EXT_host_image_copy, declared here because the vendored headers predate it.
++ *
++ * This is what makes the guest's pixels readable at all: the host renders into
++ * an optimal-tiled image, which on this platform lives in private texture
++ * memory, so no mapping of the underlying allocation ever shows the picture.
++ * This extension reads such an image straight into a linear host buffer.
++ */
++#define VKR_IMAGE_USAGE_HOST_TRANSFER_BIT 0x00400000u
++#define VKR_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES 1000270000
++#define VKR_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY 1000270003
++#define VKR_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO 1000270004
++
++typedef struct VkrPhysicalDeviceHostImageCopyFeatures {
++   VkStructureType sType;
++   void *pNext;
++   VkBool32 hostImageCopy;
++} VkrPhysicalDeviceHostImageCopyFeatures;
++
++typedef struct VkrImageToMemoryCopy {
++   VkStructureType sType;
++   const void *pNext;
++   void *pHostPointer;
++   uint32_t memoryRowLength;
++   uint32_t memoryImageHeight;
++   VkImageSubresourceLayers imageSubresource;
++   VkOffset3D imageOffset;
++   VkExtent3D imageExtent;
++} VkrImageToMemoryCopy;
++
++typedef struct VkrCopyImageToMemoryInfo {
++   VkStructureType sType;
++   const void *pNext;
++   VkFlags flags;
++   VkImage srcImage;
++   VkImageLayout srcImageLayout;
++   uint32_t regionCount;
++   const VkrImageToMemoryCopy *pRegions;
++} VkrCopyImageToMemoryInfo;
++
++typedef VkResult(VKAPI_PTR *PFN_vkrCopyImageToMemory)(VkDevice,
++                                                      const VkrCopyImageToMemoryInfo *);
++#endif /* __APPLE__ */
++
+ /* vkr_region_is_valid should be used to check for overflows */
+ #define VKR_REGION_INIT(offset, size)                                                    \
+    {                                                                                     \
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -324,7 +324,14 @@
+     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
+     */
+    int res_fd = -1;
++#ifdef __APPLE__
++   /* A cross-device blob is shared through the mapped host pointer here, not an
++    * fd, so there is nothing to duplicate.
++    */
++   if (false) {
++#else
+    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) {
++#endif
+       res_fd = os_dupfd_cloexec(blob.u.fd);
+       if (res_fd < 0) {
+          close(blob.u.fd);
+@@ -332,14 +339,29 @@
+       }
+    }
+ 
++#ifdef __APPLE__
++   void *const res_map_ptr = (void *)(uintptr_t)blob.map_ptr;
++#else
++   void *const res_map_ptr = NULL;
++#endif
++
+    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, res_fd,
+-                                             NULL)) {
++                                             res_map_ptr)) {
+       if (res_fd >= 0)
+          close(res_fd);
+       close(blob.u.fd);
+       return false;
+    }
+ 
++#ifdef __APPLE__
++   {
++      struct vkr_resource *res = vkr_context_get_resource(ctx, res_id);
++      if (res)
++         res->mem = mem;
++         res->mem_id = mem->base.id;
++   }
++#endif
++
+    *out_blob = blob;
+ 
+    return true;
+@@ -605,6 +627,7 @@
+ 
+    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
+    mtx_destroy(&ctx->object_mutex);
++   mtx_destroy(&ctx->scanout_mutex);
+ 
+    vkr_cs_encoder_fini(&ctx->encoder);
+    vkr_cs_decoder_fini(&ctx->decoder);
+@@ -664,6 +687,8 @@
+    if (!vkr_context_wait_ring_init(ctx))
+       goto err_ctx_wait_ring_init;
+ 
++   if (mtx_init(&ctx->scanout_mutex, mtx_plain) != thrd_success)
++      goto err_scanout_mutex;
+    if (mtx_init(&ctx->object_mutex, mtx_plain) != thrd_success)
+       goto err_ctx_object_mutex;
+ 
+@@ -703,6 +728,8 @@
+ err_ctx_object_table:
+    mtx_destroy(&ctx->object_mutex);
+ err_ctx_object_mutex:
++   mtx_destroy(&ctx->scanout_mutex);
++err_scanout_mutex:
+    vkr_context_wait_ring_fini(ctx);
+ err_ctx_wait_ring_init:
+    free(ctx->debug_name);
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -20,6 +20,15 @@
+ struct vkr_resource {
+    uint32_t res_id;
+ 
++#ifdef __APPLE__
++   /* the allocation this resource was exported from, so a scanout read can
++    * find the image bound to it */
++   struct vkr_device_memory *mem;
++   /* its object id: the memory can die with its device without this
++    * resource hearing about it, so a reader checks the id still resolves */
++   vkr_object_id mem_id;
++#endif
++
+    enum virgl_resource_fd_type fd_type;
+ 
+    union {
+@@ -78,6 +87,8 @@
+    } ring_monitor;
+ 
+    mtx_t object_mutex;
++   /* held across a scanout readback and across image/memory destruction */
++   mtx_t scanout_mutex;
+    struct hash_table *object_table;
+ 
+    mtx_t resource_mutex;
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -3,7 +3,10 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <stdio.h>
++
+ #include "vkr_device_memory.h"
++#include "vkr_image.h"
+ 
+ #include "venus-protocol/vn_protocol_renderer_transport.h"
+ 
+@@ -149,17 +152,102 @@
+    struct vkr_physical_device *physical_dev = dev->physical_device;
+ 
+    VkMemoryAllocateInfo *alloc_info = (VkMemoryAllocateInfo *)args->pAllocateInfo;
+-   const uint32_t mem_type_index = alloc_info->memoryTypeIndex;
++   uint32_t mem_type_index = alloc_info->memoryTypeIndex;
+    if (unlikely(mem_type_index >= physical_dev->memory_properties.memoryTypeCount)) {
+       args->ret = VK_ERROR_UNKNOWN;
+       return;
+    }
+ 
++#ifdef __APPLE__
++   /* Sharing a resource with the guest means handing over a mapped host
++    * pointer, because there are no fds here. Memory the host reports as
++    * device-local only cannot be mapped at all, so an allocation that lands
++    * there can never be shared -- which is what stopped a compositor from
++    * getting an output buffer.
++    *
++    * The host's memory is unified and every type sits in the same heap, so
++    * moving the allocation to a host-visible type costs nothing.
++    */
++   {
++      const VkPhysicalDeviceMemoryProperties *props = &physical_dev->memory_properties;
++      if (!(props->memoryTypes[mem_type_index].propertyFlags &
++            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
++         for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++            const VkMemoryPropertyFlags f = props->memoryTypes[i].propertyFlags;
++            if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++                props->memoryTypes[i].heapIndex ==
++                   props->memoryTypes[mem_type_index].heapIndex) {
++               mem_type_index = i;
++               alloc_info->memoryTypeIndex = i;
++               break;
++            }
++         }
++      }
++   }
++#endif
++
++#ifdef __APPLE__
++   /* The host has no fd-based external memory, so an allocation that asks to
++    * export or import one fails and the memory object is never created -- and
++    * the bind that follows then references a handle that does not exist, which
++    * kills the command stream. The sharing actually happens through the
++    * virtio-gpu resource, so drop the request the host cannot honour.
++    */
++   {
++      const VkStructureType drop[] = {
++         VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++         VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++      };
++      for (uint32_t i = 0; i < ARRAY_SIZE(drop); i++) {
++         VkBaseInStructure *prev = vkr_find_prev_struct(alloc_info, drop[i]);
++         if (prev)
++            prev->pNext = prev->pNext->pNext;
++      }
++   }
++#endif
++
+    /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
+    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
+    VkImportMemoryResourceInfoMESA *res_info = NULL;
+    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
+       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
++
++#ifdef __APPLE__
++   /* The guest is asking for memory that aliases a resource it already owns.
++    * There is no fd to import here, so wrap the pointer the resource is mapped
++    * at instead -- the host allocation then refers to the very same storage.
++    */
++   VkImportMemoryHostPointerInfoEXT local_host_ptr_info;
++   if (prev_of_res_info && physical_dev->EXT_external_memory_host) {
++      const VkImportMemoryResourceInfoMESA *info =
++         (const VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
++      const struct vkr_resource *res = vkr_context_get_resource(ctx, info->resourceId);
++      if (res && res->u.data) {
++         local_host_ptr_info = (VkImportMemoryHostPointerInfoEXT){
++            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++            .pNext = info->pNext,
++            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++            .pHostPointer = res->u.data,
++         };
++         prev_of_res_info->pNext = (const struct VkBaseInStructure *)&local_host_ptr_info;
++
++         struct vkr_device_memory *host_mem = vkr_device_memory_create_and_add(ctx, args);
++         if (!host_mem)
++            return;
++
++         host_mem->device = dev;
++         list_inithead(&host_mem->bound_images);
++         host_mem->property_flags =
++            physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
++         host_mem->valid_fd_types = 0;
++         host_mem->gbm_bo = NULL;
++         host_mem->allocation_size = alloc_info->allocationSize;
++         host_mem->memory_type_index = mem_type_index;
++         return;
++      }
++   }
++#endif
++
+    if (prev_of_res_info) {
+       res_info = (VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
+       if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
+@@ -252,6 +340,7 @@
+    }
+ 
+    mem->device = dev;
++   list_inithead(&mem->bound_images);
+    mem->property_flags = property_flags;
+    mem->valid_fd_types = valid_fd_types;
+    mem->gbm_bo = gbm_bo;
+@@ -263,6 +352,18 @@
+ vkr_dispatch_vkFreeMemory(struct vn_dispatch_context *dispatch,
+                           struct vn_command_vkFreeMemory *args)
+ {
++   struct vkr_context *scanout_ctx = dispatch->data;
++   mtx_lock(&scanout_ctx->scanout_mutex);
++   {
++      struct vkr_device_memory *freeing = vkr_device_memory_from_handle(args->memory);
++      if (freeing && freeing->bound_images.next) {
++         list_for_each_entry_safe (struct vkr_image, bimg, &freeing->bound_images, mem_head) {
++            list_del(&bimg->mem_head);
++            bimg->bound_mem = NULL;
++         }
++         freeing->bound_image = NULL;
++      }
++   }
+    struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
+    if (!mem)
+       return;
+@@ -275,6 +376,8 @@
+ 
+    vkr_device_memory_release(mem);
+    vkr_device_memory_destroy_and_remove(dispatch->data, args);
++out:
++   mtx_unlock(&scanout_ctx->scanout_mutex);
+ }
+ 
+ static void
+@@ -382,6 +485,10 @@
+     * to the same storage.
+     */
+    if (mem->exported) {
++#ifdef VKR_TRACE_COMMANDS
++      { FILE *tf = fopen("/tmp/vkr-res.log", "a");
++        if (tf) { fprintf(tf, "export_blob: ALREADY EXPORTED flags=0x%x\n", blob_flags); fclose(tf); } }
++#endif
+       vkr_log("mem has been exported");
+       return false;
+    }
+@@ -406,11 +513,7 @@
+    enum virgl_resource_fd_type fd_type;
+    VkExternalMemoryHandleTypeFlagBits handle_type;
+    struct virgl_resource_vulkan_info vulkan_info;
+-   if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) {
+-      if (!can_export_dma_buf) {
+-         vkr_log("mem cannot export to dma_buf for cross device blob sharing");
+-         return false;
+-      }
++   if ((blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) && can_export_dma_buf) {
+       fd_type = VIRGL_RESOURCE_FD_DMABUF;
+       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    } else if (can_export_dma_buf) {
+@@ -435,8 +538,17 @@
+    } else {
+ #ifdef __APPLE__
+       void *ptr;
+-      if (vkMapMemory(mem->device->base.handle.device, mem->base.handle.device_memory,
+-                      0, mem->allocation_size, 0, &ptr) != VK_SUCCESS) {
++      VkResult map_res = vkMapMemory(mem->device->base.handle.device,
++                                     mem->base.handle.device_memory, 0,
++                                     mem->allocation_size, 0, &ptr);
++#ifdef VKR_TRACE_COMMANDS
++      {
++         FILE *tf = fopen("/tmp/vkr-res.log", "a");
++         if (tf) { fprintf(tf, "export_blob: flags=0x%x props=0x%x map=%d\n", blob_flags,
++                           mem->property_flags, (int)map_res); fclose(tf); }
++      }
++#endif
++      if (map_res != VK_SUCCESS) {
+          vkr_log("vkMapMemory failed");
+          return false;
+       }
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -13,6 +13,13 @@
+ struct vkr_device_memory {
+    struct vkr_object base;
+ 
++#ifdef __APPLE__
++   /* the image bound here most recently, and every image bound here --
++    * see vkr_dispatch_vkBindImageMemory2 */
++   struct vkr_image *bound_image;
++   struct list_head bound_images;
++#endif
++
+    struct vkr_device *device;
+    uint32_t property_flags;
+    uint32_t valid_fd_types;
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -84,12 +84,34 @@
+    struct vkr_physical_device *physical_dev =
+       vkr_physical_device_from_handle(args->physicalDevice);
+ 
++#ifdef __APPLE__
++   /* Drop the extensions we advertise but the host does not implement. Left in
++    * place they reach MoltenVK, which fails the whole device create with
++    * VK_ERROR_EXTENSION_NOT_PRESENT.
++    */
++   {
++      VkDeviceCreateInfo *info = (VkDeviceCreateInfo *)args->pCreateInfo;
++      const char **names = (const char **)info->ppEnabledExtensionNames;
++      uint32_t kept = 0;
++      for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
++         if (vkr_physical_device_extension_is_emulated(names[i]))
++            continue;
++         names[kept++] = names[i];
++      }
++      info->enabledExtensionCount = kept;
++   }
++#endif
++
+    /* append extensions for our own use */
+    const char **exts = NULL;
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+    ext_count += physical_dev->KHR_external_fence_fd;
++#ifdef __APPLE__
++   ext_count += physical_dev->EXT_external_memory_host;
++   ext_count += physical_dev->EXT_host_image_copy;
++#endif
+    if (ext_count > args->pCreateInfo->enabledExtensionCount) {
+       exts = malloc(sizeof(*exts) * ext_count);
+       if (!exts) {
+@@ -106,6 +128,12 @@
+          exts[ext_count++] = "VK_EXT_external_memory_dma_buf";
+       if (physical_dev->KHR_external_fence_fd)
+          exts[ext_count++] = "VK_KHR_external_fence_fd";
++#ifdef __APPLE__
++      if (physical_dev->EXT_external_memory_host)
++         exts[ext_count++] = "VK_EXT_external_memory_host";
++      if (physical_dev->EXT_host_image_copy)
++         exts[ext_count++] = "VK_EXT_host_image_copy";
++#endif
+ 
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;
+@@ -119,9 +147,36 @@
+       return;
+    }
+ 
++#ifdef __APPLE__
++   /* The host would fail the device create outright if asked for a feature it
++    * reports as unsupported. See vkr_dispatch_vkGetPhysicalDeviceFeatures2.
++    */
++   {
++      VkPhysicalDeviceRobustness2FeaturesEXT *rb2 = vkr_find_struct(
++         args->pCreateInfo->pNext,
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
++      if (rb2)
++         rb2->nullDescriptor = VK_FALSE;
++   }
++#endif
++
++#ifdef __APPLE__
++   VkrPhysicalDeviceHostImageCopyFeatures host_copy_feature = {
++      .sType = VKR_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES,
++      .hostImageCopy = VK_TRUE,
++   };
++   if (physical_dev->EXT_host_image_copy) {
++      VkDeviceCreateInfo *info = (VkDeviceCreateInfo *)args->pCreateInfo;
++      host_copy_feature.pNext = (void *)info->pNext;
++      info->pNext = &host_copy_feature;
++   }
++#endif
++
+    vn_replace_vkCreateDevice_args_handle(args);
+    args->ret = vkCreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
+                               &dev->base.handle.device);
++#ifdef __APPLE__
++#endif
+    if (args->ret != VK_SUCCESS) {
+       free(exts);
+       free(dev);
+@@ -295,7 +350,11 @@
+    if (!dev)
+       return;
+ 
++   /* a device teardown frees every image and memory at once; no scanout
++    * read may be copying out of one meanwhile */
++   mtx_lock(&ctx->scanout_mutex);
+    vkr_device_destroy(ctx, dev);
++   mtx_unlock(&ctx->scanout_mutex);
+ }
+ 
+ static void
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -5,9 +5,51 @@
+ 
+ #include "vkr_image.h"
+ 
++#include "vkr_device_memory.h"
+ #include "vkr_image_gen.h"
+ #include "vkr_physical_device.h"
+ 
++#ifdef __APPLE__
++/* Enough of the common colour formats to describe a compositor's buffers. */
++static uint32_t
++vkr_format_bytes_per_pixel(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_SRGB:
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_SRGB:
++   case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
++   case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
++   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++      return 4;
++   case VK_FORMAT_R8G8B8_UNORM:
++   case VK_FORMAT_B8G8R8_UNORM:
++      return 3;
++   case VK_FORMAT_R8G8_UNORM:
++   case VK_FORMAT_R5G6B5_UNORM_PACK16:
++   case VK_FORMAT_B5G6R5_UNORM_PACK16:
++      return 2;
++   case VK_FORMAT_R8_UNORM:
++      return 1;
++   case VK_FORMAT_R16G16B16A16_SFLOAT:
++   case VK_FORMAT_R16G16B16A16_UNORM:
++      return 8;
++   default:
++      return 0;
++   }
++}
++
++static uint64_t
++vkr_align_row_pitch(uint64_t pitch)
++{
++   /* 256 is the alignment scanout hardware and every DRM driver assume */
++   const uint64_t align = 256;
++   return (pitch + align - 1) & ~(align - 1);
++}
++#endif
++
+ static void
+ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkCreateImage *args)
+@@ -31,14 +73,79 @@
+     * situation because the app does not consider the memory external.
+     */
+ 
+-   vkr_image_create_and_add(dispatch->data, args);
++#ifdef __APPLE__
++   bool was_drm_modifier = false;
++   /* The host knows neither DRM modifiers nor dma_buf handles and fails the
++    * whole image create if either is left in the chain. Linear is the only
++    * modifier advertised, so ask the host for a linear image instead and drop
++    * the structures it cannot read. The guest reaches the pixels through the
++    * virtio-gpu resource, so only the resource identity has to agree, not the
++    * host's private layout.
++    */
++   {
++      VkImageCreateInfo *info = (VkImageCreateInfo *)args->pCreateInfo;
++
++      if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
++         info->tiling = VK_IMAGE_TILING_OPTIMAL;
++         was_drm_modifier = true;
++
++         /* so the picture can be read back out of the private texture memory
++          * this image really lives in */
++         struct vkr_device *dev_for_usage = vkr_device_from_handle(args->device);
++         if (dev_for_usage->physical_device->EXT_host_image_copy)
++            info->usage |= VKR_IMAGE_USAGE_HOST_TRANSFER_BIT;
++      }
++
++      const VkStructureType drop[] = {
++         VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
++         VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++         VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++      };
++      for (uint32_t i = 0; i < ARRAY_SIZE(drop); i++) {
++         VkBaseInStructure *prev = vkr_find_prev_struct(info, drop[i]);
++         if (prev)
++            prev->pNext = prev->pNext->pNext;
++      }
++   }
++#endif
++
++#ifdef __APPLE__
++   const VkImageCreateInfo saved = *args->pCreateInfo;
++#endif
++
++   struct vkr_image *img = vkr_image_create_and_add(dispatch->data, args);
++
++#ifdef __APPLE__
++   if (img && was_drm_modifier) {
++      img->drm_modifier = true;
++      img->width = saved.extent.width;
++      img->height = saved.extent.height;
++      img->bytes_per_pixel = vkr_format_bytes_per_pixel(saved.format);
++   }
++#endif
+ }
+ 
+ static void
+ vkr_dispatch_vkDestroyImage(struct vn_dispatch_context *dispatch,
+                             struct vn_command_vkDestroyImage *args)
+ {
++   struct vkr_context *ctx = dispatch->data;
++   mtx_lock(&ctx->scanout_mutex);
++#ifdef __APPLE__
++   {
++      struct vkr_image *dying = vkr_image_from_handle(args->image);
++      if (dying && dying->bound_mem) {
++         struct vkr_device_memory *mem = dying->bound_mem;
++         list_del(&dying->mem_head);
++         dying->bound_mem = NULL;
++         if (mem->bound_image == dying)
++            mem->bound_image = list_is_empty(&mem->bound_images) ? NULL
++               : list_last_entry(&mem->bound_images, struct vkr_image, mem_head);
++      }
++   }
++#endif
+    vkr_image_destroy_and_remove(dispatch->data, args);
++   mtx_unlock(&ctx->scanout_mutex);
+ }
+ 
+ static void
+@@ -93,27 +200,74 @@
+                                          args->pSparseMemoryRequirements);
+ }
+ 
++#ifdef __APPLE__
++/* Remember which image ends up in which allocation: a scanout read starts
++ * from the resource, and the resource only knows its memory. Recorded only
++ * after the bind really happened, under the scanout lock, so a read on the
++ * other thread never picks an image that is not backed yet.
++ */
++static void
++vkr_image_record_binding(struct vkr_context *ctx,
++                         struct vkr_image *img,
++                         struct vkr_device_memory *mem)
++{
++   if (!img || !mem)
++      return;
++   mtx_lock(&ctx->scanout_mutex);
++   if (img->bound_mem)
++      list_del(&img->mem_head);
++   img->bound_mem = mem;
++   list_addtail(&img->mem_head, &mem->bound_images);
++   mem->bound_image = img;
++   mtx_unlock(&ctx->scanout_mutex);
++}
++#endif
++
+ static void
+-vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
++vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkBindImageMemory *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
++#ifdef __APPLE__
++   struct vkr_image *img = vkr_image_from_handle(args->image);
++   struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
++#endif
+ 
+    vn_replace_vkBindImageMemory_args_handle(args);
+    args->ret =
+       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
++#ifdef __APPLE__
++   if (args->ret == VK_SUCCESS)
++      vkr_image_record_binding(dispatch->data, img, mem);
++#endif
+ }
+ 
+ static void
+-vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
++vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkBindImageMemory2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
++#ifdef __APPLE__
++   /* the bind infos carry host handles after vn_replace, so resolve first */
++   const uint32_t bind_count = args->bindInfoCount < 8 ? args->bindInfoCount : 8;
++   struct vkr_image *imgs[8];
++   struct vkr_device_memory *mems[8];
++   for (uint32_t i = 0; i < bind_count; i++) {
++      imgs[i] = vkr_image_from_handle(args->pBindInfos[i].image);
++      mems[i] = vkr_device_memory_from_handle(args->pBindInfos[i].memory);
++   }
++#endif
+ 
+    vn_replace_vkBindImageMemory2_args_handle(args);
+    args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
++#ifdef __APPLE__
++   if (args->ret == VK_SUCCESS) {
++      for (uint32_t i = 0; i < bind_count; i++)
++         vkr_image_record_binding(dispatch->data, imgs[i], mems[i]);
++   }
++#endif
+ }
+ 
+ static void
+@@ -124,6 +278,29 @@
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++#ifdef __APPLE__
++   /* Reading the layout of an optimal-tiled image is not something Vulkan
++    * allows, and the host answers with a stride the guest cannot use (it kept
++    * discarding the buffer and retrying). Describe the tightly packed layout
++    * the guest expects; the host's private tiling is never visible to it.
++    */
++   {
++      const struct vkr_image *img = vkr_image_from_handle(args->image);
++      if (img && img->drm_modifier && img->bytes_per_pixel) {
++         const uint64_t row = vkr_align_row_pitch(
++            (uint64_t)img->width * img->bytes_per_pixel);
++         *args->pLayout = (VkSubresourceLayout){
++            .offset = 0,
++            .size = row * img->height,
++            .rowPitch = row,
++            .arrayPitch = row * img->height,
++            .depthPitch = row * img->height,
++         };
++         return;
++      }
++   }
++#endif
++
+    vn_replace_vkGetImageSubresourceLayout_args_handle(args);
+    vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
+                                  args->pLayout);
+@@ -134,12 +311,23 @@
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetImageDrmFormatModifierPropertiesEXT *args)
+ {
++#ifdef __APPLE__
++   /* The host does not implement this extension, so the proc pointer is NULL
++    * and calling it takes the VM down. Every modifier image here was created by
++    * vkr_dispatch_vkCreateImage, so the answer is always the one modifier we
++    * advertise.
++    */
++   args->pProperties->drmFormatModifier = 0ull; /* VKR_DRM_FORMAT_MOD_HOST_OPAQUE */
++   args->ret = VK_SUCCESS;
++   return;
++#else
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+    vn_replace_vkGetImageDrmFormatModifierPropertiesEXT_args_handle(args);
+    args->ret = vk->GetImageDrmFormatModifierPropertiesEXT(args->device, args->image,
+                                                           args->pProperties);
++#endif
+ }
+ 
+ static void
+--- a/src/venus/vkr_image.h
++++ b/src/venus/vkr_image.h
+@@ -10,6 +10,22 @@
+ 
+ struct vkr_image {
+    struct vkr_object base;
++
++#ifdef __APPLE__
++   /* Set for images the guest created with a DRM modifier. Those are backed by
++    * an optimal-tiled host image, so the host cannot answer a subresource
++    * layout query for them and vkr_dispatch_vkGetImageSubresourceLayout
++    * answers from these instead.
++    */
++   bool drm_modifier;
++   /* every image bound to a memory is kept on that memory's list, so a
++    * scanout read can pick one that matches the picture it wants */
++   struct list_head mem_head;
++   struct vkr_device_memory *bound_mem;
++   uint32_t width;
++   uint32_t height;
++   uint32_t bytes_per_pixel;
++#endif
+ };
+ VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+ 
+--- a/src/venus/vkr_instance.c
++++ b/src/venus/vkr_instance.c
+@@ -259,7 +259,9 @@
+       return;
+    }
+ 
++   mtx_lock(&ctx->scanout_mutex);
+    vkr_instance_destroy(ctx, instance);
++   mtx_unlock(&ctx->scanout_mutex);
+ }
+ 
+ void
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -3,6 +3,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <stdio.h>
++
+ #include "vkr_physical_device.h"
+ 
+ #include "venus-protocol/vn_protocol_renderer_device.h"
+@@ -195,6 +197,77 @@
+       physical_dev->gbm_device = vkr_physical_device_get_gbm_device();
+ }
+ 
++#ifdef __APPLE__
++/* MoltenVK reports no dmabuf and no fd-based external memory, so the host
++ * extension list never carries what the guest requires before Mesa will expose
++ * shareable images. Without them zink cannot create a DRI screen and the guest
++ * falls back to llvmpipe, which is what makes a desktop unusable.
++ *
++ * These are advertised to the guest and emulated on top of virtio-gpu blob
++ * resources. vkr_dispatch_vkCreateDevice keeps them from reaching the host,
++ * which would otherwise fail the device create outright.
++ */
++static const char *const vkr_emulated_extensions[] = {
++   "VK_KHR_external_memory_fd",
++   "VK_EXT_external_memory_dma_buf",
++   "VK_EXT_image_drm_format_modifier",
++   "VK_EXT_queue_family_foreign",
++   /* Venus hides VK_KHR_synchronization2 -- and clamps the device to Vulkan
++    * 1.2 -- unless the renderer can import a sync_fd semaphore, which gates
++    * every Vulkan compositor. The host has no sync_fd, so it is emulated on
++    * top of the host's timeline semaphores.
++    */
++   "VK_KHR_external_semaphore_fd",
++};
++
++bool
++vkr_physical_device_extension_is_emulated(const char *name)
++{
++   for (uint32_t i = 0; i < ARRAY_SIZE(vkr_emulated_extensions); i++) {
++      if (!strcmp(name, vkr_emulated_extensions[i]))
++         return true;
++   }
++   return false;
++}
++
++static uint32_t
++vkr_physical_device_add_emulated_extensions(VkExtensionProperties **exts,
++                                            uint32_t count)
++{
++   VkExtensionProperties *grown =
++      realloc(*exts, sizeof(**exts) * (count + ARRAY_SIZE(vkr_emulated_extensions)));
++   if (!grown)
++      return count;
++
++   *exts = grown;
++   for (uint32_t i = 0; i < ARRAY_SIZE(vkr_emulated_extensions); i++) {
++      const char *name = vkr_emulated_extensions[i];
++
++      /* the protocol has to be able to carry it, and the host must not have
++       * advertised it already */
++      if (!vkr_extension_get_spec_version(name))
++         continue;
++
++      bool already_present = false;
++      for (uint32_t j = 0; j < count; j++) {
++         if (!strcmp(grown[j].extensionName, name)) {
++            already_present = true;
++            break;
++         }
++      }
++      if (already_present)
++         continue;
++
++      VkExtensionProperties *props = &grown[count++];
++      memset(props, 0, sizeof(*props));
++      snprintf(props->extensionName, sizeof(props->extensionName), "%s", name);
++      props->specVersion = vkr_extension_get_spec_version(name);
++   }
++
++   return count;
++}
++#endif /* __APPLE__ */
++
+ static void
+ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev,
+                                     struct vkr_instance *instance)
+@@ -227,8 +300,24 @@
+          physical_dev->EXT_external_memory_dma_buf = true;
+       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
+          physical_dev->KHR_external_fence_fd = true;
++#ifdef __APPLE__
++      else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
++         physical_dev->EXT_external_memory_host = true;
++      else if (!strcmp(props->extensionName, "VK_EXT_host_image_copy"))
++         physical_dev->EXT_host_image_copy = true;
++#endif
+ 
+       const uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
++#ifdef VKR_TRACE_COMMANDS
++      {
++         FILE *tf = fopen("/tmp/vkr-extfilter.log", "a");
++         if (tf) {
++            fprintf(tf, "%-50s host_ver=%u spec_ver=%u %s\n", props->extensionName,
++                    props->specVersion, spec_ver, spec_ver ? "KEPT" : "DROPPED");
++            fclose(tf);
++         }
++      }
++#endif
+       if (spec_ver) {
+          if (props->specVersion > spec_ver)
+             props->specVersion = spec_ver;
+@@ -253,6 +342,10 @@
+          physical_dev->KHR_external_fence_fd = false;
+    }
+ 
++#ifdef __APPLE__
++   advertised_count = vkr_physical_device_add_emulated_extensions(&exts, advertised_count);
++#endif
++
+    physical_dev->extensions = exts;
+    physical_dev->extension_count = advertised_count;
+ }
+@@ -543,6 +636,19 @@
+ {
+    vn_replace_vkGetPhysicalDeviceFeatures2_args_handle(args);
+    vkGetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
++
++#ifdef __APPLE__
++   /* The host hardcodes nullDescriptor to false, and zink refuses to run
++    * without it. The feature is about a descriptor slot being allowed to be
++    * unbound rather than about the values read back, and a correct client never
++    * dereferences such a slot, so report it as supported. It is cleared again
++    * in vkr_dispatch_vkCreateDevice so the host never sees it requested.
++    */
++   VkPhysicalDeviceRobustness2FeaturesEXT *rb2 = vkr_find_struct(
++      args->pFeatures->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
++   if (rb2)
++      rb2->nullDescriptor = VK_TRUE;
++#endif
+ }
+ 
+ static void
+@@ -585,6 +691,72 @@
+    }
+ }
+ 
++#ifdef __APPLE__
++/* An opaque modifier standing for "whatever layout the host picked".
++ *
++ * Linear is not usable here: Apple GPUs cannot render into a linear texture, so
++ * a linear modifier can be sampled from but never be a compositor's output,
++ * which leaves the compositor unable to pick a format for its output at all.
++ * Claiming linear while backing it with an optimal image is worse -- the guest
++ * then asks for the image's subresource layout, which is only valid on linear
++ * images, and the host tears down the VM.
++ *
++ * Describing the layout as opaque is what DRM modifiers are for: the guest
++ * carries the token around and never introspects the bytes, which is exactly
++ * true here, because the pixels are reached through the virtio-gpu resource.
++ */
++/* DRM_FORMAT_MOD_LINEAR.
++ *
++ * The layout the guest is told about, not the one the host uses: the host image
++ * is optimal-tiled because Apple cannot render into a linear texture, and the
++ * layout query is answered from the tightly packed geometry the guest expects.
++ * Linear is the modifier a virtio-gpu scanout plane advertises, and a
++ * compositor picks its output format from the intersection of what the plane
++ * and the renderer offer -- offering anything else leaves that empty.
++ */
++#define VKR_DRM_FORMAT_MOD_HOST_OPAQUE 0ull
++
++/* Report the linear modifier for any format the host can use with linear
++ * tiling. Without this the guest asks for a format's modifier list, the host
++ * ignores the chained struct because MoltenVK does not know it, and every
++ * format comes back with no usable modifier -- which is what stops the guest
++ * from creating a DRI screen and drops the desktop onto llvmpipe.
++ */
++static void
++vkr_physical_device_fill_drm_modifiers(VkFormatProperties2 *props2)
++{
++   VkDrmFormatModifierPropertiesListEXT *list = vkr_find_struct(
++      props2->pNext, VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
++   if (!list)
++      return;
++
++
++   /* the modifier is backed by an optimal-tiled host image, so it carries the
++    * optimal features -- notably COLOR_ATTACHMENT, which linear lacks */
++   const VkFormatFeatureFlags feats = props2->formatProperties.optimalTilingFeatures;
++   if (!feats) {
++      list->drmFormatModifierCount = 0;
++      return;
++   }
++
++   if (!list->pDrmFormatModifierProperties) {
++      /* count query */
++      list->drmFormatModifierCount = 1;
++      return;
++   }
++
++   if (!list->drmFormatModifierCount)
++      return;
++
++   list->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){
++      .drmFormatModifier = VKR_DRM_FORMAT_MOD_HOST_OPAQUE,
++      .drmFormatModifierPlaneCount = 1,
++      .drmFormatModifierTilingFeatures = feats,
++   };
++   list->drmFormatModifierCount = 1;
++}
++#endif /* __APPLE__ */
++
+ static void
+ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
+    UNUSED struct vn_dispatch_context *dispatch,
+@@ -593,6 +765,24 @@
+    vn_replace_vkGetPhysicalDeviceFormatProperties2_args_handle(args);
+    vkGetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
+                                         args->pFormatProperties);
++
++#ifdef VKR_TRACE_COMMANDS
++   {
++      const VkFormatProperties *fp = &args->pFormatProperties->formatProperties;
++      const void *chain = args->pFormatProperties->pNext;
++      FILE *f = fopen("/tmp/vkr-fmt.log", "a");
++      if (f) {
++         fprintf(f, "format=%d linear=0x%x optimal=0x%x buffer=0x%x chained=%s\n",
++                 (int)args->format, fp->linearTilingFeatures, fp->optimalTilingFeatures,
++                 fp->bufferFeatures, chain ? "yes" : "no");
++         fclose(f);
++      }
++   }
++#endif
++
++#ifdef __APPLE__
++   vkr_physical_device_fill_drm_modifiers(args->pFormatProperties);
++#endif
+ }
+ 
+ static void
+@@ -600,9 +790,63 @@
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetPhysicalDeviceImageFormatProperties2 *args)
+ {
++#ifdef __APPLE__
++   /* The host cannot answer a modifier query. Since linear is the only modifier
++    * we advertise, ask the host the equivalent question about linear tiling.
++    */
++   VkPhysicalDeviceImageFormatInfo2 *fmt_info =
++      (VkPhysicalDeviceImageFormatInfo2 *)args->pImageFormatInfo;
++   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info = vkr_find_struct(
++      fmt_info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
++   VkImageTiling saved_tiling = fmt_info->tiling;
++   if (mod_info) {
++      if (mod_info->drmFormatModifier != VKR_DRM_FORMAT_MOD_HOST_OPAQUE) {
++         args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
++         return;
++      }
++      fmt_info->tiling = VK_IMAGE_TILING_OPTIMAL;
++   }
++
++   /* The host does not know the dma_buf handle type and fails the whole query
++    * if it is left in the chain, so unlink it for the duration of the call and
++    * answer that half ourselves below.
++    */
++   VkBaseInStructure *prev_ext_info = vkr_find_prev_struct(
++      fmt_info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
++   VkPhysicalDeviceExternalImageFormatInfo *ext_info =
++      prev_ext_info ? (VkPhysicalDeviceExternalImageFormatInfo *)prev_ext_info->pNext
++                    : NULL;
++   bool emulated_handle = false;
++   if (ext_info &&
++       (ext_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ||
++        ext_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)) {
++      emulated_handle = true;
++      prev_ext_info->pNext = ext_info->pNext;
++   }
++#endif
++
+    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
+    args->ret = vkGetPhysicalDeviceImageFormatProperties2(
+       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
++
++#ifdef __APPLE__
++   if (emulated_handle) {
++      prev_ext_info->pNext = (const struct VkBaseInStructure *)ext_info;
++
++      VkExternalImageFormatProperties *ext_props = vkr_find_struct(
++         args->pImageFormatProperties->pNext,
++         VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
++      if (ext_props && args->ret == VK_SUCCESS) {
++         ext_props->externalMemoryProperties = (VkExternalMemoryProperties){
++            .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT |
++                                      VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT,
++            .exportFromImportedHandleTypes = ext_info->handleType,
++            .compatibleHandleTypes = ext_info->handleType,
++         };
++      }
++   }
++   fmt_info->tiling = saved_tiling;
++#endif
+ }
+ 
+ static void
+@@ -630,6 +874,24 @@
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties *args)
+ {
++#ifdef __APPLE__
++   /* The host cannot answer for a sync_fd handle: it has no such handle type.
++    * Report the sync_fd semaphore as importable and exportable, which is what
++    * the guest checks before it will expose VK_KHR_synchronization2.
++    */
++   if (args->pExternalSemaphoreInfo->handleType ==
++       VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT) {
++      args->pExternalSemaphoreProperties->exportFromImportedHandleTypes =
++         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
++      args->pExternalSemaphoreProperties->compatibleHandleTypes =
++         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
++      args->pExternalSemaphoreProperties->externalSemaphoreFeatures =
++         VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
++         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
++      return;
++   }
++#endif
++
+    vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
+    vkGetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
+                                                   args->pExternalSemaphoreInfo,
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -25,6 +25,14 @@
+    bool EXT_external_memory_dma_buf;
+ 
+    bool KHR_external_fence_fd;
++#ifdef __APPLE__
++   /* The host's stand-in for an fd import: memory shared with the guest is
++    * reached through a mapped pointer, and this is what lets the host wrap that
++    * pointer back into a VkDeviceMemory.
++    */
++   bool EXT_external_memory_host;
++   bool EXT_host_image_copy;
++#endif
+    bool KHR_external_semaphore_fd;
+ 
+    VkPhysicalDeviceMemoryProperties memory_properties;
+@@ -44,4 +52,9 @@
+ vkr_physical_device_destroy(struct vkr_context *ctx,
+                             struct vkr_physical_device *physical_dev);
+ 
++#ifdef __APPLE__
++bool
++vkr_physical_device_extension_is_emulated(const char *name);
++#endif
++
+ #endif /* VKR_PHYSICAL_DEVICE_H */
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -479,6 +479,16 @@
+ 
+    vn_replace_vkResetFenceResourceMESA_args_handle(args);
+ 
++#ifdef __APPLE__
++   /* Both of these only export a sync_fd and close it again, which exists to
++    * flush the payload. The host has no sync_fd and the entry point is not even
++    * loaded, so calling through it kills the VM; ordering is already carried by
++    * the ring, so there is nothing left to do here.
++    */
++   (void)vk;
++   return;
++#endif
++
+    const VkFenceGetFdInfoKHR info = {
+       .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+       .fence = args->fence,
+@@ -553,6 +563,16 @@
+ 
+    vn_replace_vkWaitSemaphoreResourceMESA_args_handle(args);
+ 
++#ifdef __APPLE__
++   /* Both of these only export a sync_fd and close it again, which exists to
++    * flush the payload. The host has no sync_fd and the entry point is not even
++    * loaded, so calling through it kills the VM; ordering is already carried by
++    * the ring, so there is nothing left to do here.
++    */
++   (void)vk;
++   return;
++#endif
++
+    const VkSemaphoreGetFdInfoKHR info = {
+       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+       .semaphore = args->semaphore,
+@@ -584,6 +604,33 @@
+    /* resourceId 0 is for importing a signaled payload to sync_fd fence */
+    assert(!res_info->resourceId);
+ 
++#ifdef __APPLE__
++   /* The host has no sync_fd, so ImportSemaphoreFdKHR does not exist here and
++    * calling through the null entry would take the VM down. An fd of -1 means
++    * "a payload that is already signalled", so submit nothing and let that
++    * submission signal the semaphore, which leaves it in the state the guest
++    * is about to wait on.
++    */
++   struct vkr_queue *queue = NULL;
++   struct vkr_queue *iter;
++   LIST_FOR_EACH_ENTRY (iter, &dev->queues, base.track_head) {
++      queue = iter;
++      break;
++   }
++   if (!queue) {
++      vkr_context_set_fatal(ctx);
++      return;
++   }
++
++   const VkSubmitInfo submit_info = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .signalSemaphoreCount = 1,
++      .pSignalSemaphores = &res_info->semaphore,
++   };
++   if (vk->QueueSubmit(queue->base.handle.queue, 1, &submit_info, VK_NULL_HANDLE) !=
++       VK_SUCCESS)
++      vkr_context_set_fatal(ctx);
++#else
+    const VkImportSemaphoreFdInfoKHR import_info = {
+       .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+       .semaphore = res_info->semaphore,
+@@ -593,6 +640,7 @@
+    };
+    if (vk->ImportSemaphoreFdKHR(args->device, &import_info) != VK_SUCCESS)
+       vkr_context_set_fatal(ctx);
++#endif
+ }
+ 
+ static void
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -8,7 +8,16 @@
+ #include "venus-protocol/vn_protocol_renderer_info.h"
+ #include "virglrenderer_hw.h"
+ 
++#include <stdio.h>
++
++#include <unistd.h>
++
+ #include "vkr_context.h"
++#include "vkr_ring.h"
++#include "vkr_device.h"
++#include "vkr_device_memory.h"
++#include "vkr_image.h"
++#include "vkr_physical_device.h"
+ 
+ struct vkr_renderer_state {
+    const struct vkr_renderer_callbacks *cbs;
+@@ -233,6 +242,200 @@
+    return vkr_context_import_resource(ctx, res_id, fd_type, fd, size);
+ }
+ 
++#ifdef __APPLE__
++static bool
++vkr_renderer_read_resource_pixels_locked(struct vkr_context *ctx,
++                                         const struct vkr_resource *res,
++                                         uint32_t res_id,
++                                         void *dst,
++                                         uint32_t dst_stride,
++                                         uint32_t width,
++                                         uint32_t height)
++{
++   /* A device teardown frees the memory behind a resource without telling the
++    * resource, so trust the object table rather than the cached pointer.
++    */
++   if (res && res->mem) {
++      mtx_lock(&ctx->object_mutex);
++      const struct hash_entry *live =
++         _mesa_hash_table_search(ctx->object_table, &res->mem_id);
++      const bool ok = live && live->data == res->mem;
++      mtx_unlock(&ctx->object_mutex);
++      if (!ok) {
++         vkr_log("read_resource_pixels: res %u memory is gone", res_id);
++         return false;
++      }
++   }
++   if (!res || !res->mem || !res->mem->bound_image) {
++      vkr_log("read_resource_pixels: res %u has no image bound", res_id);
++      return false;
++   }
++
++   /* The memory may carry several images (a buffer imported more than once,
++    * or a small image reusing an allocation); copying a full frame out of a
++    * smaller one reads past its texture. Take the most recently bound image
++    * that covers the requested picture.
++    */
++   const struct vkr_image *img = NULL;
++   if (res->mem->bound_images.next) {
++      list_for_each_entry_rev (struct vkr_image, cand, &res->mem->bound_images, mem_head) {
++         if (cand->drm_modifier && cand->width >= width && cand->height >= height) {
++            img = cand;
++            break;
++         }
++      }
++   }
++   if (!img) {
++      vkr_log("read_resource_pixels: res %u has no image covering %ux%u", res_id, width, height);
++      return false;
++   }
++   {
++      mtx_lock(&ctx->object_mutex);
++      const struct hash_entry *live =
++         _mesa_hash_table_search(ctx->object_table, &img->base.id);
++      const bool ok = live && live->data == img;
++      mtx_unlock(&ctx->object_mutex);
++      if (!ok) {
++         vkr_log("read_resource_pixels: res %u image is gone", res_id);
++         return false;
++      }
++   }
++   struct vkr_device *dev = res->mem->device;
++   if (!dev || !dev->physical_device->EXT_host_image_copy)
++      return false;
++
++   PFN_vkrCopyImageToMemory copy_image_to_memory =
++      (PFN_vkrCopyImageToMemory)vkGetDeviceProcAddr(dev->base.handle.device,
++                                                    "vkCopyImageToMemoryEXT");
++   if (!copy_image_to_memory) {
++      copy_image_to_memory = (PFN_vkrCopyImageToMemory)vkGetDeviceProcAddr(
++         dev->base.handle.device, "vkCopyImageToMemory");
++   }
++   if (!copy_image_to_memory) {
++      vkr_log("read_resource_pixels: no host image copy entry point");
++      return false;
++   }
++
++   /* The guest's drawing may still be in flight; a scanout read has no other
++    * ordering against it, and reading early yields an empty picture.
++    */
++   vkDeviceWaitIdle(dev->base.handle.device);
++
++
++   const uint32_t bpp = img->bytes_per_pixel ? img->bytes_per_pixel : 4;
++   (void)bpp;
++   const VkrImageToMemoryCopy region = {
++      .sType = VKR_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY,
++      .pHostPointer = dst,
++      .memoryRowLength = dst_stride / bpp,
++      .memoryImageHeight = height,
++      .imageSubresource = {
++         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++         .mipLevel = 0,
++         .baseArrayLayer = 0,
++         .layerCount = 1,
++      },
++      .imageOffset = { 0, 0, 0 },
++      .imageExtent = { width, height, 1 },
++   };
++
++   /* Try the image bound to the resource first, then any other image of the
++    * same size the context owns.
++    *
++    * The guest's driver does not always draw into the image it binds to the
++    * shared allocation: it can keep a private image and hand the shared one a
++    * copy later. Whichever holds the picture is the one worth sending, so take
++    * the first that comes back with something in it.
++    */
++   const VkImageLayout layouts[] = { VK_IMAGE_LAYOUT_GENERAL,
++                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++
++   struct vkr_image *candidates[16];
++   uint32_t candidate_count = 0;
++   candidates[candidate_count++] = (struct vkr_image *)img;
++
++   mtx_lock(&ctx->object_mutex);
++   hash_table_foreach (ctx->object_table, entry) {
++      struct vkr_object *obj = entry->data;
++      if (candidate_count >= ARRAY_SIZE(candidates))
++         break;
++      if (obj->type != VK_OBJECT_TYPE_IMAGE)
++         continue;
++      struct vkr_image *other = (struct vkr_image *)obj;
++      if (other == img || !other->drm_modifier)
++         continue;
++      if (other->width != width || other->height != height)
++         continue;
++      candidates[candidate_count++] = other;
++   }
++   mtx_unlock(&ctx->object_mutex);
++
++   bool copied = false;
++   for (uint32_t c = 0; c < candidate_count; c++) {
++      for (uint32_t i = 0; i < ARRAY_SIZE(layouts); i++) {
++         const VkrCopyImageToMemoryInfo info = {
++            .sType = VKR_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO,
++            .srcImage = candidates[c]->base.handle.image,
++            .srcImageLayout = layouts[i],
++            .regionCount = 1,
++            .pRegions = &region,
++         };
++         if (copy_image_to_memory(dev->base.handle.device, &info) != VK_SUCCESS)
++            continue;
++
++         copied = true;
++         const uint8_t *pixels = dst;
++         const size_t bytes = (size_t)dst_stride * height;
++         for (size_t off = 0; off + 3 < bytes; off += 4) {
++            if (pixels[off] | pixels[off + 1] | pixels[off + 2])
++               return true; /* this one holds the picture */
++         }
++         break; /* copied cleanly but empty: try the next image */
++      }
++   }
++
++   if (copied)
++      return true;
++
++   vkr_log("read_resource_pixels: copy failed for res %u", res_id);
++   return false;
++}
++
++bool
++vkr_renderer_read_resource_pixels(uint32_t ctx_id,
++                                  uint32_t res_id,
++                                  void *dst,
++                                  uint32_t dst_stride,
++                                  uint32_t width,
++                                  uint32_t height)
++{
++   /* A scanout is issued on the control queue, which carries no context id, so
++    * find whichever context owns the resource instead of trusting the caller's.
++    */
++   struct vkr_context *ctx = ctx_id ? vkr_renderer_lookup_context(ctx_id) : NULL;
++   const struct vkr_resource *res = ctx ? vkr_context_get_resource(ctx, res_id) : NULL;
++   if (!res) {
++      list_for_each_entry (struct vkr_context, candidate, &vkr_state.contexts, head) {
++         const struct vkr_resource *found = vkr_context_get_resource(candidate, res_id);
++         if (found) {
++            ctx = candidate;
++            res = found;
++            break;
++         }
++      }
++   }
++   if (!ctx || !res) {
++      return false;
++   }
++   mtx_lock(&ctx->scanout_mutex);
++   const bool ok = vkr_renderer_read_resource_pixels_locked(ctx, res, res_id, dst, dst_stride, width, height);
++   mtx_unlock(&ctx->scanout_mutex);
++   return ok;
++}
++
++#endif /* __APPLE__ */
++
+ void
+ vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id)
+ {
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -72,6 +72,16 @@
+                              int fd,
+                              uint64_t size);
+ 
++#ifdef __APPLE__
++bool
++vkr_renderer_read_resource_pixels(uint32_t ctx_id,
++                                  uint32_t res_id,
++                                  void *dst,
++                                  uint32_t dst_stride,
++                                  uint32_t width,
++                                  uint32_t height);
++#endif
++
+ void
+ vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id);
+ 
+--- a/src/venus_context.c
++++ b/src/venus_context.c
+@@ -1,3 +1,5 @@
++#include <stdio.h>
++
+ #include "venus_context.h"
+ 
+ #include "util/hash_table.h"
+@@ -7,6 +9,9 @@
+ #include "virgl_util.h"
+ 
+ #include "venus/vkr_renderer.h"
++#include "virgl_protocol.h"
++#include "vrend_iov.h"
++#include "pipe/p_state.h"
+ 
+ struct venus_fence {
+    uint32_t flags;
+@@ -95,12 +100,37 @@
+ static int
+ venus_context_transfer_3d(struct virgl_context *base,
+                           struct virgl_resource *res,
+-                          UNUSED const struct vrend_transfer_info *info,
+-                          UNUSED int transfer_mode)
++                          const struct vrend_transfer_info *info,
++                          int transfer_mode)
+ {
+    struct venus_context *ctx = (struct venus_context *)base;
+ 
+-   //fprintf(stderr, "no transfer support for ctx %d and res %d", ctx->base.ctx_id, res->res_id);
++#ifdef __APPLE__
++   /* Reading a rendered image back out.
++    *
++    * The image the guest drew into is optimal-tiled, and on this platform that
++    * means private texture memory -- the bytes are not in any mapping the
++    * display path can read, which is why a scanout came out black. Copy the
++    * image itself into the caller's linear buffer instead.
++    */
++   if (transfer_mode == VIRGL_TRANSFER_FROM_HOST && info && info->iovec_cnt > 0 &&
++       info->iovec && info->box) {
++      const uint32_t width = (uint32_t)info->box->width;
++      const uint32_t height = (uint32_t)info->box->height;
++      const uint32_t stride = info->stride ? info->stride : width * 4;
++      void *dst = info->iovec[0].iov_base;
++
++      if (dst && width && height &&
++          (uint64_t)stride * height <= info->iovec[0].iov_len &&
++          vkr_renderer_read_resource_pixels(ctx->base.ctx_id, res->res_id, dst, stride,
++                                            width, height))
++         return 0;
++   }
++#endif
++
++   (void)ctx;
++   (void)info;
++   (void)transfer_mode;
+    return -1;
+ }
+ 
+@@ -123,9 +153,10 @@
+    uint64_t map_ptr;
+    struct virgl_resource_vulkan_info vulkan_info;
+ 
+-   if (!vkr_renderer_create_resource(base->ctx_id, res_id, blob_id, blob_size, blob_flags,
+-                                     &fd_type, &res_fd, &map_info, &map_ptr, &vulkan_info)) {
+-      //fprintf(stderr, "can't create res %d with blob %llu\n", res_id, blob_id);
++   const bool created =
++      vkr_renderer_create_resource(base->ctx_id, res_id, blob_id, blob_size, blob_flags,
++                                   &fd_type, &res_fd, &map_info, &map_ptr, &vulkan_info);
++   if (!created) {
+       return -1;
+    }
+ 
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -47,6 +47,7 @@
+ #include "vrend_winsys.h"
+ 
+ #include "virglrenderer.h"
++#include "venus/vkr_renderer.h"
+ #include "virglrenderer_hw.h"
+ 
+ #include "virgl_context.h"
+@@ -55,6 +56,7 @@
+ 
+ #include "venus_context.h"
+ 
++
+ struct global_state {
+    bool client_initialized;
+    void *cookie;
+@@ -452,6 +454,25 @@
+       vrend_renderer_force_ctx_0();
+ }
+ 
++#ifdef __APPLE__
++/* Read a rendered resource back as linear pixels.
++ *
++ * The display path cannot get at the picture on its own here: the guest renders
++ * into a tiled image that lives in private texture memory, so the blob's
++ * mapping reads as zeroes. This asks the Vulkan renderer for the image itself.
++ */
++int virgl_renderer_read_resource_pixels(uint32_t ctx_id,
++                                        uint32_t res_id,
++                                        void *dst,
++                                        uint32_t stride,
++                                        uint32_t width,
++                                        uint32_t height)
++{
++   return vkr_renderer_read_resource_pixels(ctx_id, res_id, dst, stride, width, height) ? 0
++                                                                                        : -1;
++}
++#endif
++
+ void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
+ {
+    TRACE_FUNC();
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -311,6 +311,16 @@
+ 
+ VIRGL_EXPORT void virgl_renderer_force_ctx_0(void);
+ 
++#ifdef __APPLE__
++/* Read a rendered resource back as linear pixels; 0 on success. */
++VIRGL_EXPORT int virgl_renderer_read_resource_pixels(uint32_t ctx_id,
++                                                     uint32_t res_id,
++                                                     void *dst,
++                                                     uint32_t stride,
++                                                     uint32_t width,
++                                                     uint32_t height);
++#endif
++
+ VIRGL_EXPORT void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle);
+ VIRGL_EXPORT void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle);
+ 
