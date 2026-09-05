@@ -552,32 +552,36 @@ pub(crate) struct UnpackReport {
 /// failures in a way that keeps the kind but drops the raw OS error.
 fn is_platform_unpack_quirk(e: &std::io::Error) -> bool {
     use std::io::ErrorKind as K;
-    const QUIRKS: &[i32] = &[
-        libc::EPERM,
-        libc::EACCES,
-        libc::EEXIST,
-        libc::ENOENT,
-        libc::ENOTDIR,
-        libc::EINVAL,
-        libc::ENOTSUP,
-        libc::EOPNOTSUPP,
-        libc::EILSEQ,
-        libc::ENAMETOOLONG,
-        libc::ELOOP,
-    ];
-    match e.raw_os_error() {
-        Some(code) => QUIRKS.contains(&code),
-        None => matches!(
-            e.kind(),
-            K::PermissionDenied
-                | K::AlreadyExists
-                | K::NotFound
-                | K::NotADirectory
-                | K::InvalidInput
-                | K::InvalidFilename
-                | K::Unsupported
-        ),
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error() {
+        const QUIRKS: &[i32] = &[
+            libc::EPERM,
+            libc::EACCES,
+            libc::EEXIST,
+            libc::ENOENT,
+            libc::ENOTDIR,
+            libc::EINVAL,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+            libc::EILSEQ,
+            libc::ENAMETOOLONG,
+            libc::ELOOP,
+        ];
+        return QUIRKS.contains(&code);
     }
+    // Windows error codes are not errnos; the std mapping onto kinds is the
+    // reliable classification there, and it also covers wrapped errors on
+    // every platform.
+    matches!(
+        e.kind(),
+        K::PermissionDenied
+            | K::AlreadyExists
+            | K::NotFound
+            | K::NotADirectory
+            | K::InvalidInput
+            | K::InvalidFilename
+            | K::Unsupported
+    )
 }
 
 fn safe_unpack_with_limits<R: Read>(
@@ -2943,29 +2947,32 @@ mod tests {
     /// a failed extraction into one that reports success on a half-written tree.
     #[test]
     fn only_platform_quirks_are_skippable_never_a_failing_filesystem() {
-        for code in [
-            libc::EPERM,
-            libc::EACCES,
-            libc::EEXIST,
-            libc::ENOTSUP,
-            libc::EINVAL,
-        ] {
-            assert!(
-                super::is_platform_unpack_quirk(&std::io::Error::from_raw_os_error(code)),
-                "errno {code} is a representation problem and stays skippable"
-            );
-        }
-        for code in [
-            libc::ENOSPC,
-            libc::EDQUOT,
-            libc::EROFS,
-            libc::EIO,
-            libc::ENOMEM,
-        ] {
-            assert!(
-                !super::is_platform_unpack_quirk(&std::io::Error::from_raw_os_error(code)),
-                "errno {code} must abort the extraction, never be skipped"
-            );
+        #[cfg(unix)]
+        {
+            for code in [
+                libc::EPERM,
+                libc::EACCES,
+                libc::EEXIST,
+                libc::ENOTSUP,
+                libc::EINVAL,
+            ] {
+                assert!(
+                    super::is_platform_unpack_quirk(&std::io::Error::from_raw_os_error(code)),
+                    "errno {code} is a representation problem and stays skippable"
+                );
+            }
+            for code in [
+                libc::ENOSPC,
+                libc::EDQUOT,
+                libc::EROFS,
+                libc::EIO,
+                libc::ENOMEM,
+            ] {
+                assert!(
+                    !super::is_platform_unpack_quirk(&std::io::Error::from_raw_os_error(code)),
+                    "errno {code} must abort the extraction, never be skipped"
+                );
+            }
         }
         // The tar crate wraps some failures and drops the errno; the kind is
         // still enough to tell a representation problem from a failing disk.
