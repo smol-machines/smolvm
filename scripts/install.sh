@@ -417,6 +417,20 @@ install_smolvm() {
         has_smol=true
     fi
 
+    # Copy the Kubernetes runtime if the distribution includes it (Linux
+    # tarballs only; older ones won't have it). Without this the shim ships in
+    # the release but never reaches disk, so `runtimeClassName: smolvm` stays
+    # out of reach for anyone who installed with this script.
+    if [[ -f "$extracted_dir/containerd-shim-smolvm-v2" ]]; then
+        cp "$extracted_dir/containerd-shim-smolvm-v2" "$prefix/"
+        chmod +x "$prefix/containerd-shim-smolvm-v2"
+        if [[ -d "$extracted_dir/kubernetes" ]]; then
+            rm -rf "$prefix/kubernetes"
+            cp -r "$extracted_dir/kubernetes" "$prefix/"
+            chmod +x "$prefix/kubernetes/install-k8s-runtime.sh" 2>/dev/null || true
+        fi
+    fi
+
     # Copy disk templates if present
     if [[ -f "$extracted_dir/storage-template.ext4" ]]; then
         cp "$extracted_dir/storage-template.ext4" "$prefix/"
