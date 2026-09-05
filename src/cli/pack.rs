@@ -287,6 +287,32 @@ impl PackCreateCmd {
                 "no image specified. Provide IMAGE argument or set 'image' in Smolfile",
             )
         })?;
+
+        // `pack create` pulls directly from an OCI container registry. If a user passes
+        // a local file path, image archive, or rootfs directory, provide a helpful diagnostic
+        // rather than failing on OCI reference character validation.
+        let image_trimmed = image.trim();
+        if image_trimmed.starts_with("./")
+            || image_trimmed.starts_with("../")
+            || image_trimmed.starts_with('/')
+            || image_trimmed.starts_with('~')
+            || image_trimmed.ends_with(".tar")
+            || image_trimmed.ends_with(".tar.gz")
+            || image_trimmed.ends_with(".tar.zst")
+            || image_trimmed.ends_with(".tgz")
+            || std::path::Path::new(image_trimmed).exists()
+        {
+            return Err(Error::config(
+                "pack create",
+                format!(
+                    "'--image' accepts container registry references (e.g. 'alpine:latest'). \
+                     To create a packed executable from a local image archive or rootfs directory ('{image}'), \
+                     first create the machine with 'smolvm machine create --image {image}' and then pack it \
+                     with 'smolvm pack create --from-vm <name>'."
+                ),
+            ));
+        }
+
         info!(image = %image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
@@ -1829,6 +1855,40 @@ mod tests {
             client.identity_token(),
             Some("eyJ_identity"),
             "identity_token must take precedence over password"
+        );
+    }
+
+    #[test]
+    fn pack_create_rejects_local_archive_paths_with_clear_diagnostic() {
+        let cmd = PackCreateCmd {
+            image: Some("./local-image.tar".to_string()),
+            from_vm: None,
+            rebase_from_image: false,
+            output: PathBuf::from("test-output"),
+            cpus: 2,
+            mem: 1024,
+            oci_platform: None,
+            entrypoint: None,
+            no_sign: false,
+            single_file: false,
+            stub: None,
+            lib_dir: None,
+            rootfs_dir: None,
+            smolfile: None,
+            gpu: false,
+            staging_dir: None,
+            proxy_opts: crate::cli::proxy_opts::ProxyOpts::default(),
+        };
+
+        let err = cmd.run().expect_err("local archive path must be rejected");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("'--image' accepts container registry references"),
+            "Expected registry reference explanation, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("pack create --from-vm"),
+            "Expected recommendation to use pack create --from-vm, got: {err_msg}"
         );
     }
 }
