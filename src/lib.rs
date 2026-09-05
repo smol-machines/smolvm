@@ -81,6 +81,11 @@ pub mod dns_filter;
 pub mod dns_filter_listener;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
+/// Boots a VM from a written boot-config: the `_boot-vm` subprocess entry point.
+/// Lives in the library, not the CLI, so any binary that links the engine (the
+/// containerd shim) can serve `_boot-vm` from its own executable instead of
+/// needing a separate `_boot-vm`-capable helper on disk.
+pub mod internal_boot;
 pub mod image_store;
 pub mod log_rotation;
 pub mod network;

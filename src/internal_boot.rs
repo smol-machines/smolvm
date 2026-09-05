@@ -6,10 +6,10 @@
 //!
 //! Usage: smolvm _boot-vm <config-path>
 
-use smolvm::agent::boot_config::BootConfig;
-use smolvm::agent::{launch_agent_vm, FsNotifyWatcher, LaunchConfig, VmDisks};
-use smolvm::data::disk::{DiskFormat, DiskType};
-use smolvm::storage::VmDisk;
+use crate::agent::boot_config::BootConfig;
+use crate::agent::{launch_agent_vm, FsNotifyWatcher, LaunchConfig, VmDisks};
+use crate::data::disk::{DiskFormat, DiskType};
+use crate::storage::VmDisk;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -18,17 +18,17 @@ const GUARDIAN_MANIFEST_MAGIC: u64 = 0x534d4f4c4752444e;
 const PREOPENED_USERFAULTFD_FD: libc::c_int = 198;
 
 #[cfg(target_os = "linux")]
-fn preopen_guardian_userfaultfd() -> smolvm::Result<()> {
+fn preopen_guardian_userfaultfd() -> crate::Result<()> {
     let Some(snapshot_dir) = std::env::var_os("SMOLVM_SNAPSHOT_DIR") else {
         return Ok(());
     };
     let manifest_path = PathBuf::from(snapshot_dir).join("manifest.bin");
     let manifest = std::fs::read(&manifest_path)
-        .map_err(|error| smolvm::Error::agent("read fork manifest", error.to_string()))?;
+        .map_err(|error| crate::Error::agent("read fork manifest", error.to_string()))?;
     let magic = manifest
         .get(..8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
-        .ok_or_else(|| smolvm::Error::agent("read fork manifest", "manifest is truncated"))?;
+        .ok_or_else(|| crate::Error::agent("read fork manifest", "manifest is truncated"))?;
     if magic != GUARDIAN_MANIFEST_MAGIC {
         return Ok(());
     }
@@ -37,7 +37,7 @@ fn preopen_guardian_userfaultfd() -> smolvm::Result<()> {
         libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) as libc::c_int
     };
     if fd < 0 {
-        return Err(smolvm::Error::agent(
+        return Err(crate::Error::agent(
             "prepare demand-paged clone RAM",
             format!(
                 "kernel-fault-capable userfaultfd is unavailable: {}; run the privileged SmolVM service so it can open userfaultfd before the per-VM uid drop",
@@ -49,7 +49,7 @@ fn preopen_guardian_userfaultfd() -> smolvm::Result<()> {
         if unsafe { libc::dup3(fd, PREOPENED_USERFAULTFD_FD, libc::O_CLOEXEC) } < 0 {
             let error = std::io::Error::last_os_error();
             unsafe { libc::close(fd) };
-            return Err(smolvm::Error::agent(
+            return Err(crate::Error::agent(
                 "prepare demand-paged clone RAM",
                 format!("reserve userfaultfd descriptor: {error}"),
             ));
@@ -63,7 +63,7 @@ fn preopen_guardian_userfaultfd() -> smolvm::Result<()> {
 /// in `.qcow2` (a copy-on-write overlay, opened as-is over its backing image);
 /// every other disk is a raw image that may need creating/formatting. The path
 /// is the single source of truth for the format — see `agent::resolve_disk_image`.
-fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> smolvm::Result<VmDisk<K>> {
+fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> crate::Result<VmDisk<K>> {
     if path.extension().and_then(|e| e.to_str()) == Some("qcow2") {
         VmDisk::<K>::open_existing_with_format(path, DiskFormat::Qcow2)
     } else {
@@ -75,7 +75,7 @@ fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> smolvm::Result<VmDi
 ///
 /// Reads the boot config from the given path, sets up libkrun, and calls
 /// `krun_start_enter` which blocks forever (or until the VM exits).
-pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
+pub fn run(config_path: PathBuf) -> crate::Result<()> {
     let t_proc = std::time::Instant::now();
 
     // --- Parent-death watchdog ---------------------------------------------
@@ -111,16 +111,16 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 if unsafe { libc::getppid() } != original_ppid {
-                    smolvm::process::exit_child(0);
+                    crate::process::exit_child(0);
                 }
             });
     }
 
     // Read boot config
     let config_data = std::fs::read(&config_path)
-        .map_err(|e| smolvm::Error::agent("read boot config", e.to_string()))?;
+        .map_err(|e| crate::Error::agent("read boot config", e.to_string()))?;
     let config: BootConfig = serde_json::from_slice(&config_data)
-        .map_err(|e| smolvm::Error::agent("parse boot config", e.to_string()))?;
+        .map_err(|e| crate::Error::agent("parse boot config", e.to_string()))?;
 
     // Clean up the config file — it's no longer needed
     let _ = std::fs::remove_file(&config_path);
@@ -163,24 +163,24 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                 }
             }
         }
-    } else if let Err(e) = smolvm::process::detach_stdio_to_stderr_file(&config.startup_error_log) {
+    } else if let Err(e) = crate::process::detach_stdio_to_stderr_file(&config.startup_error_log) {
         let _ = std::fs::write(
             &config.startup_error_log,
             format!("failed to redirect stdio: {}", e),
         );
-        smolvm::process::exit_child(1);
+        crate::process::exit_child(1);
     }
 
     // Close inherited file descriptors from the parent (server).
     // Without this, the subprocess holds database locks, network sockets, etc.
     // that can interfere with libkrun's operation. Keep stdin/stdout/stderr (0-2)
     // which now point to /dev/null.
-    smolvm::process::close_inherited_fds_from(3);
+    crate::process::close_inherited_fds_from(3);
 
     // Defense-in-depth before this process becomes the VMM host for an untrusted
     // guest: block setuid privilege escalation and core dumps (which would leak
     // guest RAM). See docs/runtime-isolation-hardening.md for the full roadmap.
-    smolvm::process::harden_self();
+    crate::process::harden_self();
 
     // A guardian-backed clone needs userfaultfd to resolve faults originating
     // inside KVM. Open it while this dedicated boot process still has the host
@@ -194,7 +194,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // when the env var is unset (no delegation) — never blocks boot.
     #[cfg(target_os = "linux")]
     if let Some(cgroup_root) = std::env::var_os("SMOLVM_CGROUP_ROOT") {
-        smolvm::process::place_in_cgroup(
+        crate::process::place_in_cgroup(
             std::path::Path::new(&cgroup_root),
             config.resources.cpus,
             config.resources.memory_mib,
@@ -214,7 +214,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             Some(ref t) => t,
             None => {
                 eprintln!("[pack-idmap] idmap source set without a mountpoint; refusing to boot");
-                smolvm::process::exit_child(1);
+                crate::process::exit_child(1);
             }
         };
         let uid: u32 = std::env::var("SMOLVM_VM_UID")
@@ -222,15 +222,15 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| {
                 eprintln!("[pack-idmap] idmap source set without SMOLVM_VM_UID; refusing to boot");
-                smolvm::process::exit_child(1);
+                crate::process::exit_child(1);
             });
         let gid: u32 = std::env::var("SMOLVM_VM_GID")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(uid);
-        if let Err(e) = smolvm::process::setup_pack_idmap_mount(shared, target, uid, gid) {
+        if let Err(e) = crate::process::setup_pack_idmap_mount(shared, target, uid, gid) {
             eprintln!("[pack-idmap] failed to mount shared pack, refusing to boot: {e}");
-            smolvm::process::exit_child(1);
+            crate::process::exit_child(1);
         }
     }
 
@@ -244,14 +244,14 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     let pod_net_attachment = match config.pod_netns.as_deref() {
         Some(netns) => {
             let ns = netns.to_string_lossy();
-            match smolvm::agent::pod_net::attach_pod_netns(&ns) {
+            match crate::agent::pod_net::attach_pod_netns(&ns) {
                 Ok(a) => Some(a),
                 Err(e) => {
                     eprintln!(
                         "[pod-net] failed to attach pod netns {}: {e}",
                         netns.display()
                     );
-                    smolvm::process::exit_child(1);
+                    crate::process::exit_child(1);
                 }
             }
         }
@@ -260,18 +260,18 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     #[cfg(target_os = "linux")]
     let pod_net_launch = pod_net_attachment.as_ref().map(|a| a.launch());
     #[cfg(not(target_os = "linux"))]
-    let pod_net_launch: Option<smolvm::agent::pod_net::PodNetLaunch> = None;
+    let pod_net_launch: Option<crate::agent::pod_net::PodNetLaunch> = None;
 
     // Encoded video uses an external ffmpeg process so smolvm neither links
     // nor bundles codec libraries. Start its broker before the parent's uid
     // drop and Landlock/seccomp; the broker independently drops to the same
     // per-VM uid; hardware modes retain only render/video device groups while
     // software mode retains none. Any failure leaves Raw VNC intact.
-    if smolvm::agent::video::is_configured()
+    if crate::agent::video::is_configured()
         && std::env::var_os("SMOLVM_DISPLAY").is_some()
         && std::env::var_os("SMOLVM_VNC").is_some()
     {
-        if let Err(e) = smolvm::agent::video::prestart_helper() {
+        if let Err(e) = crate::agent::video::prestart_helper() {
             eprintln!("[video] encoder unavailable; using Raw VNC: {e}");
         }
     }
@@ -289,16 +289,16 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             Some(u) => u,
             None => {
                 eprintln!("[uid-drop] invalid SMOLVM_VM_UID; refusing to boot");
-                smolvm::process::exit_child(1);
+                crate::process::exit_child(1);
             }
         };
         let gid: u32 = std::env::var("SMOLVM_VM_GID")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(uid);
-        if let Err(e) = smolvm::process::drop_privileges(uid, gid) {
+        if let Err(e) = crate::process::drop_privileges(uid, gid) {
             eprintln!("[uid-drop] failed, refusing to boot over-privileged: {e}");
-            smolvm::process::exit_child(1);
+            crate::process::exit_child(1);
         }
         // The setuid above clears the dumpable flag. A forkable golden's clones
         // map its guest-RAM memfd via /proc/<golden>/fd, which ptrace_may_access
@@ -307,7 +307,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         // per-VM uid isolation. See process::set_dumpable.
         #[cfg(target_os = "linux")]
         if std::env::var_os("SMOLVM_FORKABLE").is_some() {
-            smolvm::process::set_dumpable(true);
+            crate::process::set_dumpable(true);
         }
     }
 
@@ -353,7 +353,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         // denied the bundled/dev layout — where the libs live in an exe-relative
         // `lib/` dir and the env var is unset — making `libkrunfw.so` fail to
         // load under enforce ("cannot open shared object file: Permission denied").
-        if let Some(lib_dir) = smolvm::agent::find_lib_dir() {
+        if let Some(lib_dir) = crate::agent::find_lib_dir() {
             read_exec.push(lib_dir);
         }
         if let Some(libdir) = std::env::var_os("SMOLVM_LIB_DIR") {
@@ -444,9 +444,9 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         let _ = std::fs::File::create(&ready_marker);
         read_write.push(ready_marker);
 
-        if let Err(e) = smolvm::process::restrict_filesystem(&read_exec, &read_write) {
+        if let Err(e) = crate::process::restrict_filesystem(&read_exec, &read_write) {
             eprintln!("[landlock] restriction failed, refusing to boot unconfined: {e}");
-            smolvm::process::exit_child(1);
+            crate::process::exit_child(1);
         }
     }
 
@@ -481,7 +481,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                 && std::env::var_os("SMOLVM_CUDA_DAEMON").is_none()
                 && std::env::var_os("SMOLVM_CUDA_SOCK").is_none()
             {
-                match smolvm::cuda_daemon::ensure_running() {
+                match crate::cuda_daemon::ensure_running() {
                     Ok(sock) => {
                         // Single-threaded here (the filter install below relies
                         // on the same invariant), so set_var is race-free.
@@ -494,17 +494,17 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                             "[seccomp] CUDA daemon pre-start failed ({e}); refusing to boot a \
                              CUDA machine that would be SIGSYS-killed under enforce"
                         );
-                        smolvm::process::exit_child(1);
+                        crate::process::exit_child(1);
                     }
                 }
             }
-            if let Err(e) = smolvm::process::install_seccomp_filter(true) {
+            if let Err(e) = crate::process::install_seccomp_filter(true) {
                 eprintln!("[seccomp] enforce install failed, refusing to boot unconfined: {e}");
-                smolvm::process::exit_child(1);
+                crate::process::exit_child(1);
             }
         }
         Ok("audit") => {
-            if let Err(e) = smolvm::process::install_seccomp_filter(false) {
+            if let Err(e) = crate::process::install_seccomp_filter(false) {
                 eprintln!("[seccomp] audit install failed: {e}");
             }
         }
@@ -535,7 +535,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     proc_timing!("fds closed");
 
     // Open storage and overlay disks, honoring qcow2 fork-clone overlays.
-    let storage_disk = match open_boot_disk::<smolvm::storage::Storage>(
+    let storage_disk = match open_boot_disk::<crate::storage::Storage>(
         &config.storage_disk_path,
         config.storage_size_gb,
     ) {
@@ -545,12 +545,12 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                 &config.startup_error_log,
                 format!("failed to open storage disk: {}", e),
             );
-            smolvm::process::exit_child(1);
+            crate::process::exit_child(1);
         }
     };
     proc_timing!("storage opened");
 
-    let overlay_disk = match open_boot_disk::<smolvm::storage::Overlay>(
+    let overlay_disk = match open_boot_disk::<crate::storage::Overlay>(
         &config.overlay_disk_path,
         config.overlay_size_gb,
     ) {
@@ -560,7 +560,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                 &config.startup_error_log,
                 format!("failed to open overlay disk: {}", e),
             );
-            smolvm::process::exit_child(1);
+            crate::process::exit_child(1);
         }
     };
     proc_timing!("overlay opened");
@@ -579,7 +579,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                 .parent()
                 .unwrap_or(std::path::Path::new("/tmp"))
                 .join("dns-filter.sock");
-            if let Err(e) = smolvm::dns_filter_listener::start(&socket_path, hosts.clone()) {
+            if let Err(e) = crate::dns_filter_listener::start(&socket_path, hosts.clone()) {
                 tracing::warn!(error = %e, "failed to start DNS filter listener");
                 None
             } else {
@@ -619,13 +619,13 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             let Ok(shim) = u64::from_str_radix(text.trim(), 16) else {
                 return; // unrecognized marker — don't second-guess it
             };
-            if shim != smolvm::cuda_host::PROTO_HASH {
+            if shim != crate::cuda_host::PROTO_HASH {
                 let msg = format!(
                     "CUDA guest shim in the agent rootfs is STALE: rootfs wire hash {:016x} != \
                      this host {:016x}. The guest's CUDA calls will fail at cuInit. Rebuild the \
                      rootfs from the same source: scripts/build-agent-rootfs.sh --install",
                     shim,
-                    smolvm::cuda_host::PROTO_HASH
+                    crate::cuda_host::PROTO_HASH
                 );
                 tracing::warn!("{msg}");
                 eprintln!("[smolvm] WARNING: {msg}");
@@ -638,7 +638,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("/tmp"))
             .join("cuda.sock");
-        match smolvm::cuda_host::start_with_clone_mode(
+        match crate::cuda_host::start_with_clone_mode(
             &path,
             std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
         ) {
@@ -711,7 +711,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             });
     }
 
-    smolvm::process::exit_child(1);
+    crate::process::exit_child(1);
 }
 
 /// Resolve the qcow2 backing-file chain of `path`: if the file is a qcow2 with

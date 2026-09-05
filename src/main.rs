@@ -188,7 +188,7 @@ fn main() {
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
-        Commands::BootVm { config } => cli::internal_boot::run(config),
+        Commands::BootVm { config } => smolvm::internal_boot::run(config),
         #[cfg(unix)]
         Commands::CudaDaemon { socket } => {
             smolvm::cuda_daemon::run(&socket).map_err(smolvm::Error::Io)
