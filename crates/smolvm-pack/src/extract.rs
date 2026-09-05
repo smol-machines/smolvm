@@ -494,7 +494,10 @@ fn verify_parent_within_dest(path: &Path, real_dest: &Path) -> std::io::Result<(
 /// links that alias the destination root) and opens regular files with
 /// `O_NOFOLLOW` plus a canonicalized-parent check, so a write can never
 /// follow a planted symlink out of `dest`.
-fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
+fn safe_unpack<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+) -> std::io::Result<UnpackReport> {
     safe_unpack_with_limits(archive, dest, &SafeUnpackLimits::from_env())
 }
 
@@ -523,23 +526,66 @@ impl SafeUnpackLimits {
     }
 }
 
-/// Errors that must abort an extraction even for entry kinds we otherwise skip.
+/// What an unpack actually did, so a caller can judge completeness instead of
+/// inferring it from the absence of an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UnpackReport {
+    /// Entries written to the destination.
+    pub entries: u64,
+    /// Non-regular entries deliberately left out because the platform could
+    /// not represent them (see [`is_platform_unpack_quirk`]).
+    pub skipped: u64,
+}
+
+/// The errors the macOS leniency in [`safe_unpack_with_limits`] is allowed to
+/// skip for a non-regular entry: name and permission problems that come from
+/// the host filesystem being unable to represent the entry (case collisions,
+/// unsupported link or attribute forms, invalid names, ownership it cannot
+/// restore). Anything outside this list -- a full or read-only filesystem, an
+/// I/O error, exhausted memory -- means the destination stopped accepting
+/// writes, and skipping it would turn a failed extraction into a silently
+/// incomplete one. Unknown errors therefore fail loudly; that is the safe
+/// direction, and a newly met benign errno can be added here once understood.
 ///
-/// The skip path exists for entries macOS cannot represent; it must not hide a
-/// filesystem that has stopped accepting writes, because that yields a silently
-/// incomplete extraction rather than a failed one.
-fn is_unskippable_unpack_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::ENOSPC) | Some(libc::EDQUOT) | Some(libc::EROFS) | Some(libc::EIO)
-    )
+/// The classification looks at the errno when the error still carries one and
+/// falls back to the [`std::io::ErrorKind`], because the tar crate wraps some
+/// failures in a way that keeps the kind but drops the raw OS error.
+fn is_platform_unpack_quirk(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    const QUIRKS: &[i32] = &[
+        libc::EPERM,
+        libc::EACCES,
+        libc::EEXIST,
+        libc::ENOENT,
+        libc::ENOTDIR,
+        libc::EINVAL,
+        libc::ENOTSUP,
+        libc::EOPNOTSUPP,
+        libc::EILSEQ,
+        libc::ENAMETOOLONG,
+        libc::ELOOP,
+    ];
+    match e.raw_os_error() {
+        Some(code) => QUIRKS.contains(&code),
+        None => matches!(
+            e.kind(),
+            K::PermissionDenied
+                | K::AlreadyExists
+                | K::NotFound
+                | K::NotADirectory
+                | K::InvalidInput
+                | K::InvalidFilename
+                | K::Unsupported
+        ),
+    }
 }
 
 fn safe_unpack_with_limits<R: Read>(
     archive: &mut tar::Archive<R>,
     dest: &Path,
     limits: &SafeUnpackLimits,
-) -> std::io::Result<()> {
+) -> std::io::Result<UnpackReport> {
+    let mut report = UnpackReport::default();
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
     // matches the per-entry `normalized` paths, which are built from this same
     // plain `dest`. On Windows `canonicalize` returns a `\\?\`-verbatim path
@@ -796,15 +842,11 @@ fn safe_unpack_with_limits<R: Read>(
                 // For non-Regular entries (symlinks, hardlinks, dirs), skip and
                 // continue rather than aborting the entire extraction.
                 //
-                // Running out of room is not a platform limitation, and it hits
-                // directories and symlinks just as readily as regular files. If
-                // it is skipped here the extraction reports success, the caller
-                // writes the completion marker, and the half-written tree is
-                // then trusted forever: the container comes up on a rootfs that
-                // is missing most of the image, and the only symptom is the
-                // runtime claiming the entrypoint does not exist. Fail loudly
-                // instead, so the caller can report the real cause.
-                if !is_regular && !is_unskippable_unpack_error(&e) {
+                // Only for the errors that leniency is meant for, though: a
+                // destination that has stopped accepting writes must abort,
+                // or the extraction reports success on a half-written tree.
+                if !is_regular && is_platform_unpack_quirk(&e) {
+                    report.skipped += 1;
                     continue;
                 }
                 return Err(std::io::Error::new(
@@ -825,6 +867,7 @@ fn safe_unpack_with_limits<R: Read>(
             // owners, so doing it here is the single point that applies.
             set_owner(&full_path, uid, gid);
         }
+        report.entries += 1;
     }
 
     // Apply deferred directory permissions now that all children are written.
@@ -839,7 +882,7 @@ fn safe_unpack_with_limits<R: Read>(
         }
     }
 
-    Ok(())
+    Ok(report)
 }
 
 /// Normalize a path by resolving `.` and `..` components without requiring
@@ -972,7 +1015,8 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
         .map(|rd| {
             rd.flatten().any(|e| {
                 let path = e.path();
-                path.is_dir() || path.extension().is_some_and(|x| x == "tar")
+                let staging = e.file_name().to_str().is_some_and(is_partial_dir_name);
+                (path.is_dir() && !staging) || path.extension().is_some_and(|x| x == "tar")
             })
         })
         .unwrap_or(false)
@@ -1660,6 +1704,131 @@ pub unsafe fn extract_from_section(
     Ok(())
 }
 
+/// Suffix of a directory that an extraction is still writing into.
+///
+/// A tar is never unpacked straight into its final directory. It goes into
+/// `<final>.partial`, and only a complete, verified unpack is renamed into
+/// place. That makes "the final directory exists" a proof of completeness
+/// rather than a hint: an extraction cut short by a full disk, a crash or a
+/// kill leaves a `.partial` behind, which the next attempt discards, and
+/// nothing that enumerates layers can pick up a half-written tree, because
+/// the half-written tree never carries a layer's name. Both this crate and
+/// the guest agent skip directories with this suffix when enumerating layers.
+pub const PARTIAL_DIR_SUFFIX: &str = ".partial";
+
+/// Whether a directory name is an in-progress extraction rather than a layer.
+pub fn is_partial_dir_name(name: &str) -> bool {
+    name.ends_with(PARTIAL_DIR_SUFFIX)
+}
+
+fn partial_dir_for(final_dir: &Path) -> std::io::Result<PathBuf> {
+    let name = final_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cannot stage extraction for {}", final_dir.display()),
+            )
+        })?;
+    Ok(final_dir.with_file_name(format!("{name}{PARTIAL_DIR_SUFFIX}")))
+}
+
+/// Unpack `tar` so that `final_dir` exists only once it holds the whole
+/// archive.
+///
+/// The archive is written to a sibling `.partial` directory (always started
+/// from empty, so a leftover from an earlier failed attempt is never built
+/// on) and renamed into place when the unpack finishes; the rename is atomic
+/// on the same filesystem, which a sibling guarantees. A `final_dir` that
+/// already exists is complete by construction and is left alone. On any
+/// failure the staging directory is removed on a best-effort basis and the
+/// error is returned, so the caller cannot mistake the attempt for a success.
+fn materialize_tar_dir(
+    tar: &Path,
+    final_dir: &Path,
+    debug: bool,
+) -> std::io::Result<Option<UnpackReport>> {
+    if final_dir.is_dir() {
+        return Ok(None);
+    }
+    let staging = partial_dir_for(final_dir)?;
+    if staging.exists() {
+        if debug {
+            eprintln!(
+                "debug: discarding incomplete extraction {}",
+                staging.display()
+            );
+        }
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    let unpacked = (|| {
+        let tar_file = File::open(tar)?;
+        let mut archive = tar::Archive::new(tar_file);
+        safe_unpack(&mut archive, &staging)
+    })();
+    let report = match unpacked {
+        Ok(report) => report,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "extracting {} into {} failed, nothing was kept: {}",
+                    tar.display(),
+                    final_dir.display(),
+                    e
+                ),
+            ));
+        }
+    };
+    fs::rename(&staging, final_dir)?;
+    Ok(Some(report))
+}
+
+/// Bytes a non-root user can still write on the filesystem holding `path`.
+#[cfg(unix)]
+fn available_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated string and `stat` is a
+    // properly sized, writable statvfs buffer for the duration of the call.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn available_bytes(_path: &Path) -> std::io::Result<u64> {
+    Ok(u64::MAX)
+}
+
+/// Refuse to start an extraction that cannot fit, naming the shortfall.
+///
+/// Running out of room part-way through is recoverable now that extraction
+/// is transactional, but it is still a slow, confusing way to learn that the
+/// disk is full. Check up front so the user sees one clear number instead.
+fn preflight_free_space(dest: &Path, needed: u64, what: &str) -> std::io::Result<()> {
+    let available = available_bytes(dest)?;
+    if needed > available {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            format!(
+                "not enough free disk to extract {what}: it needs {:.1} GB but only \
+                 {:.1} GB is free on {}. Free some space and start again.",
+                needed as f64 / 1e9,
+                available as f64 / 1e9,
+                dest.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Name of the index file written into the extracted-layers dir recording the
 /// layers in OCI order (bottom-most first), one short layer id per line. The
 /// guest agent honors it when stacking overlayfs lowerdirs; without it, layers
@@ -1692,14 +1861,11 @@ fn post_process_extraction(
     // Extract agent-rootfs.tar to agent-rootfs directory
     let rootfs_tar = cache_dir.join("agent-rootfs.tar");
     let rootfs_dir = cache_dir.join("agent-rootfs");
-    if rootfs_tar.exists() && !rootfs_dir.exists() {
-        if debug {
+    if rootfs_tar.exists() {
+        if debug && !rootfs_dir.exists() {
             eprintln!("debug: extracting agent-rootfs.tar...");
         }
-        fs::create_dir_all(&rootfs_dir)?;
-        let tar_file = File::open(&rootfs_tar)?;
-        let mut archive = tar::Archive::new(tar_file);
-        safe_unpack(&mut archive, &rootfs_dir)?;
+        materialize_tar_dir(&rootfs_tar, &rootfs_dir, debug)?;
     }
 
     // Extract OCI layer tars to layers/{digest}/ directories.
@@ -1743,20 +1909,39 @@ fn post_process_extraction(
         // macOS, fail rather than silently corrupting case-colliding paths.
         let extract_dir = extraction_layers_dir(cache_dir, debug)?;
 
+        // Only the tars whose layer is not already in place still cost disk.
+        // A tar's size is a faithful upper bound on the tree it unpacks to.
+        let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut needed = 0u64;
         for entry in fs::read_dir(&layers_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "tar") {
-                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                let layer_dir = extract_dir.join(&*stem);
-                if !layer_dir.exists() {
-                    if debug {
-                        eprintln!("debug: extracting layer {}...", stem);
-                    }
-                    fs::create_dir_all(&layer_dir)?;
-                    let tar_file = File::open(&path)?;
-                    let mut archive = tar::Archive::new(tar_file);
-                    safe_unpack(&mut archive, &layer_dir)?;
+            let path = entry?.path();
+            if !path.extension().is_some_and(|ext| ext == "tar") {
+                continue;
+            }
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let layer_dir = extract_dir.join(&*stem);
+            if !layer_dir.is_dir() {
+                needed = needed.saturating_add(fs::metadata(&path)?.len());
+                pending.push((path, layer_dir));
+            }
+        }
+        if !pending.is_empty() {
+            preflight_free_space(&extract_dir, needed, "the packed image layers")?;
+        }
+        for (tar, layer_dir) in &pending {
+            if debug {
+                eprintln!(
+                    "debug: extracting layer {}...",
+                    layer_dir.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+            if let Some(report) = materialize_tar_dir(tar, layer_dir, debug)? {
+                if debug && report.skipped > 0 {
+                    eprintln!(
+                        "debug: layer {}: {} entries the host could not represent were skipped",
+                        layer_dir.file_name().unwrap_or_default().to_string_lossy(),
+                        report.skipped
+                    );
                 }
             }
         }
@@ -2753,25 +2938,275 @@ pub fn create_or_copy_storage_disk(
 
 #[cfg(test)]
 mod tests {
+    /// The macOS leniency may only skip the errors it exists for. A destination
+    /// that has stopped accepting writes is not one of them: skipping it turns
+    /// a failed extraction into one that reports success on a half-written tree.
     #[test]
-    fn out_of_space_is_never_skipped_as_a_platform_quirk() {
-        // The skip path in safe_unpack_with_limits exists for entries macOS
-        // cannot represent. A full filesystem must not take that path: doing so
-        // reports a successful extraction of a half-written tree, which later
-        // surfaces as the container runtime claiming the entrypoint is missing.
-        for code in [libc::ENOSPC, libc::EDQUOT, libc::EROFS, libc::EIO] {
+    fn only_platform_quirks_are_skippable_never_a_failing_filesystem() {
+        for code in [
+            libc::EPERM,
+            libc::EACCES,
+            libc::EEXIST,
+            libc::ENOTSUP,
+            libc::EINVAL,
+        ] {
             assert!(
-                super::is_unskippable_unpack_error(&std::io::Error::from_raw_os_error(code)),
-                "errno {code} must abort extraction, not be skipped"
+                super::is_platform_unpack_quirk(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} is a representation problem and stays skippable"
             );
         }
-        // Genuine platform quirks stay skippable, so the leniency still works.
-        for code in [libc::EPERM, libc::EOPNOTSUPP, libc::EINVAL] {
+        for code in [
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EROFS,
+            libc::EIO,
+            libc::ENOMEM,
+        ] {
             assert!(
-                !super::is_unskippable_unpack_error(&std::io::Error::from_raw_os_error(code)),
-                "errno {code} should remain skippable for non-regular entries"
+                !super::is_platform_unpack_quirk(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} must abort the extraction, never be skipped"
             );
         }
+        // The tar crate wraps some failures and drops the errno; the kind is
+        // still enough to tell a representation problem from a failing disk.
+        use std::io::ErrorKind as K;
+        for kind in [
+            K::AlreadyExists,
+            K::PermissionDenied,
+            K::NotFound,
+            K::Unsupported,
+        ] {
+            assert!(
+                super::is_platform_unpack_quirk(&std::io::Error::new(kind, "wrapped")),
+                "{kind:?} without an errno is still a quirk"
+            );
+        }
+        for kind in [
+            K::StorageFull,
+            K::QuotaExceeded,
+            K::ReadOnlyFilesystem,
+            K::OutOfMemory,
+            K::Other,
+        ] {
+            assert!(
+                !super::is_platform_unpack_quirk(&std::io::Error::new(kind, "wrapped")),
+                "{kind:?} without an errno must abort"
+            );
+        }
+    }
+
+    /// Build a tar of `entries`, each `(path, bytes)`, in order.
+    fn tar_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// The whole point of staging: a tar that cannot be fully unpacked leaves
+    /// no directory under the layer's name, so nothing downstream can trust a
+    /// partial tree, and the same call succeeds once the archive is intact.
+    #[test]
+    fn a_failed_extraction_leaves_no_final_directory_and_a_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let intact = tar_of(&[("bin/first", b"one"), ("bin/second", &[7u8; 4096])]);
+        // Cut the archive off inside the second entry's data.
+        let truncated = &intact[..intact.len() - 2048];
+        let tar_path = dir.path().join("layer.tar");
+        let final_dir = dir.path().join("deadbeef");
+
+        std::fs::write(&tar_path, truncated).unwrap();
+        let err = super::materialize_tar_dir(&tar_path, &final_dir, false)
+            .expect_err("a truncated archive must not extract successfully");
+        assert!(err.to_string().contains("nothing was kept"), "got: {err}");
+        assert!(
+            !final_dir.exists(),
+            "no directory may carry the layer's name"
+        );
+        assert!(
+            !super::partial_dir_for(&final_dir).unwrap().exists(),
+            "the staging directory is cleaned up after a failure"
+        );
+
+        std::fs::write(&tar_path, &intact).unwrap();
+        let report = super::materialize_tar_dir(&tar_path, &final_dir, false)
+            .unwrap()
+            .expect("a fresh extraction reports what it wrote");
+        assert_eq!(report.entries, 2);
+        assert_eq!(std::fs::read(final_dir.join("bin/first")).unwrap(), b"one");
+        assert_eq!(
+            std::fs::read(final_dir.join("bin/second")).unwrap().len(),
+            4096
+        );
+        assert!(!super::partial_dir_for(&final_dir).unwrap().exists());
+    }
+
+    /// A `.partial` left behind by a crash is never built on: the next attempt
+    /// starts from empty, so stale content cannot leak into the final tree.
+    #[test]
+    fn stale_staging_from_a_crash_is_discarded_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_dir = dir.path().join("cafebabe");
+        let staging = super::partial_dir_for(&final_dir).unwrap();
+        std::fs::create_dir_all(staging.join("usr")).unwrap();
+        std::fs::write(staging.join("usr/stale"), b"from a crashed run").unwrap();
+
+        let tar_path = dir.path().join("layer.tar");
+        std::fs::write(&tar_path, tar_of(&[("usr/fresh", b"ok")])).unwrap();
+        super::materialize_tar_dir(&tar_path, &final_dir, false).unwrap();
+
+        assert!(final_dir.join("usr/fresh").is_file());
+        assert!(
+            !final_dir.join("usr/stale").exists(),
+            "stale content must not survive"
+        );
+        assert!(!staging.exists());
+    }
+
+    /// A directory that carries the layer's name is complete by construction
+    /// and is left exactly as it is.
+    #[test]
+    fn an_existing_final_directory_is_trusted_and_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_dir = dir.path().join("0123abcd");
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::write(final_dir.join("already-here"), b"keep").unwrap();
+        let tar_path = dir.path().join("layer.tar");
+        std::fs::write(&tar_path, tar_of(&[("would-overwrite", b"no")])).unwrap();
+
+        let reused = super::materialize_tar_dir(&tar_path, &final_dir, false).unwrap();
+        assert!(
+            reused.is_none(),
+            "nothing is extracted over a complete layer"
+        );
+        assert!(final_dir.join("already-here").is_file());
+        assert!(!final_dir.join("would-overwrite").exists());
+    }
+
+    /// The preflight names the shortfall instead of letting the extraction
+    /// discover it part-way through.
+    #[test]
+    fn preflight_reports_the_shortfall_before_writing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        super::preflight_free_space(dir.path(), 1, "a tiny layer").expect("one byte always fits");
+        let err = super::preflight_free_space(dir.path(), u64::MAX, "the packed image layers")
+            .expect_err("more than any disk holds must be refused up front");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        let msg = err.to_string();
+        assert!(msg.contains("not enough free disk"), "got: {msg}");
+        assert!(msg.contains("the packed image layers"), "got: {msg}");
+        assert!(msg.contains("is free on"), "got: {msg}");
+    }
+
+    /// Fault injection against a real full filesystem: the case that produced
+    /// the bug. A tiny volume runs out of room part-way through the archive;
+    /// the extraction must fail, keep nothing under the layer's name, and
+    /// succeed on retry once there is room. Needs `hdiutil`, so it runs on
+    /// macOS when `SMOLVM_PACK_FAULT_TESTS=1`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_disk_that_fills_up_mid_extraction_fails_loudly_and_keeps_nothing() {
+        if std::env::var_os("SMOLVM_PACK_FAULT_TESTS").is_none() {
+            eprintln!("skipped: set SMOLVM_PACK_FAULT_TESTS=1 to run the hdiutil fault test");
+            return;
+        }
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("tiny.dmg");
+        let mount = dir.path().join("mnt");
+        std::fs::create_dir_all(&mount).unwrap();
+        let ok = Command::new("hdiutil")
+            .args([
+                "create", "-quiet", "-size", "2m", "-fs", "APFS", "-volname", "tiny",
+            ])
+            .arg(&image)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "hdiutil create");
+        let ok = Command::new("hdiutil")
+            .args(["attach", "-quiet", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "hdiutil attach");
+        struct Detach(PathBuf);
+        impl Drop for Detach {
+            fn drop(&mut self) {
+                let _ = Command::new("hdiutil")
+                    .args(["detach", "-quiet", "-force"])
+                    .arg(&self.0)
+                    .status();
+            }
+        }
+        let _detach = Detach(mount.clone());
+
+        // Many small directories and links so the failure lands on the
+        // non-regular path the leniency used to swallow, plus enough data to
+        // overrun a 2 MB volume.
+        let mut builder = tar::Builder::new(Vec::new());
+        for i in 0..64 {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_size(0);
+            h.set_mode(0o755);
+            h.set_cksum();
+            builder
+                .append_data(&mut h, format!("d{i}/"), std::io::empty())
+                .unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_size(48 * 1024);
+            h.set_mode(0o644);
+            h.set_cksum();
+            builder
+                .append_data(&mut h, format!("d{i}/blob"), &[1u8; 48 * 1024][..])
+                .unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_cksum();
+            builder
+                .append_link(&mut h, format!("d{i}/link"), "blob")
+                .unwrap();
+        }
+        let tar_path = dir.path().join("big.tar");
+        std::fs::write(&tar_path, builder.into_inner().unwrap()).unwrap();
+
+        let final_dir = mount.join("layer0");
+        let err = super::materialize_tar_dir(&tar_path, &final_dir, false)
+            .expect_err("3 MB of entries cannot fit a 2 MB volume");
+        assert!(
+            err.raw_os_error() == Some(libc::ENOSPC)
+                || err.to_string().contains("nothing was kept"),
+            "got: {err}"
+        );
+        assert!(
+            !final_dir.exists(),
+            "a partial tree must never carry the layer's name"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&mount)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "nothing kept on the volume, found {leftovers:?}"
+        );
+
+        // With room to spare the very same call completes.
+        let roomy = dir.path().join("roomy");
+        super::materialize_tar_dir(&tar_path, &roomy, false).unwrap();
+        assert!(roomy.join("d63/blob").is_file());
     }
 
     use super::*;

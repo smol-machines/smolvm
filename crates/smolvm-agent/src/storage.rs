@@ -887,7 +887,13 @@ fn ordered_packed_layer_names(packed_dir: &Path) -> Result<Vec<String>> {
             // A packed store is a volume root on macOS, so it always carries
             // filesystem bookkeeping directories. They are not image layers,
             // and mistaking one for the whole image builds a rootfs out of it.
-            if !name.ends_with(".tar") && !is_volume_metadata(&entry.file_name()) {
+            // A `.partial` directory is an extraction the host had not finished
+            // (it renames a complete one into its layer name); it is never a
+            // layer, whatever it happens to contain.
+            if !name.ends_with(".tar")
+                && !name.ends_with(".partial")
+                && !is_volume_metadata(&entry.file_name())
+            {
                 present.insert(name);
             }
         }
@@ -4915,6 +4921,27 @@ mod tests {
         let err = ordered_packed_layer_names(dir.path())
             .expect_err("bookkeeping directories are not layers");
         assert!(err.to_string().contains("no image layers"), "got: {err}");
+    }
+
+    /// An extraction the host did not finish is staged as `<layer>.partial`;
+    /// whatever it contains, it is not a layer, and a store holding nothing
+    /// else must fail the same way an empty one does.
+    #[test]
+    fn an_unfinished_extraction_is_never_enumerated_as_an_image_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("aaaa1111bbbb.partial");
+        std::fs::create_dir_all(staging.join("usr/bin")).unwrap();
+        std::fs::write(staging.join("usr/bin/sh"), b"").unwrap();
+        let err = ordered_packed_layer_names(dir.path())
+            .expect_err("a half-written layer must not be served as the image");
+        assert!(err.to_string().contains("no image layers"), "got: {err}");
+
+        // Once the host renames it into place it is a layer like any other.
+        std::fs::rename(&staging, dir.path().join("aaaa1111bbbb")).unwrap();
+        assert_eq!(
+            ordered_packed_layer_names(dir.path()).unwrap(),
+            vec!["aaaa1111bbbb".to_string()]
+        );
     }
 
     /// A store with no usable layer directory cannot produce the image, so it
