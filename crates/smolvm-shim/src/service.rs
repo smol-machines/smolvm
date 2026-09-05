@@ -60,14 +60,23 @@ impl Shim for Service {
         // state from disk, so a fresh process can still find and kill the VM.
         // Best-effort — a missing machine (a container-task delete, or a VM
         // already cleaned by the graceful path) is not an error.
+        //
+        // The host share tree is keyed by that same sandbox id and leaks the same
+        // way, so it goes here too. On this path it is the expensive one: the
+        // per-container delete never ran, so the tree still holds full image
+        // rootfs copies.
         let id = self.id.clone();
-        let _ = tokio::task::spawn_blocking(move || match smolvm::embedded::runtime() {
-            Ok(rt) => {
-                if let Err(e) = rt.delete_machine(&id) {
-                    warn!("delete_shim: reaping VM {id} failed (may already be gone): {e}");
+        let _ = tokio::task::spawn_blocking(move || {
+            match smolvm::embedded::runtime() {
+                Ok(rt) => {
+                    if let Err(e) = rt.delete_machine(&id) {
+                        warn!("delete_shim: reaping VM {id} failed (may already be gone): {e}");
+                    }
                 }
+                Err(e) => warn!("delete_shim: runtime unavailable, cannot reap VM {id}: {e}"),
             }
-            Err(e) => warn!("delete_shim: runtime unavailable, cannot reap VM {id}: {e}"),
+            // Independent of the runtime being reachable at all.
+            crate::engine::remove_sandbox_share_tree(&id);
         })
         .await;
         Ok(DeleteResponse {
