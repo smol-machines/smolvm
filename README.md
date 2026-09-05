@@ -280,6 +280,30 @@ kubectl logs smolvm-hello    # prints the guest's own kernel, so it is a real VM
 
 Any pod opts in with `runtimeClassName: smolvm`.
 
+Host Mount Performance
+----------------------
+
+A `--volume` directory is served over virtio-fs, so every file operation is a
+round trip to the host. Bulk reads and writes run near host speed, but
+operation-heavy work (installing dependencies, a first build, walking a big
+repository) is far slower than on the machine's own disk. Keep generated
+directories such as `node_modules`, `target` and `.venv` inside the machine.
+
+`SMOLVM_MOUNT_DAX=1` (experimental) gives each host mount a 512 MiB DAX window,
+which helps sequential and `mmap`-heavy reads but not directory traversal,
+`stat` or file creation. Set it on the process that starts the machine, with
+the value exactly `1`; a running machine needs a stop and start. It falls back
+silently, so confirm it took effect inside the guest, where the mount ends in
+`dax=always`:
+
+```bash
+SMOLVM_MOUNT_DAX=1 smolvm machine start --name NAME
+smolvm machine exec --name NAME -- grep virtiofs /proc/mounts
+```
+
+Verified on Linux x86_64. On macOS the bundled libkrun currently falls back,
+so the variable has no effect there.
+
 GPU Acceleration
 ----------------
 
