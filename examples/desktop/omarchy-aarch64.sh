@@ -7,8 +7,11 @@
 #   smolvm machine create -n omarchy -I menci/archlinuxarm:latest \
 #     --cpus 6 --mem 8192 --storage 20 --net --gpu -p 5901:5901 \
 #     -v "$PWD:/in"
-#   SMOLVM_DISPLAY=1024x768 SMOLVM_VNC=127.0.0.1:5900 \
+#   SMOLVM_DISPLAY=1024x768 SMOLVM_VNC=127.0.0.1:5900 SMOLVM_VIDEO=0 \
 #     smolvm machine start --name omarchy
+#   (SMOLVM_VIDEO=0 keeps the browser client on Raw RFB. On a local/loopback
+#   link H.264 has no bandwidth to save and only adds encode+decode latency;
+#   leave video enabled for cloud/remote viewers, where it is essential.)
 #   smolvm machine exec --name omarchy -- bash /in/omarchy-aarch64.sh
 #
 # Two ways to view it, both interactive:
@@ -75,7 +78,7 @@ if [ ! -d /usr/share/omarchy ]; then
     # before every attempt or the install fails on 404s.
     pacman -Syy --noconfirm >/dev/null 2>&1
     pacman -S --noconfirm --needed --disable-download-timeout "${OK[@]}" \
-      foot grim wayvnc swaybg ttf-nerd-fonts-symbols ttf-jetbrains-mono-nerd \
+      foot grim wayvnc waybar swaybg ttf-nerd-fonts-symbols ttf-jetbrains-mono-nerd \
       noto-fonts waybar mako swayosd hypridle hyprlock alacritty wofi \
       >/tmp/pac.log 2>&1 && { ok=1; break; }
     sleep 20
@@ -129,6 +132,18 @@ hl.config({
 })
 LUA
   chown -R omar:omar /home/omar/.config /home/omar/.local
+  # A blinking cursor gives the compositor a periodic present, so the last
+  # character of a paused line reaches the display within a blink instead of
+  # waiting for the next keystroke.
+  install -d -o omar -g omar /home/omar/.config/foot
+  printf "[cursor]\nblink=yes\nblink-rate=200\n" >> /home/omar/.config/foot/foot.ini
+  chown -R omar:omar /home/omar/.config/foot
+  # The virtual krun-display reports a tiny physical size, so Hyprland
+  # auto-picks scale 2.0; the absolute VNC pointer then lands every click at
+  # half position and nothing focuses. Pin scale 1 so pointer coordinates
+  # match the 1280x800 framebuffer 1:1 (GDK integer scale follows).
+  sed -i "s/local omarchy_monitor_scale = .auto./local omarchy_monitor_scale = 1/" /home/omar/.config/hypr/monitors.lua
+  sed -i "s/local omarchy_gdk_scale = 2/local omarchy_gdk_scale = 1/" /home/omar/.config/hypr/monitors.lua
 
   # Omarchy's keybinds launch apps through uwsm-app (systemd user session)
   # and terminals through xdg-terminal-exec (not packaged on aarch64).
@@ -160,7 +175,13 @@ EOF
   # it (headless allows it), so CAD/3D sites silently render nothing.
   cat > /usr/local/bin/chromium <<'CHROMIUMWRAP'
 #!/bin/bash
-exec /usr/bin/chromium --ozone-platform=wayland --disable-gpu --enable-unsafe-swiftshader "$@"
+# Chromium treats any unclean exit (e.g. the machine being stopped) as a crash
+# and shows a "Restore pages?" bubble on the next launch, top-right, over the
+# toolbar. --disable-session-crashed-bubble no longer suppresses it in current
+# builds, so mark the profile cleanly exited before every launch instead.
+P="$HOME/.config/chromium/Default/Preferences"
+[ -f "$P" ] && sed -i 's/"exit_type":"[^"]*"/"exit_type":"Normal"/;s/"exited_cleanly":false/"exited_cleanly":true/' "$P" 2>/dev/null
+exec /usr/bin/chromium --ozone-platform=wayland --disable-gpu --enable-unsafe-swiftshader --no-first-run --disable-session-crashed-bubble --disable-infobars "$@"
 CHROMIUMWRAP
   chmod +x /usr/local/bin/chromium
   log "setup complete"
@@ -205,6 +226,17 @@ GPU_ENV=""
 
 # ----------------------------------------------------------------- session --
 pkill -f Hyprland 2>/dev/null; pkill -f quickshell 2>/dev/null
+# The Omarchy notification overlay is a full-screen wlr-layer surface at overlay
+# level (above every window). Its input mask (the toast column) can grab pointer
+# events across the top of the screen even with no visible toast, which silently
+# makes window chrome -- a browser's tabs, back button and address bar --
+# unclickable. Make the overlay click-through so toasts still display but never
+# intercept clicks. Runs as root here: the system copy under /usr/share (which
+# Omarchy's launcher actually runs) is root-owned; the user copy is patched too.
+for _nf in /usr/share/omarchy/shell/plugins/notifications/Service.qml \
+           /home/omar/.local/share/omarchy/shell/plugins/notifications/Service.qml; do
+  [ -f "$_nf" ] && sed -i 's|mask: Region { item: popupColumn }|mask: Region {} // cloud-desktop: never grab pointer, keep window chrome clickable|' "$_nf"
+done
 pkill -x wayvnc 2>/dev/null; pkill -x seatd 2>/dev/null; sleep 1
 
 RT=/run/user/1000; mkdir -p "$RT"; chown omar:omar "$RT"; chmod 700 "$RT"
@@ -244,7 +276,7 @@ SEATD_VTBOUND=0 seatd -g wheel >/tmp/seatd.log 2>&1 &
 sleep 2
 
 sudo -u omar env HOME=/home/omar XDG_RUNTIME_DIR=$RT XDG_SESSION_TYPE=wayland \
-  LIBSEAT_BACKEND=seatd AQ_NO_ATOMIC=1 DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus OMARCHY_PATH=/usr/share/omarchy PATH=/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/usr/sbin \
+  LIBSEAT_BACKEND=seatd DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus OMARCHY_PATH=/usr/share/omarchy PATH=/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/usr/sbin \
   $GPU_ENV \
   bash -s <<'INNER'
 set -o pipefail
@@ -259,9 +291,19 @@ for i in $(seq 1 20); do timeout 10 hyprctl -j monitors >/dev/null 2>&1 && break
 echo "omarchy hyprland up on $WAYLAND_DISPLAY"
 
 export OMARCHY_PATH=$HOME/.local/share/omarchy
-(setsid env DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS \
-  QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \
-  quickshell -n -p "$OMARCHY_PATH/shell" >/tmp/qs.log 2>&1 &)
+# Omarchy's autostart (omarchy-launch-shell, from hypr/autostart.lua) already
+# starts the quickshell shell when Hyprland comes up. Starting a second one
+# here spawns a DUPLICATE whose full-screen omarchy-notifications overlay -- a
+# wlr-layer surface at overlay level, above every window -- grabs pointer
+# events across the top strip of the screen, which silently makes window chrome
+# (a browser's tabs, back button and address bar) unclickable. So wait briefly
+# for the autostart instance and only start our own if none came up.
+for _ in $(seq 1 10); do pgrep -x quickshell >/dev/null 2>&1 && break; sleep 1; done
+if ! pgrep -x quickshell >/dev/null 2>&1; then
+  (setsid env DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS \
+    QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \
+    quickshell -n -p "$OMARCHY_PATH/shell" >/tmp/qs.log 2>&1 &)
+fi
 
 # In-guest VNC: wayvnc attaches to Hyprland via screencopy with native damage
 # tracking, tight encodings, and a client-side cursor — far cheaper than
@@ -271,6 +313,51 @@ export OMARCHY_PATH=$HOME/.local/share/omarchy
 BGIMG=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null)
 [ -f "$BGIMG" ] || BGIMG=$(ls "$HOME/.config/omarchy/current/backgrounds/"* 2>/dev/null | head -1)
 [ -f "$BGIMG" ] && (setsid swaybg -i "$BGIMG" -m fill >/tmp/swaybg.log 2>&1 &)
+
+# The Omarchy quickshell bar (and its notifications / OSD) render blank on this
+# GPU stack: Qt Quick surfaces are not composited here, though shm clients
+# (foot, swaybg, waybar) are. So hide the quickshell bar via its bar-off toggle
+# and use Waybar -- GTK/shm -- as the top bar: workspaces, focused-window
+# title, clock, and CPU/RAM load. Config is only written when absent so user
+# edits survive a rerun.
+mkdir -p "$HOME/.config/waybar" "$HOME/.local/state/omarchy/toggles"
+touch "$HOME/.local/state/omarchy/toggles/bar-off"
+if [ ! -f "$HOME/.config/waybar/config.jsonc" ]; then
+  cat > "$HOME/.config/waybar/config.jsonc" <<'WBCFG'
+{
+  // Waybar replaces the Omarchy quickshell bar here: on this GPU stack Qt Quick
+  // surfaces (quickshell's bar, notifications, OSD) are not composited, while
+  // GTK/shm clients like Waybar render fine.
+  "layer": "top", "position": "top", "height": 28, "spacing": 4,
+  "modules-left": ["hyprland/workspaces", "hyprland/window"],
+  "modules-center": ["clock"],
+  "modules-right": ["cpu", "memory", "pulseaudio", "network", "tray"],
+  "hyprland/workspaces": { "format": "{id}", "on-click": "activate" },
+  "hyprland/window": { "max-length": 60 },
+  "clock": { "format": "{:%a %d %b  %H:%M}", "tooltip-format": "<tt>{calendar}</tt>" },
+  "cpu": { "format": "CPU {usage}%" },
+  "memory": { "format": "RAM {}%" },
+  "network": { "format-wifi": "{essid}", "format-ethernet": "net", "format-disconnected": "" },
+  "pulseaudio": { "format": "VOL {volume}%", "format-muted": "muted" },
+  "tray": { "spacing": 8 }
+}
+WBCFG
+fi
+if [ ! -f "$HOME/.config/waybar/style.css" ]; then
+  cat > "$HOME/.config/waybar/style.css" <<'WBCSS'
+* { font-family: "JetBrainsMono Nerd Font", monospace; font-size: 13px; min-height: 0; }
+window#waybar { background: #1a1b26; color: #a9b1d6; }
+#workspaces button { color: #a9b1d6; padding: 0 8px; background: transparent; }
+#workspaces button.active { background: #7aa2f7; color: #1a1b26; }
+#workspaces button:hover { background: #292e42; }
+#window { color: #a9b1d6; }
+#clock, #cpu, #memory, #network, #pulseaudio, #tray { padding: 0 10px; }
+#clock { font-weight: bold; }
+WBCSS
+fi
+pkill -x waybar 2>/dev/null
+(setsid env WAYLAND_DISPLAY=$WAYLAND_DISPLAY XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE=$HYPRLAND_INSTANCE_SIGNATURE waybar >/tmp/waybar.log 2>&1 &)
+
 
 sleep 8
 timeout 10 hyprctl monitors | head -4

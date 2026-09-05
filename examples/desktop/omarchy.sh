@@ -48,7 +48,13 @@ dbus-uuidgen --ensure 2>/dev/null || true
 # in windowed mode without it, so CAD/3D sites silently render nothing.
 cat > /usr/local/bin/chromium <<'CHROMIUMWRAP'
 #!/bin/bash
-exec /usr/bin/chromium --ozone-platform=wayland --disable-gpu --enable-unsafe-swiftshader "$@"
+# Chromium treats any unclean exit (e.g. the machine being stopped) as a crash
+# and shows a "Restore pages?" bubble on the next launch, top-right, over the
+# toolbar. --disable-session-crashed-bubble no longer suppresses it in current
+# builds, so mark the profile cleanly exited before every launch instead.
+P="$HOME/.config/chromium/Default/Preferences"
+[ -f "$P" ] && sed -i 's/"exit_type":"[^"]*"/"exit_type":"Normal"/;s/"exited_cleanly":false/"exited_cleanly":true/' "$P" 2>/dev/null
+exec /usr/bin/chromium --ozone-platform=wayland --disable-gpu --enable-unsafe-swiftshader --no-first-run --disable-session-crashed-bubble --disable-infobars "$@"
 CHROMIUMWRAP
 chmod +x /usr/local/bin/chromium
 
