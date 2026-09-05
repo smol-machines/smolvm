@@ -254,7 +254,7 @@ LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 # without a source checkout. Linux only: containerd is the only consumer, and
 # there is nothing to register it with on macOS or Windows.
 if [[ "$(uname -s)" == "Linux" ]]; then
-    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin containerd-shim-smolvm-v2
+    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release -p smolvm-shim --bin containerd-shim-smolvm-v2
 fi
 
 # Build the unified `smol` CLI if its source is present (it lives in a sibling
