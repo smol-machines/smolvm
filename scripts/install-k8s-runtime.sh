@@ -54,6 +54,19 @@ echo "==> Installing runtime artifacts into $DATA_DIR"
 mkdir -p "$DATA_DIR"
 if [ -n "$RUNTIME_SRC" ]; then
     [ -d "$RUNTIME_SRC" ] || { echo "error: --runtime-dir not a directory: $RUNTIME_SRC" >&2; exit 1; }
+    # `smolvm-vmm` is just the engine under the name the runtime resolves. A
+    # distribution ships the engine once, as `smolvm-bin` (with `smolvm` as its
+    # wrapper script), so derive the VMM from it rather than asking releases to
+    # carry a second 30MB copy of the same binary.
+    if [ ! -e "$RUNTIME_SRC/smolvm-vmm" ]; then
+        for cand in smolvm-bin smolvm; do
+            if [ -f "$RUNTIME_SRC/$cand" ] && [ -x "$RUNTIME_SRC/$cand" ] && head -c4 "$RUNTIME_SRC/$cand" | grep -q ELF; then
+                echo "    (deriving smolvm-vmm from $cand)"
+                cp "$RUNTIME_SRC/$cand" "$RUNTIME_SRC/smolvm-vmm"
+                break
+            fi
+        done
+    fi
     for a in "${RUNTIME_ARTIFACTS[@]}"; do
         if [ -e "$RUNTIME_SRC/$a" ]; then
             echo "    $a"
