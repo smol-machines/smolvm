@@ -1,3 +1,207 @@
+Binary files a/.cache/clangd/index/anon_file.c.99B9E6E03541840D.idx and b/.cache/clangd/index/anon_file.c.99B9E6E03541840D.idx differ
+Binary files a/.cache/clangd/index/anon_file.h.BB3645A747F6D424.idx and b/.cache/clangd/index/anon_file.h.BB3645A747F6D424.idx differ
+Binary files a/.cache/clangd/index/bitscan.c.9E27A99F16ED1A27.idx and b/.cache/clangd/index/bitscan.c.9E27A99F16ED1A27.idx differ
+Binary files a/.cache/clangd/index/bitscan.h.C9065F8E86577802.idx and b/.cache/clangd/index/bitscan.h.C9065F8E86577802.idx differ
+Binary files a/.cache/clangd/index/c11_compat.h.25A44B3026F71602.idx and b/.cache/clangd/index/c11_compat.h.25A44B3026F71602.idx differ
+Binary files a/.cache/clangd/index/c99_compat.h.3BDFB279B6BCB4FB.idx and b/.cache/clangd/index/c99_compat.h.3BDFB279B6BCB4FB.idx differ
+Binary files a/.cache/clangd/index/compiler.h.3927B1896D392069.idx and b/.cache/clangd/index/compiler.h.3927B1896D392069.idx differ
+Binary files a/.cache/clangd/index/cso_cache.c.14D925DA80BE5458.idx and b/.cache/clangd/index/cso_cache.c.14D925DA80BE5458.idx differ
+Binary files a/.cache/clangd/index/cso_cache.h.5C49BCB99C87DBD5.idx and b/.cache/clangd/index/cso_cache.h.5C49BCB99C87DBD5.idx differ
+Binary files a/.cache/clangd/index/cso_hash.c.3323B6245F906EFC.idx and b/.cache/clangd/index/cso_hash.c.3323B6245F906EFC.idx differ
+Binary files a/.cache/clangd/index/cso_hash.h.31CC94CABF231173.idx and b/.cache/clangd/index/cso_hash.h.31CC94CABF231173.idx differ
+Binary files a/.cache/clangd/index/detect_os.h.288882ECDBFC6981.idx and b/.cache/clangd/index/detect_os.h.288882ECDBFC6981.idx differ
+Binary files a/.cache/clangd/index/drm_hw.h.DF95F496C026E9E6.idx and b/.cache/clangd/index/drm_hw.h.DF95F496C026E9E6.idx differ
+Binary files a/.cache/clangd/index/drm_renderer.h.BA691FE2E4B87C4A.idx and b/.cache/clangd/index/drm_renderer.h.BA691FE2E4B87C4A.idx differ
+Binary files a/.cache/clangd/index/fast_urem_by_const.h.DA3749F4E1B05BE7.idx and b/.cache/clangd/index/fast_urem_by_const.h.DA3749F4E1B05BE7.idx differ
+Binary files a/.cache/clangd/index/hash_table.c.C02D52976775D7E0.idx and b/.cache/clangd/index/hash_table.c.C02D52976775D7E0.idx differ
+Binary files a/.cache/clangd/index/hash_table.h.5C0AAC003E45B2DF.idx and b/.cache/clangd/index/hash_table.h.5C0AAC003E45B2DF.idx differ
+Binary files a/.cache/clangd/index/iov.c.0D7F23DDB696B00C.idx and b/.cache/clangd/index/iov.c.0D7F23DDB696B00C.idx differ
+Binary files a/.cache/clangd/index/list.h.B04F1AD8580165D1.idx and b/.cache/clangd/index/list.h.B04F1AD8580165D1.idx differ
+Binary files a/.cache/clangd/index/macros.h.B9032FD945249669.idx and b/.cache/clangd/index/macros.h.B9032FD945249669.idx differ
+Binary files a/.cache/clangd/index/no_extern_c.h.DF9A4C85FAEA1AD9.idx and b/.cache/clangd/index/no_extern_c.h.DF9A4C85FAEA1AD9.idx differ
+Binary files a/.cache/clangd/index/os_file.c.D6A362E80173EBCA.idx and b/.cache/clangd/index/os_file.c.D6A362E80173EBCA.idx differ
+Binary files a/.cache/clangd/index/os_file.h.695B679026CF9E5A.idx and b/.cache/clangd/index/os_file.h.695B679026CF9E5A.idx differ
+Binary files a/.cache/clangd/index/os_memory_aligned.h.26CC3D893135F89D.idx and b/.cache/clangd/index/os_memory_aligned.h.26CC3D893135F89D.idx differ
+Binary files a/.cache/clangd/index/os_memory_stdc.h.727D1BBC2BE7EE25.idx and b/.cache/clangd/index/os_memory_stdc.h.727D1BBC2BE7EE25.idx differ
+Binary files a/.cache/clangd/index/os_memory.h.A9D56BA02F81348C.idx and b/.cache/clangd/index/os_memory.h.A9D56BA02F81348C.idx differ
+Binary files a/.cache/clangd/index/os_misc.c.9DDD1F9AEFA44F10.idx and b/.cache/clangd/index/os_misc.c.9DDD1F9AEFA44F10.idx differ
+Binary files a/.cache/clangd/index/os_misc.h.722F693467F3E7B3.idx and b/.cache/clangd/index/os_misc.h.722F693467F3E7B3.idx differ
+Binary files a/.cache/clangd/index/p_compiler.h.2AE8F9B9ED3BFED4.idx and b/.cache/clangd/index/p_compiler.h.2AE8F9B9ED3BFED4.idx differ
+Binary files a/.cache/clangd/index/p_config.h.FFF06000E63EB2B4.idx and b/.cache/clangd/index/p_config.h.FFF06000E63EB2B4.idx differ
+Binary files a/.cache/clangd/index/p_defines.h.E7C6984C3B6633A8.idx and b/.cache/clangd/index/p_defines.h.E7C6984C3B6633A8.idx differ
+Binary files a/.cache/clangd/index/p_format.h.33053DF6A89751A5.idx and b/.cache/clangd/index/p_format.h.33053DF6A89751A5.idx differ
+Binary files a/.cache/clangd/index/p_shader_tokens.h.EF283D325C1976B4.idx and b/.cache/clangd/index/p_shader_tokens.h.EF283D325C1976B4.idx differ
+Binary files a/.cache/clangd/index/p_state.h.43171AFE6E620D3D.idx and b/.cache/clangd/index/p_state.h.43171AFE6E620D3D.idx differ
+Binary files a/.cache/clangd/index/proxy_renderer.h.BC0F4D4902EC0337.idx and b/.cache/clangd/index/proxy_renderer.h.BC0F4D4902EC0337.idx differ
+Binary files a/.cache/clangd/index/ralloc.c.FCA057FCF8AB68A5.idx and b/.cache/clangd/index/ralloc.c.FCA057FCF8AB68A5.idx differ
+Binary files a/.cache/clangd/index/ralloc.h.02A485F5A4FB0925.idx and b/.cache/clangd/index/ralloc.h.02A485F5A4FB0925.idx differ
+Binary files a/.cache/clangd/index/tgsi_build.c.8A4AFA66D093E8C1.idx and b/.cache/clangd/index/tgsi_build.c.8A4AFA66D093E8C1.idx differ
+Binary files a/.cache/clangd/index/tgsi_build.h.7936FF4E486FBCC0.idx and b/.cache/clangd/index/tgsi_build.h.7936FF4E486FBCC0.idx differ
+Binary files a/.cache/clangd/index/tgsi_dump.c.6B20D06C72699478.idx and b/.cache/clangd/index/tgsi_dump.c.6B20D06C72699478.idx differ
+Binary files a/.cache/clangd/index/tgsi_dump.h.D69C06E108183519.idx and b/.cache/clangd/index/tgsi_dump.h.D69C06E108183519.idx differ
+Binary files a/.cache/clangd/index/tgsi_info.c.C67E264B6EA6C5D2.idx and b/.cache/clangd/index/tgsi_info.c.C67E264B6EA6C5D2.idx differ
+Binary files a/.cache/clangd/index/tgsi_info.h.AC97D233162FE48F.idx and b/.cache/clangd/index/tgsi_info.h.AC97D233162FE48F.idx differ
+Binary files a/.cache/clangd/index/tgsi_iterate.c.E569D24487C69914.idx and b/.cache/clangd/index/tgsi_iterate.c.E569D24487C69914.idx differ
+Binary files a/.cache/clangd/index/tgsi_iterate.h.D350C807C9D1A9C2.idx and b/.cache/clangd/index/tgsi_iterate.h.D350C807C9D1A9C2.idx differ
+Binary files a/.cache/clangd/index/tgsi_parse.c.7DE0CC9EC63FFB94.idx and b/.cache/clangd/index/tgsi_parse.c.7DE0CC9EC63FFB94.idx differ
+Binary files a/.cache/clangd/index/tgsi_parse.h.7CF75B4CF0FA4B06.idx and b/.cache/clangd/index/tgsi_parse.h.7CF75B4CF0FA4B06.idx differ
+Binary files a/.cache/clangd/index/tgsi_sanity.c.13B3BE6664659060.idx and b/.cache/clangd/index/tgsi_sanity.c.13B3BE6664659060.idx differ
+Binary files a/.cache/clangd/index/tgsi_sanity.h.263049DC8635609C.idx and b/.cache/clangd/index/tgsi_sanity.h.263049DC8635609C.idx differ
+Binary files a/.cache/clangd/index/tgsi_scan.c.C8269FCDE010BB96.idx and b/.cache/clangd/index/tgsi_scan.c.C8269FCDE010BB96.idx differ
+Binary files a/.cache/clangd/index/tgsi_scan.h.DC6EC20904AB2894.idx and b/.cache/clangd/index/tgsi_scan.h.DC6EC20904AB2894.idx differ
+Binary files a/.cache/clangd/index/tgsi_strings.c.6915C65209B81C23.idx and b/.cache/clangd/index/tgsi_strings.c.6915C65209B81C23.idx differ
+Binary files a/.cache/clangd/index/tgsi_strings.h.A744CB7E5E16AEDE.idx and b/.cache/clangd/index/tgsi_strings.h.A744CB7E5E16AEDE.idx differ
+Binary files a/.cache/clangd/index/tgsi_text.c.A97C9246E902C6BA.idx and b/.cache/clangd/index/tgsi_text.c.A97C9246E902C6BA.idx differ
+Binary files a/.cache/clangd/index/tgsi_text.h.411A9BB9D6727D09.idx and b/.cache/clangd/index/tgsi_text.h.411A9BB9D6727D09.idx differ
+Binary files a/.cache/clangd/index/tgsi_util.c.EFBF0B02051D6FD0.idx and b/.cache/clangd/index/tgsi_util.c.EFBF0B02051D6FD0.idx differ
+Binary files a/.cache/clangd/index/tgsi_util.h.7576B1F39F37BE66.idx and b/.cache/clangd/index/tgsi_util.h.7576B1F39F37BE66.idx differ
+Binary files a/.cache/clangd/index/threads_posix.h.E03D440F81EC6052.idx and b/.cache/clangd/index/threads_posix.h.E03D440F81EC6052.idx differ
+Binary files a/.cache/clangd/index/threads.h.9D162BFD7A4AB497.idx and b/.cache/clangd/index/threads.h.9D162BFD7A4AB497.idx differ
+Binary files a/.cache/clangd/index/u_atomic.h.7AEEE844EA71D1AB.idx and b/.cache/clangd/index/u_atomic.h.7AEEE844EA71D1AB.idx differ
+Binary files a/.cache/clangd/index/u_cpu_detect.c.897C1AFA2F2CBAC4.idx and b/.cache/clangd/index/u_cpu_detect.c.897C1AFA2F2CBAC4.idx differ
+Binary files a/.cache/clangd/index/u_cpu_detect.h.B9903064BEC2C6F8.idx and b/.cache/clangd/index/u_cpu_detect.h.B9903064BEC2C6F8.idx differ
+Binary files a/.cache/clangd/index/u_debug_describe.c.5AB78EBD44611692.idx and b/.cache/clangd/index/u_debug_describe.c.5AB78EBD44611692.idx differ
+Binary files a/.cache/clangd/index/u_debug_describe.h.3377900B85E76739.idx and b/.cache/clangd/index/u_debug_describe.h.3377900B85E76739.idx differ
+Binary files a/.cache/clangd/index/u_debug_refcnt.h.B2E8D50CCC1924B0.idx and b/.cache/clangd/index/u_debug_refcnt.h.B2E8D50CCC1924B0.idx differ
+Binary files a/.cache/clangd/index/u_debug.c.9E855CF55C040F11.idx and b/.cache/clangd/index/u_debug.c.9E855CF55C040F11.idx differ
+Binary files a/.cache/clangd/index/u_debug.h.3FFD92CDB8533EA9.idx and b/.cache/clangd/index/u_debug.h.3FFD92CDB8533EA9.idx differ
+Binary files a/.cache/clangd/index/u_double_list.h.0F4F049A3CB97E31.idx and b/.cache/clangd/index/u_double_list.h.0F4F049A3CB97E31.idx differ
+Binary files a/.cache/clangd/index/u_dual_blend.h.A14AAD3850C49AD3.idx and b/.cache/clangd/index/u_dual_blend.h.A14AAD3850C49AD3.idx differ
+Binary files a/.cache/clangd/index/u_endian.h.8A8016836669F1D6.idx and b/.cache/clangd/index/u_endian.h.8A8016836669F1D6.idx differ
+Binary files a/.cache/clangd/index/u_format_s3tc.h.5A92B1B6CE52222E.idx and b/.cache/clangd/index/u_format_s3tc.h.5A92B1B6CE52222E.idx differ
+Binary files a/.cache/clangd/index/u_format.c.A306654B4E7F2266.idx and b/.cache/clangd/index/u_format.c.A306654B4E7F2266.idx differ
+Binary files a/.cache/clangd/index/u_format.h.38E2AF6F959A62BD.idx and b/.cache/clangd/index/u_format.h.38E2AF6F959A62BD.idx differ
+Binary files a/.cache/clangd/index/u_hash_table.c.0E93B4C69D86FB8C.idx and b/.cache/clangd/index/u_hash_table.c.0E93B4C69D86FB8C.idx differ
+Binary files a/.cache/clangd/index/u_hash_table.h.0F8138D2075D0998.idx and b/.cache/clangd/index/u_hash_table.h.0F8138D2075D0998.idx differ
+Binary files a/.cache/clangd/index/u_inlines.h.B389E4DD50433C8A.idx and b/.cache/clangd/index/u_inlines.h.B389E4DD50433C8A.idx differ
+Binary files a/.cache/clangd/index/u_math.c.392417D40A413961.idx and b/.cache/clangd/index/u_math.c.392417D40A413961.idx differ
+Binary files a/.cache/clangd/index/u_math.h.764D4A487004438C.idx and b/.cache/clangd/index/u_math.h.764D4A487004438C.idx differ
+Binary files a/.cache/clangd/index/u_memory.h.456943C706481E44.idx and b/.cache/clangd/index/u_memory.h.456943C706481E44.idx differ
+Binary files a/.cache/clangd/index/u_pointer.h.0487FFE4EAD8A4EA.idx and b/.cache/clangd/index/u_pointer.h.0487FFE4EAD8A4EA.idx differ
+Binary files a/.cache/clangd/index/u_prim.h.30455C94ADAF901E.idx and b/.cache/clangd/index/u_prim.h.30455C94ADAF901E.idx differ
+Binary files a/.cache/clangd/index/u_string.h.17FC1FDDA856B27E.idx and b/.cache/clangd/index/u_string.h.17FC1FDDA856B27E.idx differ
+Binary files a/.cache/clangd/index/u_texture.c.06FFC3131216D38A.idx and b/.cache/clangd/index/u_texture.c.06FFC3131216D38A.idx differ
+Binary files a/.cache/clangd/index/u_texture.h.5AFFC25086F85FFA.idx and b/.cache/clangd/index/u_texture.h.5AFFC25086F85FFA.idx differ
+Binary files a/.cache/clangd/index/u_thread.h.608C3B49D511E2E7.idx and b/.cache/clangd/index/u_thread.h.608C3B49D511E2E7.idx differ
+Binary files a/.cache/clangd/index/util.c.4E695E020D3F42EF.idx and b/.cache/clangd/index/util.c.4E695E020D3F42EF.idx differ
+Binary files a/.cache/clangd/index/util.h.568F948E9E1C7613.idx and b/.cache/clangd/index/util.h.568F948E9E1C7613.idx differ
+Binary files a/.cache/clangd/index/venus_context.c.8CB65E8EE8BE01DC.idx and b/.cache/clangd/index/venus_context.c.8CB65E8EE8BE01DC.idx differ
+Binary files a/.cache/clangd/index/venus_context.h.46449588446EDFB6.idx and b/.cache/clangd/index/venus_context.h.46449588446EDFB6.idx differ
+Binary files a/.cache/clangd/index/venus_hw.h.703C1A72CCDD01A2.idx and b/.cache/clangd/index/venus_hw.h.703C1A72CCDD01A2.idx differ
+Binary files a/.cache/clangd/index/virgl_context.c.886857C7F88E55C6.idx and b/.cache/clangd/index/virgl_context.c.886857C7F88E55C6.idx differ
+Binary files a/.cache/clangd/index/virgl_context.h.1D9C9327B811916A.idx and b/.cache/clangd/index/virgl_context.h.1D9C9327B811916A.idx differ
+Binary files a/.cache/clangd/index/virgl_hw.h.97191BCB0E2552C8.idx and b/.cache/clangd/index/virgl_hw.h.97191BCB0E2552C8.idx differ
+Binary files a/.cache/clangd/index/virgl_protocol.h.3A58776C31E2FFA1.idx and b/.cache/clangd/index/virgl_protocol.h.3A58776C31E2FFA1.idx differ
+Binary files a/.cache/clangd/index/virgl_resource.c.C3078CF893894205.idx and b/.cache/clangd/index/virgl_resource.c.C3078CF893894205.idx differ
+Binary files a/.cache/clangd/index/virgl_resource.h.0F020483DD7A6021.idx and b/.cache/clangd/index/virgl_resource.h.0F020483DD7A6021.idx differ
+Binary files a/.cache/clangd/index/virgl_util.c.4788350FFFDD771F.idx and b/.cache/clangd/index/virgl_util.c.4788350FFFDD771F.idx differ
+Binary files a/.cache/clangd/index/virgl_util.h.8DE07BD4E4FF3873.idx and b/.cache/clangd/index/virgl_util.h.8DE07BD4E4FF3873.idx differ
+Binary files a/.cache/clangd/index/virglrenderer_hw.h.1BD264020332BA87.idx and b/.cache/clangd/index/virglrenderer_hw.h.1BD264020332BA87.idx differ
+Binary files a/.cache/clangd/index/virglrenderer.c.D66E26A338E7C96A.idx and b/.cache/clangd/index/virglrenderer.c.D66E26A338E7C96A.idx differ
+Binary files a/.cache/clangd/index/virglrenderer.h.B5D233ABCC026A26.idx and b/.cache/clangd/index/virglrenderer.h.B5D233ABCC026A26.idx differ
+Binary files a/.cache/clangd/index/vk_platform.h.71EEBFBAADF9E881.idx and b/.cache/clangd/index/vk_platform.h.71EEBFBAADF9E881.idx differ
+Binary files a/.cache/clangd/index/vkr_allocator.c.496F287038C332C2.idx and b/.cache/clangd/index/vkr_allocator.c.496F287038C332C2.idx differ
+Binary files a/.cache/clangd/index/vkr_allocator.h.2F7B3CDE9FDDF2BE.idx and b/.cache/clangd/index/vkr_allocator.h.2F7B3CDE9FDDF2BE.idx differ
+Binary files a/.cache/clangd/index/vkr_buffer.c.C919583EAE771D2A.idx and b/.cache/clangd/index/vkr_buffer.c.C919583EAE771D2A.idx differ
+Binary files a/.cache/clangd/index/vkr_buffer.h.000D8C93F0F4519A.idx and b/.cache/clangd/index/vkr_buffer.h.000D8C93F0F4519A.idx differ
+Binary files a/.cache/clangd/index/vkr_command_buffer.c.426FDFE4AD4C246B.idx and b/.cache/clangd/index/vkr_command_buffer.c.426FDFE4AD4C246B.idx differ
+Binary files a/.cache/clangd/index/vkr_command_buffer.h.1ABE4781F5C6BFEA.idx and b/.cache/clangd/index/vkr_command_buffer.h.1ABE4781F5C6BFEA.idx differ
+Binary files a/.cache/clangd/index/vkr_common.c.5FAF85CFAC699E16.idx and b/.cache/clangd/index/vkr_common.c.5FAF85CFAC699E16.idx differ
+Binary files a/.cache/clangd/index/vkr_common.h.2245B48DAEBA8DC6.idx and b/.cache/clangd/index/vkr_common.h.2245B48DAEBA8DC6.idx differ
+Binary files a/.cache/clangd/index/vkr_context.c.19E46C075AFD6BCC.idx and b/.cache/clangd/index/vkr_context.c.19E46C075AFD6BCC.idx differ
+Binary files a/.cache/clangd/index/vkr_context.h.9D839FFDE4F796AA.idx and b/.cache/clangd/index/vkr_context.h.9D839FFDE4F796AA.idx differ
+Binary files a/.cache/clangd/index/vkr_cs.c.E39AB3B940BD81F4.idx and b/.cache/clangd/index/vkr_cs.c.E39AB3B940BD81F4.idx differ
+Binary files a/.cache/clangd/index/vkr_cs.h.F878ACB5D8768701.idx and b/.cache/clangd/index/vkr_cs.h.F878ACB5D8768701.idx differ
+Binary files a/.cache/clangd/index/vkr_descriptor_set.c.847ED4FF0458F4A2.idx and b/.cache/clangd/index/vkr_descriptor_set.c.847ED4FF0458F4A2.idx differ
+Binary files a/.cache/clangd/index/vkr_descriptor_set.h.ABE5ED5B8CB7C5CD.idx and b/.cache/clangd/index/vkr_descriptor_set.h.ABE5ED5B8CB7C5CD.idx differ
+Binary files a/.cache/clangd/index/vkr_device_memory.c.E534A52D66A93E13.idx and b/.cache/clangd/index/vkr_device_memory.c.E534A52D66A93E13.idx differ
+Binary files a/.cache/clangd/index/vkr_device_memory.h.E93A5081C2BFABE1.idx and b/.cache/clangd/index/vkr_device_memory.h.E93A5081C2BFABE1.idx differ
+Binary files a/.cache/clangd/index/vkr_device.c.FF03FF0C5289F258.idx and b/.cache/clangd/index/vkr_device.c.FF03FF0C5289F258.idx differ
+Binary files a/.cache/clangd/index/vkr_device.h.6B2EC5163D328B93.idx and b/.cache/clangd/index/vkr_device.h.6B2EC5163D328B93.idx differ
+Binary files a/.cache/clangd/index/vkr_image.c.7E2F42D7E1B19CEC.idx and b/.cache/clangd/index/vkr_image.c.7E2F42D7E1B19CEC.idx differ
+Binary files a/.cache/clangd/index/vkr_image.h.8C6A732D7C23E14C.idx and b/.cache/clangd/index/vkr_image.h.8C6A732D7C23E14C.idx differ
+Binary files a/.cache/clangd/index/vkr_instance.c.6480EA71F5BCE477.idx and b/.cache/clangd/index/vkr_instance.c.6480EA71F5BCE477.idx differ
+Binary files a/.cache/clangd/index/vkr_instance.h.2E88F4D38F840BEE.idx and b/.cache/clangd/index/vkr_instance.h.2E88F4D38F840BEE.idx differ
+Binary files a/.cache/clangd/index/vkr_physical_device.c.9BF195335350A5A5.idx and b/.cache/clangd/index/vkr_physical_device.c.9BF195335350A5A5.idx differ
+Binary files a/.cache/clangd/index/vkr_physical_device.h.63146EBD661CC0F5.idx and b/.cache/clangd/index/vkr_physical_device.h.63146EBD661CC0F5.idx differ
+Binary files a/.cache/clangd/index/vkr_pipeline.c.7D219885F1EE8853.idx and b/.cache/clangd/index/vkr_pipeline.c.7D219885F1EE8853.idx differ
+Binary files a/.cache/clangd/index/vkr_pipeline.h.AB6B2EA82260291D.idx and b/.cache/clangd/index/vkr_pipeline.h.AB6B2EA82260291D.idx differ
+Binary files a/.cache/clangd/index/vkr_query_pool.c.1E1EC80D3862E836.idx and b/.cache/clangd/index/vkr_query_pool.c.1E1EC80D3862E836.idx differ
+Binary files a/.cache/clangd/index/vkr_query_pool.h.FF5AC8924ECECE6F.idx and b/.cache/clangd/index/vkr_query_pool.h.FF5AC8924ECECE6F.idx differ
+Binary files a/.cache/clangd/index/vkr_queue.c.07CA1F018AED98A1.idx and b/.cache/clangd/index/vkr_queue.c.07CA1F018AED98A1.idx differ
+Binary files a/.cache/clangd/index/vkr_queue.h.A36C1180A1D973AA.idx and b/.cache/clangd/index/vkr_queue.h.A36C1180A1D973AA.idx differ
+Binary files a/.cache/clangd/index/vkr_render_pass.c.373CABD925C30BB3.idx and b/.cache/clangd/index/vkr_render_pass.c.373CABD925C30BB3.idx differ
+Binary files a/.cache/clangd/index/vkr_render_pass.h.3BFD51339F9D42A6.idx and b/.cache/clangd/index/vkr_render_pass.h.3BFD51339F9D42A6.idx differ
+Binary files a/.cache/clangd/index/vkr_renderer.c.D836B07B10D9D055.idx and b/.cache/clangd/index/vkr_renderer.c.D836B07B10D9D055.idx differ
+Binary files a/.cache/clangd/index/vkr_renderer.h.DA36D1E2FBBAA0FF.idx and b/.cache/clangd/index/vkr_renderer.h.DA36D1E2FBBAA0FF.idx differ
+Binary files a/.cache/clangd/index/vkr_ring.c.7E1576E857566908.idx and b/.cache/clangd/index/vkr_ring.c.7E1576E857566908.idx differ
+Binary files a/.cache/clangd/index/vkr_ring.h.98EEB1A72D7305CD.idx and b/.cache/clangd/index/vkr_ring.h.98EEB1A72D7305CD.idx differ
+Binary files a/.cache/clangd/index/vkr_transport.c.42DFAD061440672A.idx and b/.cache/clangd/index/vkr_transport.c.42DFAD061440672A.idx differ
+Binary files a/.cache/clangd/index/vkr_transport.h.0D331218F9F5F750.idx and b/.cache/clangd/index/vkr_transport.h.0D331218F9F5F750.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_buffer_view.h.9891D079F59DE792.idx and b/.cache/clangd/index/vn_protocol_renderer_buffer_view.h.9891D079F59DE792.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_buffer.h.76E8BAF00355F0E3.idx and b/.cache/clangd/index/vn_protocol_renderer_buffer.h.76E8BAF00355F0E3.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_command_buffer.h.5F1C580CC116763D.idx and b/.cache/clangd/index/vn_protocol_renderer_command_buffer.h.5F1C580CC116763D.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_command_pool.h.EDC9616D5DF1FF83.idx and b/.cache/clangd/index/vn_protocol_renderer_command_pool.h.EDC9616D5DF1FF83.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_cs.h.CC1AEF97F1684873.idx and b/.cache/clangd/index/vn_protocol_renderer_cs.h.CC1AEF97F1684873.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_defines.h.F6E05DABAD912DE2.idx and b/.cache/clangd/index/vn_protocol_renderer_defines.h.F6E05DABAD912DE2.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_descriptor_pool.h.3B871932FBD13958.idx and b/.cache/clangd/index/vn_protocol_renderer_descriptor_pool.h.3B871932FBD13958.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_descriptor_set_layout.h.2DF51545B08053B1.idx and b/.cache/clangd/index/vn_protocol_renderer_descriptor_set_layout.h.2DF51545B08053B1.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_descriptor_set.h.62FE1310D0391D01.idx and b/.cache/clangd/index/vn_protocol_renderer_descriptor_set.h.62FE1310D0391D01.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_descriptor_update_template.h.ABFE634DF1A5D9B1.idx and b/.cache/clangd/index/vn_protocol_renderer_descriptor_update_template.h.ABFE634DF1A5D9B1.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_device_memory.h.2279842A359EF536.idx and b/.cache/clangd/index/vn_protocol_renderer_device_memory.h.2279842A359EF536.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_device.h.CF2F14F03A8FE312.idx and b/.cache/clangd/index/vn_protocol_renderer_device.h.CF2F14F03A8FE312.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_dispatches.h.CC3FD3B8DB81604D.idx and b/.cache/clangd/index/vn_protocol_renderer_dispatches.h.CC3FD3B8DB81604D.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_event.h.D55D5AC73DA4DAA0.idx and b/.cache/clangd/index/vn_protocol_renderer_event.h.D55D5AC73DA4DAA0.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_fence.h.37D7259790500FED.idx and b/.cache/clangd/index/vn_protocol_renderer_fence.h.37D7259790500FED.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_framebuffer.h.1275BA46E87DF020.idx and b/.cache/clangd/index/vn_protocol_renderer_framebuffer.h.1275BA46E87DF020.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_handles.h.54CFA91448EF6A3E.idx and b/.cache/clangd/index/vn_protocol_renderer_handles.h.54CFA91448EF6A3E.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_image_view.h.FBE14E19315E5AED.idx and b/.cache/clangd/index/vn_protocol_renderer_image_view.h.FBE14E19315E5AED.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_image.h.4E546BC244586A2D.idx and b/.cache/clangd/index/vn_protocol_renderer_image.h.4E546BC244586A2D.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_info.h.CC3594FBE8EE624D.idx and b/.cache/clangd/index/vn_protocol_renderer_info.h.CC3594FBE8EE624D.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_instance.h.CB61FA980A89FDB0.idx and b/.cache/clangd/index/vn_protocol_renderer_instance.h.CB61FA980A89FDB0.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_pipeline_cache.h.F6971C915E12120E.idx and b/.cache/clangd/index/vn_protocol_renderer_pipeline_cache.h.F6971C915E12120E.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_pipeline_layout.h.D5BBEB2AD4399D60.idx and b/.cache/clangd/index/vn_protocol_renderer_pipeline_layout.h.D5BBEB2AD4399D60.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_pipeline.h.C2B36E2911B017ED.idx and b/.cache/clangd/index/vn_protocol_renderer_pipeline.h.C2B36E2911B017ED.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_private_data_slot.h.9A4C436C563AA2D3.idx and b/.cache/clangd/index/vn_protocol_renderer_private_data_slot.h.9A4C436C563AA2D3.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_query_pool.h.72EDC9D2C602F43E.idx and b/.cache/clangd/index/vn_protocol_renderer_query_pool.h.72EDC9D2C602F43E.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_queue.h.E01F254F6E6056CC.idx and b/.cache/clangd/index/vn_protocol_renderer_queue.h.E01F254F6E6056CC.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_render_pass.h.06A56AD44A6527CD.idx and b/.cache/clangd/index/vn_protocol_renderer_render_pass.h.06A56AD44A6527CD.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_sampler_ycbcr_conversion.h.CAAE60EE76E98736.idx and b/.cache/clangd/index/vn_protocol_renderer_sampler_ycbcr_conversion.h.CAAE60EE76E98736.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_sampler.h.5232FBA69E77FC6F.idx and b/.cache/clangd/index/vn_protocol_renderer_sampler.h.5232FBA69E77FC6F.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_semaphore.h.B653725110A4FC9D.idx and b/.cache/clangd/index/vn_protocol_renderer_semaphore.h.B653725110A4FC9D.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_shader_module.h.037A15CE52DD17B5.idx and b/.cache/clangd/index/vn_protocol_renderer_shader_module.h.037A15CE52DD17B5.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_structs.h.3BA2406BB157C02D.idx and b/.cache/clangd/index/vn_protocol_renderer_structs.h.3BA2406BB157C02D.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_transport.h.081766C75D3012EF.idx and b/.cache/clangd/index/vn_protocol_renderer_transport.h.081766C75D3012EF.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_types.h.D2C7C6D5A1C85568.idx and b/.cache/clangd/index/vn_protocol_renderer_types.h.D2C7C6D5A1C85568.idx differ
+Binary files a/.cache/clangd/index/vn_protocol_renderer_util.h.E6F0253214813B2C.idx and b/.cache/clangd/index/vn_protocol_renderer_util.h.E6F0253214813B2C.idx differ
+Binary files a/.cache/clangd/index/vrend_blitter.c.9B1355FBF60EF71B.idx and b/.cache/clangd/index/vrend_blitter.c.9B1355FBF60EF71B.idx differ
+Binary files a/.cache/clangd/index/vrend_blitter.h.0BABD1EA028144EC.idx and b/.cache/clangd/index/vrend_blitter.h.0BABD1EA028144EC.idx differ
+Binary files a/.cache/clangd/index/vrend_debug.c.23371E2A548AE02E.idx and b/.cache/clangd/index/vrend_debug.c.23371E2A548AE02E.idx differ
+Binary files a/.cache/clangd/index/vrend_debug.h.59696ABBEBAC9900.idx and b/.cache/clangd/index/vrend_debug.h.59696ABBEBAC9900.idx differ
+Binary files a/.cache/clangd/index/vrend_decode.c.070CE8C49BF4DF54.idx and b/.cache/clangd/index/vrend_decode.c.070CE8C49BF4DF54.idx differ
+Binary files a/.cache/clangd/index/vrend_formats.c.01596907CCBA3322.idx and b/.cache/clangd/index/vrend_formats.c.01596907CCBA3322.idx differ
+Binary files a/.cache/clangd/index/vrend_iov.h.1555D1B0256F2F02.idx and b/.cache/clangd/index/vrend_iov.h.1555D1B0256F2F02.idx differ
+Binary files a/.cache/clangd/index/vrend_object.c.12345B1E3C2B8E6E.idx and b/.cache/clangd/index/vrend_object.c.12345B1E3C2B8E6E.idx differ
+Binary files a/.cache/clangd/index/vrend_object.h.1F662D56BAFBEBF0.idx and b/.cache/clangd/index/vrend_object.h.1F662D56BAFBEBF0.idx differ
+Binary files a/.cache/clangd/index/vrend_renderer.c.650B3DD6A5561CC2.idx and b/.cache/clangd/index/vrend_renderer.c.650B3DD6A5561CC2.idx differ
+Binary files a/.cache/clangd/index/vrend_renderer.h.E751C5EFE3762D2B.idx and b/.cache/clangd/index/vrend_renderer.h.E751C5EFE3762D2B.idx differ
+Binary files a/.cache/clangd/index/vrend_shader.c.787F04F38A3643A3.idx and b/.cache/clangd/index/vrend_shader.c.787F04F38A3643A3.idx differ
+Binary files a/.cache/clangd/index/vrend_shader.h.25438B5CCEA3177E.idx and b/.cache/clangd/index/vrend_shader.h.25438B5CCEA3177E.idx differ
+Binary files a/.cache/clangd/index/vrend_strbuf.h.DED14CE905ECB22A.idx and b/.cache/clangd/index/vrend_strbuf.h.DED14CE905ECB22A.idx differ
+Binary files a/.cache/clangd/index/vrend_tweaks.c.F0506809929C75EC.idx and b/.cache/clangd/index/vrend_tweaks.c.F0506809929C75EC.idx differ
+Binary files a/.cache/clangd/index/vrend_tweaks.h.6D0312C947FE3695.idx and b/.cache/clangd/index/vrend_tweaks.h.6D0312C947FE3695.idx differ
+Binary files a/.cache/clangd/index/vrend_winsys.c.15A8F37409DCB609.idx and b/.cache/clangd/index/vrend_winsys.c.15A8F37409DCB609.idx differ
+Binary files a/.cache/clangd/index/vrend_winsys.h.EA2D80A7C064EC3B.idx and b/.cache/clangd/index/vrend_winsys.h.EA2D80A7C064EC3B.idx differ
+Binary files a/.cache/clangd/index/vtest_protocol.h.77D5C3B217758B0D.idx and b/.cache/clangd/index/vtest_protocol.h.77D5C3B217758B0D.idx differ
+Binary files a/.cache/clangd/index/vtest_renderer.c.81879BD960BF7598.idx and b/.cache/clangd/index/vtest_renderer.c.81879BD960BF7598.idx differ
+Binary files a/.cache/clangd/index/vtest_server.c.7097FDCC6FC5700B.idx and b/.cache/clangd/index/vtest_server.c.7097FDCC6FC5700B.idx differ
+Binary files a/.cache/clangd/index/vtest_shm.c.9DD43A85FA8DD34A.idx and b/.cache/clangd/index/vtest_shm.c.9DD43A85FA8DD34A.idx differ
+Binary files a/.cache/clangd/index/vtest_shm.h.A5D9F6B5A9FCD2D5.idx and b/.cache/clangd/index/vtest_shm.h.A5D9F6B5A9FCD2D5.idx differ
+Binary files a/.cache/clangd/index/vtest.h.068E055978F85BBC.idx and b/.cache/clangd/index/vtest.h.068E055978F85BBC.idx differ
+Binary files a/.cache/clangd/index/vulkan_core.h.2697CD94A89619F1.idx and b/.cache/clangd/index/vulkan_core.h.2697CD94A89619F1.idx differ
+Binary files a/.cache/clangd/index/vulkan.h.91BC23EF19A18127.idx and b/.cache/clangd/index/vulkan.h.91BC23EF19A18127.idx differ
+Binary files a/.cache/clangd/index/xxhash.h.855524FCC5C784D7.idx and b/.cache/clangd/index/xxhash.h.855524FCC5C784D7.idx differ
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h b/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h
 --- a/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h
 +++ b/src/venus/venus-protocol/vn_protocol_renderer_dispatches.h
 @@ -555,6 +555,7 @@
@@ -8,6 +212,7 @@
      {
  #ifdef DEBUG
          TRACE_SCOPE_SLOW(vn_dispatch_command_name(cmd_type));
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_common.h b/src/venus/vkr_common.h
 --- a/src/venus/vkr_common.h
 +++ b/src/venus/vkr_common.h
 @@ -54,6 +54,50 @@
@@ -61,6 +266,7 @@
  /* vkr_region_is_valid should be used to check for overflows */
  #define VKR_REGION_INIT(offset, size)                                                    \
     {                                                                                     \
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_context.c b/src/venus/vkr_context.c
 --- a/src/venus/vkr_context.c
 +++ b/src/venus/vkr_context.c
 @@ -324,7 +324,14 @@
@@ -135,6 +341,7 @@
     vkr_context_wait_ring_fini(ctx);
  err_ctx_wait_ring_init:
     free(ctx->debug_name);
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_context.h b/src/venus/vkr_context.h
 --- a/src/venus/vkr_context.h
 +++ b/src/venus/vkr_context.h
 @@ -20,6 +20,15 @@
@@ -162,6 +369,7 @@
     struct hash_table *object_table;
  
     mtx_t resource_mutex;
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -3,7 +3,10 @@
@@ -175,7 +383,7 @@
  
  #include "venus-protocol/vn_protocol_renderer_transport.h"
  
-@@ -149,17 +152,102 @@
+@@ -149,17 +152,103 @@
     struct vkr_physical_device *physical_dev = dev->physical_device;
  
     VkMemoryAllocateInfo *alloc_info = (VkMemoryAllocateInfo *)args->pAllocateInfo;
@@ -265,6 +473,7 @@
 +
 +         host_mem->device = dev;
 +         list_inithead(&host_mem->bound_images);
++         host_mem->guest_ptr = res->u.data;
 +         host_mem->property_flags =
 +            physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
 +         host_mem->valid_fd_types = 0;
@@ -279,7 +488,7 @@
     if (prev_of_res_info) {
        res_info = (VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
        if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
-@@ -252,6 +340,7 @@
+@@ -252,6 +341,7 @@
     }
  
     mem->device = dev;
@@ -287,7 +496,7 @@
     mem->property_flags = property_flags;
     mem->valid_fd_types = valid_fd_types;
     mem->gbm_bo = gbm_bo;
-@@ -263,6 +352,18 @@
+@@ -263,6 +353,18 @@
  vkr_dispatch_vkFreeMemory(struct vn_dispatch_context *dispatch,
                            struct vn_command_vkFreeMemory *args)
  {
@@ -306,7 +515,7 @@
     struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
     if (!mem)
        return;
-@@ -275,6 +376,8 @@
+@@ -275,6 +377,8 @@
  
     vkr_device_memory_release(mem);
     vkr_device_memory_destroy_and_remove(dispatch->data, args);
@@ -315,7 +524,7 @@
  }
  
  static void
-@@ -382,6 +485,10 @@
+@@ -382,6 +486,10 @@
      * to the same storage.
      */
     if (mem->exported) {
@@ -326,7 +535,7 @@
        vkr_log("mem has been exported");
        return false;
     }
-@@ -406,11 +513,7 @@
+@@ -406,11 +514,7 @@
     enum virgl_resource_fd_type fd_type;
     VkExternalMemoryHandleTypeFlagBits handle_type;
     struct virgl_resource_vulkan_info vulkan_info;
@@ -339,7 +548,7 @@
        fd_type = VIRGL_RESOURCE_FD_DMABUF;
        handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     } else if (can_export_dma_buf) {
-@@ -435,8 +538,17 @@
+@@ -435,8 +539,17 @@
     } else {
  #ifdef __APPLE__
        void *ptr;
@@ -359,9 +568,10 @@
           vkr_log("vkMapMemory failed");
           return false;
        }
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_device_memory.h b/src/venus/vkr_device_memory.h
 --- a/src/venus/vkr_device_memory.h
 +++ b/src/venus/vkr_device_memory.h
-@@ -13,6 +13,13 @@
+@@ -13,6 +13,16 @@
  struct vkr_device_memory {
     struct vkr_object base;
  
@@ -370,11 +580,15 @@
 +    * see vkr_dispatch_vkBindImageMemory2 */
 +   struct vkr_image *bound_image;
 +   struct list_head bound_images;
++   /* The guest storage this memory wraps, so a scanout read can tell the
++    * desktop's own buffers apart from an app's same-size buffers. */
++   const void *guest_ptr;
 +#endif
 +
     struct vkr_device *device;
     uint32_t property_flags;
     uint32_t valid_fd_types;
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_device.c b/src/venus/vkr_device.c
 --- a/src/venus/vkr_device.c
 +++ b/src/venus/vkr_device.c
 @@ -84,12 +84,34 @@
@@ -474,6 +688,7 @@
  }
  
  static void
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_image.c b/src/venus/vkr_image.c
 --- a/src/venus/vkr_image.c
 +++ b/src/venus/vkr_image.c
 @@ -5,9 +5,51 @@
@@ -740,6 +955,7 @@
  }
  
  static void
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_image.h b/src/venus/vkr_image.h
 --- a/src/venus/vkr_image.h
 +++ b/src/venus/vkr_image.h
 @@ -10,6 +10,22 @@
@@ -765,6 +981,7 @@
  };
  VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
  
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_instance.c b/src/venus/vkr_instance.c
 --- a/src/venus/vkr_instance.c
 +++ b/src/venus/vkr_instance.c
 @@ -259,7 +259,9 @@
@@ -777,6 +994,7 @@
  }
  
  void
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
 --- a/src/venus/vkr_physical_device.c
 +++ b/src/venus/vkr_physical_device.c
 @@ -3,6 +3,8 @@
@@ -1109,6 +1327,7 @@
     vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
     vkGetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
                                                    args->pExternalSemaphoreInfo,
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
 --- a/src/venus/vkr_physical_device.h
 +++ b/src/venus/vkr_physical_device.h
 @@ -25,6 +25,14 @@
@@ -1136,6 +1355,7 @@
 +#endif
 +
  #endif /* VKR_PHYSICAL_DEVICE_H */
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
 --- a/src/venus/vkr_queue.c
 +++ b/src/venus/vkr_queue.c
 @@ -479,6 +479,16 @@
@@ -1214,17 +1434,20 @@
  }
  
  static void
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
 --- a/src/venus/vkr_renderer.c
 +++ b/src/venus/vkr_renderer.c
-@@ -8,7 +8,16 @@
+@@ -8,7 +8,18 @@
  #include "venus-protocol/vn_protocol_renderer_info.h"
  #include "virglrenderer_hw.h"
  
 +#include <stdio.h>
 +
 +#include <unistd.h>
++#include <stdlib.h>
 +
  #include "vkr_context.h"
++#include "vkr_queue.h"
 +#include "vkr_ring.h"
 +#include "vkr_device.h"
 +#include "vkr_device_memory.h"
@@ -1233,11 +1456,113 @@
  
  struct vkr_renderer_state {
     const struct vkr_renderer_callbacks *cbs;
-@@ -233,6 +242,200 @@
+@@ -233,6 +244,320 @@
     return vkr_context_import_resource(ctx, res_id, fd_type, fd, size);
  }
  
 +#ifdef __APPLE__
++/* Wait for the guest's rendering to arrive and finish before a scanout read.
++ *
++ * The KMS flush that triggers a scanout read is not gated on the compositor's
++ * render fence here (the virtio-gpu device has no fence passing), so the guest
++ * can request the flush a moment before it has even submitted the frame's
++ * commands to the Venus ring. vkDeviceWaitIdle then finds nothing pending and
++ * the read returns the previous frame. Give an imminent submission a short
++ * window to land, waking the rings so their threads consume it, and wait until
++ * no queue has an unretired fence. A floor covers the not-yet-submitted case;
++ * a cap bounds the cost when nothing is coming.
++ */
++/* Wait for the guest's imminent render to arrive and finish before a scanout
++ * read. The KMS flush that triggers the read is not gated on the compositor's
++ * render fence (the virtio-gpu device has no fence passing), so the guest can
++ * request the flush a moment before it submits the frame's Venus commands, and
++ * vkDeviceWaitIdle then finds nothing to wait for. Watch the rings for a
++ * submission arriving after the flush (their tail advancing), let the ring
++ * threads run it, and wait until it has retired. A short probe window bounds
++ * the wait when nothing is coming; a cap bounds it when something is stuck.
++ */
++static void
++vkr_scanout_wait_ready(void)
++{
++   static uint64_t probe_ns = 5000000;  /* give a late submission this long to appear */
++   static uint64_t cap_ns = 15000000;   /* hard ceiling per read */
++   static int init = 0;
++   if (!init) {
++      init = 1;
++      const char *pr = getenv("SMOLVM_SCANOUT_PROBE_US");
++      const char *cp = getenv("SMOLVM_SCANOUT_CAP_US");
++      if (pr) probe_ns = (uint64_t)strtoull(pr, NULL, 10) * 1000;
++      if (cp) cap_ns = (uint64_t)strtoull(cp, NULL, 10) * 1000;
++   }
++
++   /* Snapshot each ring's tail and wake the ring threads. */
++   uint32_t tails[256];
++   struct vkr_ring *rings[256];
++   unsigned n = 0;
++   list_for_each_entry (struct vkr_context, ctx, &vkr_state.contexts, head) {
++      mtx_lock(&ctx->ring_mutex);
++      list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
++         if (ring->started && n < ARRAY_SIZE(rings)) {
++            rings[n] = ring;
++            tails[n] = vkr_ring_load_tail(ring);
++            n++;
++            vkr_ring_notify(ring);
++         }
++      }
++      mtx_unlock(&ctx->ring_mutex);
++   }
++
++   struct timespec start;
++   clock_gettime(CLOCK_MONOTONIC, &start);
++   bool saw_activity = false;
++   for (;;) {
++      /* A submission that arrived after the flush, work still unconsumed, or a
++       * fence still in flight all count as activity we should wait out. */
++      bool active = false;
++      for (unsigned i = 0; i < n; i++) {
++         const uint32_t tail = vkr_ring_load_tail(rings[i]);
++         if (tail != tails[i] || rings[i]->buffer.cur != tail) {
++            active = true;
++            break;
++         }
++      }
++      if (!active) {
++         list_for_each_entry (struct vkr_context, ctx, &vkr_state.contexts, head) {
++            for (uint32_t i = 0; i < 64 && !active; i++) {
++               struct vkr_queue *q = ctx->sync_queues[i];
++               if (!q)
++                  continue;
++               mtx_lock(&q->sync_thread.mutex);
++               if (!LIST_IS_EMPTY(&q->sync_thread.syncs))
++                  active = true;
++               mtx_unlock(&q->sync_thread.mutex);
++            }
++            if (active)
++               break;
++         }
++      }
++      if (active)
++         saw_activity = true;
++
++      struct timespec now;
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      const uint64_t el = (uint64_t)(now.tv_sec - start.tv_sec) * 1000000000ull +
++                          (now.tv_nsec - start.tv_nsec);
++
++      /* Done once a submission we saw has drained and retired. */
++      if (saw_activity && !active)
++         break;
++      /* Nothing showed up in the probe window: read what we have. */
++      if (!saw_activity && el >= probe_ns)
++         break;
++      if (el >= cap_ns)
++         break;
++
++      const struct timespec nap = { .tv_sec = 0, .tv_nsec = 150000 };
++      nanosleep(&nap, NULL);
++   }
++}
++
 +static bool
 +vkr_renderer_read_resource_pixels_locked(struct vkr_context *ctx,
 +                                         const struct vkr_resource *res,
@@ -1274,7 +1599,10 @@
 +   const struct vkr_image *img = NULL;
 +   if (res->mem->bound_images.next) {
 +      list_for_each_entry_rev (struct vkr_image, cand, &res->mem->bound_images, mem_head) {
-+         if (cand->drm_modifier && cand->width >= width && cand->height >= height) {
++         /* Only an image whose memory is actually bound has host-readable
++          * texture storage; reading an unbound one faults inside Metal. */
++         if (cand->bound_mem && cand->drm_modifier && cand->width >= width &&
++             cand->height >= height) {
 +            img = cand;
 +            break;
 +         }
@@ -1314,6 +1642,7 @@
 +   /* The guest's drawing may still be in flight; a scanout read has no other
 +    * ordering against it, and reading early yields an empty picture.
 +    */
++   vkr_scanout_wait_ready();
 +   vkDeviceWaitIdle(dev->base.handle.device);
 +
 +
@@ -1346,10 +1675,11 @@
 +                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 +                                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
 +
-+   struct vkr_image *candidates[16];
++   struct vkr_image *candidates[64];
 +   uint32_t candidate_count = 0;
 +   candidates[candidate_count++] = (struct vkr_image *)img;
 +
++   const void *scanout_guest_ptr = res->mem ? res->mem->guest_ptr : NULL;
 +   mtx_lock(&ctx->object_mutex);
 +   hash_table_foreach (ctx->object_table, entry) {
 +      struct vkr_object *obj = entry->data;
@@ -1360,7 +1690,20 @@
 +      struct vkr_image *other = (struct vkr_image *)obj;
 +      if (other == img || !other->drm_modifier)
 +         continue;
++      /* Skip an image whose memory is not bound: its Metal texture has no
++       * backing yet and copying from it faults. This happens during startup
++       * and teardown, when a re-read can land between image creation and its
++       * memory binding. */
++      if (!other->bound_mem)
++         continue;
 +      if (other->width != width || other->height != height)
++         continue;
++      /* Only consider images that wrap the same guest storage as the scanout
++       * resource. A GPU app such as a browser allocates many same-size buffers
++       * of its own; without this they crowd out the desktop's real frame and
++       * the read comes back black. */
++      if (scanout_guest_ptr && other->bound_mem->guest_ptr &&
++          other->bound_mem->guest_ptr != scanout_guest_ptr)
 +         continue;
 +      candidates[candidate_count++] = other;
 +   }
@@ -1434,6 +1777,7 @@
  void
  vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id)
  {
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
 --- a/src/venus/vkr_renderer.h
 +++ b/src/venus/vkr_renderer.h
 @@ -72,6 +72,16 @@
@@ -1453,6 +1797,32 @@
  void
  vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id);
  
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -65,7 +65,7 @@
+    atomic_store_explicit(ring->control.head, ring_head, memory_order_release);
+ }
+ 
+-static uint32_t
++uint32_t
+ vkr_ring_load_tail(const struct vkr_ring *ring)
+ {
+    /* the driver is expected to store the tail with memory_order_release,
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus/vkr_ring.h b/src/venus/vkr_ring.h
+--- a/src/venus/vkr_ring.h
++++ b/src/venus/vkr_ring.h
+@@ -119,6 +119,9 @@
+ void
+ vkr_ring_notify(struct vkr_ring *ring);
+ 
++uint32_t
++vkr_ring_load_tail(const struct vkr_ring *ring);
++
+ bool
+ vkr_ring_write_extra(struct vkr_ring *ring, size_t offset, uint32_t val);
+ 
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/venus_context.c b/src/venus_context.c
 --- a/src/venus_context.c
 +++ b/src/venus_context.c
 @@ -1,3 +1,5 @@
@@ -1526,6 +1896,23 @@
        return -1;
     }
  
+@@ -233,7 +264,14 @@
+ static void
+ venus_context_retire_fences(struct virgl_context *base)
+ {
+-   fprintf(stderr, "%s: UNIMPLEMENTED\n", __func__);
++   /* No-op: Venus fences are retired asynchronously through the vkr renderer
++    * callback (venus_state_cb_retire_fence -> venus_context_retire_fences_internal),
++    * which runs whenever a fence signals. The virglrenderer core also invokes
++    * this base callback from its per-poll retire path; doing the work again here
++    * is unnecessary. It must stay silent: the core polls it every frame, so an
++    * fprintf here floods stderr (observed filling the agent log to hundreds of
++    * MB and stalling the GPU worker on the synchronous write). */
++   (void)base;
+ #if 0
+    struct proxy_context *ctx = (struct proxy_context *)base;
+ 
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/virglrenderer.c b/src/virglrenderer.c
 --- a/src/virglrenderer.c
 +++ b/src/virglrenderer.c
 @@ -47,6 +47,7 @@
@@ -1570,6 +1957,7 @@
  void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
  {
     TRACE_FUNC();
+diff --color -ruN -x build -x '*.o' -x '*.dylib' -x '*.a' -x .git -x '*.symbols' -x '*.p' a/src/virglrenderer.h b/src/virglrenderer.h
 --- a/src/virglrenderer.h
 +++ b/src/virglrenderer.h
 @@ -311,6 +311,16 @@
