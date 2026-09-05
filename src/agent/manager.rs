@@ -907,6 +907,59 @@ impl AgentManager {
         // different name).
         let storage_dir = ensure_vm_dir(&name)?;
 
+        Self::open_for_vm_at(name, rootfs_path, storage_dir, storage_gb, overlay_gb)
+    }
+
+    /// Prepare a named VM's final disks before opening them through the manager.
+    ///
+    /// VM-mode artifacts use this to avoid initializing generic blank disk
+    /// templates that the artifact restore would immediately replace. The
+    /// rootfs lookup and name binding still happen before `prepare`, preserving
+    /// the validation and collision checks performed by ordinary VM creation.
+    pub fn for_vm_with_prepared_disks<F>(
+        name: impl Into<String>,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+        prepare: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        let name = name.into();
+        let rootfs_path = Self::default_rootfs_path()?;
+        let storage_dir = ensure_vm_dir(&name)?;
+        Self::for_vm_with_prepared_disks_at(
+            name,
+            rootfs_path,
+            storage_dir,
+            storage_gb,
+            overlay_gb,
+            prepare,
+        )
+    }
+
+    fn for_vm_with_prepared_disks_at<F>(
+        name: String,
+        rootfs_path: PathBuf,
+        storage_dir: PathBuf,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+        prepare: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        prepare(&storage_dir)?;
+        Self::open_for_vm_at(name, rootfs_path, storage_dir, storage_gb, overlay_gb)
+    }
+
+    fn open_for_vm_at(
+        name: String,
+        rootfs_path: PathBuf,
+        storage_dir: PathBuf,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Result<Self> {
         // A fork clone has a `.qcow2` copy-on-write overlay in place of the
         // `.raw` disk; detect it by file presence (the on-disk file is the
         // source of truth) and open it as-is rather than creating/formatting.
@@ -3215,6 +3268,113 @@ mod tests {
         assert_eq!(overlay.size_gib(), 1);
         assert_eq!(std::fs::metadata(storage_path).unwrap().len(), 1 << 30);
         assert_eq!(std::fs::metadata(overlay_path).unwrap().len(), 1 << 30);
+    }
+
+    #[test]
+    fn manager_open_uses_preseeded_qcow_disks_without_creating_raw_disks() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_qcow = temp.path().join("storage.qcow2");
+        let overlay_qcow = temp.path().join("overlay.qcow2");
+        std::fs::write(&storage_qcow, b"QFI\xfb-storage").unwrap();
+        std::fs::write(&overlay_qcow, b"QFI\xfb-overlay").unwrap();
+
+        let (storage_path, storage_format) =
+            resolve_disk_image(temp.path(), crate::storage::STORAGE_DISK_FILENAME);
+        let (overlay_path, overlay_format) =
+            resolve_disk_image(temp.path(), crate::storage::OVERLAY_DISK_FILENAME);
+        let storage =
+            open_storage_disk_for_manager(&storage_path, storage_format, Some(20)).unwrap();
+        let overlay =
+            open_overlay_disk_for_manager(&overlay_path, overlay_format, Some(10)).unwrap();
+
+        assert_eq!(storage.path(), storage_qcow);
+        assert_eq!(storage.format(), DiskFormat::Qcow2);
+        assert_eq!(overlay.path(), overlay_qcow);
+        assert_eq!(overlay.format(), DiskFormat::Qcow2);
+        assert!(!temp.path().join("storage.raw").exists());
+        assert!(!temp.path().join("overlay.raw").exists());
+    }
+
+    #[test]
+    fn vm_artifact_raw_fallback_is_seeded_before_generic_disk_initialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let disk_dir = temp.path().join("vm");
+        let pack_dir = temp.path().join("pack");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        std::fs::create_dir_all(&pack_dir).unwrap();
+
+        let overlay_template = pack_dir.join("overlay-template.raw");
+        let storage_template = pack_dir.join("storage-template.raw");
+        std::fs::write(&overlay_template, b"artifact-overlay").unwrap();
+        std::fs::write(&storage_template, b"artifact-storage").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&overlay_template)
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&storage_template)
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+
+        let manager = AgentManager::for_vm_with_prepared_disks_at(
+            "artifact-vm".to_string(),
+            rootfs,
+            disk_dir.clone(),
+            None,
+            None,
+            |prepared_dir| {
+                // This is the regression assertion: the old create order opened
+                // AgentManager first, so both generic disks already existed here.
+                assert!(!prepared_dir.join("storage.raw").exists());
+                assert!(!prepared_dir.join("overlay.raw").exists());
+                assert!(!prepared_dir.join("storage.qcow2").exists());
+                assert!(!prepared_dir.join("overlay.qcow2").exists());
+
+                crate::storage::seed_vm_mode_disks(
+                    prepared_dir,
+                    &pack_dir,
+                    crate::storage::VmModeDiskSeedSpec {
+                        // Exercise the portable sparse-copy/raw fallback rather
+                        // than Linux's content-addressed qcow2 base path.
+                        artifact_sha256: None,
+                        overlay_template: Some("overlay-template.raw"),
+                        storage_template: Some("storage-template.raw"),
+                        overlay_logical_size: Some(4096),
+                        storage_logical_size: Some(4096),
+                        overlay_gb: None,
+                        storage_gb: None,
+                    },
+                )
+                .map_err(|error| Error::agent("seed test VM-mode disks", error.to_string()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(manager.storage_path(), disk_dir.join("storage.raw"));
+        assert_eq!(manager.overlay_path(), disk_dir.join("overlay.raw"));
+        let read_prefix = |path: &Path| {
+            use std::io::Read as _;
+            let mut prefix = [0_u8; 16];
+            std::fs::File::open(path)
+                .unwrap()
+                .read_exact(&mut prefix)
+                .unwrap();
+            prefix
+        };
+        assert_eq!(
+            read_prefix(&disk_dir.join("storage.raw")),
+            *b"artifact-storage"
+        );
+        assert_eq!(
+            read_prefix(&disk_dir.join("overlay.raw")),
+            *b"artifact-overlay"
+        );
     }
 
     #[test]

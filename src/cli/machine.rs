@@ -3462,8 +3462,8 @@ impl CreateCmd {
         smolvm::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
 
         // Read the footer now; the bundle is extracted into the machine's own
-        // data dir after `create_vm` succeeds (below), so a duplicate-name create
-        // cannot clobber an existing machine's layers.
+        // data dir while the name reservation is held below, so a duplicate-name
+        // create cannot clobber an existing machine's layers.
         let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?;
 
@@ -3736,11 +3736,24 @@ impl CreateCmd {
         // extract before publishing the VM row. Other processes either see the
         // reservation conflict or the finished VM, never a half-created record.
         let create_result = (|| -> smolvm::Result<()> {
-            let manager = AgentManager::for_vm_with_sizes(
-                &name_for_layers,
-                params.storage_gb,
-                params.overlay_gb,
-            )?;
+            // A VM-mode artifact carries its final block devices. Do not open the
+            // manager until those disks are in place: an empty machine directory
+            // makes manager construction initialize the generic 10/20 GiB disk
+            // templates, only for `seed_vm_mode_disks` to discard them below.
+            // Image-mode artifacts and checkpoints retain their existing order.
+            let manager = if vm_seed.is_some() {
+                // Preserve the manager's cheap rootfs preflight before any
+                // artifact extraction mutates this machine's data directory.
+                AgentManager::default_rootfs_path()?;
+                smolvm::agent::ensure_vm_dir(&name_for_layers)?;
+                None
+            } else {
+                Some(AgentManager::for_vm_with_sizes(
+                    &name_for_layers,
+                    params.storage_gb,
+                    params.overlay_gb,
+                )?)
+            };
 
             let cache_dir = smolvm::agent::machine_layers_cache_dir(&name_for_layers);
             smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
@@ -3787,35 +3800,34 @@ impl CreateCmd {
             smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
             let (pack_content_dir, artifact_sha256) = result?;
 
-            // VM-mode pack: seed this machine's overlay+storage disks from the
-            // packed templates so a start boots the source VM's rootfs rather than
-            // the bare agent-rootfs. Shared with the serve API create path: it
-            // resizes the truncated templates into valid raw disks and removes the
-            // manager's default `.qcow2` overlays so the start resolves these.
-            // (Writing the resized copy onto `manager.overlay_path()` — the default
-            // `.qcow2` — handed the guest raw bytes named `.qcow2`, the /bin/sh-missing
-            // bug's disk counterpart.)
-            if let Some(seed) = &vm_seed {
-                let disk_dir = manager
-                    .storage_path()
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(|| smolvm::agent::vm_data_dir(&name_for_layers));
-                smolvm::storage::seed_vm_mode_disks(
-                    &disk_dir,
-                    &pack_content_dir,
-                    smolvm::storage::VmModeDiskSeedSpec {
-                        artifact_sha256: artifact_sha256.as_deref(),
-                        overlay_template: seed.overlay_template.as_deref(),
-                        storage_template: seed.storage_template.as_deref(),
-                        overlay_logical_size: seed.overlay_logical_size,
-                        storage_logical_size: seed.storage_logical_size,
-                        overlay_gb: params.overlay_gb,
-                        storage_gb: params.storage_gb,
+            // VM-mode disks now exist, so construction resolves their qcow2/raw
+            // format without touching the generic blank-disk templates. Keep the
+            // manager alive through publication, matching the original lifetime.
+            let _manager = match (manager, vm_seed.as_ref()) {
+                (Some(manager), _) => manager,
+                (None, Some(seed)) => AgentManager::for_vm_with_prepared_disks(
+                    &name_for_layers,
+                    params.storage_gb,
+                    params.overlay_gb,
+                    |disk_dir| {
+                        smolvm::storage::seed_vm_mode_disks(
+                            disk_dir,
+                            &pack_content_dir,
+                            smolvm::storage::VmModeDiskSeedSpec {
+                                artifact_sha256: artifact_sha256.as_deref(),
+                                overlay_template: seed.overlay_template.as_deref(),
+                                storage_template: seed.storage_template.as_deref(),
+                                overlay_logical_size: seed.overlay_logical_size,
+                                storage_logical_size: seed.storage_logical_size,
+                                overlay_gb: params.overlay_gb,
+                                storage_gb: params.storage_gb,
+                            },
+                        )
+                        .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))
                     },
-                )
-                .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
-            }
+                )?,
+                (None, None) => unreachable!("only VM-mode artifacts defer the manager"),
+            };
 
             if let Some(ref checkpoint) = checkpoint {
                 let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);

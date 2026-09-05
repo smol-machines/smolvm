@@ -502,6 +502,19 @@ struct VmModeSeed {
     overlay_gb: Option<u64>,
 }
 
+async fn create_agent_manager(
+    name: String,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+) -> Result<AgentManager, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
+            .map_err(|e| ApiError::internal(format!("failed to create agent manager: {e}")))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+}
+
 /// Create a new machine.
 #[utoipa::path(
     post,
@@ -707,8 +720,8 @@ pub async fn create_machine(
         // different-arch guest kernel. Guest arch must match; host OS need not.
         crate::platform::ensure_artifact_arch_matches_host(&manifest.platform)
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        // Extraction happens after the agent manager creates this machine's data
-        // dir (below), so the layers land in the machine's own dir, not here.
+        // Extraction happens after the name is reserved and this machine's data
+        // dir is prepared below, so the layers land in the machine's own dir.
         let canonical = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf())
@@ -898,21 +911,31 @@ pub async fn create_machine(
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
 
-    // Create manager (does not boot the VM)
-    let manager = tokio::task::spawn_blocking({
-        let name = name.clone();
-        let storage_gb = restored_storage_gb;
-        let overlay_gb = restored_overlay_gb;
-        move || {
-            AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
-                .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))
-        }
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+    // VM-mode artifacts carry their final block devices. Their manager must be
+    // opened after those disks are seeded or it initializes generic blank disks
+    // that are immediately discarded. Preserve the existing order for image-mode
+    // artifacts, ordinary creates, and live checkpoints.
+    let mut manager = if vm_seed.is_some() {
+        let name_for_dir = name.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+            // Preserve the manager's cheap rootfs preflight before extraction
+            // creates or populates any machine-owned paths.
+            AgentManager::default_rootfs_path()
+                .map_err(|e| ApiError::internal(format!("failed to resolve agent rootfs: {e}")))?;
+            crate::agent::ensure_vm_dir(&name_for_dir).map_err(|e| {
+                ApiError::internal(format!("failed to create machine data dir: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+        None
+    } else {
+        Some(create_agent_manager(name.clone(), restored_storage_gb, restored_overlay_gb).await?)
+    };
 
-    // Extract the bundle's OCI layers into this machine's own data dir (created
-    // by the manager above) rather than the shared pack cache, so every start is
+    // Extract the bundle's OCI layers into this machine's own data dir rather
+    // than the shared pack cache, so every start is
     // independent of the .smolmachine file surviving and the macOS layers volume
     // is owned 1:1 by the machine. Extraction mounts the case-sensitive volume on
     // macOS; detach it immediately so a created-but-unstarted machine leaves
@@ -974,8 +997,8 @@ pub async fn create_machine(
             // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
             smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
             if let Err(e) = result {
-                // Extraction failed after the manager created the machine's data
-                // dir. guard.complete() will not run, so no DB record persists and
+                // Extraction failed after the machine data dir was created.
+                // guard.complete() will not run, so no DB record persists and
                 // the name is released on drop — but the on-disk dir would be left
                 // orphaned. Roll it back so a retry starts clean. Best-effort: a
                 // remove failure only leaves the orphan, never a worse state.
@@ -993,18 +1016,15 @@ pub async fn create_machine(
 
     // VM-mode pack: seed this machine's overlay + storage disks from the packed
     // templates (extracted above) so a start boots the source VM's rootfs rather
-    // than the bare agent-rootfs (the /bin/sh-missing bug). `open_or_create_at`
-    // reuses an existing disk, so seeding once at create persists across starts.
+    // than the bare agent-rootfs (the /bin/sh-missing bug). The manager is opened
+    // only after these final disks exist, and seeding once persists across starts.
     // Mirrors `pack_run`'s VM-mode disk restore (`setup_vm_overlay` +
     // `create_or_copy_storage_disk`).
     if let Some(seed) = vm_seed {
         let name2 = name.clone();
-        let disk_dir = manager
-            .storage_path()
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| vm_data_dir(&name));
-        let seed_result = tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        let storage_gb = restored_storage_gb;
+        let overlay_gb = restored_overlay_gb;
+        let seed_result = tokio::task::spawn_blocking(move || -> Result<AgentManager, ApiError> {
             let cache_dir = crate::agent::machine_layers_cache_dir(&name2);
             // With the shared store, the pack contents live in `_shared/<checksum>`
             // (the per-machine `pack` dir is an empty mountpoint), so seed the
@@ -1023,28 +1043,34 @@ pub async fn create_machine(
                 } else {
                     (cache_dir, None)
                 };
-            crate::storage::seed_vm_mode_disks(
-                &disk_dir,
-                &pack_content_dir,
-                crate::storage::VmModeDiskSeedSpec {
-                    artifact_sha256: artifact_sha256.as_deref(),
-                    overlay_template: seed.overlay_template.as_deref(),
-                    storage_template: seed.storage_template.as_deref(),
-                    overlay_logical_size: seed.overlay_logical_size,
-                    storage_logical_size: seed.storage_logical_size,
-                    overlay_gb: seed.overlay_gb,
-                    storage_gb: seed.storage_gb,
-                },
-            )
-            .map_err(|e| ApiError::internal(format!("seed VM-mode disks: {}", e)))
+            AgentManager::for_vm_with_prepared_disks(&name2, storage_gb, overlay_gb, |disk_dir| {
+                crate::storage::seed_vm_mode_disks(
+                    disk_dir,
+                    &pack_content_dir,
+                    crate::storage::VmModeDiskSeedSpec {
+                        artifact_sha256: artifact_sha256.as_deref(),
+                        overlay_template: seed.overlay_template.as_deref(),
+                        storage_template: seed.storage_template.as_deref(),
+                        overlay_logical_size: seed.overlay_logical_size,
+                        storage_logical_size: seed.storage_logical_size,
+                        overlay_gb: seed.overlay_gb,
+                        storage_gb: seed.storage_gb,
+                    },
+                )
+                .map_err(|e| crate::Error::agent("seed VM-mode disks", e.to_string()))
+            })
+            .map_err(|e| ApiError::internal(format!("prepare VM-mode disks: {e}")))
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
         // On failure roll back the data dir the manager created, so a retry starts
         // clean (the reservation guard releases the name but leaves the dir).
-        if let Err(e) = seed_result {
-            let _ = std::fs::remove_dir_all(vm_data_dir(&name));
-            return Err(e);
+        match seed_result {
+            Ok(created) => manager = Some(created),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(vm_data_dir(&name));
+                return Err(error);
+            }
         }
     }
 
@@ -1105,7 +1131,7 @@ pub async fn create_machine(
 
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
-        manager,
+        manager: manager.expect("manager is constructed before registration"),
         mounts: host_mount_specs,
         remote_volumes,
         ports: restored_ports,
