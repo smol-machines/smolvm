@@ -1806,9 +1806,31 @@ fn available_bytes(path: &Path) -> std::io::Result<u64> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
-#[cfg(not(unix))]
-fn available_bytes(_path: &Path) -> std::io::Result<u64> {
-    Ok(u64::MAX)
+/// Bytes the calling user can still write on the volume holding `path`.
+#[cfg(windows)]
+fn available_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call,
+    // `available` is a writable u64, and the two totals are optional (null).
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(available)
 }
 
 /// Refuse to start an extraction that cannot fit, naming the shortfall.
