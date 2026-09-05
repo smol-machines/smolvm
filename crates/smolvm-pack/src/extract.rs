@@ -523,6 +523,18 @@ impl SafeUnpackLimits {
     }
 }
 
+/// Errors that must abort an extraction even for entry kinds we otherwise skip.
+///
+/// The skip path exists for entries macOS cannot represent; it must not hide a
+/// filesystem that has stopped accepting writes, because that yields a silently
+/// incomplete extraction rather than a failed one.
+fn is_unskippable_unpack_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) | Some(libc::EROFS) | Some(libc::EIO)
+    )
+}
+
 fn safe_unpack_with_limits<R: Read>(
     archive: &mut tar::Archive<R>,
     dest: &Path,
@@ -783,7 +795,16 @@ fn safe_unpack_with_limits<R: Read>(
                 // limitations (xattr encoding, uid/gid mapping, resource forks).
                 // For non-Regular entries (symlinks, hardlinks, dirs), skip and
                 // continue rather than aborting the entire extraction.
-                if !is_regular {
+                //
+                // Running out of room is not a platform limitation, and it hits
+                // directories and symlinks just as readily as regular files. If
+                // it is skipped here the extraction reports success, the caller
+                // writes the completion marker, and the half-written tree is
+                // then trusted forever: the container comes up on a rootfs that
+                // is missing most of the image, and the only symptom is the
+                // runtime claiming the entrypoint does not exist. Fail loudly
+                // instead, so the caller can report the real cause.
+                if !is_regular && !is_unskippable_unpack_error(&e) {
                     continue;
                 }
                 return Err(std::io::Error::new(
@@ -2732,6 +2753,27 @@ pub fn create_or_copy_storage_disk(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn out_of_space_is_never_skipped_as_a_platform_quirk() {
+        // The skip path in safe_unpack_with_limits exists for entries macOS
+        // cannot represent. A full filesystem must not take that path: doing so
+        // reports a successful extraction of a half-written tree, which later
+        // surfaces as the container runtime claiming the entrypoint is missing.
+        for code in [libc::ENOSPC, libc::EDQUOT, libc::EROFS, libc::EIO] {
+            assert!(
+                super::is_unskippable_unpack_error(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} must abort extraction, not be skipped"
+            );
+        }
+        // Genuine platform quirks stay skippable, so the leniency still works.
+        for code in [libc::EPERM, libc::EOPNOTSUPP, libc::EINVAL] {
+            assert!(
+                !super::is_unskippable_unpack_error(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} should remain skippable for non-regular entries"
+            );
+        }
+    }
+
     use super::*;
 
     /// The version that shipped in the pack this was written for. A regression
