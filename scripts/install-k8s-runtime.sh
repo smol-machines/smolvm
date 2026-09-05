@@ -11,8 +11,9 @@
 # Usage:
 #   sudo ./scripts/install-k8s-runtime.sh [--shim PATH] [--runtime-dir DIR]
 #
-#   --shim PATH          The built containerd-shim-smolvm-v2 binary
-#                        (default: target/release/containerd-shim-smolvm-v2).
+#   --shim PATH          The built containerd-shim-smolvm-v2 binary (default:
+#                        the one beside this script in an unpacked release,
+#                        else target/release/containerd-shim-smolvm-v2).
 #   --runtime-dir DIR    A directory holding the smolvm runtime artifacts to
 #                        install into /var/lib/smolvm: lib/ (libkrun*.so),
 #                        init.krun, smolvm-vmm, agent-rootfs/. A smolvm Linux
@@ -22,7 +23,15 @@
 #
 set -euo pipefail
 
-SHIM_SRC="target/release/containerd-shim-smolvm-v2"
+# Default shim location, resolved for both layouts this script ships in: an
+# unpacked release, where it sits beside the runtime artifacts one level up
+# from this script, and a source checkout, where cargo leaves it in target/.
+_HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$_HERE/../containerd-shim-smolvm-v2" ]; then
+    SHIM_SRC="$_HERE/../containerd-shim-smolvm-v2"
+else
+    SHIM_SRC="target/release/containerd-shim-smolvm-v2"
+fi
 RUNTIME_SRC=""
 DATA_DIR="/var/lib/smolvm"
 BIN_DIR="/usr/local/bin"

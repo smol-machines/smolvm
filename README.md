@@ -252,6 +252,34 @@ Known Limitations
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
 * Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine branch` / snapshot. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
 
+Kubernetes
+----------
+
+smolvm ships a **containerd shim v2**, so Kubernetes runs a pod as its own microVM
+through a `RuntimeClass`, the same integration point Kata uses. The Linux release
+carries the shim and the manifests; there is nothing to build.
+
+On each node that should run microVM pods (requires KVM):
+
+```bash
+# 1. install the shim + runtime artifacts, then apply the containerd config it prints
+sudo ./kubernetes/install-k8s-runtime.sh
+sudo systemctl restart containerd
+
+# 2. label the node so the RuntimeClass will schedule to it
+kubectl label node <node> smolvm-runtime=true
+```
+
+Then register the class and run a pod:
+
+```bash
+kubectl apply -f kubernetes/runtimeclass.yaml
+kubectl apply -f kubernetes/example-pod.yaml
+kubectl logs smolvm-hello    # prints the guest's own kernel, so it is a real VM
+```
+
+Any pod opts in with `runtimeClassName: smolvm`.
+
 GPU Acceleration
 ----------------
 

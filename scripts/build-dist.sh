@@ -250,6 +250,13 @@ fi
 echo "Building release binaries..."
 LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 
+# The containerd shim, so a release can run pods as microVMs under Kubernetes
+# without a source checkout. Linux only: containerd is the only consumer, and
+# there is nothing to register it with on macOS or Windows.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release -p smolvm-shim --bin containerd-shim-smolvm-v2
+fi
+
 # Build the unified `smol` CLI if its source is present (it lives in a sibling
 # repo checked out at ./smol). It is a separate cargo workspace that depends on
 # the engine by path, so build it from inside ./smol with an ABSOLUTE
@@ -331,6 +338,20 @@ cp ./target/release/smolvm "$DIST_DIR/smolvm-bin"
 # Copy wrapper script
 cp ./scripts/smolvm-wrapper.sh "$DIST_DIR/smolvm"
 chmod +x "$DIST_DIR/smolvm"
+
+# Kubernetes runtime: the containerd shim plus everything needed to register
+# it. Shipping these means `runtimeClassName: smolvm` is reachable from a
+# downloaded release; previously the shim existed only in the source tree, so
+# the feature was invisible to anyone who installed the normal way.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    mkdir -p "$DIST_DIR/kubernetes"
+    cp ./target/release/containerd-shim-smolvm-v2 "$DIST_DIR/containerd-shim-smolvm-v2"
+    chmod +x "$DIST_DIR/containerd-shim-smolvm-v2"
+    cp ./scripts/install-k8s-runtime.sh "$DIST_DIR/kubernetes/"
+    chmod +x "$DIST_DIR/kubernetes/install-k8s-runtime.sh"
+    cp ./deploy/kubernetes/runtimeclass.yaml ./deploy/kubernetes/example-pod.yaml "$DIST_DIR/kubernetes/"
+    echo "Bundled Kubernetes runtime: containerd-shim-smolvm-v2 + manifests"
+fi
 
 # Copy the unified smol CLI (binary renamed to smol-bin + its own wrapper).
 # The wrapper points at the same lib/ and agent-rootfs, so one tarball serves
