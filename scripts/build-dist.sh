@@ -254,7 +254,7 @@ LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 # without a source checkout. Linux only: containerd is the only consumer, and
 # there is nothing to register it with on macOS or Windows.
 if [[ "$(uname -s)" == "Linux" ]]; then
-    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin containerd-shim-smolvm-v2
+    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release -p smolvm-shim --bin containerd-shim-smolvm-v2
 fi
 
 # Build the unified `smol` CLI if its source is present (it lives in a sibling
@@ -347,6 +347,10 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     mkdir -p "$DIST_DIR/kubernetes"
     cp ./target/release/containerd-shim-smolvm-v2 "$DIST_DIR/containerd-shim-smolvm-v2"
     chmod +x "$DIST_DIR/containerd-shim-smolvm-v2"
+    # The engine under the name the k8s installer copies into /var/lib/smolvm.
+    # Verified required: with it moved aside, every pod sandbox fails to create.
+    cp ./target/release/smolvm "$DIST_DIR/smolvm-vmm"
+    chmod +x "$DIST_DIR/smolvm-vmm"
     cp ./scripts/install-k8s-runtime.sh "$DIST_DIR/kubernetes/"
     chmod +x "$DIST_DIR/kubernetes/install-k8s-runtime.sh"
     cp ./deploy/kubernetes/runtimeclass.yaml ./deploy/kubernetes/example-pod.yaml "$DIST_DIR/kubernetes/"

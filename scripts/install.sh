@@ -424,6 +424,10 @@ install_smolvm() {
     if [[ -f "$extracted_dir/containerd-shim-smolvm-v2" ]]; then
         cp "$extracted_dir/containerd-shim-smolvm-v2" "$prefix/"
         chmod +x "$prefix/containerd-shim-smolvm-v2"
+        if [[ -f "$extracted_dir/smolvm-vmm" ]]; then
+            cp "$extracted_dir/smolvm-vmm" "$prefix/"
+            chmod +x "$prefix/smolvm-vmm"
+        fi
         if [[ -d "$extracted_dir/kubernetes" ]]; then
             rm -rf "$prefix/kubernetes"
             cp -r "$extracted_dir/kubernetes" "$prefix/"
