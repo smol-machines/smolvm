@@ -56,6 +56,15 @@ const POD_SHARE_GUEST_PATH: &str = "/podshare";
 /// stay in lockstep with those constants.
 const POD_SHARE_GUEST_MOUNT: &str = "/run/smolvm/virtiofs/podshare";
 
+/// Build the sandbox's single host mount.
+///
+/// Read-only: nothing in the guest writes the share, and the agent stacks a
+/// writable overlay over it for the container rootfs.
+fn pod_share_mount(share_dir: &Path) -> Result<HostMount, String> {
+    HostMount::new(share_dir, POD_SHARE_GUEST_PATH, true)
+        .map_err(|e| format!("pod share mount: {e}"))
+}
+
 /// Default sandbox VM sizing until pod-overhead plumbing lands.
 const SANDBOX_CPUS: u8 = 2;
 const SANDBOX_MEMORY_MIB: u32 = 1024;
@@ -653,8 +662,7 @@ impl PodBackend for EnginePodBackend {
                 .map_err(|e| format!("mkdir {}: {e}", share_dir.display()))?;
 
             let rt = smolvm::embedded::runtime().map_err(|e| e.to_string())?;
-            let mount = HostMount::new(&share_dir, POD_SHARE_GUEST_PATH, false)
-                .map_err(|e| format!("pod share mount: {e}"))?;
+            let mount = pod_share_mount(&share_dir)?;
             let spec = MachineSpec {
                 name: id_owned.clone(),
                 mounts: vec![mount],
@@ -1326,6 +1334,19 @@ impl PodBackend for ShimBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The share was created writable while every guest-side path that touches it
+    /// treats it as read-only: the agent copies CRI mounts out of it and stacks an
+    /// overlay over the rootfs precisely because writes return EACCES. A writable
+    /// share contradicts that and removes the boundary those paths rely on.
+    #[test]
+    fn the_pod_share_is_mounted_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mount = pod_share_mount(dir.path()).expect("pod share mount");
+
+        assert!(mount.read_only, "the pod share must be mounted read-only");
+        assert_eq!(mount.target, Path::new(POD_SHARE_GUEST_PATH));
+    }
 
     fn spec_with(annotations: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "annotations": annotations })
