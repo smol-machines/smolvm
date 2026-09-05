@@ -136,6 +136,7 @@ pub fn start_icmp_relay(
 
 /// Relay-thread state for one (guest, destination, ident) echo flow.
 struct IcmpFlow {
+    id: usize,
     socket: HostSocket,
     guest: IpAddr,
     destination: IpAddr,
@@ -151,13 +152,19 @@ fn run_icmp_relay(
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
     let mut flows: HashMap<(IpAddr, IpAddr, u16), IcmpFlow> = HashMap::new();
+    let mut id_to_key: HashMap<usize, (IpAddr, IpAddr, u16)> = HashMap::new();
+    let mut next_flow_id: usize = 1;
     let mut recv_buf = [MaybeUninit::<u8>::uninit(); MAX_ICMP_BYTES];
     // The host ICMP socket may be denied (Linux `ping_group_range`, no
     // privileges); log that once rather than on every dropped ping.
     let mut warned_socket_error = false;
+    let poller = wake.poller();
 
     loop {
         if shutdown() {
+            for flow in flows.values() {
+                let _ = poller.delete(&flow.socket);
+            }
             return;
         }
 
@@ -177,9 +184,22 @@ fn run_icmp_relay(
                         }
                         match create_flow_socket(echo.destination) {
                             Ok(socket) => {
+                                let id = next_flow_id;
+                                next_flow_id = next_flow_id.wrapping_add(1).max(1);
+                                if let Err(err) =
+                                    unsafe { poller.add(&socket, Event::readable(id)) }
+                                {
+                                    virtio_net_log!(
+                                        "virtio-net: failed to register host ICMP socket for {} on poller: {}",
+                                        echo.destination,
+                                        err
+                                    );
+                                    continue;
+                                }
                                 flows.insert(
                                     key,
                                     IcmpFlow {
+                                        id,
                                         socket,
                                         guest: echo.guest,
                                         destination: echo.destination,
@@ -187,6 +207,7 @@ fn run_icmp_relay(
                                         last_active: Instant::now(),
                                     },
                                 );
+                                id_to_key.insert(id, key);
                             }
                             Err(err) => {
                                 if !warned_socket_error {
@@ -208,47 +229,28 @@ fn run_icmp_relay(
                     let _ = flow.socket.send(&request);
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    for flow in flows.values() {
+                        let _ = poller.delete(&flow.socket);
+                    }
+                    return;
+                }
             }
         }
 
-        // Inbound: poll all flow sockets for replies. The wake's poller blocks
-        // on "wake OR any flow socket readable" in a single call; the wake is a
-        // notify (no key), and each flow socket is registered at key `slot + 1`.
-        let poller = wake.poller();
-        let keys: Vec<(IpAddr, IpAddr, u16)> = flows.keys().copied().collect();
-        for (slot, key) in keys.iter().enumerate() {
-            // SAFETY: the socket is owned by `flows` and is deleted from the
-            // poller below before the next iteration may drop it.
-            let _ = unsafe { poller.add(&flows[key].socket, Event::readable(slot + 1)) };
-        }
-
+        // Inbound: poll all flow sockets for replies.
         let mut events = Events::new();
         let _ = poller.wait(
             &mut events,
             Some(Duration::from_millis(RELAY_POLL_MAX_MS as u64)),
         );
 
-        // A pending notify is consumed by `wait`; nothing else to drain.
-        let mut ready: Vec<bool> = vec![false; keys.len()];
-        for event in events.iter() {
-            if event.key >= 1 && event.key - 1 < ready.len() {
-                ready[event.key - 1] = true;
-            }
-        }
-
-        // Deregister sockets before the next rebuild so a closed flow's socket
-        // is never left registered on the poller.
-        for key in &keys {
-            let _ = poller.delete(&flows[key].socket);
-        }
-
         let mut woke_reply = false;
-        for (slot, key) in keys.iter().enumerate() {
-            if !ready[slot] {
+        for event in events.iter() {
+            let Some(&key) = id_to_key.get(&event.key) else {
                 continue;
-            }
-            let Some(flow) = flows.get_mut(key) else {
+            };
+            let Some(flow) = flows.get_mut(&key) else {
                 continue;
             };
             // Drain everything ready on this socket. WouldBlock ends the drain;
@@ -277,7 +279,12 @@ fn run_icmp_relay(
                             flow.guest
                         );
                     }
-                    Err(TrySendError::Disconnected(_)) => return,
+                    Err(TrySendError::Disconnected(_)) => {
+                        for flow in flows.values() {
+                            let _ = poller.delete(&flow.socket);
+                        }
+                        return;
+                    }
                 }
             }
         }
@@ -287,7 +294,15 @@ fn run_icmp_relay(
 
         // NAT-style idle expiry.
         let now = Instant::now();
-        flows.retain(|_, flow| now.duration_since(flow.last_active) < FLOW_IDLE_TIMEOUT);
+        flows.retain(|_, flow| {
+            if now.duration_since(flow.last_active) >= FLOW_IDLE_TIMEOUT {
+                let _ = poller.delete(&flow.socket);
+                id_to_key.remove(&flow.id);
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
