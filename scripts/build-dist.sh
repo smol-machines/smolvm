@@ -347,6 +347,11 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     mkdir -p "$DIST_DIR/kubernetes"
     cp ./target/release/containerd-shim-smolvm-v2 "$DIST_DIR/containerd-shim-smolvm-v2"
     chmod +x "$DIST_DIR/containerd-shim-smolvm-v2"
+    # The engine under the name install-k8s-runtime.sh copies into
+    # /var/lib/smolvm. Verified required: with it moved aside on a live node,
+    # every pod sandbox fails to create.
+    cp ./target/release/smolvm "$DIST_DIR/smolvm-vmm"
+    chmod +x "$DIST_DIR/smolvm-vmm"
     cp ./scripts/install-k8s-runtime.sh "$DIST_DIR/kubernetes/"
     chmod +x "$DIST_DIR/kubernetes/install-k8s-runtime.sh"
     cp ./deploy/kubernetes/runtimeclass.yaml ./deploy/kubernetes/example-pod.yaml "$DIST_DIR/kubernetes/"
