@@ -232,6 +232,16 @@ pub fn start_fabric(
 }
 
 #[cfg(unix)]
+fn accept_blocking_peer(listener: &UnixListener) -> io::Result<UnixStream> {
+    let (stream, _) = listener.accept()?;
+    // The listener is nonblocking so the accept loop can poll for shutdown.
+    // Normalize accepted peers explicitly: on platforms where they inherit
+    // O_NONBLOCK, read_full would otherwise spin while retrying WouldBlock.
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
 fn run_accept_loop(
     lease: FabricLease,
     queues: Arc<NetworkFrameQueues>,
@@ -242,8 +252,8 @@ fn run_accept_loop(
         if queues.is_shutting_down() {
             return; // dropping `lease` unlinks the registry socket
         }
-        match lease.listener.accept() {
-            Ok((stream, _)) => {
+        match accept_blocking_peer(&lease.listener) {
+            Ok(stream) => {
                 let reader_queues = queues.clone();
                 let _ = std::thread::Builder::new()
                     .name("smolvm-fabric-recv".into())
@@ -447,6 +457,7 @@ pub fn start_fabric(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn leases_are_distinct_and_release_on_drop() {
@@ -531,6 +542,20 @@ mod tests {
         }
         queues_a.begin_shutdown();
         queues_b.begin_shutdown();
+    }
+
+    #[test]
+    fn accepted_fabric_peer_is_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(tmp.path().join("fabric.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _client = UnixStream::connect(tmp.path().join("fabric.sock")).unwrap();
+
+        let peer = accept_blocking_peer(&listener).unwrap();
+        let flags = unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_GETFL) };
+
+        assert!(flags >= 0, "F_GETFL failed: {}", io::Error::last_os_error());
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
     }
 
     #[test]
