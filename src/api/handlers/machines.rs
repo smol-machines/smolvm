@@ -2919,6 +2919,28 @@ pub(crate) async fn delete_one(
         }
     }
 
+    // Free the machine's data BEFORE the registry write, not after — the same
+    // order `cli::vm_common::remove_vm_data_and_record` uses for the CLI path.
+    //
+    // The registry lives on a filesystem an operator may have sized to share
+    // with VM storage, and a workload that fills it leaves the database with no
+    // room to commit. Removing the record first then needs space the workload
+    // has already taken: the delete fails, the machine is stopped but
+    // undeletable, and every retry hits the same wall. Releasing the disk images
+    // first makes the delete self-financing — it frees far more than the record
+    // removal needs, so cleanup still works on a full disk.
+    let data_dir = vm_data_dir(&name);
+    if data_dir.exists() {
+        // Release this VM's per-VM uid (if any) back to the allocator before the
+        // dir holding its `.vm-uid` record is removed, so a high-churn cloud node
+        // doesn't leak the uid range. A fork clone has no uid of its own (it
+        // shares its golden's). See process::free_vm_uid.
+        crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
+        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
+        }
+    }
+
     // Remove from registry (in-memory + database) in a blocking task: the DB
     // delete is synchronous disk I/O and must not run on an async worker thread,
     // where it would starve the small per-node reactor under delete churn.
@@ -2947,19 +2969,6 @@ pub(crate) async fn delete_one(
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
-
-    // Remove VM data directory (disk images, sockets, etc.)
-    let data_dir = vm_data_dir(&name);
-    if data_dir.exists() {
-        // Release this VM's per-VM uid (if any) back to the allocator before the
-        // dir holding its `.vm-uid` record is removed, so a high-churn cloud node
-        // doesn't leak the uid range. A fork clone has no uid of its own (it
-        // shares its golden's). See process::free_vm_uid.
-        crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
-        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
-            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
-        }
-    }
 
     if let Some(parent) = record.golden.clone() {
         let db = state.db().clone();
