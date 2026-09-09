@@ -95,7 +95,11 @@ pub fn plan_launch_network(
     let has_cidr_policy = resources
         .allowed_cidrs
         .as_ref()
-        .is_some_and(|cidrs| !cidrs.is_empty());
+        .is_some_and(|cidrs| !cidrs.is_empty())
+        || resources
+            .denied_cidrs
+            .as_ref()
+            .is_some_and(|cidrs| !cidrs.is_empty());
     let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
     let has_host_service = guest_host_service_configured();
     let has_fabric = resources.network_name.is_some();
@@ -176,6 +180,10 @@ pub fn validate_requested_network_backend(
         .allowed_cidrs
         .as_ref()
         .is_some_and(|c| !c.is_empty())
+        || resources
+            .denied_cidrs
+            .as_ref()
+            .is_some_and(|c| !c.is_empty())
         || dns_filter_hosts.is_some_and(|h| !h.is_empty());
     let has_host_service = guest_host_service_configured();
 
@@ -217,7 +225,7 @@ pub fn validate_requested_network_backend(
     if has_egress_policy && backend != NetworkBackend::VirtioNet {
         return Err(crate::Error::config(
             "egress",
-            "egress policy (--allow-cidr/--allow-host/--outbound-localhost-only) requires the \
+            "egress policy (--allow-cidr/--deny-cidr/--allow-host/--outbound-localhost-only) requires the \
              virtio-net backend; TSI does not enforce it. Remove --net-backend tsi or set it to virtio-net",
         ));
     }
@@ -229,7 +237,11 @@ pub fn validate_requested_network_backend(
     let has_cidr_policy = resources
         .allowed_cidrs
         .as_ref()
-        .is_some_and(|cidrs| !cidrs.is_empty());
+        .is_some_and(|cidrs| !cidrs.is_empty())
+        || resources
+            .denied_cidrs
+            .as_ref()
+            .is_some_and(|cidrs| !cidrs.is_empty());
     let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
     let wants_network = resources.network || port_count > 0 || has_cidr_policy || has_dns_filter;
 
@@ -316,6 +328,27 @@ mod tests {
         resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
         let plan = plan_launch_network(&resources, None, 0);
         assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+    }
+
+    #[test]
+    fn test_deny_cidr_policy_default_selects_virtio() {
+        // A deny list is enforced only by the virtio-net gateway, so like the
+        // allow list it must pull the default off TSI — even with no allow
+        // rules and no --net (the deny policy itself implies networking).
+        let mut resources = resources();
+        resources.denied_cidrs = Some(vec!["192.168.0.0/16".into()]);
+        let plan = plan_launch_network(&resources, None, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+    }
+
+    #[test]
+    fn test_validate_deny_cidr_explicit_tsi_rejected() {
+        // Explicit TSI + a deny list would silently not enforce it: reject.
+        let mut resources = resources();
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::Tsi);
+        resources.denied_cidrs = Some(vec!["192.168.0.0/16".into()]);
+        assert!(validate_requested_network_backend(&resources, None, 0).is_err());
     }
 
     #[test]

@@ -484,6 +484,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
 
+    /// Denied egress CIDR ranges, evaluated before the allow list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied_cidrs: Option<Vec<String>>,
+
     /// Preferred network backend override for machine launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
@@ -714,6 +718,7 @@ impl VmRecord {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            denied_cidrs: None,
             network_backend: None,
             dns: None,
             network_name: None,
@@ -785,6 +790,7 @@ impl VmRecord {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            denied_cidrs: None,
             network_backend: None,
             dns: None,
             network_name: None,
@@ -999,6 +1005,7 @@ impl VmRecord {
             overlay_gib: self.overlay_gb,
             block_io: self.block_io,
             allowed_cidrs: self.allowed_cidrs.clone(),
+            denied_cidrs: self.denied_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
         }

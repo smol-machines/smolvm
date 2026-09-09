@@ -108,6 +108,7 @@ pub fn build_create_params(
     cli_overlay_gb: Option<u64>,
     cli_block_io: Option<BlockIoEngine>,
     cli_allow_cidr: Vec<String>,
+    cli_deny_cidr: Vec<String>,
     // Labels come only from the CLI today; a Smolfile has no `labels` key yet.
     // Threaded explicitly so `--label` is not silently dropped when a Smolfile
     // is also supplied.
@@ -122,6 +123,7 @@ pub fn build_create_params(
                 .map_err(|e| smolvm::Error::config("CLI ports", e))?;
             let net = cli_net
                 || !cli_allow_cidr.is_empty()
+                || !cli_deny_cidr.is_empty()
                 || cli_dns.is_some()
                 || cli_network_name.is_some();
             return Ok(CreateVmParams {
@@ -148,6 +150,7 @@ pub fn build_create_params(
                 overlay_gb: cli_overlay_gb,
                 block_io: cli_block_io.unwrap_or_default(),
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
+                denied_cidrs: cidrs_to_option(cli_deny_cidr),
                 restart_policy: None,
                 restart_max_retries: None,
                 restart_max_backoff_secs: None,
@@ -309,13 +312,27 @@ pub fn build_create_params(
     // CLI extends
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
-    // --allow-cidr / --allow-host / [network] / --dns implies --net
-    let net = if !allowed_cidrs_vec.is_empty() || !sf_allow_hosts.is_empty() || cli_dns.is_some() {
+    // Parse [network].deny_cidrs the same way, then CLI extends.
+    let mut denied_cidrs_vec: Vec<String> = network
+        .deny_cidrs
+        .iter()
+        .map(|s| parse_cidr(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| smolvm::Error::config("smolfile [network] deny_cidrs", e))?;
+    denied_cidrs_vec.extend(cli_deny_cidr);
+
+    // --allow-cidr / --deny-cidr / --allow-host / [network] / --dns implies --net
+    let net = if !allowed_cidrs_vec.is_empty()
+        || !denied_cidrs_vec.is_empty()
+        || !sf_allow_hosts.is_empty()
+        || cli_dns.is_some()
+    {
         true
     } else {
         net
     };
     let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
+    let denied_cidrs = cidrs_to_option(denied_cidrs_vec);
 
     // Restart policy from [restart] section
     let restart_policy = sf
@@ -381,6 +398,7 @@ pub fn build_create_params(
         overlay_gb,
         block_io,
         allowed_cidrs,
+        denied_cidrs,
         restart_policy,
         restart_max_retries,
         restart_max_backoff_secs,
@@ -580,6 +598,7 @@ mod tests {
             None,
             None,
             vec![],
+            vec![],
             Default::default(),
         )
     }
@@ -611,6 +630,10 @@ env = ["GREETING=hello", "EMPTY="]
 workdir = "/srv/app"
 user = "501:20"
 init = ["echo init"]
+
+[network]
+allow_cidrs = ["10.0.0.0/8"]
+deny_cidrs = ["10.1.0.0/16"]
 "#,
         )
         .unwrap();
@@ -625,6 +648,8 @@ init = ["echo init"]
         assert_eq!(params.user.as_deref(), Some("501:20"));
         assert_eq!(params.init, vec!["echo init"]);
         assert_eq!(params.network_backend, Some(NetworkBackend::VirtioNet));
+        assert_eq!(params.allowed_cidrs, Some(vec!["10.0.0.0/8".to_string()]));
+        assert_eq!(params.denied_cidrs, Some(vec!["10.1.0.0/16".to_string()]));
 
         // Hop 2a: create params -> record, the `machine create` path.
         let created = build_vm_record(&params).unwrap();
@@ -642,6 +667,8 @@ init = ["echo init"]
         assert_eq!(created.user, params.user);
         assert_eq!(created.init, params.init);
         assert_eq!(created.network_backend, params.network_backend);
+        assert_eq!(created.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(created.denied_cidrs, params.denied_cidrs);
 
         // Hop 2b: create params -> overrides -> record, the `run` and
         // first-launch paths.
@@ -656,6 +683,8 @@ init = ["echo init"]
         assert_eq!(persisted.user, params.user);
         assert_eq!(persisted.init, params.init);
         assert_eq!(persisted.network_backend, params.network_backend);
+        assert_eq!(persisted.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(persisted.denied_cidrs, params.denied_cidrs);
 
         // Hop 3: record -> pack manifest, the `pack create --from-vm` path.
         let mut manifest = PackManifest::new(
@@ -804,6 +833,7 @@ init = ["echo init"]
             None,
             None,
             vec![],
+            vec![],
             Default::default(),
         )
         .unwrap();
@@ -871,6 +901,7 @@ init = ["echo init"]
             None,
             None,
             None,
+            vec![],
             vec![],
             Default::default(),
         )
@@ -980,6 +1011,7 @@ mod resource_cap_precedence_tests {
             None,
             None,
             None,
+            vec![],
             vec![],
             Default::default(),
         )
@@ -1120,6 +1152,7 @@ mod smolfile_local_image_tests {
             None,
             None,
             vec![],
+            vec![],
             Default::default(),
         )
         .expect("params");
@@ -1153,10 +1186,83 @@ mod smolfile_local_image_tests {
             None,
             None,
             vec![],
+            vec![],
             Default::default(),
         )
         .expect("params");
         assert_eq!(flagged.image, Some(image));
+    }
+
+    /// A deny list must behave like the allow list it mirrors: the Smolfile
+    /// values come first, CLI `--deny-cidr` extends them, a deny list alone
+    /// implies networking, and a malformed entry is rejected at parse time
+    /// (never silently dropped, which would widen the policy).
+    #[test]
+    fn deny_cidrs_merge_imply_net_and_reject_bad_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[network]\ndeny_cidrs = [\"192.168.0.0/16\"]\n",
+        )
+        .unwrap();
+
+        let with_cli = |smolfile: Option<PathBuf>, deny: Vec<String>| {
+            build_create_params(
+                "deny-vm".to_string(),
+                if smolfile.is_some() {
+                    None
+                } else {
+                    Some("alpine".to_string())
+                },
+                None,
+                vec![],
+                None,
+                None,
+                vec![],
+                vec![],
+                false,
+                None,
+                None,
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+                smolfile,
+                None,
+                None,
+                None,
+                vec![],
+                deny,
+                Default::default(),
+            )
+        };
+
+        // Smolfile + CLI merge, Smolfile first; deny alone implies --net.
+        let params = with_cli(Some(path.clone()), vec!["10.0.0.0/8".to_string()]).unwrap();
+        assert_eq!(
+            params.denied_cidrs,
+            Some(vec!["192.168.0.0/16".to_string(), "10.0.0.0/8".to_string()])
+        );
+        assert!(params.net, "a deny list implies networking");
+
+        // CLI-only path (no Smolfile) carries and implies net the same way.
+        let params = with_cli(None, vec!["172.16.0.0/12".to_string()]).unwrap();
+        assert_eq!(params.denied_cidrs, Some(vec!["172.16.0.0/12".to_string()]));
+        assert!(params.net);
+
+        // A malformed Smolfile deny entry is a config error, not a skip.
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[network]\ndeny_cidrs = [\"not-a-cidr\"]\n",
+        )
+        .unwrap();
+        let err = match with_cli(Some(path), vec![]) {
+            Ok(_) => panic!("a malformed deny CIDR must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("deny_cidrs"), "{err}");
     }
 }
 
