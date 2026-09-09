@@ -3764,7 +3764,10 @@ impl CreateCmd {
                 env
             },
             workdir: manifest.workdir,
-            user: None,
+            // The account the packed workload runs as travels in the manifest,
+            // the same way its entrypoint, env, and workdir do; `--user` still
+            // overrides it, as it does for an image.
+            user: self.user.clone().or_else(|| manifest.user.clone()),
             storage_gb: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.storage_gib)
