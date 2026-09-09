@@ -11,7 +11,7 @@ pub mod push;
 
 pub use cache::BlobCache;
 pub use client::{validate_digest, RegistryClient};
-pub use pull::{pull, PullResult};
+pub use pull::{pull, pull_with_progress, PullResult};
 pub use push::{push, PushResult};
 
 use serde::{Deserialize, Serialize};

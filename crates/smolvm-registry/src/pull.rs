@@ -49,6 +49,34 @@ pub async fn pull(
     cache: &BlobCache,
     blob_peers: &[String],
 ) -> Result<PullResult> {
+    pull_with_progress(
+        client,
+        repo,
+        reference,
+        output,
+        cache,
+        blob_peers,
+        &mut |_, _| {},
+    )
+    .await
+}
+
+/// [`pull`], reporting download progress.
+///
+/// `on_progress` is called with `(bytes_on_disk, total_bytes)` as the layer
+/// streams in, on every chunk — callers throttle their own rendering. It is not
+/// called for a cache hit or a peer fetch, neither of which downloads from the
+/// registry, and `bytes_on_disk` starts from the resume point when a retry
+/// picks up a partial file rather than restarting at zero.
+pub async fn pull_with_progress(
+    client: &RegistryClient,
+    repo: &str,
+    reference: &str,
+    output: Option<&Path>,
+    cache: &BlobCache,
+    blob_peers: &[String],
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> Result<PullResult> {
     // 1. Fetch the manifest, resolving a multi-platform index to this machine's
     //    host-platform entry (Docker-style fan-out). Shared with `inspect`.
     tracing::info!(repo = %repo, reference = %reference, "fetching manifest...");
@@ -114,7 +142,8 @@ pub async fn pull(
     //    transfer, then verify the digest and adopt into cache.
     tracing::info!(digest = %digest, size, "downloading blob...");
 
-    let result = download_with_resume(client, repo, digest, size, output, cache).await?;
+    let result =
+        download_with_resume(client, repo, digest, size, output, cache, on_progress).await?;
 
     tracing::info!(digest = %digest, size = result.size, "pull complete");
 
@@ -147,6 +176,7 @@ async fn download_with_resume(
     expected_size: u64,
     output: Option<&Path>,
     cache: &BlobCache,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<PullResult> {
     let partial_path = cache.blob_path_for(digest).with_extension("partial");
 
@@ -159,7 +189,17 @@ async fn download_with_resume(
             .map(|m| m.len())
             .unwrap_or(0);
 
-        match fetch_into_partial(client, repo, digest, have, expected_size, &partial_path).await {
+        match fetch_into_partial(
+            client,
+            repo,
+            digest,
+            have,
+            expected_size,
+            &partial_path,
+            on_progress,
+        )
+        .await
+        {
             Ok(written) => {
                 let actual = hash_file(&partial_path).await?;
                 if actual != *digest {
@@ -195,14 +235,24 @@ async fn download_with_resume(
             }
             Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
                 let backoff = RETRY_BACKOFF * 2u32.pow(attempt - 1);
+                // Report what is actually on disk, not `have`: that was read
+                // before the attempt, so a transfer that broke after gigabytes
+                // logged `have_bytes=0` and read as "downloaded nothing" when
+                // the next attempt in fact resumes from near the end.
+                let on_disk = tokio::fs::metadata(&partial_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(have);
                 tracing::warn!(
                     digest = %digest,
                     attempt,
                     max_attempts = MAX_ATTEMPTS,
-                    have_bytes = have,
+                    bytes_on_disk = on_disk,
+                    resumed_from = have,
+                    total_bytes = expected_size,
                     backoff_ms = backoff.as_millis(),
                     error = %e,
-                    "blob download failed; resuming after backoff"
+                    "blob download interrupted; resuming after backoff"
                 );
                 tokio::time::sleep(backoff).await;
             }
@@ -223,6 +273,7 @@ async fn fetch_into_partial(
     have: u64,
     expected_size: u64,
     partial_path: &Path,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<u64> {
     let (stream, resumed_at) = client.pull_blob_stream_from(repo, digest, have).await?;
 
@@ -244,6 +295,7 @@ async fn fetch_into_partial(
         let chunk: bytes::Bytes = chunk_result.map_err(RegistryError::Http)?;
         file.write_all(&chunk).await?;
         written += chunk.len() as u64;
+        on_progress(written, expected_size);
     }
     file.flush().await?;
     drop(file);
@@ -437,6 +489,66 @@ mod tests {
             },
             "layers": [ { "mediaType": LAYER_MEDIA_TYPE, "digest": digest, "size": size } ],
         })
+    }
+
+    /// A download reports progress while it streams: every callback carries the
+    /// running byte count and the layer's declared total, counts never go
+    /// backwards, and the last one reaches the full size. Without this a
+    /// multi-gigabyte pull prints one line and then looks hung for minutes.
+    #[tokio::test]
+    async fn pull_reports_download_progress() {
+        use sha2::{Digest, Sha256};
+
+        let data = vec![7u8; 64 * 1024];
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&manifest_for(&digest, data.len())).unwrap(),
+                MANIFEST_MEDIA_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(data.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let result = pull_with_progress(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &mut |done, total| seen.push((done, total)),
+        )
+        .await
+        .expect("pull must succeed");
+
+        assert!(!seen.is_empty(), "progress must be reported at least once");
+        assert!(
+            seen.iter().all(|&(_, total)| total == data.len() as u64),
+            "every callback carries the layer size declared in the manifest"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 <= w[1].0),
+            "byte counts must never go backwards"
+        );
+        assert_eq!(
+            seen.last().unwrap().0,
+            data.len() as u64,
+            "the final callback reaches the full size"
+        );
+        assert_eq!(result.size, data.len() as u64);
     }
 
     /// The incident behaviour: a transfer that dies mid-blob must RESUME from the

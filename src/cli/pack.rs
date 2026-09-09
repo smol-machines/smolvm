@@ -1448,16 +1448,36 @@ impl PackPullCmd {
             })
             .unwrap_or_default();
 
+        // A multi-gigabyte layer takes minutes, and without a bar the command
+        // looks hung for all of it. Terminal only: the throttled redraws rely on
+        // `\r`, which does nothing in a log file, so a CI run would collect
+        // hundreds of stacked lines instead of one.
+        let show_progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        // The layer size is only known once the manifest is fetched, so the bar
+        // cannot be built until the first callback carries the total.
+        let mut bar: Option<crate::cli::ProgressBar> = None;
         let result = rt
-            .block_on(smolvm_registry::pull(
+            .block_on(smolvm_registry::pull_with_progress(
                 &client,
                 &repo,
                 tag_or_digest,
                 self.output.as_deref(),
                 &cache,
                 &blob_peers,
+                &mut |done, total| {
+                    if !show_progress {
+                        return;
+                    }
+                    bar.get_or_insert_with(|| {
+                        crate::cli::ProgressBar::new("Downloading", (total > 0).then_some(total))
+                    })
+                    .update(done);
+                },
             ))
             .map_err(|e| Error::agent("registry pull", e.to_string()))?;
+        if let Some(bar) = bar.take() {
+            bar.finish(result.size);
+        }
 
         if result.cached {
             eprintln!("Using cached blob ({})", result.digest);
@@ -1465,9 +1485,9 @@ impl PackPullCmd {
 
         let dest = self.output.unwrap_or(result.path);
         eprintln!(
-            "Pulled successfully -> {} ({} bytes)",
+            "Pulled successfully -> {} ({})",
             dest.display(),
-            result.size,
+            crate::cli::format_bytes(result.size),
         );
 
         // Warn if the artifact targets a different host platform.
