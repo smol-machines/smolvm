@@ -39,12 +39,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// VM-mode (`--from-vm`) packs carry the source VM's rootfs DISKS, but the packed
 /// template has its trailing zero extent stripped, so the disk must be grown back to
-/// its logical size before boot. The caller's [`AgentManager`] has already created
-/// default `.qcow2` overlays backed by the EMPTY default template; this removes them
-/// and replaces them with disks backed by the packed image. On Linux, a shared
-/// extraction with an artifact SHA-256 creates one immutable, normalized raw base
-/// per artifact/disk/size and gives every machine a tiny qcow2 overlay. macOS keeps
-/// using APFS clonefile, while unsupported qcow2 hosts retain the sparse-copy path.
+/// its logical size before boot. Create paths call this before constructing their
+/// [`AgentManager`], allowing the manager to open the final artifact disks directly.
+/// Any stale default overlays from an interrupted/older create are removed first.
+/// On Linux, a shared extraction with an artifact SHA-256 creates one immutable,
+/// normalized raw base per artifact/disk/size and gives every machine a tiny qcow2
+/// overlay. macOS keeps using APFS clonefile, while unsupported qcow2 hosts retain
+/// the sparse-copy path.
 /// A `.formatted` marker stops the host from reformatting the inherited filesystem;
 /// the guest still grows it with resize2fs.
 ///
@@ -53,7 +54,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// templates are sparse (~25 MiB of real data in a multi-GiB logical file), so a dense
 /// copy would balloon every machine to its full logical size (~28 GiB) on disk.
 ///
-/// `disk_dir` is the machine's data dir (the parent of `manager.storage_path()`).
+/// `disk_dir` is the machine's prepared data directory.
 /// Shared by both the serve API create path and the `smolvm machine create --from`
 /// CLI path so a VM-mode pack restores identically through either entry point.
 ///
