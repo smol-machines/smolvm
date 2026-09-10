@@ -3440,14 +3440,21 @@ fn handle_streaming_archive_directory(
     stream: &mut impl ReadWrite,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let normalized = match normalize_guest_path(path) {
-        Ok(path) => path,
+    // Resolve through the same containment check single-file reads use, rather
+    // than trusting the requested path. `normalize_guest_path` alone is lexical:
+    // it rejects `..` but happily accepts a path whose final component is a
+    // symlink, and `tar -C` follows that symlink, so a workload could leave a
+    // link in its workspace and have a caller archive whatever it pointed at.
+    // The resolver maps the path under the workspace or overlay root and
+    // canonicalizes it, so a link out of those roots is refused here.
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read) {
+        Ok(resolved) => resolved,
         Err(response) => {
             send_response(stream, &response)?;
             return Ok(());
         }
     };
-    let directory = std::path::Path::new(&normalized);
+    let directory = resolved.as_path();
     if !directory.is_dir() {
         send_response(
             stream,
@@ -7802,6 +7809,43 @@ mod tests {
             &workspace,
         );
         assert!(matches!(res, Err(AgentResponse::Error { .. })));
+    }
+
+    /// A workload can leave a symlink in its own workspace pointing at a
+    /// directory outside it, and `tar -C` follows such a link — so archiving a
+    /// workspace path must be refused when it resolves outside the workspace.
+    ///
+    /// This covers the resolver for a DIRECTORY escape, the shape the archive
+    /// path passes it; the file cases above cover a file escape. It does not by
+    /// itself prove which resolver the archive handler calls — that is the
+    /// wiring this change makes, and it is visible at the call site.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guest_read_rejects_a_symlinked_directory_escaping_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+
+        // The workload plants a link in its workspace to a directory outside it.
+        symlink(&outside, workspace.join("results")).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/workspace/results",
+            FilePathAccess::Read,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(
+            matches!(res, Err(AgentResponse::Error { .. })),
+            "archiving a workspace path that links outside the workspace must be refused"
+        );
     }
 
     #[cfg(unix)]
