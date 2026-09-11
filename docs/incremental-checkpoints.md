@@ -43,6 +43,15 @@ for each checkpoint, while unchanged chunks are reused instead of compressed
 and written again. Savings depend on how much RAM and disk content changes.
 Capture time is not guaranteed to fall in proportion to the bytes saved.
 
+Stored-checkpoint chunk reuse does not change the live branching limits. A live
+branch lineage and its QCOW2 disk backing chain are each bounded at 32 levels;
+the store deduplicates their contents but does not flatten or reset them. This
+is a depth limit, not a child-count limit: one batch may create many sibling
+children from one captured generation. Repeated single-child branch operations
+from a continuing source can add backing layers even when the resulting children are
+siblings. Stop and pack the desired state into a new root before continuing
+from a chain at the limit.
+
 ## Periodic checkpoints
 
 A timer or job runner can capture the same machine repeatedly, using the same
