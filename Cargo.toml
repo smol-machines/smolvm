@@ -62,6 +62,7 @@ socket2 = "0.6"
 dirs = "5"
 sha1 = "0.10"
 sha2 = "0.10"
+zstd = "0.13"
 hex = "0.4"
 getrandom = "0.3"
 # Host filesystem watcher (FSEvents on macOS, inotify on Linux) that drives

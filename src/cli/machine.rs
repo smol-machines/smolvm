@@ -337,6 +337,9 @@ pub enum MachineCmd {
     /// Save a running machine, including RAM, as a portable checkpoint
     Checkpoint(super::pack::CheckpointCmd),
 
+    /// Remove unused objects from a checkpoint store
+    CheckpointPrune(super::pack::PruneCheckpointStoreCmd),
+
     /// Assign parameters and release one held branch-pool slot
     #[command(name = "branch-release", visible_alias = "fork-release")]
     BranchRelease(ForkReleaseCmd),
@@ -418,6 +421,7 @@ impl MachineCmd {
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Branch(cmd) => cmd.run(),
             MachineCmd::Checkpoint(cmd) => cmd.run(),
+            MachineCmd::CheckpointPrune(cmd) => cmd.run(),
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -3575,8 +3579,14 @@ impl CreateCmd {
         }
 
         // Read manifest from the sidecar to get image metadata.
-        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
-            .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
+        let stored = sidecar_path.is_dir();
+        let manifest = if stored {
+            smolvm::checkpoint_store::read_manifest(sidecar_path)
+                .map_err(|e| smolvm::Error::agent("read stored checkpoint", e.to_string()))?
+        } else {
+            smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
+                .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?
+        };
         let checkpoint = manifest.checkpoint.clone();
         if let Some(ref checkpoint) = checkpoint {
             smolvm::portable_checkpoint::validate_compatibility(checkpoint)?;
@@ -3616,8 +3626,14 @@ impl CreateCmd {
         // Read the footer now; the bundle is extracted into the machine's own
         // data dir after `create_vm` succeeds (below), so a duplicate-name create
         // cannot clobber an existing machine's layers.
-        let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
-            .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?;
+        let footer = if stored {
+            None
+        } else {
+            Some(
+                smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
+                    .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?,
+            )
+        };
 
         // A VM-mode pack (`--from-vm`) carries the source VM's overlay+storage
         // DISKS (the real rootfs), not OCI layers. Capture the templates before
@@ -3909,12 +3925,16 @@ impl CreateCmd {
             }
 
             println!("Extracting .smolmachine assets...");
-            let result = if smolvm_pack::extract::shared_extract_enabled() {
+            let result = if stored {
+                smolvm::checkpoint_store::materialize(sidecar_path, &cache_dir)
+                    .map_err(|e| smolvm::Error::agent("materialize checkpoint", e.to_string()))?;
+                Ok((cache_dir.clone(), None))
+            } else if smolvm_pack::extract::shared_extract_enabled() {
                 #[cfg(target_os = "linux")]
                 {
                     let lease = smolvm::artifact_cache::materialize_shared_pack_lease(
                         sidecar_path,
-                        &footer,
+                        footer.as_ref().expect("file artifact has a footer"),
                         &cache_dir,
                         false,
                     )
@@ -3927,7 +3947,7 @@ impl CreateCmd {
                 smolvm_pack::extract::extract_sidecar(
                     sidecar_path,
                     &cache_dir,
-                    &footer,
+                    footer.as_ref().expect("file artifact has a footer"),
                     false,
                     false,
                 )

@@ -36,6 +36,9 @@ const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 /// Optional host paths used while building a portable checkpoint artifact.
 #[derive(Debug, Clone, Default)]
 pub struct CaptureOptions {
+    /// Reuse content-addressed objects in this directory and publish a
+    /// self-contained checkpoint directory instead of a compressed file.
+    pub store_dir: Option<PathBuf>,
     /// Disk-backed directory used for the temporary, uncompressed image.
     pub staging_dir: Option<PathBuf>,
     /// Directory containing libkrun and libkrunfw.
@@ -47,7 +50,9 @@ pub struct CaptureOptions {
 /// Timings and size returned by a completed portable checkpoint capture.
 #[derive(Debug, Clone)]
 pub struct CaptureResult {
-    /// Compressed artifact size in bytes.
+    /// Logical bytes reused from earlier checkpoints (zero for standalone exports).
+    pub reused_bytes: u64,
+    /// Compressed artifact size, or new compressed object bytes for a store capture.
     pub size_bytes: u64,
     /// Time for which the source's vCPUs and disks were frozen.
     pub source_pause: std::time::Duration,
@@ -64,15 +69,20 @@ pub struct CaptureResult {
 pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) -> Result<()> {
     crate::data::validate_vm_name(name, "machine name")
         .map_err(|reason| Error::config("restore checkpoint", reason))?;
-    if !artifact.is_file() {
+    if !artifact.is_file() && !artifact.is_dir() {
         return Err(Error::config(
             "restore checkpoint",
             format!("file not found: {}", artifact.display()),
         ));
     }
 
-    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
-        .map_err(|error| Error::agent("read checkpoint manifest", error.to_string()))?;
+    let manifest = if artifact.is_dir() {
+        crate::checkpoint_store::read_manifest(artifact)
+            .map_err(|error| Error::agent("read stored checkpoint", error.to_string()))?
+    } else {
+        smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+            .map_err(|error| Error::agent("read checkpoint manifest", error.to_string()))?
+    };
     let checkpoint = manifest.checkpoint.as_ref().ok_or_else(|| {
         Error::config(
             "restore checkpoint",
@@ -100,8 +110,6 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
     };
 
     let record = restored_record(name, &manifest, checkpoint)?;
-    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
-        .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
     let vm_data = crate::agent::vm_data_dir(name);
     let cache_dir = crate::agent::machine_layers_cache_dir(name);
     let result = (|| -> Result<()> {
@@ -121,8 +129,15 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
                 ));
             }
         }
-        smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, &footer, false, false)
-            .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
+        if artifact.is_dir() {
+            crate::checkpoint_store::materialize(artifact, &cache_dir)
+                .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
+        } else {
+            let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+                .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, &footer, false, false)
+                .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
+        }
         install(&cache_dir, &vm_data, checkpoint)?;
         discard_transport_pack(&vm_data)?;
         if !reservation
@@ -242,6 +257,7 @@ fn restored_record(
 
 struct SavedVmPause {
     control: PathBuf,
+    prepared_save: Option<PathBuf>,
     armed: bool,
 }
 
@@ -270,6 +286,12 @@ impl Drop for SavedVmPause {
                 Ok(reply) => tracing::warn!(%reply, "failed to resume checkpoint source"),
                 Err(error) => tracing::warn!(%error, "failed to resume checkpoint source"),
             }
+        }
+        if let Some(dir) = self.prepared_save.take() {
+            let _ = crate::agent::fork::control_socket_cmd(
+                &self.control,
+                &format!("CANCEL_SAVE {}", dir.display()),
+            );
         }
     }
 }
@@ -336,6 +358,7 @@ fn validated_capture_source(name: &str) -> Result<SmolvmConfig> {
             format!("machine '{name}' is not checkpointable: {status}"),
         ));
     }
+    crate::agent::fork::validate_checkpoint_agent(name)?;
     Ok(config)
 }
 
@@ -349,6 +372,12 @@ pub fn capture_to_path(
     options: &CaptureOptions,
 ) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
+    if options.store_dir.is_some() && options.staging_dir.is_some() {
+        return Err(Error::config(
+            "checkpoint machine",
+            "stored checkpoints stage inside the store; omit staging_dir",
+        ));
+    }
     if output
         .extension()
         .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
@@ -370,10 +399,70 @@ pub fn capture_to_path(
     // immediately before capture so this fast preflight is never trusted for
     // the consistency boundary.
     let _ = validated_capture_source(name)?;
+    if options.store_dir.is_some() {
+        let reply = crate::agent::fork::control_socket_cmd(
+            &crate::agent::fork::control_socket_path(name),
+            "SAVE_CAPABILITIES",
+        )?;
+        if reply.trim() != "OK deferred-stream-v1" {
+            return Err(Error::config("incremental checkpoint", "this machine's runtime does not support incremental checkpoint streaming; restart it with an updated libkrun, or omit --store for a standalone checkpoint"));
+        }
+    }
 
+    let stored = options
+        .store_dir
+        .as_ref()
+        .map(|store| -> Result<_> {
+            let parent = output
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            std::fs::create_dir_all(store)
+                .map_err(|e| Error::agent("create checkpoint store", e.to_string()))?;
+            let store = store
+                .canonicalize()
+                .map_err(|e| Error::agent("resolve checkpoint store", e.to_string()))?;
+            let parent = parent
+                .canonicalize()
+                .map_err(|e| Error::agent("resolve checkpoint output", e.to_string()))?;
+            if parent.starts_with(store.join("staging"))
+                || parent.starts_with(store.join("objects"))
+            {
+                return Err(Error::config(
+                    "checkpoint output",
+                    "output cannot be inside the store's reserved staging or objects directories",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if std::fs::metadata(&parent)?.dev() != std::fs::metadata(&store)?.dev() {
+                    return Err(Error::config(
+                        "checkpoint output",
+                        "output and store must be on the same filesystem",
+                    ));
+                }
+            }
+            let capture_root = store.join("staging");
+            std::fs::create_dir_all(&capture_root)
+                .map_err(|e| Error::agent("create checkpoint staging", e.to_string()))?;
+            let directory = tempfile::Builder::new()
+                .prefix(".checkpoint-")
+                .tempdir_in(capture_root)
+                .map_err(|e| Error::agent("stage stored checkpoint", e.to_string()))?;
+            let writer = crate::checkpoint_store::Writer::new(&store, directory.path())
+                .map_err(|e| Error::agent("open checkpoint store", e.to_string()))?;
+            Ok((directory, writer))
+        })
+        .transpose()?;
+
+    let asset_staging_root = match stored.as_ref() {
+        Some((directory, _)) => directory.path().to_path_buf(),
+        None => staging_root(options)?,
+    };
     let temp_dir = tempfile::Builder::new()
         .prefix("checkpoint-staging-")
-        .tempdir_in(staging_root(options)?)
+        .tempdir_in(asset_staging_root)
         .map_err(|error| Error::agent("create checkpoint staging", error.to_string()))?;
     let staging_dir = temp_dir.path().join("staging");
     let mut collector = AssetCollector::new(staging_dir.clone())
@@ -403,11 +492,22 @@ pub fn capture_to_path(
     crate::agent::fork::sync_fork_source(name)?;
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
-    let reply = crate::agent::fork::control_socket_cmd_with_timeout(
+    let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
         &control,
-        &format!("SAVE {}", snapshot_dir.display()),
+        &format!("PREPARE_SAVE {}", snapshot_dir.display()),
         std::time::Duration::from_secs(30 * 60),
     )?;
+    let prepared = reply.starts_with("OK");
+    if !prepared
+        && options.store_dir.is_none()
+        && (reply.starts_with("ERR ENOTSUP") || reply.trim() == "ERR EINVAL unknown command")
+    {
+        reply = crate::agent::fork::control_socket_cmd_with_timeout(
+            &control,
+            &format!("SAVE {}", snapshot_dir.display()),
+            std::time::Duration::from_secs(30 * 60),
+        )?;
+    }
     if !reply.starts_with("OK") {
         return Err(Error::agent(
             "checkpoint machine",
@@ -416,12 +516,50 @@ pub fn capture_to_path(
     }
     let mut pause = SavedVmPause {
         control,
+        prepared_save: prepared.then(|| snapshot_dir.clone()),
         armed: true,
     };
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     pause.resume()?;
     let source_pause = pause_started.elapsed();
     drop(source_lock);
+
+    let mut stored = stored;
+    let stored_memory = if let Some((_, writer)) = stored.as_mut() {
+        let mut stream = crate::platform::uds::UdsStream::connect(&pause.control)
+            .map_err(|e| Error::agent("connect checkpoint stream", e.to_string()))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30 * 60)))
+            .map_err(|e| Error::agent("configure checkpoint stream", e.to_string()))?;
+        writeln!(stream, "FINISH_SAVE_STREAM {}", snapshot_dir.display())
+            .map_err(|e| Error::agent("request checkpoint stream", e.to_string()))?;
+        let memory = writer
+            .ingest_memory(&mut stream, (u64::from(vm.mem) + 2048) * 1024 * 1024)
+            .map_err(|e| Error::agent("store checkpoint memory", e.to_string()))?;
+        let mut reply = String::new();
+        stream
+            .take(4096)
+            .read_to_string(&mut reply)
+            .map_err(|e| Error::agent("complete checkpoint stream", e.to_string()))?;
+        if !reply.starts_with("OK saved (") {
+            return Err(Error::agent("complete checkpoint stream", reply));
+        }
+        pause.prepared_save = None;
+        Some(memory)
+    } else {
+        if prepared {
+            let reply = crate::agent::fork::control_socket_cmd_with_timeout(
+                &pause.control,
+                &format!("FINISH_SAVE {}", snapshot_dir.display()),
+                std::time::Duration::from_secs(30 * 60),
+            )?;
+            if !reply.starts_with("OK") {
+                return Err(Error::agent("finish checkpoint", reply));
+            }
+            pause.prepared_save = None;
+        }
+        None
+    };
 
     let assets = crate::pack_export::FromVmAssets {
         mode: PackMode::Vm,
@@ -476,7 +614,16 @@ pub fn capture_to_path(
         // very little is resident. The pack container verifies its compressed
         // bytes; hashing the expanded holes again makes import scale with the
         // configured RAM limit instead of the checkpoint's physical size.
-        memory: describe_sparse_asset(&snapshot_dir.join("memory.bin"), "checkpoint/memory.bin")?,
+        memory: match stored_memory.as_ref() {
+            Some(memory) => CheckpointAsset {
+                path: "checkpoint/memory.bin".into(),
+                size: crate::checkpoint_store::logical_size(memory),
+                sha256: String::new(),
+            },
+            None => {
+                describe_sparse_asset(&snapshot_dir.join("memory.bin"), "checkpoint/memory.bin")?
+            }
+        },
         layout: describe_asset(
             &snapshot_dir.join("manifest.bin"),
             "checkpoint/manifest.bin",
@@ -487,6 +634,36 @@ pub fn capture_to_path(
     });
     manifest.assets = collector.into_inventory();
 
+    if let Some((directory, mut writer)) = stored {
+        let mut files = writer
+            .ingest_tree(&staging_dir)
+            .map_err(|e| Error::agent("store checkpoint assets", e.to_string()))?;
+        files.push(stored_memory.expect("stored capture has a RAM index"));
+        // Only compressed objects and the index are published. Keeping these
+        // assets inside owned staging also makes interrupted captures reclaimable.
+        temp_dir
+            .close()
+            .map_err(|e| Error::agent("remove checkpoint staging", e.to_string()))?;
+        let stats = writer
+            .finish(directory.path(), manifest, files)
+            .map_err(|e| Error::agent("finish checkpoint index", e.to_string()))?;
+        tracing::info!(
+            new_logical_bytes = stats.new_logical_bytes,
+            new_compressed_bytes = stats.new_bytes,
+            reused_bytes = stats.reused_bytes,
+            zero_bytes = stats.zero_bytes,
+            "checkpoint objects stored"
+        );
+        crate::checkpoint_store::publish(directory.path(), output)
+            .map_err(|e| Error::agent("publish stored checkpoint", e.to_string()))?;
+        return Ok(CaptureResult {
+            size_bytes: stats.new_bytes,
+            reused_bytes: stats.reused_bytes,
+            source_pause,
+            elapsed: started.elapsed(),
+        });
+    }
+
     let collector = AssetCollector::new(staging_dir)
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
     let info = Packer::new(manifest)
@@ -494,6 +671,7 @@ pub fn capture_to_path(
         .pack_artifact(output)
         .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
     Ok(CaptureResult {
+        reused_bytes: 0,
         size_bytes: info.total_size,
         source_pause,
         elapsed: started.elapsed(),

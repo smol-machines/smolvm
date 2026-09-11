@@ -70,6 +70,7 @@ pub mod config;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,
 // so the module (and its callers in cuda_host) are unix-only.
+pub mod checkpoint_store;
 #[cfg(unix)]
 pub mod cuda_daemon;
 pub mod cuda_host;

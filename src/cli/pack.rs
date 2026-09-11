@@ -65,15 +65,30 @@ impl PackCmd {
 #[derive(Args, Debug)]
 pub struct CheckpointCmd {
     /// Running machine to checkpoint.
-    #[arg(short = 'n', long, value_name = "NAME")]
-    pub name: String,
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "NAME",
+        required_unless_present = "export_from",
+        conflicts_with = "export_from"
+    )]
+    pub name: Option<String>,
 
-    /// Destination `.smolcheckpoint` file.
+    /// Export a stored checkpoint directory as one portable file.
+    #[arg(long, value_name = "CHECKPOINT", conflicts_with = "store")]
+    pub export_from: Option<PathBuf>,
+
+    /// Reuse unchanged chunks here; output becomes a self-contained directory
+    /// on the same filesystem (copy the whole directory to move it).
+    #[arg(long, value_name = "DIR")]
+    pub store: Option<PathBuf>,
+
+    /// Destination `.smolcheckpoint` file (directory with --store).
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 
     /// Directory under which large temporary checkpoint assets are staged.
-    #[arg(long = "staging-dir", value_name = "DIR")]
+    #[arg(long = "staging-dir", value_name = "DIR", conflicts_with = "store")]
     pub staging_dir: Option<PathBuf>,
 
     /// Path to library directory containing libkrun and libkrunfw.
@@ -91,10 +106,24 @@ pub struct CheckpointCmd {
 impl CheckpointCmd {
     /// Capture and package a live machine at one RAM/disk consistency boundary.
     pub fn run(self) -> smolvm::Result<()> {
+        if let Some(source) = self.export_from {
+            let bytes = smolvm::checkpoint_store::export(&source, &self.output)
+                .map_err(|e| smolvm::Error::agent("export checkpoint", e.to_string()))?;
+            println!(
+                "Exported checkpoint to {} ({} MiB)",
+                self.output.display(),
+                bytes / (1024 * 1024)
+            );
+            return Ok(());
+        }
+        let name = self
+            .name
+            .ok_or_else(|| smolvm::Error::config("checkpoint", "--name is required"))?;
         let result = smolvm::portable_checkpoint::capture_to_path(
-            &self.name,
+            &name,
             &self.output,
             &smolvm::portable_checkpoint::CaptureOptions {
+                store_dir: self.store.clone(),
                 staging_dir: self.staging_dir,
                 lib_dir: self.lib_dir,
                 rootfs_dir: self.rootfs_dir,
@@ -105,12 +134,38 @@ impl CheckpointCmd {
             result.source_pause.as_secs_f64()
         );
         println!(
-            "Checkpointed '{}' to {} ({} MiB compressed, {:.3}s total, {:.3}s source pause)",
-            self.name,
+            "Checkpointed '{}' to {} ({} MiB written, {:.3}s total, {:.3}s source pause)",
+            name,
             self.output.display(),
             result.size_bytes / (1024 * 1024),
             result.elapsed.as_secs_f64(),
             result.source_pause.as_secs_f64()
+        );
+        if self.store.is_some() {
+            println!(
+                "Reused {} MiB from existing checkpoint objects",
+                result.reused_bytes / (1024 * 1024)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Reclaim checkpoint cache objects that no retained checkpoint references.
+#[derive(Args, Debug)]
+pub struct PruneCheckpointStoreCmd {
+    /// Store used by `machine checkpoint --store`.
+    #[arg(long, value_name = "DIR")]
+    pub store: PathBuf,
+}
+
+impl PruneCheckpointStoreCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let bytes = smolvm::checkpoint_store::prune(&self.store)
+            .map_err(|e| smolvm::Error::agent("prune checkpoint store", e.to_string()))?;
+        println!(
+            "Reclaimed {} MiB of unreferenced checkpoint objects",
+            bytes / (1024 * 1024)
         );
         Ok(())
     }

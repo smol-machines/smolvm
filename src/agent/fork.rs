@@ -343,6 +343,12 @@ fn branch_client(machine: &str, what: &str) -> Result<AgentClient> {
     Ok(client)
 }
 
+/// A portable restore releases the inherited branchpoint through this same
+/// protocol, even when the source did not declare a workload branch barrier.
+pub(crate) fn validate_checkpoint_agent(machine: &str) -> Result<()> {
+    branch_client(machine, "checkpoint machine").map(drop)
+}
+
 /// Wait until the golden workload reaches the standard live-fork boundary.
 ///
 /// The workload signals this by calling `smolvm-fork-ready`, which writes the
