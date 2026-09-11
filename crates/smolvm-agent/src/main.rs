@@ -314,8 +314,14 @@ fn main() {
     #[cfg(target_os = "linux")]
     if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
         setup_gpu_dev_nodes();
-        setup_kvm_dev_node();
     }
+
+    // Deliberately NOT under the GPU condition above: nesting and the GPU are
+    // independent, and gating this on --gpu would leave a --nested machine with
+    // no /dev/kvm. Cheap when unused — it returns immediately unless the kernel
+    // registered KVM.
+    #[cfg(target_os = "linux")]
+    setup_kvm_dev_node();
 
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
@@ -878,45 +884,6 @@ fn mount_essential_filesystems() {
 /// node and card from /sys/class/drm/ and creates the corresponding
 /// character device node in /dev/dri/ so containers can access the GPU.
 #[cfg(target_os = "linux")]
-/// Create `/dev/kvm` when the guest kernel registered it.
-///
-/// With nested virtualization the kernel brings KVM up and registers its misc
-/// device, but a workload container's `/dev` is not devtmpfs, so no node ever
-/// appears and anything needing a hypervisor fails with the misleading "KVM not
-/// available. Ensure KVM kernel module is loaded" -- the module IS there. Same
-/// gap the DRM nodes above work around, and the minor is read the same way.
-fn setup_kvm_dev_node() {
-    if std::path::Path::new("/dev/kvm").exists() {
-        return;
-    }
-    let Ok(misc) = std::fs::read_to_string("/proc/misc") else {
-        return; // no kernel support: nothing to expose, and that is not an error
-    };
-    // /proc/misc lines are "<minor> <name>"; KVM is always misc major 10.
-    let Some(minor) = misc.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let minor = parts.next()?.parse::<u32>().ok()?;
-        (parts.next()? == "kvm").then_some(minor)
-    }) else {
-        return;
-    };
-    let Ok(path) = std::ffi::CString::new("/dev/kvm") else {
-        return;
-    };
-    // SAFETY: mknod a character device with KVM's fixed major and the minor the
-    // kernel just reported. 0666 so an unprivileged workload can use it too.
-    let rc = unsafe {
-        libc::mknod(
-            path.as_ptr(),
-            libc::S_IFCHR | 0o666,
-            libc::makedev(10, minor),
-        )
-    };
-    if rc == 0 {
-        tracing::info!(minor, "created /dev/kvm for nested virtualization");
-    }
-}
-
 fn setup_gpu_dev_nodes() {
     let sysfs_drm = std::path::Path::new("/sys/class/drm");
     if !sysfs_drm.exists() {
@@ -1003,6 +970,46 @@ fn setup_gpu_dev_nodes() {
                 libc::makedev(major, minor),
             );
         }
+    }
+}
+
+/// Create `/dev/kvm` when the guest kernel registered it.
+///
+/// With nested virtualization the kernel brings KVM up and registers its misc
+/// device, but a workload container's `/dev` is not devtmpfs, so no node ever
+/// appears and anything needing a hypervisor fails with the misleading "KVM not
+/// available. Ensure KVM kernel module is loaded" -- the module IS there. Same
+/// gap the DRM nodes above work around, and the minor is read the same way.
+#[cfg(target_os = "linux")]
+fn setup_kvm_dev_node() {
+    if std::path::Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let Ok(misc) = std::fs::read_to_string("/proc/misc") else {
+        return; // no kernel support: nothing to expose, and that is not an error
+    };
+    // /proc/misc lines are "<minor> <name>"; KVM is always misc major 10.
+    let Some(minor) = misc.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let minor = parts.next()?.parse::<u32>().ok()?;
+        (parts.next()? == "kvm").then_some(minor)
+    }) else {
+        return;
+    };
+    let Ok(path) = std::ffi::CString::new("/dev/kvm") else {
+        return;
+    };
+    // SAFETY: mknod a character device with KVM's fixed major and the minor the
+    // kernel just reported. 0666 so an unprivileged workload can use it too.
+    let rc = unsafe {
+        libc::mknod(
+            path.as_ptr(),
+            libc::S_IFCHR | 0o666,
+            libc::makedev(10, minor),
+        )
+    };
+    if rc == 0 {
+        tracing::info!(minor, "created /dev/kvm for nested virtualization");
     }
 }
 
