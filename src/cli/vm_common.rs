@@ -2746,6 +2746,7 @@ where
     if manager.try_connect_existing().is_some() {
         let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
         println!("Machine '{}': running{}", label, pid_suffix);
+        print_memory_usage(&manager);
         extra(&manager);
         manager.detach();
     } else if let Some(ref n) = name {
@@ -2769,6 +2770,38 @@ where
     }
 
     Ok(())
+}
+
+/// Print what the machine is actually using, asked of the guest.
+///
+/// Deliberately not taken from the host: macOS charges the VMM's
+/// `phys_footprint` as `internal + compressed` with the compressed part counted
+/// at the pages' uncompressed size, so an idle machine whose memory has been
+/// compressed appears to be using several times what it occupies. The guest's
+/// allocator is the only thing that knows.
+///
+/// Silent when the machine's agent predates the request: a `status` that still
+/// reports state is more useful than one that fails over a detail.
+fn print_memory_usage(manager: &AgentManager) {
+    let Ok(mut client) = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())
+    else {
+        return;
+    };
+    let Ok(status) = client.memory_status() else {
+        return;
+    };
+    if status.total_bytes == 0 {
+        return;
+    }
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let percent = status.used_bytes() as f64 * 100.0 / status.total_bytes as f64;
+    println!(
+        "  memory: {:.2} GiB of {:.2} GiB used ({:.0}%), {:.2} GiB available",
+        gib(status.used_bytes()),
+        gib(status.total_bytes),
+        percent,
+        gib(status.available_bytes),
+    );
 }
 
 /// Build the per-machine JSON object shared by `machine list --json` and

@@ -333,6 +333,16 @@ pub enum AgentRequest {
     /// Get storage disk status.
     StorageStatus,
 
+    /// Report the guest's own view of machine memory, read from
+    /// `/proc/meminfo`.
+    ///
+    /// The host cannot answer this. macOS charges the VMM's `phys_footprint`
+    /// as `internal + compressed`, and the compressed part is counted at the
+    /// pages' *uncompressed* size, so an idle guest whose memory has been
+    /// compressed reports a footprint several times the bytes it actually
+    /// occupies. Only the guest's allocator knows what the machine is using.
+    MemoryStatus,
+
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
     NetworkTest {
@@ -728,6 +738,7 @@ impl AgentRequest {
             AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
+            AgentRequest::MemoryStatus => "MemoryStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
@@ -1071,6 +1082,38 @@ pub struct OverlayInfo {
     pub upper_path: String,
     /// Path to the work directory.
     pub work_path: String,
+}
+
+/// The guest's own account of machine memory, from `/proc/meminfo`.
+///
+/// This is what a machine is actually using. The host-side `phys_footprint`
+/// answers a different question — it counts compressed pages at their
+/// uncompressed size and keeps counting memory the guest has stopped needing —
+/// so it runs well above these figures and should not be read as consumption.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryStatus {
+    /// Total usable RAM the guest sees, in bytes. Slightly below the machine's
+    /// configured size: the kernel reserves some before the allocator sees it.
+    pub total_bytes: u64,
+    /// Memory available for new allocations without swapping, in bytes. The
+    /// figure to report, since `free_bytes` excludes reclaimable page cache.
+    pub available_bytes: u64,
+    /// Free memory in bytes: never allocated, or released and not reused.
+    pub free_bytes: u64,
+    /// Page cache in bytes. Counted inside `available_bytes`.
+    pub cached_bytes: u64,
+    /// Swap configured in the guest, in bytes. Zero when the guest has none.
+    pub swap_total_bytes: u64,
+    /// Swap in use, in bytes.
+    pub swap_used_bytes: u64,
+}
+
+impl MemoryStatus {
+    /// Memory the guest cannot hand back on demand.
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.available_bytes)
+    }
 }
 
 /// Storage status information.

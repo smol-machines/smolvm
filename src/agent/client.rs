@@ -9,9 +9,9 @@ use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
-    encode_message, AgentRequest, AgentResponse, Envelope, FsNotifyEvent, ImageInfo, OverlayInfo,
-    StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX,
-    MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    encode_message, AgentRequest, AgentResponse, Envelope, FsNotifyEvent, ImageInfo, MemoryStatus,
+    OverlayInfo, StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE,
+    FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -1582,6 +1582,15 @@ impl AgentClient {
     pub fn storage_status(&mut self) -> Result<StorageStatus> {
         let resp = self.request(&AgentRequest::StorageStatus)?;
         expect_data(resp, "storage status")
+    }
+
+    /// The guest's own view of machine memory.
+    ///
+    /// Agents older than this request reject it as an unknown variant, so
+    /// callers should treat an error as "not available" rather than a failure.
+    pub fn memory_status(&mut self) -> Result<MemoryStatus> {
+        let resp = self.request(&AgentRequest::MemoryStatus)?;
+        expect_data(resp, "memory status")
     }
 
     /// Test network connectivity directly from the agent (not via chroot).

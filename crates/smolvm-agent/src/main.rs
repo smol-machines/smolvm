@@ -2347,6 +2347,7 @@ fn handle_request(
         AgentRequest::FormatStorage => handle_format_storage(),
 
         AgentRequest::StorageStatus => handle_storage_status(),
+        AgentRequest::MemoryStatus => handle_memory_status(),
 
         AgentRequest::BranchpointWait { timeout_ms } => {
             let markers = branchpoint::Markers::standard();
@@ -6570,6 +6571,57 @@ fn handle_storage_status() -> AgentResponse {
     AgentResponse::from_result(storage::status(), error_codes::STATUS_FAILED)
 }
 
+/// Report machine memory as the guest's own allocator sees it.
+///
+/// `/proc/meminfo` reports kB (always kibibytes, whatever the unit column
+/// says), so every value is scaled to bytes here and the protocol carries only
+/// bytes. A field the running kernel does not publish stays zero rather than
+/// failing the request: `SwapTotal` is absent on a guest with no swap, and
+/// `MemAvailable` predates some very old kernels.
+fn handle_memory_status() -> AgentResponse {
+    AgentResponse::from_result(read_meminfo("/proc/meminfo"), error_codes::STATUS_FAILED)
+}
+
+/// Parse the `Key:  value kB` lines of a meminfo file into bytes.
+fn read_meminfo(path: &str) -> std::io::Result<smolvm_protocol::MemoryStatus> {
+    let text = std::fs::read_to_string(path)?;
+    let mut status = smolvm_protocol::MemoryStatus::default();
+    let mut swap_free = 0u64;
+
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        // The value is the first token of the remainder; the unit, when present,
+        // is always kB.
+        let Some(value) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let bytes = value.saturating_mul(1024);
+        match key {
+            "MemTotal" => status.total_bytes = bytes,
+            "MemAvailable" => status.available_bytes = bytes,
+            "MemFree" => status.free_bytes = bytes,
+            "Cached" => status.cached_bytes = bytes,
+            "SwapTotal" => status.swap_total_bytes = bytes,
+            "SwapFree" => swap_free = bytes,
+            _ => {}
+        }
+    }
+
+    status.swap_used_bytes = status.swap_total_bytes.saturating_sub(swap_free);
+    // A kernel too old for MemAvailable would otherwise report everything as
+    // used; free plus reclaimable cache is the estimate it replaced.
+    if status.available_bytes == 0 {
+        status.available_bytes = status.free_bytes.saturating_add(status.cached_bytes);
+    }
+    Ok(status)
+}
+
 // ============================================================================
 // VM-Level Exec Handlers (Direct Execution in VM)
 // ============================================================================
@@ -7942,5 +7994,89 @@ fn branchpoint_error(e: branchpoint::TypedError) -> AgentResponse {
     AgentResponse::Error {
         message: e.message,
         code: Some(e.code.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    use super::read_meminfo;
+
+    fn write(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(contents.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    /// meminfo reports kibibytes, so every field has to be scaled. Reading the
+    /// numbers as bytes would understate a machine's memory 1024-fold.
+    #[test]
+    fn values_are_scaled_from_kibibytes_to_bytes() {
+        let f = write(
+            "MemTotal:        4035968 kB\n\
+             MemFree:         4001728 kB\n\
+             MemAvailable:    3982212 kB\n\
+             Cached:             9512 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+
+        assert_eq!(m.total_bytes, 4_035_968 * 1024);
+        assert_eq!(m.free_bytes, 4_001_728 * 1024);
+        assert_eq!(m.available_bytes, 3_982_212 * 1024);
+        assert_eq!(m.cached_bytes, 9_512 * 1024);
+        // Total minus available is what the guest cannot hand back.
+        assert_eq!(m.used_bytes(), (4_035_968 - 3_982_212) * 1024);
+    }
+
+    /// Swap is reported as total and free; used is the difference. A guest with
+    /// no swap publishes neither line and must report zero, not garbage.
+    #[test]
+    fn swap_used_is_total_minus_free_and_absent_swap_is_zero() {
+        let with_swap = write(
+            "MemTotal:        1024 kB\n\
+             MemAvailable:     512 kB\n\
+             SwapTotal:       2048 kB\n\
+             SwapFree:         512 kB\n",
+        );
+        let m = read_meminfo(with_swap.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.swap_total_bytes, 2048 * 1024);
+        assert_eq!(m.swap_used_bytes, (2048 - 512) * 1024);
+
+        let no_swap = write("MemTotal:        1024 kB\nMemAvailable:     512 kB\n");
+        let m = read_meminfo(no_swap.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.swap_total_bytes, 0);
+        assert_eq!(m.swap_used_bytes, 0);
+    }
+
+    /// Kernels predating MemAvailable would otherwise report the whole machine
+    /// as used, since used is derived from it.
+    #[test]
+    fn a_kernel_without_mem_available_falls_back_to_free_plus_cache() {
+        let f = write(
+            "MemTotal:        1000 kB\n\
+             MemFree:          200 kB\n\
+             Cached:           300 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.available_bytes, 500 * 1024);
+        assert_eq!(m.used_bytes(), 500 * 1024);
+    }
+
+    /// Lines this build does not care about, and malformed ones, must not
+    /// derail the fields it does read.
+    #[test]
+    fn unknown_and_malformed_lines_are_skipped() {
+        let f = write(
+            "Committed_AS:   123456 kB\n\
+             not a meminfo line\n\
+             HugePages_Total:     0\n\
+             MemTotal:         2048 kB\n\
+             Bogus:          notanumber kB\n\
+             MemAvailable:     1024 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.total_bytes, 2048 * 1024);
+        assert_eq!(m.available_bytes, 1024 * 1024);
     }
 }
