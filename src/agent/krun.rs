@@ -85,6 +85,13 @@ pub struct KrunFunctions {
     >,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
+    /// Expose the host's virtualization extensions to the guest so it can run
+    /// KVM itself. Optional: older bundled libkrun builds lack it.
+    pub set_nested_virt: Option<unsafe extern "C" fn(u32, bool) -> i32>,
+    /// Whether the HOST can offer nesting at all (1 = yes). Checked before
+    /// asking, so an unsupported host gets a clear refusal instead of a VM that
+    /// boots without `/dev/kvm`.
+    pub check_nested_virt: Option<unsafe extern "C" fn() -> i32>,
     /// Add a virtio-gpu scanout (display) of the given width/height.
     ///
     /// Without at least one display the device reports `num_scanouts = 0`, the
@@ -200,6 +207,8 @@ impl KrunFunctions {
         let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
+        let set_nested_virt = load_optional_sym!("krun_set_nested_virt");
+        let check_nested_virt = load_optional_sym!("krun_check_nested_virt");
         let add_display = load_optional_sym!("krun_add_display");
         let set_display_backend = load_optional_sym!("krun_set_display_backend");
         let add_input_device = load_optional_sym!("krun_add_input_device");
@@ -233,6 +242,8 @@ impl KrunFunctions {
             add_net_unixstream,
             get_egress_handle,
             set_gpu_options2,
+            set_nested_virt,
+            check_nested_virt,
             add_display,
             set_display_backend,
             add_input_device,

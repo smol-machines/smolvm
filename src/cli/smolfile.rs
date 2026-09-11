@@ -163,6 +163,7 @@ pub fn build_create_params(
                 cuda_vram_limit_mib: None,
                 docker_socket: false,
                 gpu: false,
+                nested_virt: false,
                 gpu_vram_mib: None,
                 rosetta: false,
                 dns_filter_hosts: None,
@@ -358,6 +359,7 @@ pub fn build_create_params(
         .and_then(|s| parse_duration_secs(s));
 
     Ok(CreateVmParams {
+        nested_virt: false,
         labels: cli_labels,
         secret_refs: sf.secrets,
         name,

@@ -407,6 +407,7 @@ impl PackCreateCmd {
                 dns: None,
                 network_name: None,
                 gpu: false,
+                nested_virt: false,
                 cuda: false,
                 storage_gib: None,
                 overlay_gib: None,

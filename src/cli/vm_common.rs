@@ -499,6 +499,8 @@ pub struct CreateVmParams {
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
+    /// Expose host virtualization extensions so the guest can run KVM.
+    pub nested_virt: bool,
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
     pub gpu_vram_mib: Option<u32>,
@@ -724,6 +726,10 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.dns = params.dns;
     record.network_name = params.network_name.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
+    // Persist nesting the same way: `machine start` rebuilds resources from the
+    // record, so a flag that only reaches the create-time launch is silently
+    // dropped on every later start.
+    record.nested_virt = if params.nested_virt { Some(true) } else { None };
     record.rosetta = if params.rosetta { Some(true) } else { None };
     // Same invariant the CLI enforces, applied again here because
     // Smolfile values arrive through `params.gpu_vram_mib` without

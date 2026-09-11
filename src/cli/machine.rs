@@ -600,6 +600,13 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Resources")]
     pub gpu: bool,
 
+    /// Expose the host's virtualization extensions so the guest can run KVM --
+    /// i.e. run smolvm, QEMU or Docker Desktop's hypervisor inside the machine.
+    /// Off by default: nesting turns work the guest would do natively into
+    /// vmexits, so a nested guest runs far slower.
+    #[arg(long = "nested", help_heading = "Resources")]
+    pub nested_virt: bool,
+
     /// GPU shared-memory region size in MiB. Ignored without --gpu.
     /// Default 4096 (4 GiB). Must be > 0.
     #[arg(
@@ -1242,6 +1249,9 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        // `build_create_params` fills resources from the Smolfile, so a CLI-only
+        // flag has to be merged here or it never reaches the record.
+        params.nested_virt = params.nested_virt || self.nested_virt;
         params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
@@ -1554,6 +1564,7 @@ impl RunCmd {
             network_name: params.network_name.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
+            nested_virt: self.nested_virt,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
             cuda: self.cuda || params.cuda,
             rosetta: self.rosetta || params.rosetta,
@@ -3285,6 +3296,12 @@ pub struct CreateCmd {
     #[arg(long)]
     pub gpu: bool,
 
+    /// Expose the host's virtualization extensions so the guest can run KVM --
+    /// i.e. run smolvm, QEMU or another hypervisor inside the machine. Off by
+    /// default: nesting turns work the guest would do natively into vmexits.
+    #[arg(long = "nested")]
+    pub nested_virt: bool,
+
     /// GPU shared-memory region size in MiB. Ignored without --gpu.
     /// Default 4096 (4 GiB). Must be > 0.
     #[arg(
@@ -3459,6 +3476,9 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+        // `build_create_params` fills resources from the Smolfile, so a CLI-only
+        // flag has to be merged here or it never reaches the record.
+        params.nested_virt = params.nested_virt || self.nested_virt;
 
         // Resolve the image source on the host now, AFTER the CLI flag and the
         // Smolfile have been merged, so both take the same path: a registry
@@ -3503,6 +3523,7 @@ impl CreateCmd {
             dns: params.dns,
             network_name: params.network_name.clone(),
             gpu: params.gpu,
+            nested_virt: params.nested_virt,
             gpu_vram_mib: params.gpu_vram_mib,
             cuda: params.cuda,
             rosetta: params.rosetta,
@@ -3716,6 +3737,7 @@ impl CreateCmd {
             None => None,
         };
         let params = vm_common::CreateVmParams {
+            nested_virt: self.nested_virt,
             secret_refs: manifest.secret_refs,
             name,
             // A VM-mode pack is a VM, not a container: its synthetic `vm://<name>`
@@ -3830,6 +3852,7 @@ impl CreateCmd {
             dns: params.dns,
             network_name: params.network_name.clone(),
             gpu: params.gpu,
+            nested_virt: params.nested_virt,
             gpu_vram_mib: params.gpu_vram_mib,
             cuda: params.cuda,
             rosetta: params.rosetta,

@@ -1633,6 +1633,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // needs to expose it.
         gpu_vram_mib: None,
         cuda: spec.cuda.unwrap_or(false),
+        nested_virt: false,
         rosetta: false,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,

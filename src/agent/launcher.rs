@@ -786,6 +786,39 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Expose the host's virtualization extensions so the guest can run KVM
+        // (smolvm, QEMU, anything needing /dev/kvm). Refuse up front when the
+        // host cannot offer it: the alternative is a VM that boots fine and then
+        // fails deep inside the guest with a confusing "KVM not available".
+        if resources.nested_virt {
+            let set_nested = krun.set_nested_virt.ok_or_else(|| {
+                Error::agent(
+                    "nested virtualization",
+                    "this libkrun build has no krun_set_nested_virt; update the bundled library"
+                        .to_string(),
+                )
+            })?;
+            if let Some(check) = krun.check_nested_virt {
+                let supported = check();
+                if supported != 1 {
+                    return Err(Error::agent(
+                        "nested virtualization",
+                        format!(
+                            "the host cannot expose virtualization extensions (check returned {supported}).                              On Apple silicon this needs an M3 or newer and macOS 15+; on Linux it needs                              nested KVM enabled (kvm_intel.nested=1 or kvm_amd nested=1)."
+                        ),
+                    ));
+                }
+            }
+            let rc = set_nested(ctx, true);
+            if rc < 0 {
+                return Err(Error::agent(
+                    "nested virtualization",
+                    format!("krun_set_nested_virt failed (rc={rc})"),
+                ));
+            }
+            tracing::info!("nested virtualization enabled for the guest");
+        }
+
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).

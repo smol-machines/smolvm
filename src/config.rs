@@ -421,6 +421,12 @@ pub struct VmRecord {
     #[serde(default)]
     pub gpu: Option<bool>,
 
+    /// Expose host virtualization extensions so the guest can run KVM. Decided
+    /// at create time and persisted, like `gpu`, because it changes how the VM
+    /// is built rather than how it is used.
+    #[serde(default)]
+    pub nested_virt: Option<bool>,
+
     /// GPU shared-memory region size in MiB. `None` → default
     /// (`DEFAULT_GPU_VRAM_MIB`). Ignored unless `gpu` is true.
     #[serde(default)]
@@ -701,6 +707,7 @@ impl VmRecord {
             network,
             gpu: None,
             gpu_vram_mib: None,
+            nested_virt: None,
             rosetta: None,
             restart: RestartConfig::default(),
             last_exit_code: None,
@@ -772,6 +779,7 @@ impl VmRecord {
             network,
             gpu: None,
             gpu_vram_mib: None,
+            nested_virt: None,
             rosetta: None,
             restart,
             last_exit_code: None,
@@ -994,6 +1002,7 @@ impl VmRecord {
             gpu: self.gpu.unwrap_or(false),
             gpu_vram_mib: self.gpu_vram_mib,
             cuda: self.cuda,
+            nested_virt: self.nested_virt.unwrap_or(false),
             rosetta: self.rosetta.unwrap_or(false),
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,

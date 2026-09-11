@@ -72,6 +72,12 @@ pub struct VmResources {
     /// so unmodified CUDA/PyTorch code in the guest runs on the host GPU.
     #[serde(default)]
     pub cuda: bool,
+    /// Expose the host's virtualization extensions so the guest can run KVM --
+    /// i.e. run smolvm (or any hypervisor) inside the machine. Off by default:
+    /// nesting costs a vmexit on work the guest would otherwise do natively,
+    /// and most workloads never need it.
+    #[serde(default)]
+    pub nested_virt: bool,
     /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: bool,
@@ -170,6 +176,7 @@ impl Default for VmResources {
             gpu: false,
             gpu_vram_mib: None,
             cuda: false,
+            nested_virt: false,
             rosetta: false,
             storage_gib: None,
             overlay_gib: None,
