@@ -218,11 +218,10 @@ impl Writer {
                 if kind.is_dir() {
                     visit(writer, root, &entry.path(), result)?;
                 } else if kind.is_file() {
-                    let meta = entry.metadata()?;
                     #[cfg(unix)]
                     let mode = {
                         use std::os::unix::fs::PermissionsExt;
-                        meta.permissions().mode()
+                        entry.metadata()?.permissions().mode()
                     };
                     #[cfg(not(unix))]
                     let mode = 0o600;

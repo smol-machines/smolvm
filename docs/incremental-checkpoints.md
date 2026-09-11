@@ -43,6 +43,26 @@ for each checkpoint, while unchanged chunks are reused instead of compressed
 and written again. Savings depend on how much RAM and disk content changes.
 Capture time is not guaranteed to fall in proportion to the bytes saved.
 
+## Periodic checkpoints
+
+A timer or job runner can capture the same machine repeatedly, using the same
+store and a unique output name each time. SmolVM does not yet provide a built-in
+checkpoint scheduler or automatic age/count-based retention.
+
+Run one scheduled capture at a time per source machine. The engine locks the
+capture boundary, but releases that lock when the source resumes, so multiple
+captures can otherwise hash/compress retained generations concurrently. That
+uses additional memory and I/O rather than making a backup schedule faster.
+Set the interval from measured complete capture time, not just source pause time.
+
+Keep the previous successful checkpoint until the new command succeeds. A
+capture's success means its output has been durably published, not merely that
+the source has resumed. Delete expired checkpoint directories according to your
+retention policy, then run `checkpoint-prune`; shared objects required by other
+retained checkpoints remain intact. Capture and prune failures should be logged
+and alerted by the scheduler. This is a local storage mechanism, not an off-host
+backup service; export or copy complete checkpoints for host-failure protection.
+
 ## Move a checkpoint
 
 Copy the entire checkpoint directory, including its `objects` directory, or
