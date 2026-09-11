@@ -378,8 +378,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
         fi
     done
 
-    # libkrun.dylib links the GPU libraries at their Homebrew build paths, so
-    # its load commands carry absolute /opt/homebrew (or /usr/local) entries.
+    # libkrun.dylib links GPU libraries at either their Homebrew build paths or
+    # @rpath when it was built against the already-relocated bundled library.
     # The plain CLI masks this because smolvm-wrapper.sh exports
     # DYLD_LIBRARY_PATH before exec, but a packed launcher dlopens libkrun with
     # no such override, so dyld resolves those dependents from the host's
@@ -399,7 +399,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
         echo "Relocating libkrun dependency: $dep -> @loader_path/$leaf"
         install_name_tool -change "$dep" "@loader_path/$leaf" "$DIST_DIR/lib/libkrun.dylib"
         RELOCATED=1
-    done < <(otool -L "$DIST_DIR/lib/libkrun.dylib" | awk 'NR>1 {print $1}' | grep -E '^(/opt/homebrew|/usr/local)/' || true)
+    done < <(otool -L "$DIST_DIR/lib/libkrun.dylib" | awk 'NR>1 {print $1}' | grep -E '^(@rpath/|/opt/homebrew|/usr/local)/?' || true)
     if [[ "$RELOCATED" == "1" ]]; then
         DYLIB_SIGN_ARGS=(--force --sign "$IDENTITY")
         if [[ "$IDENTITY" != "-" ]]; then
