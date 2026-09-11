@@ -676,6 +676,28 @@ impl OciSpec {
         self.process.env.push(format!("{}{}", prefix, value));
     }
 
+    /// Expose /dev/kvm to the container if the VM has it.
+    ///
+    /// crun lays a fresh tmpfs over /dev, so a node the agent created in the
+    /// VM's /dev is invisible inside the container -- which is where a nested
+    /// hypervisor actually runs. Bind-mounted for the same reason as /dev/dri
+    /// above: it is equivalent to `--device /dev/kvm`, and mknod into crun's
+    /// tmpfs is not a workable alternative.
+    pub fn add_kvm_device_if_available(&mut self) {
+        if self.mounts.iter().any(|m| m.destination == "/dev/kvm") {
+            return;
+        }
+        if !std::path::Path::new("/dev/kvm").exists() {
+            return; // not a --nested machine, or the kernel has no KVM
+        }
+        self.mounts.push(OciMount {
+            destination: "/dev/kvm".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/kvm".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
+        });
+    }
+
     /// Expose GPU render nodes to the container if /dev/dri exists in the VM.
     ///
     /// Detects virtio-gpu devices at runtime and adds a bind mount to the OCI
@@ -1845,6 +1867,7 @@ mod tests {
         let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
         let mounts_before = spec.mounts.len();
         spec.add_gpu_devices_if_available();
+        spec.add_kvm_device_if_available();
 
         if std::path::Path::new("/dev/dri").exists() {
             // GPU present — /dev/dri bind mount was added
@@ -1872,6 +1895,7 @@ mod tests {
         });
 
         spec.add_gpu_devices_if_available();
+        spec.add_kvm_device_if_available();
 
         assert_eq!(
             spec.mounts

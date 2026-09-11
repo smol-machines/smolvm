@@ -791,6 +791,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // host cannot offer it: the alternative is a VM that boots fine and then
         // fails deep inside the guest with a confusing "KVM not available".
         if resources.nested_virt {
+            // The aarch64 guest kernel is built with CONFIG_VIRTUALIZATION unset,
+            // so it has no KVM at all: the host would happily expose EL2 and the
+            // guest would still have no /dev/kvm, failing later and confusingly
+            // inside the guest. Refuse here instead. Lift this together with the
+            // libkrunfw kernel rebuild that turns KVM on for aarch64.
+            if cfg!(target_arch = "aarch64") {
+                return Err(Error::agent(
+                    "nested virtualization",
+                    "the aarch64 guest kernel is built without KVM, so a nested \
+                     hypervisor cannot run in it yet. Use an x86_64 host, or wait \
+                     for a libkrunfw build with CONFIG_KVM enabled for aarch64."
+                        .to_string(),
+                ));
+            }
             let set_nested = krun.set_nested_virt.ok_or_else(|| {
                 Error::agent(
                     "nested virtualization",

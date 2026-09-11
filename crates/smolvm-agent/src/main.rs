@@ -3873,6 +3873,7 @@ fn write_oci_bundle(
     // storage::run_command(). Mirror that path's GPU wiring so `-i`/`-t`
     // shells see /dev/dri when the VM was started with --gpu.
     spec.add_gpu_devices_if_available();
+    spec.add_kvm_device_if_available();
 
     if container_init {
         const INIT_SOURCE: &str = "/usr/local/bin/smolvm-agent";
@@ -5094,6 +5095,7 @@ fn spawn_interactive_command(
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
     let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
     spec.add_gpu_devices_if_available();
+    spec.add_kvm_device_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = storage::volume_bind_source(tag);
