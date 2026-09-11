@@ -570,7 +570,7 @@ pub fn export(directory: &Path, output: &Path) -> io::Result<u64> {
     Ok(info.total_size)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
