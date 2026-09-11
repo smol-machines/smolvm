@@ -76,6 +76,44 @@ jobs:
           path: lib/linux-${{ matrix.arch }}/
           if-no-files-found: error
 
+  # Build the Windows host library from the same pinned source. Checkpoint
+  # support is platform-gated in smolvm, but every shipped libkrun artifact
+  # must still match the pin so an unrelated release cannot silently retain an
+  # older runtime.
+  windows-libkrun:
+    name: libkrun windows-x86_64
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,x86_64-unknown-linux-musl
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 musl-tools clang libclang-dev
+
+      - name: Build libkrun (BLK=1 NET=1)
+        run: |
+          cargo build --manifest-path libkrun/Cargo.toml --release \
+            --target x86_64-pc-windows-gnu -p libkrun --features blk,net
+          cp libkrun/target/x86_64-pc-windows-gnu/release/krun.dll \
+            lib/windows-x86_64/krun.dll
+          ./scripts/stamp-libkrun-provenance.sh lib/windows-x86_64 --skip-libkrunfw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-windows-x86_64
+          path: lib/windows-x86_64/
+          if-no-files-found: error
+
   # Cross-build the Windows libkrunfw.dll (guest kernel wrapped for a Windows
   # host) with mingw-w64 on Linux. The kernel builds with native gcc; only the
   # final bundle link uses the mingw toolchain (Makefile OS=Windows path). Only
