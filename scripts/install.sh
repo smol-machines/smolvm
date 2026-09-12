@@ -309,12 +309,12 @@ zstd_declared_size() {
 # Fail the install unless the templates the runtime will look for are present
 # and will present their full virtual size.
 #
-# The runtime resolves `<name>` before `<name>.zst`, under ~/.smolvm and beside
-# the binary, and takes the instant copy-on-write boot path only when the
-# resolved template is at least the disk type's default size. `$prefix` is both
-# of those roots for an install: it is the default prefix, and it is the
-# directory the installed binary runs from. A compressed template is measured by
-# the size its frame declares, which is what expanding it produces.
+# The runtime resolves `<name>` before `<name>.zst`, under ~/.smolvm, beside
+# the binary, and in the conf/ sibling of a bin/-layout install, and takes the
+# instant copy-on-write boot path only when the resolved template is at least
+# the disk type's default size. `$prefix` here is the directory this install
+# wrote the templates to, which is one of those roots. A compressed template is
+# measured by the size its frame declares, which is what expanding it produces.
 verify_disk_templates() {
     local prefix="$1"
     local spec name min_bytes resolved size
@@ -408,6 +408,22 @@ install_smolvm() {
         exit 1
     fi
 
+    # Tarball layout: newer releases keep executables in bin/ and disk
+    # templates in conf/; older releases (still installable via --version) are
+    # flat. The install mirrors the tarball's own layout into the prefix — the
+    # bundled wrapper resolves lib/ and agent-rootfs/ relative to itself, so
+    # the two must move together.
+    local src_bin_dir="$extracted_dir" src_conf_dir="$extracted_dir"
+    local dst_bin_dir="$prefix" dst_conf_dir="$prefix"
+    if [[ -d "$extracted_dir/bin" ]]; then
+        src_bin_dir="$extracted_dir/bin"
+        dst_bin_dir="$prefix/bin"
+    fi
+    if [[ -d "$extracted_dir/conf" ]]; then
+        src_conf_dir="$extracted_dir/conf"
+        dst_conf_dir="$prefix/conf"
+    fi
+
     # Safety: refuse to install to system directories
     case "$prefix" in
         /|/usr|/usr/*|/bin|/sbin|/lib|/lib64|/etc|/var|/opt|/tmp|/System|/System/*|/Library|/Library/*)
@@ -450,6 +466,16 @@ install_smolvm() {
         warn "$prefix/lib exists but no .version file found — skipping lib/ removal"
         warn "If this is a previous smolvm install, remove it manually first"
     fi
+    # Same guard for the bin/ and conf/ directories the newer layout writes.
+    local sub
+    for sub in bin conf; do
+        if [[ -d "$prefix/$sub" ]] && [[ -f "$prefix/.version" ]]; then
+            rm -rf "$prefix/${sub:?}"
+        elif [[ -d "$prefix/$sub" ]]; then
+            warn "$prefix/$sub exists but no .version file found — skipping removal"
+            warn "If this is a previous smolvm install, remove it manually first"
+        fi
+    done
     # An older layout bundled agent-rootfs next to the binary, and the wrapper
     # prefers that copy over the one in the data directory. Upgrades refresh the
     # data-dir copy but left this one in place, so a new binary kept booting a
@@ -477,6 +503,9 @@ install_smolvm() {
     if [[ -f "$prefix/smolvm-stub" ]]; then
         rm -f "$prefix/smolvm-stub"
     fi
+    if [[ -f "$prefix/containerd-shim-smolvm-v2" ]]; then
+        rm -f "$prefix/containerd-shim-smolvm-v2"
+    fi
     if [[ -f "$prefix/storage-template.ext4" ]]; then
         rm -f "$prefix/storage-template.ext4"
     fi
@@ -491,20 +520,21 @@ install_smolvm() {
     fi
 
     # Copy files
+    mkdir -p "$dst_bin_dir" "$dst_conf_dir"
     cp -r "$extracted_dir/lib" "$prefix/"
-    cp "$extracted_dir/smolvm" "$prefix/"
-    cp "$extracted_dir/smolvm-bin" "$prefix/"
-    chmod +x "$prefix/smolvm"
-    chmod +x "$prefix/smolvm-bin"
+    cp "$src_bin_dir/smolvm" "$dst_bin_dir/"
+    cp "$src_bin_dir/smolvm-bin" "$dst_bin_dir/"
+    chmod +x "$dst_bin_dir/smolvm"
+    chmod +x "$dst_bin_dir/smolvm-bin"
 
     # Copy the unified `smol` CLI if the distribution includes it. Older
     # engine-only tarballs won't have it; newer ones ship both.
     local has_smol=false
-    if [[ -f "$extracted_dir/smol" ]] && [[ -f "$extracted_dir/smol-bin" ]]; then
-        cp "$extracted_dir/smol" "$prefix/"
-        cp "$extracted_dir/smol-bin" "$prefix/"
-        chmod +x "$prefix/smol"
-        chmod +x "$prefix/smol-bin"
+    if [[ -f "$src_bin_dir/smol" ]] && [[ -f "$src_bin_dir/smol-bin" ]]; then
+        cp "$src_bin_dir/smol" "$dst_bin_dir/"
+        cp "$src_bin_dir/smol-bin" "$dst_bin_dir/"
+        chmod +x "$dst_bin_dir/smol"
+        chmod +x "$dst_bin_dir/smol-bin"
         has_smol=true
     fi
 
@@ -512,9 +542,9 @@ install_smolvm() {
     # tarballs only; older ones won't have it). Without this the shim ships in
     # the release but never reaches disk, so `runtimeClassName: smolvm` stays
     # out of reach for anyone who installed with this script.
-    if [[ -f "$extracted_dir/containerd-shim-smolvm-v2" ]]; then
-        cp "$extracted_dir/containerd-shim-smolvm-v2" "$prefix/"
-        chmod +x "$prefix/containerd-shim-smolvm-v2"
+    if [[ -f "$src_bin_dir/containerd-shim-smolvm-v2" ]]; then
+        cp "$src_bin_dir/containerd-shim-smolvm-v2" "$dst_bin_dir/"
+        chmod +x "$dst_bin_dir/containerd-shim-smolvm-v2"
         if [[ -d "$extracted_dir/kubernetes" ]]; then
             rm -rf "$prefix/kubernetes"
             cp -r "$extracted_dir/kubernetes" "$prefix/"
@@ -525,15 +555,15 @@ install_smolvm() {
     # Copy disk templates if present. Releases ship them zstd-compressed, and
     # the runtime expands a `.zst` next to itself on first use, so either form
     # is usable; prefer the compressed one the tarball actually carries.
-    if [[ -f "$extracted_dir/storage-template.ext4.zst" ]]; then
-        cp "$extracted_dir/storage-template.ext4.zst" "$prefix/"
-    elif [[ -f "$extracted_dir/storage-template.ext4" ]]; then
-        cp "$extracted_dir/storage-template.ext4" "$prefix/"
+    if [[ -f "$src_conf_dir/storage-template.ext4.zst" ]]; then
+        cp "$src_conf_dir/storage-template.ext4.zst" "$dst_conf_dir/"
+    elif [[ -f "$src_conf_dir/storage-template.ext4" ]]; then
+        cp "$src_conf_dir/storage-template.ext4" "$dst_conf_dir/"
     fi
-    if [[ -f "$extracted_dir/overlay-template.ext4.zst" ]]; then
-        cp "$extracted_dir/overlay-template.ext4.zst" "$prefix/"
-    elif [[ -f "$extracted_dir/overlay-template.ext4" ]]; then
-        cp "$extracted_dir/overlay-template.ext4" "$prefix/"
+    if [[ -f "$src_conf_dir/overlay-template.ext4.zst" ]]; then
+        cp "$src_conf_dir/overlay-template.ext4.zst" "$dst_conf_dir/"
+    elif [[ -f "$src_conf_dir/overlay-template.ext4" ]]; then
+        cp "$src_conf_dir/overlay-template.ext4" "$dst_conf_dir/"
     fi
 
     # Size the disk templates to their default virtual size at install time, so
@@ -545,12 +575,12 @@ install_smolvm() {
     # case the runtime safely falls back to the copy path. The sizes mirror
     # DEFAULT_STORAGE_SIZE_GIB (20) and DEFAULT_OVERLAY_SIZE_GIB (10).
     if [[ "$(uname -s)" == "Linux" ]] && command -v truncate >/dev/null 2>&1; then
-        [[ -f "$prefix/storage-template.ext4" ]] && truncate -s 20G "$prefix/storage-template.ext4"
-        [[ -f "$prefix/overlay-template.ext4" ]] && truncate -s 10G "$prefix/overlay-template.ext4"
+        [[ -f "$dst_conf_dir/storage-template.ext4" ]] && truncate -s 20G "$dst_conf_dir/storage-template.ext4"
+        [[ -f "$dst_conf_dir/overlay-template.ext4" ]] && truncate -s 10G "$dst_conf_dir/overlay-template.ext4"
     fi
 
     # Templates are final here; nothing installed later touches them.
-    if ! verify_disk_templates "$prefix"; then
+    if ! verify_disk_templates "$dst_conf_dir"; then
         rm -rf "$tmp_dir"
         exit 1
     fi
@@ -573,12 +603,17 @@ install_smolvm() {
         warn "agent-rootfs not found in distribution - some features may not work"
     fi
 
-    # Copy init.krun if present (Linux only, required by libkrunfw kernel)
-    if [[ -f "$extracted_dir/init.krun" ]]; then
-        info "Installing init.krun to $data_dir..."
-        cp "$extracted_dir/init.krun" "$data_dir/init.krun"
-        chmod +x "$data_dir/init.krun"
-    fi
+    # Copy init.krun if present (Linux only, required by libkrunfw kernel).
+    # Newer tarballs carry it in lib/, older ones at the root.
+    local init_krun
+    for init_krun in "$extracted_dir/lib/init.krun" "$extracted_dir/init.krun"; do
+        if [[ -f "$init_krun" ]]; then
+            info "Installing init.krun to $data_dir..."
+            cp "$init_krun" "$data_dir/init.krun"
+            chmod +x "$data_dir/init.krun"
+            break
+        fi
+    done
 
     # Store version info
     echo "$version" > "$prefix/.version"
@@ -595,8 +630,8 @@ install_smolvm() {
             xattr -dr com.apple.quarantine "$prefix" 2>/dev/null || true
         fi
         if command -v codesign &> /dev/null; then
-            local _sig_bin="$prefix/smolvm-bin"
-            [[ "$has_smol" == true ]] && _sig_bin="$prefix/smol-bin"
+            local _sig_bin="$dst_bin_dir/smolvm-bin"
+            [[ "$has_smol" == true ]] && _sig_bin="$dst_bin_dir/smol-bin"
             if ! codesign --verify --deep "$_sig_bin" 2>/dev/null; then
                 warn "The installed binary is not validly code-signed."
                 warn "It needs the com.apple.security.hypervisor entitlement to start VMs."
@@ -610,9 +645,9 @@ install_smolvm() {
     # Create symlinks in bin directory. `smol` is the primary, user-facing CLI;
     # `smolvm` remains available as the lower-level engine command.
     mkdir -p "$BIN_DIR"
-    ln -sf "$prefix/smolvm" "$BIN_DIR/smolvm"
+    ln -sf "$dst_bin_dir/smolvm" "$BIN_DIR/smolvm"
     if [[ "$has_smol" == true ]]; then
-        ln -sf "$prefix/smol" "$BIN_DIR/smol"
+        ln -sf "$dst_bin_dir/smol" "$BIN_DIR/smol"
         success "smol $version installed to $prefix (also installed: smolvm)"
     else
         success "smolvm $version installed to $prefix"

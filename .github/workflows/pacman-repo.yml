@@ -136,6 +136,10 @@ jobs:
             rm -rf pkgroot
             mkdir pkgroot
             tar -xzf tarball.tgz --strip-components=1 -C pkgroot
+            # 1.15+ tarballs keep executables in bin/ and templates in conf/;
+            # flatten so the nfpm file map works for both layouts.
+            if [ -d pkgroot/bin ]; then mv pkgroot/bin/* pkgroot/ && rmdir pkgroot/bin; fi
+            if [ -d pkgroot/conf ]; then mv pkgroot/conf/* pkgroot/ && rmdir pkgroot/conf; fi
             cp packaging/deb/copyright pkgroot/copyright
             sed -i \
               -e 's|^SMOLVM_BIN=.*|SMOLVM_BIN=/usr/lib/smolvm/smolvm-bin|' \

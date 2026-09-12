@@ -260,7 +260,16 @@ pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            // Beside the executable: the Windows release and pre-bin/ Unix
+            // dists ship templates flat next to the binary.
             roots.push(dir.to_path_buf());
+            // The bin/ dist layout keeps executables in bin/ with the
+            // templates in a conf/ sibling (and installs migrated from the
+            // flat layout may still hold them at the install root).
+            if let Some(root) = dir.parent() {
+                roots.push(root.join("conf"));
+                roots.push(root.to_path_buf());
+            }
         }
     }
 

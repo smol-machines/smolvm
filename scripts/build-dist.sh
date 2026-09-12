@@ -327,17 +327,19 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     fi
 fi
 
-# Create distribution directory
+# Create distribution directory. Executables live in bin/, disk templates in
+# conf/, libraries in lib/, so the tarball root holds only directories and the
+# informational files (README.txt, checksums.txt). See issue #1069.
 echo "Creating distribution package..."
 rm -rf "$DIST_DIR"
-mkdir -p "$DIST_DIR/lib"
+mkdir -p "$DIST_DIR/bin" "$DIST_DIR/conf" "$DIST_DIR/lib"
 
 # Copy binary (renamed to smolvm-bin)
-cp ./target/release/smolvm "$DIST_DIR/smolvm-bin"
+cp ./target/release/smolvm "$DIST_DIR/bin/smolvm-bin"
 
 # Copy wrapper script
-cp ./scripts/smolvm-wrapper.sh "$DIST_DIR/smolvm"
-chmod +x "$DIST_DIR/smolvm"
+cp ./scripts/smolvm-wrapper.sh "$DIST_DIR/bin/smolvm"
+chmod +x "$DIST_DIR/bin/smolvm"
 
 # Kubernetes runtime: the containerd shim plus everything needed to register
 # it. Shipping these means `runtimeClassName: smolvm` is reachable from a
@@ -345,8 +347,8 @@ chmod +x "$DIST_DIR/smolvm"
 # the feature was invisible to anyone who installed the normal way.
 if [[ "$(uname -s)" == "Linux" ]]; then
     mkdir -p "$DIST_DIR/kubernetes"
-    cp ./target/release/containerd-shim-smolvm-v2 "$DIST_DIR/containerd-shim-smolvm-v2"
-    chmod +x "$DIST_DIR/containerd-shim-smolvm-v2"
+    cp ./target/release/containerd-shim-smolvm-v2 "$DIST_DIR/bin/containerd-shim-smolvm-v2"
+    chmod +x "$DIST_DIR/bin/containerd-shim-smolvm-v2"
     cp ./scripts/install-k8s-runtime.sh "$DIST_DIR/kubernetes/"
     chmod +x "$DIST_DIR/kubernetes/install-k8s-runtime.sh"
     cp ./deploy/kubernetes/runtimeclass.yaml ./deploy/kubernetes/example-pod.yaml "$DIST_DIR/kubernetes/"
@@ -357,9 +359,9 @@ fi
 # The wrapper points at the same lib/ and agent-rootfs, so one tarball serves
 # both `smol` (the user-facing CLI) and `smolvm` (the lower-level engine).
 if [[ "$BUILD_SMOL" == "1" ]]; then
-    cp ./smol/target/release/smol "$DIST_DIR/smol-bin"
-    cp ./scripts/smol-wrapper.sh "$DIST_DIR/smol"
-    chmod +x "$DIST_DIR/smol"
+    cp ./smol/target/release/smol "$DIST_DIR/bin/smol-bin"
+    cp ./scripts/smol-wrapper.sh "$DIST_DIR/bin/smol"
+    chmod +x "$DIST_DIR/bin/smol"
 fi
 
 # Copy libraries
@@ -493,8 +495,8 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 
     if [[ -n "$INIT_KRUN" ]]; then
         echo "Copying init.krun from $INIT_KRUN..."
-        cp "$INIT_KRUN" "$DIST_DIR/init.krun"
-        chmod +x "$DIST_DIR/init.krun"
+        cp "$INIT_KRUN" "$DIST_DIR/lib/init.krun"
+        chmod +x "$DIST_DIR/lib/init.krun"
 
         # init.krun runs as the guest PID 1, so it must match the target arch.
         # libkrun/init/init is a committed binary that does NOT track the build
@@ -507,7 +509,7 @@ if [[ "$(uname -s)" == "Linux" ]]; then
             aarch64|arm64) want="aarch64" ;;
             *)       want="" ;;
         esac
-        init_desc="$(file -b "$DIST_DIR/init.krun")"
+        init_desc="$(file -b "$DIST_DIR/lib/init.krun")"
         if [[ -n "$want" ]] && [[ "$init_desc" != *"$want"* ]]; then
             echo "ERROR: init.krun is the wrong architecture for a $host_arch build." >&2
             echo "       expected '$want', got: $init_desc" >&2
@@ -550,7 +552,7 @@ echo "Agent rootfs size: $(du -sh "$DIST_DIR/agent-rootfs" | cut -f1)"
 # This eliminates the e2fsprogs dependency for end users
 echo "Creating storage template..."
 TEMPLATE_SIZE=$((512 * 1024 * 1024))  # 512MB
-TEMPLATE_PATH="$DIST_DIR/storage-template.ext4"
+TEMPLATE_PATH="$DIST_DIR/conf/storage-template.ext4"
 
 # Find mkfs.ext4
 MKFS_PATHS=(
@@ -600,7 +602,7 @@ else
     echo "Storage template created: $(du -h "$TEMPLATE_PATH" | cut -f1) physical (20 GiB virtual)"
 
     # Create overlay template (same format, different label)
-    OVERLAY_TEMPLATE_PATH="$DIST_DIR/overlay-template.ext4"
+    OVERLAY_TEMPLATE_PATH="$DIST_DIR/conf/overlay-template.ext4"
     dd if=/dev/zero of="$OVERLAY_TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
     "$MKFS_BIN" -F -q -m 0 -L smolvm-overlay "$OVERLAY_TEMPLATE_PATH"
     # Size to the default overlay virtual size (DEFAULT_OVERLAY_SIZE_GIB=10).
@@ -639,15 +641,23 @@ INSTALLATION
    tar -xzf smolvm-*.tar.gz
    cd smolvm-*
 
-2. Run the smolvm wrapper script. It automatically uses the bundled
-   agent-rootfs/ directory when present.
+2. Run bin/smolvm. The wrapper automatically uses the bundled lib/ and
+   agent-rootfs/ directories.
 
 3. (Optional) Add to PATH:
    # Add to ~/.bashrc or ~/.zshrc:
-   export PATH="/path/to/smolvm-directory:$PATH"
+   export PATH="/path/to/smolvm-directory/bin:$PATH"
 
 4. (Optional) Create a symlink:
-   sudo ln -s /path/to/smolvm-directory/smolvm /usr/local/bin/smolvm
+   sudo ln -s /path/to/smolvm-directory/bin/smolvm /usr/local/bin/smolvm
+
+LAYOUT
+======
+
+  bin/           smolvm (wrapper), smolvm-bin, and any bundled CLIs
+  conf/          pre-formatted disk templates (storage/overlay, zstd)
+  lib/           libkrun, libkrunfw, and the other bundled libraries
+  agent-rootfs/  the guest agent's root filesystem
 
 PREREQUISITES
 =============
@@ -663,15 +673,15 @@ Linux:
 USAGE
 =====
 
-Run the 'smolvm' script (not smolvm-bin directly):
+Run the 'bin/smolvm' script (not smolvm-bin directly):
 
-  ./smolvm machine run --net --image alpine -- echo "Hello World"
-  ./smolvm machine create --net --name myvm
-  ./smolvm machine start --name myvm
-  ./smolvm machine exec --name myvm -- /bin/sh
-  ./smolvm machine ls
-  ./smolvm machine stop --name myvm
-  ./smolvm machine delete --name myvm
+  ./bin/smolvm machine run --net --image alpine -- echo "Hello World"
+  ./bin/smolvm machine create --net --name myvm
+  ./bin/smolvm machine start --name myvm
+  ./bin/smolvm machine exec --name myvm -- /bin/sh
+  ./bin/smolvm machine ls
+  ./bin/smolvm machine stop --name myvm
+  ./bin/smolvm machine delete --name myvm
 
 TROUBLESHOOTING
 ===============
@@ -702,7 +712,7 @@ else
     echo "Error: neither sha256sum nor shasum found; cannot generate checksums" >&2
     exit 1
 fi
-(cd "$DIST_DIR" && "${SHA256_CMD[@]}" smolvm smolvm-bin lib/* > checksums.txt)
+(cd "$DIST_DIR" && "${SHA256_CMD[@]}" bin/smolvm bin/smolvm-bin lib/* > checksums.txt)
 
 # Delete existing tarball. This is because when a new release is created, there could be 
 # tarball of the old release left in dist/, and ./install-local.sh may pick up the wrong tarball

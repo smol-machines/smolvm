@@ -1034,14 +1034,23 @@ impl AgentManager {
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf))
         {
-            let dir = exe_dir.join("agent-rootfs");
-            if dir.is_dir() {
-                return Ok(dir);
+            // Beside the executable (Windows and pre-bin/ Unix dists), then one
+            // level up (the bin/ dist layout keeps agent-rootfs/ at the root,
+            // beside bin/).
+            let mut candidates = vec![exe_dir.clone()];
+            if let Some(root) = exe_dir.parent() {
+                candidates.push(root.to_path_buf());
             }
-            for name in ["agent-rootfs.tar.gz", "agent-rootfs.tar"] {
-                let tar = exe_dir.join(name);
-                if tar.is_file() {
-                    return Self::ensure_extracted_rootfs(&tar);
+            for base in &candidates {
+                let dir = base.join("agent-rootfs");
+                if dir.is_dir() {
+                    return Ok(dir);
+                }
+                for name in ["agent-rootfs.tar.gz", "agent-rootfs.tar"] {
+                    let tar = base.join(name);
+                    if tar.is_file() {
+                        return Self::ensure_extracted_rootfs(&tar);
+                    }
                 }
             }
         }
@@ -2452,6 +2461,10 @@ impl AgentManager {
             if let Some(parent) = boot_exe.parent() {
                 search.push(parent.to_path_buf());
                 search.push(parent.join("lib"));
+                // The bin/ dist layout keeps lib/ beside bin/, not inside it.
+                if let Some(root) = parent.parent() {
+                    search.push(root.join("lib"));
+                }
             }
             let var = if cfg!(target_os = "macos") {
                 "DYLD_LIBRARY_PATH"

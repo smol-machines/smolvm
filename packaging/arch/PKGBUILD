@@ -65,21 +65,27 @@ package() {
     esac
     cd "$_dir"
 
+    # 1.15+ tarballs keep executables in bin/ and disk templates in conf/;
+    # older ones are flat. Resolve once so this PKGBUILD builds either.
+    local _bindir=. _confdir=.
+    [[ -d bin ]] && _bindir=bin
+    [[ -d conf ]] && _confdir=conf
+
     # Point the wrapper at the packaged locations instead of script-relative ones
     sed -i \
         -e 's|^SMOLVM_BIN=.*|SMOLVM_BIN=/usr/lib/smolvm/smolvm-bin|' \
         -e 's|^SMOLVM_LIB=.*|SMOLVM_LIB=/usr/lib/smolvm/lib|' \
         -e 's|^SMOLVM_BUNDLED_ROOTFS=.*|SMOLVM_BUNDLED_ROOTFS=/usr/lib/smolvm/agent-rootfs|' \
-        smolvm
+        "$_bindir/smolvm"
 
-    install -Dm0755 smolvm "$pkgdir/usr/bin/smolvm"
-    install -Dm0755 smolvm-bin "$pkgdir/usr/lib/smolvm/smolvm-bin"
+    install -Dm0755 "$_bindir/smolvm" "$pkgdir/usr/bin/smolvm"
+    install -Dm0755 "$_bindir/smolvm-bin" "$pkgdir/usr/lib/smolvm/smolvm-bin"
     cp -a lib "$pkgdir/usr/lib/smolvm/lib"
     cp -r agent-rootfs "$pkgdir/usr/lib/smolvm/agent-rootfs"
     # pre-formatted disk templates, zstd-compressed (optional at runtime; the
     # engine expands them to sparse files on first use, saving a mkfs)
-    install -Dm644 storage-template.ext4.zst "$pkgdir/usr/lib/smolvm/storage-template.ext4.zst"
-    install -Dm644 overlay-template.ext4.zst "$pkgdir/usr/lib/smolvm/overlay-template.ext4.zst"
+    install -Dm644 "$_confdir/storage-template.ext4.zst" "$pkgdir/usr/lib/smolvm/storage-template.ext4.zst"
+    install -Dm644 "$_confdir/overlay-template.ext4.zst" "$pkgdir/usr/lib/smolvm/overlay-template.ext4.zst"
     install -Dm644 "../LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 README.txt "$pkgdir/usr/share/doc/$pkgname/README.txt"
 }
