@@ -2131,6 +2131,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                     Ok(req) => (req, None),
                     Err(e) => {
                         warn!(error = %e, "invalid request");
+                        // Keep the "invalid request: " prefix stable: the host
+                        // recognizes "invalid request: unknown variant `…`" as
+                        // a protocol-version skew and rewrites it into an
+                        // update-the-agent message (client.rs
+                        // `describe_agent_error`).
                         send_response(
                             stream,
                             &AgentResponse::error(
