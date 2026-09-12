@@ -91,6 +91,11 @@ pub struct VmResources {
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Denied egress CIDR ranges, evaluated before the allow list: a
+    /// destination inside one is refused even when `allowed_cidrs` or a
+    /// learned `--allow-host` IP covers it. None = no deny list.
+    #[serde(default)]
+    pub denied_cidrs: Option<Vec<String>>,
     /// Custom DNS resolver for the guest. None = backend default.
     ///
     /// Under TSI this becomes the guest's `/etc/resolv.conf` nameserver (the
@@ -182,6 +187,7 @@ impl Default for VmResources {
             overlay_gib: None,
             block_io: BlockIoEngine::Sync,
             allowed_cidrs: None,
+            denied_cidrs: None,
             dns: None,
             network_name: None,
         }

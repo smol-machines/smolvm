@@ -176,6 +176,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--tty` | `-t` | run, exec | Allocate pseudo-TTY |
 | `--allow-cidr` | | run, create | CIDR egress filter (implies --net) |
 | `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
+| `--deny-cidr` | | run, create | CIDR egress deny list, checked before the allow rules (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
 
 ## Smolfile Reference
@@ -203,6 +204,7 @@ overlay = 4                           # overlay disk GiB (default: 2)
 [network]
 allow_hosts = ["api.stripe.com"]      # resolved at VM start (implies net)
 allow_cidrs = ["10.0.0.0/8"]         # IP/CIDR ranges (implies net)
+deny_cidrs = ["192.168.0.0/16"]      # denied before the allow rules (implies net)
 
 # Dev profile (used by `machine run` and `machine create`)
 [dev]
@@ -259,9 +261,10 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `--allow-host api.stripe.com` enables egress only to resolved IPs of that hostname (implies `--net`). Also enables DNS filtering — only allowed hostnames can be resolved.
 - `--allow-cidr 10.0.0.0/8` enables egress only to specified IP ranges (implies `--net`)
 - `--allow-host` and `--allow-cidr` can be combined and used multiple times
+- `--deny-cidr 192.168.0.0/16` blocks egress to the given range (implies `--net`). Deny rules are evaluated first: a destination inside a denied range is unreachable even when an allow rule covers it. A deny list can be used alone (everything else stays reachable) or with allow rules to carve holes out of them.
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP)
-- Smolfile: use `[network] allow_hosts` and `[network] allow_cidrs`
+- Smolfile: use `[network] allow_hosts`, `[network] allow_cidrs`, and `[network] deny_cidrs`
 
 ### Proxy Support
 

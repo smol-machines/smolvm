@@ -424,6 +424,9 @@ pub struct CheckpointNetwork {
     /// Captured outbound CIDR allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Captured outbound CIDR deny-list, evaluated before the allow rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied_cidrs: Option<Vec<String>>,
     /// Captured outbound DNS hostname allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,

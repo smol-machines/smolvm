@@ -1087,6 +1087,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // temporary allowed IPs. The guest-side DNS proxy is left off
                 // (see below) so those queries leave as real UDP datagrams.
                 let egress_hosts = egress_refresh_hosts.clone().unwrap_or_default();
+                // The deny list is enforced only by the host-side virtio-net
+                // gateway; libkrun's TSI filter has no deny support. The plan
+                // and validation force virtio-net whenever one is set, so
+                // reaching TSI with a deny list is a bug — fail closed rather
+                // than boot a VM that silently ignores it.
+                if resources
+                    .denied_cidrs
+                    .as_ref()
+                    .is_some_and(|cidrs| !cidrs.is_empty())
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "set egress policy",
+                        "a deny-CIDR list requires the virtio-net backend; TSI does not enforce it. \
+                         Remove the deny list or set --net-backend virtio-net",
+                    ));
+                }
                 if resources.allowed_cidrs.is_some() || !egress_hosts.is_empty() {
                     let Some(set_egress) = krun.set_egress_policy else {
                         krun_free_ctx(ctx);
@@ -1239,7 +1256,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 let mut egress = smolvm_network::EgressPolicy::new(
                     resources.allowed_cidrs.as_deref(),
                     egress_refresh_hosts.as_deref(),
-                );
+                )
+                .with_denied_cidrs(resources.denied_cidrs.as_deref())
+                .map_err(|e| {
+                    krun_free_ctx(ctx);
+                    Error::agent("set egress policy", e)
+                })?;
                 if let Some(path) = denial_log {
                     egress = egress.with_denial_log(path);
                 }

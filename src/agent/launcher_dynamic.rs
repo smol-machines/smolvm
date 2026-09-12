@@ -411,6 +411,21 @@ pub fn launch_agent_vm_dynamic(
             // trusted resolver and A/AAAA answers for allowed hosts become
             // temporarily allowed IPs.
             let egress_hosts = config.dns_filter_hosts.clone().unwrap_or_default();
+            // The deny list is enforced only by the host-side virtio-net
+            // gateway; libkrun's TSI filter has no deny support. Backend
+            // planning forces virtio-net whenever one is set, so fail closed
+            // rather than boot a VM that silently ignores it.
+            if config
+                .resources
+                .denied_cidrs
+                .as_ref()
+                .is_some_and(|cidrs| !cidrs.is_empty())
+            {
+                free_ctx_on_err!(
+                    "a deny-CIDR list requires the virtio-net backend; TSI does not enforce it. \
+                     Remove the deny list or set --net-backend virtio-net"
+                );
+            }
             let has_cidrs = config
                 .resources
                 .allowed_cidrs
@@ -494,10 +509,15 @@ pub fn launch_agent_vm_dynamic(
                 .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
                 .collect();
             // Denial sink beside the vsock socket, mirroring the static launcher.
-            let mut egress = smolvm_network::EgressPolicy::new(
+            let mut egress = match smolvm_network::EgressPolicy::new(
                 config.resources.allowed_cidrs.as_deref(),
                 config.dns_filter_hosts.as_deref(),
-            );
+            )
+            .with_denied_cidrs(config.resources.denied_cidrs.as_deref())
+            {
+                Ok(egress) => egress,
+                Err(e) => free_ctx_on_err!(e),
+            };
             if let Some(dir) = config.vsock_socket.parent() {
                 egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
             }

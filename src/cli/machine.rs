@@ -126,6 +126,18 @@ fn smolmachine_egress_fields(
     )
 }
 
+/// `--deny-cidr` for the .smolmachine create path: empty -> None, like the
+/// allow list in [`smolmachine_egress_fields`]. A deny list also implies
+/// networking, matching the flag's behavior on the other create paths.
+fn smolmachine_deny_fields(deny_cidrs: &[String]) -> (bool, Option<Vec<String>>) {
+    let denied_cidrs = if deny_cidrs.is_empty() {
+        None
+    } else {
+        Some(deny_cidrs.to_vec())
+    };
+    (denied_cidrs.is_some(), denied_cidrs)
+}
+
 /// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
 /// into validated [`SecretRef`]s keyed by the guest-side env var name.
 ///
@@ -475,7 +487,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "deny_cidr", "outbound_localhost_only", "secret_env", "secret_file"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -585,6 +597,11 @@ pub struct RunCmd {
     /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
     pub allow_host: Vec<String>,
+
+    /// Deny egress to specific CIDR range, evaluated before the allow rules
+    /// (can be used multiple times, implies --net)
+    #[arg(long = "deny-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
+    pub deny_cidr: Vec<String>,
 
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long, help_heading = "Network")]
@@ -1025,6 +1042,10 @@ fn ensure_init_layer(
             create.push("--allow-cidr".into());
             create.push(c.clone());
         }
+        for c in params.denied_cidrs.iter().flatten() {
+            create.push("--deny-cidr".into());
+            create.push(c.clone());
+        }
         for h in params.dns_filter_hosts.iter().flatten() {
             create.push("--allow-host".into());
             create.push(h.clone());
@@ -1243,6 +1264,7 @@ impl RunCmd {
             self.overlay,
             self.block_io,
             cli_allow_cidrs,
+            self.deny_cidr.clone(),
             // Ephemeral runs are not addressable later, so they carry no labels;
             // `machine create` is the path an orchestrator labels.
             Default::default(),
@@ -1334,6 +1356,7 @@ impl RunCmd {
                     egress: Some(crate::cli::pack_run::ResolvedEgressPolicy {
                         network_override: None,
                         allowed_cidrs: params.allowed_cidrs.clone(),
+                        denied_cidrs: params.denied_cidrs.clone(),
                         dns_filter_hosts: params.dns_filter_hosts.clone(),
                     }),
                 }
@@ -1455,6 +1478,7 @@ impl RunCmd {
                 egress: Some(crate::cli::pack_run::ResolvedEgressPolicy {
                     network_override: Some(params.net),
                     allowed_cidrs: params.allowed_cidrs.clone(),
+                    denied_cidrs: params.denied_cidrs.clone(),
                     dns_filter_hosts: params.dns_filter_hosts.clone(),
                 }),
             }
@@ -1571,6 +1595,7 @@ impl RunCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            denied_cidrs: params.denied_cidrs.clone(),
             block_io: params.block_io,
         };
         validate_requested_network_backend(
@@ -3288,6 +3313,11 @@ pub struct CreateCmd {
     #[arg(long = "allow-host", value_name = "HOSTNAME")]
     pub allow_host: Vec<String>,
 
+    /// Deny egress to specific CIDR range, evaluated before the allow rules
+    /// (can be used multiple times, implies --net)
+    #[arg(long = "deny-cidr", value_parser = parse_cidr, value_name = "CIDR")]
+    pub deny_cidr: Vec<String>,
+
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long)]
     pub outbound_localhost_only: bool,
@@ -3473,6 +3503,7 @@ impl CreateCmd {
             self.overlay,
             self.block_io,
             cli_allow_cidrs,
+            self.deny_cidr.clone(),
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
@@ -3530,6 +3561,7 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            denied_cidrs: params.denied_cidrs.clone(),
             block_io: params.block_io,
         };
         // Reject zero-valued resources before the machine is persisted.
@@ -3588,6 +3620,7 @@ impl CreateCmd {
                 || self.network_name.is_some()
                 || !self.allow_cidr.is_empty()
                 || !self.allow_host.is_empty()
+                || !self.deny_cidr.is_empty()
                 || self.outbound_localhost_only
                 || self.gpu
                 || self.gpu_vram_mib.is_some()
@@ -3693,6 +3726,8 @@ impl CreateCmd {
             cli_network,
             cli_dns_filter_hosts,
         );
+        let (deny_implies_net, denied_cidrs) = smolmachine_deny_fields(&self.deny_cidr);
+        let network = network || deny_implies_net;
         let checkpoint_network = checkpoint
             .as_ref()
             .and_then(|checkpoint| checkpoint.network.as_ref());
@@ -3702,6 +3737,9 @@ impl CreateCmd {
         let allowed_cidrs = checkpoint_network
             .and_then(|captured| captured.allowed_cidrs.clone())
             .or(allowed_cidrs);
+        let denied_cidrs = checkpoint_network
+            .and_then(|captured| captured.denied_cidrs.clone())
+            .or(denied_cidrs);
         let dns_filter_hosts = checkpoint_network
             .and_then(|captured| captured.dns_filter_hosts.clone())
             .or(dns_filter_hosts);
@@ -3800,6 +3838,7 @@ impl CreateCmd {
                 .or(self.overlay),
             block_io: self.block_io.unwrap_or_default(),
             allowed_cidrs,
+            denied_cidrs,
             restart_policy: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.workload.as_ref())
@@ -3860,6 +3899,7 @@ impl CreateCmd {
             overlay_gib: params.overlay_gb,
             block_io: params.block_io,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            denied_cidrs: params.denied_cidrs.clone(),
         };
         resources.validate()?;
         validate_requested_network_backend(
@@ -5003,6 +5043,10 @@ impl UpdateCmd {
                 if r.allowed_cidrs.is_some() {
                     changes.push("  cleared allow_cidrs".to_string());
                     r.allowed_cidrs = None;
+                }
+                if r.denied_cidrs.is_some() {
+                    changes.push("  cleared deny_cidrs".to_string());
+                    r.denied_cidrs = None;
                 }
                 if r.dns_filter_hosts.is_some() {
                     changes.push("  cleared dns_filter_hosts".to_string());

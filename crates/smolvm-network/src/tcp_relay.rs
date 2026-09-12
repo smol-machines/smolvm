@@ -308,6 +308,24 @@ impl TcpRelayTable {
                 .record_denial("connect", &format_args!("to {destination}"));
             return false;
         }
+        // The guest reaches host-local services by addressing its gateway,
+        // which `host_connect_addr` redirects to the host's loopback. The
+        // check above gated the guest-visible destination; the deny list must
+        // also hold for the address actually dialed, so denying 127.0.0.0/8
+        // closes the host door regardless of which name the guest used for it.
+        let connect_addr = self.host_connect_addr(destination);
+        if connect_addr.ip() != destination.ip() && self.egress.denies(connect_addr.ip()) {
+            tracing::debug!(
+                %destination,
+                %connect_addr,
+                "virtio-net: blocking outbound connection by egress deny on the dialed address"
+            );
+            self.egress.record_denial(
+                "connect",
+                &format_args!("to {destination} (dials {connect_addr})"),
+            );
+            return false;
+        }
 
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
@@ -339,7 +357,7 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: RelayTarget::Connect(self.host_connect_addr(destination)),
+                    relay_target: RelayTarget::Connect(connect_addr),
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -995,6 +1013,34 @@ mod tests {
             table.host_connect_addr(SocketAddr::new(lan, 3306)),
             SocketAddr::new(lan, 3306),
         );
+    }
+
+    #[test]
+    fn deny_on_loopback_closes_the_gateway_host_door() {
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let egress = EgressPolicy::unrestricted()
+            .with_denied_cidrs(Some(&["127.0.0.0/8".into()]))
+            .unwrap();
+        let mut table = TcpRelayTable::new(None, egress, vec![gateway], None);
+        let mut sockets = SocketSet::new(vec![]);
+        let guest: SocketAddr = "100.96.0.2:40000".parse().unwrap();
+
+        // The guest-visible destination (its gateway address) is not itself
+        // denied, but the relay dials 127.0.0.1 for it — the deny must hold
+        // against the dialed address too, or denying loopback would be a no-op
+        // for the host door.
+        assert!(!table.create_tcp_socket(guest, SocketAddr::new(gateway, 8080), &mut sockets));
+
+        // External destinations are unaffected by a loopback deny.
+        assert!(table.create_tcp_socket(guest, "1.1.1.1:443".parse().unwrap(), &mut sockets));
+
+        // Denying the gateway range itself blocks the door at the
+        // guest-visible address as well.
+        let denied_gw = EgressPolicy::unrestricted()
+            .with_denied_cidrs(Some(&["100.96.0.0/30".into()]))
+            .unwrap();
+        let mut table = TcpRelayTable::new(None, denied_gw, vec![gateway], None);
+        assert!(!table.create_tcp_socket(guest, SocketAddr::new(gateway, 8080), &mut sockets));
     }
 
     #[test]

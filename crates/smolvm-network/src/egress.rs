@@ -6,6 +6,9 @@
 //! (`TcpRelayTable::create_tcp_socket`). This mirrors libkrun's `vsock/dns_filter.rs`
 //! `EgressPolicy` so both backends behave identically:
 //!
+//! - static `denied_cidrs` (IPv4 or IPv6) are always refused, before any other
+//!   rule — an allow-list entry, a learned DNS IP, or the local floor's
+//!   loopback re-open never overrides a deny;
 //! - static `allowed_cidrs` (IPv4 or IPv6) are always permitted;
 //! - `--allow-host` names are matched by the gateway's DNS interception, and the
 //!   A/AAAA records of allowed answers are *learned* as temporarily-allowed IPs
@@ -239,6 +242,10 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
 #[derive(Clone)]
 pub struct EgressPolicy {
     inner: Option<Arc<AllowList>>,
+    /// Denied CIDRs, evaluated before every other rule. A destination inside
+    /// one is refused even when an allow-list entry or learned DNS IP covers
+    /// it, and a deny list is enforced with or without an allow list.
+    denied: Arc<Vec<Cidr>>,
     /// Hard-floor scope, resolved once from the deployment context at creation.
     floor: FloorMode,
     /// Audit sink for denials. When set, every denied connect/sendto/resolve is
@@ -252,6 +259,7 @@ impl EgressPolicy {
     pub fn unrestricted() -> Self {
         Self {
             inner: None,
+            denied: Arc::new(Vec::new()),
             floor: floor_mode(),
             denial_log: None,
         }
@@ -288,9 +296,28 @@ impl EgressPolicy {
                 allowed_hosts,
                 learned: Mutex::new(HashMap::new()),
             })),
+            denied: Arc::new(Vec::new()),
             floor: floor_mode(),
             denial_log: None,
         }
+    }
+
+    /// Attach the denied CIDRs (`--deny-cidr` / `[network] deny_cidrs`). Works
+    /// on both a restricted and an unrestricted policy: a deny list alone
+    /// leaves every other destination allowed. Entries are validated at the
+    /// CLI/Smolfile/API boundary; an unparseable one that still reaches here
+    /// is a hard error rather than a skip, because silently dropping a DENY
+    /// entry would widen the policy.
+    pub fn with_denied_cidrs(mut self, denied_cidrs: Option<&[String]>) -> Result<Self, String> {
+        let mut denied = Vec::new();
+        for spec in denied_cidrs.unwrap_or(&[]) {
+            match Cidr::parse(spec) {
+                Some(cidr) => denied.push(cidr),
+                None => return Err(format!("unparseable egress deny CIDR '{spec}'")),
+            }
+        }
+        self.denied = Arc::new(denied);
+        Ok(self)
     }
 
     /// Convenience for the CIDR-only case.
@@ -340,7 +367,7 @@ impl EgressPolicy {
 
     /// Whether any policy is in force (false = allow-all).
     pub fn is_restricted(&self) -> bool {
-        self.inner.is_some()
+        self.inner.is_some() || !self.denied.is_empty()
     }
 
     /// Whether the gateway should DNS-filter queries (an allow-host list is set).
@@ -362,8 +389,31 @@ impl EgressPolicy {
         }
     }
 
+    /// Whether `ip` falls in the deny list, including via its IPv4-mapped
+    /// IPv6 form so `::ffff:10.0.0.4` cannot slip past a `10.0.0.0/8` rule —
+    /// the same normalization the floor applies. Public so the TCP relay can
+    /// also hold the deny list against the host-side address it actually
+    /// dials when it redirects a gateway-addressed flow to loopback.
+    pub fn denies(&self, ip: IpAddr) -> bool {
+        if self.denied.iter().any(|cidr| cidr.contains(ip)) {
+            return true;
+        }
+        if let IpAddr::V6(v6) = ip {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return self.denied.iter().any(|cidr| cidr.contains(IpAddr::V4(v4)));
+            }
+        }
+        false
+    }
+
     /// Whether an outbound connection to `ip` (v4 or v6) is permitted.
     pub fn allows(&self, ip: IpAddr) -> bool {
+        // The deny list is absolute and checked first: nothing below — not an
+        // explicit allow-list CIDR, a learned DNS IP, or the local floor's
+        // loopback re-open — can override a denied destination.
+        if self.denies(ip) {
+            return false;
+        }
         // Platform hard-floor: deny per the resolved FloorMode (metadata + host
         // loopback locally, the full internal floor under fleet mode). The floor
         // is absolute under `Strict`; in the softer local modes an EXPLICIT
@@ -585,6 +635,83 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         policy.learn_ip_records(&[(ip, 1)]);
         assert!(policy.allows(ip));
+    }
+
+    #[test]
+    fn deny_only_blocks_denied_and_allows_the_rest() {
+        // The issue's motivating shape: outbound open, internal networks denied.
+        let policy = EgressPolicy::unrestricted()
+            .with_denied_cidrs(Some(&[
+                "10.0.0.0/8".into(),
+                "172.16.0.0/12".into(),
+                "192.168.0.0/16".into(),
+                "fc00::/7".into(),
+            ]))
+            .unwrap();
+        assert!(policy.is_restricted());
+        assert!(!policy.allows_v4(Ipv4Addr::new(10, 0, 0, 4)));
+        assert!(!policy.allows_v4(Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(!policy.allows_v4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!policy.allows_v6("fc00::1".parse().unwrap()));
+        // Everything else stays reachable — a deny list alone is not an allow-list.
+        assert!(policy.allows_v4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(policy.allows_v6("2606:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn deny_wins_over_allow_and_bare_ip_form_works() {
+        // Allow a broad range, carve a hole out of it; a bare IP denies /32.
+        let policy = EgressPolicy::new(Some(&["8.8.0.0/16".into()]), None)
+            .with_denied_cidrs(Some(&["8.8.8.0/24".into(), "8.8.4.4".into()]))
+            .unwrap();
+        assert!(!policy.allows_v4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!policy.allows_v4(Ipv4Addr::new(8, 8, 4, 4)));
+        assert!(policy.allows_v4(Ipv4Addr::new(8, 8, 4, 5)));
+        assert!(policy.allows_v4(Ipv4Addr::new(8, 8, 1, 1)));
+    }
+
+    #[test]
+    fn deny_wins_over_learned_dns_ips() {
+        // DNS learning cannot punch through a deny (anti-rebinding parity with
+        // the floor): an allowed host resolving into a denied range stays denied.
+        let policy = EgressPolicy::new(None, Some(&["example.com".into()]))
+            .with_denied_cidrs(Some(&["93.184.0.0/16".into()]))
+            .unwrap();
+        let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        policy.learn_ip_records(&[(ip, 300)]);
+        assert!(!policy.allows(ip));
+    }
+
+    #[test]
+    fn deny_wins_over_the_local_loopback_reopen() {
+        // An explicit allow CIDR may re-open host loopback locally, but not
+        // when a deny also covers it — deny is evaluated first.
+        let policy = EgressPolicy::new(Some(&["127.0.0.1/32".into()]), None)
+            .with_denied_cidrs(Some(&["127.0.0.0/8".into()]))
+            .unwrap();
+        assert!(!policy.allows_v4(Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
+    #[test]
+    fn deny_matches_ipv4_mapped_ipv6() {
+        // A v4 deny rule must hold against the mapped-v6 spelling of the same
+        // address, exactly as the floor normalizes — otherwise ::ffff:10.0.0.4
+        // slips past a 10.0.0.0/8 deny.
+        let policy = EgressPolicy::unrestricted()
+            .with_denied_cidrs(Some(&["10.0.0.0/8".into()]))
+            .unwrap();
+        assert!(!policy.allows_v6("::ffff:10.0.0.4".parse().unwrap()));
+        assert!(policy.allows_v6("::ffff:1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn unparseable_deny_cidr_is_a_hard_error() {
+        // Every user-facing surface validates CIDRs before they get here, so
+        // an unparseable entry reaching the engine is a bug upstream; erroring
+        // beats skipping it, which would silently widen the policy.
+        assert!(EgressPolicy::unrestricted()
+            .with_denied_cidrs(Some(&["nonsense".into()]))
+            .is_err());
     }
 
     #[test]
