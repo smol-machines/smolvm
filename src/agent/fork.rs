@@ -450,13 +450,15 @@ enum LiveBranchRamMode {
 }
 
 fn select_live_branch_ram_mode(
-    clone_count: usize,
     userfaultfd_available: bool,
     requested: Option<&str>,
 ) -> Result<LiveBranchRamMode> {
     match requested.unwrap_or("auto") {
-        "auto" if clone_count > 1 => Ok(LiveBranchRamMode::Shared),
-        "auto" if userfaultfd_available => Ok(LiveBranchRamMode::Paged),
+        // Every child can become active, including a held pool slot after it is
+        // leased. Compilers, browsers, and other dense workloads can turn a
+        // later generation into minutes of serialized fault delivery, so auto
+        // always selects the sparse materialized generation. Demand paging is
+        // retained as an explicit operator/debugging choice.
         "auto" => Ok(LiveBranchRamMode::Shared),
         "shared" => Ok(LiveBranchRamMode::Shared),
         "paged" if userfaultfd_available => Ok(LiveBranchRamMode::Paged),
@@ -2017,13 +2019,7 @@ pub(crate) fn prepare_forks_reusing(
     let userfaultfd_available = kernel_fault_userfaultfd_available();
     let requested_ram_mode = std::env::var("SMOLVM_BRANCH_RAM_MODE").ok();
     let live_ram_mode = fork_continue
-        .then(|| {
-            select_live_branch_ram_mode(
-                specs.len(),
-                userfaultfd_available,
-                requested_ram_mode.as_deref(),
-            )
-        })
+        .then(|| select_live_branch_ram_mode(userfaultfd_available, requested_ram_mode.as_deref()))
         .transpose()?;
 
     let gdir = vm_data_dir(golden);
@@ -2184,22 +2180,14 @@ pub(crate) fn prepare_forks_reusing(
         };
 
         let t_snap = std::time::Instant::now();
-        // A batch maps one materialized memfd generation so siblings share
-        // every clean physical page. For a single sparse child, demand paging
-        // avoids materializing untouched source RAM when userfaultfd is usable.
-        // The environment override is an operator/debugging escape hatch; auto
-        // is the user-facing behavior.
+        // Active children map one sparse materialized memfd generation so CPU-
+        // and I/O-heavy work never serializes behind page-by-page delivery.
+        // Held pool slots use the same shared generation because they may run a
+        // dense workload as soon as they are leased. The environment override
+        // remains an operator and debugging escape hatch.
         let fork_verb = if fork_continue {
             match live_ram_mode.expect("fork-continue mode selected before capture") {
-                LiveBranchRamMode::Shared => {
-                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                    if specs.len() == 1 && !userfaultfd_available {
-                        tracing::warn!(
-                            "kernel-fault userfaultfd unavailable; using a shared materialized RAM generation (grant the service read/write access to /dev/userfaultfd to make sparse single-child branches lazy)"
-                        );
-                    }
-                    "FORK_CONTINUE"
-                }
+                LiveBranchRamMode::Shared => "FORK_CONTINUE",
                 LiveBranchRamMode::Paged => "FORK_CONTINUE_PAGED",
             }
         } else {
@@ -3527,23 +3515,19 @@ mod tests {
     #[test]
     fn live_branch_ram_auto_shares_active_sibling_pages() {
         assert_eq!(
-            select_live_branch_ram_mode(2, true, None).unwrap(),
+            select_live_branch_ram_mode(true, None).unwrap(),
             LiveBranchRamMode::Shared
         );
         assert_eq!(
-            select_live_branch_ram_mode(100, false, Some("auto")).unwrap(),
+            select_live_branch_ram_mode(false, Some("auto")).unwrap(),
             LiveBranchRamMode::Shared
         );
     }
 
     #[test]
-    fn live_branch_ram_auto_pages_only_one_sparse_child() {
+    fn live_branch_ram_auto_shares_single_children_and_pool_slots() {
         assert_eq!(
-            select_live_branch_ram_mode(1, true, None).unwrap(),
-            LiveBranchRamMode::Paged
-        );
-        assert_eq!(
-            select_live_branch_ram_mode(1, false, None).unwrap(),
+            select_live_branch_ram_mode(true, None).unwrap(),
             LiveBranchRamMode::Shared
         );
     }
@@ -3551,11 +3535,11 @@ mod tests {
     #[test]
     fn live_branch_ram_override_is_validated() {
         assert_eq!(
-            select_live_branch_ram_mode(8, true, Some("paged")).unwrap(),
+            select_live_branch_ram_mode(true, Some("paged")).unwrap(),
             LiveBranchRamMode::Paged
         );
-        assert!(select_live_branch_ram_mode(8, false, Some("paged")).is_err());
-        assert!(select_live_branch_ram_mode(8, true, Some("copy-everything")).is_err());
+        assert!(select_live_branch_ram_mode(false, Some("paged")).is_err());
+        assert!(select_live_branch_ram_mode(true, Some("copy-everything")).is_err());
     }
 
     #[test]
