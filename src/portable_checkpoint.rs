@@ -286,6 +286,46 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
     Ok(root)
 }
 
+// SAVE runs in the already-confined VMM, not in the privileged API service.
+// Its output must be inside the machine's writable directory and owned by the
+// same lineage UID. Never grant the VMM access to service-owned pack libraries.
+fn runtime_capture_dir(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
+    let data = crate::agent::vm_data_dir(name);
+    let owner = vm
+        .fork_overlay_owner
+        .as_deref()
+        .or(vm.golden.as_deref())
+        .unwrap_or(name);
+    let owner_data = crate::agent::vm_data_dir(owner);
+    let ids = crate::process::vm_drop_ids(
+        &crate::agent::vm_uid_registry_dir(),
+        &data,
+        None,
+        Some(&owner_data),
+    )
+    .transpose()
+    .map_err(|error| Error::agent("resolve checkpoint uid", error.to_string()))?;
+    runtime_capture_dir_at(&data, ids)
+}
+
+fn runtime_capture_dir_at(data: &Path, ids: Option<(u32, u32)>) -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("checkpoint-capture-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let temporary = builder
+        .tempdir_in(data)
+        .map_err(|error| Error::agent("create runtime checkpoint directory", error.to_string()))?;
+    if let Some((uid, gid)) = ids {
+        crate::process::chown_tree(temporary.path(), uid, gid)
+            .map_err(|error| Error::agent("own runtime checkpoint directory", error.to_string()))?;
+    }
+    Ok(temporary)
+}
+
 fn checkpoint_lib_dir(options: &CaptureOptions) -> Result<PathBuf> {
     options
         .lib_dir
@@ -400,12 +440,14 @@ pub fn capture_to_path(
         .get(name)
         .expect("validated checkpoint source must remain in its loaded config");
     let control = crate::agent::fork::control_socket_path(name);
+    let runtime_capture = runtime_capture_dir(name, vm)?;
+    let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
     crate::agent::fork::sync_fork_source(name)?;
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
     let reply = crate::agent::fork::control_socket_cmd_with_timeout(
         &control,
-        &format!("SAVE {}", snapshot_dir.display()),
+        &format!("SAVE {}", runtime_snapshot.display()),
         std::time::Duration::from_secs(30 * 60),
     )?;
     if !reply.starts_with("OK") {
@@ -422,6 +464,15 @@ pub fn capture_to_path(
     pause.resume()?;
     let source_pause = pause_started.elapsed();
     drop(source_lock);
+
+    // Export after resuming the source. Preserve sparse RAM holes/reflinks;
+    // copying into service staging must not extend the guest's pause.
+    for file in ["checkpoint.bin", "memory.bin", "manifest.bin"] {
+        crate::disk_utils::clone_or_copy_file(
+            &runtime_snapshot.join(file),
+            &snapshot_dir.join(file),
+        )?;
+    }
 
     let assets = crate::pack_export::FromVmAssets {
         mode: PackMode::Vm,
@@ -1782,6 +1833,26 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_capture_is_private_machine_local_and_removed_on_drop() {
+        let data = tempfile::tempdir().unwrap();
+        let capture = runtime_capture_dir_at(data.path(), None).unwrap();
+        let path = capture.path().to_path_buf();
+        assert_eq!(path.parent(), Some(data.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        std::fs::create_dir(path.join(ASSET_DIR)).unwrap();
+        std::fs::write(path.join(ASSET_DIR).join("memory.bin"), b"private state").unwrap();
+        drop(capture);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn install_verifies_and_consumes_checkpoint() {
