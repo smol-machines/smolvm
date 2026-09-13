@@ -2115,6 +2115,10 @@ impl AgentManager {
         // multithreaded `serve` process, where concurrent forks would clobber
         // each other (and `set_var` is `unsafe` in edition 2024 for that reason).
         let fork_clone = features.snapshot_dir.is_some();
+        // Either shape backs guest RAM with a memfd — a golden creates one, a
+        // clone maps the golden's copy-on-write — and the kernel charges those
+        // pages to this VM's cgroup as shmem it cannot reclaim without swap.
+        let fork_memfd = features.forkable || fork_clone;
         let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
         let fork_env: Vec<(&str, String)> = {
             let mut v = Vec::new();
@@ -2574,7 +2578,7 @@ impl AgentManager {
                 let budget = crate::process::vmm_memory_budget(
                     resources_for_config.memory_mib,
                     config.cuda,
-                    config.forkable,
+                    fork_memfd,
                 );
                 let caps = crate::systemd_scope::ScopeCaps {
                     memory_max_bytes: Some(budget.max_bytes),
