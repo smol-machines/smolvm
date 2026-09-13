@@ -9,6 +9,7 @@ be inspected. No host policy or existing service configuration is changed.
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import urllib.request
@@ -70,6 +71,18 @@ def main():
                 while block := response.read(1024 * 1024):
                     output.write(block)
             assert marker(source) == expected, "source failed to continue after SAVE"
+            damaged = Path(directory, "damaged.smolcheckpoint")
+            shutil.copyfile(artifact, damaged)
+            with damaged.open("r+b") as output:
+                first = output.read(1)
+                output.seek(0)
+                output.write(bytes([first[0] ^ 0xff]))
+            try:
+                call("POST", "", {"name": restored, "from": str(damaged)})
+                raise AssertionError("accepted damaged checkpoint")
+            except urllib.error.HTTPError as error:
+                assert error.code == 400, error
+                assert b"checksum mismatch" in error.read()
             call("POST", "", {"name": restored, "from": str(artifact)})
             call("POST", f"/{restored}/start")
             assert marker(restored) == expected, "disk or RAM was not restored"

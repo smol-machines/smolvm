@@ -701,6 +701,8 @@ pub async fn create_machine(
                 sidecar_path
             )));
         }
+        crate::portable_checkpoint::verified_sidecar_footer(path)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
         let checkpoint = manifest.checkpoint.clone();

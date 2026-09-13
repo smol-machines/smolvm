@@ -77,17 +77,7 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
     }
 
     let footer = if artifact.is_file() {
-        let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
-            .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
-        if !smolvm_pack::packer::verify_sidecar_checksum(artifact, &footer)
-            .map_err(|error| Error::agent("verify checkpoint checksum", error.to_string()))?
-        {
-            return Err(Error::agent(
-                "verify checkpoint checksum",
-                format!("checksum mismatch for {}", artifact.display()),
-            ));
-        }
-        Some(footer)
+        Some(verified_sidecar_footer(artifact)?)
     } else {
         None
     };
@@ -179,6 +169,21 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
         return Err(error);
     }
     Ok(())
+}
+
+/// Verify a single-file artifact before reading its manifest or extracting it.
+pub fn verified_sidecar_footer(artifact: &Path) -> Result<smolvm_pack::format::PackFooter> {
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+    if !smolvm_pack::packer::verify_sidecar_checksum(artifact, &footer)
+        .map_err(|error| Error::agent("verify checkpoint checksum", error.to_string()))?
+    {
+        return Err(Error::agent(
+            "verify checkpoint checksum",
+            format!("checksum mismatch for {}", artifact.display()),
+        ));
+    }
+    Ok(footer)
 }
 
 struct RestoreReservation {

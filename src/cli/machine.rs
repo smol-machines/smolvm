@@ -3580,6 +3580,13 @@ impl CreateCmd {
 
         // Read manifest from the sidecar to get image metadata.
         let stored = sidecar_path.is_dir();
+        let footer = if stored {
+            None
+        } else {
+            Some(smolvm::portable_checkpoint::verified_sidecar_footer(
+                sidecar_path,
+            )?)
+        };
         let manifest = if stored {
             smolvm::checkpoint_store::read_manifest(sidecar_path)
                 .map_err(|e| smolvm::Error::agent("read stored checkpoint", e.to_string()))?
@@ -3622,18 +3629,6 @@ impl CreateCmd {
         // native binaries and cannot boot under a different-arch guest kernel. Only
         // the guest arch must match — the host OS does not (see the fn's docs).
         smolvm::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
-
-        // Read the footer now; the bundle is extracted into the machine's own
-        // data dir after `create_vm` succeeds (below), so a duplicate-name create
-        // cannot clobber an existing machine's layers.
-        let footer = if stored {
-            None
-        } else {
-            Some(
-                smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
-                    .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?,
-            )
-        };
 
         // A VM-mode pack (`--from-vm`) carries the source VM's overlay+storage
         // DISKS (the real rootfs), not OCI layers. Capture the templates before
