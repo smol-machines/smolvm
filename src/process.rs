@@ -504,8 +504,7 @@ pub fn place_in_cgroup(
     let _ = write_cgroup(&vm, "pids.max", &CGROUP_PIDS_MAX.to_string());
     let budget = vmm_memory_budget(memory_mib, cuda, memfd_backed);
     let memory_limit_bytes = budget.max_bytes;
-    // high BEFORE max: a reclaim threshold without a ceiling is safe, a ceiling
-    // without a reclaim threshold is what kills VMs.
+    // Establish the early throttle/reclaim threshold before the hard ceiling.
     let _ = write_cgroup(&vm, "memory.high", &budget.high_bytes.to_string());
     let _ = write_cgroup(&vm, "memory.max", &memory_limit_bytes.to_string());
 
@@ -526,13 +525,10 @@ pub fn place_in_cgroup(
 ///
 /// cgroup v2 charges anon + page cache + shmem to one counter, so the page
 /// cache the host faults in for a VM's own disks competes with the guest RAM
-/// the customer bought. `memory.max` on its own is a KILL threshold — without a
-/// `memory.high` there is no throttle-and-reclaim stage, so a VM using the RAM
-/// it was sold plus its own page cache walks into the ceiling and is SIGKILLed.
-///
-/// Measured on a 2 GiB machine before this existed: 2.01 GiB shmem (the guest)
-/// plus 701 MiB of reclaimable page cache against a 2.75 GiB cap, having hit
-/// the hard limit 3,849 times — on a host with 657 GiB free.
+/// the customer bought. `memory.max` also attempts reclaim before invoking
+/// OOM; `memory.high` starts throttling and reclaim earlier. Neither threshold
+/// makes resident unswappable shmem reclaimable. A `memory.events` max event
+/// records limit pressure, not an OOM kill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmmMemoryBudget {
     /// `memory.high` — throttle and reclaim here, before anything is killed.
@@ -548,10 +544,10 @@ pub struct VmmMemoryBudget {
 /// rings, virtiofs/virtio-net buffers and the disk page cache all grow with it,
 /// so a fixed allowance is generous at 2 GiB and negligible at 40 GiB.
 ///
-/// CUDA device mappings and memfd-backed (forkable) guest RAM are charged to
-/// this cgroup as shmem, which cannot be reclaimed at all without swap — they
-/// need room BEYOND the guest allocation, not inside it. Omitting that for
-/// forkable VMs is why a branchable machine was killed the moment it booted.
+/// Reserve a conservative extra guest-sized allowance for CUDA or forkable
+/// workloads. A memfd mapping does not itself double physical memory: private
+/// COW pages and retained generations can add charges. The branch lifecycle
+/// accounts for additional retained generations separately.
 pub fn vmm_memory_budget(guest_memory_mib: u32, cuda: bool, memfd_backed: bool) -> VmmMemoryBudget {
     let guest = u64::from(guest_memory_mib);
     let overhead = VMM_MEM_OVERHEAD_MIB.max(guest / 4);
@@ -588,7 +584,7 @@ fn cgroup_v2_process_dir(pid: Pid) -> Option<std::path::PathBuf> {
     Some(std::path::Path::new("/sys/fs/cgroup").join(rel))
 }
 
-/// Update `memory.max` only when `pid` is already inside a cgroup owned by
+/// Update both memory thresholds only when `pid` is already inside a cgroup owned by
 /// SmolVM. Returns `false` for ordinary CLI-launched/externally-capped
 /// processes, whose enclosing cgroup must never be modified by a guest action.
 ///
@@ -601,6 +597,7 @@ pub fn set_managed_vmm_memory_limit(
     machine: &str,
     pid: Pid,
     memory_max_bytes: u64,
+    memory_high_bytes: u64,
 ) -> Result<bool> {
     let Some(dir) = cgroup_v2_process_dir(pid) else {
         return Ok(false);
@@ -610,10 +607,16 @@ pub fn set_managed_vmm_memory_limit(
     };
     let scope = crate::systemd_scope::scope_name(machine);
     if leaf == scope {
-        crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes)?;
+        crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes, memory_high_bytes)?;
         return Ok(true);
     }
     if leaf == format!("vm-{pid}") {
+        write_cgroup(&dir, "memory.high", &memory_high_bytes.to_string()).map_err(|error| {
+            Error::agent(
+                "VM cgroup",
+                format!("update {} memory.high: {error}", dir.display()),
+            )
+        })?;
         write_cgroup(&dir, "memory.max", &memory_max_bytes.to_string()).map_err(|error| {
             Error::agent(
                 "VM cgroup",
@@ -634,6 +637,7 @@ pub fn set_managed_vmm_memory_limit(
     _machine: &str,
     _pid: Pid,
     _memory_max_bytes: u64,
+    _memory_high_bytes: u64,
 ) -> Result<bool> {
     Ok(false)
 }
@@ -3022,8 +3026,7 @@ mod tests {
             std::fs::read_to_string(vm.join("memory.max")).expect("read memory limit"),
             vmm_memory_budget(1024, true, false).max_bytes.to_string()
         );
-        // The reclaim threshold must exist, or page cache growth goes straight
-        // to an OOM kill instead of an eviction.
+        // The early reclaim threshold must be installed alongside the hard cap.
         assert_eq!(
             std::fs::read_to_string(vm.join("memory.high")).expect("read reclaim threshold"),
             vmm_memory_budget(1024, true, false).high_bytes.to_string()
@@ -3032,11 +3035,8 @@ mod tests {
 
     #[test]
     fn a_reclaim_threshold_always_sits_below_the_ceiling_and_above_the_guest() {
-        // The bug this encodes: with no memory.high there is no reclaim stage,
-        // so a VM using the RAM it was sold plus its own disk page cache walks
-        // into memory.max and is SIGKILLed. The threshold must also sit ABOVE
-        // the guest allocation, or the guest alone would hold the cgroup in
-        // permanent reclaim.
+        // The early threshold must sit above guest RAM, so the configured
+        // guest allocation alone cannot hold the cgroup in permanent reclaim.
         for &mib in &[512_u32, 1024, 2048, 8192, 40960] {
             for &(cuda, memfd) in &[(false, false), (false, true), (true, false)] {
                 let b = vmm_memory_budget(mib, cuda, memfd);
@@ -3055,17 +3055,16 @@ mod tests {
 
     #[test]
     fn a_forkable_vm_gets_room_for_its_unreclaimable_memfd() {
-        // A branchable machine's guest RAM is a memfd, charged as shmem, which
-        // cannot be reclaimed without swap — so it needs room BEYOND the guest
-        // size. Without this a 2 GiB branchable machine was OOM-killed on boot.
+        // Preserve the conservative allowance for private COW pages in
+        // addition to the original shared backing.
         let plain = vmm_memory_budget(2048, false, false);
         let forkable = vmm_memory_budget(2048, false, true);
         assert!(
             forkable.max_bytes > plain.max_bytes + 1024 * 1024 * 1024,
             "a forkable VM needs a guest-sized allowance beyond the plain cap"
         );
-        // and the elastic room above the unreclaimable floor must be real
-        let floor = 2048_u64 * 1024 * 1024 * 2; // guest + its memfd charge
+        // Keep reclaim headroom above the two-backing allowance.
+        let floor = 2048_u64 * 1024 * 1024 * 2;
         assert!(
             forkable.high_bytes > floor,
             "no headroom above the shmem floor"

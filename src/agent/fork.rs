@@ -1420,6 +1420,19 @@ fn fork_lineage_memory_limit_bytes(record: &VmRecord, additional_ram_units: u64)
 }
 
 #[cfg(target_os = "linux")]
+fn fork_lineage_memory_budget(
+    record: &VmRecord,
+    additional_ram_units: u64,
+) -> Result<crate::process::VmmMemoryBudget> {
+    let base = crate::process::vmm_memory_budget(record.mem, record.cuda, true);
+    let max_bytes = fork_lineage_memory_limit_bytes(record, additional_ram_units)?;
+    Ok(crate::process::VmmMemoryBudget {
+        high_bytes: max_bytes - (base.max_bytes - base.high_bytes),
+        max_bytes,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn source_has_private_ram_backing(record: &VmRecord) -> bool {
     record.pid_start_time.is_some() && record.fork_lineage_pid_start_time == record.pid_start_time
 }
@@ -1436,8 +1449,10 @@ fn set_fork_lineage_memory_limit(
     if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
         return Ok(false);
     }
-    let limit = fork_lineage_memory_limit_bytes(record, generations)?;
-    let updated = crate::process::set_managed_vmm_memory_limit(golden, pid, limit)?;
+    let budget = fork_lineage_memory_budget(record, generations)?;
+    let limit = budget.max_bytes;
+    let updated =
+        crate::process::set_managed_vmm_memory_limit(golden, pid, limit, budget.high_bytes)?;
     if updated {
         tracing::debug!(%golden, generations, memory_max_bytes = limit, "sized live-branch lineage cgroup");
     }
@@ -4129,7 +4144,7 @@ mod tests {
         let mut record = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
         assert_eq!(
             fork_lineage_memory_limit_bytes(&record, 2).unwrap(),
-            3840 * 1024 * 1024
+            4864 * 1024 * 1024
         );
 
         record.cuda = true;
@@ -4137,6 +4152,19 @@ mod tests {
             fork_lineage_memory_limit_bytes(&record, 2).unwrap(),
             4864 * 1024 * 1024
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lineage_reclaim_threshold_tracks_growth_and_collection() {
+        let record = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
+        let base = fork_lineage_memory_budget(&record, 0).unwrap();
+        for generations in [1, 2, 8, 32, 8, 2, 0] {
+            let budget = fork_lineage_memory_budget(&record, generations).unwrap();
+            let retained = generations * 1024 * 1024 * 1024;
+            assert_eq!(budget.high_bytes, base.high_bytes + retained);
+            assert_eq!(budget.max_bytes, base.max_bytes + retained);
+        }
     }
 
     #[cfg(target_os = "linux")]
