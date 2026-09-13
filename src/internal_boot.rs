@@ -199,6 +199,9 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
             config.resources.cpus,
             config.resources.memory_mib,
             config.cuda,
+            // Forkable VMs back guest RAM with a memfd, charged to this cgroup
+            // as unreclaimable shmem — it needs room beyond the guest size.
+            std::env::var_os("SMOLVM_FORKABLE").is_some(),
         );
     }
 

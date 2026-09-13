@@ -469,14 +469,21 @@ pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
 /// Caps applied (best-effort, each independently):
 /// - `cpu.max` = `vcpus * 100ms / 100ms` → bounds CPU to ~`vcpus` cores.
 /// - `pids.max` = [`CGROUP_PIDS_MAX`] → caps host tasks (fork-bomb containment).
-/// - `memory.max` = guest RAM, CUDA mapping allowance, and fixed overhead.
+/// - `memory.high`/`memory.max` = guest RAM, unreclaimable-mapping allowance,
+///   and proportional overhead, with a reclaim stage below the ceiling.
 ///
 /// `root` must be a delegated root with `cpu`/`memory`/`pids` enabled in its
 /// `subtree_control` (see [`setup_cgroup_delegation_root`]); otherwise the limit
 /// files won't exist and the caps silently degrade while the process still runs.
 /// Never blocks boot.
 #[cfg(target_os = "linux")]
-pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32, cuda: bool) {
+pub fn place_in_cgroup(
+    root: &std::path::Path,
+    vcpus: u8,
+    memory_mib: u32,
+    cuda: bool,
+    memfd_backed: bool,
+) {
     let pid = unsafe { libc::getpid() };
     let vm = root.join(format!("vm-{pid}"));
     if let Err(e) = std::fs::create_dir(&vm) {
@@ -495,7 +502,11 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32, cuda:
         &format!("{quota_us} {CGROUP_CPU_PERIOD_US}"),
     );
     let _ = write_cgroup(&vm, "pids.max", &CGROUP_PIDS_MAX.to_string());
-    let memory_limit_bytes = vmm_memory_limit_bytes(memory_mib, cuda);
+    let budget = vmm_memory_budget(memory_mib, cuda, memfd_backed);
+    let memory_limit_bytes = budget.max_bytes;
+    // high BEFORE max: a reclaim threshold without a ceiling is safe, a ceiling
+    // without a reclaim threshold is what kills VMs.
+    let _ = write_cgroup(&vm, "memory.high", &budget.high_bytes.to_string());
     let _ = write_cgroup(&vm, "memory.max", &memory_limit_bytes.to_string());
 
     // Join the leaf last; from here the caps above govern this process tree.
@@ -510,19 +521,54 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32, cuda:
     );
 }
 
+/// Host-memory budget for one VMM's cgroup: a reclaim threshold and a hard
+/// ceiling.
+///
+/// cgroup v2 charges anon + page cache + shmem to one counter, so the page
+/// cache the host faults in for a VM's own disks competes with the guest RAM
+/// the customer bought. `memory.max` on its own is a KILL threshold — without a
+/// `memory.high` there is no throttle-and-reclaim stage, so a VM using the RAM
+/// it was sold plus its own page cache walks into the ceiling and is SIGKILLed.
+///
+/// Measured on a 2 GiB machine before this existed: 2.01 GiB shmem (the guest)
+/// plus 701 MiB of reclaimable page cache against a 2.75 GiB cap, having hit
+/// the hard limit 3,849 times — on a host with 657 GiB free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmmMemoryBudget {
+    /// `memory.high` — throttle and reclaim here, before anything is killed.
+    pub high_bytes: u64,
+    /// `memory.max` — the hard backstop for a genuine runaway.
+    pub max_bytes: u64,
+}
+
 /// Bound host memory for a VMM while leaving room beyond its configured guest
-/// RAM. CUDA device mappings and forkable memfd-backed guest pages can both be
-/// charged to the VMM cgroup, so CUDA needs room for one additional guest-sized
-/// mapping plus the fixed process overhead. CPU-only VMs retain the tighter
-/// historical guest-plus-overhead cap.
-pub fn vmm_memory_limit_bytes(guest_memory_mib: u32, cuda: bool) -> u64 {
+/// RAM, and leave a reclaim stage below the ceiling.
+///
+/// Overhead scales with the guest rather than being flat: page tables, virtio
+/// rings, virtiofs/virtio-net buffers and the disk page cache all grow with it,
+/// so a fixed allowance is generous at 2 GiB and negligible at 40 GiB.
+///
+/// CUDA device mappings and memfd-backed (forkable) guest RAM are charged to
+/// this cgroup as shmem, which cannot be reclaimed at all without swap — they
+/// need room BEYOND the guest allocation, not inside it. Omitting that for
+/// forkable VMs is why a branchable machine was killed the moment it booted.
+pub fn vmm_memory_budget(guest_memory_mib: u32, cuda: bool, memfd_backed: bool) -> VmmMemoryBudget {
     let guest = u64::from(guest_memory_mib);
-    let limit_mib = if cuda {
-        guest.saturating_mul(2).saturating_add(VMM_MEM_OVERHEAD_MIB)
-    } else {
-        guest.saturating_add(VMM_MEM_OVERHEAD_MIB)
-    };
-    limit_mib.saturating_mul(1024 * 1024)
+    let overhead = VMM_MEM_OVERHEAD_MIB.max(guest / 4);
+    let unreclaimable = if cuda || memfd_backed { guest } else { 0 };
+    let max_mib = guest.saturating_add(unreclaimable).saturating_add(overhead);
+    // Start reclaiming once three quarters of the overhead is in use, keeping
+    // the last quarter as the hard backstop.
+    let high_mib = max_mib.saturating_sub(overhead / 4);
+    VmmMemoryBudget {
+        high_bytes: high_mib.saturating_mul(1024 * 1024),
+        max_bytes: max_mib.saturating_mul(1024 * 1024),
+    }
+}
+
+/// The hard ceiling alone, for callers doing their own arithmetic on it.
+pub fn vmm_memory_limit_bytes(guest_memory_mib: u32, cuda: bool, memfd_backed: bool) -> u64 {
+    vmm_memory_budget(guest_memory_mib, cuda, memfd_backed).max_bytes
 }
 
 #[cfg(target_os = "linux")]
@@ -2952,11 +2998,17 @@ mod tests {
         let pid = unsafe { libc::getpid() };
         let vm = root.path().join(format!("vm-{pid}"));
         std::fs::create_dir(&vm).expect("create fake VM cgroup");
-        for file in ["cpu.max", "pids.max", "memory.max", "cgroup.procs"] {
+        for file in [
+            "cpu.max",
+            "pids.max",
+            "memory.high",
+            "memory.max",
+            "cgroup.procs",
+        ] {
             std::fs::write(vm.join(file), []).expect("create fake cgroup control");
         }
 
-        place_in_cgroup(root.path(), 2, 1024, true);
+        place_in_cgroup(root.path(), 2, 1024, true, false);
 
         assert_eq!(
             std::fs::read_to_string(vm.join("cpu.max")).expect("read boot CPU quota"),
@@ -2968,20 +3020,78 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(vm.join("memory.max")).expect("read memory limit"),
-            ((2 * 1024_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024).to_string()
+            vmm_memory_budget(1024, true, false).max_bytes.to_string()
+        );
+        // The reclaim threshold must exist, or page cache growth goes straight
+        // to an OOM kill instead of an eviction.
+        assert_eq!(
+            std::fs::read_to_string(vm.join("memory.high")).expect("read reclaim threshold"),
+            vmm_memory_budget(1024, true, false).high_bytes.to_string()
         );
     }
 
     #[test]
+    fn a_reclaim_threshold_always_sits_below_the_ceiling_and_above_the_guest() {
+        // The bug this encodes: with no memory.high there is no reclaim stage,
+        // so a VM using the RAM it was sold plus its own disk page cache walks
+        // into memory.max and is SIGKILLed. The threshold must also sit ABOVE
+        // the guest allocation, or the guest alone would hold the cgroup in
+        // permanent reclaim.
+        for &mib in &[512_u32, 1024, 2048, 8192, 40960] {
+            for &(cuda, memfd) in &[(false, false), (false, true), (true, false)] {
+                let b = vmm_memory_budget(mib, cuda, memfd);
+                let guest = u64::from(mib) * 1024 * 1024;
+                assert!(
+                    b.high_bytes < b.max_bytes,
+                    "{mib} {cuda} {memfd}: high >= max"
+                );
+                assert!(
+                    b.high_bytes > guest,
+                    "{mib} {cuda} {memfd}: reclaim starts inside guest RAM"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_forkable_vm_gets_room_for_its_unreclaimable_memfd() {
+        // A branchable machine's guest RAM is a memfd, charged as shmem, which
+        // cannot be reclaimed without swap — so it needs room BEYOND the guest
+        // size. Without this a 2 GiB branchable machine was OOM-killed on boot.
+        let plain = vmm_memory_budget(2048, false, false);
+        let forkable = vmm_memory_budget(2048, false, true);
+        assert!(
+            forkable.max_bytes > plain.max_bytes + 1024 * 1024 * 1024,
+            "a forkable VM needs a guest-sized allowance beyond the plain cap"
+        );
+        // and the elastic room above the unreclaimable floor must be real
+        let floor = 2048_u64 * 1024 * 1024 * 2; // guest + its memfd charge
+        assert!(
+            forkable.high_bytes > floor,
+            "no headroom above the shmem floor"
+        );
+    }
+
+    #[test]
+    fn overhead_scales_with_the_guest_instead_of_staying_flat() {
+        // A flat 768 MiB is 37% headroom at 2 GiB and 1.9% at 40 GiB; page
+        // tables, virtio rings and disk page cache all grow with the guest.
+        let small = vmm_memory_budget(2048, false, false).max_bytes - 2048 * 1024 * 1024;
+        let large = vmm_memory_budget(40960, false, false).max_bytes - 40960 * 1024 * 1024;
+        assert!(large > small * 4, "overhead did not scale with guest size");
+    }
+
+    #[test]
     fn cuda_vmm_memory_limit_allows_device_and_memfd_mappings() {
-        assert_eq!(
-            vmm_memory_limit_bytes(8192, true),
-            (2 * 8192_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024
-        );
-        assert_eq!(
-            vmm_memory_limit_bytes(8192, false),
-            (8192_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024
-        );
+        // CUDA device mappings are charged to this cgroup, so a CUDA VM needs
+        // room for a second guest-sized mapping. Asserted as a property rather
+        // than a literal: the overhead term is proportional now, so pinning the
+        // exact byte count would just re-encode the formula.
+        let guest = 8192_u64 * 1024 * 1024;
+        let with_cuda = vmm_memory_limit_bytes(8192, true, false);
+        let plain = vmm_memory_limit_bytes(8192, false, false);
+        assert!(with_cuda >= plain + guest, "no room for the device mapping");
+        assert!(plain > guest, "no overhead above the guest allocation");
     }
 
     #[test]

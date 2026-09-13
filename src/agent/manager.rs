@@ -2571,11 +2571,14 @@ impl AgentManager {
         #[cfg(target_os = "linux")]
         if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
             if let Some(name) = self.name() {
+                let budget = crate::process::vmm_memory_budget(
+                    resources_for_config.memory_mib,
+                    config.cuda,
+                    config.forkable,
+                );
                 let caps = crate::systemd_scope::ScopeCaps {
-                    memory_max_bytes: Some(crate::process::vmm_memory_limit_bytes(
-                        resources_for_config.memory_mib,
-                        config.cuda,
-                    )),
+                    memory_max_bytes: Some(budget.max_bytes),
+                    memory_high_bytes: Some(budget.high_bytes),
                     cpu_quota_usec_per_sec: Some(
                         u64::from(resources_for_config.cpus.max(1)) * 1_000_000,
                     ),

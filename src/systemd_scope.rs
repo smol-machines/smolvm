@@ -88,6 +88,11 @@ fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
 pub struct ScopeCaps {
     /// Hard memory ceiling in bytes (`MemoryMax`). `None` = uncapped.
     pub memory_max_bytes: Option<u64>,
+    /// Reclaim threshold in bytes (`MemoryHigh`), set below `MemoryMax` so the
+    /// kernel evicts page cache under pressure instead of jumping straight to
+    /// an OOM kill. `None` = no reclaim stage, which is what made a VM using
+    /// the RAM it was sold die against the ceiling.
+    pub memory_high_bytes: Option<u64>,
     /// CPU quota in microseconds-of-CPU-time per real second
     /// (`CPUQuotaPerSecUSec`). For N vCPUs uncapped-overcommit, pass
     /// `N * 1_000_000`. `None` = uncapped.
@@ -183,6 +188,9 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
         format!("smolvm VM {machine_id}"),
     ]);
     nprops += 1;
+    if let Some(m) = caps.memory_high_bytes {
+        props.extend(["MemoryHigh".into(), "t".into(), m.to_string()]);
+    }
     if let Some(m) = caps.memory_max_bytes {
         props.extend(["MemoryMax".into(), "t".into(), m.to_string()]);
         nprops += 1;

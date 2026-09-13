@@ -1408,7 +1408,7 @@ fn fork_lineage_memory_limit_bytes(record: &VmRecord, additional_ram_units: u64)
     let guest_bytes = u64::from(record.mem)
         .checked_mul(1024 * 1024)
         .ok_or_else(|| Error::agent("fork memory accounting", "guest memory size overflow"))?;
-    crate::process::vmm_memory_limit_bytes(record.mem, record.cuda)
+    crate::process::vmm_memory_limit_bytes(record.mem, record.cuda, true)
         .checked_add(
             additional_ram_units
                 .checked_mul(guest_bytes)
