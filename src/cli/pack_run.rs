@@ -247,6 +247,11 @@ pub struct PackRunCmd {
     #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Custom DNS resolver for the guest (implies --net). Defaults to the
+    /// host's own resolver; use this when that is not the resolver to use.
+    #[arg(long, value_name = "IP", help_heading = "Network")]
+    pub dns: Option<std::net::Ipv4Addr>,
+
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
@@ -510,7 +515,7 @@ impl PackRunCmd {
                 !ports.is_empty(),
             ),
             network_backend: self.net_backend,
-            dns: None,
+            dns: self.dns,
             network_name: None,
             gpu: manifest.gpu,
             nested_virt: false,
@@ -1310,6 +1315,11 @@ struct PackedRunArgs {
     #[arg(long = "net-backend", value_enum)]
     net_backend: Option<NetworkBackend>,
 
+    /// Custom DNS resolver for the guest (implies --net). Defaults to the
+    /// host's own resolver; use this when that is not the resolver to use.
+    #[arg(long, value_name = "IP")]
+    dns: Option<std::net::Ipv4Addr>,
+
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
     cpus: Option<u8>,
@@ -1380,6 +1390,11 @@ struct PackedStartArgs {
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum)]
     net_backend: Option<NetworkBackend>,
+
+    /// Custom DNS resolver for the guest (implies --net). Defaults to the
+    /// host's own resolver; use this when that is not the resolver to use.
+    #[arg(long, value_name = "IP")]
+    dns: Option<std::net::Ipv4Addr>,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1529,6 +1544,7 @@ fn run_ephemeral(
                 port: args.port,
                 net: args.net,
                 net_backend: args.net_backend,
+                dns: args.dns,
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1670,7 +1686,7 @@ fn run_from_cache(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
-        dns: None,
+        dns: args.dns,
         network_name: None,
         gpu: manifest.gpu,
         nested_virt: false,
@@ -2094,7 +2110,7 @@ fn daemon_start(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
-        dns: None,
+        dns: args.dns,
         network_name: None,
         gpu: manifest.gpu,
         nested_virt: false,

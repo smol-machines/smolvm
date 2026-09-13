@@ -185,7 +185,7 @@ fn gpu_virgl_flags() -> u32 {
 ///
 /// `guest_network` is `Some` for virtio-net (the agent derives its resolver from
 /// `dns_server`, the gateway address). For TSI it is `None`: there is no host
-/// gateway to route a resolver through, so a `--dns` override must be passed
+/// gateway to route a resolver through, so the effective resolver is passed
 /// straight through for the agent to write into resolv.conf.
 pub(crate) fn guest_network_env(
     guest_network: Option<smolvm_network::GuestNetworkConfig>,
@@ -216,7 +216,12 @@ pub(crate) fn guest_network_env(
             push(guest_env::PREFIX_LEN6, n.prefix_len6.to_string());
         }
         push(guest_env::DNS, n.dns_server.to_string());
-    } else if let Some(dns) = dns_override {
+    } else if let Some(dns) = crate::data::network::effective_dns(
+        dns_override,
+        crate::network::EffectiveNetworkBackend::Tsi,
+    )
+    .addr
+    {
         push(guest_env::DNS, dns.to_string());
     }
     env

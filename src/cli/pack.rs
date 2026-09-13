@@ -221,6 +221,12 @@ pub struct PackCreateCmd {
     #[arg(long = "staging-dir", value_name = "DIR")]
     pub staging_dir: Option<PathBuf>,
 
+    /// Custom DNS resolver for the VM that builds the pack. Defaults to the
+    /// host's own resolver; use this when that is not the resolver the pull
+    /// needs. For --from-vm, defaults to the machine's own --dns when it has one.
+    #[arg(long, value_name = "IP", help_heading = "Network")]
+    pub dns: Option<std::net::Ipv4Addr>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -404,7 +410,7 @@ impl PackCreateCmd {
                 memory_mib: 8192,
                 network: true,
                 network_backend: None,
-                dns: None,
+                dns: self.dns,
                 network_name: None,
                 gpu: false,
                 nested_virt: false,
@@ -672,6 +678,7 @@ impl PackCreateCmd {
             no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
             include_workspace: self.include_workspace,
+            dns: smolvm::pack_export::export_dns(self.dns, vm),
         };
         let assets = smolvm::pack_export::collect_from_vm_assets(
             &mut collector,
@@ -1887,6 +1894,7 @@ mod tests {
             lib_dir: None,
             rootfs_dir: None,
             smolfile: None,
+            dns: None,
             gpu: false,
             staging_dir: None,
             proxy_opts: crate::cli::proxy_opts::ProxyOpts::default(),

@@ -7448,6 +7448,28 @@ mod tests {
         assert_eq!(tsi_resolv_conf(Some("  "), "nameserver 10.0.0.2\n"), None);
     }
 
+    // The host's own resolver now arrives through the same env var as `--dns`
+    // (issue #1191: a guest resolved through 1.1.1.1 by default, so a machine on
+    // a network that blocks the public resolvers could not pull any image). The
+    // agent must write it verbatim and must not fall back to the public pair
+    // just because the guest's current file already names them.
+    #[test]
+    fn tsi_resolv_conf_writes_the_host_resolver_over_the_public_default() {
+        assert_eq!(
+            tsi_resolv_conf(
+                Some("128.112.128.12"),
+                "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+            )
+            .as_deref(),
+            Some("nameserver 128.112.128.12\n")
+        );
+        // A private-range host resolver is the common VPN and corporate case.
+        assert_eq!(
+            tsi_resolv_conf(Some("192.168.5.2"), "nameserver 127.0.0.1\n").as_deref(),
+            Some("nameserver 192.168.5.2\n")
+        );
+    }
+
     // A stale loopback (left by a prior --allow-host run) or an empty file is
     // repaired to the public resolvers.
     #[test]

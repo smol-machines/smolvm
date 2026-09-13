@@ -43,6 +43,18 @@ pub struct FromVmExportOptions {
     /// starts with those files. It lives on the storage disk, which container
     /// packs otherwise never carry, so without this a pack silently loses it.
     pub include_workspace: bool,
+    /// Resolver for the export helper's in-VM registry pull. `None` leaves the
+    /// helper on the launch default, which is the host's own resolver.
+    pub dns: Option<std::net::Ipv4Addr>,
+}
+
+/// The resolver a from-VM export helper should pull the base image with.
+///
+/// `pack create --dns` wins; otherwise the machine's own resolver is inherited,
+/// because the export re-pulls the base image in a fresh helper VM and a machine
+/// that needed a specific resolver to pull needs the same one to be packed.
+pub fn export_dns(flag: Option<std::net::Ipv4Addr>, vm: &VmRecord) -> Option<std::net::Ipv4Addr> {
+    flag.or(vm.dns)
 }
 
 /// What the export decided about the machine, for the caller's manifest.
@@ -311,6 +323,7 @@ impl ExportVm {
         source_vm_dir: &Path,
         packed_layers_dir: Option<PathBuf>,
         network: bool,
+        dns: Option<std::net::Ipv4Addr>,
     ) -> crate::Result<Self> {
         let (storage_disk, storage_fmt) = resolve_disk_image(source_vm_dir, STORAGE_DISK_FILENAME);
         // A machine that has never been started has no disks yet — attaching
@@ -377,7 +390,7 @@ impl ExportVm {
                 memory_mib: 8192,
                 network,
                 network_backend: None,
-                dns: None,
+                dns,
                 gpu: false,
                 cuda: false,
                 gpu_vram_mib: None,
@@ -450,7 +463,7 @@ fn export_flattened_from_registry_image(
     image: &str,
     opts: &FromVmExportOptions,
 ) -> crate::Result<(Vec<String>, Option<String>)> {
-    let export_vm = ExportVm::start(vm_name, vm_dir, None, true)?;
+    let export_vm = ExportVm::start(vm_name, vm_dir, None, true, opts.dns)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -533,7 +546,9 @@ fn export_flattened_from_local_image(
         }
     }
 
-    let export_vm = ExportVm::start(vm_name, vm_dir, host_dir.clone(), false)?;
+    // No network: this helper stages layers already on the host, so it never
+    // resolves a name and needs no resolver.
+    let export_vm = ExportVm::start(vm_name, vm_dir, host_dir.clone(), false, None)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -666,7 +681,8 @@ fn export_flattened_from_artifact_sourced(
         )
     })?;
 
-    let export_vm = ExportVm::start(vm_name, vm_dir, Some(pack_content_dir.clone()), false)?;
+    // No network, as above: the layers are staged from the host's own pack dir.
+    let export_vm = ExportVm::start(vm_name, vm_dir, Some(pack_content_dir.clone()), false, None)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -945,6 +961,8 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
         VmResources {
             cpus: 2,
             memory_mib: 2048,
+            // No network: this helper only rewrites a disk image, so it has no
+            // resolver to configure.
             network: false,
             network_backend: None,
             dns: None,
@@ -1099,12 +1117,36 @@ mod env_merge_tests {
 
 #[cfg(test)]
 mod from_vm_manifest_tests {
-    use super::{export_overlay_owner, seed_manifest_from_vm, FromVmAssets};
+    use super::{export_dns, export_overlay_owner, seed_manifest_from_vm, FromVmAssets};
     use crate::config::VmRecord;
     use smolvm_pack::{PackManifest, PackMode};
 
     fn record(name: &str) -> VmRecord {
         VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false)
+    }
+
+    // Issue #1191: `pack create` had no --dns at all and the export helper was
+    // built with dns: None, so a machine that could only pull through a specific
+    // resolver could be created but never packed. The helper re-pulls the base
+    // image, so it needs the same resolver the machine needed.
+    #[test]
+    fn a_from_vm_export_inherits_the_machine_resolver_unless_the_flag_overrides_it() {
+        let mut vm = record("packme");
+        vm.dns = Some(std::net::Ipv4Addr::new(192, 168, 5, 2));
+
+        assert_eq!(
+            export_dns(None, &vm),
+            Some(std::net::Ipv4Addr::new(192, 168, 5, 2))
+        );
+        assert_eq!(
+            export_dns(Some(std::net::Ipv4Addr::new(9, 9, 9, 9)), &vm),
+            Some(std::net::Ipv4Addr::new(9, 9, 9, 9))
+        );
+
+        // A machine with no resolver of its own leaves the helper on the launch
+        // default, which is now the host's resolver rather than 1.1.1.1.
+        let plain = record("plain");
+        assert_eq!(export_dns(None, &plain), None);
     }
 
     fn assets() -> FromVmAssets {

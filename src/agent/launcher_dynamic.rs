@@ -487,6 +487,14 @@ pub fn launch_agent_vm_dynamic(
 
             let mut guest_network = GuestNetworkConfig::default();
             guest_network.host_service = crate::network::launch::guest_host_service()?;
+            // The effective resolver becomes the gateway's upstream, the same way
+            // the static launcher sets it; this arm never applied `--dns` at all.
+            guest_network.upstream_dns = crate::data::network::effective_dns(
+                config.resources.dns,
+                EffectiveNetworkBackend::VirtioNet,
+            )
+            .addr
+            .unwrap_or(guest_network.upstream_dns);
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings
