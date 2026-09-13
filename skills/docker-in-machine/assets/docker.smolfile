@@ -1,0 +1,28 @@
+# A machine that runs a Docker daemon inside itself, for workloads that must
+# call Docker themselves: Testcontainers, Compose, image builds, agents that
+# launch containers. smolvm boots OCI images without Docker, so this is only for
+# software inside the machine that needs the daemon.
+#
+# The bind mounts below are in `init`, which is where the upstream example puts
+# them, and `init` runs ONCE. They are correct for the first boot and gone on
+# every boot after it, so scripts/start-dockerd.sh re-applies them before
+# starting dockerd. Do not rely on this block alone.
+cpus = 2
+memory = 2048
+net = true
+
+# Docker's data directory must live on /storage, not on the rootfs overlay.
+# This is a hard requirement: the rootfs overlay uses the initramfs (ramfs) as
+# its lower layer, ramfs has no file-handle support, and overlayfs then rejects
+# it as an upper dir for Docker's nested overlay.
+storage = 20
+
+docker_socket = true
+
+init = [
+    "apk update -q",
+    "apk add docker -q",
+    "mkdir -p /storage/docker /var/lib/docker /storage/containerd /var/lib/containerd",
+    "mount --bind /storage/docker /var/lib/docker",
+    "mount --bind /storage/containerd /var/lib/containerd",
+]

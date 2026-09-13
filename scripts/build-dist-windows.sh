@@ -138,8 +138,11 @@ USAGE (run smolvm.exe directly)
   smolvm.exe machine stats --name myvm
   smolvm.exe machine stop --name myvm
 
+GPU
+  CUDA compute works: run with --cuda against an NVIDIA GPU.
+
 NOT YET SUPPORTED ON WINDOWS
-  GPU acceleration; machine fork / snapshot.
+  Vulkan graphics (--gpu); machine fork / snapshot.
 
 More: https://github.com/smol-machines/smolvm
 EOF

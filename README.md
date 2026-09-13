@@ -297,7 +297,7 @@ Known Limitations
 * macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
-* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine branch` / `machine checkpoint`. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
+* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. CUDA (`--cuda`) works on Windows against an NVIDIA GPU. Not yet available on Windows: Vulkan (`--gpu`) and `machine branch` / `machine checkpoint`. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
 
 Kubernetes
 ----------
@@ -346,7 +346,6 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 |--------|----------|
 | Alpine | `apk add virglrenderer mesa-vulkan-intel` (or `mesa-vulkan-ati` for AMD) |
 | Debian/Ubuntu | `apt install virglrenderer0 mesa-vulkan-drivers` |
-| Nix / NixOS | the flake does not put virglrenderer on the loader path; export `LD_LIBRARY_PATH` with the nixpkgs `virglrenderer` and `libepoxy` lib dirs (and `/run/opengl-driver/lib` on NixOS), see the [GPU page](https://smolmachines.com/docs/introduction/concepts/gpu) |
 
 > virglrenderer depends on libEGL and libdrm from the host GPU driver stack. These are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
 
@@ -401,6 +400,13 @@ The user documentation at [smolmachines.com/docs](https://smolmachines.com/docs/
 welcome there. It is Markdown only, with no build to run; its
 [CONTRIBUTING.md](https://github.com/smol-machines/docs/blob/main/CONTRIBUTING.md) covers the
 page format and how a change reaches the site.
+
+Task-scoped procedures for agents and scripts live in [`skills/`](skills/), one directory per use
+case: `install`, `teardown`, `sandbox`, `dev-env`, `local-api`, `docker-in-machine` and
+`gpu-cuda` and `pack`. Each carries a preflight script,
+the lifecycle commands, a cleanup that reaps what it started, and the traps that cost real time.
+[`AGENTS.md`](AGENTS.md#skills) has the table of which packet answers which task, and how an agent
+finds them.
 
 Bugs and feature requests for the runtime stay here.
 

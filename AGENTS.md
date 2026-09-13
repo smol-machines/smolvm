@@ -10,7 +10,7 @@ A tool to build and run portable, self-contained virtual machines locally. <200m
 | Linux x86_64 / aarch64 | matching Linux | KVM | `/dev/kvm` |
 | Windows x86_64 | x86_64 Linux | Windows Hypervisor Platform (WHP) | WHP feature enabled |
 
-Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no branch/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
+Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): `--net` works as on other platforms (virtio-net with inbound `-p`; TSI for outbound-only VMs); CUDA (`--cuda`) works, Vulkan (`--gpu`) does not; no branch/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
 
 ## Quick Reference
 
@@ -87,6 +87,55 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 - **`pack start` + `exec`** — daemon mode. `/workspace` persists across exec sessions and stop/start. Container overlay resets per exec (package installs don't persist — use `/workspace` for durable data).
 - **`machine create --from .smolmachine`** — creates a persistent named machine from a packed artifact. Boots from pre-extracted layers (~250ms, no image pull). Full `machine exec` persistence — package installs, file writes all survive across exec and stop/start.
 - **Memory-backed paths** — `/tmp`, `/run`, and `/dev/shm` are tmpfs regardless of the mode above. They keep their contents while the machine runs, including across `exec` sessions, but are empty again after a stop and start. `/workspace` and the rest of the machine filesystem are on the storage disk, so write anything that must outlive a restart there — including credentials and configuration, which should not sit in `/tmp` or behind a symlink into it.
+
+## Skills
+
+Task-scoped procedures for this CLI, one directory per use case under `skills/`. Each was run end
+to end on a published release; each says which steps were not.
+
+| Task | Packet | Its preflight checks | Not for |
+|------|--------|----------------------|---------|
+| Install smolvm and prove the host boots a VM | `install` | version, platform, KVM or `kern.hv_support`, macOS socket path length, Intel Mac stated unverified | anything after the first boot |
+| Stop everything and remove smolvm's state | `teardown` | every state directory with its size, image caches, `PATH` block, whether state can be relocated | deleting machines another session created |
+| Run untrusted code, no network, repo read-only | `sandbox` | as install, plus mounts plus ports against the device budget, and whether the offline shape works here | a machine you re-enter; anything needing state to survive |
+| Keep a machine with its dependencies, re-enter it later | `dev-env` | as install, plus `restart_after_stop` | untrusted code; a machine that must leave nothing behind |
+| Drive smolvm over its local HTTP API | `local-api` | as install, plus `auth=none`, transport availability, `curl` and `python3` | a substitute for the CLI in a shell script |
+| Run a Docker daemon inside a machine | `docker-in-machine` | as install, plus whether this platform can do it at all | Windows, where the guest kernel cannot; running OCI images, which smolvm does natively |
+| Run CUDA compute against a host GPU | `gpu-cuda` | GPU and driver, KVM access, host `libcuda` count, glibc image requirement | Vulkan (`--gpu`), which works on no tested host |
+| Ship a machine or an image as one portable file | `pack` | as install, plus free memory against the exporter's fixed 8192 MiB | a machine you keep and re-enter; carrying an artifact to another architecture |
+
+Each directory holds `SKILL.md` (the procedure), `scripts/` (preflight, the lifecycle, cleanup) and
+`references/` (traps and per-platform arms, read when the situation calls for them). Scripts are
+wrappers over this CLI: they edit no configuration, escalate no privilege, and delete only machines
+they created. They are plain `bash` and assume nothing about which agent, if any, is driving them.
+
+### Finding them
+
+`skills/` is the home. The format is a `SKILL.md` per directory with `name` (matching the directory
+name) and `description` frontmatter, which is what current agents read.
+
+An agent with no skill discovery needs nothing: read `skills/<name>/SKILL.md` when the task matches
+its description.
+
+An agent that scans a fixed path needs `skills/` linked to that path, which is a local choice and
+is deliberately not committed here. The paths known at the time of writing, each from that agent's
+own documentation, read 2026-09-08:
+
+| Agent | Project path | Notes |
+|---|---|---|
+| Claude Code | `.claude/skills/<name>/SKILL.md` | also `~/.claude/skills` for personal skills |
+| OpenCode | `.opencode/skills/<name>/SKILL.md` | also accepts `.claude/skills` and the cross-agent `.agents/skills`, walking up to the git worktree root |
+
+```bash
+# Expose them to an agent that scans .claude/skills, once, locally:
+mkdir -p .claude && ln -s ../skills .claude/skills
+```
+
+Check the agent's own documentation before trusting a path here; discovery conventions are young
+and move.
+
+`AGENTS.md` is how to work in this repository and is always in context. A `SKILL.md` is how to
+accomplish one task with the product, and loads only when that task comes up.
 
 ## CLI Structure
 

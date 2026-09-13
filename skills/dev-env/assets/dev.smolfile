@@ -1,0 +1,30 @@
+# A persistent development machine. `smolvm machine create -s dev.smolfile`.
+#
+# The two keys worth understanding before you edit this:
+#
+#   init  runs ONCE, on the first start, and as root. It does not run again on
+#         later starts, whatever the docs say, so anything that has to be true
+#         on every boot does not belong here.
+#   user  governs `exec` and `shell`, not `init`.
+#
+# There is no workload-command key here. Pass one after `--` on `machine create`,
+# as scripts/create-dev-machine.sh does: without it the image's own CMD becomes
+# the persistent workload, and for an interpreter image that command exits at
+# once and `exec` starts racing the relaunch.
+image = "python:3.12-alpine"
+net = true
+cpus = 2
+memory = 2048
+
+# A host mount carries host ownership, so `user` below cannot write to it.
+# Read source in, write build output somewhere else.
+volumes = ["./src:/app"]
+
+init = [
+  "sh -c \"id -un > /init-ran-as.txt\"",
+  "sh -c \"date +%s >> /init-count.txt\"",
+  "adduser -D app",
+]
+
+user = "app"
+workdir = "/app"
