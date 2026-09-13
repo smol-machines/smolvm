@@ -1080,6 +1080,29 @@ impl AgentManager {
         ))
     }
 
+    /// Decide whether a staged extraction is usable, given tar's exit status.
+    ///
+    /// `sbin/init` is the guest's exec target and the last entry to survive a
+    /// failed symlink creation, so its presence is the acceptance test. It is
+    /// checked with `symlink_metadata`, not `exists`, because it is a symlink to
+    /// a guest-only path that would not resolve on the host: the same rule
+    /// [`Self::resolve_rootfs_path`] applies, so the two can never disagree.
+    fn accept_extraction(staged: &Path, status: std::process::ExitStatus) -> Result<()> {
+        if std::fs::symlink_metadata(staged.join("sbin/init")).is_ok() {
+            return Ok(());
+        }
+        Err(Error::storage(
+            "extract rootfs tar",
+            format!(
+                "the agent rootfs extracted without sbin/init (tar exited with {status}): \
+                 this host could not create the rootfs's symlinks.\n  On Windows, enable \
+                 Developer Mode (Settings > Privacy & security > For developers) or run smolvm \
+                 once from an elevated shell, then run again. Nothing was cached, so there is \
+                 nothing to delete first."
+            ),
+        ))
+    }
+
     /// Extract a bundled agent-rootfs tarball to a cache dir (idempotent) and
     /// return that dir. Keyed by the tarball's size+mtime so a newer SDK build
     /// re-extracts; extraction is staged in a temp dir then atomically renamed so
@@ -1121,23 +1144,15 @@ impl AgentManager {
             .arg(&tmp)
             .status()
             .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))?;
+        // tar's exit status cannot decide this on its own: a healthy Windows
+        // extraction also exits non-zero, on the extended-attribute warning.
+        if let Err(e) = Self::accept_extraction(&tmp, status) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
         if !status.success() {
-            // On Windows, `tar` can't recreate the rootfs's busybox symlinks
-            // without symlink privilege (Developer Mode / elevation) and exits
-            // non-zero with warnings — but the real files (notably the agent)
-            // still extract. Treat the result as usable as long as the agent
-            // binary landed; otherwise it's a genuine extraction failure.
-            let agent_present = tmp.join("usr/local/bin/smolvm-agent").exists();
-            if !agent_present {
-                let _ = std::fs::remove_dir_all(&tmp);
-                return Err(Error::storage(
-                    "extract rootfs tar",
-                    format!("tar exited with {status} and the agent binary was not extracted"),
-                ));
-            }
             tracing::warn!(
-                "rootfs tar extraction exited with {status} (host could not create some \
-                 symlinks); continuing — the agent binary extracted successfully"
+                "rootfs tar extraction exited with {status} but sbin/init landed; continuing"
             );
         }
         let _ = std::fs::write(tmp.join(".extracted"), b"");
@@ -3423,6 +3438,85 @@ mod tests {
             .to_string();
         assert!(err.contains("could not find agent rootfs"), "{err}");
         assert!(err.contains(&bare.display().to_string()), "{err}");
+    }
+
+    // Issue #965: on a Windows shell without SeCreateSymbolicLinkPrivilege (no
+    // Developer Mode, not elevated) tar creates none of the rootfs's symlinks,
+    // sbin/init among them, while every regular file lands. The old code asked
+    // only whether the agent binary arrived, so it wrote the .extracted marker
+    // and published the broken tree; the guest then had nothing to exec and the
+    // boot came back as exit 127, and the bad extraction was reused on every
+    // later run until the user deleted the cache by hand. Measured on v1.14.6
+    // under `runas /trustlevel:0x20000`: 0 symlinks in the published tree, the
+    // agent binary present, sbin/init absent.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        // A real ExitStatus, since accept_extraction only formats it.
+        std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                vec!["/C".to_string(), format!("exit {code}")]
+            } else {
+                vec!["-c".to_string(), format!("exit {code}")]
+            })
+            .status()
+            .expect("spawn a process that just exits")
+    }
+
+    #[test]
+    fn extraction_without_sbin_init_is_refused_and_names_the_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        // Exactly what a privilege-less Windows extraction leaves: regular files
+        // land, no symlink does.
+        std::fs::create_dir_all(staged.join("usr/local/bin")).unwrap();
+        std::fs::create_dir_all(staged.join("sbin")).unwrap();
+        std::fs::write(staged.join("usr/local/bin/smolvm-agent"), b"agent").unwrap();
+
+        let err = super::AgentManager::accept_extraction(&staged, exit_status(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without sbin/init"), "{err}");
+        assert!(
+            err.contains("could not create the rootfs's symlinks"),
+            "{err}"
+        );
+        assert!(err.contains("Developer Mode"), "{err}");
+        assert!(err.contains("elevated shell"), "{err}");
+        // The remedy must not send the user to delete a cache, because the
+        // caller removes the staging directory and publishes nothing.
+        assert!(err.contains("nothing to delete first"), "{err}");
+    }
+
+    #[test]
+    fn a_nonzero_tar_exit_is_tolerated_when_sbin_init_landed() {
+        // A healthy Windows extraction also exits non-zero, on
+        // "Cannot restore extended attributes on this system", so the exit
+        // status alone cannot decide. Observed on v1.14.6 in an elevated shell:
+        // tar exit 1 with every symlink correctly created.
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        std::fs::create_dir_all(staged.join("sbin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", staged.join("sbin/init"))
+            .unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(staged.join("sbin/init"), b"").unwrap();
+
+        assert!(super::AgentManager::accept_extraction(&staged, exit_status(1)).is_ok());
+        assert!(super::AgentManager::accept_extraction(&staged, exit_status(0)).is_ok());
+    }
+
+    #[test]
+    fn a_regular_file_at_sbin_init_is_accepted_like_a_symlink() {
+        // symlink_metadata does not care which it is, and neither does
+        // resolve_rootfs_path, so the two agree by construction. A rootfs whose
+        // sbin/init is a real file is a valid rootfs; what this rule rejects is
+        // the entry being absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        std::fs::create_dir_all(staged.join("sbin")).unwrap();
+        std::fs::write(staged.join("sbin/init"), b"").unwrap();
+
+        assert!(super::AgentManager::accept_extraction(&staged, exit_status(0)).is_ok());
     }
 
     use super::*;
