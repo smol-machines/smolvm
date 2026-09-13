@@ -814,9 +814,12 @@ impl PodBackend for EnginePodBackend {
         let stdio = spec.stdio.clone();
 
         // containerd's ExecProcessRequest.spec is an Any whose value is the
-        // OCI Process serialized as JSON — pass it through verbatim.
-        let process_json = String::from_utf8(spec.exec_spec.unwrap_or_default())
+        // OCI Process serialized as JSON, passed through as-is except for the
+        // host LSM labels, which containerd stamps on exec processes too and
+        // which crun cannot honor in the guest (see [`strip_host_lsm`]).
+        let raw = String::from_utf8(spec.exec_spec.unwrap_or_default())
             .map_err(|e| format!("exec spec is not UTF-8 JSON: {e}"))?;
+        let process_json = strip_host_lsm_from_exec_spec(&raw)?;
 
         tokio::task::spawn_blocking(move || {
             let resp = pod_request(
@@ -1057,6 +1060,34 @@ impl PodBackend for EnginePodBackend {
     }
 }
 
+/// Strip host-kernel LSM settings from an OCI `process` object.
+///
+/// containerd stamps the NODE's AppArmor profile (`runtime/default`) into every
+/// container and exec process spec, and a SELinux label on SELinux hosts. Both
+/// name policy loaded in the host kernel. The pod's guest kernel has neither, so
+/// crun aborts the container outright ("AppArmor is not initialized correctly")
+/// and the pod CrashLoopBackOffs with no useful signal. Nothing is weakened by
+/// dropping them: the VM boundary is the isolation, and a host LSM label has
+/// nothing to attach to on the other side of it (the same reason Kata drops it).
+fn strip_host_lsm(process: &mut serde_json::Value) {
+    if let Some(obj) = process.as_object_mut() {
+        obj.remove("apparmorProfile");
+        obj.remove("selinuxLabel");
+    }
+}
+
+/// Drop the host LSM labels from a raw exec process spec, returning the spec to
+/// send to the guest.
+///
+/// Both steps surface their error instead of passing the spec through: an
+/// unparsed spec would still carry the label the caller means to remove.
+fn strip_host_lsm_from_exec_spec(process_json: &str) -> Result<String, String> {
+    let mut process: serde_json::Value = serde_json::from_str(process_json)
+        .map_err(|e| format!("exec spec is not valid JSON: {e}"))?;
+    strip_host_lsm(&mut process);
+    serde_json::to_string(&process).map_err(|e| format!("exec spec failed to reserialize: {e}"))
+}
+
 /// Copy the CRI bind mounts referenced by `config.json` into the pod share so
 /// the guest can materialize them into the container, and rewrite each such
 /// mount's `source` to the guest-visible path under [`POD_SHARE_GUEST_MOUNT`].
@@ -1075,6 +1106,11 @@ fn materialize_bind_mounts(
 ) -> Result<String, String> {
     let mut spec: serde_json::Value =
         serde_json::from_str(spec_json).map_err(|e| format!("parse config.json: {e}"))?;
+
+    // The guest kernel has no AppArmor/SELinux policy loaded; see [`strip_host_lsm`].
+    if let Some(process) = spec.get_mut("process") {
+        strip_host_lsm(process);
+    }
 
     // Inject the pod hostname if the container spec doesn't carry one.
     if let Some(h) = sandbox_hostname {
@@ -1408,5 +1444,74 @@ mod tests {
             ))),
             GpuRequest::default()
         );
+    }
+
+    /// containerd stamps the host's AppArmor profile / SELinux label into the
+    /// container spec; the guest kernel has neither, so crun would abort the
+    /// container ("AppArmor is not initialized correctly").
+    #[test]
+    fn materialize_strips_host_lsm_from_container_spec() {
+        let spec = r#"{
+            "hostname": "pod-a",
+            "process": {
+                "args": ["sh"],
+                "apparmorProfile": "runtime/default",
+                "selinuxLabel": "system_u:system_r:container_t:s0"
+            }
+        }"#;
+        let out = materialize_bind_mounts(spec, Path::new("/nonexistent"), "c1", None, None)
+            .expect("materialize");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["process"].get("apparmorProfile").is_none());
+        assert!(v["process"].get("selinuxLabel").is_none());
+        // The rest of the process object is untouched.
+        assert_eq!(v["process"]["args"][0], "sh");
+    }
+
+    /// A spec that cannot be parsed must fail the exec, not pass through. The
+    /// first version of this fix wrapped the strip in `if let Ok(...)`, so a
+    /// malformed spec silently kept its host label and crun aborted the exec in
+    /// the guest with "AppArmor is not initialized correctly" and nothing
+    /// logged, which is the failure this whole change exists to remove.
+    #[test]
+    fn unparseable_exec_spec_is_an_error_naming_the_parse_failure() {
+        let err = strip_host_lsm_from_exec_spec("not json at all").unwrap_err();
+        assert!(
+            err.starts_with("exec spec is not valid JSON: "),
+            "error must name the stage and carry serde's reason, got: {err}"
+        );
+        assert!(
+            err.len() > "exec spec is not valid JSON: ".len(),
+            "the parse error itself must be in the text, got: {err}"
+        );
+    }
+
+    /// The strip still happens on the good path, and the spec that comes back
+    /// is the one the guest receives.
+    #[test]
+    fn exec_spec_round_trips_without_its_host_lsm_labels() {
+        let out = strip_host_lsm_from_exec_spec(
+            r#"{"args":["id"],"env":["A=1"],"apparmorProfile":"runtime/default","selinuxLabel":"system_u:system_r:container_t:s0"}"#,
+        )
+        .expect("valid spec strips");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("apparmorProfile").is_none());
+        assert!(v.get("selinuxLabel").is_none());
+        assert_eq!(v["args"][0], "id");
+        assert_eq!(v["env"][0], "A=1");
+    }
+
+    /// Exec specs get the same containerd stamp; `strip_host_lsm` is what the
+    /// exec path applies to the raw OCI Process JSON.
+    #[test]
+    fn strip_host_lsm_leaves_other_fields() {
+        let mut process: serde_json::Value = serde_json::from_str(
+            r#"{"args":["env"],"env":["A=1"],"apparmorProfile":"runtime/default"}"#,
+        )
+        .unwrap();
+        strip_host_lsm(&mut process);
+        assert!(process.get("apparmorProfile").is_none());
+        assert_eq!(process["env"][0], "A=1");
+        assert_eq!(process["args"][0], "env");
     }
 }
