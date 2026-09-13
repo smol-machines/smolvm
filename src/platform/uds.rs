@@ -33,6 +33,14 @@ impl UdsStream {
         Ok(Self { inner: sock })
     }
 
+    /// Connect with a deadline, including a full listener backlog.
+    pub fn connect_timeout(path: impl AsRef<Path>, timeout: Duration) -> io::Result<Self> {
+        let addr = SockAddr::unix(path.as_ref())?;
+        let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        sock.connect_timeout(&addr, timeout)?;
+        Ok(Self { inner: sock })
+    }
+
     /// Wrap an already-connected `socket2::Socket` (e.g. one returned by
     /// [`UdsListener::accept`]).
     pub fn from_socket(inner: Socket) -> Self {

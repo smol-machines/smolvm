@@ -199,6 +199,9 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
             config.resources.cpus,
             config.resources.memory_mib,
             config.cuda,
+            // Match scope-mode accounting for both sources and restored clones.
+            std::env::var_os("SMOLVM_FORKABLE").is_some()
+                || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
         );
     }
 

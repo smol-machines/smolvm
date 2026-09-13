@@ -2214,6 +2214,13 @@ async fn boot_prepared_fork_inner(
         // Boot from the golden's snapshot instead of cold-booting.
         features.forkable = record.forkable;
         features.snapshot_dir = Some(prep.snapshot_dir);
+        // A nested branch must keep the original lineage's UID, not allocate
+        // a new UID from the immediate parent's snapshot directory.
+        features.uid_share_dir = record
+            .fork_overlay_owner
+            .as_deref()
+            .or(record.golden.as_deref())
+            .map(crate::agent::vm_data_dir);
         features.cuda_share_weights = share_weights;
         features.cuda_preload_modules = record.cuda_preload_modules;
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;

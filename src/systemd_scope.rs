@@ -88,6 +88,10 @@ fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
 pub struct ScopeCaps {
     /// Hard memory ceiling in bytes (`MemoryMax`). `None` = uncapped.
     pub memory_max_bytes: Option<u64>,
+    /// Reclaim threshold in bytes (`MemoryHigh`), set below `MemoryMax` so the
+    /// kernel starts throttling and reclaim before the hard limit is reached.
+    /// `None` disables this early threshold; `MemoryMax` still attempts reclaim.
+    pub memory_high_bytes: Option<u64>,
     /// CPU quota in microseconds-of-CPU-time per real second
     /// (`CPUQuotaPerSecUSec`). For N vCPUs uncapped-overcommit, pass
     /// `N * 1_000_000`. `None` = uncapped.
@@ -168,6 +172,25 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot create scope"))?;
     let name = scope_name(machine_id);
+    let args = scope_start_args(machine_id, pid, caps);
+    let mut cmd = Command::new(&busctl);
+    cmd.args(&args);
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if !out.status.success() {
+        return Err(Error::agent(
+            "vm scope",
+            format!(
+                "StartTransientUnit {name} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    tracing::info!(scope = %name, pid, "adopted VM into systemd transient scope");
+    Ok(())
+}
+
+fn scope_start_args(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Vec<String> {
+    let name = scope_name(machine_id);
 
     // Build the a(sv) property list in busctl's positional encoding:
     //   <prop-name> <variant-type> <variant-value...>
@@ -183,6 +206,10 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
         format!("smolvm VM {machine_id}"),
     ]);
     nprops += 1;
+    if let Some(m) = caps.memory_high_bytes {
+        props.extend(["MemoryHigh".into(), "t".into(), m.to_string()]);
+        nprops += 1;
+    }
     if let Some(m) = caps.memory_max_bytes {
         props.extend(["MemoryMax".into(), "t".into(), m.to_string()]);
         nprops += 1;
@@ -213,29 +240,21 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     args.extend(props);
     args.push("0".into()); // empty aux array
 
-    let mut cmd = Command::new(&busctl);
-    cmd.args(&args);
-    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(Error::agent(
-            "vm scope",
-            format!("StartTransientUnit {name} failed: {}", stderr.trim()),
-        ));
-    }
-    tracing::info!(scope = %name, pid, "adopted VM into systemd transient scope");
-    Ok(())
+    args
 }
 
-/// Change the hard memory ceiling of an existing VM scope.
+/// Change the reclaim threshold and hard memory ceiling of an existing VM scope.
 ///
 /// A live branch source retains immutable RAM generations in the same memory
 /// cgroup that originally faulted those pages.  Linux does not migrate those
 /// page charges when a raw-forked guardian moves between cgroups, so the scope
 /// ceiling must grow with the number of retained generations and shrink again
 /// when they are collected.
-pub fn set_scope_memory_max(machine_id: &str, memory_max_bytes: u64) -> Result<()> {
+pub fn set_scope_memory_max(
+    machine_id: &str,
+    memory_max_bytes: u64,
+    memory_high_bytes: u64,
+) -> Result<()> {
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot update scope"))?;
     let name = scope_name(machine_id);
@@ -252,7 +271,10 @@ pub fn set_scope_memory_max(machine_id: &str, memory_max_bytes: u64) -> Result<(
         "sba(sv)".to_string(),
         name.clone(),
         "true".to_string(),
-        "1".to_string(),
+        "2".to_string(),
+        "MemoryHigh".to_string(),
+        "t".to_string(),
+        memory_high_bytes.to_string(),
         "MemoryMax".to_string(),
         "t".to_string(),
         memory_max_bytes.to_string(),
@@ -332,6 +354,33 @@ pub fn kill_scope(machine_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_property_count_matches_every_optional_cap_combination() {
+        for mask in 0..16 {
+            let caps = ScopeCaps {
+                memory_high_bytes: (mask & 1 != 0).then_some(100),
+                memory_max_bytes: (mask & 2 != 0).then_some(200),
+                cpu_quota_usec_per_sec: (mask & 4 != 0).then_some(300),
+                tasks_max: (mask & 8 != 0).then_some(400),
+            };
+            let args = scope_start_args("test", 123, &caps);
+            let declared: usize = args[8].parse().unwrap();
+            let mut cursor = 9;
+            for _ in 0..declared {
+                cursor += match args[cursor + 1].as_str() {
+                    "au" => 3 + args[cursor + 2].parse::<usize>().unwrap(),
+                    "s" | "t" => 3,
+                    other => panic!("unexpected variant {other}"),
+                };
+            }
+            assert_eq!(
+                &args[cursor..],
+                &["0"],
+                "mask {mask}: malformed auxiliary array"
+            );
+        }
+    }
 
     // A wedged busctl (systemd stuck on a dying cgroup) must not pin the thread:
     // the call is bounded and returns promptly, well under the hang it replaces.
