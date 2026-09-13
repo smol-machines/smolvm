@@ -113,6 +113,18 @@ impl Supervisor {
 
     /// Check a single machine and restart if needed.
     async fn check_machine(&mut self, name: &str) -> crate::Result<()> {
+        {
+            let lifecycle = self.state.lifecycle_lock(name);
+            // An API lifecycle operation may be creating or deleting the row.
+            // Let it finish, without blocking other machines' health checks.
+            let Ok(_guard) = lifecycle.try_lock() else {
+                return Ok(());
+            };
+            if self.state.forget_deleted_machine(name)? {
+                self.next_restart_at.remove(name);
+                return Ok(());
+            }
+        }
         // Check if machine is alive
         let is_alive = self.state.is_machine_alive(name);
 
@@ -428,6 +440,37 @@ mod restart_timing_tests {
         assert!(!supervisor
             .next_restart_at
             .contains_key("supervisor-live-pid"));
+    }
+
+    #[tokio::test]
+    async fn external_delete_clears_registry_and_pending_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("machines.db")).unwrap();
+        let name = "supervisor-external-delete";
+        db.insert_vm(
+            name,
+            &crate::config::VmRecord::new(name.into(), 1, 512, vec![], vec![], false),
+        )
+        .unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        state.load_persisted_machines();
+        assert!(state.get_machine(name).is_ok());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        supervisor
+            .next_restart_at
+            .insert(name.into(), Instant::now());
+        state.db().remove_vm(name).unwrap();
+        // In-flight lifecycle work must be left alone until it finishes.
+        let lock = state.lifecycle_lock(name);
+        let guard = lock.lock().await;
+        supervisor.check_machine(name).await.unwrap();
+        assert!(state.get_machine(name).is_ok());
+        drop(guard);
+        supervisor.check_machine(name).await.unwrap();
+        assert!(state.get_machine(name).is_err());
+        assert!(!supervisor.next_restart_at.contains_key(name));
+        supervisor.check_machine(name).await.unwrap();
     }
 
     // A backoff at or below the minimum restarts immediately and schedules nothing.
