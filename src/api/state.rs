@@ -691,6 +691,27 @@ impl ApiState {
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))
     }
 
+    /// Forget an externally deleted machine without deleting data or stopping
+    /// a process. Caller must hold the machine's lifecycle lock.
+    pub(crate) fn forget_deleted_machine(&self, name: &str) -> crate::Result<bool> {
+        if self.db.get_vm(name)?.is_some() {
+            return Ok(false);
+        }
+        let mut machines = self.machines.write();
+        let entry = machines.get(name).cloned();
+        if let Some(entry) = entry {
+            let Some(entry_guard) = entry.try_lock() else {
+                return Ok(false);
+            };
+            // A detached manager must not stop a surviving or replacement VM
+            // when its final reference is dropped.
+            entry_guard.manager.detach();
+            machines.remove(name);
+            tracing::info!(machine = name, "forgot externally deleted machine");
+        }
+        Ok(true)
+    }
+
     /// Update machine state in database (call after start/stop).
     ///
     /// Returns an error if the database write fails. Callers in API handlers
@@ -1888,6 +1909,58 @@ mod tests {
             state.remove_machine("nope"),
             Err(ApiError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn externally_deleted_machine_is_forgotten_without_deleting_replacements() {
+        let (_dir, state) = temp_api_state();
+        let name = "external-delete-qa";
+        let record = VmRecord::new(name.into(), 1, 512, vec![], vec![], false);
+        state.db.insert_vm(name, &record).unwrap();
+        state.insert_machine(
+            name,
+            MachineEntry {
+                manager: AgentManager::for_vm(name).unwrap(),
+                mounts: vec![],
+                ports: vec![],
+                resources: ResourceSpec {
+                    cpus: None,
+                    memory_mb: None,
+                    network: None,
+                    gpu: None,
+                    cuda: None,
+                    storage_gb: None,
+                    overlay_gb: None,
+                    block_io: None,
+                    allowed_cidrs: None,
+                    allowed_hosts: None,
+                    network_backend: None,
+                },
+                restart: RestartConfig::default(),
+                network: false,
+                secret_refs: Default::default(),
+                source_smolmachine: None,
+                forkable: false,
+                cuda_fork_pool_size: None,
+                cuda_vram_limit_mib: None,
+                forkpoint_held: false,
+            },
+        );
+        assert!(!state.forget_deleted_machine(name).unwrap());
+        state.db.remove_vm(name).unwrap();
+        let entry = state.get_machine(name).unwrap();
+        let busy = entry.lock();
+        assert!(!state.forget_deleted_machine(name).unwrap());
+        drop(busy);
+        // A same-name replacement in the DB must survive reconciliation.
+        state.db.insert_vm(name, &record).unwrap();
+        assert!(!state.forget_deleted_machine(name).unwrap());
+        assert!(state.db.get_vm(name).unwrap().is_some());
+        state.db.remove_vm(name).unwrap();
+        assert!(state.forget_deleted_machine(name).unwrap());
+        assert!(state.get_machine(name).is_err());
+        assert!(entry.lock().manager.is_detached());
+        assert!(state.forget_deleted_machine(name).unwrap());
     }
 
     // remove_machine must clear BOTH the DB row and the in-memory registry entry
