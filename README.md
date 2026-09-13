@@ -346,7 +346,6 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 |--------|----------|
 | Alpine | `apk add virglrenderer mesa-vulkan-intel` (or `mesa-vulkan-ati` for AMD) |
 | Debian/Ubuntu | `apt install virglrenderer0 mesa-vulkan-drivers` |
-| Nix / NixOS | the flake does not put virglrenderer on the loader path; export `LD_LIBRARY_PATH` with the nixpkgs `virglrenderer` and `libepoxy` lib dirs (and `/run/opengl-driver/lib` on NixOS), see the [GPU page](https://smolmachines.com/docs/introduction/concepts/gpu) |
 
 > virglrenderer depends on libEGL and libdrm from the host GPU driver stack. These are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
 
@@ -401,6 +400,12 @@ The user documentation at [smolmachines.com/docs](https://smolmachines.com/docs/
 welcome there. It is Markdown only, with no build to run; its
 [CONTRIBUTING.md](https://github.com/smol-machines/docs/blob/main/CONTRIBUTING.md) covers the
 page format and how a change reaches the site.
+
+Task-scoped procedures for agents and scripts live in [`skills/`](skills/), one directory per use
+case: `install`, `teardown` and `sandbox`, with more to follow. Each carries a preflight script,
+the lifecycle commands, a cleanup that reaps what it started, and the traps that cost real time.
+[`AGENTS.md`](AGENTS.md#skills) has the table of which packet answers which task, and how an agent
+finds them.
 
 Bugs and feature requests for the runtime stay here.
 

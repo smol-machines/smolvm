@@ -88,6 +88,53 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 - **`machine create --from .smolmachine`** — creates a persistent named machine from a packed artifact. Boots from pre-extracted layers (~250ms, no image pull). Full `machine exec` persistence — package installs, file writes all survive across exec and stop/start.
 - **Memory-backed paths** — `/tmp`, `/run`, and `/dev/shm` are tmpfs regardless of the mode above. They keep their contents while the machine runs, including across `exec` sessions, but are empty again after a stop and start. `/workspace` and the rest of the machine filesystem are on the storage disk, so write anything that must outlive a restart there — including credentials and configuration, which should not sit in `/tmp` or behind a symlink into it.
 
+## Skills
+
+Task-scoped procedures for this CLI, one directory per use case under `skills/`. Each was run end
+to end on a published release; each says which steps were not.
+
+| Task | Packet | Its preflight checks | Not for |
+|------|--------|----------------------|---------|
+| Install smolvm and prove the host boots a VM | `install` | version, platform, KVM or `kern.hv_support`, macOS socket path length, Intel Mac stated unverified | anything after the first boot |
+| Stop everything and remove smolvm's state | `teardown` | every state directory with its size, image caches, `PATH` block, whether state can be relocated | deleting machines another session created |
+| Run untrusted code, no network, repo read-only | `sandbox` | as install, plus mounts plus ports against the device budget, and whether the offline shape works here | a machine you re-enter; anything needing state to survive |
+
+More packets follow with the same shape: a persistent dev environment, the local HTTP API, Docker
+inside a machine, and CUDA against a host GPU.
+
+Each directory holds `SKILL.md` (the procedure), `scripts/` (preflight, the lifecycle, cleanup) and
+`references/` (traps and per-platform arms, read when the situation calls for them). Scripts are
+wrappers over this CLI: they edit no configuration, escalate no privilege, and delete only machines
+they created. They are plain `bash` and assume nothing about which agent, if any, is driving them.
+
+### Finding them
+
+`skills/` is the home. The format is a `SKILL.md` per directory with `name` (matching the directory
+name) and `description` frontmatter, which is what current agents read.
+
+An agent with no skill discovery needs nothing: read `skills/<name>/SKILL.md` when the task matches
+its description.
+
+An agent that scans a fixed path needs `skills/` linked to that path, which is a local choice and
+is deliberately not committed here. The paths known at the time of writing, each from that agent's
+own documentation, read 2026-09-08:
+
+| Agent | Project path | Notes |
+|---|---|---|
+| Claude Code | `.claude/skills/<name>/SKILL.md` | also `~/.claude/skills` for personal skills |
+| OpenCode | `.opencode/skills/<name>/SKILL.md` | also accepts `.claude/skills` and the cross-agent `.agents/skills`, walking up to the git worktree root |
+
+```bash
+# Expose them to an agent that scans .claude/skills, once, locally:
+mkdir -p .claude && ln -s ../skills .claude/skills
+```
+
+Check the agent's own documentation before trusting a path here; discovery conventions are young
+and move.
+
+`AGENTS.md` is how to work in this repository and is always in context. A `SKILL.md` is how to
+accomplish one task with the product, and loads only when that task comes up.
+
 ## CLI Structure
 
 All commands use named flags (no positional args except `machine create --name NAME` and `machine delete --name NAME`).
