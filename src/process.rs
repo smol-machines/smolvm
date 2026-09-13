@@ -1186,6 +1186,7 @@ pub fn allocate_vm_uid(
     vm_key: &str,
 ) -> std::io::Result<u32> {
     std::fs::create_dir_all(registry_dir)?;
+    let _registry_lock = lock_uid_registry(registry_dir)?;
     let cache = key_dir.join(".vm-uid");
     // Fast path: a cached uid whose marker still belongs to us.
     if let Some(uid) = std::fs::read_to_string(&cache)
@@ -1244,11 +1245,40 @@ pub fn allocate_vm_uid(
 /// shares its golden's uid and never claims its own). Linux-only.
 #[cfg(target_os = "linux")]
 pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
+    let Ok(_registry_lock) = lock_uid_registry(registry_dir) else {
+        tracing::warn!("unable to lock UID registry; retaining assignment");
+        return;
+    };
     if let Some(uid) = std::fs::read_to_string(key_dir.join(".vm-uid"))
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
     {
-        let _ = std::fs::remove_file(registry_dir.join(uid.to_string()));
+        if uid_marker_key(registry_dir, uid).as_deref()
+            == key_dir.file_name().and_then(|name| name.to_str())
+        {
+            let _ = std::fs::remove_file(registry_dir.join(uid.to_string()));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lock_uid_registry(registry_dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(registry_dir.join(".allocation.lock"))?;
+    loop {
+        // Hold one transaction across lookup, claim, cache update and release.
+        // O_EXCL alone only makes UIDs unique, not assignments per machine.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 

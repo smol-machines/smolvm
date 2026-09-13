@@ -1807,6 +1807,11 @@ impl AgentManager {
             lock_file
         };
 
+        // The launcher, not the VMM, owns vm.lock. A service restart releases
+        // that lock while its VMM survives. Failed agent reconnect must not
+        // authorize opening the surviving process's disks a second time.
+        self.verify_no_persisted_process()?;
+
         // Check and update state
         {
             let mut inner = self.inner.lock();
@@ -1902,6 +1907,40 @@ impl AgentManager {
         Ok(())
     }
 
+    fn verify_no_persisted_process(&self) -> Result<()> {
+        if let Some((pid, _)) = self.read_pid_file_with_start_time() {
+            refuse_live_launch_pid(pid)?;
+        }
+        // The database can retain identity when a PID file is missing.
+        if let Some(name) = self.name() {
+            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                if let Some(pid) = record.pid {
+                    refuse_live_launch_pid(pid)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve process identity and the launch lock unless teardown succeeds.
+    fn abort_failed_launch(&self, pid: i32) -> Result<()> {
+        self.inner.lock().child = Some(ChildProcess::new(pid));
+        let identity = match process::process_start_time(pid) {
+            Some(start) => format!("{pid}\n{start}"),
+            None => pid.to_string(),
+        };
+        if let Err(error) = std::fs::write(&self.pid_file, identity) {
+            tracing::warn!(pid, %error, "could not persist failed launch identity; retaining child handle");
+        }
+        process::stop_vm_process(pid, Duration::ZERO, process::VM_SIGKILL_TIMEOUT)?;
+        if process::is_alive(pid) {
+            return Err(Error::agent("abort launch", "VMM is still alive"));
+        }
+        let _ = std::fs::remove_file(&self.pid_file);
+        self.mark_stopped();
+        Ok(())
+    }
+
     /// Common post-launch bookkeeping: store child PID, write config/PID files,
     /// wait for agent ready.
     ///
@@ -1949,33 +1988,16 @@ impl AgentManager {
                 Ok(())
             }
             Err(e) => {
-                // The _boot-vm child may be stuck inside krun_start_enter()
-                // where SIGTERM alone may not kill it (the VM run loop can
-                // mask signals). Use the full SIGTERM -> wait -> SIGKILL
-                // sequence so the child is reliably dead before we return,
-                // preventing an orphaned process from holding ports/sockets
-                // and making every subsequent start attempt fail permanently.
-                if let Err(kill_err) = process::stop_vm_process(
-                    child_pid,
-                    AGENT_STOP_TIMEOUT,
-                    process::VM_SIGKILL_TIMEOUT,
-                ) {
+                // The _boot-vm child may be stuck inside krun_start_enter().
+                // Terminate it and retain its identity if it cannot be reaped,
+                // so another launch cannot reopen disks it still owns.
+                if let Err(kill_err) = self.abort_failed_launch(child_pid) {
                     tracing::warn!(
                         pid = child_pid,
                         error = %kill_err,
                         "failed to kill _boot-vm child after start failure; \
                          process may be orphaned"
                     );
-                }
-                // Remove the PID file written earlier in this function so a
-                // stale PID doesn't confuse future reconnect attempts.
-                let _ = std::fs::remove_file(&self.pid_file);
-                let mut inner = self.inner.lock();
-                inner.state = AgentState::Stopped;
-                inner.child = None;
-                #[cfg(unix)]
-                {
-                    inner.vm_lock_handle = None;
                 }
                 Err(e)
             }
@@ -2569,8 +2591,7 @@ impl AgentManager {
         // boot subprocess skipped self-placement and the VM is still in serve's
         // cgroup for this microsecond window — the adopt moves it out. Caps mirror
         // process::place_in_cgroup (VMM_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
-        // =1024) as scope properties. Best-effort: on failure the VM keeps running
-        // (just not restart-safe), same as an uncapped cgroup join.
+        // =1024) as scope properties. Required placement fails closed.
         #[cfg(target_os = "linux")]
         if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
             if let Some(name) = self.name() {
@@ -2588,14 +2609,10 @@ impl AgentManager {
                     tasks_max: Some(1024),
                 };
                 if let Err(e) = crate::systemd_scope::adopt_into_scope(name, child_pid, &caps) {
-                    // Only reachable when is_available() said yes (root + systemd +
-                    // busctl) but the bus call still failed — effectively a broken
-                    // D-Bus. The VM keeps running but stays in serve's cgroup,
-                    // uncapped and not restart-safe. Loud so the operator notices.
-                    tracing::warn!(
-                        error = %e, pid = child_pid,
-                        "failed to adopt VM into systemd scope; VM left in service cgroup — uncapped and NOT restart-safe"
-                    );
+                    // Terminate only this newly spawned child, never the existing
+                    // same-name scope: it may still own another live process.
+                    self.abort_failed_launch(child_pid)?;
+                    return Err(Error::agent("adopt VM scope", e.to_string()));
                 }
             }
         }
@@ -2688,9 +2705,15 @@ impl AgentManager {
     fn stop_vm_process(&self, pid: crate::process::Pid, start_time: Option<u64>) -> Result<()> {
         // Use short timeout — the agent may already be gone (ephemeral run exited).
         // A 100ms connect timeout avoids blocking the exit path.
-        let shutdown_acked = if let Ok(mut client) =
-            super::AgentClient::connect_with_short_timeout(&self.vsock_socket)
-        {
+        let connect_started = Instant::now();
+        let connection = super::AgentClient::connect_with_short_timeout(&self.vsock_socket);
+        tracing::debug!(
+            pid,
+            connect_ms = connect_started.elapsed().as_millis(),
+            connected = connection.is_ok(),
+            "shutdown agent connect finished"
+        );
+        let shutdown_acked = if let Ok(mut client) = connection {
             client.shutdown().is_ok()
         } else {
             false
@@ -3260,6 +3283,16 @@ impl AgentManager {
     }
 }
 
+fn refuse_live_launch_pid(pid: crate::process::Pid) -> Result<()> {
+    if process::is_alive(pid) {
+        return Err(Error::agent(
+            "start agent",
+            format!("recorded VMM process {pid} is still alive; refusing a second launch on its disks; use machine start to recover an unreachable machine or stop it first"),
+        ));
+    }
+    Ok(())
+}
+
 impl Drop for AgentManager {
     fn drop(&mut self) {
         let inner = self.inner.lock();
@@ -3432,6 +3465,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn launch_refuses_live_persisted_pid_without_agent_reachability() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
+        let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();
+        let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
+        manager.pid_file = temp.path().join("agent.pid");
+        manager.vsock_socket = temp.path().join("missing-agent.sock");
+        #[cfg(unix)]
+        {
+            manager.vm_lock = temp.path().join("vm.lock");
+        }
+        let identity = std::process::id().to_string();
+        std::fs::write(&manager.pid_file, &identity).unwrap();
+        // Fresh manager (Stopped), no responding agent, but a live recorded PID.
+        // This must fail before rootfs validation or disk formatting.
+        let error = manager
+            .prepare_for_launch(&[], &[], VmResources::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("refusing a second launch"));
+        assert_eq!(
+            std::fs::read_to_string(&manager.pid_file).unwrap(),
+            identity
+        );
+        assert_eq!(manager.inner.lock().state, AgentState::Stopped);
+    }
 
     #[test]
     fn reconnecting_to_custom_raw_disks_never_resizes_them() {

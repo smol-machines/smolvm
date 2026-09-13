@@ -126,6 +126,13 @@ impl Supervisor {
         // Machine is dead — try to retrieve its exit code via waitpid
         // and persist it so the restart policy can use it.
         if let Ok(Some(record)) = self.state.db().get_vm(name) {
+            // A recovered manager can lack a child handle and its PID file
+            // can be missing while the database still identifies a live VMM.
+            // Do not erase that identity or schedule another launch.
+            if record.is_process_alive() {
+                self.next_restart_at.remove(name);
+                return Ok(());
+            }
             if let Some(pid) = record.pid {
                 let exit_code = crate::process::try_wait(pid);
                 self.state.set_last_exit_code(name, exit_code);
@@ -385,6 +392,43 @@ mod restart_timing_tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn live_database_pid_survives_missing_manager_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        let mut record = crate::config::VmRecord::new(
+            "supervisor-live-pid".into(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+        );
+        record.pid = Some(std::process::id() as i32);
+        record.state = crate::config::RecordState::Running;
+        state
+            .db()
+            .insert_vm("supervisor-live-pid", &record)
+            .unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        supervisor
+            .next_restart_at
+            .insert("supervisor-live-pid".into(), Instant::now());
+        assert!(!state.is_machine_alive("supervisor-live-pid"));
+        supervisor
+            .check_machine("supervisor-live-pid")
+            .await
+            .unwrap();
+        let kept = state.db().get_vm("supervisor-live-pid").unwrap().unwrap();
+        assert_eq!(kept.pid, record.pid);
+        assert_eq!(kept.state, record.state);
+        assert!(!supervisor
+            .next_restart_at
+            .contains_key("supervisor-live-pid"));
+    }
 
     // A backoff at or below the minimum restarts immediately and schedules nothing.
     #[test]
