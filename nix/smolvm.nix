@@ -17,7 +17,7 @@
   gnutar,
   coreutils,
 }: let
-  version = "1.14.6";
+  version = "1.15.1";
 
   releases = {
     x86_64-linux = {

@@ -76,7 +76,22 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
         ));
     }
 
-    let manifest = if artifact.is_dir() {
+    let footer = if artifact.is_file() {
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+            .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+        if !smolvm_pack::packer::verify_sidecar_checksum(artifact, &footer)
+            .map_err(|error| Error::agent("verify checkpoint checksum", error.to_string()))?
+        {
+            return Err(Error::agent(
+                "verify checkpoint checksum",
+                format!("checksum mismatch for {}", artifact.display()),
+            ));
+        }
+        Some(footer)
+    } else {
+        None
+    };
+    let manifest = if footer.is_none() {
         crate::checkpoint_store::read_manifest(artifact)
             .map_err(|error| Error::agent("read stored checkpoint", error.to_string()))?
     } else {
@@ -129,14 +144,12 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
                 ));
             }
         }
-        if artifact.is_dir() {
+        if let Some(footer) = &footer {
+            smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, footer, false, false)
+                .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
+        } else {
             crate::checkpoint_store::materialize(artifact, &cache_dir)
                 .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
-        } else {
-            let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
-                .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
-            smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, &footer, false, false)
-                .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
         }
         install(&cache_dir, &vm_data, checkpoint)?;
         discard_transport_pack(&vm_data)?;
@@ -306,6 +319,46 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
     std::fs::create_dir_all(&root)
         .map_err(|error| Error::agent("create checkpoint staging root", error.to_string()))?;
     Ok(root)
+}
+
+// SAVE runs in the already-confined VMM, not in the privileged API service.
+// Its output must be inside the machine's writable directory and owned by the
+// same lineage UID. Never grant the VMM access to service-owned pack libraries.
+fn runtime_capture_dir(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
+    let data = crate::agent::vm_data_dir(name);
+    let owner = vm
+        .fork_overlay_owner
+        .as_deref()
+        .or(vm.golden.as_deref())
+        .unwrap_or(name);
+    let owner_data = crate::agent::vm_data_dir(owner);
+    let ids = crate::process::vm_drop_ids(
+        &crate::agent::vm_uid_registry_dir(),
+        &data,
+        None,
+        Some(&owner_data),
+    )
+    .transpose()
+    .map_err(|error| Error::agent("resolve checkpoint uid", error.to_string()))?;
+    runtime_capture_dir_at(&data, ids)
+}
+
+fn runtime_capture_dir_at(data: &Path, ids: Option<(u32, u32)>) -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("checkpoint-capture-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let temporary = builder
+        .tempdir_in(data)
+        .map_err(|error| Error::agent("create runtime checkpoint directory", error.to_string()))?;
+    if let Some((uid, gid)) = ids {
+        crate::process::chown_tree(temporary.path(), uid, gid)
+            .map_err(|error| Error::agent("own runtime checkpoint directory", error.to_string()))?;
+    }
+    Ok(temporary)
 }
 
 fn checkpoint_lib_dir(options: &CaptureOptions) -> Result<PathBuf> {
@@ -489,12 +542,14 @@ pub fn capture_to_path(
         .get(name)
         .expect("validated checkpoint source must remain in its loaded config");
     let control = crate::agent::fork::control_socket_path(name);
+    let runtime_capture = runtime_capture_dir(name, vm)?;
+    let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
     crate::agent::fork::sync_fork_source(name)?;
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
     let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
         &control,
-        &format!("PREPARE_SAVE {}", snapshot_dir.display()),
+        &format!("PREPARE_SAVE {}", runtime_snapshot.display()),
         std::time::Duration::from_secs(30 * 60),
     )?;
     let prepared = reply.starts_with("OK");
@@ -504,7 +559,7 @@ pub fn capture_to_path(
     {
         reply = crate::agent::fork::control_socket_cmd_with_timeout(
             &control,
-            &format!("SAVE {}", snapshot_dir.display()),
+            &format!("SAVE {}", runtime_snapshot.display()),
             std::time::Duration::from_secs(30 * 60),
         )?;
     }
@@ -516,7 +571,7 @@ pub fn capture_to_path(
     }
     let mut pause = SavedVmPause {
         control,
-        prepared_save: prepared.then(|| snapshot_dir.clone()),
+        prepared_save: prepared.then(|| runtime_snapshot.clone()),
         armed: true,
     };
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
@@ -531,7 +586,7 @@ pub fn capture_to_path(
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30 * 60)))
             .map_err(|e| Error::agent("configure checkpoint stream", e.to_string()))?;
-        writeln!(stream, "FINISH_SAVE_STREAM {}", snapshot_dir.display())
+        writeln!(stream, "FINISH_SAVE_STREAM {}", runtime_snapshot.display())
             .map_err(|e| Error::agent("request checkpoint stream", e.to_string()))?;
         let memory = writer
             .ingest_memory(&mut stream, (u64::from(vm.mem) + 2048) * 1024 * 1024)
@@ -550,7 +605,7 @@ pub fn capture_to_path(
         if prepared {
             let reply = crate::agent::fork::control_socket_cmd_with_timeout(
                 &pause.control,
-                &format!("FINISH_SAVE {}", snapshot_dir.display()),
+                &format!("FINISH_SAVE {}", runtime_snapshot.display()),
                 std::time::Duration::from_secs(30 * 60),
             )?;
             if !reply.starts_with("OK") {
@@ -560,6 +615,16 @@ pub fn capture_to_path(
         }
         None
     };
+    // Export sparse files after resume; streamed RAM is already in the store.
+    for file in ["checkpoint.bin", "memory.bin", "manifest.bin"] {
+        if file == "memory.bin" && stored_memory.is_some() {
+            continue;
+        }
+        crate::disk_utils::clone_or_copy_file(
+            &runtime_snapshot.join(file),
+            &snapshot_dir.join(file),
+        )?;
+    }
 
     let assets = crate::pack_export::FromVmAssets {
         mode: PackMode::Vm,
@@ -1960,6 +2025,55 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_checks_sidecar_checksum_before_manifest_or_machine_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("state.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://checksum-test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        Packer::new(manifest).pack_artifact(&artifact).unwrap();
+        let db = crate::db::SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let error = restore_from_path(&db, "checksum-test", &artifact).unwrap_err();
+        assert!(
+            error.to_string().contains("not a .smolcheckpoint"),
+            "{error}"
+        );
+        let original = std::fs::read(&artifact).unwrap();
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(&artifact).unwrap();
+        for offset in [0, footer.manifest_offset as usize] {
+            let mut damaged = original.clone();
+            damaged[offset] ^= 0xff;
+            std::fs::write(&artifact, damaged).unwrap();
+            let error = restore_from_path(&db, "checksum-test", &artifact).unwrap_err();
+            assert!(error.to_string().contains("checksum mismatch"), "{error}");
+            assert!(db.get_vm("checksum-test").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_capture_is_private_machine_local_and_removed_on_drop() {
+        let data = tempfile::tempdir().unwrap();
+        let capture = runtime_capture_dir_at(data.path(), None).unwrap();
+        let path = capture.path().to_path_buf();
+        assert_eq!(path.parent(), Some(data.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        std::fs::create_dir(path.join(ASSET_DIR)).unwrap();
+        std::fs::write(path.join(ASSET_DIR).join("memory.bin"), b"private state").unwrap();
+        drop(capture);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn install_verifies_and_consumes_checkpoint() {

@@ -283,6 +283,18 @@ fn merge_env(image_env: &[String], vm_env: &[(String, String)]) -> Vec<String> {
     merged
 }
 
+/// Floor for the export helper's storage disk, in GiB.
+///
+/// The helper extracts the source image's layers onto its OWN disk and then
+/// flattens them with the machine's overlay, so it needs room for several
+/// copies of the source's content — not the one-size-fits-all default a fresh
+/// machine gets.
+const EXPORT_HELPER_MIN_STORAGE_GIB: u64 = 64;
+
+/// How many times the source's own storage the helper is given, to cover the
+/// extracted layers plus the flattened output built alongside them.
+const EXPORT_HELPER_STORAGE_FACTOR: u64 = 3;
+
 /// A helper VM used to read the source machine's disks and flatten layers.
 /// Stops the VM and removes its scratch data dir on drop.
 struct ExportVm {
@@ -325,8 +337,28 @@ impl ExportVm {
         );
         let data_dir = vm_data_dir(&scratch_name);
 
+        // Size the helper's disk from the source rather than taking the default
+        // a fresh machine gets: a large export filled that fixed disk mid-pull
+        // and the agent died, surfacing as a bare "connection closed" with
+        // nothing naming the disk. These disks are sparse, so a generous
+        // virtual size costs nothing on the host until it is actually written.
+        let source_apparent_gib = std::fs::metadata(&storage_disk)
+            .map(|m| m.len().div_ceil(1024 * 1024 * 1024))
+            .unwrap_or(0);
+        let helper_storage_gib = source_apparent_gib
+            .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
+            .max(EXPORT_HELPER_MIN_STORAGE_GIB);
+        tracing::debug!(
+            source_apparent_gib,
+            helper_storage_gib,
+            "sizing the export helper's disk from the source machine"
+        );
+
         println!("Starting agent VM to export machine state...");
-        let manager = AgentManager::for_vm_with_sizes(&scratch_name, None, None)?;
+        // Both halves matter: this call creates the backing disk, the
+        // `VmResources` below tells the guest how large it is.
+        let manager =
+            AgentManager::for_vm_with_sizes(&scratch_name, Some(helper_storage_gib), None)?;
         let features = LaunchFeatures {
             extra_disks: vec![(storage_disk, false, storage_fmt)],
             packed_layers_dir,
@@ -351,7 +383,7 @@ impl ExportVm {
                 gpu_vram_mib: None,
                 nested_virt: false,
                 rosetta: false,
-                storage_gib: None,
+                storage_gib: Some(helper_storage_gib),
                 overlay_gib: None,
                 block_io: Default::default(),
                 allowed_cidrs: None,
@@ -1170,5 +1202,47 @@ mod from_vm_manifest_tests {
         clone.golden = Some("orig".to_string());
         clone.fork_overlay_owner = Some("shared-owner".to_string());
         assert_eq!(export_overlay_owner("clone", &clone), "shared-owner");
+    }
+}
+
+#[cfg(test)]
+mod export_helper_sizing_tests {
+    use super::{EXPORT_HELPER_MIN_STORAGE_GIB, EXPORT_HELPER_STORAGE_FACTOR};
+
+    /// Mirrors the sizing done in `ExportVm::start`, so the policy is asserted
+    /// without booting a VM.
+    fn helper_storage_gib(source_apparent_gib: u64) -> u64 {
+        source_apparent_gib
+            .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
+            .max(EXPORT_HELPER_MIN_STORAGE_GIB)
+    }
+
+    #[test]
+    fn a_big_machine_gets_a_helper_disk_bigger_than_itself() {
+        // The export failure that prompted this: a machine holding ~13 GiB on a
+        // 50 GiB disk. The helper used to get the fixed default and filled up
+        // mid-pull, dying as a bare "connection closed".
+        assert!(
+            helper_storage_gib(50) > 50,
+            "the helper must outsize its source"
+        );
+        assert_eq!(helper_storage_gib(50), 150);
+        // Room for the extracted layers AND the flattened copy built beside them.
+        assert_eq!(helper_storage_gib(100), 300);
+    }
+
+    #[test]
+    fn a_small_or_unreadable_source_still_gets_a_workable_floor() {
+        // A default-sized machine, and the `metadata()` failure path that
+        // reports 0 — neither may produce a helper too small to pull into.
+        assert_eq!(helper_storage_gib(20), EXPORT_HELPER_MIN_STORAGE_GIB);
+        assert_eq!(helper_storage_gib(0), EXPORT_HELPER_MIN_STORAGE_GIB);
+        // The floor has to clear a realistic image pull, not merely be non-zero.
+        assert!(helper_storage_gib(0) >= 64);
+    }
+
+    #[test]
+    fn an_absurd_source_size_cannot_overflow_the_multiply() {
+        assert_eq!(helper_storage_gib(u64::MAX), u64::MAX);
     }
 }

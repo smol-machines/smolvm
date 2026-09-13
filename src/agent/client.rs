@@ -280,6 +280,40 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// likely already torn down — safe to proceed with SIGTERM.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
 
+fn shutdown_io_until(
+    deadline: Instant,
+    mut operation: impl FnMut() -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "shutdown deadline exceeded",
+            ));
+        }
+        match operation() {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ))
+            }
+            Ok(count) => return Ok(count),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Default read window for a guest-side flatten (overlay merge + tar of tens
 /// of GiB to the guest disk). The guest stays quiet while tar runs, so the
 /// window must cover the whole tar, not just the mount. Pack size is
@@ -1128,7 +1162,7 @@ impl AgentClient {
 
     /// Connect to the agent socket and configure read/write timeouts (in milliseconds).
     fn connect_with_timeouts_ms(socket_path: &Path, read_ms: u64, write_ms: u64) -> Result<Self> {
-        let stream = UdsStream::connect(socket_path)
+        let stream = UdsStream::connect_timeout(socket_path, Duration::from_millis(read_ms.max(1)))
             .map_err(|e| Error::agent("connect to agent", e.to_string()))?;
 
         stream
@@ -1617,39 +1651,63 @@ impl AgentClient {
     /// may be killed before ext4 journal commits are flushed, causing layer
     /// corruption on next boot.
     pub fn shutdown(&mut self) -> Result<()> {
-        // Set a timeout for shutdown acknowledgment.
-        // The agent calls sync() then sends the ack — typically <100ms,
-        // but heavy writes or large journals may take longer.
-        // If no ack within 5s, the VM has likely already torn down.
-        let _ = self
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS)));
+        self.shutdown_with_deadline(Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS))
+    }
 
-        let data = self.encode_traced(&AgentRequest::Shutdown)?;
-        self.stream
-            .write_all(&data)
-            .map_err(|e| Error::agent("send shutdown", e.to_string()))?;
-
-        // Wait for acknowledgment - this confirms sync() completed.
-        // Returns Ok only when the ack is actually received, so callers
-        // can distinguish "sync confirmed" from "sync unknown".
-        match self.receive() {
-            Ok(_) => {
-                tracing::debug!("agent acknowledged shutdown (sync complete)");
-                Ok(())
+    fn shutdown_with_deadline(&mut self, timeout: Duration) -> Result<()> {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        self.stream.as_socket().set_nonblocking(true)?;
+        let result = (|| -> Result<()> {
+            let data = self.encode_traced(&AgentRequest::Shutdown)?;
+            let mut sent = 0;
+            while sent < data.len() {
+                sent += shutdown_io_until(deadline, || self.stream.write(&data[sent..]))?;
             }
-            Err(e) => {
-                let error_str = e.to_string();
-                if is_benign_shutdown_error(&error_str) {
-                    tracing::debug!(
-                        "shutdown ack not received (connection closed) - sync may have completed"
-                    );
-                } else {
-                    tracing::warn!(error = %e, "shutdown acknowledgment failed");
-                }
-                Err(Error::agent("shutdown ack", error_str))
+            tracing::debug!(
+                send_ms = started.elapsed().as_millis(),
+                "shutdown request sent; waiting for acknowledgment"
+            );
+            let mut header = [0; 4];
+            self.shutdown_read_until(&mut header, deadline)?;
+            let len = u32::from_be_bytes(header) as usize;
+            if len > MAX_FRAME_SIZE as usize {
+                return Err(Error::agent("shutdown ack", "response frame too large"));
+            }
+            let mut body = vec![0; len];
+            self.shutdown_read_until(&mut body, deadline)?;
+            match serde_json::from_slice::<AgentResponse>(&body)
+                .map_err(|error| Error::agent("shutdown ack", error.to_string()))?
+            {
+                AgentResponse::Ok { .. } => Ok(()),
+                _ => Err(Error::agent("shutdown ack", "unexpected acknowledgment")),
+            }
+        })();
+        let reset = self.stream.as_socket().set_nonblocking(false);
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis(),
+            acknowledged = result.is_ok(),
+            "shutdown acknowledgment finished"
+        );
+        if let Err(error) = &result {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            if is_benign_shutdown_error(&error.to_string()) {
+                tracing::debug!(%error, "shutdown connection closed without acknowledgment");
+            } else {
+                tracing::warn!(%error, "shutdown acknowledgment failed");
             }
         }
+        result?;
+        reset?;
+        Ok(())
+    }
+
+    fn shutdown_read_until(&mut self, buf: &mut [u8], deadline: Instant) -> Result<()> {
+        let mut read = 0;
+        while read < buf.len() {
+            read += shutdown_io_until(deadline, || self.stream.read(&mut buf[read..]))?;
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -3829,6 +3887,39 @@ mod stalled_body_tests {
     use super::*;
     use std::io::Write;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn shutdown_deadline_is_not_extended_by_partial_frames() {
+        for slow_header in [true, false] {
+            let (client_stream, mut peer) = UdsStream::pair().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut request = [0; 1024];
+                assert!(peer.read(&mut request).unwrap() > 0);
+                let body = serde_json::to_vec(&AgentResponse::Ok { data: None }).unwrap();
+                let header = (body.len() as u32).to_be_bytes();
+                let bytes = if slow_header {
+                    [header.as_slice(), body.as_slice()].concat()
+                } else {
+                    peer.write_all(&header).unwrap();
+                    body
+                };
+                for byte in bytes {
+                    if peer.write_all(&[byte]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            });
+            let mut client = AgentClient::from_stream(client_stream);
+            let start = Instant::now();
+            let error = client
+                .shutdown_with_deadline(Duration::from_millis(100))
+                .unwrap_err();
+            assert!(error.to_string().contains("deadline exceeded"), "{error}");
+            assert!(start.elapsed() < Duration::from_millis(500));
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn receive_times_out_when_peer_never_starts_a_frame() {
