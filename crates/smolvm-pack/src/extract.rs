@@ -57,7 +57,7 @@ pub(crate) fn mark_file_sparse(file: &fs::File) -> std::io::Result<()> {
 /// extractions of the same checksum race. The lock is released when the OS
 /// closes the handle (i.e. when the `File` is dropped).
 #[cfg(unix)]
-fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
+pub(crate) fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
     let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
@@ -66,7 +66,7 @@ fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
+pub(crate) fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
     use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -3514,6 +3514,7 @@ mod tests {
 
     /// Build a tar archive carrying a single symlink entry whose link target
     /// is `link_target`, plus (optionally) a trailing regular-file entry.
+    #[cfg(unix)]
     fn make_symlink_tar(name: &str, link_target: &str) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();

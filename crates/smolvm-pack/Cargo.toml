@@ -12,7 +12,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 smolvm-protocol = { path = "../smolvm-protocol", version = "1.6.1" }
 tar = "0.4"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 crc32fast = "1.4"
 tempfile = "3"
 sha2 = "0.10"

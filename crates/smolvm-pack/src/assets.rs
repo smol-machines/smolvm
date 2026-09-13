@@ -243,6 +243,32 @@ fn digest_to_filename(digest: &str) -> Result<String> {
 /// Level 19 was ~100x slower for only ~10% better compression.
 pub const ZSTD_LEVEL: i32 = 3;
 
+fn compression_permit(cache: &Path) -> Result<File> {
+    fs::create_dir_all(cache)?;
+    // Never unlink this file: API exports run in separate CLI processes and
+    // must lock the same inode. Closing the handle releases admission on errors
+    // and process exit as well as success.
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(cache.join("asset-compression.lock"))?;
+    crate::extract::lock_file_exclusive(&file)?;
+    Ok(file)
+}
+
+fn compression_workers(parallelism: usize) -> u32 {
+    // Zero means zstd's synchronous mode, not automatic worker selection.
+    if parallelism <= 1 {
+        0
+    } else {
+        parallelism.min(4) as u32
+    }
+}
+
 /// Find a pre-formatted disk template by filename.
 ///
 /// Searches in order:
@@ -904,9 +930,28 @@ impl AssetCollector {
     /// (two-file mode: libs are embedded in the stub binary instead).
     /// When false, everything is included (single-file mode).
     pub fn compress(&self, output: &Path, exclude_libs: bool) -> Result<u64> {
+        // One asset compressor per cache root, including API subprocesses.
+        // The permit also covers finish(), which drains outstanding zstd jobs.
+        let cache = dirs::cache_dir()
+            .ok_or_else(|| PackError::Compression("cannot locate compression cache".into()))?
+            .join("smolvm");
+        let _permit = compression_permit(&cache).map_err(|error| {
+            PackError::Compression(format!(
+                "acquire compression admission at {}: {error}",
+                cache.display()
+            ))
+        })?;
         let output_file = File::create(output)?;
-        let encoder = zstd::stream::Encoder::new(output_file, ZSTD_LEVEL)
+        let mut encoder = zstd::stream::Encoder::new(output_file, ZSTD_LEVEL)
             .map_err(|e| PackError::Compression(e.to_string()))?;
+        let workers = compression_workers(
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        );
+        if workers > 0 {
+            encoder
+                .multithread(workers)
+                .map_err(|e| PackError::Compression(e.to_string()))?;
+        }
         let mut tar_builder = tar::Builder::new(encoder);
 
         // Sort entries for deterministic tar ordering (consistent checksums)
@@ -1347,6 +1392,123 @@ mod tests {
         let restored = output.join("test.txt");
         assert!(restored.exists());
         assert_eq!(fs::read_to_string(&restored).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn compression_worker_budget_is_bounded() {
+        assert_eq!(compression_workers(0), 0);
+        assert_eq!(compression_workers(1), 0);
+        assert_eq!(compression_workers(2), 2);
+        assert_eq!(compression_workers(4), 4);
+        assert_eq!(compression_workers(8), 4);
+        assert_eq!(compression_workers(usize::MAX), 4);
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for compression_admission_is_cross_process"]
+    fn compression_admission_child() {
+        let Some(root) = std::env::var_os("SMOLVM_TEST_COMPRESSION_ADMISSION") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        fs::write(root.join("ready"), b"ready").unwrap();
+        let _permit = compression_permit(&root).unwrap();
+        fs::write(root.join("admitted"), b"admitted").unwrap();
+    }
+
+    #[test]
+    fn compression_admission_is_cross_process() {
+        use std::time::{Duration, Instant};
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let permit = compression_permit(temp.path()).unwrap();
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "assets::tests::compression_admission_child",
+                    "--ignored",
+                ])
+                .env("SMOLVM_TEST_COMPRESSION_ADMISSION", temp.path())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !temp.path().join("ready").exists() {
+            assert!(Instant::now() < deadline, "child did not reach admission");
+            assert!(child.0.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let blocked_until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < blocked_until {
+            assert!(!temp.path().join("admitted").exists());
+            assert!(child.0.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(permit);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child stayed blocked after release"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(temp.path().join("admitted").exists());
+        // The inode remains available for later processes; it is not a stale
+        // ownership marker and does not need cleanup after the owner exits.
+        assert!(temp.path().join("asset-compression.lock").exists());
+        drop(compression_permit(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn compression_error_releases_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let collector = AssetCollector::new(temp.path().join("staging")).unwrap();
+        // Opening a directory as the output fails after admission is acquired.
+        assert!(collector.compress(temp.path(), false).is_err());
+        let output = temp.path().join("retry.zst");
+        assert!(collector.compress(&output, false).unwrap() > 0);
+    }
+
+    #[test]
+    fn concurrent_large_asset_exports_roundtrip_independently() {
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for seed in 0..4u8 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let temp = tempfile::tempdir().unwrap();
+                    let staging = temp.path().join("staging");
+                    let collector = AssetCollector::new(staging.clone()).unwrap();
+                    // Larger than a zstd job, with a different payload per caller.
+                    let payload: Vec<u8> = (0..12 * 1024 * 1024usize)
+                        .map(|i| (i.wrapping_mul(31) ^ (i >> 9)) as u8 ^ seed)
+                        .collect();
+                    fs::write(staging.join("payload"), &payload).unwrap();
+                    fs::create_dir(staging.join("lib")).unwrap();
+                    fs::write(staging.join("lib/excluded"), b"excluded").unwrap();
+                    barrier.wait();
+                    let compressed = temp.path().join("assets.zst");
+                    collector.compress(&compressed, true).unwrap();
+                    let output = temp.path().join("restored");
+                    decompress_assets_from_file(&compressed, &output).unwrap();
+                    assert_eq!(fs::read(output.join("payload")).unwrap(), payload);
+                    assert!(!output.join("lib").exists());
+                });
+            }
+        });
     }
 
     #[cfg(target_os = "macos")]
