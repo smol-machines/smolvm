@@ -118,6 +118,7 @@ pub fn start_udp_relay(
 
 /// Relay-thread state for one (guest, destination) flow.
 struct UdpFlow {
+    id: usize,
     socket: HostUdpSocket,
     guest: SocketAddr,
     destination: SocketAddr,
@@ -132,10 +133,16 @@ fn run_udp_relay(
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
     let mut flows: HashMap<(SocketAddr, SocketAddr), UdpFlow> = HashMap::new();
+    let mut id_to_key: HashMap<usize, (SocketAddr, SocketAddr)> = HashMap::new();
+    let mut next_flow_id: usize = 1;
     let mut recv_buf = vec![0u8; MAX_DATAGRAM_BYTES];
+    let poller = wake.poller();
 
     loop {
         if shutdown() {
+            for flow in flows.values() {
+                let _ = poller.delete(&flow.socket);
+            }
             return;
         }
 
@@ -155,15 +162,32 @@ fn run_udp_relay(
                         }
                         match create_flow_socket(datagram.destination) {
                             Ok(socket) => {
+                                let id = next_flow_id;
+                                next_flow_id = next_flow_id.wrapping_add(1).max(1);
+                                // SAFETY: the socket is owned by `flows` and is deleted from the
+                                // poller when the flow expires or on shutdown.
+                                if let Err(err) =
+                                    unsafe { poller.add(&socket, Event::readable(id)) }
+                                {
+                                    virtio_net_log!(
+                                        "virtio-net: failed to register host UDP socket for {} -> {} on poller: {}",
+                                        datagram.guest,
+                                        datagram.destination,
+                                        err
+                                    );
+                                    continue;
+                                }
                                 flows.insert(
                                     key,
                                     UdpFlow {
+                                        id,
                                         socket,
                                         guest: datagram.guest,
                                         destination: datagram.destination,
                                         last_active: Instant::now(),
                                     },
                                 );
+                                id_to_key.insert(id, key);
                             }
                             Err(err) => {
                                 virtio_net_log!(
@@ -182,47 +206,28 @@ fn run_udp_relay(
                     let _ = flow.socket.send(&datagram.payload);
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    for flow in flows.values() {
+                        let _ = poller.delete(&flow.socket);
+                    }
+                    return;
+                }
             }
         }
 
-        // Inbound: poll all flow sockets for replies. The wake's poller blocks
-        // on "wake OR any flow socket readable" in a single call; the wake is a
-        // notify (no key), and each flow socket is registered at key `slot + 1`.
-        let poller = wake.poller();
-        let keys: Vec<(SocketAddr, SocketAddr)> = flows.keys().copied().collect();
-        for (slot, key) in keys.iter().enumerate() {
-            // SAFETY: the socket is owned by `flows` and is deleted from the
-            // poller below before the next iteration may drop it.
-            let _ = unsafe { poller.add(&flows[key].socket, Event::readable(slot + 1)) };
-        }
-
+        // Inbound: poll all flow sockets for replies.
         let mut events = Events::new();
         let _ = poller.wait(
             &mut events,
             Some(Duration::from_millis(RELAY_POLL_MAX_MS as u64)),
         );
 
-        // A pending notify is consumed by `wait`; nothing else to drain.
-        let mut ready: Vec<bool> = vec![false; keys.len()];
-        for event in events.iter() {
-            if event.key >= 1 && event.key - 1 < ready.len() {
-                ready[event.key - 1] = true;
-            }
-        }
-
-        // Deregister sockets before the next rebuild so a closed flow's socket
-        // is never left registered on the poller.
-        for key in &keys {
-            let _ = poller.delete(&flows[key].socket);
-        }
-
         let mut woke_reply = false;
-        for (slot, key) in keys.iter().enumerate() {
-            if !ready[slot] {
+        for event in events.iter() {
+            let Some(&key) = id_to_key.get(&event.key) else {
                 continue;
-            }
-            let Some(flow) = flows.get_mut(key) else {
+            };
+            let Some(flow) = flows.get_mut(&key) else {
                 continue;
             };
             // Drain everything ready on this socket. WouldBlock ends the drain;
@@ -243,7 +248,12 @@ fn run_udp_relay(
                             flow.guest
                         );
                     }
-                    Err(TrySendError::Disconnected(_)) => return,
+                    Err(TrySendError::Disconnected(_)) => {
+                        for flow in flows.values() {
+                            let _ = poller.delete(&flow.socket);
+                        }
+                        return;
+                    }
                 }
             }
         }
@@ -253,7 +263,15 @@ fn run_udp_relay(
 
         // NAT-style idle expiry.
         let now = Instant::now();
-        flows.retain(|_, flow| now.duration_since(flow.last_active) < FLOW_IDLE_TIMEOUT);
+        flows.retain(|_, flow| {
+            if now.duration_since(flow.last_active) >= FLOW_IDLE_TIMEOUT {
+                let _ = poller.delete(&flow.socket);
+                id_to_key.remove(&flow.id);
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
