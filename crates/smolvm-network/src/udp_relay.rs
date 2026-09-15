@@ -30,7 +30,7 @@
 //! pressure (full channels / tables) is acceptable UDP semantics — logged,
 //! never blocking.
 
-use crate::egress::EgressPolicy;
+use crate::policy::{Policy, PolicyHandle};
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use polling::{Event, Events};
@@ -91,6 +91,7 @@ pub struct UdpRelayChannels {
 pub fn start_udp_relay(
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
+    egress: PolicyHandle,
 ) -> UdpRelayChannels {
     let (to_relay_tx, to_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let (from_relay_tx, from_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -106,6 +107,7 @@ pub fn start_udp_relay(
                 thread_wake,
                 reply_wake,
                 shutdown,
+                egress,
             );
         });
 
@@ -130,6 +132,7 @@ fn run_udp_relay(
     wake: WakePipe,
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
+    egress: PolicyHandle,
 ) {
     let mut flows: HashMap<(SocketAddr, SocketAddr), UdpFlow> = HashMap::new();
     let mut recv_buf = vec![0u8; MAX_DATAGRAM_BYTES];
@@ -153,7 +156,14 @@ fn run_udp_relay(
                             );
                             continue;
                         }
-                        match create_flow_socket(datagram.destination) {
+                        // The policy may dial somewhere other than the address
+                        // the guest used; the flow key keeps the guest's, so the
+                        // reply is sourced from what it sent to.
+                        let peer = egress
+                            .rewrite(datagram.destination.ip())
+                            .map(|ip| SocketAddr::new(ip, datagram.destination.port()))
+                            .unwrap_or(datagram.destination);
+                        match create_flow_socket(peer) {
                             Ok(socket) => {
                                 flows.insert(
                                     key,
@@ -427,9 +437,10 @@ impl Default for UdpSocketTable {
 
 /// Whether the gateway should relay a guest UDP datagram to this destination.
 /// DNS (:53) is excluded — it has its own intercept-and-filter path. Egress
-/// policy applies exactly as for TCP (static CIDRs + DNS-learned IPs).
-pub fn should_relay_udp(destination: SocketAddr, egress: &EgressPolicy) -> bool {
-    destination.port() != 53 && egress.allows(destination.ip())
+/// policy applies exactly as for TCP, and judges the address the guest used —
+/// a `Policy::rewrite` of it happens afterwards, in the relay thread.
+pub fn should_relay_udp(destination: SocketAddr, egress: &dyn Policy) -> bool {
+    destination.port() != 53 && egress.allows(destination.ip(), Some(destination.port()))
 }
 
 fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> SocketAddr {
@@ -440,6 +451,8 @@ fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::EgressPolicy;
+    use std::net::IpAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -481,6 +494,7 @@ mod tests {
         let channels = start_udp_relay(
             reply_wake.clone(),
             Arc::new(move || stop_flag.load(Ordering::Relaxed)),
+            Arc::new(EgressPolicy::unrestricted()),
         );
 
         let guest: SocketAddr = "100.96.0.2:40000".parse().unwrap();
@@ -516,22 +530,104 @@ mod tests {
         channels.relay_thread_wake.wake();
     }
 
+    /// A policy that publishes `SENTINEL` to the guest for one host-local port
+    /// and rewrites it to loopback on the way out — the shape a consumer uses to
+    /// expose a host service without handing the guest the host's loopback.
+    struct SentinelPolicy(u16);
+
+    /// RFC 5737 TEST-NET-1: never a real destination.
+    const SENTINEL: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+    impl Policy for SentinelPolicy {
+        fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
+            ip == SENTINEL && port == Some(self.0)
+        }
+
+        fn rewrite(&self, ip: IpAddr) -> Option<IpAddr> {
+            (ip == SENTINEL).then_some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        }
+    }
+
+    #[test]
+    fn a_policy_rewrite_reaches_the_host_over_udp() {
+        // A real host UDP server, exposed to the guest as a sentinel address on
+        // its own port: the datagram must arrive, and the reply must come back
+        // addressed from the sentinel the guest used, not from the loopback.
+        let server = HostUdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_port = server.local_addr().unwrap().port();
+        let egress: PolicyHandle = Arc::new(SentinelPolicy(host_port));
+        let sentinel = SocketAddr::new(SENTINEL, host_port);
+        assert!(should_relay_udp(sentinel, egress.as_ref()));
+        // Only that port: the rewrite never widens what `allows` granted.
+        assert!(!should_relay_udp(
+            SocketAddr::new(SENTINEL, 22),
+            egress.as_ref()
+        ));
+
+        let reply_wake = Arc::new(WakePipe::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let channels = start_udp_relay(
+            reply_wake.clone(),
+            Arc::new(move || stop_flag.load(Ordering::Relaxed)),
+            egress,
+        );
+
+        let guest: SocketAddr = "100.96.0.2:40001".parse().unwrap();
+        channels
+            .to_relay
+            .send(UdpDatagram {
+                guest,
+                destination: sentinel,
+                payload: b"ping".to_vec(),
+            })
+            .unwrap();
+        channels.relay_thread_wake.wake();
+
+        let mut buf = [0u8; 16];
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (len, peer) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len], b"ping");
+        server.send_to(b"pong", peer).unwrap();
+
+        let reply = channels
+            .from_relay
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(reply.guest, guest);
+        assert_eq!(reply.destination, sentinel); // sourced from the sentinel
+        assert_eq!(reply.payload, b"pong");
+
+        stop.store(true, Ordering::Relaxed);
+        channels.relay_thread_wake.wake();
+    }
+
     #[test]
     fn should_relay_respects_dns_carveout_and_policy() {
-        let open = EgressPolicy::unrestricted();
-        assert!(should_relay_udp("1.2.3.4:123".parse().unwrap(), &open));
-        assert!(!should_relay_udp("1.2.3.4:53".parse().unwrap(), &open));
+        let open: PolicyHandle = Arc::new(EgressPolicy::unrestricted());
+        assert!(should_relay_udp(
+            "1.2.3.4:123".parse().unwrap(),
+            open.as_ref()
+        ));
+        assert!(!should_relay_udp(
+            "1.2.3.4:53".parse().unwrap(),
+            open.as_ref()
+        ));
 
         // Public CIDR — a private allow-list entry would be overridden by the
         // egress hard-floor (see egress.rs tests).
-        let restricted = EgressPolicy::from_allowed_cidrs(Some(&["8.8.8.0/24".into()]));
+        let restricted: PolicyHandle = Arc::new(EgressPolicy::from_allowed_cidrs(Some(&[
+            "8.8.8.0/24".into(),
+        ])));
         assert!(should_relay_udp(
             "8.8.8.3:123".parse().unwrap(),
-            &restricted
+            restricted.as_ref()
         ));
         assert!(!should_relay_udp(
             "1.2.3.4:123".parse().unwrap(),
-            &restricted
+            restricted.as_ref()
         ));
     }
 }

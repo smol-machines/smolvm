@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dns;
+use crate::policy::{DnsDecision, Policy};
+use crate::virtio_net_log;
 
 /// Learned-IP TTL clamp, matching libkrun's DNS filter.
 const MIN_LEARNED_TTL: u64 = 60;
@@ -28,7 +30,7 @@ const MAX_LEARNED_TTL: u64 = 3600;
 
 /// A parsed CIDR (IPv4 or IPv6) with cheap containment testing.
 #[derive(Clone, Copy, Debug)]
-enum Cidr {
+pub enum Cidr {
     V4 { network: u32, mask: u32 },
     V6 { network: u128, mask: u128 },
 }
@@ -37,7 +39,7 @@ impl Cidr {
     /// Parse `"a.b.c.d"` / `"a.b.c.d/n"` / `"x::y"` / `"x::y/n"`. A bare address
     /// gets a full-length prefix. Returns `None` for malformed input or a prefix
     /// length beyond the address width.
-    fn parse(spec: &str) -> Option<Self> {
+    pub fn parse(spec: &str) -> Option<Self> {
         let (addr, prefix) = match spec.trim().split_once('/') {
             Some((addr, prefix)) => (addr, Some(prefix.parse::<u8>().ok()?)),
             None => (spec.trim(), None),
@@ -76,7 +78,7 @@ impl Cidr {
         }
     }
 
-    fn contains(&self, ip: IpAddr) -> bool {
+    pub fn contains(&self, ip: IpAddr) -> bool {
         match (self, ip) {
             (Self::V4 { network, mask }, IpAddr::V4(ip)) => (u32::from(ip) & mask) == *network,
             (Self::V6 { network, mask }, IpAddr::V6(ip)) => (u128::from(ip) & mask) == *network,
@@ -98,7 +100,7 @@ struct AllowList {
 /// LAN from a local VM is legitimate and expected, so the broad internal-subnet
 /// floor is reserved for the multi-tenant context where it's actually needed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FloorMode {
+pub enum FloorMode {
     /// Trusted single-tenant/local override (`SMOLVM_EGRESS_ALLOW_PRIVATE=1`):
     /// floor nothing — the guest reaches exactly what the host can.
     Off,
@@ -155,15 +157,20 @@ fn floor_mode() -> FloorMode {
     if allow_private {
         return FloorMode::Off;
     }
-    // Fleet mode is absolute: `SMOLVM_ALLOW_HOST_LOOPBACK` only relaxes the LOCAL
-    // default, never Strict, so it can't re-expose the host loopback / control
-    // door on a multi-tenant node.
+    // Fleet mode is absolute: no env flag relaxes Strict once
+    // `SMOLVM_PUBLISH_ADDR` is set, so host loopback / control-plane doors stay
+    // shut on a multi-tenant node.
     if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some() {
         return FloorMode::Strict;
     }
+    // Fork default: inverted vs upstream — this fork keeps host loopback
+    // reachable locally (the loopback-forwarding feature relies on it), so
+    // `MetadataOnly` is the default and `SMOLVM_ALLOW_HOST_LOOPBACK=0` opts
+    // into upstream's hardened `MetadataAndLoopback` floor. Fleet mode above
+    // is unaffected.
     let allow_host_loopback = std::env::var("SMOLVM_ALLOW_HOST_LOOPBACK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     if allow_host_loopback {
         FloorMode::MetadataOnly
     } else {
@@ -209,13 +216,15 @@ fn is_reserved_v4(v4: Ipv4Addr) -> bool {
         || v4.is_private()    // 10/8, 172.16/12, 192.168/16 — host/control internal subnet
         || v4.is_unspecified()
         || v4.is_broadcast()
+        // 224.0.0.0/4 — host LAN segment the floor exists to block
+        || v4.is_multicast()
         // 100.64.0.0/10 (CGNAT) — the gateway's own guest/gateway addresses live here.
         || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b))
 }
 
 /// Whether `ip` is floored under `mode` — the single hard-floor predicate. Also
 /// defeats DNS-rebinding (a learned IP in a floored range is still denied).
-fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
+pub fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
     match mode {
         FloorMode::Off => false,
         FloorMode::MetadataOnly => is_link_local(ip),
@@ -225,6 +234,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
             IpAddr::V6(v6) => {
                 v6.is_loopback()
                     || v6.is_unspecified()
+                    || v6.is_multicast() // ff00::/8, incl. ff02::1 — see is_reserved_v4
                     || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                     || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                     || v6.to_ipv4_mapped().is_some_and(is_reserved_v4)
@@ -293,7 +303,6 @@ impl EgressPolicy {
         }
     }
 
-    /// Convenience for the CIDR-only case.
     /// Attach the audit sink denials are appended to. The launcher points this
     /// at the machine's data dir so the host can read denials back.
     pub fn with_denial_log(mut self, path: std::path::PathBuf) -> Self {
@@ -435,6 +444,41 @@ impl EgressPolicy {
     }
 }
 
+/// The gateway's built-in policy, portless and address-scoped — a consumer
+/// with different grants implements [`Policy`] itself.
+impl Policy for EgressPolicy {
+    fn allows(&self, ip: IpAddr, _port: Option<u16>) -> bool {
+        EgressPolicy::allows(self, ip)
+    }
+
+    fn dns(&self, query: &[u8]) -> DnsDecision {
+        if !self.dns_filter_active() {
+            return DnsDecision::Forward { learn: false };
+        }
+        match dns::question_name(query) {
+            Some(name) if self.hostname_allowed(&name) => DnsDecision::Forward { learn: true },
+            Some(name) => {
+                virtio_net_log!(
+                    "virtio-net: blocking DNS query by allow-host policy name={}",
+                    name
+                );
+                // Standardized marker for the egress audit trail (`read_egress_denials`).
+                self.record_denial("resolve", &name);
+                DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
+            }
+            None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
+        }
+    }
+
+    fn learn(&self, answer: &[u8]) {
+        self.learn_ip_records(&dns::answer_ip_records(answer));
+    }
+
+    fn denied(&self, operation: &str, dest: &dyn std::fmt::Display) {
+        self.record_denial(operation, dest);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,15 +531,14 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_local_floors_metadata_and_loopback() {
-        // Local default (no fleet mode): the cloud-metadata link-local range AND
-        // the host's own loopback are denied — a guest reaching `127.0.0.1` would
-        // otherwise hit the host's loopback services. The host's LAN and CGNAT
-        // stay reachable, so a local VM still behaves predictably.
+    fn unrestricted_local_floors_only_metadata() {
+        // Local default (no fleet mode): only the cloud-metadata link-local
+        // range is denied — the fork keeps host loopback reachable by default
+        // (`SMOLVM_ALLOW_HOST_LOOPBACK=0` opts into the harder floor). The
+        // host's LAN and CGNAT stay reachable, so a local VM behaves predictably.
         let p = EgressPolicy::unrestricted();
         assert!(!p.allows_v4(Ipv4Addr::new(169, 254, 169, 254))); // metadata: denied
-        assert!(!p.allows_v4(Ipv4Addr::new(127, 0, 0, 1))); // loopback: denied
-        assert!(!p.allows_v4(Ipv4Addr::new(0, 0, 0, 0))); // unspecified: denied
+        assert!(p.allows_v4(Ipv4Addr::new(127, 0, 0, 1))); // loopback: reachable
         assert!(p.allows_v4(Ipv4Addr::new(10, 0, 0, 4))); // LAN: reachable
         assert!(p.allows_v4(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(p.allows_v4(Ipv4Addr::new(172, 16, 0, 1)));
@@ -505,16 +548,34 @@ mod tests {
 
     #[test]
     fn explicit_cidr_reopens_loopback_locally_but_learned_ip_does_not() {
-        // A developer who deliberately allow-lists loopback CAN reach a host
-        // service on 127.0.0.1 in the local modes...
-        let local = EgressPolicy::new(Some(&["127.0.0.1/32".into()]), None);
+        // Under the hardened local floor (upstream's default), a developer who
+        // deliberately allow-lists loopback CAN reach a host service on
+        // 127.0.0.1. Constructed directly so the test pins this floor mode
+        // regardless of the environment-defaulted one.
+        let local = EgressPolicy {
+            inner: Some(Arc::new(AllowList {
+                cidrs: vec![Cidr::parse("127.0.0.1/32").unwrap()],
+                allowed_hosts: None,
+                learned: Mutex::new(HashMap::new()),
+            })),
+            floor: FloorMode::MetadataAndLoopback,
+            denial_log: None,
+        };
         assert!(local.allows_v4(Ipv4Addr::new(127, 0, 0, 1)));
         // ...but only the named address — a sibling loopback IP stays floored.
         assert!(!local.allows_v4(Ipv4Addr::new(127, 0, 0, 2)));
         // A learned DNS answer for loopback never re-opens it (anti-rebinding):
         // only a static CIDR defeats the floor, and Strict keeps it absolute
         // (see `floor_strict_blocks_internal_and_metadata`).
-        let learned = EgressPolicy::new(None, Some(&["evil.test".into()]));
+        let learned = EgressPolicy {
+            inner: Some(Arc::new(AllowList {
+                cidrs: vec![],
+                allowed_hosts: Some(vec!["evil.test".into()]),
+                learned: Mutex::new(HashMap::new()),
+            })),
+            floor: FloorMode::MetadataAndLoopback,
+            denial_log: None,
+        };
         learned.learn_ip_records(&[(IpAddr::V4(Ipv4Addr::LOCALHOST), 300)]);
         assert!(!learned.allows_v4(Ipv4Addr::LOCALHOST));
     }
@@ -682,8 +743,12 @@ mod tests {
             v4(192, 168, 1, 5),     // RFC1918
             v4(10, 0, 0, 7),
             v4(172, 16, 5, 5),
-            v4(127, 0, 0, 1),  // loopback
-            v4(100, 64, 0, 1), // CGNAT gateway range
+            v4(127, 0, 0, 1),       // loopback
+            v4(100, 64, 0, 1),      // CGNAT gateway range
+            v4(224, 0, 0, 251),     // multicast (mDNS) — the host LAN segment
+            v4(239, 255, 255, 250), // multicast (SSDP)
+            "ff02::1".parse().unwrap(),
+            "::ffff:239.255.255.250".parse().unwrap(), // …and the mapped spelling
         ] {
             assert!(
                 is_floored(ip, FloorMode::Strict),
@@ -704,5 +769,85 @@ mod tests {
             "2606:4700::1111".parse().unwrap(),
             FloorMode::Strict
         ));
+    }
+
+    /// An A query for `name` — enough for a policy to read the question.
+    fn query_for(name: &str) -> Vec<u8> {
+        let mut q = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            q.push(u8::try_from(label.len()).expect("test label fits a DNS label"));
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.extend_from_slice(&[0, 0, 1, 0, 1]); // root label, QTYPE=A, QCLASS=IN
+        q
+    }
+
+    /// The DNS gate, reached the way the gateway reaches it.
+    ///
+    /// Forwarding a name upstream is what decides whether that name — and the
+    /// data a guest can encode in one — leaves the box at all. The decision used
+    /// to sit inline in `stack.rs` with no test of its own; it is a trait method
+    /// now, so pin it here.
+    #[test]
+    fn the_dns_gate_forwards_only_listed_names() {
+        let policy = EgressPolicy::new(None, Some(&["example.com".into()]));
+        let p: &dyn Policy = &policy;
+
+        // A listed name, and anything under it, goes upstream and is learned so
+        // the connection that follows passes.
+        for allowed in ["example.com", "www.example.com"] {
+            assert!(
+                matches!(
+                    p.dns(&query_for(allowed)),
+                    DnsDecision::Forward { learn: true }
+                ),
+                "{allowed} should be forwarded"
+            );
+        }
+        // Everything else is answered here rather than sent on: NXDOMAIN for a
+        // name nobody listed, SERVFAIL for a query that will not parse.
+        for refused in ["evil.test", "example.com.evil.test", "notexample.com"] {
+            assert!(
+                matches!(p.dns(&query_for(refused)), DnsDecision::Immediate(_)),
+                "{refused} must not reach the resolver"
+            );
+        }
+        assert!(matches!(p.dns(&[0, 1, 2]), DnsDecision::Immediate(_)));
+
+        // No allow-host list: nothing is filtered, and nothing is learned either
+        // — otherwise resolving any name would defeat `allowed_cidrs`.
+        let open = EgressPolicy::unrestricted();
+        let o: &dyn Policy = &open;
+        assert!(matches!(
+            o.dns(&query_for("anything.test")),
+            DnsDecision::Forward { learn: false }
+        ));
+    }
+
+    /// The rest of the trait surface: the built-in policy learns from raw answer
+    /// bytes, ignores ports, rewrites nothing, and answers no name itself.
+    #[test]
+    fn the_builtin_policy_learns_from_bytes_and_ignores_ports() {
+        let policy = EgressPolicy::new(None, Some(&["example.com".into()]));
+        let p: &dyn Policy = &policy;
+        let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        assert!(!p.allows(ip, Some(443)));
+
+        // `learn` is handed the answer whole, question and all.
+        p.learn(&dns::build_ip_response(
+            &query_for("example.com"),
+            &[ip],
+            300,
+        ));
+        // Learned, and on every port: ports are not this policy's vocabulary, so
+        // a consumer needing them implements its own.
+        for port in [Some(443), Some(22), None] {
+            assert!(p.allows(ip, port), "{port:?} should be allowed");
+        }
+
+        // It publishes no stand-in address and answers no name, so the gateway
+        // has nothing to rewrite and no reason to intercept TCP/53 for it.
+        assert_eq!(p.rewrite(ip), None);
+        assert!(!p.intercepts_dns());
     }
 }
