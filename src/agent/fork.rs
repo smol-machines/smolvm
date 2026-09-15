@@ -789,10 +789,13 @@ fn prepare_running_disk_generation(
     gdir: &Path,
     snapshot_dir: &Path,
     vm_ids: Option<(u32, u32)>,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
 ) -> Result<()> {
     use crate::data::disk::DiskFormat;
 
     ensure_fork_disk_chain_is_bounded(gdir)?;
+    reconcile_running_disk_geometry(gdir, storage_gb, overlay_gb)?;
 
     let generation_id = snapshot_dir.file_name().ok_or_else(|| {
         Error::agent(
@@ -908,6 +911,85 @@ fn prepare_running_disk_generation(
     if let Err(error) = write_result {
         rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
         return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reconcile_running_disk_geometry(
+    gdir: &Path,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+) -> Result<()> {
+    use crate::data::disk::{DiskFormat, Overlay, Storage};
+
+    for (raw, requested_gb, disk_type) in [
+        (
+            crate::data::storage::STORAGE_DISK_FILENAME,
+            storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB),
+            DiskFormat::Raw,
+        ),
+        (
+            crate::data::storage::OVERLAY_DISK_FILENAME,
+            overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
+            DiskFormat::Raw,
+        ),
+    ] {
+        let (path, format) = resolve_disk_image(gdir, raw);
+        if format != disk_type || !path.is_file() {
+            continue;
+        }
+        let expected = requested_gb
+            .checked_mul(crate::data::consts::BYTES_PER_GIB)
+            .ok_or_else(|| {
+                Error::agent(
+                    "reconcile fork disk geometry",
+                    format!("{raw} size overflows: {requested_gb} GiB"),
+                )
+            })?;
+        let actual = std::fs::metadata(&path)
+            .map_err(|error| {
+                Error::agent(
+                    "inspect fork disk geometry",
+                    format!("{}: {error}", path.display()),
+                )
+            })?
+            .len();
+        if actual >= expected {
+            continue;
+        }
+        match raw {
+            crate::data::storage::STORAGE_DISK_FILENAME => {
+                crate::disk_utils::expand_sparse_disk::<Storage>(&path, requested_gb)
+            }
+            crate::data::storage::OVERLAY_DISK_FILENAME => {
+                crate::disk_utils::expand_sparse_disk::<Overlay>(&path, requested_gb)
+            }
+            _ => unreachable!(),
+        }
+        .map_err(|error| {
+            Error::agent(
+                "reconcile fork disk geometry",
+                format!("{}: {error}", path.display()),
+            )
+        })?;
+        let repaired = std::fs::metadata(&path)
+            .map_err(|error| {
+                Error::agent(
+                    "verify fork disk geometry",
+                    format!("{}: {error}", path.display()),
+                )
+            })?
+            .len();
+        if repaired != expected {
+            return Err(Error::agent(
+                "verify fork disk geometry",
+                format!(
+                    "{} requested {expected} bytes, found {repaired}",
+                    path.display()
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -2191,7 +2273,13 @@ pub(crate) fn prepare_forks_reusing(
 
         if fork_continue {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if let Err(error) = prepare_running_disk_generation(&gdir, &snapshot_dir, vm_ids) {
+            if let Err(error) = prepare_running_disk_generation(
+                &gdir,
+                &snapshot_dir,
+                vm_ids,
+                golden_rec.storage_gb,
+                golden_rec.overlay_gb,
+            ) {
                 if forkpoint_armed {
                     let _ = park_forkpoint_after_capture(golden);
                 }
