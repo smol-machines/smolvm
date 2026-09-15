@@ -314,6 +314,8 @@ pub struct ResolvedEgressPolicy {
     pub network_override: Option<bool>,
     /// Outbound CIDR allow-list, with `--allow-host` names already resolved.
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Outbound CIDR deny-list, evaluated before the allow rules.
+    pub denied_cidrs: Option<Vec<String>>,
     /// Hostnames the guest DNS filter permits resolving.
     pub dns_filter_hosts: Option<Vec<String>>,
 }
@@ -524,6 +526,10 @@ impl PackRunCmd {
                 .egress
                 .as_ref()
                 .and_then(|policy| policy.allowed_cidrs.clone()),
+            denied_cidrs: self
+                .egress
+                .as_ref()
+                .and_then(|policy| policy.denied_cidrs.clone()),
         };
         validate_requested_network_backend(
             &resources,
@@ -1681,6 +1687,7 @@ fn run_from_cache(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
+        denied_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, ports.len())?;
 
@@ -2105,6 +2112,7 @@ fn daemon_start(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
+        denied_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, ports.len())?;
 
@@ -2387,6 +2395,7 @@ mod tests {
         let closed = ResolvedEgressPolicy {
             network_override: Some(false),
             allowed_cidrs: None,
+            denied_cidrs: None,
             dns_filter_hosts: None,
         };
         assert!(!effective_network(Some(&closed), false, true, true));
@@ -2405,6 +2414,7 @@ mod tests {
         let policy = ResolvedEgressPolicy {
             network_override: None,
             allowed_cidrs: Some(vec!["140.82.112.0/20".to_string()]),
+            denied_cidrs: None,
             dns_filter_hosts: Some(vec!["github.com".to_string()]),
         };
         assert!(effective_network(Some(&policy), false, true, false));
