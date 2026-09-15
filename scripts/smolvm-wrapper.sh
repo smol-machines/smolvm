@@ -38,10 +38,18 @@ resolve_symlink() {
 SCRIPT_PATH="$(resolve_symlink "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
-# The actual binary and libraries are in the same directory
+# The binary sits beside this script. Libraries and the agent rootfs are one
+# level up in the bin/ dist layout, or beside the script in the older flat
+# layout — probe for lib/ to tell the two apart. Packaging (the PKGBUILD and
+# the deb/rpm pipeline) rewrites the three SMOLVM_* assignments below to
+# absolute paths with sed, so each must stay a single VAR=... line.
+SMOLVM_ROOT="$SCRIPT_DIR"
+if [[ ! -d "$SMOLVM_ROOT/lib" && -d "$SCRIPT_DIR/../lib" ]]; then
+    SMOLVM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 SMOLVM_BIN="$SCRIPT_DIR/smolvm-bin"
-SMOLVM_LIB="$SCRIPT_DIR/lib"
-SMOLVM_BUNDLED_ROOTFS="$SCRIPT_DIR/agent-rootfs"
+SMOLVM_LIB="$SMOLVM_ROOT/lib"
+SMOLVM_BUNDLED_ROOTFS="$SMOLVM_ROOT/agent-rootfs"
 
 if [[ -d "$SMOLVM_BUNDLED_ROOTFS" ]]; then
     export SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$SMOLVM_BUNDLED_ROOTFS}"
