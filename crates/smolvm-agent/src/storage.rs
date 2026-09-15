@@ -4213,6 +4213,7 @@ fn establish_keepalive_container(
             crate::crun::create_failure_reason(&container_id, &create)
         )));
     }
+    crate::crun::discard_create_diagnostics(&container_id);
 
     let start = CrunCommand::start(&container_id)
         .output()

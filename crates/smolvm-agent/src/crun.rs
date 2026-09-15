@@ -182,18 +182,52 @@ pub fn create_log_path(container_id: &str) -> PathBuf {
     Path::new(paths::CONTAINERS_RUN_DIR).join(format!("create-{stem}.log"))
 }
 
-/// Read back and remove the diagnostics crun recorded for a failed create.
-/// Empty when crun logged nothing, so callers should fall back to stderr.
-pub fn take_create_log(container_id: &str) -> String {
-    let path = create_log_path(container_id);
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let _ = std::fs::remove_file(&path);
-    text.trim().to_string()
+/// Where a [`CrunCommand::create`] parks crun's stderr. crun only writes its
+/// `--log` once it is running; a crun that never got that far (its dynamic
+/// loader could not find a shared library, the binary is not executable) says
+/// why on stderr and exits 127, which a `/dev/null` stderr turned into
+/// "reported nothing" (smol-machines/smolvm#1270). A file, unlike a pipe,
+/// cannot block `output()` when crun hands the descriptor to the container.
+pub fn create_stderr_path(container_id: &str) -> PathBuf {
+    create_log_path(container_id).with_extension("stderr")
 }
 
-/// Best available explanation for a failed create: crun's log, its stderr when
-/// the log is empty, and failing both the exit status -- which at least
-/// distinguishes a rejected config from a crun that died on a signal.
+/// Read back and remove the diagnostics crun recorded for a failed create:
+/// its `--log` first, then whatever it wrote to stderr before or instead of
+/// logging. Empty when neither has anything.
+pub fn take_create_log(container_id: &str) -> String {
+    let mut text = String::new();
+    for path in [
+        create_log_path(container_id),
+        create_stderr_path(container_id),
+    ] {
+        let part = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        let part = part.trim();
+        if !part.is_empty() {
+            if !text.is_empty() {
+                text.push_str("; ");
+            }
+            text.push_str(part);
+        }
+    }
+    text
+}
+
+/// Drop the diagnostics files of a create that succeeded; nothing reads them
+/// afterwards and the next create would only truncate them.
+pub fn discard_create_diagnostics(container_id: &str) {
+    for path in [
+        create_log_path(container_id),
+        create_stderr_path(container_id),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Best available explanation for a failed create: crun's log and stderr,
+/// then the captured stderr of `output`, and failing both the exit status --
+/// with a hint for the one status crun cannot explain itself.
 pub fn create_failure_reason(container_id: &str, output: &std::process::Output) -> String {
     let logged = take_create_log(container_id);
     if !logged.is_empty() {
@@ -204,7 +238,20 @@ pub fn create_failure_reason(container_id: &str, output: &std::process::Output) 
     if !stderr.is_empty() {
         return stderr.to_string();
     }
-    format!("crun {} and reported nothing", output.status)
+    describe_silent_exit(output.status)
+}
+
+/// Exit 127 is the dynamic loader's code: crun itself could not start, so the
+/// agent rootfs (/lib, /usr/lib) is the place to look, not the container.
+fn describe_silent_exit(status: std::process::ExitStatus) -> String {
+    if status.code() == Some(127) {
+        format!(
+            "crun {status} and reported nothing: exit 127 is the dynamic loader failing before \
+             crun ran (a crun shared library was not loadable from the agent rootfs)"
+        )
+    } else {
+        format!("crun {status} and reported nothing")
+    }
 }
 
 impl CrunCommand {
@@ -259,7 +306,16 @@ impl CrunCommand {
         ]);
         c.cmd.stdin(Stdio::null());
         c.cmd.stdout(Stdio::null());
-        c.cmd.stderr(Stdio::null());
+        // stderr goes to a file next to the log (never a pipe: crun hands the
+        // descriptor to the container). It is read back only on failure.
+        let stderr_path = create_stderr_path(container_id);
+        let stderr_file = log_ready
+            .then(|| std::fs::File::create(&stderr_path).ok())
+            .flatten();
+        match stderr_file {
+            Some(file) => c.cmd.stderr(Stdio::from(file)),
+            None => c.cmd.stderr(Stdio::null()),
+        };
         c
     }
 
@@ -610,6 +666,34 @@ impl CrunCommand {
     pub fn status(mut self) -> std::io::Result<std::process::ExitStatus> {
         self.apply_pending();
         self.cmd.status()
+    }
+}
+
+#[cfg(test)]
+mod create_diagnostics_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn silent_exit_127_points_at_the_agent_rootfs_loader() {
+        let status = std::process::ExitStatus::from_raw(127 << 8);
+        let reason = describe_silent_exit(status);
+        assert!(reason.contains("exit status: 127"), "{reason}");
+        assert!(reason.contains("dynamic loader"), "{reason}");
+        assert!(reason.contains("agent rootfs"), "{reason}");
+        let other = describe_silent_exit(std::process::ExitStatus::from_raw(1 << 8));
+        assert_eq!(other, "crun exit status: 1 and reported nothing");
+    }
+
+    #[test]
+    fn stderr_file_sits_beside_the_log_and_is_read_back() {
+        let id = "diag-test-Æ/..-id";
+        assert_eq!(
+            create_stderr_path(id),
+            create_log_path(id).with_extension("stderr")
+        );
+        assert!(!create_stderr_path(id).to_string_lossy().contains("/.."));
+        assert!(create_stderr_path(id).starts_with(paths::CONTAINERS_RUN_DIR));
     }
 }
 

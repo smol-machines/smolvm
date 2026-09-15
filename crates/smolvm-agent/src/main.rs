@@ -4077,7 +4077,7 @@ fn handle_run_detached(
     // it, and `crun start` returns immediately once the container is running.
     let create_output = crun::CrunCommand::create(&bundle_path, &container_id).output();
     match create_output {
-        Ok(output) if output.status.success() => {}
+        Ok(output) if output.status.success() => crun::discard_create_diagnostics(&container_id),
         Ok(output) => {
             send_response(
                 stream,
@@ -4758,6 +4758,7 @@ fn ensure_main_container(
         )
         .into());
     }
+    crun::discard_create_diagnostics(&container_id);
     // Mount remote volumes in the window between create and start: the
     // container's namespaces exist but its first instruction has not run, so
     // anything exec'd into it afterwards is guaranteed to see the bucket. This
