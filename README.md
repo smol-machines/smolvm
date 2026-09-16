@@ -101,7 +101,7 @@ NOTION_API_KEY=secret_… smolvm machine run --net --image alpine \
   --credential notion=NOTION_API_KEY@api.notion.com -- sh -c 'echo $NOTION_API_KEY'   # a placeholder
 ```
 
-See [credential substitution](docs/credential-substitution.md) and the [security model](docs/security-model.md).
+See [credential substitution](docs/credential-substitution.md), the [security model](docs/security-model.md), and the [sandbox topic](docs/sandbox/README.md) for what the network does when you leave `--net` off.
 Use `--allow-host-pattern '*.example.com'` to allow subdomains only. The older
 `--allow-host example.com` continues to allow both the apex and subdomains.
 A stopped machine's allow list can be changed with `smolvm machine update`
