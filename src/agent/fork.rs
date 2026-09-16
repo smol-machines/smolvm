@@ -1488,6 +1488,19 @@ fn set_fork_lineage_memory_limit(
     if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
         return Ok(false);
     }
+    let reply = control_socket_cmd_with_timeout(
+        &control_socket_path(golden),
+        "SAVE_STATUS",
+        std::time::Duration::from_secs(2),
+    )?;
+    let pending = checkpoint_memory_units(&reply)?;
+    // The query must not lend a replacement process the previous VM's budget.
+    if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
+        return Ok(false);
+    }
+    let generations = generations
+        .checked_add(pending)
+        .ok_or_else(|| Error::agent("checkpoint memory accounting", "RAM unit count overflow"))?;
     let budget = fork_lineage_memory_budget(record, generations)?;
     let limit = budget.max_bytes;
     let updated =
@@ -1496,6 +1509,21 @@ fn set_fork_lineage_memory_limit(
         tracing::debug!(%golden, generations, memory_max_bytes = limit, "sized live-branch lineage cgroup");
     }
     Ok(updated)
+}
+
+#[cfg(target_os = "linux")]
+fn checkpoint_memory_units(reply: &str) -> Result<u64> {
+    match reply.trim() {
+        "OK memory_released" => Ok(0),
+        "OK preparing" | "OK ready" | "OK finishing" => Ok(1),
+        // Older runtimes cannot release the source lock during streamed packing.
+        // Their existing serialized capture path still owns the reservation.
+        "ERR EINVAL unknown command" | "ERR EINVAL snapshot dir required" => Ok(0),
+        other => Err(Error::agent(
+            "checkpoint memory accounting",
+            format!("runtime ownership is unknown; refusing to resize memory: {other}"),
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1527,6 +1555,7 @@ pub(crate) struct ForkLineageMemoryReservation {
     previous_ram_units: u64,
     source_rebased: bool,
     managed: bool,
+    source_released: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1561,6 +1590,13 @@ impl ForkLineageMemoryReservation {
         Ok(())
     }
 
+    /// The runtime owns the pending-memory record while output runs. Future
+    /// branch/resizing operations include it via SAVE_STATUS. Drop must now
+    /// reconcile the current lineage, not the pre-capture generation count.
+    pub(crate) fn allow_concurrent_branches(&mut self) {
+        self.source_released = true;
+    }
+
     fn reserve(
         golden: &str,
         record: &VmRecord,
@@ -1587,6 +1623,7 @@ impl ForkLineageMemoryReservation {
             previous_ram_units,
             source_rebased: false,
             managed,
+            source_released: false,
         })
     }
 
@@ -1599,6 +1636,32 @@ impl ForkLineageMemoryReservation {
 impl Drop for ForkLineageMemoryReservation {
     fn drop(&mut self) {
         if !self.managed {
+            return;
+        }
+        if self.source_released {
+            let result = (|| -> Result<()> {
+                let _lock = lock_fork_source(&self.golden)?;
+                let db = SmolvmDb::open()?;
+                let Some(record) = db.get_vm(&self.golden)? else {
+                    return Ok(());
+                };
+                if record.pid != self.record.pid
+                    || record.pid_start_time != self.record.pid_start_time
+                {
+                    return Ok(());
+                }
+                let retained = db.retained_fork_snapshot(&self.golden)?;
+                reconcile_fork_lineage_memory_limit(
+                    &db,
+                    &self.golden,
+                    &record,
+                    &vm_data_dir(&self.golden).join("s"),
+                    retained.as_ref(),
+                )
+            })();
+            if let Err(error) = result {
+                tracing::warn!(golden = %self.golden, %error, "retaining checkpoint memory allowance until ownership can be reconciled");
+            }
             return;
         }
         // A published commit marker means the new generation really can retain
@@ -4365,6 +4428,33 @@ mod tests {
             fork_lineage_memory_limit_bytes(&record, 2).unwrap(),
             4864 * 1024 * 1024
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checkpoint_memory_ownership_is_counted_and_unknown_status_fails_closed() {
+        for state in ["preparing", "ready", "finishing"] {
+            assert_eq!(
+                checkpoint_memory_units(&format!("OK {state}\n")).unwrap(),
+                1
+            );
+        }
+        for reply in [
+            "OK memory_released\n",
+            "ERR EINVAL unknown command\n",
+            "ERR EINVAL snapshot dir required\n",
+        ] {
+            assert_eq!(checkpoint_memory_units(reply).unwrap(), 0);
+        }
+        for reply in [
+            "",
+            "OK",
+            "OK durable",
+            "ERR EIO disconnected",
+            "OK finishing\nOK memory_released",
+        ] {
+            assert!(checkpoint_memory_units(reply).is_err());
+        }
     }
 
     #[cfg(target_os = "linux")]
