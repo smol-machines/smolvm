@@ -103,13 +103,20 @@ pub fn seed_vm_mode_disks(
             seed,
             crate::agent::create_disk_overlays,
         )? {
+            if seed.storage_template.is_some() {
+                smolvm_pack::extract::mark_layers_preunpacked(cache_dir);
+            }
             return Ok(());
         }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = seed.artifact_sha256;
 
-    seed_vm_mode_disks_by_copy(disk_dir, cache_dir, seed)
+    seed_vm_mode_disks_by_copy(disk_dir, cache_dir, seed)?;
+    if seed.storage_template.is_some() {
+        smolvm_pack::extract::mark_layers_preunpacked(cache_dir);
+    }
+    Ok(())
 }
 
 /// Portable sparse-copy fallback for VM-mode disks.
