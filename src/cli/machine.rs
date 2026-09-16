@@ -678,6 +678,25 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub docker_socket: bool,
 
+    /// Expose a Unix socket the guest listens on to the host (repeatable). The
+    /// host reaches it at the given host path, or `<vm-dir>/<basename>` by
+    /// default. Format: GUEST_PATH[:HOST_PATH].
+    #[arg(
+        long = "expose-socket",
+        value_name = "GUEST_PATH[:HOST_PATH]",
+        help_heading = "Network"
+    )]
+    pub expose_socket: Vec<String>,
+
+    /// Mount a host Unix socket into the guest (repeatable), so a guest process
+    /// reaches the host service at GUEST_PATH. Format: HOST_PATH:GUEST_PATH.
+    #[arg(
+        long = "mount-socket",
+        value_name = "HOST_PATH:GUEST_PATH",
+        help_heading = "Network"
+    )]
+    pub mount_socket: Vec<String>,
+
     /// Mount ~/.docker/ into the VM. Registry credentials from `docker login`
     /// (credential helpers included) are resolved on the host for every pull,
     /// so this is only needed for other contents of the directory.
@@ -1271,6 +1290,8 @@ impl RunCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        params.published_sockets =
+            parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins).
         for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
@@ -1639,6 +1660,7 @@ impl RunCmd {
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
+            published_sockets: params.published_sockets.clone(),
             // A foreground ephemeral VM exists only to serve this command, so bind
             // its lifetime to this process. Without the watchdog the VM survives a
             // SIGKILL of the CLI — which is how orchestrators (and CI) enforce
