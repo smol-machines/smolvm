@@ -761,6 +761,28 @@ const GUEST_LAYERS_DIR: &str = "packed-layers";
 /// Marker written once every staged tar has been unpacked, holding the staged
 /// set's signature so a restart reuses the work and a changed pack redoes it.
 const GUEST_LAYERS_MARKER: &str = ".extracted";
+/// Left by the host beside the staged tars when the storage disk was seeded
+/// from the pack's captured disk (see `smolvm_pack::extract`).
+const LAYERS_PREUNPACKED_MARKER: &str = ".preunpacked";
+
+/// Whether the packed layers for `image` are already on this storage disk in
+/// usable form: the host seeded the disk from the pack's captured disk (it
+/// left the marker beside the staged tars) and that disk holds the image in
+/// the local store, pulled and unpacked by the guest that baked it. Then the
+/// staged tars describe a filesystem this disk already has, and unpacking
+/// them again would only cost time.
+fn image_preunpacked_on_disk(packed_dir: &Path, image: &str) -> bool {
+    if !packed_dir.join(LAYERS_PREUNPACKED_MARKER).is_file() {
+        return false;
+    }
+    match query_local_image(image) {
+        Ok(Some(_)) => {
+            debug!(image = %image, "image already on the seeded disk, skipping packed layers");
+            true
+        }
+        _ => false,
+    }
+}
 
 /// Written by the host beside layers it extracted itself, declaring that their
 /// opaque-directory markers use `user.overlay.*`. Absent means `trusted.*`,
@@ -847,6 +869,13 @@ where
         .unwrap_or("packed");
     let out = Path::new(STORAGE_ROOT).join(GUEST_LAYERS_DIR).join(key);
     let marker = out.join(GUEST_LAYERS_MARKER);
+    // The host seeded this storage disk from the pack's own captured disk,
+    // whose layers a guest unpacked at bake time; the staged tars describe the
+    // same filesystem, so there is nothing left to unpack.
+    if packed_dir.join(LAYERS_PREUNPACKED_MARKER).is_file() && marker.is_file() {
+        info!(layers = %out.display(), "using layers unpacked at bake time");
+        return Ok(Some(out));
+    }
     let signature = staged_tars_signature(&tars)?;
     if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
         return Ok(Some(out));
@@ -2369,7 +2398,9 @@ where
     let image = image.as_str();
 
     // If packed layers are available, return synthetic image info
-    if let Some(packed_dir) = get_packed_layers_dir() {
+    if let Some(packed_dir) =
+        get_packed_layers_dir().filter(|dir| !image_preunpacked_on_disk(dir, image))
+    {
         info!(image = %image, "using packed layers, skipping network pull");
         // A saved-image archive is flattened, host-staged tars are unpacked
         // here, and an already-unpacked dir is used as-is.
@@ -2720,9 +2751,20 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     // Query must not unpack an image: it has a short, single-response RPC
     // deadline. Unprepared local images go through the streaming pull path.
     if let Some(packed_dir) = get_packed_layers_dir() {
-        return query_packed_image(image, packed_dir, Path::new(STORAGE_ROOT));
+        // A disk seeded from the pack's captured disk already holds the image
+        // in the local store; answer from there so every consumer (launch,
+        // config lookup, this query) agrees with the layer selection.
+        if !image_preunpacked_on_disk(packed_dir, image) {
+            return query_packed_image(image, packed_dir, Path::new(STORAGE_ROOT));
+        }
     }
+    query_local_image(image)
+}
 
+/// Query the local image store only, ignoring any packed layers.
+fn query_local_image(image: &str) -> Result<Option<ImageInfo>> {
+    let image = normalize_image_ref(image);
+    let image = image.as_str();
     let root = Path::new(STORAGE_ROOT);
     let manifest_path = root
         .join(MANIFESTS_DIR)
@@ -3428,7 +3470,9 @@ fn hosts_file_has_entries(path: &Path) -> bool {
 /// which may call this before or after `machine exec`.
 pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     // Check if we have packed layers available
-    if let Some(packed_dir) = get_packed_layers_dir() {
+    if let Some(packed_dir) =
+        get_packed_layers_dir().filter(|dir| !image_preunpacked_on_disk(dir, image))
+    {
         info!(image = %image, packed_dir = %packed_dir.display(), "using packed layers");
         // A saved-image archive is flattened into a rootfs (a single packed
         // layer), host-staged tars are unpacked here, and an already-unpacked
@@ -3918,7 +3962,9 @@ where
     // Resolve image layers (same logic as prepare_overlay). A local image
     // archive is flattened into a rootfs first; a packed-layers dir is used
     // as-is.
-    let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
+    let lowerdirs = if let Some(packed_dir) =
+        get_packed_layers_dir().filter(|dir| !image_preunpacked_on_disk(dir, image))
+    {
         let effective = effective_packed_dir_with_progress(packed_dir, &mut progress)?;
         get_packed_lowerdirs(&effective)?
     } else {
