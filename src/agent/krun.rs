@@ -121,6 +121,8 @@ pub struct KrunFunctions {
     /// VM's RAM + restore state instead of cold-booting).
     pub set_snapshot: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
     pub set_snapshot_memory_fd: Option<unsafe extern "C" fn(u32, i32) -> i32>,
+    /// Opt into immutable backing retained across restored branches.
+    pub set_snapshot_memory_fd2: Option<unsafe extern "C" fn(u32, i32, u32) -> i32>,
     /// Create a qcow2 copy-on-write overlay backed by an existing disk image
     /// (used for fork-clone block disks). Pure filesystem op; takes no ctx.
     pub create_disk_overlay:
@@ -217,6 +219,7 @@ impl KrunFunctions {
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
         let set_snapshot_memory_fd = load_optional_sym!("krun_set_snapshot_memory_fd");
+        let set_snapshot_memory_fd2 = load_optional_sym!("krun_set_snapshot_memory_fd2");
         let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay");
 
         Ok(Self {
@@ -253,6 +256,7 @@ impl KrunFunctions {
             set_control_socket,
             set_snapshot,
             set_snapshot_memory_fd,
+            set_snapshot_memory_fd2,
             create_disk_overlay,
         })
     }

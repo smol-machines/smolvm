@@ -1739,12 +1739,24 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 return Err(Error::agent("restore RAM", "invalid input descriptor"));
             }
             let input = OwnedFd::from_raw_fd(fd);
-            let set_memory = try_or_free_ctx!(
-                krun.set_snapshot_memory_fd.ok_or(()),
-                "restore RAM",
-                "libkrun lacks read-only snapshot memory support"
-            );
-            let result = set_memory(ctx, input.as_raw_fd());
+            // This descriptor comes from open_readonly_memory: verified
+            // service-owned input beneath a private directory, never a guest
+            // writable file. Its bytes remain immutable; cleanup only unlinks
+            // names, while libkrun and descendants retain their descriptors.
+            let (result, backend) = if let Some(set_memory) = krun.set_snapshot_memory_fd2 {
+                const IMMUTABLE: u32 = 1;
+                (
+                    set_memory(ctx, input.as_raw_fd(), IMMUTABLE),
+                    "immutable-file",
+                )
+            } else {
+                let set_memory = try_or_free_ctx!(
+                    krun.set_snapshot_memory_fd.ok_or(()),
+                    "restore RAM",
+                    "libkrun lacks read-only snapshot memory support"
+                );
+                (set_memory(ctx, input.as_raw_fd()), "private-copy")
+            };
             if result < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
@@ -1752,6 +1764,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     format!("libkrun rejected read-only input: {result}"),
                 ));
             }
+            tracing::info!(backend, "configured checkpoint RAM backing");
         }
         if let Ok(snap_dir) = std::env::var("SMOLVM_SNAPSHOT_DIR") {
             if !snap_dir.is_empty() {
