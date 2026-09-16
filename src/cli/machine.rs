@@ -2399,6 +2399,220 @@ mod tests {
         command: MachineCmd,
     }
 
+    // A stopped machine had no way to gain or lose an allowed host: the host list
+    // was written once at create and never by update, so editing a Smolfile and
+    // re-running `machine update --net` left the new host unresolvable on the
+    // next start. These drive the record mutation directly, because the command
+    // applies it inside a database transaction that needs no VM but does need a
+    // database.
+    #[test]
+    fn update_adds_an_allowed_host_and_turns_networking_on() {
+        let mut hosts = None;
+        let mut network = false;
+        let mut changes = Vec::new();
+
+        apply_allow_host_changes(
+            &mut hosts,
+            &mut network,
+            &["registry.npmjs.org".to_string()],
+            &[],
+            &mut changes,
+        );
+
+        assert_eq!(hosts, Some(vec!["registry.npmjs.org".to_string()]));
+        assert!(network);
+        assert_eq!(
+            changes,
+            vec![
+                "  added allowed host: registry.npmjs.org".to_string(),
+                "  network: enabled".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_does_not_add_an_allowed_host_twice() {
+        let mut hosts = Some(vec!["registry.npmjs.org".to_string()]);
+        let mut network = true;
+        let mut changes = Vec::new();
+
+        apply_allow_host_changes(
+            &mut hosts,
+            &mut network,
+            &["registry.npmjs.org".to_string()],
+            &[],
+            &mut changes,
+        );
+
+        assert_eq!(hosts, Some(vec!["registry.npmjs.org".to_string()]));
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn update_removes_an_allowed_host_and_leaves_the_others() {
+        let mut hosts = Some(vec![
+            "dl-cdn.alpinelinux.org".to_string(),
+            "registry.npmjs.org".to_string(),
+        ]);
+        let mut network = true;
+        let mut changes = Vec::new();
+
+        apply_allow_host_changes(
+            &mut hosts,
+            &mut network,
+            &[],
+            &["dl-cdn.alpinelinux.org".to_string()],
+            &mut changes,
+        );
+
+        assert_eq!(hosts, Some(vec!["registry.npmjs.org".to_string()]));
+        assert!(network);
+        assert_eq!(
+            changes,
+            vec!["  removed allowed host: dl-cdn.alpinelinux.org".to_string()]
+        );
+    }
+
+    #[test]
+    fn update_reports_removing_a_host_that_is_not_present() {
+        let mut hosts = Some(vec!["registry.npmjs.org".to_string()]);
+        let mut network = true;
+        let mut changes = Vec::new();
+
+        apply_allow_host_changes(
+            &mut hosts,
+            &mut network,
+            &[],
+            &["example.invalid".to_string()],
+            &mut changes,
+        );
+
+        assert_eq!(hosts, Some(vec!["registry.npmjs.org".to_string()]));
+        assert_eq!(
+            changes,
+            vec!["  allowed host not present: example.invalid".to_string()]
+        );
+    }
+
+    #[test]
+    fn update_clears_the_host_list_when_the_last_host_is_removed() {
+        // An empty list still reads as "hosts are set" at start, which
+        // initializes a deny-all policy on a machine that no longer asks for one.
+        let mut hosts = Some(vec!["dl-cdn.alpinelinux.org".to_string()]);
+        let mut network = true;
+        let mut changes = Vec::new();
+
+        apply_allow_host_changes(
+            &mut hosts,
+            &mut network,
+            &[],
+            &["dl-cdn.alpinelinux.org".to_string()],
+            &mut changes,
+        );
+
+        assert_eq!(hosts, None);
+        assert_eq!(
+            changes,
+            vec!["  removed allowed host: dl-cdn.alpinelinux.org".to_string()]
+        );
+    }
+
+    #[test]
+    fn update_removes_then_adds_in_one_invocation() {
+        let mut hosts = Some(vec!["dl-cdn.alpinelinux.org".to_string()]);
+        let mut network = true;
+        let mut changes = Vec::new();
+
+        apply_allow_host_changes(
+            &mut hosts,
+            &mut network,
+            &["registry.npmjs.org".to_string()],
+            &["dl-cdn.alpinelinux.org".to_string()],
+            &mut changes,
+        );
+
+        assert_eq!(hosts, Some(vec!["registry.npmjs.org".to_string()]));
+        assert_eq!(
+            changes,
+            vec![
+                "  removed allowed host: dl-cdn.alpinelinux.org".to_string(),
+                "  added allowed host: registry.npmjs.org".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_accepts_allow_host() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "update",
+            "--name",
+            "hosts-test",
+            "--allow-host",
+            "registry.npmjs.org",
+            "--allow-host",
+            "dl-cdn.alpinelinux.org",
+        ]);
+        let MachineCmd::Update(cmd) = cli.command else {
+            panic!("expected machine update command");
+        };
+
+        assert_eq!(
+            cmd.allow_host,
+            vec![
+                "registry.npmjs.org".to_string(),
+                "dl-cdn.alpinelinux.org".to_string()
+            ]
+        );
+        assert!(cmd.remove_allow_host.is_empty());
+    }
+
+    #[test]
+    fn update_accepts_remove_allow_host() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "update",
+            "--name",
+            "hosts-test",
+            "--remove-allow-host",
+            "dl-cdn.alpinelinux.org",
+        ]);
+        let MachineCmd::Update(cmd) = cli.command else {
+            panic!("expected machine update command");
+        };
+
+        assert_eq!(
+            cmd.remove_allow_host,
+            vec!["dl-cdn.alpinelinux.org".to_string()]
+        );
+        assert!(cmd.allow_host.is_empty());
+    }
+
+    #[test]
+    fn update_accepts_both_host_flags_with_net() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "update",
+            "--name",
+            "hosts-test",
+            "--net",
+            "--allow-host",
+            "registry.npmjs.org",
+            "--remove-allow-host",
+            "dl-cdn.alpinelinux.org",
+        ]);
+        let MachineCmd::Update(cmd) = cli.command else {
+            panic!("expected machine update command");
+        };
+
+        assert!(cmd.net);
+        assert_eq!(cmd.allow_host, vec!["registry.npmjs.org".to_string()]);
+        assert_eq!(
+            cmd.remove_allow_host,
+            vec!["dl-cdn.alpinelinux.org".to_string()]
+        );
+    }
+
     #[test]
     fn create_accepts_port_ranges() {
         let cli = TestMachineCli::parse_from([
@@ -4734,6 +4948,7 @@ impl ResizeCmd {
 ///   smolvm machine update --name myvm --cpus 4 --mem 4096
 ///   smolvm machine update --name myvm --remove-volume ./src:/app
 ///   smolvm machine update --name myvm --net -e DEBUG=1
+///   smolvm machine update --name myvm --allow-host registry.npmjs.org
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
@@ -4778,6 +4993,16 @@ pub struct UpdateCmd {
     #[arg(long, conflicts_with = "net")]
     pub no_net: bool,
 
+    /// Allow egress to a hostname, resolved at every start (implies --net).
+    /// Ignored when --no-net is given in the same invocation, which clears
+    /// the whole egress policy.
+    #[arg(long = "allow-host", value_name = "HOSTNAME")]
+    pub allow_host: Vec<String>,
+
+    /// Stop allowing egress to a hostname
+    #[arg(long = "remove-allow-host", value_name = "HOSTNAME")]
+    pub remove_allow_host: Vec<String>,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -4817,6 +5042,57 @@ pub struct UpdateCmd {
     /// Set the host block I/O engine for the next start.
     #[arg(long = "block-io", value_enum)]
     pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
+}
+
+/// Apply `--allow-host` and `--remove-allow-host` to a machine record's host
+/// list, appending one summary line per change.
+///
+/// The record stores hostnames, not addresses: the start path re-resolves every
+/// name to fresh CIDRs, so removing a name here is what closes it.
+fn apply_allow_host_changes(
+    dns_filter_hosts: &mut Option<Vec<String>>,
+    network: &mut bool,
+    add: &[String],
+    remove: &[String],
+    changes: &mut Vec<String>,
+) {
+    for rm in remove {
+        let removed = match dns_filter_hosts {
+            Some(hosts) => {
+                let before = hosts.len();
+                hosts.retain(|h| h != rm);
+                hosts.len() < before
+            }
+            None => false,
+        };
+        if removed {
+            changes.push(format!("  removed allowed host: {}", rm));
+        } else {
+            changes.push(format!("  allowed host not present: {}", rm));
+        }
+    }
+    // An empty list would still count as "hosts are set" at start, which
+    // initializes a deny-all egress policy on a machine that asked for none.
+    if dns_filter_hosts
+        .as_ref()
+        .is_some_and(|hosts| hosts.is_empty())
+    {
+        *dns_filter_hosts = None;
+    }
+
+    for host in add {
+        let hosts = dns_filter_hosts.get_or_insert_with(Vec::new);
+        if !hosts.contains(host) {
+            changes.push(format!("  added allowed host: {}", host));
+            hosts.push(host.clone());
+        }
+        // An allowed host is an egress rule, so it implies networking, the same
+        // way `--allow-host` does at create.
+        if !*network {
+            changes.push("  network: enabled".to_string());
+            *network = true;
+        }
+    }
 }
 
 impl UpdateCmd {
@@ -4937,6 +5213,13 @@ impl UpdateCmd {
         let (final_live_mounts, final_staged_mounts) =
             HostMount::split_storage_tuples(&final_mounts);
 
+        // Resolve every added host before the DB write, so an unresolvable name
+        // leaves the record untouched rather than half-applied.
+        for host in &self.allow_host {
+            crate::cli::parsers::resolve_host_to_cidrs(host)
+                .map_err(|e| smolvm::Error::config("--allow-host", e))?;
+        }
+
         // Expand physical disk files before the DB write. If expansion fails,
         // no DB changes are made — the record stays consistent.
         let mut changes: Vec<String> = Vec::new();
@@ -5013,6 +5296,14 @@ impl UpdateCmd {
                 changes.push("  network: enabled".to_string());
                 r.network = true;
             }
+            apply_allow_host_changes(
+                &mut r.dns_filter_hosts,
+                &mut r.network,
+                &self.allow_host,
+                &self.remove_allow_host,
+                &mut changes,
+            );
+
             if self.no_net {
                 changes.push("  network: disabled".to_string());
                 r.network = false;
