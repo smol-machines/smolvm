@@ -84,12 +84,13 @@ fn resolve_egress_flags(
     outbound_localhost_only: bool,
     net: bool,
 ) -> smolvm::Result<(Vec<String>, bool, Option<Vec<String>>)> {
-    // Resolve hostnames to CIDRs — fail hard on resolution errors
+    // Validate each hostname now and fail hard, but do not store what it
+    // resolves to: start re-resolves every host, so a baked address is only a
+    // stale copy of what start will look up again.
     for host in &allow_host {
         let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
             .map_err(|e| smolvm::Error::config("--allow-host", e))?;
         tracing::info!(host, ?cidrs, "resolved hostname for egress policy");
-        allow_cidr.extend(cidrs);
     }
 
     if outbound_localhost_only {
@@ -2405,6 +2406,26 @@ mod tests {
     // next start. These drive the record mutation directly, because the command
     // applies it inside a database transaction that needs no VM but does need a
     // database.
+    #[test]
+    fn create_stores_explicit_cidrs_only_and_not_a_host_s_addresses() {
+        // A host's addresses used to be baked into the stored CIDR list at
+        // create, next to explicit --allow-cidr values and indistinguishable
+        // from them. That made a later --remove-allow-host unable to close the
+        // host: the name left the list while its create-time addresses stayed
+        // reachable by direct IP until they rotated.
+        let (cidrs, net, hosts) = resolve_egress_flags(
+            vec!["10.0.0.0/8".to_string()],
+            vec!["localhost".to_string()],
+            false,
+            false,
+        )
+        .expect("localhost resolves");
+
+        assert_eq!(cidrs, vec!["10.0.0.0/8".to_string()]);
+        assert!(net);
+        assert_eq!(hosts, Some(vec!["localhost".to_string()]));
+    }
+
     #[test]
     fn update_adds_an_allowed_host_and_turns_networking_on() {
         let mut hosts = None;
