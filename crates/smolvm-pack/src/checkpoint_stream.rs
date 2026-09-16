@@ -113,6 +113,50 @@ mod tests {
             assert!(CheckpointStream::read(&mut bad.as_slice(), 8192).is_err());
         }
     }
+
+    #[test]
+    fn extended_sparse_headers_preserve_every_range() {
+        let logical = 32768_u64;
+        let mut wire = b"SMOLCKS1".to_vec();
+        wire.extend_from_slice(&3_u32.to_le_bytes());
+        wire.extend_from_slice(&3_u32.to_le_bytes());
+        wire.extend_from_slice(b"cpumapSMOLRSP1");
+        wire.extend_from_slice(&logical.to_le_bytes());
+        wire.extend_from_slice(&31_u32.to_le_bytes());
+        for index in 0..30_u64 {
+            wire.extend_from_slice(&(index * 1024).to_le_bytes());
+            wire.extend_from_slice(&512_u64.to_le_bytes());
+        }
+        wire.extend_from_slice(&logical.to_le_bytes());
+        wire.extend_from_slice(&0_u64.to_le_bytes());
+        for value in 1..=30_u8 {
+            wire.extend_from_slice(&[value; 512]);
+        }
+        wire.extend_from_slice(b"OK saved (32768 bytes, 1 regions)\n");
+        let mut unaligned = wire.clone();
+        unaligned[50..58].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(CheckpointStream::read(&mut unaligned.as_slice(), logical).is_err());
+        let mut source = wire.as_slice();
+        let mut stream = CheckpointStream::read(&mut source, logical).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        stream.append(&mut builder).unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        let mut restored = Vec::new();
+        archive
+            .entries()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut restored)
+            .unwrap();
+        let mut expected = vec![0; logical as usize];
+        for index in 0..30 {
+            expected[index * 1024..index * 1024 + 512].fill(index as u8 + 1);
+        }
+        assert_eq!(restored, expected);
+    }
 }
 
 fn invalid() -> io::Error {
@@ -169,6 +213,17 @@ impl<'a> CheckpointStream<'a> {
                 end = next;
             }
             ranges.push((offset, len));
+        }
+        if ranges
+            .iter()
+            .take(count - 1)
+            .any(|(offset, _)| offset % 512 != 0)
+            || ranges
+                .iter()
+                .take(count.saturating_sub(2))
+                .any(|(_, len)| len % 512 != 0)
+        {
+            return Err(invalid());
         }
         Ok(Self {
             source,
