@@ -308,10 +308,28 @@ mod shutdown_compat_tests {
     }
 }
 
+/// Managed writable disk, never an arbitrary guest path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedDisk {
+    /// Persistent workspace and image storage disk.
+    Storage,
+    /// Writable guest root filesystem overlay disk.
+    Overlay,
+}
+
 /// Agent request types (for image management and OCI operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Grow a mounted filesystem after the VMM publishes its new capacity.
+    /// Never formats, repairs, unmounts, or shrinks the filesystem.
+    GrowFilesystem {
+        /// Managed disk whose mounted filesystem should grow.
+        disk: ManagedDisk,
+        /// Exact capacity in bytes already published by the VMM.
+        expected_bytes: u64,
+    },
     /// Ping to check if agent is alive.
     Ping,
 
@@ -794,6 +812,12 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::GrowFilesystem {
+                disk,
+                expected_bytes,
+            } => {
+                format!("GrowFilesystem {{ disk: {disk:?}, expected_bytes: {expected_bytes} }}")
+            }
             AgentRequest::Ping => "Ping".into(),
             AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
             AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),
@@ -1439,6 +1463,29 @@ impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filesystem_growth_uses_only_managed_disk_names() {
+        use super::{AgentRequest, ManagedDisk};
+        let request = AgentRequest::GrowFilesystem {
+            disk: ManagedDisk::Storage,
+            expected_bytes: 2147483648,
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["method"], "grow_filesystem");
+        assert_eq!(wire["disk"], "storage");
+        assert!(matches!(
+            serde_json::from_value::<AgentRequest>(wire).unwrap(),
+            AgentRequest::GrowFilesystem {
+                disk: ManagedDisk::Storage,
+                expected_bytes: 2147483648
+            }
+        ));
+        assert!(serde_json::from_str::<AgentRequest>(
+            r#"{"method":"grow_filesystem","disk":"/dev/vdc","expected_bytes":2147483648}"#
+        )
+        .is_err());
+    }
+
     use super::*;
 
     #[test]
