@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
 mod crun;
+mod live_resources;
 mod shutdown;
 mod shutdown_freeze;
 
@@ -2320,6 +2321,9 @@ fn handle_request(
         AgentRequest::Ping
         | AgentRequest::NetworkTest { .. }
         | AgentRequest::VmExec { .. }
+        // Live growth only accepts an already-mounted disk. Never enter the
+        // boot-time mount/format fallback as a side effect of this request.
+        | AgentRequest::GrowFilesystem { .. }
         | AgentRequest::Shutdown { .. } => {}
         _ => {
             ensure_storage_mounted();
@@ -2360,6 +2364,10 @@ fn handle_request(
         AgentRequest::ListDirectory { path } => handle_list_directory(&path),
 
         AgentRequest::StorageStatus => handle_storage_status(),
+        AgentRequest::GrowFilesystem {
+            disk,
+            expected_bytes,
+        } => live_resources::grow_filesystem(disk, expected_bytes, client_fd),
         AgentRequest::MemoryStatus => handle_memory_status(),
 
         AgentRequest::BranchpointWait { timeout_ms } => {
