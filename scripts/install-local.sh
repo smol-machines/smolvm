@@ -74,8 +74,18 @@ find_tarball() {
 install_from_dir() {
     local src_dir="$1"
 
+    # Tarball layout: newer dists keep executables in bin/ and disk templates
+    # in conf/; older ones are flat. The install mirrors the dist's own layout
+    # into the prefix — the wrapper resolves lib/ relative to itself, so the
+    # two must move together.
+    local src_bin_dir="$src_dir" dst_bin_dir="$INSTALL_PREFIX"
+    if [[ -d "$src_dir/bin" ]]; then
+        src_bin_dir="$src_dir/bin"
+        dst_bin_dir="$INSTALL_PREFIX/bin"
+    fi
+
     # Verify required files exist
-    if [[ ! -f "$src_dir/smolvm" ]] || [[ ! -f "$src_dir/smolvm-bin" ]]; then
+    if [[ ! -f "$src_bin_dir/smolvm" ]] || [[ ! -f "$src_bin_dir/smolvm-bin" ]]; then
         error "Invalid smolvm distribution: missing smolvm or smolvm-bin"
         exit 1
     fi
@@ -96,15 +106,19 @@ install_from_dir() {
     # Create installation directory
     mkdir -p "$INSTALL_PREFIX"
 
-    # Remove old installation
-    rm -rf "$INSTALL_PREFIX/lib"
+    # Remove old installation (both layouts, so upgrades never mix them)
+    rm -rf "$INSTALL_PREFIX/lib" "$INSTALL_PREFIX/bin" "$INSTALL_PREFIX/conf"
     rm -f "$INSTALL_PREFIX/smolvm" "$INSTALL_PREFIX/smolvm-bin"
 
     # Copy files
+    mkdir -p "$dst_bin_dir"
     cp -r "$src_dir/lib" "$INSTALL_PREFIX/"
-    cp "$src_dir/smolvm" "$INSTALL_PREFIX/"
-    cp "$src_dir/smolvm-bin" "$INSTALL_PREFIX/"
-    chmod +x "$INSTALL_PREFIX/smolvm" "$INSTALL_PREFIX/smolvm-bin"
+    if [[ -d "$src_dir/conf" ]]; then
+        cp -r "$src_dir/conf" "$INSTALL_PREFIX/"
+    fi
+    cp "$src_bin_dir/smolvm" "$dst_bin_dir/"
+    cp "$src_bin_dir/smolvm-bin" "$dst_bin_dir/"
+    chmod +x "$dst_bin_dir/smolvm" "$dst_bin_dir/smolvm-bin"
 
     # Install agent-rootfs to data directory
     local data_dir
@@ -125,20 +139,25 @@ install_from_dir() {
         warn "agent-rootfs not found in distribution"
     fi
 
-    # Copy init.krun if present (Linux only, required by libkrunfw kernel)
-    if [[ -f "$src_dir/init.krun" ]]; then
-        info "Installing init.krun to $data_dir..."
-        cp "$src_dir/init.krun" "$data_dir/init.krun"
-        chmod +x "$data_dir/init.krun"
-        success "init.krun installed"
-    fi
+    # Copy init.krun if present (Linux only, required by libkrunfw kernel).
+    # Newer dists carry it in lib/, older ones at the root.
+    local init_krun
+    for init_krun in "$src_dir/lib/init.krun" "$src_dir/init.krun"; do
+        if [[ -f "$init_krun" ]]; then
+            info "Installing init.krun to $data_dir..."
+            cp "$init_krun" "$data_dir/init.krun"
+            chmod +x "$data_dir/init.krun"
+            success "init.krun installed"
+            break
+        fi
+    done
 
     # Store version
     echo "$version" > "$INSTALL_PREFIX/.version"
 
     # Create symlink
     mkdir -p "$BIN_DIR"
-    ln -sf "$INSTALL_PREFIX/smolvm" "$BIN_DIR/smolvm"
+    ln -sf "$dst_bin_dir/smolvm" "$BIN_DIR/smolvm"
 
     success "Installed smolvm to $INSTALL_PREFIX"
     success "Symlink created at $BIN_DIR/smolvm"
