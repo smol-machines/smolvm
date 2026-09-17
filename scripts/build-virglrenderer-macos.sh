@@ -62,4 +62,11 @@ otool -L "$OUT" | awk 'NR>1 {print $1}' | grep -E 'libMoltenVK|libepoxy' | while
 done
 codesign --force --sign - "$OUT" 2>/dev/null
 echo "Installed: $OUT"
+# Record what this library was built from, so CI can tell when the patch set
+# or version moves on without a rebuild (scripts/check-virglrenderer-provenance.sh).
+cat > "$(dirname "$OUT")/libvirglrenderer.provenance" <<PROV
+virglrenderer=$VIRGL_VERSION
+patches=$("$ROOT/scripts/virglrenderer-patch-digest.sh")
+PROV
+echo "Stamped: $(dirname "$OUT")/libvirglrenderer.provenance"
 otool -L "$OUT" | grep -E '@loader_path|MoltenVK|epoxy' | sed 's/^/  /'
