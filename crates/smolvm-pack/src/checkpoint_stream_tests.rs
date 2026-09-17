@@ -79,6 +79,42 @@ fn failed_runtime_completion_never_publishes_an_artifact() {
 }
 
 #[test]
+fn interrupted_stream_preserves_existing_checkpoint_and_cleans_temporary_output() {
+    let good = wire(b"OK saved (8192 bytes, 1 regions)\n");
+    for end in 0..good.len() {
+        let mut source = &good[..end];
+        let Ok(mut stream) = CheckpointStream::read(&mut source, 8192) else {
+            continue;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("existing.smolcheckpoint");
+        let previous = b"previous durable checkpoint";
+        std::fs::write(&output, previous).unwrap();
+        let collector = crate::assets::AssetCollector::new(temp.path().join("staging")).unwrap();
+        let manifest = crate::PackManifest::new(
+            "test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        assert!(
+            crate::Packer::new(manifest)
+                .with_asset_collector(collector)
+                .pack_checkpoint_stream(&output, &mut stream)
+                .is_err(),
+            "accepted truncated stream at {end}"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), previous);
+        let mut entries: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["existing.smolcheckpoint", "staging"]);
+    }
+}
+
+#[test]
 fn malformed_maps_and_unbounded_metadata_are_rejected() {
     let good = wire(b"OK saved (8192 bytes, 1 regions)\n");
     let mut source = good.as_slice();
