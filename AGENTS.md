@@ -168,7 +168,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--net` | | run, create | Enable outbound networking (off by default) |
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
-| `--volume` | `-v` | run, create, update | Mount host dir: `HOST:GUEST[:ro]` |
+| `--volume` | `-v` | run, create, update | Mount host dir: `HOST:GUEST[:ro]`. Served over virtio-fs, so operation-heavy work is slow on it (see Host Mounts) |
 | `--allow-system-mounts` | | run, create, update, pack run | Permit trusted read-only `/etc` and `/var/log` mounts below `/host` |
 | `--port` | `-p` | run, create, update | Port mapping: `HOST:GUEST` |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
@@ -177,6 +177,20 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-cidr` | | run, create | CIDR egress filter (implies --net) |
 | `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
+
+## Host Mounts
+
+A `-v` directory is served over virtio-fs: each file operation is a round trip
+to the host. Bulk I/O is near host speed; installing dependencies, first builds
+and large directory walks are far slower than on the machine's own disk.
+
+- Keep generated directories (`node_modules`, `target`, `.venv`) inside the
+  machine, not on the host mount.
+- `SMOLVM_MOUNT_DAX=1` on the process that starts the machine adds a 512 MiB
+  DAX window per host mount. It helps sequential and `mmap` reads only, needs a
+  stop and start, and falls back silently. Confirm in the guest with
+  `grep virtiofs /proc/mounts`: an active mount ends in `dax=always`.
+  Linux only today; on macOS it has no effect.
 
 ## Smolfile Reference
 
