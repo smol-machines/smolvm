@@ -877,10 +877,13 @@ pub struct StopResponse {
 // Resize Types
 // ============================================================================
 
-/// Request to resize a machine's disk resources.
+/// Request to grow running CPU or disk resources.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResizeMachineRequest {
+    /// Total guest CPU count (live growth, optional).
+    #[serde(default)]
+    pub cpus: Option<u8>,
     /// Storage disk size in GiB (expand only, optional).
     #[serde(default)]
     #[schema(example = 50)]
