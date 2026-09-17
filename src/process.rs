@@ -642,6 +642,71 @@ pub fn set_managed_vmm_memory_limit(
     Ok(false)
 }
 
+/// Update only a verified VMM's own CPU quota, never a shared enclosing cgroup.
+#[cfg(target_os = "linux")]
+pub fn set_managed_vmm_cpu_count(
+    machine: &str,
+    pid: Pid,
+    started: Option<u64>,
+    cpus: u8,
+) -> Result<bool> {
+    if cpus == 0 || !is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "CPU resize",
+            "invalid CPU count or VMM process identity changed",
+        ));
+    }
+    let Some(dir) = cgroup_v2_process_dir(pid) else {
+        return Ok(false);
+    };
+    let leaf = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if leaf == crate::systemd_scope::scope_name(machine) {
+        crate::systemd_scope::set_scope_cpu_count(machine, cpus)?;
+    } else if leaf == format!("vm-{pid}") {
+        write_cgroup(
+            &dir,
+            "cpu.max",
+            &format!(
+                "{} {}",
+                u64::from(cpus) * CGROUP_CPU_PERIOD_US,
+                CGROUP_CPU_PERIOD_US
+            ),
+        )
+        .map_err(|error| Error::agent("CPU resize", format!("cannot update CPU quota: {error}")))?;
+    } else {
+        return Ok(false);
+    }
+    let quota = std::fs::read_to_string(dir.join("cpu.max"))
+        .map_err(|error| Error::agent("CPU resize", format!("cannot verify CPU quota: {error}")))?;
+    let values: Vec<_> = quota.split_whitespace().collect();
+    let verified = match values.as_slice() {
+        [quota, period] => match (quota.parse::<u64>(), period.parse::<u64>()) {
+            (Ok(quota), Ok(period)) if period > 0 => {
+                period.checked_mul(u64::from(cpus)) == Some(quota)
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !verified || !is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "CPU resize",
+            "CPU quota or VMM identity could not be verified after update",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_managed_vmm_cpu_count(
+    _machine: &str,
+    _pid: Pid,
+    _started: Option<u64>,
+    _cpus: u8,
+) -> Result<bool> {
+    Ok(false)
+}
+
 /// Bound each CUDA fork-pool VM to its configured CPU count or an even share
 /// of the host, whichever is smaller. Preserve two vCPUs when the configured
 /// VM and host permit it because single-vCPU CUDA forkable guests do not reach
