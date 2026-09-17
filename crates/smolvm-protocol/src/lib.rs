@@ -311,6 +311,9 @@ mod shutdown_compat_tests {
 /// Agent supports guarded online growth of mounted managed ext4 filesystems.
 pub const ONLINE_FILESYSTEM_GROWTH_CAPABILITY: &str = "online-filesystem-growth-v1";
 
+/// Agent can online and verify CPUs after the VMM creates them.
+pub const ONLINE_CPU_GROWTH_CAPABILITY: &str = "online-cpu-growth-v1";
+
 /// Managed writable disk, never an arbitrary guest path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -325,6 +328,11 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Online CPUs already created by the VMM, without offlining existing CPUs.
+    OnlineCpus {
+        /// Total CPU count, using consecutive CPU IDs starting at zero.
+        target_count: u8,
+    },
     /// Grow a mounted filesystem after the VMM publishes its new capacity.
     /// Never formats, repairs, unmounts, or shrinks the filesystem.
     GrowFilesystem {
@@ -815,6 +823,9 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::OnlineCpus { target_count } => {
+                format!("OnlineCpus {{ target_count: {target_count} }}")
+            }
             AgentRequest::GrowFilesystem {
                 disk,
                 expected_bytes,
@@ -1466,6 +1477,19 @@ impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_growth_roundtrips_a_numeric_count_only() {
+        let req = super::AgentRequest::OnlineCpus { target_count: 4 };
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<super::AgentRequest>(&wire).unwrap(),
+            super::AgentRequest::OnlineCpus { target_count: 4 }
+        ));
+        assert!(serde_json::from_str::<super::AgentRequest>(
+            r#"{"method":"online_cpus","target_count":256}"#
+        )
+        .is_err());
+    }
     #[test]
     fn filesystem_growth_uses_only_managed_disk_names() {
         use super::{AgentRequest, ManagedDisk};

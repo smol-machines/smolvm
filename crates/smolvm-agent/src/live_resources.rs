@@ -1,6 +1,7 @@
-//! Online filesystem growth for managed disks; no offline repair fallback.
+//! Verified guest-side resource growth; never shrink or repair offline.
 
 use smolvm_protocol::{error_codes, AgentResponse, ManagedDisk};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 use std::os::unix::fs::{FileExt, FileTypeExt};
@@ -10,6 +11,98 @@ use std::os::unix::io::RawFd;
 use std::sync::Mutex;
 
 static RESIZE: Mutex<()> = Mutex::new(());
+static CPU_RESIZE: Mutex<()> = Mutex::new(());
+
+fn parse_cpu_list(value: &str) -> io::Result<BTreeSet<u32>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid kernel CPU list");
+    let mut cpus = BTreeSet::new();
+    for part in value.trim().split(',') {
+        let (first, last) = part.split_once('-').unwrap_or((part, part));
+        let first: u32 = first.parse().map_err(|_| invalid())?;
+        let last: u32 = last.parse().map_err(|_| invalid())?;
+        // Bound parsing independently of the requested count. This is not
+        // the VMM's capacity; larger kernel topologies fail explicitly.
+        if first > last || last >= 8192 {
+            return Err(invalid());
+        }
+        cpus.extend(first..=last);
+    }
+    Ok(cpus)
+}
+
+fn cpu_online_plan(
+    present: &BTreeSet<u32>,
+    online: &BTreeSet<u32>,
+    count: u8,
+) -> io::Result<Vec<u32>> {
+    let target: BTreeSet<_> = (0..u32::from(count)).collect();
+    if count == 0 || !online.is_subset(&target) || !target.is_subset(present) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CPU target must include every online CPU and be present in the guest topology",
+        ));
+    }
+    Ok(target.difference(online).copied().collect())
+}
+
+pub(crate) fn online_cpus(count: u8, client_fd: Option<RawFd>) -> AgentResponse {
+    let Ok(_guard) = CPU_RESIZE.try_lock() else {
+        return AgentResponse::error(
+            "another CPU resize is in progress",
+            error_codes::INVALID_REQUEST,
+        );
+    };
+    let read_list = |name: &str| -> io::Result<BTreeSet<u32>> {
+        parse_cpu_list(&std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/{name}"
+        ))?)
+    };
+    let plan = read_list("present").and_then(|present| {
+        read_list("online").and_then(|online| cpu_online_plan(&present, &online, count))
+    });
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            return AgentResponse::error(
+                format!("cannot online CPUs: {error}"),
+                error_codes::INVALID_REQUEST,
+            )
+        }
+    };
+    if !plan.is_empty() {
+        // Only validated numeric IDs enter this script. The exec supervisor
+        // bounds slow kernel CPU startup and reaps the writer on disconnect.
+        // Never offline CPUs to roll back a partial success.
+        let script = plan
+            .iter()
+            .map(|cpu| format!("printf 1 > /sys/devices/system/cpu/cpu{cpu}/online"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let response = crate::handle_vm_exec(
+            &["/bin/sh".into(), "-ec".into(), script],
+            &[],
+            None,
+            Some(120_000),
+            client_fd,
+            None,
+        );
+        if !matches!(response, AgentResponse::Completed { exit_code: 0, .. }) {
+            return AgentResponse::error(
+                "CPU onlining did not complete; some CPUs may already be online, reconcile before retrying",
+                error_codes::INTERNAL_ERROR,
+            );
+        }
+    }
+    match read_list("online") {
+        Ok(online) if online == (0..u32::from(count)).collect() => AgentResponse::Ok {
+            data: Some(serde_json::json!({"online_cpus": count})),
+        },
+        _ => AgentResponse::error(
+            "CPU online count could not be verified; reconcile before retrying",
+            error_codes::INTERNAL_ERROR,
+        ),
+    }
+}
 
 fn device_path(disk: ManagedDisk) -> &'static str {
     match disk {
@@ -158,6 +251,33 @@ pub(crate) fn grow_filesystem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_lists_are_bounded_and_validate_ranges() {
+        assert_eq!(
+            parse_cpu_list("0-2,5\n").unwrap(),
+            BTreeSet::from([0, 1, 2, 5])
+        );
+        for invalid in ["", "3-1", "0-4294967295", "1-2-3", "-1", "0,"] {
+            assert!(parse_cpu_list(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn cpu_growth_retries_only_missing_cpus_and_never_offlines() {
+        let present = parse_cpu_list("0-15").unwrap();
+        let online = parse_cpu_list("0-1").unwrap();
+        assert_eq!(cpu_online_plan(&present, &online, 4).unwrap(), vec![2, 3]);
+        assert!(cpu_online_plan(&present, &online, 2).unwrap().is_empty());
+        assert!(cpu_online_plan(&present, &online, 0).is_err());
+        assert!(cpu_online_plan(&present, &online, 1).is_err());
+        assert!(cpu_online_plan(&present, &online, 17).is_err());
+        assert_eq!(
+            cpu_online_plan(&present, &parse_cpu_list("0-2").unwrap(), 4).unwrap(),
+            vec![3]
+        );
+        assert!(cpu_online_plan(&parse_cpu_list("0,2-3").unwrap(), &online, 4).is_err());
+    }
 
     #[test]
     fn growth_waits_for_exact_guest_capacity() {
