@@ -10,6 +10,7 @@
 
 mod artifact_writer;
 pub mod assets;
+pub mod checkpoint_stream;
 pub mod detect;
 pub mod extract;
 pub mod format;

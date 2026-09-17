@@ -930,20 +930,38 @@ impl AssetCollector {
     /// (two-file mode: libs are embedded in the stub binary instead).
     /// When false, everything is included (single-file mode).
     pub fn compress(&self, output: &Path, exclude_libs: bool) -> Result<u64> {
-        let output_file = self.compress_with(|| File::create(output), exclude_libs)?;
+        let output_file = self.compress_with(|| File::create(output), exclude_libs, None)?;
         Ok(output_file.metadata()?.len())
     }
 
     /// Compress into an owned writer so callers can checksum bytes as they are
     /// emitted instead of copying and rereading a multi-GiB archive.
     pub(crate) fn compress_to<W: Write>(&self, output: W, exclude_libs: bool) -> Result<W> {
-        self.compress_with(|| Ok(output), exclude_libs)
+        self.compress_with(|| Ok(output), exclude_libs, None)
+    }
+
+    pub(crate) fn compress_checkpoint_to<W: Write>(
+        &self,
+        output: W,
+        stream: &mut crate::checkpoint_stream::CheckpointStream<'_>,
+    ) -> Result<W> {
+        match fs::symlink_metadata(self.staging_dir.join("checkpoint/memory.bin")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                return Err(PackError::Tar(
+                    "checkpoint RAM appears in both staging and stream".into(),
+                ))
+            }
+        }
+        self.compress_with(|| Ok(output), false, Some(stream))
     }
 
     fn compress_with<W: Write>(
         &self,
         output: impl FnOnce() -> std::io::Result<W>,
         exclude_libs: bool,
+        stream: Option<&mut crate::checkpoint_stream::CheckpointStream<'_>>,
     ) -> Result<W> {
         // One asset compressor per cache root, including API subprocesses.
         // The permit also covers finish(), which drains outstanding zstd jobs.
@@ -996,6 +1014,9 @@ impl AssetCollector {
             }
         }
 
+        if let Some(stream) = stream {
+            stream.append(&mut tar_builder)?;
+        }
         let encoder = tar_builder
             .into_inner()
             .map_err(|e| PackError::Tar(e.to_string()))?;

@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -971,6 +971,7 @@ pub fn materialize_with_base(
             cloned = false;
         }
         let file = File::options()
+            .read(true)
             .write(true)
             .create_new(!cloned)
             .open(&destination)?;
@@ -981,8 +982,9 @@ pub fn materialize_with_base(
             (Some((_, base)), true) => &base.chunks,
             _ => &[],
         };
-        let mut reused = 0u64;
-        let jobs: Vec<(u64, usize, Option<&String>)> = entry
+        let reused = AtomicU64::new(0);
+        let written = AtomicU64::new(0);
+        let jobs: Vec<(u64, usize, Option<&String>, bool)> = entry
             .chunks
             .iter()
             .enumerate()
@@ -990,31 +992,42 @@ pub fn materialize_with_base(
                 let offset = index as u64 * CHUNK_SIZE as u64;
                 let count = (entry.size - offset).min(CHUNK_SIZE as u64) as usize;
                 let unchanged = base_chunks.get(index).is_some_and(|base| base == hash);
-                if unchanged {
-                    reused += 1;
-                    return None;
-                }
                 match hash {
-                    Some(hash) => Some((offset, count, Some(hash))),
+                    Some(hash) => Some((offset, count, Some(hash), unchanged)),
                     // A hole where the clone still has data must be punched;
                     // a fresh file is already a hole there.
-                    None if cloned => Some((offset, count, None)),
+                    None if cloned => Some((offset, count, None, unchanged)),
                     None => None,
                 }
             })
             .collect();
-        let written = jobs.len() as u64;
         for_each_parallel(
             threads,
             jobs.into_iter(),
-            |(offset, count, hash)| match hash {
-                Some(hash) => {
-                    let bytes = read_object(&objects.join(hash), hash, count)?;
-                    write_at(&file, offset, &bytes)
+            |(offset, count, hash, unchanged)| {
+                // The base index describes expected bytes, not proof that
+                // its mutable cache file still contains them. Verify our
+                // private clone so a later change to the base cannot race
+                // verification against use.
+                if unchanged
+                    && cloned_chunk_matches(&file, offset, count, hash.map(String::as_str))?
+                {
+                    reused.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
                 }
-                None => punch_hole(&file, offset, count as u64),
+                match hash {
+                    Some(hash) => {
+                        let bytes = read_object(&objects.join(hash), hash, count)?;
+                        write_at(&file, offset, &bytes)?;
+                    }
+                    None => punch_hole(&file, offset, count as u64)?,
+                }
+                written.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             },
         )?;
+        let reused = reused.load(Ordering::Relaxed);
+        let written = written.load(Ordering::Relaxed);
         reused_total += reused;
         written_total += written;
         tracing::debug!(
@@ -1097,6 +1110,51 @@ pub fn promote_base(directory: &Path, materialized: &Path, base_root: &Path) -> 
 }
 
 const BASE_LOCK: &str = ".lock";
+
+fn cloned_chunk_matches(
+    file: &File,
+    offset: u64,
+    count: usize,
+    hash: Option<&str>,
+) -> io::Result<bool> {
+    #[cfg(unix)]
+    if hash.is_none() {
+        use std::os::fd::AsRawFd;
+        // A real filesystem hole is intrinsically zero; avoid reading it.
+        // All data access elsewhere is positional, so lseek's cursor is unused.
+        let data = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
+        if (data >= 0 && data as u64 >= offset + count as u64)
+            || (data < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO))
+        {
+            return Ok(true);
+        }
+    }
+    let mut bytes = vec![0; count];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut bytes, offset)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut read = 0;
+        while read < count {
+            let n = file.seek_read(&mut bytes[read..], offset + read as u64)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short restore base chunk",
+                ));
+            }
+            read += n;
+        }
+    }
+    Ok(match hash {
+        Some(hash) => digest(&bytes) == hash,
+        None => smolvm_pack::is_zero_filled(&bytes),
+    })
+}
 
 /// Shared while a restore diffs against the base, exclusive throughout
 /// promotion. This sibling inode must never be renamed or deleted with a base.
@@ -1381,6 +1439,49 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn cloned_chunk_verification_checks_data_holes_and_short_reads() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len((2 * CHUNK_SIZE) as u64).unwrap();
+        let bytes = vec![7; CHUNK_SIZE];
+        write_at(&file, 0, &bytes).unwrap();
+        assert!(cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
+        assert!(cloned_chunk_matches(&file, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
+        write_at(&file, 0, &[9]).unwrap();
+        assert!(!cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
+        write_at(&file, CHUNK_SIZE as u64, &[9]).unwrap();
+        assert!(!cloned_chunk_matches(&file, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
+        file.set_len(17).unwrap();
+        assert!(cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).is_err());
+    }
+
+    #[test]
+    fn changed_base_bytes_are_not_reused_as_verified_checkpoint_data() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = root.path().join("saved");
+        let base = root.path().join("base");
+        let output = root.path().join("output");
+        let bytes = vec![7; CHUNK_SIZE];
+        capture(&root.path().join("cache"), &saved, &bytes);
+        materialize(&saved, &output).unwrap();
+        let promoted = promote_base(&saved, &output, &base).unwrap();
+        if std::env::var_os("SMOLVM_TEST_REQUIRE_REFLINK").is_some() {
+            assert!(promoted, "this test gate requires real reflink support");
+        }
+        if !promoted {
+            return;
+        }
+        // Keep the length and index unchanged: size is not a checksum.
+        fs::write(base.join("checkpoint/memory.bin"), vec![9; CHUNK_SIZE]).unwrap();
+        let restored = root.path().join("restored");
+        materialize_with_base(&saved, &restored, Some(&base)).unwrap();
+        let actual = fs::read(restored.join("checkpoint/memory.bin")).unwrap();
+        assert!(
+            actual == bytes,
+            "restore reused changed base bytes without verification"
+        );
     }
     use super::*;
 

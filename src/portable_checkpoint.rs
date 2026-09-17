@@ -930,8 +930,19 @@ pub(crate) fn capture_to_path_with_source_release(
     let runtime_capture = runtime_capture_dir(name, vm)?;
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
     #[cfg(target_os = "linux")]
-    let mut memory_reservation =
-        crate::agent::fork::ForkLineageMemoryReservation::checkpoint(name, &runtime_snapshot)?;
+    let mut memory_reservation = Some(
+        crate::agent::fork::ForkLineageMemoryReservation::checkpoint(name, &runtime_snapshot)?,
+    );
+    let retain = cfg!(target_os = "linux")
+        && options
+            .prepared_cache_budget_bytes
+            .is_some_and(|bytes| bytes > 0)
+        && smolvm_pack::extract::shared_extract_enabled();
+    let sparse_capable = cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && options.store_dir.is_none()
+        && !retain
+        && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
+            == "OK sparse-stream-v1 ownership-v1";
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
     let snapshot_dir = staging_dir.join(ASSET_DIR);
@@ -967,7 +978,7 @@ pub(crate) fn capture_to_path_with_source_release(
     };
     #[cfg(target_os = "linux")]
     if prepared {
-        memory_reservation.checkpoint_prepared()?;
+        memory_reservation.as_mut().unwrap().checkpoint_prepared()?;
     }
     log_phase(
         name,
@@ -982,6 +993,29 @@ pub(crate) fn capture_to_path_with_source_release(
     pause.resume()?;
     log_phase(name, "capture_disks_and_resume", &mut phase);
     let source_pause = pause_started.elapsed();
+
+    let mut sparse_socket = if prepared && sparse_capable {
+        let mut stream = crate::platform::uds::UdsStream::connect(&pause.control)
+            .map_err(|e| Error::agent("connect sparse checkpoint stream", e.to_string()))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30 * 60)))
+            .map_err(|e| Error::agent("configure sparse checkpoint stream", e.to_string()))?;
+        writeln!(stream, "FINISH_SAVE_SPARSE {}", runtime_snapshot.display())
+            .map_err(|e| Error::agent("request sparse checkpoint stream", e.to_string()))?;
+        Some(stream)
+    } else {
+        None
+    };
+    let mut streamed_memory = match sparse_socket.as_mut() {
+        Some(stream) => Some(
+            smolvm_pack::checkpoint_stream::CheckpointStream::read(
+                stream,
+                (u64::from(vm.mem) + 2048) * 1024 * 1024,
+            )
+            .map_err(|e| Error::agent("read sparse checkpoint boundary", e.to_string()))?,
+        ),
+        None => None,
+    };
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
@@ -1007,7 +1041,7 @@ pub(crate) fn capture_to_path_with_source_release(
         pause.prepared_save = None;
         Some(memory)
     } else {
-        if prepared {
+        if prepared && streamed_memory.is_none() {
             let reply = crate::agent::fork::control_socket_cmd_with_timeout(
                 &pause.control,
                 &format!("FINISH_SAVE {}", runtime_snapshot.display()),
@@ -1021,12 +1055,32 @@ pub(crate) fn capture_to_path_with_source_release(
         }
         None
     };
-    log_phase(name, "capture_finish_memory", &mut phase);
+    log_phase(
+        name,
+        if streamed_memory.is_some() {
+            "capture_stream_boundary"
+        } else {
+            "capture_finish_memory"
+        },
+        &mut phase,
+    );
     #[cfg(target_os = "linux")]
-    drop(memory_reservation);
+    if streamed_memory.is_none() {
+        drop(memory_reservation.take());
+    }
     // Export sparse files after resume; streamed RAM is already in the store.
     for file in ["checkpoint.bin", "memory.bin", "manifest.bin"] {
-        if file == "memory.bin" && stored_memory.is_some() {
+        if file == "memory.bin" && (stored_memory.is_some() || streamed_memory.is_some()) {
+            continue;
+        }
+        if let Some(stream) = &streamed_memory {
+            let bytes = match file {
+                "checkpoint.bin" => stream.state(),
+                "manifest.bin" => stream.layout(),
+                _ => unreachable!("memory payload is streamed separately"),
+            };
+            std::fs::write(snapshot_dir.join(file), bytes)
+                .map_err(|e| Error::agent("stage streamed checkpoint metadata", e.to_string()))?;
             continue;
         }
         if file == "memory.bin"
@@ -1101,9 +1155,17 @@ pub(crate) fn capture_to_path_with_source_release(
                 size: crate::checkpoint_store::logical_size(memory),
                 sha256: String::new(),
             },
-            None => {
-                describe_sparse_asset(&snapshot_dir.join("memory.bin"), "checkpoint/memory.bin")?
-            }
+            None => match &streamed_memory {
+                Some(stream) => CheckpointAsset {
+                    path: "checkpoint/memory.bin".into(),
+                    size: stream.memory_len(),
+                    sha256: String::new(),
+                },
+                None => describe_sparse_asset(
+                    &snapshot_dir.join("memory.bin"),
+                    "checkpoint/memory.bin",
+                )?,
+            },
         },
         layout: describe_asset(
             &snapshot_dir.join("manifest.bin"),
@@ -1117,6 +1179,13 @@ pub(crate) fn capture_to_path_with_source_release(
     log_phase(name, "capture_manifest", &mut phase);
     // Everything consumed below is capture-owned. Packaging and publication
     // must not serialize new branches or other operations on the live source.
+    #[cfg(target_os = "linux")]
+    if streamed_memory.is_some() {
+        memory_reservation
+            .as_mut()
+            .unwrap()
+            .allow_concurrent_branches();
+    }
     drop(source_lock);
     release_source();
 
@@ -1155,12 +1224,11 @@ pub(crate) fn capture_to_path_with_source_release(
     let packer = Packer::new(manifest)
         .with_asset_collector(collector)
         .with_direct_artifact_io();
-    let retain = cfg!(target_os = "linux")
-        && options
-            .prepared_cache_budget_bytes
-            .is_some_and(|bytes| bytes > 0)
-        && smolvm_pack::extract::shared_extract_enabled();
-    let (info, identity) = if retain {
+    let (info, identity) = if let Some(stream) = streamed_memory.as_mut() {
+        packer
+            .pack_checkpoint_stream(output, stream)
+            .map(|info| (info, None))
+    } else if retain {
         packer
             .pack_artifact_with_identity(output)
             .map(|(info, identity)| (info, Some(identity)))
@@ -1168,6 +1236,11 @@ pub(crate) fn capture_to_path_with_source_release(
         packer.pack_artifact(output).map(|info| (info, None))
     }
     .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    if streamed_memory.is_some() {
+        pause.prepared_save = None;
+        #[cfg(target_os = "linux")]
+        drop(memory_reservation.take());
+    }
     log_phase(name, "capture_pack", &mut phase);
     #[cfg(not(target_os = "linux"))]
     let _ = identity;
