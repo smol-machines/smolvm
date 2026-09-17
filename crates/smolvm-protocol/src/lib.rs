@@ -308,6 +308,9 @@ mod shutdown_compat_tests {
     }
 }
 
+/// Agent supports guarded online growth of mounted managed ext4 filesystems.
+pub const ONLINE_FILESYSTEM_GROWTH_CAPABILITY: &str = "online-filesystem-growth-v1";
+
 /// Managed writable disk, never an arbitrary guest path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
