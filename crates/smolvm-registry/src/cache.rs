@@ -1,7 +1,8 @@
 //! Local blob cache for registry pulls.
 //!
 //! Content-addressed storage at `~/.cache/smolvm-registry/blobs/sha256/`.
-//! Blobs are stored by their digest. LRU eviction keeps total size under a
+//! Blobs are stored by their digest, each with a zero-length `.used` sibling
+//! that records when it was last read. LRU eviction keeps total size under a
 //! configurable limit — default 5 GB, override with `SMOLVM_BLOB_CACHE_MAX_BYTES`.
 
 use std::fs;
@@ -37,6 +38,51 @@ fn is_partial(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("partial")
 }
 
+/// True if a cache-dir entry is a `.used` recency marker rather than a blob.
+///
+/// Recency lives on a zero-length sibling instead of the blob's own inode
+/// because a cache hit must not write to the blob at all: a hit used to set
+/// the blob's atime for LRU, and on Linux every `utimensat` also moves the
+/// inode's ctime. A machine create that pins a verified artifact by its exact
+/// inode identity (device, inode, length, mtime, ctime) then sees "changed
+/// while it was being verified" whenever another create of the same artifact
+/// hits the cache mid-verification — a burst of creates from one pack failed
+/// at random for that reason alone.
+fn is_lru_marker(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some(LRU_MARKER_EXT)
+}
+
+const LRU_MARKER_EXT: &str = "used";
+
+fn lru_marker_path(blob: &Path) -> PathBuf {
+    let mut name = blob.as_os_str().to_owned();
+    name.push(".");
+    name.push(LRU_MARKER_EXT);
+    PathBuf::from(name)
+}
+
+/// Record that `blob` was just used. Writes only the marker, never the blob.
+fn note_used(blob: &Path) {
+    let marker = lru_marker_path(blob);
+    let created = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&marker)
+        .is_ok();
+    if created {
+        let _ = filetime::set_file_mtime(&marker, filetime::FileTime::now());
+    }
+}
+
+/// When `blob` was last used: its marker's mtime, or for a blob cached before
+/// markers existed, the atime the old scheme maintained.
+fn last_used(blob: &Path, meta: &fs::Metadata) -> std::time::SystemTime {
+    fs::metadata(lru_marker_path(blob))
+        .and_then(|m| m.modified())
+        .or_else(|_| meta.accessed())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
 /// Content-addressed blob cache.
 pub struct BlobCache {
     root: PathBuf,
@@ -63,8 +109,7 @@ impl BlobCache {
     pub fn get(&self, digest: &str) -> Option<PathBuf> {
         let path = self.blob_path(digest);
         if path.exists() {
-            // Touch atime for LRU tracking.
-            let _ = filetime::set_file_atime(&path, filetime::FileTime::now());
+            note_used(&path);
             Some(path)
         } else {
             None
@@ -100,7 +145,8 @@ impl BlobCache {
         if self.root.exists() {
             for entry in fs::read_dir(&self.root)? {
                 let entry = entry?;
-                if entry.file_type()?.is_file() && !is_partial(&entry.path()) {
+                let path = entry.path();
+                if entry.file_type()?.is_file() && !is_partial(&path) && !is_lru_marker(&path) {
                     total += entry.metadata()?.len();
                 }
             }
@@ -131,16 +177,17 @@ impl BlobCache {
             let entry = entry?;
             // Never evict in-flight `.partial` downloads — a concurrent pull is
             // actively writing them; deleting one breaks its adopt with ENOENT.
-            if !entry.file_type()?.is_file() || is_partial(&entry.path()) {
+            let path = entry.path();
+            if !entry.file_type()?.is_file() || is_partial(&path) || is_lru_marker(&path) {
                 continue;
             }
             let meta = entry.metadata()?;
-            let atime = meta.accessed().unwrap_or(std::time::UNIX_EPOCH);
-            entries.push((entry.path(), meta.len(), atime));
+            let used = last_used(&path, &meta);
+            entries.push((path, meta.len(), used));
         }
 
-        // Sort by atime ascending (oldest first).
-        entries.sort_by_key(|(_, _, atime)| *atime);
+        // Least recently used first.
+        entries.sort_by_key(|(_, _, used)| *used);
 
         let mut current = entries.iter().map(|(_, size, _)| size).sum::<u64>();
 
@@ -150,6 +197,7 @@ impl BlobCache {
             }
             tracing::debug!(path = %path.display(), size, "evicting cached blob");
             fs::remove_file(path)?;
+            let _ = fs::remove_file(lru_marker_path(path));
             current -= size;
         }
 
@@ -297,6 +345,79 @@ mod tests {
         assert_eq!(parse_cache_limit(None), DEFAULT_MAX_SIZE);
         assert_eq!(parse_cache_limit(Some("garbage")), DEFAULT_MAX_SIZE);
         assert_eq!(parse_cache_limit(Some("0")), DEFAULT_MAX_SIZE);
+    }
+
+    /// A cache hit must not write to the blob's inode: the machine-create path
+    /// pins a verified artifact by (dev, ino, len, mtime, ctime), and setting
+    /// atime moves ctime on Linux, so a concurrent hit made verification fail.
+    #[cfg(unix)]
+    #[test]
+    fn get_does_not_touch_the_blob_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let path = cache.put(digest, b"payload").unwrap();
+        // Coarse filesystems stamp whole seconds; make sure a touch would show.
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_times(&path, old, old).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        for _ in 0..3 {
+            assert_eq!(cache.get(digest).as_deref(), Some(path.as_path()));
+        }
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            (after.mtime(), after.mtime_nsec()),
+            (before.mtime(), before.mtime_nsec())
+        );
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+        assert_eq!(
+            (after.atime(), after.atime_nsec()),
+            (before.atime(), before.atime_nsec())
+        );
+        assert!(
+            lru_marker_path(&path).exists(),
+            "recency is recorded on the marker"
+        );
+    }
+
+    /// The marker keeps LRU order: a blob that was read recently survives
+    /// eviction ahead of one that was only written, and markers are neither
+    /// counted toward the size nor evicted on their own.
+    #[test]
+    fn get_refreshes_recency_through_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 250).unwrap();
+        let a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let c = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let pa = cache.put(a, &[0u8; 100]).unwrap();
+        let pb = cache.put(b, &[0u8; 100]).unwrap();
+        // Pin distinct, ordered recency so the test does not depend on clock resolution.
+        let t = |secs: i64| filetime::FileTime::from_unix_time(1_600_000_000 + secs, 0);
+        filetime::set_file_times(&pa, t(1), t(1)).unwrap();
+        filetime::set_file_times(&pb, t(2), t(2)).unwrap();
+        cache.get(a).unwrap();
+        filetime::set_file_mtime(lru_marker_path(&pa), t(3)).unwrap();
+        assert_eq!(cache.total_size().unwrap(), 200, "markers do not count");
+
+        cache.put(c, &[0u8; 100]).unwrap();
+
+        assert!(cache.get(a).is_some(), "recently read blob survives");
+        assert!(
+            cache.get(b).is_none(),
+            "least recently used blob is evicted"
+        );
+        assert!(!lru_marker_path(&pb).exists(), "its marker goes with it");
+        assert!(cache.get(c).is_some());
     }
 
     #[test]

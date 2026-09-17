@@ -2840,6 +2840,32 @@ mod tests {
         artifact
     }
 
+    /// A registry-cache hit on the artifact being verified must leave the
+    /// verification stable. The hit used to set the blob's atime for LRU, which
+    /// moves ctime on Linux, so a burst of creates from one cached pack failed
+    /// with "changed while it was being verified" whenever two overlapped.
+    #[cfg(unix)]
+    #[test]
+    fn registry_cache_hit_during_checksum_keeps_verification_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = smolvm_registry::BlobCache::open(dir.path().to_path_buf(), u64::MAX).unwrap();
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let staged = packed_sidecar(dir.path(), "staged.smolcheckpoint", "cache-hit");
+        let blob = cache.blob_path_for(digest);
+        std::fs::rename(&staged, &blob).unwrap();
+
+        let outcome = classify_sidecar_verification_after_read(&blob, || {
+            for _ in 0..8 {
+                assert_eq!(cache.get(digest).as_deref(), Some(blob.as_path()));
+            }
+        })
+        .unwrap();
+        assert!(
+            matches!(outcome, SidecarVerification::Stable(_)),
+            "a concurrent cache hit must not invalidate the verification"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn link_during_checksum_requires_new_proof_not_corruption_recovery() {
