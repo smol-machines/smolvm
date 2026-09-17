@@ -4300,7 +4300,7 @@ async fn delete_one_transaction(
         (status = 200, description = "Machine resized", body = MachineInfo),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "Machine is running", body = ApiErrorResponse),
+        (status = 409, description = "Machine state or shared disks prevent resizing", body = ApiErrorResponse),
         (status = 500, description = "Resize failed", body = ApiErrorResponse)
     )
 )]
@@ -4316,7 +4316,7 @@ pub async fn resize_machine(
     // update), so hold the lock across the whole operation as the other lifecycle
     // handlers do — the state check below is only meaningful under it.
     let lifecycle = state.lifecycle_lock(&name);
-    let _guard = lifecycle.lock().await;
+    let guard = lifecycle.lock_owned().await;
 
     let record = state
         .lookup_vm(&name)
@@ -4324,6 +4324,23 @@ pub async fn resize_machine(
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     let actual_state = record.actual_state();
+    if actual_state == RecordState::Running {
+        let db = state.db().clone();
+        let resize_name = name.clone();
+        let record = tokio::task::spawn_blocking(move || {
+            // Keep lifecycle ownership if the HTTP request is cancelled while
+            // a disk or filesystem operation is still running.
+            let _guard = guard;
+            crate::agent::live_resize::grow_disks(&db, &resize_name, req.storage_gb, req.overlay_gb)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("live resize task failed: {error}")))?
+        .map_err(|error| match error {
+            crate::Error::Config { .. } => ApiError::BadRequest(error.to_string()),
+            other => ApiError::from(other),
+        })?;
+        return Ok(Json(record_to_info(&name, &record)));
+    }
     match actual_state {
         RecordState::Stopped | RecordState::Created => {}
         _ => {
