@@ -2327,6 +2327,7 @@ fn handle_request(
             let capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
+                smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
             ];
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,

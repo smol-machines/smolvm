@@ -1677,9 +1677,54 @@ impl AgentClient {
     }
 
     /// Get storage status.
+    ///
+    /// Reports current guest storage usage, independently of configured limits.
     pub fn storage_status(&mut self) -> Result<StorageStatus> {
         let resp = self.request(&AgentRequest::StorageStatus)?;
         expect_data(resp, "storage status")
+    }
+
+    /// Grow a mounted managed filesystem after its disk capacity was increased.
+    /// Check capability before changing the backing: old running guests must
+    /// not be left with a partially applied resize they cannot complete.
+    pub fn grow_filesystem(
+        &mut self,
+        disk: smolvm_protocol::ManagedDisk,
+        expected_bytes: u64,
+    ) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY)? {
+            return Err(Error::agent(
+                "grow filesystem",
+                "running guest agent does not support online filesystem growth",
+            ));
+        }
+        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(130))?;
+        match self.request(&AgentRequest::GrowFilesystem {
+            disk,
+            expected_bytes,
+        })? {
+            AgentResponse::Ok { data: Some(data) }
+                if data.get("device_bytes").and_then(serde_json::Value::as_u64)
+                    == Some(expected_bytes)
+                    && data
+                        .get("filesystem_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|bytes| bytes > 0 && bytes <= expected_bytes) =>
+            {
+                Ok(())
+            }
+            AgentResponse::Completed {
+                exit_code, stderr, ..
+            } => Err(Error::agent(
+                "grow filesystem",
+                format!(
+                    "online resize exited {exit_code}: {}",
+                    String::from_utf8_lossy(&stderr)
+                ),
+            )),
+            AgentResponse::Error { message, .. } => Err(Error::agent("grow filesystem", message)),
+            _ => Err(Error::agent("grow filesystem", "unexpected response type")),
+        }
     }
 
     /// The guest's own view of machine memory.
