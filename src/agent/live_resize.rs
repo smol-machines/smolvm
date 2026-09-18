@@ -410,6 +410,7 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Reject live RAM growth on hosts without a supported hot-add backend.
 pub fn grow_memory(_db: &SmolvmDb, _name: &str, _target_mib: u32) -> Result<VmRecord> {
     Err(Error::agent(
         "RAM resize",

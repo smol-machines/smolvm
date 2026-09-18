@@ -749,6 +749,7 @@ pub fn raise_managed_vmm_memory_budget(
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Report that this host has no Linux managed-scope memory limit to update.
 pub fn raise_managed_vmm_memory_budget(
     _machine: &str,
     _pid: Pid,
@@ -814,6 +815,7 @@ pub fn set_managed_vmm_cpu_count(
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Report that this host has no Linux managed-scope CPU quota to update.
 pub fn set_managed_vmm_cpu_count(
     _machine: &str,
     _pid: Pid,
