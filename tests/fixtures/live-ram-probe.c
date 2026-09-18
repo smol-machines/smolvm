@@ -27,13 +27,22 @@ static void verify(uint64_t *p, size_t bytes, uint64_t seed) {
 
 int main(void) {
     const size_t initial = 64UL << 20, extra = 640UL << 20;
+    uint64_t grown_seed = 0xfedcba9876543210ULL;
     uint64_t *base = allocate(initial, 0x123456789abcdef0ULL), *grown = NULL;
     unsigned long sequence = 0;
     for (;;) {
         if (!grown && access("/run/ram-probe-grow", F_OK) == 0)
-            grown = allocate(extra, 0xfedcba9876543210ULL);
+            grown = allocate(extra, grown_seed);
+        if (grown && grown_seed == 0xfedcba9876543210ULL &&
+            access("/run/ram-probe-mutate", F_OK) == 0) {
+            grown_seed = 0x55aa55aa12345678ULL;
+            for (size_t i = 0; i < extra / sizeof(*grown); ++i)
+                grown[i] = grown_seed ^ i;
+            FILE *done = fopen("/run/ram-probe-mutated", "w");
+            if (!done || fclose(done)) { perror("mutation marker"); return 3; }
+        }
         verify(base, initial, 0x123456789abcdef0ULL);
-        if (grown) verify(grown, extra, 0xfedcba9876543210ULL);
+        if (grown) verify(grown, extra, grown_seed);
         FILE *out = fopen("/run/ram-probe-status.next", "w");
         if (!out) { perror("status"); return 3; }
         fprintf(out, "%ld %lu %zu\n", (long)getpid(), ++sequence,
