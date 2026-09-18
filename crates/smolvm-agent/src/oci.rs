@@ -1001,7 +1001,7 @@ fn full_capabilities() -> Vec<String> {
 /// Default device nodes for container execution.
 /// These are standard Linux devices that should exist in /dev.
 fn default_devices() -> Vec<OciDevice> {
-    vec![
+    let mut devices = vec![
         // /dev/null - discard all writes, reads return EOF
         OciDevice {
             device_type: "c".to_string(),
@@ -1093,7 +1093,61 @@ fn default_devices() -> Vec<OciDevice> {
             uid: Some(0),
             gid: Some(0),
         },
-    ]
+    ];
+    devices.extend(attached_disk_devices());
+    devices
+}
+
+/// Block-device nodes for disks attached with `--disk`.
+///
+/// The guest kernel's devtmpfs has them, but the container's `/dev` is a fresh
+/// tmpfs built from this list, so an attached disk is invisible inside the
+/// container until someone runs `mknod` by hand on every boot. Worse than
+/// invisible: `dd of=/dev/vdc` in a container without the node silently creates
+/// a regular file on that tmpfs and reports success, so a caller can appear to
+/// write a disk and lose everything.
+///
+/// `/dev/vda` (the machine's storage disk) and `/dev/vdb` (its overlay) are
+/// deliberately left out. They back the container's own filesystem, so handing
+/// the workload raw access would let it corrupt the ground it stands on.
+/// Everything past them was attached by the caller and is exactly what they
+/// asked to reach.
+fn attached_disk_devices() -> Vec<OciDevice> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/block") else {
+        return out;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("vd") && n > &"vdb".to_string())
+        .collect();
+    // Stable order so the container's /dev matches the attach order.
+    names.sort();
+    for name in names {
+        // `/sys/block/<dev>/dev` holds "major:minor".
+        let Ok(raw) = std::fs::read_to_string(format!("/sys/block/{name}/dev")) else {
+            continue;
+        };
+        let Some((major, minor)) = raw.trim().split_once(':') else {
+            continue;
+        };
+        let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+            continue;
+        };
+        out.push(OciDevice {
+            device_type: "b".to_string(),
+            path: format!("/dev/{name}"),
+            major,
+            minor,
+            // Root-only: an attached disk is raw storage, not something every
+            // uid in the image should be able to overwrite.
+            file_mode: Some(0o600),
+            uid: Some(0),
+            gid: Some(0),
+        });
+    }
+    out
 }
 
 /// The guest's `/dev/net/tun`, bind-mounted into the container.
@@ -1858,6 +1912,33 @@ mod tests {
         );
         assert!(spec.process.env.contains(&"HOME=/srv".to_string()));
         assert!(!spec.process.env.contains(&"HOME=/".to_string()));
+    }
+
+    /// The machine's own storage and overlay disks must never be exposed to the
+    /// container: raw access to them lets a workload corrupt the filesystem it
+    /// is running on. Everything past `vdb` was attached by the caller.
+    #[test]
+    fn attached_disk_nodes_skip_the_machines_own_disks() {
+        let keep = |n: &str| n.starts_with("vd") && n > "vdb";
+        assert!(!keep("vda"), "storage disk stays out of the container");
+        assert!(!keep("vdb"), "overlay disk stays out of the container");
+        assert!(keep("vdc"), "the first attached disk is exposed");
+        assert!(keep("vdd"));
+        assert!(!keep("sda"), "only virtio disks are considered");
+    }
+
+    /// Whatever `/sys/block` reports, the node must be a block device owned by
+    /// root: an attached disk is raw storage, not something every uid in the
+    /// image should be able to overwrite.
+    #[test]
+    fn attached_disk_nodes_are_root_owned_block_devices() {
+        for d in attached_disk_devices() {
+            assert_eq!(d.device_type, "b", "{}", d.path);
+            assert_eq!(d.file_mode, Some(0o600), "{}", d.path);
+            assert_eq!(d.uid, Some(0));
+            assert_eq!(d.gid, Some(0));
+            assert!(d.path.starts_with("/dev/vd"), "{}", d.path);
+        }
     }
 
     #[test]
