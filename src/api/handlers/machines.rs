@@ -4325,9 +4325,12 @@ pub async fn resize_machine(
 
     let actual_state = record.actual_state();
     if actual_state == RecordState::Running {
-        if req.cpus.is_some() && (req.storage_gb.is_some() || req.overlay_gb.is_some()) {
+        let resource_kinds = u8::from(req.cpus.is_some())
+            + u8::from(req.mem.is_some())
+            + u8::from(req.storage_gb.is_some() || req.overlay_gb.is_some());
+        if resource_kinds > 1 {
             return Err(ApiError::BadRequest(
-                "resize CPUs and disks in separate requests".into(),
+                "resize CPUs, RAM, and disks in separate requests".into(),
             ));
         }
         let db = state.db().clone();
@@ -4338,6 +4341,8 @@ pub async fn resize_machine(
             let _guard = guard;
             if let Some(cpus) = req.cpus {
                 crate::agent::live_resize::grow_cpus(&db, &resize_name, cpus)
+            } else if let Some(mem) = req.mem {
+                crate::agent::live_resize::grow_memory(&db, &resize_name, mem)
             } else {
                 crate::agent::live_resize::grow_disks(
                     &db,
@@ -4355,9 +4360,10 @@ pub async fn resize_machine(
         })?;
         return Ok(Json(record_to_info(&name, &record)));
     }
-    if req.cpus.is_some() {
+    if req.cpus.is_some() || req.mem.is_some() {
         return Err(ApiError::BadRequest(
-            "live CPU resize requires a running machine; use update for a stopped machine".into(),
+            "live CPU/RAM resize requires a running machine; use update for a stopped machine"
+                .into(),
         ));
     }
     match actual_state {
@@ -5465,6 +5471,7 @@ mod tests {
             storage_gb: Some(10),
             overlay_gb: None,
             cpus: None,
+            mem: None,
         };
         let result = resize_machine(State(state), Path("test-vm".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
@@ -5480,6 +5487,7 @@ mod tests {
             storage_gb: None,
             overlay_gb: None,
             cpus: None,
+            mem: None,
         };
         let result = resize_machine(State(state), Path("test-vm".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
@@ -5492,6 +5500,7 @@ mod tests {
             storage_gb: Some(30),
             overlay_gb: None,
             cpus: None,
+            mem: None,
         };
         let result = resize_machine(State(state), Path("nonexistent".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));

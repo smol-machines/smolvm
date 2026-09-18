@@ -1468,6 +1468,31 @@ fn fork_lineage_memory_budget(
     })
 }
 
+/// Compute the complete live-growth budget while the caller holds the source
+/// lock. Old generations are conservatively charged at the new guest size;
+/// never omit their allowance when raising a branch source's usable RAM.
+#[cfg(target_os = "linux")]
+pub(crate) fn live_resize_memory_budget(
+    db: &SmolvmDb,
+    name: &str,
+    record: &VmRecord,
+    target_mib: u32,
+) -> Result<crate::process::VmmMemoryBudget> {
+    let retained = db.retained_fork_snapshot(name)?;
+    let generations = referenced_fork_generation_count(
+        db,
+        name,
+        &vm_data_dir(name).join("s"),
+        retained.as_ref(),
+    )?;
+    let mut target = record.clone();
+    target.mem = target_mib;
+    fork_lineage_memory_budget(
+        &target,
+        generations + u64::from(source_has_private_ram_backing(record)),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn source_has_private_ram_backing(record: &VmRecord) -> bool {
     record.pid_start_time.is_some() && record.fork_lineage_pid_start_time == record.pid_start_time

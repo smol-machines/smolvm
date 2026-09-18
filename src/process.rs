@@ -642,6 +642,122 @@ pub fn set_managed_vmm_memory_limit(
     Ok(false)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn raised_memory_budget(
+    current: VmmMemoryBudget,
+    requested: VmmMemoryBudget,
+) -> Result<VmmMemoryBudget> {
+    if current.max_bytes == 0
+        || current.high_bytes > current.max_bytes
+        || requested.max_bytes == 0
+        || requested.high_bytes > requested.max_bytes
+    {
+        return Err(Error::config("RAM resize", "invalid memory budget"));
+    }
+    // A branch source can already carry retained-generation or capture
+    // allowances. Raising live RAM must never remove those allowances.
+    Ok(VmmMemoryBudget {
+        max_bytes: current.max_bytes.max(requested.max_bytes),
+        high_bytes: current.high_bytes.max(requested.high_bytes),
+    })
+}
+
+/// Raise and verify a VMM's owned memory limits before publishing more guest
+/// RAM. `requested` includes all retained-generation allowances, not just the
+/// guest's new size. Idempotent retries cannot lower an existing allowance.
+/// Returns false for an externally managed/shared cgroup, which the caller
+/// must admit against separately rather than changing its limits.
+#[cfg(target_os = "linux")]
+pub fn raise_managed_vmm_memory_budget(
+    machine: &str,
+    pid: Pid,
+    started: Option<u64>,
+    requested: VmmMemoryBudget,
+) -> Result<bool> {
+    if !is_our_process_strict(pid, started) {
+        return Err(Error::agent("RAM resize", "VMM process identity changed"));
+    }
+    let Some(dir) = cgroup_v2_process_dir(pid) else {
+        return Ok(false);
+    };
+    let leaf = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let systemd_owned = leaf == crate::systemd_scope::scope_name(machine);
+    if !systemd_owned && leaf != format!("vm-{pid}") {
+        return Ok(false);
+    }
+    let read_budget = || -> Result<VmmMemoryBudget> {
+        let read = |file: &str| -> Result<u64> {
+            std::fs::read_to_string(dir.join(file))
+                .map_err(|error| {
+                    Error::agent("RAM resize", format!("cannot read {file}: {error}"))
+                })?
+                .trim()
+                .parse()
+                .map_err(|_| {
+                    Error::agent(
+                        "RAM resize",
+                        format!("owned VM {file} must have a finite memory limit"),
+                    )
+                })
+        };
+        Ok(VmmMemoryBudget {
+            max_bytes: read("memory.max")?,
+            high_bytes: read("memory.high")?,
+        })
+    };
+    let before = read_budget()?;
+    let target = raised_memory_budget(before, requested)?;
+    if !is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "RAM resize",
+            "VMM process identity changed before limit update",
+        ));
+    }
+    if target != before {
+        if systemd_owned {
+            crate::systemd_scope::set_scope_memory_max(
+                machine,
+                target.max_bytes,
+                target.high_bytes,
+            )?;
+        } else {
+            // Raise the hard ceiling first; a failed second write leaves a
+            // conservative reclaim threshold and is safe to retry.
+            write_cgroup(&dir, "memory.max", &target.max_bytes.to_string())
+                .and_then(|()| write_cgroup(&dir, "memory.high", &target.high_bytes.to_string()))
+                .map_err(|error| {
+                    Error::agent(
+                        "RAM resize",
+                        format!(
+                            "memory limit update incomplete: {error}; guest RAM has not been added"
+                        ),
+                    )
+                })?;
+        }
+    }
+    let actual = read_budget()?;
+    if actual != target
+        || !is_our_process_strict(pid, started)
+        || cgroup_v2_process_dir(pid).as_ref() != Some(&dir)
+    {
+        return Err(Error::agent(
+            "RAM resize",
+            "memory limits or VMM identity changed during resize; guest RAM has not been added",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn raise_managed_vmm_memory_budget(
+    _machine: &str,
+    _pid: Pid,
+    _started: Option<u64>,
+    _requested: VmmMemoryBudget,
+) -> Result<bool> {
+    Ok(false)
+}
+
 /// Update only a verified VMM's own CPU quota, never a shared enclosing cgroup.
 #[cfg(target_os = "linux")]
 pub fn set_managed_vmm_cpu_count(
@@ -3306,6 +3422,54 @@ mod tests {
                     "{mib} {cuda} {memfd}: reclaim starts inside guest RAM"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn raising_memory_limits_preserves_lineage_allowances_and_is_idempotent() {
+        let existing = VmmMemoryBudget {
+            high_bytes: 700,
+            max_bytes: 800,
+        };
+        let small = VmmMemoryBudget {
+            high_bytes: 300,
+            max_bytes: 400,
+        };
+        assert_eq!(raised_memory_budget(existing, small).unwrap(), existing);
+        let larger = VmmMemoryBudget {
+            high_bytes: 900,
+            max_bytes: 1000,
+        };
+        let raised = raised_memory_budget(existing, larger).unwrap();
+        assert_eq!(raised, larger);
+        assert_eq!(raised_memory_budget(raised, larger).unwrap(), raised);
+        let mixed = raised_memory_budget(
+            existing,
+            VmmMemoryBudget {
+                high_bytes: 600,
+                max_bytes: 900,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mixed,
+            VmmMemoryBudget {
+                high_bytes: 700,
+                max_bytes: 900
+            }
+        );
+        for invalid in [
+            VmmMemoryBudget {
+                high_bytes: 1,
+                max_bytes: 0,
+            },
+            VmmMemoryBudget {
+                high_bytes: 901,
+                max_bytes: 900,
+            },
+        ] {
+            assert!(raised_memory_budget(existing, invalid).is_err());
+            assert!(raised_memory_budget(invalid, existing).is_err());
         }
     }
 
