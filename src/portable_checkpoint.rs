@@ -756,6 +756,7 @@ fn checkpoint_rootfs_dir(options: &CaptureOptions) -> Result<PathBuf> {
 
 fn validated_capture_source(name: &str) -> Result<SmolvmConfig> {
     let config = SmolvmConfig::load()?;
+    config.db().require_completed_resize(name)?;
     let vm = config
         .vms
         .get(name)
