@@ -3833,19 +3833,22 @@ pub async fn stop_machine(
     let entry = state.get_machine(&name).ok();
     let name_clone = name.clone();
     let stopped = tokio::task::spawn_blocking(move || {
-        let ok = if let Some(ref entry) = entry {
+        // Carry WHY a stop failed, not just that it did. The reason is the only
+        // thing that distinguishes a guest too slow to confirm its flush from a
+        // wedged agent that will never answer, and a caller reading the API
+        // response never sees this node's log.
+        let outcome: Result<(), String> = if let Some(ref entry) = entry {
             let e = entry.lock();
-            match e.manager.stop() {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(name = %name_clone, error = %err, "graceful stop failed; preserving the live VM for retry");
-                    false
-                }
-            }
+            e.manager.stop().map_err(|err| {
+                tracing::warn!(name = %name_clone, error = %err, "graceful stop failed; preserving the live VM for retry");
+                err.to_string()
+            })
+        } else if shutdown_machine_process(&name_clone, pid, pid_start_time, true) {
+            Ok(())
         } else {
-            shutdown_machine_process(&name_clone, pid, pid_start_time, true)
+            Err("the VM process did not exit".to_string())
         };
-        if ok {
+        if outcome.is_ok() {
             // Process is gone — detach this machine's case-sensitive layers
             // volume (macOS hdiutil mount; no-op on Linux). The volume lives
             // under the machine's own data dir and is owned 1:1 by it, so the
@@ -3854,15 +3857,14 @@ pub async fn stop_machine(
                 &crate::agent::machine_layers_cache_dir(&name_clone),
             );
         }
-        ok
+        outcome
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
 
-    if !stopped {
+    if let Err(reason) = stopped {
         return Err(ApiError::Internal(format!(
-            "machine '{}' process may still be running after stop attempt",
-            name
+            "machine '{name}' is still running because the stop did not complete: {reason}"
         )));
     }
 
