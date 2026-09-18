@@ -3079,7 +3079,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smolfile"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "serde",
  "smolvm-protocol",
@@ -3105,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "async-stream",
  "axum",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-agent"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "flate2",
  "lazy_static",
@@ -3192,7 +3192,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -3201,11 +3201,11 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.16.1"
+version = "1.16.2"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3222,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "crossbeam-queue",
  "getrandom 0.3.4",
@@ -3246,14 +3246,14 @@ dependencies = [
 
 [[package]]
 name = "smolvm-nvml-shim"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "smolvm-oci-layer"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "flate2",
  "libc",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-pack"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "crc32fast",
  "dirs",
@@ -3286,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-protocol"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "base64",
  "serde",
@@ -3296,7 +3296,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-registry"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "bytes",
  "dirs",
@@ -3318,7 +3318,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-s3fs"
-version = "1.16.1"
+version = "1.16.2"
 dependencies = [
  "hmac",
  "libc",
