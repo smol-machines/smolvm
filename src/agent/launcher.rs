@@ -774,6 +774,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
         }
+        if krun.configure_live_resize(ctx, resources.cpus) < 0 {
+            krun_free_ctx(ctx);
+            return Err(Error::agent(
+                "configure vm",
+                "live resize configuration failed",
+            ));
+        }
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
             let cpu_profile_result = krun_set_cpu_template(ctx, 1);
