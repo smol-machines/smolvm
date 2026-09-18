@@ -341,7 +341,7 @@ impl MemoryGrowthInfo {
 fn unsupported_live_compute(operation: &str) -> Error {
     Error::config(
         operation,
-        "live CPU and RAM growth currently require a Linux x86_64 host; disk growth is supported separately",
+        "live CPU growth currently requires a Linux x86_64 host; RAM and disk growth are supported separately",
     )
 }
 
@@ -350,6 +350,25 @@ fn ensure_live_compute_platform(operation: &str) -> Result<()> {
         Ok(())
     } else {
         Err(unsupported_live_compute(operation))
+    }
+}
+
+fn unsupported_live_memory() -> Error {
+    Error::config(
+        "RAM resize",
+        "live RAM growth requires a Linux x86_64 or aarch64 host; disk growth is supported separately",
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_live_memory_platform() -> Result<()> {
+    if cfg!(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) {
+        Ok(())
+    } else {
+        Err(unsupported_live_memory())
     }
 }
 
@@ -363,7 +382,7 @@ pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecor
 
 #[cfg(target_os = "linux")]
 fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
-    ensure_live_compute_platform("RAM resize")?;
+    ensure_live_memory_platform()?;
     let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
     if record.actual_state() != RecordState::Running {
         return Err(Error::agent_conflict(
@@ -391,8 +410,9 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
     let (pid, started) = manager
         .pid_and_start_time()
         .ok_or_else(|| Error::agent("RAM resize", "VMM process identity is unavailable"))?;
+    // Check enforcement before recording an intent, including partial retries.
+    let available = crate::process::vmm_growth_memory_stats(pid, started)?;
     if extra_bytes > 0 {
-        let available = crate::process::vmm_growth_memory_stats(pid, started)?;
         let reserve = (available.total_bytes / 20).clamp(512 << 20, 4096 << 20);
         if available.available_bytes < extra_bytes.saturating_add(reserve) {
             return Err(Error::agent_conflict(
@@ -467,7 +487,7 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
 #[cfg(not(target_os = "linux"))]
 /// Reject live RAM growth on hosts without a supported hot-add backend.
 pub fn grow_memory(_db: &SmolvmDb, _name: &str, _target_mib: u32) -> Result<VmRecord> {
-    Err(unsupported_live_compute("RAM resize"))
+    Err(unsupported_live_memory())
 }
 
 fn validate_growth(current: u64, requested: u64) -> Result<u64> {
@@ -731,16 +751,30 @@ mod tests {
 
     #[test]
     fn live_compute_platform_refusal_is_actionable() {
-        for operation in ["CPU resize", "RAM resize"] {
-            let result = ensure_live_compute_platform(operation);
-            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-                assert!(result.is_ok());
-            } else {
-                let error = result.unwrap_err().to_string();
-                assert!(error.contains(operation));
-                assert!(error.contains("Linux x86_64"));
-                assert!(error.contains("disk growth is supported separately"));
-            }
+        let result = ensure_live_compute_platform("CPU resize");
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert!(result.is_ok());
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("CPU resize"));
+            assert!(error.contains("Linux x86_64"));
+            assert!(error.contains("RAM and disk growth are supported separately"));
+        }
+    }
+
+    #[test]
+    fn live_memory_platform_accepts_linux_arm_and_x86() {
+        let result = ensure_live_memory_platform();
+        if cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )) {
+            assert!(result.is_ok());
+        } else {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("Linux x86_64 or aarch64"));
         }
     }
 
