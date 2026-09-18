@@ -109,6 +109,26 @@ impl AttachedDisk {
                 }
             }
         }
+        // 🔴 Writes to an attached disk are silently discarded on macOS: the
+        // guest reads back its own writes within a boot, but the host file is
+        // byte-identical to pristine once the VMM releases it and the data is
+        // gone after a restart (measured: a 16 MiB fill "completed" at memory
+        // speed and changed nothing on disk). The VMM does hold the file open
+        // read-write, and the managed storage disk added through the same
+        // `krun_add_disk2` call persists correctly, so this sits below our API
+        // surface. It predates `--disk` — the `SMOLVM_EXTRA_DISK` hook on the
+        // released 1.16.1 binary behaves identically — and went unnoticed
+        // because its only consumer, `--from-vm` export, exclusively reads.
+        //
+        // Silent data loss is the worst way to find that out, so refuse the
+        // write mode here. Read-only attachment is correct on macOS and stays
+        // available.
+        #[cfg(target_os = "macos")]
+        if !self.read_only {
+            return Err(format!(
+                "{display}: read-write disk attachment loses data on macOS — writes never reach the host file. Attach it read-only with `:ro`, or use a Linux host"
+            ));
+        }
         // Opening is the only honest accessibility test: under per-VM uid
         // isolation the VMM runs as a dropped uid, and a host device is
         // typically root-owned, so a readable-looking path can still fail at
@@ -290,6 +310,7 @@ mod attached_disk_tests {
         assert!(as_dir.validate().unwrap_err().contains("is a directory"));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn validate_accepts_a_regular_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -301,6 +322,36 @@ mod attached_disk_tests {
         }
         .validate()
         .expect("a writable regular file is a valid disk");
+    }
+
+    /// Writes to an attached disk never reach the host file on macOS, so the
+    /// write mode is refused rather than silently losing the guest's data.
+    /// Read-only attachment is correct there and must stay available.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_refuses_read_write_attachment_but_allows_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("wal.img");
+        std::fs::write(&img, [0u8; 64]).unwrap();
+
+        let err = AttachedDisk {
+            path: img.clone(),
+            read_only: false,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("loses data on macOS"), "{err}");
+        assert!(
+            err.contains(":ro"),
+            "the message must name the way forward: {err}"
+        );
+
+        AttachedDisk {
+            path: img,
+            read_only: true,
+        }
+        .validate()
+        .expect("read-only attachment is correct on macOS");
     }
 
     /// A read-only attachment must not demand write access: attaching someone
@@ -322,7 +373,8 @@ mod attached_disk_tests {
         .expect("read-only attach only needs read access");
 
         // Running as root bypasses the mode, so only assert the negative case
-        // where the mode is actually enforced.
+        // where the mode is actually enforced. On macOS the read-write guard
+        // fires before the permission check, which is also a refusal.
         if unsafe { libc::geteuid() } != 0 {
             let err = AttachedDisk {
                 path: img,
@@ -330,7 +382,10 @@ mod attached_disk_tests {
             }
             .validate()
             .unwrap_err();
-            assert!(err.contains("cannot open for read-write"), "{err}");
+            assert!(
+                err.contains("cannot open for read-write") || err.contains("loses data on macOS"),
+                "{err}"
+            );
         }
     }
 
