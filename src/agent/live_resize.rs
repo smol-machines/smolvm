@@ -341,12 +341,15 @@ impl MemoryGrowthInfo {
 fn unsupported_live_compute(operation: &str) -> Error {
     Error::config(
         operation,
-        "live CPU growth currently requires a Linux x86_64 host; RAM and disk growth are supported separately",
+        "live CPU growth requires Linux x86_64 or macOS Apple Silicon; RAM and disk growth are supported separately",
     )
 }
 
 fn ensure_live_compute_platform(operation: &str) -> Result<()> {
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    if cfg!(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )) {
         Ok(())
     } else {
         Err(unsupported_live_compute(operation))
@@ -755,7 +758,10 @@ mod tests {
     #[test]
     fn live_compute_platform_refusal_is_actionable() {
         let result = ensure_live_compute_platform("CPU resize");
-        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        if cfg!(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )) {
             assert!(result.is_ok());
         } else {
             let error = result.unwrap_err().to_string();
