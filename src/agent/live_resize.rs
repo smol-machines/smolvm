@@ -5,11 +5,37 @@
 
 use super::{fork, AgentClient, AgentManager};
 use crate::config::{RecordState, VmRecord};
-use crate::db::SmolvmDb;
+use crate::db::{ResizeIntent, ResizeTarget, SmolvmDb};
 use crate::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::{Error, Result};
 use smolvm_protocol::{ManagedDisk, ONLINE_FILESYSTEM_GROWTH_CAPABILITY};
 use std::time::Duration;
+
+fn begin_resize_intent(
+    db: &SmolvmDb,
+    name: &str,
+    pid: crate::process::Pid,
+    started: Option<u64>,
+    target: ResizeTarget,
+) -> Result<ResizeIntent> {
+    if !crate::process::is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "live resize",
+            "VMM process identity cannot be verified",
+        ));
+    }
+    db.begin_resize(name, pid, started.expect("verified start time"), target)
+}
+
+fn finish_resize_intent(db: &SmolvmDb, name: &str, intent: &ResizeIntent) -> Result<()> {
+    if !crate::process::is_our_process_strict(intent.pid, Some(intent.started)) {
+        return Err(Error::agent(
+            "live resize",
+            "VMM exited or changed before resize completion; reconciliation required",
+        ));
+    }
+    db.finish_resize(name, intent)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "linux", test))]
@@ -116,6 +142,7 @@ pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecor
         }
     }
     let budget = fork::live_resize_memory_budget(db, name, &record, target_mib)?;
+    let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Memory(target_mib))?;
     if !crate::process::raise_managed_vmm_memory_budget(name, pid, started, budget)? {
         // Do not silently resize a guest beyond an external/shared cgroup's
         // allowance. External capacity negotiation is a separate integration.
@@ -173,6 +200,7 @@ pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecor
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    finish_resize_intent(db, name, &intent)?;
     db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))
 }
 
@@ -252,6 +280,7 @@ pub fn grow_cpus(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
     let (pid, started) = manager
         .pid_and_start_time()
         .ok_or_else(|| Error::agent("CPU resize", "VMM process identity is unavailable"))?;
+    let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Cpus(target))?;
     crate::process::set_managed_vmm_cpu_count(name, pid, started, target)?;
     let reply = fork::control_socket_cmd(&socket, &format!("PROTOTYPE_GROW_CPUS {target}"))?;
     if reply.trim() != format!("OK created {target} vCPUs; guest online required") {
@@ -274,6 +303,7 @@ pub fn grow_cpus(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
             ),
         )
     })?;
+    finish_resize_intent(db, name, &intent)?;
     db.get_vm(name)?
         .ok_or_else(|| Error::VmNotFound { name: name.into() })
 }
@@ -345,6 +375,19 @@ pub fn grow_disks(
             "running runtime lacks online disk growth support; no disks changed",
         ));
     }
+    let (pid, started) = manager
+        .pid_and_start_time()
+        .ok_or_else(|| Error::agent("live resize", "VMM process identity is unavailable"))?;
+    let intent = begin_resize_intent(
+        db,
+        name,
+        pid,
+        started,
+        ResizeTarget::Disks {
+            storage: storage_gb,
+            overlay: overlay_gb,
+        },
+    )?;
     for (disk, id, target, bytes) in requested {
         let reply = fork::control_socket_cmd_with_timeout(
             &socket, &format!("GROW_DISK {id} {bytes}"), Duration::from_secs(120),
@@ -366,6 +409,7 @@ pub fn grow_disks(
             "live resize", format!("{id} disk is now {target} GiB; filesystem growth incomplete: {error}; retry the same target"),
         ))?;
     }
+    finish_resize_intent(db, name, &intent)?;
     db.get_vm(name)?
         .ok_or_else(|| Error::config("live resize", "machine record disappeared"))
 }

@@ -2036,6 +2036,7 @@ pub(crate) fn prepare_forks_reusing(
     reuse_live_snapshot: bool,
 ) -> Result<PreparedForkBatch> {
     let preparation_started = std::time::Instant::now();
+    db.require_completed_resize(golden)?;
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
     }
