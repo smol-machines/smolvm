@@ -301,11 +301,17 @@ impl KrunFunctions {
     /// # Safety
     /// `ctx` must be a live context belonging to this loaded runtime.
     pub unsafe fn configure_live_resize(&self, ctx: u32, cpus: u8) -> i32 {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         if let Some(configure) = self.set_live_resize {
             // The current x86 firmware reserves at most 16 CPU slots. Larger
             // machines can still grow RAM without advertising unsupported CPU growth.
-            return configure(ctx, 2 | u32::from(cpus <= 16));
+            return configure(
+                ctx,
+                2 | u32::from(cfg!(target_arch = "x86_64") && cpus <= 16),
+            );
         }
         let _ = (ctx, cpus);
         0
