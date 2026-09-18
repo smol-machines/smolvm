@@ -35,6 +35,15 @@ after=$(guest 'cat /run/heartbeat')
 test "$after" -gt "$before"
 if machine resize --name "$name" --cpus 0; then exit 1; fi
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-1'
+memory_before=$(guest "awk '/^MemTotal:/ {print \$2}' /proc/meminfo")
+disk_before=$(guest 'cat /sys/class/block/vda/size')
+if machine resize --name "$name" --mem 256; then exit 1; fi
+if machine resize --name "$name" --storage 0; then exit 1; fi
+test "$(guest "awk '/^MemTotal:/ {print \$2}' /proc/meminfo")" = "$memory_before"
+test "$(guest 'cat /sys/class/block/vda/size')" = "$disk_before"
+machine resize --name "$name" --cpus 1
+guest 'test "$(cat /sys/devices/system/cpu/online)" = 0'
+machine resize --name "$name" --cpus 2
 mkdir -m 700 "$root/artifacts"
 machine checkpoint --name "$name" --output "$root/artifacts/shrunk.smolcheckpoint"
 machine delete --name "$name" --force
@@ -58,4 +67,14 @@ machine resize --name "$name" --cpus 4
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-3; taskset -c 3 true'
 name=$parent
 guest 'test "$(cat /dev/shm/state)" = parent; test "$(cat /sys/devices/system/cpu/online)" = 0-1'
+if test -n "${SMOLVM_TEST_LEGACY_LIB_DIR:-}"; then
+    name="${parent}-legacy"
+    owned+=("$name")
+    machine create --name "$name" --cpus 4 --mem 512 --storage 1 --overlay 1
+    SMOLVM_LIB_DIR="$SMOLVM_TEST_LEGACY_LIB_DIR" machine start --name "$name" --branchable
+    if machine resize --name "$name" --cpus 2 >"$root/legacy-refusal.log" 2>&1; then exit 1; fi
+    grep -q 'cannot safely restore offlined CPUs' "$root/legacy-refusal.log"
+    guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-3'
+    echo legacy_runtime_refused_without_guest_mutation
+fi
 echo cpu_shrink_restore_regrow_branch_passed
