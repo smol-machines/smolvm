@@ -2317,6 +2317,7 @@ fn handle_request(
         // boot-time mount/format fallback as a side effect of this request.
         | AgentRequest::GrowFilesystem { .. }
         | AgentRequest::OnlineCpus { .. }
+        | AgentRequest::OnlineMemory { .. }
         | AgentRequest::Shutdown { .. } => {}
         _ => {
             ensure_storage_mounted();
@@ -2330,6 +2331,7 @@ fn handle_request(
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_string(),
+                smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_string(),
             ];
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,
@@ -2360,6 +2362,10 @@ fn handle_request(
         AgentRequest::OnlineCpus { target_count } => {
             live_resources::online_cpus(target_count, client_fd)
         }
+        AgentRequest::OnlineMemory {
+            start_address,
+            length_bytes,
+        } => live_resources::online_memory(start_address, length_bytes, client_fd),
         AgentRequest::GrowFilesystem {
             disk,
             expected_bytes,

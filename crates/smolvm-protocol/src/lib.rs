@@ -314,6 +314,9 @@ pub const ONLINE_FILESYSTEM_GROWTH_CAPABILITY: &str = "online-filesystem-growth-
 /// Agent can online and verify CPUs after the VMM creates them.
 pub const ONLINE_CPU_GROWTH_CAPABILITY: &str = "online-cpu-growth-v1";
 
+/// Agent can online and verify a RAM range already added by the VMM.
+pub const ONLINE_MEMORY_GROWTH_CAPABILITY: &str = "online-memory-growth-v1";
+
 /// Managed writable disk, never an arbitrary guest path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -328,6 +331,13 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Online existing guest memory blocks; never create or offline memory.
+    OnlineMemory {
+        /// Guest physical address of the first block.
+        start_address: u64,
+        /// Length of the existing, block-aligned range in bytes.
+        length_bytes: u64,
+    },
     /// Online CPUs already created by the VMM, without offlining existing CPUs.
     OnlineCpus {
         /// Total CPU count, using consecutive CPU IDs starting at zero.
@@ -823,6 +833,12 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::OnlineMemory {
+                start_address,
+                length_bytes,
+            } => {
+                format!("OnlineMemory {{ start_address: {start_address}, length_bytes: {length_bytes} }}")
+            }
             AgentRequest::OnlineCpus { target_count } => {
                 format!("OnlineCpus {{ target_count: {target_count} }}")
             }
@@ -1477,6 +1493,27 @@ impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_growth_roundtrips_numeric_geometry_only() {
+        let request = super::AgentRequest::OnlineMemory {
+            start_address: 1 << 30,
+            length_bytes: 128 << 20,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<super::AgentRequest>(&wire).unwrap(),
+            super::AgentRequest::OnlineMemory {
+                start_address: 1073741824,
+                length_bytes: 134217728
+            }
+        ));
+        for invalid in [
+            r#"{"method":"online_memory","start_address":-1,"length_bytes":4096}"#,
+            r#"{"method":"online_memory","start_address":"/dev/mem","length_bytes":4096}"#,
+        ] {
+            assert!(serde_json::from_str::<super::AgentRequest>(invalid).is_err());
+        }
+    }
     #[test]
     fn cpu_growth_roundtrips_a_numeric_count_only() {
         let req = super::AgentRequest::OnlineCpus { target_count: 4 };

@@ -12,6 +12,106 @@ use std::sync::Mutex;
 
 static RESIZE: Mutex<()> = Mutex::new(());
 static CPU_RESIZE: Mutex<()> = Mutex::new(());
+static MEMORY_RESIZE: Mutex<()> = Mutex::new(());
+
+fn memory_blocks(start: u64, length: u64, block_size: u64) -> io::Result<std::ops::Range<u64>> {
+    if block_size == 0
+        || !block_size.is_power_of_two()
+        || length == 0
+        || !start.is_multiple_of(block_size)
+        || !length.is_multiple_of(block_size)
+        || length / block_size > 8192
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RAM range must cover 1–8192 complete guest memory blocks",
+        ));
+    }
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAM range overflows"))?;
+    Ok(start / block_size..end / block_size)
+}
+
+fn memory_online_plan(
+    blocks: std::ops::Range<u64>,
+    mut read_state: impl FnMut(u64) -> io::Result<String>,
+) -> io::Result<Vec<u64>> {
+    let mut plan = Vec::new();
+    // Complete validation precedes any write. A missing or transitioning block
+    // is not success, and a retry never offlines already usable memory.
+    for block in blocks {
+        match read_state(block)?.trim() {
+            "online" => {}
+            "offline" => plan.push(block),
+            state => {
+                return Err(io::Error::other(format!(
+                    "memory{block} has unsettled state {state}"
+                )))
+            }
+        }
+    }
+    Ok(plan)
+}
+
+pub(crate) fn online_memory(start: u64, length: u64, client_fd: Option<RawFd>) -> AgentResponse {
+    let Ok(_guard) = MEMORY_RESIZE.try_lock() else {
+        return AgentResponse::error(
+            "another RAM resize is in progress",
+            error_codes::INVALID_REQUEST,
+        );
+    };
+    let read_state = |block: u64| {
+        std::fs::read_to_string(format!("/sys/devices/system/memory/memory{block}/state"))
+    };
+    let preflight = (|| -> io::Result<_> {
+        let size = std::fs::read_to_string("/sys/devices/system/memory/block_size_bytes")?;
+        let size = u64::from_str_radix(size.trim().trim_start_matches("0x"), 16)
+            .map_err(|_| io::Error::other("invalid guest memory block size"))?;
+        let blocks = memory_blocks(start, length, size)?;
+        let plan = memory_online_plan(blocks.clone(), read_state)?;
+        Ok((blocks, plan))
+    })();
+    let (blocks, plan) =
+        match preflight {
+            Ok(value) => value,
+            Err(error) => return AgentResponse::error(
+                format!(
+                    "cannot online RAM: {error}; wait for memory blocks and retry the same range"
+                ),
+                error_codes::INVALID_REQUEST,
+            ),
+        };
+    if !plan.is_empty() {
+        // Only validated numeric block IDs reach the shell. The existing exec
+        // supervisor bounds a slow kernel write and handles client disconnect.
+        let script = plan
+            .iter()
+            .map(|block| format!("printf online > /sys/devices/system/memory/memory{block}/state"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let response = crate::handle_vm_exec(
+            &["/bin/sh".into(), "-ec".into(), script],
+            &[],
+            None,
+            Some(120_000),
+            client_fd,
+            None,
+        );
+        if !matches!(response, AgentResponse::Completed { exit_code: 0, .. }) {
+            return AgentResponse::error("RAM onlining incomplete; some blocks may be online, retry the same range without shrinking", error_codes::INTERNAL_ERROR);
+        }
+    }
+    match memory_online_plan(blocks, read_state) {
+        Ok(remaining) if remaining.is_empty() => AgentResponse::Ok {
+            data: Some(serde_json::json!({"start_address": start, "online_bytes": length})),
+        },
+        _ => AgentResponse::error(
+            "RAM online state could not be verified; retry the same range",
+            error_codes::INTERNAL_ERROR,
+        ),
+    }
+}
 
 fn parse_cpu_list(value: &str) -> io::Result<BTreeSet<u32>> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid kernel CPU list");
@@ -251,6 +351,45 @@ pub(crate) fn grow_filesystem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_range_rejects_partial_blocks_overflow_and_unbounded_work() {
+        assert_eq!(memory_blocks(1024, 512, 128).unwrap(), 8..12);
+        for (start, length, block) in [
+            (0, 0, 128),
+            (1, 128, 128),
+            (0, 129, 128),
+            (0, 128, 0),
+            (0, 128, 3),
+            (u64::MAX - 127, 128, 128),
+            (0, 8193 * 128, 128),
+        ] {
+            assert!(memory_blocks(start, length, block).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_online_retries_only_offline_blocks_and_rejects_missing_or_unsettled_blocks() {
+        assert_eq!(
+            memory_online_plan(8..11, |id| Ok(if id == 9 {
+                "online\n"
+            } else {
+                "offline\n"
+            }
+            .into()))
+            .unwrap(),
+            vec![8, 10]
+        );
+        assert!(memory_online_plan(8..11, |_| Ok("online\n".into()))
+            .unwrap()
+            .is_empty());
+        assert!(
+            memory_online_plan(8..11, |_| Err(io::Error::from(io::ErrorKind::NotFound))).is_err()
+        );
+        for state in ["going-offline", "", "unknown"] {
+            assert!(memory_online_plan(8..11, |_| Ok(state.into())).is_err());
+        }
+    }
 
     #[test]
     fn cpu_lists_are_bounded_and_validate_ranges() {

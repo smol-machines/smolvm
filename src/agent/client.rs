@@ -1752,6 +1752,37 @@ impl AgentClient {
         }
     }
 
+    /// Online only an existing block-aligned RAM range after runtime hot-add.
+    pub fn online_memory(&mut self, start_address: u64, length_bytes: u64) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY)? {
+            return Err(Error::agent(
+                "online RAM",
+                "running guest agent does not support RAM growth",
+            ));
+        }
+        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(130))?;
+        match self.request(&AgentRequest::OnlineMemory {
+            start_address,
+            length_bytes,
+        })? {
+            AgentResponse::Ok { data: Some(data) }
+                if data
+                    .get("start_address")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(start_address)
+                    && data.get("online_bytes").and_then(serde_json::Value::as_u64)
+                        == Some(length_bytes) =>
+            {
+                Ok(())
+            }
+            AgentResponse::Error { message, .. } => Err(Error::agent("online RAM", message)),
+            _ => Err(Error::agent(
+                "online RAM",
+                "guest did not verify the requested RAM range",
+            )),
+        }
+    }
+
     /// The guest's own view of machine memory.
     ///
     /// Agents older than this request reject it as an unknown variant, so
