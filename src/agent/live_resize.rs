@@ -5,7 +5,7 @@
 
 use super::{fork, AgentClient, AgentManager};
 use crate::config::{RecordState, VmRecord};
-use crate::db::{ResizeIntent, ResizeTarget, ResizeReceipt, ResizeReceiptState, SmolvmDb};
+use crate::db::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget, SmolvmDb};
 use crate::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::{Error, Result};
 use smolvm_protocol::{ManagedDisk, ONLINE_FILESYSTEM_GROWTH_CAPABILITY};
@@ -94,39 +94,73 @@ pub(crate) fn grow_checked(
         }
     }
     let receipt = if let Some(operation_id) = operation_id {
-        let runtime = expected.ok_or_else(|| Error::config("live resize", "operationId requires expectedRuntime"))?;
+        let runtime = expected
+            .ok_or_else(|| Error::config("live resize", "operationId requires expectedRuntime"))?;
         let original = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
-        let receipt = db.begin_resize_receipt(name, &ResizeReceipt {
-            operation_id: operation_id.into(), runtime: runtime.clone(), target: target.clone(),
-            original: ResizeGeometry::from(&original), state: ResizeReceiptState::Active,
-        })?;
+        let receipt = db.begin_resize_receipt(
+            name,
+            &ResizeReceipt {
+                operation_id: operation_id.into(),
+                runtime: runtime.clone(),
+                target: target.clone(),
+                original: ResizeGeometry::from(&original),
+                state: ResizeReceiptState::Active,
+            },
+        )?;
         match &receipt.state {
-            ResizeReceiptState::Rejected { message } => return Ok(ResizeOutcome::Rejected { operation_id: operation_id.into(), runtime: runtime.clone(), message: message.clone() }),
-            ResizeReceiptState::Applied => return db.get_vm(name)?.map(ResizeOutcome::Applied).ok_or_else(|| Error::vm_not_found(name)),
-            ResizeReceiptState::Active => {},
+            ResizeReceiptState::Rejected { message } => {
+                return Ok(ResizeOutcome::Rejected {
+                    operation_id: operation_id.into(),
+                    runtime: runtime.clone(),
+                    message: message.clone(),
+                })
+            }
+            ResizeReceiptState::Applied => {
+                return db
+                    .get_vm(name)?
+                    .map(ResizeOutcome::Applied)
+                    .ok_or_else(|| Error::vm_not_found(name))
+            }
+            ResizeReceiptState::Active => {}
         }
         Some(receipt)
-    } else { None };
+    } else {
+        None
+    };
     let result = grow_target_locked(db, name, target);
     match (result, receipt) {
         (Ok(record), Some(receipt)) => {
             db.finish_resize_receipt(name, &receipt, ResizeReceiptState::Applied)?;
             Ok(ResizeOutcome::Applied(record))
-        },
+        }
         (Err(error), Some(receipt)) => {
             // Every irreversible grow path records an intent before touching
             // the runtime. Missing intent alone is insufficient: a prior try
             // could have completed before its reply/receipt was committed.
             let current = db.get_vm(name)?;
-            let unchanged = current.as_ref().is_some_and(|r| ResizeGeometry::from(r) == receipt.original);
-            if unchanged && db.pending_resize(name)?.is_none()
-                && RuntimeIdentity::observe(receipt.runtime.pid).as_ref() == Some(&receipt.runtime) {
+            let unchanged = current
+                .as_ref()
+                .is_some_and(|r| ResizeGeometry::from(r) == receipt.original);
+            if unchanged
+                && db.pending_resize(name)?.is_none()
+                && RuntimeIdentity::observe(receipt.runtime.pid).as_ref() == Some(&receipt.runtime)
+            {
                 let message: String = error.to_string().chars().take(4096).collect();
-                db.finish_resize_receipt(name, &receipt, ResizeReceiptState::Rejected { message: message.clone() })?;
-                return Ok(ResizeOutcome::Rejected { operation_id: receipt.operation_id, runtime: receipt.runtime, message });
+                db.finish_resize_receipt(
+                    name,
+                    &receipt,
+                    ResizeReceiptState::Rejected {
+                        message: message.clone(),
+                    },
+                )?;
+                return Ok(ResizeOutcome::Rejected {
+                    operation_id: receipt.operation_id,
+                    runtime: receipt.runtime,
+                    message,
+                });
             }
             Err(error)
-        },
+        }
         (Ok(record), None) => Ok(ResizeOutcome::Applied(record)),
         (Err(error), None) => Err(error),
     }
@@ -142,13 +176,22 @@ pub(crate) struct ResizeGeometry {
 
 impl From<&VmRecord> for ResizeGeometry {
     fn from(record: &VmRecord) -> Self {
-        Self { cpus: record.cpus, memory_mb: record.mem, storage_gb: record.storage_gb, overlay_gb: record.overlay_gb }
+        Self {
+            cpus: record.cpus,
+            memory_mb: record.mem,
+            storage_gb: record.storage_gb,
+            overlay_gb: record.overlay_gb,
+        }
     }
 }
 
 pub(crate) enum ResizeOutcome {
     Applied(VmRecord),
-    Rejected { operation_id: String, runtime: RuntimeIdentity, message: String },
+    Rejected {
+        operation_id: String,
+        runtime: RuntimeIdentity,
+        message: String,
+    },
 }
 
 fn grow_target_locked(db: &SmolvmDb, name: &str, target: ResizeTarget) -> Result<VmRecord> {
