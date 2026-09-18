@@ -3530,6 +3530,45 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
 /// Used on both ends: the extract/run side here, and the pack-create side in
 /// `assets::create_storage_template` when it copies the pre-formatted
 /// `storage-template.ext4` into the staging directory.
+/// Copy a disk template as a copy-on-write clone where the filesystem can
+/// (APFS `clonefile`, Linux `FICLONE` on btrfs/xfs), so a multi-GiB template
+/// costs nothing per run; otherwise a hole-preserving copy. `dst` must not
+/// exist.
+pub(crate) fn clone_or_sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let (Ok(from), Ok(to)) = (
+            std::ffi::CString::new(src.as_os_str().as_bytes()),
+            std::ffi::CString::new(dst.as_os_str().as_bytes()),
+        ) {
+            if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+                return Ok(());
+            }
+            let _ = fs::remove_file(dst);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        if let Ok(from) = File::open(src) {
+            if let Ok(to) = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dst)
+            {
+                if unsafe { libc::ioctl(to.as_raw_fd(), FICLONE as _, from.as_raw_fd()) } == 0 {
+                    return Ok(());
+                }
+                drop(to);
+                let _ = fs::remove_file(dst);
+            }
+        }
+    }
+    sparse_copy(src, dst)
+}
+
 pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mut src_file = File::open(src)?;
     let size = src_file.metadata()?.len();
@@ -3690,7 +3729,7 @@ pub fn copy_overlay_template(
 
     // Hole-preserving copy: fs::copy can densify a sparse template on some
     // Linux filesystems/mounts, ballooning the overlay to its full logical size.
-    sparse_copy(&src, dest)?;
+    clone_or_sparse_copy(&src, dest)?;
 
     // Determine target size: max of the copied size, overlay_logical_size
     // (original sparse extent before trailing-hole truncation), and
@@ -3720,6 +3759,21 @@ pub fn copy_overlay_template(
     Ok(())
 }
 
+/// Marker the host leaves beside the staged layer tars once a storage disk was
+/// seeded from the pack's own captured disk. That disk already holds these
+/// layers unpacked (by a guest, as root, at bake time), so the guest may use
+/// them without unpacking the tars again. The guest still requires its own
+/// unpack marker on the disk, so a disk that was not seeded is unaffected.
+pub const LAYERS_PREUNPACKED_MARKER: &str = ".preunpacked";
+
+/// Leave [`LAYERS_PREUNPACKED_MARKER`] beside the staged layer tars in `cache_dir`.
+pub fn mark_layers_preunpacked(cache_dir: &Path) {
+    let layers = cache_dir.join("layers");
+    if layers.is_dir() {
+        let _ = fs::write(layers.join(LAYERS_PREUNPACKED_MARKER), b"");
+    }
+}
+
 /// Create or copy storage disk from template.
 ///
 /// If a pre-formatted template exists in the cache, copy it.
@@ -3741,7 +3795,7 @@ pub fn create_or_copy_storage_disk(
             // multi-GiB storage template on some Linux filesystems/mounts,
             // turning ~25 MiB of real data into its full logical size of zeros on
             // disk and risking ENOSPC when several extractions run.
-            sparse_copy(&template_path, storage_path)?;
+            clone_or_sparse_copy(&template_path, storage_path)?;
             // Restore a VM-mode disk's original trailing sparse extent and/or
             // honor a larger requested size. resize2fs in the guest grows only
             // when the requested block device is larger than the inherited FS.
@@ -3764,6 +3818,7 @@ pub fn create_or_copy_storage_disk(
                 mark_file_sparse(&file)?;
                 file.set_len(desired)?;
             }
+            mark_layers_preunpacked(cache_dir);
             return Ok(());
         }
     }
@@ -5390,6 +5445,44 @@ mod tests {
             allocated_bytes < 16 * 1024 * 1024,
             "storage disk was densified: {allocated_bytes} bytes allocated for a sparse template"
         );
+    }
+
+    /// Seeding the storage disk from the pack's captured disk leaves the
+    /// marker beside the staged layers, so the guest knows the layers on that
+    /// disk are already unpacked; an empty disk (no template) leaves none.
+    #[test]
+    fn test_create_or_copy_storage_disk_marks_layers_preunpacked() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(cache_dir.path().join("layers")).unwrap();
+        let template = cache_dir.path().join("storage-template.ext4");
+        fs::write(&template, b"captured disk stand-in").unwrap();
+        let marker = cache_dir
+            .path()
+            .join("layers")
+            .join(LAYERS_PREUNPACKED_MARKER);
+
+        create_or_copy_storage_disk(
+            cache_dir.path(),
+            None,
+            &cache_dir.path().join("fresh.ext4"),
+            Some(1024 * 1024),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !marker.exists(),
+            "an empty disk must not claim unpacked layers"
+        );
+
+        create_or_copy_storage_disk(
+            cache_dir.path(),
+            Some("storage-template.ext4"),
+            &cache_dir.path().join("seeded.ext4"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(marker.is_file());
     }
 
     #[test]

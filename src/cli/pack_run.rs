@@ -866,7 +866,9 @@ fn resolve_sidecar_path(explicit: Option<&Path>) -> smolvm::Result<PathBuf> {
     ))
 }
 
-/// Set up the overlay disk for VM mode.
+/// Set up the overlay disk from the pack's template: VM-mode packs always
+/// carry one, and an image-based pack carries one when it was exported with
+/// its disks (the overlay then holds the machine's state exactly as baked).
 ///
 /// If the manifest specifies VM mode, copies the overlay template from
 /// `cache_dir` to `dest`. Returns the overlay path (for `PackedLaunchConfig`)
@@ -879,7 +881,7 @@ fn setup_vm_overlay(
     dest: &Path,
     overlay_gb: Option<u64>,
 ) -> smolvm::Result<Option<PathBuf>> {
-    if manifest.mode == PackMode::Vm {
+    if manifest.mode == PackMode::Vm || manifest.assets.overlay_template.is_some() {
         // VM mode: use the overlay template from the pack
         let overlay_template = manifest
             .assets

@@ -1061,6 +1061,7 @@ fn ensure_init_layer(
                 "--from-vm",
                 &tmp,
                 "--include-workspace",
+                "--include-disks",
                 "-o",
                 &staged_out,
             ],
@@ -3644,7 +3645,12 @@ impl CreateCmd {
             overlay_logical_size: Option<u64>,
             storage_logical_size: Option<u64>,
         }
-        let vm_seed = if checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm
+        // VM-mode packs always carry disk templates; an image-based pack may
+        // carry them too (a bake keeps its unpacked disks), and seeding from
+        // them is what lets the machine start without unpacking the layers.
+        let carries_disks = manifest.assets.storage_template.is_some();
+        let vm_seed = if checkpoint.is_none()
+            && (manifest.mode == smolvm_pack::format::PackMode::Vm || carries_disks)
         {
             Some(VmModeSeed {
                 overlay_template: manifest
@@ -3763,7 +3769,9 @@ impl CreateCmd {
                 .and_then(|checkpoint| checkpoint.workload.as_ref())
             {
                 Some(workload.image.clone())
-            } else if vm_seed.is_some() || checkpoint.is_some() {
+            } else if manifest.mode == smolvm_pack::format::PackMode::Vm || checkpoint.is_some() {
+                // Seeding disks from an image-based pack's captured disks must
+                // not turn the machine into a bare VM: it still runs its image.
                 None
             } else {
                 Some(manifest.image)
