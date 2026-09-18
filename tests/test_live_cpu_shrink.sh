@@ -13,7 +13,19 @@ guest() { machine exec --name "$name" -- sh -ec "$1"; }
 cleanup() {
     result=$?
     trap - EXIT
-    for vm in "${owned[@]}"; do
+    for ((index=${#owned[@]}-1; index>=0; index--)); do
+        vm=${owned[index]}
+        if test "$result" -ne 0; then
+            vm_dir=$(machine data-dir --name "$vm") || vm_dir=""
+            if test -n "$vm_dir"; then
+                for log in agent-console.log agent-startup-error.log; do
+                    if test -f "$vm_dir/$log"; then
+                        cp "$vm_dir/$log" "$root/$vm-$log"
+                        tail -30 "$vm_dir/$log"
+                    fi
+                done
+            fi
+        fi
         machine delete --name "$vm" --force || result=1
     done
     printf 'cpu_shrink_exit=%s retained_root=%s\n' "$result" "$root"
