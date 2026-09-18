@@ -142,8 +142,8 @@ guest 'test -f /run/ram-probe-mutated'
 sleep 5
 read -r child_pid child_next child_bytes <<<"$(guest 'cat /run/ram-probe-status')"
 test "$child_next" -gt "$child_sequence"
-# Linux ARM currently retains a frozen source. Verify that child mutations did
-# not change that source by resuming a second child from the same frozen base.
+# Verify that child mutations did not change the continuing Mac source by
+# creating another child and checking both RAM and disk state.
 machine delete --name "$child" --force
 owned_names=("$parent")
 second="${parent}-independence"
