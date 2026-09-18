@@ -37,8 +37,9 @@ root = Path(tempfile.mkdtemp(prefix='resize-crash-boundary-', dir='/var/tmp'))
 root.chmod(0o711)
 name = root.name
 env = dict(os.environ, XDG_DATA_HOME=str(root/'data'), XDG_CACHE_HOME=str(root/'cache'),
-    SMOLVM_DATA_DIR=str(root/'node'), SMOLVM_VM_USE_SCOPE='1',
-    KRUN_PROTOTYPE_CPU_GROWTH='1', KRUN_PROTOTYPE_MEMORY_GROWTH='1')
+    SMOLVM_DATA_DIR=str(root/'node'), SMOLVM_VM_USE_SCOPE='1')
+env.pop('KRUN_PROTOTYPE_CPU_GROWTH', None)
+env.pop('KRUN_PROTOTYPE_MEMORY_GROWTH', None)
 
 def cli(*args, check=True):
     p = subprocess.run([str(binary), 'machine', *args], env=env, text=True,

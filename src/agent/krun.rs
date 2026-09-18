@@ -51,6 +51,7 @@ pub struct KrunFunctions {
     pub free_ctx: unsafe extern "C" fn(u32),
     pub set_vm_config: unsafe extern "C" fn(u32, u8, u32) -> i32,
     pub set_cpu_template: unsafe extern "C" fn(u32, u32) -> i32,
+    pub set_live_resize: Option<unsafe extern "C" fn(u32, u32) -> i32>,
     pub set_workdir: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
     pub set_exec: unsafe extern "C" fn(
         u32,
@@ -221,6 +222,7 @@ impl KrunFunctions {
         let free_ctx = load_sym!(krun_free_ctx);
         let set_vm_config = load_sym!(krun_set_vm_config);
         let set_cpu_template = load_sym!(krun_set_cpu_template);
+        let set_live_resize = load_optional_sym!("krun_set_live_resize");
         let set_workdir = load_sym!(krun_set_workdir);
         let set_exec = load_sym!(krun_set_exec);
         let set_port_map = load_sym!(krun_set_port_map);
@@ -259,6 +261,7 @@ impl KrunFunctions {
             free_ctx,
             set_vm_config,
             set_cpu_template,
+            set_live_resize,
             set_workdir,
             set_exec,
             set_port_map,
@@ -292,6 +295,22 @@ impl KrunFunctions {
 }
 
 impl KrunFunctions {
+    /// Enable supported fresh-boot hotplug topology without process-global switches.
+    /// Older runtimes retain their existing boot behavior and reject growth later.
+    ///
+    /// # Safety
+    /// `ctx` must be a live context belonging to this loaded runtime.
+    pub unsafe fn configure_live_resize(&self, ctx: u32, cpus: u8) -> i32 {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Some(configure) = self.set_live_resize {
+            // The current x86 firmware reserves at most 16 CPU slots. Larger
+            // machines can still grow RAM without advertising unsupported CPU growth.
+            return configure(ctx, 2 | u32::from(cpus <= 16));
+        }
+        let _ = (ctx, cpus);
+        0
+    }
+
     /// Copy libkrun's thread-local diagnostic before another FFI call can
     /// replace it. Older compatible libraries simply return no detail.
     pub fn last_error_message(&self) -> Option<String> {
