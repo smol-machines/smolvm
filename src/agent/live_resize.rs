@@ -118,7 +118,7 @@ pub(crate) fn grow_checked(
             ResizeReceiptState::Applied => {
                 return db
                     .get_vm(name)?
-                    .map(ResizeOutcome::Applied)
+                    .map(|record| ResizeOutcome::Applied(Box::new(record)))
                     .ok_or_else(|| Error::vm_not_found(name))
             }
             ResizeReceiptState::Active => {}
@@ -131,7 +131,7 @@ pub(crate) fn grow_checked(
     match (result, receipt) {
         (Ok(record), Some(receipt)) => {
             db.finish_resize_receipt(name, &receipt, ResizeReceiptState::Applied)?;
-            Ok(ResizeOutcome::Applied(record))
+            Ok(ResizeOutcome::Applied(Box::new(record)))
         }
         (Err(error), Some(receipt)) => {
             // Every irreversible grow path records an intent before touching
@@ -161,7 +161,7 @@ pub(crate) fn grow_checked(
             }
             Err(error)
         }
-        (Ok(record), None) => Ok(ResizeOutcome::Applied(record)),
+        (Ok(record), None) => Ok(ResizeOutcome::Applied(Box::new(record))),
         (Err(error), None) => Err(error),
     }
 }
@@ -186,7 +186,7 @@ impl From<&VmRecord> for ResizeGeometry {
 }
 
 pub(crate) enum ResizeOutcome {
-    Applied(VmRecord),
+    Applied(Box<VmRecord>),
     Rejected {
         operation_id: String,
         runtime: RuntimeIdentity,
