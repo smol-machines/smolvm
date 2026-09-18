@@ -52,7 +52,7 @@ impl RuntimeIdentity {
     }
 }
 
-fn host_boot_id() -> Result<Option<String>> {
+pub(crate) fn host_boot_id() -> Result<Option<String>> {
     #[cfg(target_os = "linux")]
     {
         let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
@@ -228,6 +228,7 @@ fn begin_resize_intent(
 }
 
 fn finish_resize_intent(db: &SmolvmDb, name: &str, intent: &ResizeIntent) -> Result<()> {
+    validate_intent_boot(intent, host_boot_id()?.as_deref())?;
     if !crate::process::is_our_process_strict(intent.pid, Some(intent.started)) {
         return Err(Error::agent(
             "live resize",
@@ -235,6 +236,13 @@ fn finish_resize_intent(db: &SmolvmDb, name: &str, intent: &ResizeIntent) -> Res
         ));
     }
     db.finish_resize(name, intent)
+}
+
+fn validate_intent_boot(intent: &ResizeIntent, actual: Option<&str>) -> Result<()> {
+    if intent.boot_id.as_deref() != actual {
+        return Err(Error::agent_conflict("recover resize", "host restarted or its boot identity is unavailable; refusing to replay the previous boot's resize"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -644,6 +652,7 @@ pub(crate) fn reconcile_pending(db: &SmolvmDb, name: &str) -> Result<Option<VmRe
     let Some(intent) = db.pending_resize(name)? else {
         return Ok(None);
     };
+    validate_intent_boot(&intent, host_boot_id()?.as_deref())?;
     if !crate::process::is_our_process_strict(intent.pid, Some(intent.started)) {
         return Err(Error::agent_conflict("recover resize", "original VMM is no longer running; refusing to apply its resize to another machine incarnation"));
     }
@@ -674,6 +683,23 @@ pub(crate) fn reconcile_pending(db: &SmolvmDb, name: &str) -> Result<Option<VmRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_resize_cannot_cross_host_boots_even_with_identical_pid_and_start() {
+        let mut intent = ResizeIntent {
+            token: "operation".into(),
+            pid: 42,
+            started: 100,
+            boot_id: Some("boot-a".into()),
+            target: ResizeTarget::Cpus(4),
+        };
+        validate_intent_boot(&intent, Some("boot-a")).unwrap();
+        assert!(validate_intent_boot(&intent, Some("boot-b")).is_err());
+        assert!(validate_intent_boot(&intent, None).is_err());
+        intent.boot_id = None;
+        assert!(validate_intent_boot(&intent, Some("boot-a")).is_err());
+        validate_intent_boot(&intent, None).unwrap();
+    }
 
     #[test]
     fn runtime_identity_rejects_restarts_pid_reuse_and_missing_identity() {
