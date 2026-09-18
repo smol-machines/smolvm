@@ -361,8 +361,7 @@ pub enum MachineCmd {
     #[command(visible_alias = "list")]
     Ls(LsCmd),
 
-    /// Resize a machine's disk resources (use `update` instead)
-    #[command(hide = true)]
+    /// Grow a running machine's CPUs, RAM, or disks without rebooting
     Resize(ResizeCmd),
 
     /// Modify settings on a stopped machine (mounts, ports, resources, disks)
@@ -2397,6 +2396,49 @@ mod tests {
     struct TestMachineCli {
         #[command(subcommand)]
         command: MachineCmd,
+    }
+
+    #[test]
+    fn live_resize_accepts_absolute_resource_targets() {
+        for (flag, value) in [
+            ("--cpus", "4"),
+            ("--mem", "4096"),
+            ("--storage", "50"),
+            ("--overlay", "20"),
+        ] {
+            let cli = TestMachineCli::try_parse_from([
+                "machine", "resize", "--name", "worker", flag, value,
+            ])
+            .unwrap();
+            let MachineCmd::Resize(cmd) = cli.command else {
+                panic!("expected resize");
+            };
+            assert_eq!(cmd.name.as_deref(), Some("worker"));
+            match flag {
+                "--cpus" => assert_eq!(cmd.cpus, Some(4)),
+                "--mem" => assert_eq!(cmd.mem, Some(4096)),
+                "--storage" => assert_eq!(cmd.storage, Some(50)),
+                _ => assert_eq!(cmd.overlay, Some(20)),
+            }
+        }
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "resize",
+            "--storage",
+            "50",
+            "--overlay",
+            "20"
+        ])
+        .is_ok());
+        assert!(TestMachineCli::try_parse_from(["machine", "resize"]).is_err());
+        for (flag, value) in [
+            ("--cpus", "0"),
+            ("--cpus", "256"),
+            ("--mem", "0"),
+            ("--mem", "-1"),
+        ] {
+            assert!(TestMachineCli::try_parse_from(["machine", "resize", flag, value]).is_err());
+        }
     }
 
     #[test]
@@ -4667,28 +4709,38 @@ impl LsCmd {
 // Resize Command
 // ============================================================================
 
-/// Resize a machine's disk resources.
+/// Grow a machine's resources without rebooting a running workload.
 ///
-/// Expands the storage and/or overlay disk for a stopped machine.
-/// The VM must be stopped before resizing. Disk expansion happens
-/// immediately; filesystem resize occurs automatically on next boot.
+/// Running machines online added resources immediately when the runtime and
+/// guest support hot-add. Stopped machines retain disk expansion support;
+/// use `update` for stopped CPU/RAM settings. Sizes are absolute targets.
 ///
 /// Examples:
 ///   smolvm machine resize --name my-vm --storage 50
 ///   smolvm machine resize --name my-vm --overlay 20
 ///   smolvm machine resize --name my-vm --storage 50 --overlay 20
 ///   smolvm machine resize --storage 50  # default VM
+///   smolvm machine resize --name my-vm --cpus 4
+///   smolvm machine resize --name my-vm --mem 4096
 #[derive(Args, Debug)]
 #[command(group(
     clap::ArgGroup::new("resize-target")
         .required(true)
-        .args(["storage", "overlay"])
+        .args(["cpus", "mem", "storage", "overlay"])
         .multiple(true)
 ))]
 pub struct ResizeCmd {
     /// Machine to resize (default: "default")
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
+
+    /// Target online vCPU count (grow only)
+    #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u8).range(1..))]
+    pub cpus: Option<u8>,
+
+    /// Target usable RAM in MiB (grow only; platform hot-add alignment applies)
+    #[arg(long, value_name = "MiB", value_parser = clap::value_parser!(u32).range(1..))]
+    pub mem: Option<u32>,
 
     /// Storage disk size in GiB (expand only)
     #[arg(long, value_name = "GiB")]
@@ -4704,19 +4756,7 @@ impl ResizeCmd {
         let name = vm_common::resolve_vm_name(self.name)?;
         let name_str = name.as_deref().unwrap_or("default");
 
-        vm_common::resize_vm(name_str, self.storage, self.overlay).map_err(|e| {
-            if matches!(&e, smolvm::Error::InvalidState { .. }) {
-                smolvm::Error::agent(
-                    "resize",
-                    format!(
-                        "VM '{}' is running. Stop it first with: smolvm machine stop --name {}",
-                        name_str, name_str
-                    ),
-                )
-            } else {
-                e
-            }
-        })
+        vm_common::resize_vm(name_str, self.cpus, self.mem, self.storage, self.overlay)
     }
 }
 

@@ -3136,10 +3136,13 @@ pub fn expand_disks(
     Ok(changes)
 }
 
-/// Legacy wrapper: expand disks AND update the DB in one call.
-/// Used by the hidden `machine resize` backward-compat command.
+/// Resize running resources through the shared engine and its durable journal.
+/// Stopped disk expansion retains the previous behavior; CPU/RAM settings for
+/// a stopped machine remain the responsibility of `machine update`.
 pub fn resize_vm(
     name: &str,
+    new_cpus: Option<u8>,
+    new_mem: Option<u32>,
     new_storage_gb: Option<u64>,
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
@@ -3152,6 +3155,43 @@ pub fn resize_vm(
         .ok_or_else(|| smolvm::Error::vm_not_found(name))?
         .clone();
 
+    let actual_state = record.actual_state();
+    if actual_state == RecordState::Running {
+        let kinds = u8::from(new_cpus.is_some())
+            + u8::from(new_mem.is_some())
+            + u8::from(new_storage_gb.is_some() || new_overlay_gb.is_some());
+        if kinds != 1 {
+            return Err(smolvm::Error::config(
+                "live resize",
+                "resize CPUs, RAM, and disks in separate requests",
+            ));
+        }
+        let resized = if let Some(cpus) = new_cpus {
+            smolvm::agent::live_resize::grow_cpus(&db, name, cpus)?
+        } else if let Some(mem) = new_mem {
+            smolvm::agent::live_resize::grow_memory(&db, name, mem)?
+        } else {
+            smolvm::agent::live_resize::grow_disks(&db, name, new_storage_gb, new_overlay_gb)?
+        };
+        println!(
+            "Resized running machine '{name}' without rebooting: {} CPUs, {} MiB RAM",
+            resized.cpus, resized.mem
+        );
+        if let Some(size) = new_storage_gb {
+            println!("Storage filesystem: {size} GiB");
+        }
+        if let Some(size) = new_overlay_gb {
+            println!("Overlay filesystem: {size} GiB");
+        }
+        return Ok(());
+    }
+    if new_cpus.is_some() || new_mem.is_some() {
+        return Err(smolvm::Error::config("resize", "live CPU/RAM resize requires a running machine; use machine update for stopped settings"));
+    }
+    let _source_lock = smolvm::agent::fork::lock_fork_source(name)?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?;
     let actual_state = record.actual_state();
     match actual_state {
         RecordState::Stopped | RecordState::Created => {}
