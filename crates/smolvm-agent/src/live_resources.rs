@@ -4,7 +4,7 @@ use smolvm_protocol::{error_codes, AgentResponse, ManagedDisk};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
-use std::os::unix::fs::{FileExt, FileTypeExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
@@ -314,29 +314,7 @@ pub(crate) fn grow_filesystem(
         );
     };
     let device = device_path(disk);
-    let preflight = (|| -> io::Result<String> {
-        let mut file = File::open(device)?;
-        if !file.metadata()?.file_type().is_block_device() {
-            return Err(io::Error::other("managed disk is not a block device"));
-        }
-        validate_capacity(file.seek(SeekFrom::End(0))?, expected)?;
-        let mounts = std::fs::read_to_string("/proc/mounts")?;
-        let mount = mounts
-            .lines()
-            .find_map(|line| {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                (fields.len() >= 4
-                    && fields[0] == device
-                    && fields[2] == "ext4"
-                    && fields[3].split(',').any(|option| option == "rw"))
-                .then(|| unescape_mount_path(fields[1]))
-            })
-            .ok_or_else(|| {
-                io::Error::other("managed disk must already be mounted read-write as ext4")
-            })?;
-        Ok(mount)
-    })();
-    let mount = match preflight {
+    let mount = match filesystem_mount(disk, expected) {
         Ok(mount) => mount,
         Err(error) => {
             return AgentResponse::error(
@@ -345,11 +323,21 @@ pub(crate) fn grow_filesystem(
             )
         }
     };
-    // The existing exec supervisor bounds runtime and reaps the child on
-    // disconnect. A timeout does not imply rollback: callers must reconcile
-    // the actual filesystem size before retrying. Never invoke e2fsck here.
+    // Run the kernel resize in a supervised subprocess. resize2fs opens the
+    // mounted block device writable, which hardened guest kernels prohibit.
+    // EXT4_IOC_RESIZE_FS instead authorizes growth on the mounted filesystem.
+    // A timeout never implies rollback; the existing journal reconciles it.
+    let disk_name = match disk {
+        ManagedDisk::Storage => "storage",
+        ManagedDisk::Overlay => "overlay",
+    };
     let response = crate::handle_vm_exec(
-        &["resize2fs".into(), device.into()],
+        &[
+            "/proc/self/exe".into(),
+            FILESYSTEM_HELPER.into(),
+            disk_name.into(),
+            expected.to_string(),
+        ],
         &[],
         None,
         Some(120_000),
@@ -361,8 +349,6 @@ pub(crate) fn grow_filesystem(
     }
     let verified = (|| -> io::Result<u64> {
         let _mounted = File::open(mount)?;
-        // Flush the actual mounted filesystem, not /dev's devtmpfs, before
-        // reading its on-disk superblock for the postcondition.
         #[cfg(target_os = "linux")]
         if unsafe { libc::syncfs(_mounted.as_raw_fd()) } != 0 {
             return Err(io::Error::last_os_error());
@@ -385,9 +371,134 @@ pub(crate) fn grow_filesystem(
     }
 }
 
+fn filesystem_mount(disk: ManagedDisk, expected: u64) -> io::Result<String> {
+    let device = device_path(disk);
+    let mut file = File::open(device)?;
+    if !file.metadata()?.file_type().is_block_device() {
+        return Err(io::Error::other("managed disk is not a block device"));
+    }
+    validate_capacity(file.seek(SeekFrom::End(0))?, expected)?;
+    let mounts = std::fs::read_to_string("/proc/mounts")?;
+    let mount = mounts
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.len() >= 4
+                && fields[0] == device
+                && fields[2] == "ext4"
+                && fields[3].split(',').any(|option| option == "rw"))
+            .then(|| unescape_mount_path(fields[1]))
+        })
+        .ok_or_else(|| {
+            io::Error::other("managed disk must already be mounted read-write as ext4")
+        })?;
+    if File::open(&mount)?.metadata()?.dev() != file.metadata()?.rdev() {
+        return Err(io::Error::other("managed filesystem mount changed"));
+    }
+    Ok(mount)
+}
+
+const FILESYSTEM_HELPER: &str = "--smolvm-grow-filesystem";
+
+pub(crate) fn filesystem_helper_requested() -> bool {
+    std::env::args().nth(1).as_deref() == Some(FILESYSTEM_HELPER)
+}
+
+fn filesystem_helper_args(args: &[String]) -> io::Result<(ManagedDisk, u64)> {
+    let [disk, capacity] = args else {
+        return Err(io::Error::other("expected managed disk and capacity"));
+    };
+    let disk = match disk.as_str() {
+        "storage" => ManagedDisk::Storage,
+        "overlay" => ManagedDisk::Overlay,
+        _ => return Err(io::Error::other("unknown managed disk")),
+    };
+    let capacity = capacity.parse::<u64>().map_err(io::Error::other)?;
+    validate_capacity(capacity, capacity)?;
+    Ok((disk, capacity))
+}
+
+pub(crate) fn run_filesystem_helper() -> i32 {
+    let result = filesystem_helper_args(&std::env::args().skip(2).collect::<Vec<_>>())
+        .and_then(|(disk, expected)| online_resize(disk, expected));
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("online filesystem growth failed: {error}");
+            1
+        }
+    }
+}
+
+fn online_resize(disk: ManagedDisk, expected: u64) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mount = File::open(filesystem_mount(disk, expected)?)?;
+        let file = File::open(device_path(disk))?;
+        if mount.metadata()?.dev() != file.metadata()?.rdev() {
+            return Err(io::Error::other("managed filesystem mount changed"));
+        }
+        let mut sb = [0; 1024];
+        file.read_exact_at(&mut sb, 1024)?;
+        let (bytes, block_size) = filesystem_bytes(&sb)?;
+        if bytes > expected {
+            return Err(io::Error::other("filesystem shrink is not supported"));
+        }
+        let blocks = expected / block_size;
+        // Linux ext4 UAPI: _IOW('f', 16, __u64), on a pinned mount descriptor.
+        let request = libc::_IOW::<u64>(b'f' as u32, 16);
+        if bytes / block_size != blocks
+            && unsafe { libc::ioctl(mount.as_raw_fd(), request, &blocks) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::syncfs(mount.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (disk, expected);
+        Err(io::Error::other("online filesystem growth requires Linux"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_helper_accepts_only_managed_disks_and_valid_capacities() {
+        for disk in ["storage", "overlay"] {
+            let (parsed, bytes) =
+                filesystem_helper_args(&[disk.into(), "2147483648".into()]).unwrap();
+            assert_eq!(
+                device_path(parsed),
+                if disk == "storage" {
+                    "/dev/vda"
+                } else {
+                    "/dev/vdb"
+                }
+            );
+            assert_eq!(bytes, 2 << 30);
+        }
+        for args in [
+            vec![],
+            vec!["storage"],
+            vec!["/dev/vda", "512"],
+            vec!["storage", "0"],
+            vec!["storage", "513"],
+            vec!["storage", "-512"],
+            vec!["storage", "18446744073709551616"],
+            vec!["storage", "512", "extra"],
+        ] {
+            assert!(filesystem_helper_args(
+                &args.into_iter().map(String::from).collect::<Vec<_>>()
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn memory_range_rejects_partial_blocks_overflow_and_unbounded_work() {

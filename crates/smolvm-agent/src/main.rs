@@ -242,6 +242,9 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    if live_resources::filesystem_helper_requested() {
+        std::process::exit(live_resources::run_filesystem_helper());
+    }
     if process::container_init_requested() {
         std::process::exit(process::run_container_init());
     }
