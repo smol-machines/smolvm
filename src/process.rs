@@ -2068,7 +2068,8 @@ pub fn is_alive(pid: Pid) -> bool {
         return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     }
     // A CLI cannot waitpid() a VM owned by serve. An exited child still has
-    // a PID until that parent reaps it, but no workload or open files remain.
+    // a PID until that parent reaps it. A zombie *leader*, however, can still
+    // have other threads completing exit and retaining the VM's cgroup/files.
     // Do not make cleanup depend on the parent's next supervisor tick.
     // Unreadable or malformed procfs data is not evidence of exit.
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -2078,11 +2079,18 @@ pub fn is_alive(pid: Pid) -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_stat_has_exited(stat: &str) -> bool {
-    matches!(
-        stat.rsplit_once(") ")
-            .and_then(|(_, fields)| fields.split_ascii_whitespace().next()),
-        Some("Z" | "X" | "x")
-    )
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    let mut fields = fields.split_ascii_whitespace();
+    // Field 3 (state).
+    let state = fields.next();
+    // Field 20 (num_threads), after consuming field 3 above.
+    let threads = fields.nth(16).and_then(|value| value.parse::<u64>().ok());
+    // Do not release ownership while another thread can still touch memory or
+    // disks. The one remaining unreaped zombie belongs to its original parent.
+    // Truncated/unknown thread counts are not evidence of complete exit.
+    matches!(state, Some("Z" | "X" | "x")) && threads == Some(1)
 }
 
 /// Check if a process is alive (Windows).
@@ -3600,13 +3608,35 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn zombie_leader_with_remaining_threads_has_not_exited() {
+        // Captured immediately after the 1060 MiB workload's stop returned.
+        // The leader is Z, but field 20 (num_threads) is still two and the
+        // kernel reports its cgroup populated. Reusing the scope is premature.
+        let stat = "376791 (libkrun VM) Z 1 376791 376782 0 -1 4228364 69130 0 0 0 1002 143 0 0 20 0 2 0 153760195 0 0";
+        assert!(!linux_stat_has_exited(stat));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn exited_state_requires_a_complete_procfs_state_field() {
         for state in ["Z", "X", "x"] {
+            let mut fields = vec!["0"; 18];
+            fields[0] = state;
+            fields[17] = "1";
             assert!(linux_stat_has_exited(&format!(
-                "123 (worker) {state} 1 2 3"
+                "123 (worker) {}",
+                fields.join(" ")
             )));
+            for threads in ["0", "2", "256", "unknown"] {
+                fields[17] = threads;
+                assert!(!linux_stat_has_exited(&format!(
+                    "123 (worker) {}",
+                    fields.join(" ")
+                )));
+            }
         }
         for stat in [
+            "123 (worker) Z 1 2 3",
             "123 (worker) R 1 2 3",
             "123 (worker) D 1 2 3",
             "123 (worker) T 1 2 3",
