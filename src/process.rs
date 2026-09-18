@@ -2577,6 +2577,68 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
 
 /// Missing controllers are not unlimited budgets. Ancestor counter read
 /// failures remain separate errors and must still fail closed.
+#[cfg(target_os = "macos")]
+pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMemoryStats> {
+    if !is_our_process_strict(pid, started) {
+        return Err(Error::agent("RAM resize", "VMM process identity changed"));
+    }
+    // macOS has no cgroup-equivalent VM budget. Admit against free and
+    // purgeable physical pages only, not swap or speculative compression.
+    // This is a conservative preflight, not a reservation against other apps.
+    unsafe extern "C" {
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    let unavailable = || Error::agent("RAM resize", "cannot verify Mac memory headroom");
+    let mut total = 0u64;
+    let mut total_len = std::mem::size_of_val(&total);
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: each output is correctly sized for its native ABI; the acquired
+    // host send right is released even if reading statistics fails.
+    let (sysctl_result, vm_result, page_size) = unsafe {
+        let sysctl_result = libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut total as *mut u64).cast(),
+            &mut total_len,
+            std::ptr::null_mut(),
+            0,
+        );
+        let host = libc::mach_host_self();
+        let vm_result = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast(),
+            &mut count,
+        );
+        mach_port_deallocate(libc::mach_task_self(), host);
+        (sysctl_result, vm_result, libc::sysconf(libc::_SC_PAGESIZE))
+    };
+    if sysctl_result != 0
+        || total_len != 8
+        || total == 0
+        || vm_result != libc::KERN_SUCCESS
+        || count != libc::HOST_VM_INFO64_COUNT
+        || page_size <= 0
+    {
+        return Err(unavailable());
+    }
+    // SAFETY: host_statistics64 succeeded and returned the complete structure.
+    let stats = unsafe { stats.assume_init() };
+    let available = (u64::from(stats.free_count) + u64::from(stats.purgeable_count))
+        .checked_mul(page_size as u64)
+        .ok_or_else(unavailable)?;
+    if !is_our_process_strict(pid, started) {
+        return Err(Error::agent("RAM resize", "VMM process identity changed"));
+    }
+    Ok(HostMemoryStats {
+        total_bytes: total,
+        available_bytes: available.min(total),
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn require_resize_memory_controller(root: &std::path::Path) -> Result<()> {
     let controllers =

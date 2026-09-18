@@ -198,11 +198,11 @@ fn grow_target_locked(db: &SmolvmDb, name: &str, target: ResizeTarget) -> Result
     match target {
         ResizeTarget::Cpus(cpus) => grow_cpus_locked(db, name, cpus),
         ResizeTarget::Memory(memory) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 grow_memory_locked(db, name, memory)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 grow_memory(db, name, memory)
             }
@@ -278,7 +278,7 @@ fn validate_intent_boot(intent: &ResizeIntent, actual: Option<&str>) -> Result<(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub(crate) struct MemoryGrowthInfo {
     boot_mib: u32,
     base: u64,
@@ -287,7 +287,7 @@ pub(crate) struct MemoryGrowthInfo {
     capacity: u64,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl MemoryGrowthInfo {
     pub(crate) fn parse(reply: &str) -> Result<Self> {
         let invalid = || Error::agent("RAM resize", "runtime reported invalid RAM growth geometry");
@@ -356,16 +356,17 @@ fn ensure_live_compute_platform(operation: &str) -> Result<()> {
 fn unsupported_live_memory() -> Error {
     Error::config(
         "RAM resize",
-        "live RAM growth requires a Linux x86_64 or aarch64 host; disk growth is supported separately",
+        "live RAM growth requires Linux x86_64 or aarch64, or macOS Apple Silicon; disk growth is supported separately",
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn ensure_live_memory_platform() -> Result<()> {
     if cfg!(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
-    )) {
+    )) || cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    {
         Ok(())
     } else {
         Err(unsupported_live_memory())
@@ -374,13 +375,13 @@ fn ensure_live_memory_platform() -> Result<()> {
 
 /// Live RAM growth. Host budget changes precede guest exposure; the runtime
 /// reports its boot layout and a durable intent allows interrupted retries.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
     let _source_guard = fork::lock_fork_source(name)?;
     grow_memory_locked(db, name, target_mib)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
     ensure_live_memory_platform()?;
     let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
@@ -421,8 +422,10 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
             ));
         }
     }
+    #[cfg(target_os = "linux")]
     let budget = fork::live_resize_memory_budget(db, name, &record, target_mib)?;
     let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Memory(target_mib))?;
+    #[cfg(target_os = "linux")]
     if !crate::process::raise_managed_vmm_memory_budget(name, pid, started, budget)? {
         // Do not silently resize a guest beyond an external/shared cgroup's
         // allowance. External capacity negotiation is a separate integration.
@@ -484,7 +487,7 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
     db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 /// Reject live RAM growth on hosts without a supported hot-add backend.
 pub fn grow_memory(_db: &SmolvmDb, _name: &str, _target_mib: u32) -> Result<VmRecord> {
     Err(unsupported_live_memory())
@@ -731,11 +734,11 @@ pub(crate) fn reconcile_pending(db: &SmolvmDb, name: &str) -> Result<Option<VmRe
     let record = match intent.target {
         ResizeTarget::Cpus(target) => grow_cpus_locked(db, name, target)?,
         ResizeTarget::Memory(target) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 grow_memory_locked(db, name, target)?
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 grow_memory(db, name, target)?
             }
@@ -763,12 +766,13 @@ mod tests {
     }
 
     #[test]
-    fn live_memory_platform_accepts_linux_arm_and_x86() {
+    fn live_memory_platform_accepts_linux_and_apple_silicon() {
         let result = ensure_live_memory_platform();
         if cfg!(all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
-        )) {
+        )) || cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        {
             assert!(result.is_ok());
         } else {
             assert!(result
