@@ -5,6 +5,7 @@ edition = "2021"
 description = "OCI Distribution client for smolmachines registry"
 license = "Apache-2.0"
 repository = "https://github.com/smol-machines/smolvm"
+readme = "README.md"
 
 [dependencies]
 smolvm-pack = { path = "../smolvm-pack", version = "1.6.1" }

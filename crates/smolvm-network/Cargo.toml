@@ -5,6 +5,7 @@ edition = "2021"
 description = "Host-side virtio-net runtime for smolvm"
 license = "Apache-2.0"
 repository = "https://github.com/smol-machines/smolvm"
+readme = "README.md"
 
 [dependencies]
 crossbeam-queue = "0.3"
