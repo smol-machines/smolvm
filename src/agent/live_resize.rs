@@ -102,21 +102,19 @@ pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecor
     let added_mib = info.target_added_mib(target_mib)?;
     let target_bytes = added_mib << 20;
     let extra_bytes = target_bytes - info.mapped;
+    let (pid, started) = manager
+        .pid_and_start_time()
+        .ok_or_else(|| Error::agent("RAM resize", "VMM process identity is unavailable"))?;
     if extra_bytes > 0 {
-        let available = crate::process::host_memory_stats().ok_or_else(|| {
-            Error::agent("RAM resize", "host memory headroom could not be verified")
-        })?;
+        let available = crate::process::vmm_growth_memory_stats(pid, started)?;
         let reserve = (available.total_bytes / 20).clamp(512 << 20, 4096 << 20);
         if available.available_bytes < extra_bytes.saturating_add(reserve) {
             return Err(Error::agent_conflict(
                 "RAM resize",
-                "insufficient host memory headroom for requested growth",
+                "insufficient host or VMM parent memory headroom for requested growth",
             ));
         }
     }
-    let (pid, started) = manager
-        .pid_and_start_time()
-        .ok_or_else(|| Error::agent("RAM resize", "VMM process identity is unavailable"))?;
     let budget = fork::live_resize_memory_budget(db, name, &record, target_mib)?;
     if !crate::process::raise_managed_vmm_memory_budget(name, pid, started, budget)? {
         // Do not silently resize a guest beyond an external/shared cgroup's
