@@ -2575,8 +2575,7 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
     Ok(stats)
 }
 
-/// Missing controllers are not unlimited budgets. Ancestor counter read
-/// failures remain separate errors and must still fail closed.
+/// Conservative admission for Mac VM growth; macOS has no managed cgroup cap.
 #[cfg(target_os = "macos")]
 pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMemoryStats> {
     if !is_our_process_strict(pid, started) {
@@ -2598,6 +2597,7 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
     let mut count = libc::HOST_VM_INFO64_COUNT;
     // SAFETY: each output is correctly sized for its native ABI; the acquired
     // host send right is released even if reading statistics fails.
+    #[allow(deprecated)] // libc retains the native Mach ABI; no mach2 dependency needed.
     let (sysctl_result, vm_result, page_size) = unsafe {
         let sysctl_result = libc::sysctlbyname(
             c"hw.memsize".as_ptr(),
@@ -2639,6 +2639,8 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
     })
 }
 
+/// Missing controllers are not unlimited budgets. Ancestor counter read
+/// failures remain separate errors and must still fail closed.
 #[cfg(target_os = "linux")]
 fn require_resize_memory_controller(root: &std::path::Path) -> Result<()> {
     let controllers =
