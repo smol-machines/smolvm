@@ -118,6 +118,28 @@ test_machine_resize_running_vm() {
         test $(df -k / | tail -1 | awk "{print \$2}") -gt 1900000
     ' || exit_code=1
 
+    # Exercise newly available blocks on both disks, not just the advertised
+    # capacity. A non-sparse 1100 MiB file cannot fit on either original disk.
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+        for path in /storage/resize-capacity /root/resize-capacity; do
+            dd if=/dev/zero of="$path" bs=1048576 count=1100
+            printf resize-tail >>"$path"
+            test "$(stat -c %s "$path")" = 1153433611
+        done
+        sync
+    ' || exit_code=1
+
+    # A successful live resize must also survive an ordinary stop/start.
+    $SMOLVM machine stop --name "$vm_name" || exit_code=1
+    $SMOLVM machine start --name "$vm_name" || exit_code=1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+        test "$(cat /storage/resize-marker)" = disk-marker
+        for path in /storage/resize-capacity /root/resize-capacity; do
+            test "$(stat -c %s "$path")" = 1153433611
+            test "$(tail -c 11 "$path")" = resize-tail
+        done
+    ' || exit_code=1
+
     # Cleanup must use the path observed while the machine record exists.
     # `machine data-dir` correctly refuses a deleted machine name.
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
