@@ -884,6 +884,9 @@ pub struct StopResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResizeMachineRequest {
+    /// Stable operation identity for safe retries; requires expectedRuntime.
+    #[serde(default)]
+    pub operation_id: Option<String>,
     /// Refuse growth if this observed runtime has exited or been replaced.
     #[serde(default)]
     pub expected_runtime: Option<crate::agent::live_resize::RuntimeIdentity>,

@@ -4368,6 +4368,7 @@ pub async fn resize_machine(
                 &resize_name,
                 target,
                 req.expected_runtime.as_ref(),
+                req.operation_id.as_deref(),
             )
         })
         .await
@@ -4376,9 +4377,12 @@ pub async fn resize_machine(
             crate::Error::Config { .. } => ApiError::BadRequest(error.to_string()),
             other => ApiError::from(other),
         })?;
-        return Ok(Json(record_to_info(&name, &record)));
+        return match record {
+            crate::agent::live_resize::ResizeOutcome::Applied(record) => Ok(Json(record_to_info(&name, &record))),
+            crate::agent::live_resize::ResizeOutcome::Rejected { operation_id, runtime, message } => Err(ApiError::ResizeRejected { operation_id, runtime, message }),
+        };
     }
-    if req.expected_runtime.is_some() {
+    if req.expected_runtime.is_some() || req.operation_id.is_some() {
         return Err(ApiError::Conflict(
             "observed machine runtime is no longer running; inspect it before resizing".into(),
         ));

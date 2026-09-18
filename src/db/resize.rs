@@ -19,7 +19,68 @@ pub(crate) struct ResizeIntent {
     pub target: ResizeTarget,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ResizeReceiptState {
+    Active,
+    Rejected { message: String },
+    Applied,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ResizeReceipt {
+    pub operation_id: String,
+    pub runtime: crate::agent::live_resize::RuntimeIdentity,
+    pub target: ResizeTarget,
+    pub original: crate::agent::live_resize::ResizeGeometry,
+    pub state: ResizeReceiptState,
+}
+
 impl SmolvmDb {
+    /// Bind retries to one runtime and target before dispatch. Terminal receipts
+    /// survive server restarts and remain until the machine is deleted.
+    pub(crate) fn begin_resize_receipt(&self, name: &str, request: &ResizeReceipt) -> Result<ResizeReceipt> {
+        if request.operation_id.is_empty() || request.operation_id.len() > 128
+            || !request.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || request.state != ResizeReceiptState::Active {
+            return Err(Error::config("live resize", "invalid resize operation identity"));
+        }
+        self.with_durable_resize_write(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).db_err("begin resize receipt")?;
+            let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM vms WHERE name = ?1)", params![name], |r| r.get(0)).db_err("check resize receipt machine")?;
+            if !exists { return Err(Error::vm_not_found(name)); }
+            let existing: Option<Vec<u8>> = tx.query_row("SELECT data FROM vm_resize_receipts WHERE name = ?1 AND operation_id = ?2",
+                params![name, request.operation_id], |r| r.get(0)).optional().db_err("read resize receipt")?;
+            let receipt = if let Some(bytes) = existing {
+                let previous: ResizeReceipt = serde_json::from_slice(&bytes).db_err("decode resize receipt")?;
+                if previous.runtime != request.runtime || previous.target != request.target {
+                    return Err(Error::agent_conflict("live resize", "resize operation identity was already used for another runtime or target"));
+                }
+                previous
+            } else {
+                tx.execute("INSERT INTO vm_resize_receipts (name,operation_id,data) VALUES (?1,?2,?3)",
+                    params![name, request.operation_id, serde_json::to_vec(request).db_err("encode resize receipt")?]).db_err("save resize receipt")?;
+                request.clone()
+            };
+            tx.commit().db_err("commit resize receipt")?;
+            Ok(receipt)
+        })
+    }
+
+    pub(crate) fn finish_resize_receipt(&self, name: &str, expected: &ResizeReceipt, terminal: ResizeReceiptState) -> Result<()> {
+        if expected.state != ResizeReceiptState::Active || terminal == ResizeReceiptState::Active {
+            return Err(Error::config("live resize", "invalid resize receipt transition"));
+        }
+        let mut completed = expected.clone();
+        completed.state = terminal;
+        self.with_durable_resize_write(|conn| {
+            let updated = conn.execute("UPDATE vm_resize_receipts SET data = ?1 WHERE name = ?2 AND operation_id = ?3 AND data = ?4",
+                params![serde_json::to_vec(&completed).db_err("encode completed resize receipt")?, name, expected.operation_id,
+                    serde_json::to_vec(expected).db_err("encode active resize receipt")?]).db_err("finish resize receipt")?;
+            if updated != 1 { return Err(Error::agent_conflict("live resize", "resize receipt ownership changed")); }
+            Ok(())
+        })
+    }
+
     pub(crate) fn pending_resize(&self, name: &str) -> Result<Option<ResizeIntent>> {
         self.with_read_conn(|conn| {
             let bytes: Option<Vec<u8>> = conn
