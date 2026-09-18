@@ -2546,6 +2546,7 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
     if !verify() {
         return Err(Error::agent("RAM resize", "VMM process identity changed"));
     }
+    require_resize_memory_controller(std::path::Path::new("/sys/fs/cgroup"))?;
     let dir = cgroup_v2_process_dir(pid)
         .ok_or_else(|| Error::agent("RAM resize", "cannot resolve VMM memory hierarchy"))?;
     let stats = std::fs::read_to_string("/proc/meminfo")
@@ -2572,6 +2573,28 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
         ));
     }
     Ok(stats)
+}
+
+/// Missing controllers are not unlimited budgets. Ancestor counter read
+/// failures remain separate errors and must still fail closed.
+#[cfg(target_os = "linux")]
+fn require_resize_memory_controller(root: &std::path::Path) -> Result<()> {
+    let controllers =
+        std::fs::read_to_string(root.join("cgroup.controllers")).map_err(|error| {
+            Error::agent(
+                "RAM resize",
+                format!(
+                    "cannot verify host cgroup controllers: {error}; guest RAM has not changed"
+                ),
+            )
+        })?;
+    if !controllers.split_whitespace().any(|name| name == "memory") {
+        return Err(Error::config(
+            "RAM resize",
+            "live RAM growth requires an enabled and delegated cgroup-v2 memory controller to enforce VM limits; it is unavailable in this host hierarchy; check the host boot configuration and cgroup delegation; guest RAM has not changed",
+        ));
+    }
+    Ok(())
 }
 
 /// Report effective host memory available to SmolVM.
@@ -3748,6 +3771,25 @@ mod tests {
             constrain_memory_to_ancestors(host, std::path::Path::new("/outside"), root.path())
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resize_admission_requires_available_memory_controller() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cgroup.controllers");
+        assert!(require_resize_memory_controller(root.path()).is_err());
+        for controllers in ["", "cpuset cpu io pids\n", "memory_extra\n"] {
+            std::fs::write(&path, controllers).unwrap();
+            let error = require_resize_memory_controller(root.path()).unwrap_err();
+            assert!(error.to_string().contains("memory controller"));
+            assert!(error.to_string().contains("guest RAM has not changed"));
+        }
+        std::fs::write(&path, "cpuset cpu io memory pids\n").unwrap();
+        require_resize_memory_controller(root.path()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(require_resize_memory_controller(root.path()).is_err());
     }
 
     #[cfg(target_os = "linux")]
