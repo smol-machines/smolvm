@@ -541,11 +541,11 @@ fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
             "machine must be running",
         ));
     }
-    if target == 0 || target < record.cpus {
-        return Err(Error::config(
-            "CPU resize",
-            "CPU count cannot shrink or be zero",
-        ));
+    if target == 0 {
+        return Err(Error::config("CPU resize", "CPU count cannot be zero"));
+    }
+    if target < record.cpus {
+        return shrink_cpus_locked(db, name, target);
     }
     let manager = AgentManager::for_vm(name)?;
     let mut client = AgentClient::connect(manager.vsock_socket())?;
@@ -558,7 +558,7 @@ fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
     let socket = fork::control_socket_path(name);
     let (created, capacity) =
         cpu_status(&fork::control_socket_cmd(&socket, "PROTOTYPE_CPU_STATUS")?)?;
-    if target < created || target > capacity {
+    if target > capacity {
         return Err(Error::config(
             "CPU resize",
             format!(
@@ -571,20 +571,22 @@ fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
         .ok_or_else(|| Error::agent("CPU resize", "VMM process identity is unavailable"))?;
     let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Cpus(target))?;
     crate::process::set_managed_vmm_cpu_count(name, pid, started, target)?;
-    let reply = fork::control_socket_cmd(&socket, &format!("PROTOTYPE_GROW_CPUS {target}"))?;
-    if reply.trim() != format!("OK created {target} vCPUs; guest online required") {
+    let required_slots = target.max(created);
+    let reply =
+        fork::control_socket_cmd(&socket, &format!("PROTOTYPE_GROW_CPUS {required_slots}"))?;
+    if reply.trim() != format!("OK created {required_slots} vCPUs; guest online required") {
         return Err(Error::agent("CPU resize", format!("CPU creation incomplete: {reply}; quota may already be raised, reconcile before retrying")));
     }
     let (actual, _) = cpu_status(&fork::control_socket_cmd(&socket, "PROTOTYPE_CPU_STATUS")?)?;
-    if actual != target {
+    if actual != required_slots {
         return Err(Error::agent(
             "CPU resize",
             "runtime did not verify the requested CPU count",
         ));
     }
-    db.update_vm(name, |record| record.cpus = actual)?
+    db.update_vm(name, |record| record.cpus = target)?
         .ok_or_else(|| Error::agent("CPU resize", "CPUs created but machine record disappeared"))?;
-    client.online_cpus(actual).map_err(|error| {
+    client.online_cpus(target).map_err(|error| {
         Error::agent(
             "CPU resize",
             format!(
@@ -595,6 +597,50 @@ fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
     finish_resize_intent(db, name, &intent)?;
     db.get_vm(name)?
         .ok_or_else(|| Error::VmNotFound { name: name.into() })
+}
+
+fn shrink_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
+    // HVF must implement CPU_OFF and checkpoint its powered-off state before
+    // this can safely be widened to macOS. Reject before touching the guest.
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(Error::config("CPU shrink", "live CPU shrink requires Linux x86_64 with offline-CPU checkpoint support; no CPUs changed"));
+    }
+    let manager = AgentManager::for_vm(name)?;
+    let socket = fork::control_socket_path(name);
+    if fork::control_socket_cmd(&socket, "CPU_SHRINK_CAPABILITIES")?.trim()
+        != "OK preserved-offline-cpu-slots-v1"
+    {
+        return Err(Error::config(
+            "CPU shrink",
+            "loaded runtime cannot safely restore offlined CPUs; no CPUs changed",
+        ));
+    }
+    let (created, _) = cpu_status(&fork::control_socket_cmd(&socket, "PROTOTYPE_CPU_STATUS")?)?;
+    if target == 0 || target > created {
+        return Err(Error::config(
+            "CPU shrink",
+            "target must retain CPU0 and fit existing CPU slots",
+        ));
+    }
+    let mut client = AgentClient::connect(manager.vsock_socket())?;
+    if !client.supports_capability(smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY)? {
+        return Err(Error::config(
+            "CPU shrink",
+            "running guest lacks CPU shrink support; no CPUs changed",
+        ));
+    }
+    let (pid, started) = manager
+        .pid_and_start_time()
+        .ok_or_else(|| Error::agent("CPU shrink", "VMM process identity unavailable"))?;
+    let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Cpus(target))?;
+    client.offline_cpus(target)?;
+    // Quota is reduced only after the kernel has successfully offlined the
+    // trailing CPUs and the agent has verified the complete resulting set.
+    crate::process::set_managed_vmm_cpu_count(name, pid, started, target)?;
+    db.update_vm(name, |record| record.cpus = target)?
+        .ok_or_else(|| Error::vm_not_found(name))?;
+    finish_resize_intent(db, name, &intent)?;
+    db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))
 }
 
 /// Grow running disks and their mounted filesystems without restarting the VM.
