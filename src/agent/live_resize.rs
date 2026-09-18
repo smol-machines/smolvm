@@ -19,14 +19,28 @@ pub struct RuntimeIdentity {
     pub pid: i32,
     /// Platform-native process start timestamp, treated as an opaque value.
     pub start_time: u64,
+    /// Linux host boot identity; process start times are relative to this boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 
 impl RuntimeIdentity {
     /// Observe a live smolvm process, refusing unverifiable identities.
     pub fn observe(pid: i32) -> Option<Self> {
         let start_time = crate::process::process_start_time(pid)?;
-        crate::process::is_our_process_strict(pid, Some(start_time))
-            .then_some(Self { pid, start_time })
+        let boot_id = host_boot_id().ok()?;
+        crate::process::is_our_process_strict(pid, Some(start_time)).then_some(Self {
+            pid,
+            start_time,
+            boot_id,
+        })
+    }
+
+    fn validate_boot(&self, actual: Option<&str>) -> Result<()> {
+        if self.boot_id.as_deref() != actual {
+            return Err(Error::agent_conflict("live resize", "host restarted or its boot identity is unavailable; inspect the machine before resizing"));
+        }
+        Ok(())
     }
 
     fn validate(&self, actual: Option<(i32, Option<u64>)>) -> Result<()> {
@@ -35,6 +49,26 @@ impl RuntimeIdentity {
                 "machine restarted or its runtime identity is unavailable; inspect it before resizing"));
         }
         Ok(())
+    }
+}
+
+fn host_boot_id() -> Result<Option<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| Error::agent("runtime identity", error.to_string()))?;
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::agent(
+                "runtime identity",
+                "host boot identity is empty",
+            ));
+        }
+        Ok(Some(id.to_owned()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
     }
 }
 
@@ -50,6 +84,7 @@ pub(crate) fn grow_checked(
     if let Some(expected) = expected {
         let manager = AgentManager::for_vm(name)?;
         expected.validate(manager.pid_and_start_time())?;
+        expected.validate_boot(host_boot_id()?.as_deref())?;
         if !crate::process::is_our_process_strict(expected.pid, Some(expected.start_time)) {
             return Err(Error::agent_conflict(
                 "live resize",
@@ -541,8 +576,17 @@ mod tests {
         let expected = RuntimeIdentity {
             pid: 42,
             start_time: 100,
+            boot_id: None,
         };
         expected.validate(Some((42, Some(100)))).unwrap();
+        let boot_bound = RuntimeIdentity {
+            boot_id: Some("boot-a".into()),
+            ..expected.clone()
+        };
+        boot_bound.validate_boot(Some("boot-a")).unwrap();
+        assert!(boot_bound.validate_boot(Some("boot-b")).is_err());
+        assert!(boot_bound.validate_boot(None).is_err());
+        assert!(expected.validate_boot(Some("boot-a")).is_err());
         for actual in [
             None,
             Some((42, None)),
@@ -553,7 +597,8 @@ mod tests {
         }
         assert!(RuntimeIdentity {
             pid: 0,
-            start_time: 100
+            start_time: 100,
+            boot_id: None,
         }
         .validate(Some((0, Some(100))))
         .is_err());
