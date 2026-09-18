@@ -394,6 +394,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub block_io: crate::data::resources::BlockIoEngine,
 
+    /// Host disks attached beyond the managed storage and overlay disks
+    /// (`--disk`). Persisted so every start re-attaches them in the same order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<crate::data::disk::AttachedDisk>,
+
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
@@ -713,6 +718,7 @@ impl VmRecord {
             cpus,
             mem,
             block_io: Default::default(),
+            disks: Vec::new(),
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -786,6 +792,7 @@ impl VmRecord {
             cpus,
             mem,
             block_io: Default::default(),
+            disks: Vec::new(),
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -1022,6 +1029,7 @@ impl VmRecord {
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             block_io: self.block_io,
+            disks: self.disks.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
@@ -1483,6 +1491,38 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.storage_gb, Some(50));
         assert_eq!(deserialized.overlay_gb, Some(20));
+    }
+
+    /// Attached disks must survive the record: `start` re-attaches from the
+    /// record, so a disk that round-trips badly silently disappears on restart.
+    #[test]
+    fn attached_disks_round_trip_and_default_to_empty() {
+        let legacy = r#"{"name":"legacy"}"#;
+        let record: VmRecord = serde_json::from_str(legacy).unwrap();
+        assert!(
+            record.disks.is_empty(),
+            "a record predating --disk has none"
+        );
+
+        let mut record = VmRecord::new("db".to_string(), 2, 512, vec![], vec![], false);
+        record.disks = vec![
+            crate::data::disk::AttachedDisk {
+                path: std::path::PathBuf::from("/dev/nvme1n1"),
+                read_only: false,
+            },
+            crate::data::disk::AttachedDisk {
+                path: std::path::PathBuf::from("/srv/golden.img"),
+                read_only: true,
+            },
+        ];
+        let decoded: VmRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded.disks, record.disks, "order and mode are preserved");
+        assert_eq!(
+            decoded.vm_resources().disks,
+            record.disks,
+            "and they reach the launcher through vm_resources()"
+        );
     }
 
     #[test]

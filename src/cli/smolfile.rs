@@ -125,6 +125,7 @@ pub fn build_create_params(
                 || cli_dns.is_some()
                 || cli_network_name.is_some();
             return Ok(CreateVmParams {
+                disks: Vec::new(),
                 secret_refs: Default::default(),
                 name,
                 labels: cli_labels,
@@ -359,6 +360,7 @@ pub fn build_create_params(
         .and_then(|s| parse_duration_secs(s));
 
     Ok(CreateVmParams {
+        disks: Vec::new(),
         nested_virt: false,
         labels: cli_labels,
         secret_refs: sf.secrets,

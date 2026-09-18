@@ -88,6 +88,10 @@ pub struct VmResources {
     /// Host block I/O engine. Defaults to the historical synchronous path.
     #[serde(default)]
     pub block_io: BlockIoEngine,
+    /// Host disks attached beyond the managed storage and overlay disks, in
+    /// order, surfacing as `/dev/vdc`, `/dev/vdd`, ... Empty for most machines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<crate::data::disk::AttachedDisk>,
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -181,6 +185,7 @@ impl Default for VmResources {
             storage_gib: None,
             overlay_gib: None,
             block_io: BlockIoEngine::Sync,
+            disks: Vec::new(),
             allowed_cidrs: None,
             dns: None,
             network_name: None,

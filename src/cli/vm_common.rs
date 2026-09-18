@@ -478,6 +478,8 @@ pub struct CreateVmParams {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub block_io: smolvm::data::resources::BlockIoEngine,
+    /// Host disks attached beyond storage and overlay (`--disk`).
+    pub disks: Vec<smolvm::data::disk::AttachedDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
@@ -721,6 +723,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.block_io = params.block_io;
+    record.disks = params.disks.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
@@ -1912,6 +1915,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.storage_gb = o.storage_gb;
     r.overlay_gb = o.overlay_gb;
     r.block_io = o.block_io;
+    r.disks = o.disks.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
     r.init = o.init.clone();
     r.init_completed = false;
@@ -1982,6 +1986,8 @@ pub struct DefaultVmOverrides {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub block_io: smolvm::data::resources::BlockIoEngine,
+    /// Host disks attached beyond storage and overlay (`--disk`).
+    pub disks: Vec<smolvm::data::disk::AttachedDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -2028,6 +2034,7 @@ impl DefaultVmOverrides {
             storage_gb: params.storage_gb,
             overlay_gb: params.overlay_gb,
             block_io: params.block_io,
+            disks: params.disks.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
             init: params.init.clone(),
             env: smolvm::util::parse_env_list(&params.env),
@@ -2835,6 +2842,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "storage_gb": record.storage_gb,
         "overlay_gb": record.overlay_gb,
         "block_io": record.block_io,
+        "disks": record.disks,
         "image": record.image,
         "entrypoint": record.entrypoint,
         "cmd": record.cmd,

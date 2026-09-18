@@ -2408,6 +2408,18 @@ impl AgentManager {
             pack_idmap_source,
             extra_disks: {
                 let mut __d = features.extra_disks;
+                // `--disk` values recorded on the machine, re-attached on every
+                // start in the order given. Format is read from the file's magic
+                // rather than assumed: a block device and a raw image are both
+                // `Raw`, but an attached qcow2 must be declared qcow2 or libkrun
+                // exposes its header as the whole device.
+                for disk in &resources_for_config.disks {
+                    __d.push((
+                        disk.path.clone(),
+                        disk.read_only,
+                        crate::data::disk::detect_disk_format(&disk.path),
+                    ));
+                }
                 if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
                     for entry in spec.split(',').filter(|s| !s.is_empty()) {
                         let (path, ro) = match entry.strip_suffix(":ro") {

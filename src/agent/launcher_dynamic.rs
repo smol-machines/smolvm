@@ -647,6 +647,47 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    // Attached host disks (`--disk`), after storage and overlay, so they land on
+    // /dev/vdc onward in the order the machine recorded. The static launcher has
+    // carried these for the from-vm export helper; the dynamic path dropped them,
+    // which silently gave a packed machine fewer disks than it asked for.
+    for (i, disk) in config.resources.disks.iter().enumerate() {
+        let attached_id = try_or_free_ctx!(
+            CString::new(format!("attached{i}")),
+            "attached disk id contains null byte"
+        );
+        let attached_path =
+            try_or_free_ctx!(path_to_cstring(&disk.path), "disk path contains null byte");
+        let format = crate::data::disk::detect_disk_format(&disk.path).to_krun_u32();
+        let result = if disk.read_only {
+            unsafe {
+                (krun.add_disk2)(
+                    ctx,
+                    attached_id.as_ptr(),
+                    attached_path.as_ptr(),
+                    format,
+                    true,
+                )
+            }
+        } else {
+            add_dynamic_block_disk(
+                krun,
+                ctx,
+                attached_id.as_ptr(),
+                attached_path.as_ptr(),
+                format,
+                config.resources.block_io,
+            )
+        };
+        if result < 0 {
+            free_ctx_on_err!(dynamic_block_error(
+                &format!("attached disk {} ({})", i, disk.path.display()),
+                config.resources.block_io,
+                result
+            ));
+        }
+    }
+
     // Add vsock port for control channel
     let socket_path = try_or_free_ctx!(
         path_to_cstring(config.vsock_socket),

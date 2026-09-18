@@ -651,6 +651,14 @@ pub struct RunCmd {
     #[arg(long = "block-io", value_enum, help_heading = "Resources")]
     pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
 
+    /// Attach a host disk image or block device (repeatable), appearing in the
+    /// guest as /dev/vdc, /dev/vdd, ... in the order given. Append `:ro` for
+    /// read-only. The disk is handed over raw — smolvm never formats or mounts
+    /// it — so a machine can put, say, a database's WAL on a different device
+    /// from its data.
+    #[arg(long = "disk", value_name = "PATH[:ro]", help_heading = "Resources")]
+    pub disk: Vec<String>,
+
     /// Load VM configuration from a Smolfile (TOML)
     #[arg(
         long = "smolfile",
@@ -1258,6 +1266,7 @@ impl RunCmd {
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
+        params.disks = parse_attached_disks(&self.disk)?;
         params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
@@ -1579,6 +1588,7 @@ impl RunCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
+            disks: Vec::new(),
         };
         validate_requested_network_backend(
             &resources,
@@ -2644,6 +2654,30 @@ mod tests {
         assert!(cmd.auto_graph);
     }
 
+    /// `--disk` is repeatable and order-preserving: the guest sees them as
+    /// /dev/vdc, /dev/vdd, ... in the order given, so order is meaningful.
+    #[test]
+    fn disk_flag_is_repeatable_and_keeps_order() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "db",
+            "--disk",
+            "/dev/nvme1n1",
+            "--disk",
+            "/srv/golden.img:ro",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.disk, vec!["/dev/nvme1n1", "/srv/golden.img:ro"]);
+
+        let parsed = parse_attached_disks(&cmd.disk)
+            .expect_err("validation runs at create, so absent paths are refused up front");
+        assert!(format!("{parsed}").contains("/dev/nvme1n1"));
+    }
+
     #[test]
     fn block_io_defaults_to_unset_and_accepts_async() {
         let cli = TestMachineCli::parse_from(["machine", "create", "--name", "default"]);
@@ -3244,6 +3278,14 @@ pub struct CreateCmd {
     #[arg(long = "block-io", value_enum)]
     pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
 
+    /// Attach a host disk image or block device (repeatable), appearing in the
+    /// guest as /dev/vdc, /dev/vdd, ... in the order given. Append `:ro` for
+    /// read-only. The disk is handed over raw — smolvm never formats or mounts
+    /// it — so a machine can put, say, a database's WAL on a different device
+    /// from its data.
+    #[arg(long = "disk", value_name = "PATH[:ro]")]
+    pub disk: Vec<String>,
+
     /// Mount host directory (can be used multiple times). Also accepts
     /// S3-compatible object storage, mounted inside the guest on every start:
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
@@ -3402,6 +3444,24 @@ pub struct CreateCmd {
     pub command: Vec<String>,
 }
 
+/// Parse and validate every `--disk` value.
+///
+/// Validation happens at create/run time rather than at boot: a machine
+/// recorded against an unreadable device would otherwise fail every start with
+/// a virtio-blk error that names neither the disk nor the reason.
+fn parse_attached_disks(specs: &[String]) -> smolvm::Result<Vec<smolvm::data::disk::AttachedDisk>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let disk = smolvm::data::disk::AttachedDisk::parse(spec)
+                .map_err(|e| smolvm::Error::agent("attach disk", e))?;
+            disk.validate()
+                .map_err(|e| smolvm::Error::agent("attach disk", e))?;
+            Ok(disk)
+        })
+        .collect()
+}
+
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
         // Everything after `--` is the workload, so machine options written
@@ -3486,6 +3546,10 @@ impl CreateCmd {
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
+        // Attached host disks are validated at create, not at start: a machine
+        // recorded against an unreadable device would fail every start with a
+        // virtio-blk error that says nothing about which disk or why.
+        params.disks = parse_attached_disks(&self.disk)?;
 
         // Resolve the image source on the host now, AFTER the CLI flag and the
         // Smolfile have been merged, so both take the same path: a registry
@@ -3538,6 +3602,7 @@ impl CreateCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
+            disks: Vec::new(),
         };
         // Reject zero-valued resources before the machine is persisted.
         // Without this, `machine create` succeeds and the failure only
@@ -3751,6 +3816,7 @@ impl CreateCmd {
             None => None,
         };
         let params = vm_common::CreateVmParams {
+            disks: Vec::new(),
             nested_virt: self.nested_virt,
             secret_refs: manifest.secret_refs,
             name,
@@ -3873,6 +3939,7 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             block_io: params.block_io,
+            disks: Vec::new(),
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
         resources.validate()?;
