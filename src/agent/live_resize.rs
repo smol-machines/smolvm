@@ -104,6 +104,11 @@ impl MemoryGrowthInfo {
 #[cfg(target_os = "linux")]
 pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
     let _source_guard = fork::lock_fork_source(name)?;
+    grow_memory_locked(db, name, target_mib)
+}
+
+#[cfg(target_os = "linux")]
+fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
     let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
     if record.actual_state() != RecordState::Running {
         return Err(Error::agent_conflict(
@@ -243,6 +248,10 @@ fn cpu_status(reply: &str) -> Result<(u8, u8)> {
 /// Preserve created CPU count even if subsequent guest onlining fails.
 pub fn grow_cpus(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
     let _source_guard = fork::lock_fork_source(name)?;
+    grow_cpus_locked(db, name, target)
+}
+
+fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
     let record = db
         .get_vm(name)?
         .ok_or_else(|| Error::VmNotFound { name: name.into() })?;
@@ -319,6 +328,15 @@ pub fn grow_disks(
     overlay_gb: Option<u64>,
 ) -> Result<VmRecord> {
     let _source_guard = fork::lock_fork_source(name)?;
+    grow_disks_locked(db, name, storage_gb, overlay_gb)
+}
+
+fn grow_disks_locked(
+    db: &SmolvmDb,
+    name: &str,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+) -> Result<VmRecord> {
     let record = db
         .get_vm(name)?
         .ok_or_else(|| Error::VmNotFound { name: name.into() })?;
@@ -412,6 +430,44 @@ pub fn grow_disks(
     finish_resize_intent(db, name, &intent)?;
     db.get_vm(name)?
         .ok_or_else(|| Error::config("live resize", "machine record disappeared"))
+}
+
+/// Finish only an intent still belonging to this exact running VMM. The API
+/// caller also holds its lifecycle mutex; the flock protects against other
+/// processes and makes re-reading the intent and choosing its target atomic
+/// with respect to ordinary resize/branch/checkpoint operations.
+pub(crate) fn reconcile_pending(db: &SmolvmDb, name: &str) -> Result<Option<VmRecord>> {
+    let Some(_source_guard) = fork::try_lock_fork_source(name)? else {
+        return Ok(None);
+    };
+    let Some(intent) = db.pending_resize(name)? else {
+        return Ok(None);
+    };
+    if !crate::process::is_our_process_strict(intent.pid, Some(intent.started)) {
+        return Err(Error::agent_conflict("recover resize", "original VMM is no longer running; refusing to apply its resize to another machine incarnation"));
+    }
+    let manager = AgentManager::for_vm(name)?;
+    if manager.pid_and_start_time() != Some((intent.pid, Some(intent.started))) {
+        return Err(Error::agent_conflict(
+            "recover resize",
+            "machine identity no longer matches pending resize",
+        ));
+    }
+    let record = match intent.target {
+        ResizeTarget::Cpus(target) => grow_cpus_locked(db, name, target)?,
+        ResizeTarget::Memory(target) => {
+            #[cfg(target_os = "linux")]
+            {
+                grow_memory_locked(db, name, target)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                grow_memory(db, name, target)?
+            }
+        }
+        ResizeTarget::Disks { storage, overlay } => grow_disks_locked(db, name, storage, overlay)?,
+    };
+    Ok(Some(record))
 }
 
 #[cfg(test)]

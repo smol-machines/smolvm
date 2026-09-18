@@ -364,6 +364,10 @@ impl ServeStartCmd {
                 smolvm::api::pool_controller::ForkPoolController::new(pool_state, pool_shutdown);
             controller.run().await;
         });
+        let resize_controller_handle = tokio::spawn(smolvm::api::resize_controller::run(
+            state.clone(),
+            shutdown_rx.clone(),
+        ));
 
         // Create router
         let drain_state = state.clone();
@@ -407,6 +411,11 @@ impl ServeStartCmd {
             }
         }
         server_result?;
+        // A blocking resize retains lifecycle ownership until its bounded
+        // runtime/agent calls finish. Do not drain/detach underneath that work.
+        if let Err(error) = resize_controller_handle.await {
+            tracing::error!(%error, "resize recovery controller failed during shutdown");
+        }
         let mut pool_controller_handle = pool_controller_handle;
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
