@@ -25,7 +25,12 @@ cleanup() {
         guest 'cat /run/ram-probe.log; cat /proc/meminfo; dmesg | tail -60' || true
     fi
     for ((index=${#owned_names[@]}-1; index>=0; index--)); do
-        machine delete --name "${owned_names[index]}" --force || true
+        if ! machine delete --name "${owned_names[index]}" --force; then
+            printf 'Failed to clean up test machine: %s\n' "${owned_names[index]}" >&2
+            # Preserve an earlier failure, but never report a clean acceptance
+            # run when an owned VM may still be running.
+            if test "$result" -eq 0; then result=1; fi
+        fi
     done
     printf 'live_ram_resize_exit=%s retained_root=%s\n' "$result" "$root"
     exit "$result"
