@@ -78,6 +78,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     let stats = pid.and_then(crate::process::process_stats);
     let memory_stats = pid.and_then(crate::process::process_memory_stats);
     MachineInfo {
+        runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name: name.to_string(),
         image: record.image.clone(),
         state: actual_state.to_string(),
@@ -4339,18 +4340,22 @@ pub async fn resize_machine(
             // Keep lifecycle ownership if the HTTP request is cancelled while
             // a disk or filesystem operation is still running.
             let _guard = guard;
-            if let Some(cpus) = req.cpus {
-                crate::agent::live_resize::grow_cpus(&db, &resize_name, cpus)
+            let target = if let Some(cpus) = req.cpus {
+                crate::db::ResizeTarget::Cpus(cpus)
             } else if let Some(mem) = req.mem {
-                crate::agent::live_resize::grow_memory(&db, &resize_name, mem)
+                crate::db::ResizeTarget::Memory(mem)
             } else {
-                crate::agent::live_resize::grow_disks(
-                    &db,
-                    &resize_name,
-                    req.storage_gb,
-                    req.overlay_gb,
-                )
-            }
+                crate::db::ResizeTarget::Disks {
+                    storage: req.storage_gb,
+                    overlay: req.overlay_gb,
+                }
+            };
+            crate::agent::live_resize::grow_checked(
+                &db,
+                &resize_name,
+                target,
+                req.expected_runtime.as_ref(),
+            )
         })
         .await
         .map_err(|error| ApiError::internal(format!("live resize task failed: {error}")))?
@@ -4359,6 +4364,11 @@ pub async fn resize_machine(
             other => ApiError::from(other),
         })?;
         return Ok(Json(record_to_info(&name, &record)));
+    }
+    if req.expected_runtime.is_some() {
+        return Err(ApiError::Conflict(
+            "observed machine runtime is no longer running; inspect it before resizing".into(),
+        ));
     }
     if req.cpus.is_some() || req.mem.is_some() {
         return Err(ApiError::BadRequest(
@@ -5469,6 +5479,7 @@ mod tests {
 
         let req = ResizeMachineRequest {
             storage_gb: Some(10),
+            expected_runtime: None,
             overlay_gb: None,
             cpus: None,
             mem: None,
@@ -5485,6 +5496,7 @@ mod tests {
 
         let req = ResizeMachineRequest {
             storage_gb: None,
+            expected_runtime: None,
             overlay_gb: None,
             cpus: None,
             mem: None,
@@ -5498,6 +5510,7 @@ mod tests {
         let (_dir, state) = setup_test_state();
         let req = ResizeMachineRequest {
             storage_gb: Some(30),
+            expected_runtime: None,
             overlay_gb: None,
             cpus: None,
             mem: None,

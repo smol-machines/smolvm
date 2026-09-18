@@ -1739,6 +1739,10 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     let disk_used_mb = crate::agent::disk_used_mb(&name);
 
     MachineInfo {
+        runtime: entry
+            .manager
+            .child_pid()
+            .and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name,
         image: entry.image.clone(),
         state: state.to_string(),

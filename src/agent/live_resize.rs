@@ -11,6 +11,68 @@ use crate::{Error, Result};
 use smolvm_protocol::{ManagedDisk, ONLINE_FILESYSTEM_GROWTH_CAPABILITY};
 use std::time::Duration;
 
+/// Host process identity used to condition a mutation on the observed VMM.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeIdentity {
+    /// Host process identifier; reuse is distinguished by its start time.
+    pub pid: i32,
+    /// Platform-native process start timestamp, treated as an opaque value.
+    pub start_time: u64,
+}
+
+impl RuntimeIdentity {
+    /// Observe a live smolvm process, refusing unverifiable identities.
+    pub fn observe(pid: i32) -> Option<Self> {
+        let start_time = crate::process::process_start_time(pid)?;
+        crate::process::is_our_process_strict(pid, Some(start_time))
+            .then_some(Self { pid, start_time })
+    }
+
+    fn validate(&self, actual: Option<(i32, Option<u64>)>) -> Result<()> {
+        if self.pid <= 0 || actual != Some((self.pid, Some(self.start_time))) {
+            return Err(Error::agent_conflict("live resize",
+                "machine restarted or its runtime identity is unavailable; inspect it before resizing"));
+        }
+        Ok(())
+    }
+}
+
+/// Check the caller's observed incarnation under the same cross-process lock
+/// as growth, before guest calls, resource budgets or journal changes.
+pub(crate) fn grow_checked(
+    db: &SmolvmDb,
+    name: &str,
+    target: ResizeTarget,
+    expected: Option<&RuntimeIdentity>,
+) -> Result<VmRecord> {
+    let _source_guard = fork::lock_fork_source(name)?;
+    if let Some(expected) = expected {
+        let manager = AgentManager::for_vm(name)?;
+        expected.validate(manager.pid_and_start_time())?;
+        if !crate::process::is_our_process_strict(expected.pid, Some(expected.start_time)) {
+            return Err(Error::agent_conflict(
+                "live resize",
+                "original machine runtime is no longer running",
+            ));
+        }
+    }
+    match target {
+        ResizeTarget::Cpus(cpus) => grow_cpus_locked(db, name, cpus),
+        ResizeTarget::Memory(memory) => {
+            #[cfg(target_os = "linux")]
+            {
+                grow_memory_locked(db, name, memory)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                grow_memory(db, name, memory)
+            }
+        }
+        ResizeTarget::Disks { storage, overlay } => grow_disks_locked(db, name, storage, overlay),
+    }
+}
+
 fn begin_resize_intent(
     db: &SmolvmDb,
     name: &str,
@@ -473,6 +535,29 @@ pub(crate) fn reconcile_pending(db: &SmolvmDb, name: &str) -> Result<Option<VmRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_identity_rejects_restarts_pid_reuse_and_missing_identity() {
+        let expected = RuntimeIdentity {
+            pid: 42,
+            start_time: 100,
+        };
+        expected.validate(Some((42, Some(100)))).unwrap();
+        for actual in [
+            None,
+            Some((42, None)),
+            Some((43, Some(100))),
+            Some((42, Some(101))),
+        ] {
+            assert!(expected.validate(actual).is_err(), "{actual:?}");
+        }
+        assert!(RuntimeIdentity {
+            pid: 0,
+            start_time: 100
+        }
+        .validate(Some((0, Some(100))))
+        .is_err());
+    }
 
     #[test]
     fn memory_growth_targets_use_runtime_boot_layout_not_a_stale_record() {
