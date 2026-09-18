@@ -1506,18 +1506,28 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "add extra disk",
                 "path contains null byte"
             );
-            if krun_add_disk2(
-                ctx,
-                block_id.as_ptr(),
-                path.as_ptr(),
-                format.to_krun_u32(),
-                *read_only,
-            ) < 0
-            {
+            // Through the same helper the managed disks use, so `--block-io`
+            // reaches these too. Attaching them with a bare `krun_add_disk2`
+            // pinned them to the synchronous engine, which silently excluded
+            // the io_uring path from the one disk it exists for: a raw device
+            // a caller attached for a database.
+            let result = add_block_disk(
+                BlockDisk {
+                    ctx,
+                    block_id: block_id.as_ptr(),
+                    disk_path: path.as_ptr(),
+                    disk_format: format.to_krun_u32(),
+                    read_only: *read_only,
+                },
+                resources.block_io,
+                krun_add_disk2,
+                krun_add_disk4,
+            );
+            if result < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add extra disk",
-                    format!("krun_add_disk2 failed for extra disk {}", i),
+                    block_io_error(&format!("extra disk {i}"), resources.block_io, result),
                 ));
             }
             tracing::debug!(disk = i, path = %disk_path.display(), read_only, "added extra disk");
