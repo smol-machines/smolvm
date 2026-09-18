@@ -253,7 +253,9 @@ fn cpu_offline_plan(
             "CPU shrink must retain CPU0 and all requested CPUs already online",
         ));
     }
-    Ok(online.difference(&target).rev().copied().collect())
+    let mut plan: Vec<_> = online.difference(&target).copied().collect();
+    plan.reverse();
+    Ok(plan)
 }
 
 pub(crate) fn offline_cpus(count: u8, client_fd: Option<RawFd>) -> AgentResponse {
