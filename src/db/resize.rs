@@ -472,6 +472,33 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preserves_target_and_fences_stale_completions_after_reopen() {
+        let (dir, db) = setup();
+        let old = db
+            .begin_resize("vm", 123, 45, ResizeTarget::Memory(1280))
+            .unwrap();
+        let runtime = crate::agent::live_resize::RuntimeIdentity {
+            pid: 124,
+            start_time: 46,
+            boot_id: Some("replacement-boot".into()),
+        };
+        let next = db.rebind_resize("vm", &old, &runtime).unwrap();
+        assert_eq!(next.target, old.target);
+        assert_ne!(next.token, old.token);
+        assert_eq!(next.pid, runtime.pid);
+        assert_eq!(next.started, runtime.start_time);
+        assert_eq!(next.boot_id, runtime.boot_id);
+        assert!(db.finish_resize("vm", &old).is_err());
+        assert!(db.rebind_resize("vm", &old, &runtime).is_err());
+        assert!(db.require_completed_resize("vm").is_err());
+        drop(db);
+        let db = SmolvmDb::open_at(&dir.path().join("state.db")).unwrap();
+        assert_eq!(db.pending_resize("vm").unwrap(), Some(next.clone()));
+        db.finish_resize("vm", &next).unwrap();
+        db.require_completed_resize("vm").unwrap();
+    }
+
+    #[test]
     fn removal_clears_intent_without_allowing_stale_completion() {
         let (_dir, db) = setup();
         let intent = db
