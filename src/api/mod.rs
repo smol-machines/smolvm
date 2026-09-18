@@ -26,6 +26,7 @@ pub mod error;
 pub mod guest_rollout;
 pub mod handlers;
 pub mod pool_controller;
+pub mod resize_controller;
 pub mod rollout;
 pub mod state;
 pub mod supervisor;

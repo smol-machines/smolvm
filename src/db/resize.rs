@@ -20,6 +20,34 @@ pub(crate) struct ResizeIntent {
 }
 
 impl SmolvmDb {
+    pub(crate) fn pending_resize(&self, name: &str) -> Result<Option<ResizeIntent>> {
+        self.with_read_conn(|conn| {
+            let bytes: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM vm_resize_intents WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err("read pending resize")?;
+            bytes
+                .map(|bytes| serde_json::from_slice(&bytes).db_err("decode pending resize"))
+                .transpose()
+        })
+    }
+
+    pub(crate) fn pending_resize_names(&self) -> Result<Vec<String>> {
+        self.with_read_conn(|conn| {
+            let mut statement = conn
+                .prepare("SELECT name FROM vm_resize_intents ORDER BY name")
+                .db_err("list pending resizes")?;
+            let rows = statement
+                .query_map([], |row| row.get(0))
+                .db_err("query pending resizes")?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .db_err("read pending resize names")
+        })
+    }
     /// Branch/capture callers hold the source lock before this check, so an
     /// unfinished operation cannot leak partially applied geometry into a
     /// published checkpoint or descendant.
@@ -160,6 +188,8 @@ mod tests {
         let intent = db
             .begin_resize("vm", 123, 45, ResizeTarget::Memory(1280))
             .unwrap();
+        assert_eq!(db.pending_resize_names().unwrap(), vec!["vm"]);
+        assert_eq!(db.pending_resize("vm").unwrap(), Some(intent.clone()));
         assert!(db.require_completed_resize("vm").is_err());
         drop(db);
         let db = SmolvmDb::open_at(&dir.path().join("state.db")).unwrap();
@@ -180,6 +210,8 @@ mod tests {
         wrong.token.push('x');
         assert!(db.finish_resize("vm", &wrong).is_err());
         db.finish_resize("vm", &intent).unwrap();
+        assert!(db.pending_resize_names().unwrap().is_empty());
+        assert!(db.pending_resize("vm").unwrap().is_none());
         db.require_completed_resize("vm").unwrap();
         let next = db
             .begin_resize("vm", 123, 45, ResizeTarget::Cpus(4))
