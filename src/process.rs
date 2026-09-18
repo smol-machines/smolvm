@@ -2497,6 +2497,81 @@ fn finite_cgroup_memory_headroom(mut dir: std::path::PathBuf) -> Option<(u64, u6
     tightest_limit.zip(tightest_headroom)
 }
 
+/// Unlike telemetry, admission must not silently ignore an unreadable limit.
+/// The cgroup-v2 root has no memory controller files; every non-root ancestor
+/// of a memory-controlled VM must provide both counters.
+#[cfg(target_os = "linux")]
+fn constrain_memory_to_ancestors(
+    mut stats: HostMemoryStats,
+    mut dir: &std::path::Path,
+    root: &std::path::Path,
+) -> std::io::Result<HostMemoryStats> {
+    use std::io::{Error as IoError, ErrorKind};
+    if !dir.starts_with(root) {
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "cgroup outside hierarchy",
+        ));
+    }
+    while dir != root {
+        let max = std::fs::read_to_string(dir.join("memory.max"))?;
+        let current = std::fs::read_to_string(dir.join("memory.current"))?;
+        let current: u64 = current
+            .trim()
+            .parse()
+            .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid memory.current"))?;
+        if max.trim() != "max" {
+            let max: u64 = max
+                .trim()
+                .parse()
+                .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid memory.max"))?;
+            stats.total_bytes = stats.total_bytes.min(max);
+            stats.available_bytes = stats.available_bytes.min(max.saturating_sub(current));
+        }
+        dir = dir
+            .parent()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing cgroup parent"))?;
+    }
+    Ok(stats)
+}
+
+/// Capacity outside the VM's owned leaf, whose limit is raised separately.
+/// Sampling the API process instead is incorrect when it lives in a different
+/// slice. This is a preflight, not a reservation against concurrent consumers.
+#[cfg(target_os = "linux")]
+pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMemoryStats> {
+    let verify = || is_our_process_strict(pid, started);
+    if !verify() {
+        return Err(Error::agent("RAM resize", "VMM process identity changed"));
+    }
+    let dir = cgroup_v2_process_dir(pid)
+        .ok_or_else(|| Error::agent("RAM resize", "cannot resolve VMM memory hierarchy"))?;
+    let stats = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_host_meminfo(&contents))
+        .ok_or_else(|| Error::agent("RAM resize", "cannot verify host memory headroom"))?;
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let parent = if dir == root {
+        root
+    } else {
+        dir.parent()
+            .ok_or_else(|| Error::agent("RAM resize", "missing VMM cgroup parent"))?
+    };
+    let stats = constrain_memory_to_ancestors(stats, parent, root).map_err(|error| {
+        Error::agent(
+            "RAM resize",
+            format!("cannot verify VMM parent memory headroom: {error}"),
+        )
+    })?;
+    if !verify() || cgroup_v2_process_dir(pid).as_ref() != Some(&dir) {
+        return Err(Error::agent(
+            "RAM resize",
+            "VMM identity or memory hierarchy changed",
+        ));
+    }
+    Ok(stats)
+}
+
 /// Report effective host memory available to SmolVM.
 pub fn host_memory_stats() -> Option<HostMemoryStats> {
     #[cfg(target_os = "linux")]
@@ -3614,6 +3689,63 @@ mod tests {
         // kernel reports its cgroup populated. Reusing the scope is premature.
         let stat = "376791 (libkrun VM) Z 1 376791 376782 0 -1 4228364 69130 0 0 0 1002 143 0 0 20 0 2 0 153760195 0 0";
         assert!(!linux_stat_has_exited(stat));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resize_admission_checks_every_vm_parent_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let outer = root.path().join("fleet");
+        let inner = outer.join("tenant");
+        std::fs::create_dir_all(&inner).unwrap();
+        let write = |dir: &std::path::Path, max: &str, current: &str| {
+            std::fs::write(dir.join("memory.max"), max).unwrap();
+            std::fs::write(dir.join("memory.current"), current).unwrap();
+        };
+        let host = HostMemoryStats {
+            total_bytes: 10000,
+            available_bytes: 8000,
+        };
+        write(&outer, "4000", "3500");
+        write(&inner, "max", "1000");
+        assert_eq!(
+            constrain_memory_to_ancestors(host, &inner, root.path()).unwrap(),
+            HostMemoryStats {
+                total_bytes: 4000,
+                available_bytes: 500
+            }
+        );
+        // A tighter child matters even though the host and outer slice fit.
+        write(&inner, "2000", "1800");
+        assert_eq!(
+            constrain_memory_to_ancestors(host, &inner, root.path()).unwrap(),
+            HostMemoryStats {
+                total_bytes: 2000,
+                available_bytes: 200
+            }
+        );
+        write(&inner, "2000", "2100");
+        assert_eq!(
+            constrain_memory_to_ancestors(host, &inner, root.path())
+                .unwrap()
+                .available_bytes,
+            0
+        );
+        for (max, current) in [("garbage", "1"), ("max", "garbage"), ("-1", "0")] {
+            write(&inner, max, current);
+            assert!(constrain_memory_to_ancestors(host, &inner, root.path()).is_err());
+        }
+        write(&inner, "max", "0");
+        std::fs::remove_file(outer.join("memory.max")).unwrap();
+        assert!(constrain_memory_to_ancestors(host, &inner, root.path()).is_err());
+        assert_eq!(
+            constrain_memory_to_ancestors(host, root.path(), root.path()).unwrap(),
+            host
+        );
+        assert!(
+            constrain_memory_to_ancestors(host, std::path::Path::new("/outside"), root.path())
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
