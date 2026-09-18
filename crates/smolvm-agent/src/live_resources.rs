@@ -9,6 +9,7 @@ use std::os::unix::fs::{FileExt, FileTypeExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 static RESIZE: Mutex<()> = Mutex::new(());
 static CPU_RESIZE: Mutex<()> = Mutex::new(());
@@ -54,6 +55,37 @@ fn memory_online_plan(
     Ok(plan)
 }
 
+fn wait_memory_online_plan(
+    blocks: std::ops::Range<u64>,
+    timeout: Duration,
+    mut read_state: impl FnMut(u64) -> io::Result<String>,
+    mut cancelled: impl FnMut() -> bool,
+) -> io::Result<Vec<u64>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "RAM caller disconnected before onlining",
+            ));
+        }
+        match memory_online_plan(blocks.clone(), &mut read_state) {
+            // Only publication lag is retryable. Permission failures or an
+            // unexpected existing state must not turn into blind retries.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => return result,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "guest did not publish the requested RAM blocks",
+            ));
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
+
 pub(crate) fn online_memory(start: u64, length: u64, client_fd: Option<RawFd>) -> AgentResponse {
     let Ok(_guard) = MEMORY_RESIZE.try_lock() else {
         return AgentResponse::error(
@@ -61,6 +93,7 @@ pub(crate) fn online_memory(start: u64, length: u64, client_fd: Option<RawFd>) -
             error_codes::INVALID_REQUEST,
         );
     };
+    let started = Instant::now();
     let read_state = |block: u64| {
         std::fs::read_to_string(format!("/sys/devices/system/memory/memory{block}/state"))
     };
@@ -69,19 +102,23 @@ pub(crate) fn online_memory(start: u64, length: u64, client_fd: Option<RawFd>) -
         let size = u64::from_str_radix(size.trim().trim_start_matches("0x"), 16)
             .map_err(|_| io::Error::other("invalid guest memory block size"))?;
         let blocks = memory_blocks(start, length, size)?;
-        let plan = memory_online_plan(blocks.clone(), read_state)?;
+        let plan =
+            wait_memory_online_plan(blocks.clone(), Duration::from_secs(30), read_state, || {
+                client_fd.is_some_and(crate::process::is_peer_closed)
+            })?;
         Ok((blocks, plan))
     })();
-    let (blocks, plan) =
-        match preflight {
-            Ok(value) => value,
-            Err(error) => return AgentResponse::error(
+    let (blocks, plan) = match preflight {
+        Ok(value) => value,
+        Err(error) => {
+            return AgentResponse::error(
                 format!(
                     "cannot online RAM: {error}; wait for memory blocks and retry the same range"
                 ),
                 error_codes::INVALID_REQUEST,
-            ),
-        };
+            )
+        }
+    };
     if !plan.is_empty() {
         // Only validated numeric block IDs reach the shell. The existing exec
         // supervisor bounds a slow kernel write and handles client disconnect.
@@ -94,7 +131,7 @@ pub(crate) fn online_memory(start: u64, length: u64, client_fd: Option<RawFd>) -
             &["/bin/sh".into(), "-ec".into(), script],
             &[],
             None,
-            Some(120_000),
+            Some(120_000u64.saturating_sub(started.elapsed().as_millis() as u64)),
             client_fd,
             None,
         );
@@ -389,6 +426,60 @@ mod tests {
         for state in ["going-offline", "", "unknown"] {
             assert!(memory_online_plan(8..11, |_| Ok(state.into())).is_err());
         }
+    }
+
+    #[test]
+    fn memory_onlining_waits_for_publication_but_not_other_errors() {
+        let mut attempts = 0;
+        let plan = wait_memory_online_plan(
+            8..9,
+            Duration::from_secs(1),
+            |_| {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::ErrorKind::NotFound.into())
+                } else {
+                    Ok("offline".into())
+                }
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(plan, vec![8]);
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            wait_memory_online_plan(
+                8..9,
+                Duration::ZERO,
+                |_| Err(io::ErrorKind::NotFound.into()),
+                || false
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            wait_memory_online_plan(
+                8..9,
+                Duration::from_secs(1),
+                |_| Err(io::ErrorKind::PermissionDenied.into()),
+                || false
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            wait_memory_online_plan(
+                8..9,
+                Duration::from_secs(1),
+                |_| panic!("cancelled request must not inspect memory"),
+                || true
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 
     #[test]
