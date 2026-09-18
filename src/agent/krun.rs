@@ -310,7 +310,12 @@ impl KrunFunctions {
             // machines can still grow RAM without advertising unsupported CPU growth.
             return configure(
                 ctx,
-                2 | u32::from(cfg!(all(target_os = "linux", target_arch = "x86_64")) && cpus <= 16),
+                2 | u32::from(
+                    cfg!(any(
+                        all(target_os = "linux", target_arch = "x86_64"),
+                        all(target_os = "macos", target_arch = "aarch64")
+                    )) && cpus <= 16,
+                ),
             );
         }
         let _ = (ctx, cpus);
