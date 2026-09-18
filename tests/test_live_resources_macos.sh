@@ -56,11 +56,10 @@ test "$initial_bytes" -eq 67108864
 python3 - "$root" "$binary" "$name" <<'PY'
 import pathlib, socket, subprocess, sys
 root, binary, name = sys.argv[1:]
-sockets = list(pathlib.Path(root).rglob("control.sock"))
-assert len(sockets) == 1, sockets
+machine_dir = subprocess.check_output([binary, "machine", "data-dir", "--name", name], text=True).strip()
 with socket.socket(socket.AF_UNIX) as control:
     control.settimeout(5)
-    control.connect(str(sockets[0]))
+    control.connect(str(pathlib.Path(machine_dir) / "control.sock"))
     control.sendall(b"PROTOTYPE_GROW_CPUS 3\n")
     reply = control.recv(4096)
     assert b"OK created 3 vCPUs" in reply, reply
