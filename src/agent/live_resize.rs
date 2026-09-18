@@ -224,7 +224,39 @@ fn begin_resize_intent(
             "VMM process identity cannot be verified",
         ));
     }
-    db.begin_resize(name, pid, started.expect("verified start time"), target)
+    let runtime = RuntimeIdentity {
+        pid,
+        start_time: started.expect("verified start time"),
+        boot_id: host_boot_id()?,
+    };
+    if let Some(previous) = db.pending_resize(name)? {
+        let different_runtime = previous.pid != runtime.pid
+            || previous.started != runtime.start_time
+            || previous.boot_id != runtime.boot_id;
+        if different_runtime && previous.target == target {
+            let old_is_alive = crate::process::is_alive(previous.pid);
+            let observed_start = crate::process::process_start_time(previous.pid);
+            if previous_runtime_gone(
+                &previous,
+                runtime.boot_id.as_deref(),
+                old_is_alive,
+                observed_start,
+            ) {
+                return db.rebind_resize(name, &previous, &runtime);
+            }
+        }
+    }
+    db.begin_resize(name, pid, runtime.start_time, target)
+}
+
+fn previous_runtime_gone(
+    intent: &ResizeIntent,
+    current_boot: Option<&str>,
+    alive: bool,
+    observed_start: Option<u64>,
+) -> bool {
+    let previous_boot_ended = matches!((intent.boot_id.as_deref(), current_boot), (Some(old), Some(current)) if old != current);
+    previous_boot_ended || !alive || observed_start.is_some_and(|start| start != intent.started)
 }
 
 fn finish_resize_intent(db: &SmolvmDb, name: &str, intent: &ResizeIntent) -> Result<()> {
