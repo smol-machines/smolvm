@@ -285,6 +285,18 @@ const EXPORT_HELPER_STORAGE_FACTOR: u64 = 3;
 /// nothing on the host until it is written.
 const EXPORT_HELPER_STORAGE_ENV: &str = "SMOLVM_EXPORT_HELPER_STORAGE_GIB";
 
+/// Overrides the helper's memory, in MiB.
+const EXPORT_HELPER_MEMORY_ENV: &str = "SMOLVM_EXPORT_HELPER_MEMORY_MIB";
+
+/// What the helper asks for when the host has the memory to spare. Flattening
+/// streams its output to the host rather than buffering it, so this is page
+/// cache and mount bookkeeping, not a working set.
+const EXPORT_HELPER_MEMORY_MIB: u64 = 8192;
+
+/// Floor for the helper's memory: below this the guest cannot mount the
+/// overlay and tar the merged tree.
+const EXPORT_HELPER_MIN_MEMORY_MIB: u64 = 1024;
+
 /// How large the export helper's storage disk should be.
 ///
 /// The helper holds the image's layers plus the flattened output, so the size
@@ -294,8 +306,39 @@ const EXPORT_HELPER_STORAGE_ENV: &str = "SMOLVM_EXPORT_HELPER_STORAGE_GIB";
 /// an artifact carries it in the host layer directory the helper mounts
 /// (`packed_layers_gib`) and can have a small disk of its own. Take whichever
 /// is larger, and keep a floor for machines whose disks are both small.
+/// How much memory the export helper's VM should have.
+///
+/// A fixed 8 GiB is more than a small host has to spare, and a helper that
+/// cannot be admitted fails as a bare readiness timeout naming neither the
+/// memory it asked for nor a way to lower it. Ask for less than the host has
+/// free instead: the helper streams its output, so a smaller VM makes an
+/// export slower, not impossible.
+fn export_helper_memory_mib() -> u32 {
+    let mib = parse_helper_override(std::env::var(EXPORT_HELPER_MEMORY_ENV).ok().as_deref())
+        .unwrap_or_else(|| helper_memory_for(host_available_memory_mib()));
+    mib.try_into().unwrap_or(u32::MAX)
+}
+
+/// The policy above, separated from the host state it reads, so the whole
+/// table can be asserted without a particular machine.
+fn helper_memory_for(available_mib: Option<u64>) -> u64 {
+    let Some(available_mib) = available_mib else {
+        return EXPORT_HELPER_MEMORY_MIB;
+    };
+    // Leave the host at least as much as the helper takes: an export runs
+    // beside whatever asked for it.
+    EXPORT_HELPER_MEMORY_MIB
+        .min(available_mib / 2)
+        .max(EXPORT_HELPER_MIN_MEMORY_MIB)
+}
+
+/// Memory the host can spare right now, in MiB, where that can be read.
+fn host_available_memory_mib() -> Option<u64> {
+    crate::process::host_memory_stats().map(|stats| stats.available_bytes / (1024 * 1024))
+}
+
 fn export_helper_storage_gib(source_apparent_gib: u64, packed_layers_gib: u64) -> u64 {
-    parse_helper_storage_override(std::env::var(EXPORT_HELPER_STORAGE_ENV).ok().as_deref())
+    parse_helper_override(std::env::var(EXPORT_HELPER_STORAGE_ENV).ok().as_deref())
         .unwrap_or_else(|| helper_storage_for(source_apparent_gib, packed_layers_gib))
 }
 
@@ -312,7 +355,7 @@ fn helper_storage_for(source_apparent_gib: u64, packed_layers_gib: u64) -> u64 {
 /// A usable [`EXPORT_HELPER_STORAGE_ENV`] value. Anything unparsable or zero
 /// is ignored rather than failing the export: the heuristic still produces a
 /// working disk, and refusing to run would be a worse answer than a typo.
-fn parse_helper_storage_override(value: Option<&str>) -> Option<u64> {
+fn parse_helper_override(value: Option<&str>) -> Option<u64> {
     value?.trim().parse::<u64>().ok().filter(|gib| *gib > 0)
 }
 
@@ -440,7 +483,7 @@ impl ExportVm {
             Vec::new(),
             VmResources {
                 cpus: 4,
-                memory_mib: 8192,
+                memory_mib: export_helper_memory_mib(),
                 network,
                 network_backend: None,
                 dns: None,
@@ -1674,8 +1717,8 @@ mod from_vm_manifest_tests {
 #[cfg(test)]
 mod export_helper_sizing_tests {
     use super::{
-        export_helper_storage_gib, helper_storage_for, parse_helper_storage_override,
-        EXPORT_HELPER_MIN_STORAGE_GIB,
+        export_helper_storage_gib, helper_memory_for, helper_storage_for, parse_helper_override,
+        EXPORT_HELPER_MEMORY_MIB, EXPORT_HELPER_MIN_MEMORY_MIB, EXPORT_HELPER_MIN_STORAGE_GIB,
     };
 
     #[test]
@@ -1709,16 +1752,33 @@ mod export_helper_sizing_tests {
         assert!(helper_storage_for(u64::MAX, 0) >= EXPORT_HELPER_MIN_STORAGE_GIB);
     }
 
+    /// Memory follows the same shape as the disk: ask for the comfortable
+    /// size when the host can spare it, never more than half of what is free,
+    /// and never below what mounting and tarring needs. A host whose memory
+    /// cannot be read keeps the old fixed size rather than guessing low.
+    #[test]
+    fn helper_memory_follows_what_the_host_can_spare() {
+        assert_eq!(helper_memory_for(None), EXPORT_HELPER_MEMORY_MIB);
+        // Plenty free: the comfortable size, not half of a huge number.
+        assert_eq!(helper_memory_for(Some(64 * 1024)), EXPORT_HELPER_MEMORY_MIB);
+        // The reported failure: a host that cannot seat an 8 GiB helper.
+        assert_eq!(helper_memory_for(Some(4096)), 2048);
+        assert_eq!(helper_memory_for(Some(3000)), 1500);
+        // Very little free still asks for something that can do the work.
+        assert_eq!(helper_memory_for(Some(512)), EXPORT_HELPER_MIN_MEMORY_MIB);
+        assert_eq!(helper_memory_for(Some(0)), EXPORT_HELPER_MIN_MEMORY_MIB);
+    }
+
     #[test]
     fn only_a_usable_override_is_honored() {
-        assert_eq!(parse_helper_storage_override(Some("512")), Some(512));
-        assert_eq!(parse_helper_storage_override(Some("  512  ")), Some(512));
+        assert_eq!(parse_helper_override(Some("512")), Some(512));
+        assert_eq!(parse_helper_override(Some("  512  ")), Some(512));
         // A typo or a zero falls back to the heuristic instead of failing the
         // export or booting a helper with no disk.
-        assert_eq!(parse_helper_storage_override(Some("0")), None);
-        assert_eq!(parse_helper_storage_override(Some("512G")), None);
-        assert_eq!(parse_helper_storage_override(Some("")), None);
-        assert_eq!(parse_helper_storage_override(None), None);
+        assert_eq!(parse_helper_override(Some("0")), None);
+        assert_eq!(parse_helper_override(Some("512G")), None);
+        assert_eq!(parse_helper_override(Some("")), None);
+        assert_eq!(parse_helper_override(None), None);
     }
 
     /// Without the variable set, the public entry point is the heuristic.
