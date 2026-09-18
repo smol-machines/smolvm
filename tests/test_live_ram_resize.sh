@@ -81,7 +81,10 @@ sleep 5
 read -r restored_pid next_sequence restored_bytes <<<"$(guest 'cat /run/ram-probe-status')"
 test "$next_sequence" -gt "$restored_sequence"
 guest 'test "$(cat /dev/shm/lineage-marker)" = source; test "$(cat /storage/lineage-marker)" = source'
+before_kib=$(guest "awk '/^MemTotal:/ {print \$2}' /proc/meminfo")
 machine resize --name "$name" --mem 1152
+after_kib=$(guest "awk '/^MemTotal:/ {print \$2}' /proc/meminfo")
+test "$after_kib" -gt "$((before_kib + 120 * 1024))"
 guest 'dd if=/dev/urandom of=/dev/shm/after-restore-growth bs=1048576 count=32'
 payload_hash=$(guest 'sha256sum /dev/shm/after-restore-growth' | awk '{print $1}')
 parent=$name
@@ -95,6 +98,12 @@ read -r child_pid child_sequence child_bytes <<<"$(guest 'cat /run/ram-probe-sta
 test "$child_pid" = "$pid"
 test "$child_bytes" = "$bytes"
 guest 'echo child >/dev/shm/lineage-marker; echo child >/storage/lineage-marker'
+guest 'touch /run/ram-probe-mutate'
+for i in $(seq 1 60); do
+    if guest 'test -f /run/ram-probe-mutated'; then break; fi
+    sleep 1
+done
+guest 'test -f /run/ram-probe-mutated'
 sleep 5
 read -r child_pid child_next child_bytes <<<"$(guest 'cat /run/ram-probe-status')"
 test "$child_next" -gt "$child_sequence"
@@ -107,6 +116,7 @@ owned_names+=("$second")
 machine branch --from "$parent" --name "$second"
 name=$second
 guest 'test "$(cat /dev/shm/lineage-marker)" = source; test "$(cat /storage/lineage-marker)" = source'
+guest 'test ! -e /run/ram-probe-mutate; test ! -e /run/ram-probe-mutated'
 test "$(guest 'sha256sum /dev/shm/after-restore-growth' | awk '{print $1}')" = "$payload_hash"
 test "$(guest 'cat /proc/sys/kernel/random/boot_id')" = "$boot"
 read -r second_pid second_sequence second_bytes <<<"$(guest 'cat /run/ram-probe-status')"
