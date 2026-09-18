@@ -334,7 +334,10 @@ pub enum ManagedDisk {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
     /// Offline trailing CPUs after the host verifies runtime shrink support.
-    OfflineCpus { target_count: u8 },
+    OfflineCpus {
+        /// Retained online CPU count, starting at CPU0; must be nonzero.
+        target_count: u8,
+    },
     /// Online existing guest memory blocks; never create or offline memory.
     OnlineMemory {
         /// Guest physical address of the first block.
