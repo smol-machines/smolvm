@@ -217,6 +217,46 @@ impl SmolvmDb {
         })
     }
 
+    /// Transfer an interrupted target to an explicitly requested replacement
+    /// runtime. The caller holds the source lock and proves the old VMM is gone.
+    /// Never erase the journal between incarnations or change its target.
+    pub(crate) fn rebind_resize(
+        &self,
+        name: &str,
+        expected: &ResizeIntent,
+        runtime: &crate::agent::live_resize::RuntimeIdentity,
+    ) -> Result<ResizeIntent> {
+        if runtime.pid <= 0 {
+            return Err(Error::config("live resize", "invalid replacement runtime"));
+        }
+        let replacement = ResizeIntent {
+            token: Self::create_reservation_token(),
+            pid: runtime.pid,
+            started: runtime.start_time,
+            boot_id: runtime.boot_id.clone(),
+            target: expected.target.clone(),
+        };
+        self.with_durable_resize_write(|conn| {
+            let count = conn
+                .execute(
+                    "UPDATE vm_resize_intents SET data = ?1 WHERE name = ?2 AND data = ?3",
+                    params![
+                        serde_json::to_vec(&replacement).db_err("encode replacement resize")?,
+                        name,
+                        serde_json::to_vec(expected).db_err("encode previous resize")?
+                    ],
+                )
+                .db_err("transfer interrupted resize")?;
+            if count != 1 {
+                return Err(Error::agent_conflict(
+                    "live resize",
+                    "resize ownership changed before runtime transfer",
+                ));
+            }
+            Ok(replacement)
+        })
+    }
+
     /// Clear only the operation we verified. A stale completion must never
     /// erase a newer operation, even if the machine name has been reused.
     pub(crate) fn finish_resize(&self, name: &str, expected: &ResizeIntent) -> Result<()> {
