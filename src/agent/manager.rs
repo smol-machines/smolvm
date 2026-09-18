@@ -2717,28 +2717,46 @@ impl AgentManager {
 
     /// Returns `Ok(())` if the process is confirmed dead, `Err` if still alive
     /// or identity could not be verified.
-    fn stop_vm_process(&self, pid: crate::process::Pid, start_time: Option<u64>) -> Result<()> {
-        // Use short timeout — the agent may already be gone (ephemeral run exited).
-        // A 100ms connect timeout avoids blocking the exit path.
-        let connect_started = Instant::now();
-        let connection = super::AgentClient::connect_with_short_timeout(&self.vsock_socket);
-        tracing::debug!(
-            pid,
-            connect_ms = connect_started.elapsed().as_millis(),
-            connected = connection.is_ok(),
-            "shutdown agent connect finished"
-        );
-        let shutdown = connection.and_then(|mut client| client.shutdown());
-        let shutdown_acked = shutdown.is_ok();
+    fn stop_vm_process(
+        &self,
+        pid: crate::process::Pid,
+        start_time: Option<u64>,
+        guest_is_paused: bool,
+    ) -> Result<()> {
+        // A paused guest has no vCPU to service the request and nothing left to
+        // flush, so skip the handshake rather than wait out its deadline and
+        // then refuse the stop. Identity is still verified below, from the PID
+        // start time or this VM's own boot-config path.
+        let shutdown_acked = if guest_is_paused {
+            tracing::debug!(
+                pid,
+                "guest is paused; terminating without a shutdown handshake"
+            );
+            false
+        } else {
+            // Use short timeout — the agent may already be gone (ephemeral run exited).
+            // A 100ms connect timeout avoids blocking the exit path.
+            let connect_started = Instant::now();
+            let connection = super::AgentClient::connect_with_short_timeout(&self.vsock_socket);
+            tracing::debug!(
+                pid,
+                connect_ms = connect_started.elapsed().as_millis(),
+                connected = connection.is_ok(),
+                "shutdown agent connect finished"
+            );
+            let shutdown = connection.and_then(|mut client| client.shutdown());
+            let acked = shutdown.is_ok();
 
-        // Process identity is not proof that guest writes reached disk. A slow
-        // flush must not turn a graceful stop into an unannounced power cut.
-        if !shutdown_acked && process::is_alive(pid) {
-            return Err(Error::agent(
-                "stop agent",
-                format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {}", shutdown.unwrap_err()),
-            ));
-        }
+            // Process identity is not proof that guest writes reached disk. A slow
+            // flush must not turn a graceful stop into an unannounced power cut.
+            if !acked && process::is_alive(pid) {
+                return Err(Error::agent(
+                    "stop agent",
+                    format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {}", shutdown.unwrap_err()),
+                ));
+            }
+            acked
+        };
 
         // Identity check: vsock acknowledgement OR strict PID start-time match OR
         // an argv match on this VM's unique boot-config path. We intentionally do
@@ -2951,6 +2969,23 @@ impl AgentManager {
 
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
+        self.stop_inner(false)
+    }
+
+    /// Stop a machine whose guest is paused and already quiesced.
+    ///
+    /// A frozen fork base is snapshot-paused: its vCPUs are not running, so its
+    /// agent cannot answer a shutdown request no matter how long we wait, and
+    /// the checkpoint that froze it already quiesced its filesystems. The
+    /// graceful path exists to guarantee an fsync acknowledgement before the
+    /// process dies; here that guarantee is already met, so asking for it only
+    /// burns the deadline and then refuses to stop a machine that is safe to
+    /// terminate — leaving it running, and billing, with no way out but delete.
+    pub fn stop_paused(&self) -> Result<()> {
+        self.stop_inner(true)
+    }
+
+    fn stop_inner(&self, guest_is_paused: bool) -> Result<()> {
         let state = {
             let inner = self.inner.lock();
             inner.state
@@ -2960,7 +2995,7 @@ impl AgentManager {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
             if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
-                if let Err(e) = self.stop_vm_process(pid, start_time) {
+                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused) {
                     tracing::warn!(
                         pid,
                         "orphan process still alive, preserving PID/socket files"
@@ -2999,7 +3034,7 @@ impl AgentManager {
         };
 
         if let Some(pid) = child_pid {
-            if let Err(e) = self.stop_vm_process(pid, pid_start_time) {
+            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused) {
                 // Revert to Running — don't lie about state or delete markers
                 {
                     let mut inner = self.inner.lock();
@@ -3471,6 +3506,41 @@ fn boot_failure_reason(
 
 #[cfg(test)]
 mod tests {
+    /// A frozen fork base is snapshot-paused, so no shutdown acknowledgement is
+    /// ever coming. Waiting for one and then refusing to stop is how such a
+    /// machine became unstoppable: `exec` and `start` both told the caller to
+    /// stop it, and `stop` was the one thing that could not work.
+    #[cfg(unix)]
+    #[test]
+    fn a_paused_guest_is_terminated_without_waiting_for_an_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
+        let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();
+        let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
+        // No agent listening, exactly as for a paused guest.
+        manager.vsock_socket = temp.path().join("missing-agent.sock");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as crate::process::Pid;
+
+        let started = std::time::Instant::now();
+        let result = manager.stop_vm_process(pid, process::process_start_time(pid), true);
+        let elapsed = started.elapsed();
+        let survived = matches!(child.try_wait(), Ok(None));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(result.is_ok(), "a paused guest must stop: {result:?}");
+        assert!(!survived, "the paused VM's process must be gone");
+        // The handshake was skipped, not merely fast: its own deadline is 5s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}, so the shutdown handshake was still attempted"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn graceful_stop_keeps_live_process_when_guest_does_not_acknowledge() {
@@ -3484,7 +3554,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as crate::process::Pid;
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid));
+        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false);
         let survived = matches!(child.try_wait(), Ok(None));
         let _ = child.kill();
         let _ = child.wait();

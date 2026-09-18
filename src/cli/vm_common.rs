@@ -2270,13 +2270,22 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
 
     println!("Stopping machine '{}'...", name);
 
+    // A frozen fork base is snapshot-paused: its agent cannot answer, so both
+    // the staged-mount sync and the shutdown handshake would block until their
+    // deadlines and then fail. The checkpoint that froze it already quiesced
+    // its filesystems, which is what the handshake exists to confirm.
+    let frozen = resolved == RecordState::Frozen;
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
-    if !record.staged_mounts.is_empty() {
+    if !frozen && !record.staged_mounts.is_empty() {
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
         smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
     }
-    manager.stop()?;
+    if frozen {
+        manager.stop_paused()?;
+    } else {
+        manager.stop()?;
+    }
 
     // Detach the machine's case-sensitive layers volume now that its process is
     // gone (macOS hdiutil mount; no-op on Linux). The volume is owned 1:1 by this
