@@ -290,8 +290,10 @@ const EXPORT_HELPER_MEMORY_ENV: &str = "SMOLVM_EXPORT_HELPER_MEMORY_MIB";
 
 /// What the helper asks for when the host has the memory to spare. Flattening
 /// streams its output to the host rather than buffering it, so this is page
-/// cache and mount bookkeeping, not a working set.
-const EXPORT_HELPER_MEMORY_MIB: u64 = 8192;
+/// cache and mount bookkeeping, not a working set — and a helper that asks for
+/// more than a laptop or CI runner can seat fails the export outright, which
+/// is worse than running it with a smaller page cache.
+const EXPORT_HELPER_MEMORY_MIB: u64 = 4096;
 
 /// Floor for the helper's memory: below this the guest cannot mount the
 /// overlay and tar the merged tree.
@@ -478,12 +480,13 @@ impl ExportVm {
                 return Err(error);
             }
         };
+        let helper_memory_mib = export_helper_memory_mib();
         if let Err(e) = manager.start_with_full_config(
             Vec::new(),
             Vec::new(),
             VmResources {
                 cpus: 4,
-                memory_mib: export_helper_memory_mib(),
+                memory_mib: helper_memory_mib,
                 network,
                 network_backend: None,
                 dns: None,
@@ -503,7 +506,19 @@ impl ExportVm {
             // The Drop cleanup only arms once Self exists — a failed boot must
             // clean its own scratch dir or every failed export leaks one.
             let _ = std::fs::remove_dir_all(&data_dir);
-            return Err(e);
+            // A host that cannot seat the helper reports only that the agent
+            // never became ready, which names neither what was asked for nor
+            // the knobs that lower it.
+            return Err(Error::agent(
+                "pack from VM",
+                format!(
+                    "{e}. The export helper asked for {} MiB of memory and a {} GiB disk. If this host cannot seat that, set {}=<MiB> and/or {}=<GiB> and retry.",
+                    helper_memory_mib,
+                    helper_storage_gib,
+                    EXPORT_HELPER_MEMORY_ENV,
+                    EXPORT_HELPER_STORAGE_ENV,
+                ),
+            ));
         }
         Ok(Self {
             manager,
@@ -527,7 +542,7 @@ impl ExportVm {
         Error::agent(
             "pack from VM",
             format!(
-                "{message}. The export helper's {} GiB disk filled while it held the image.                  Set {}=<GiB> to give it a larger one; the disk is sparse, so a generous                  value costs nothing on the host until it is written.",
+                "{message}. The export helper's {} GiB disk filled while it held the image. Set {}=<GiB> to give it a larger one; the disk is sparse, so a generous                  value costs nothing on the host until it is written.",
                 self.storage_gib, EXPORT_HELPER_STORAGE_ENV
             ),
         )
@@ -1761,7 +1776,7 @@ mod export_helper_sizing_tests {
         assert_eq!(helper_memory_for(None), EXPORT_HELPER_MEMORY_MIB);
         // Plenty free: the comfortable size, not half of a huge number.
         assert_eq!(helper_memory_for(Some(64 * 1024)), EXPORT_HELPER_MEMORY_MIB);
-        // The reported failure: a host that cannot seat an 8 GiB helper.
+        // The reported failure: a host that cannot seat the comfortable size.
         assert_eq!(helper_memory_for(Some(4096)), 2048);
         assert_eq!(helper_memory_for(Some(3000)), 1500);
         // Very little free still asks for something that can do the work.
