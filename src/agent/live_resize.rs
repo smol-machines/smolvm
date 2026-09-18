@@ -338,9 +338,23 @@ impl MemoryGrowthInfo {
     }
 }
 
-/// Experimental live RAM growth. Host budget changes precede guest exposure;
-/// the runtime reports its boot layout so retries need not trust stale metadata.
-/// This prototype still needs persistent operation recovery before release.
+fn unsupported_live_compute(operation: &str) -> Error {
+    Error::config(
+        operation,
+        "live CPU and RAM growth currently require a Linux x86_64 host; disk growth is supported separately",
+    )
+}
+
+fn ensure_live_compute_platform(operation: &str) -> Result<()> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Ok(())
+    } else {
+        Err(unsupported_live_compute(operation))
+    }
+}
+
+/// Live RAM growth. Host budget changes precede guest exposure; the runtime
+/// reports its boot layout and a durable intent allows interrupted retries.
 #[cfg(target_os = "linux")]
 pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
     let _source_guard = fork::lock_fork_source(name)?;
@@ -349,6 +363,7 @@ pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecor
 
 #[cfg(target_os = "linux")]
 fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
+    ensure_live_compute_platform("RAM resize")?;
     let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
     if record.actual_state() != RecordState::Running {
         return Err(Error::agent_conflict(
@@ -452,10 +467,7 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
 #[cfg(not(target_os = "linux"))]
 /// Reject live RAM growth on hosts without a supported hot-add backend.
 pub fn grow_memory(_db: &SmolvmDb, _name: &str, _target_mib: u32) -> Result<VmRecord> {
-    Err(Error::agent(
-        "RAM resize",
-        "live RAM growth is not yet supported on this host platform",
-    ))
+    Err(unsupported_live_compute("RAM resize"))
 }
 
 fn validate_growth(current: u64, requested: u64) -> Result<u64> {
@@ -485,7 +497,7 @@ fn cpu_status(reply: &str) -> Result<(u8, u8)> {
     ))
 }
 
-/// Experimental CPU resize; runtime must have explicitly enabled CPU growth.
+/// Live CPU resize; runtime must have enabled CPU growth at boot.
 /// Preserve created CPU count even if subsequent guest onlining fails.
 pub fn grow_cpus(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
     let _source_guard = fork::lock_fork_source(name)?;
@@ -493,6 +505,7 @@ pub fn grow_cpus(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
 }
 
 fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
+    ensure_live_compute_platform("CPU resize")?;
     let record = db
         .get_vm(name)?
         .ok_or_else(|| Error::VmNotFound { name: name.into() })?;
@@ -715,6 +728,21 @@ pub(crate) fn reconcile_pending(db: &SmolvmDb, name: &str) -> Result<Option<VmRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_compute_platform_refusal_is_actionable() {
+        for operation in ["CPU resize", "RAM resize"] {
+            let result = ensure_live_compute_platform(operation);
+            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                assert!(result.is_ok());
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(operation));
+                assert!(error.contains("Linux x86_64"));
+                assert!(error.contains("disk growth is supported separately"));
+            }
+        }
+    }
 
     #[test]
     fn replacement_requires_proof_the_previous_runtime_is_gone() {
