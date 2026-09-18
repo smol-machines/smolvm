@@ -480,6 +480,8 @@ pub struct CreateVmParams {
     pub block_io: smolvm::data::resources::BlockIoEngine,
     /// Host disks attached beyond storage and overlay (`--disk`).
     pub disks: Vec<smolvm::data::disk::AttachedDisk>,
+    /// vhost-user block backends (`--vhost-user-blk`).
+    pub vhost_user_blk: Vec<smolvm::data::disk::VhostUserBlk>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
@@ -724,6 +726,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.overlay_gb = params.overlay_gb;
     record.block_io = params.block_io;
     record.disks = params.disks.clone();
+    record.vhost_user_blk = params.vhost_user_blk.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
@@ -1916,6 +1919,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.overlay_gb = o.overlay_gb;
     r.block_io = o.block_io;
     r.disks = o.disks.clone();
+    r.vhost_user_blk = o.vhost_user_blk.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
     r.init = o.init.clone();
     r.init_completed = false;
@@ -1988,6 +1992,8 @@ pub struct DefaultVmOverrides {
     pub block_io: smolvm::data::resources::BlockIoEngine,
     /// Host disks attached beyond storage and overlay (`--disk`).
     pub disks: Vec<smolvm::data::disk::AttachedDisk>,
+    /// vhost-user block backends (`--vhost-user-blk`).
+    pub vhost_user_blk: Vec<smolvm::data::disk::VhostUserBlk>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -2035,6 +2041,7 @@ impl DefaultVmOverrides {
             overlay_gb: params.overlay_gb,
             block_io: params.block_io,
             disks: params.disks.clone(),
+            vhost_user_blk: params.vhost_user_blk.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
             init: params.init.clone(),
             env: smolvm::util::parse_env_list(&params.env),
@@ -2843,6 +2850,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "overlay_gb": record.overlay_gb,
         "block_io": record.block_io,
         "disks": record.disks,
+        "vhost_user_blk": record.vhost_user_blk,
         "image": record.image,
         "entrypoint": record.entrypoint,
         "cmd": record.cmd,

@@ -519,6 +519,7 @@ impl PackRunCmd {
             overlay_gib: self.overlay,
             block_io: self.block_io.unwrap_or_default(),
             disks: Vec::new(),
+            vhost_user_blk: Vec::new(),
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: self
@@ -1680,6 +1681,7 @@ fn run_from_cache(
         overlay_gib: args.overlay,
         block_io: args.block_io.unwrap_or_default(),
         disks: Vec::new(),
+        vhost_user_blk: Vec::new(),
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
@@ -2105,6 +2107,7 @@ fn daemon_start(
         overlay_gib: args.overlay,
         block_io: args.block_io.unwrap_or_default(),
         disks: Vec::new(),
+        vhost_user_blk: Vec::new(),
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,

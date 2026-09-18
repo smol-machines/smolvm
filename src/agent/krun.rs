@@ -61,6 +61,18 @@ pub struct KrunFunctions {
     pub set_port_map: unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32,
     pub add_disk2:
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
+    /// `krun_add_vhost_user_device(ctx, device_type, socket_path, name, num_queues, queue_sizes)`.
+    /// Optional: absent from a libkrun built without the `vhost-user` feature.
+    pub add_vhost_user_device: Option<
+        unsafe extern "C" fn(
+            u32,
+            u32,
+            *const libc::c_char,
+            *const libc::c_char,
+            u16,
+            *const u16,
+        ) -> i32,
+    >,
     pub add_disk4: Option<
         unsafe extern "C" fn(
             u32,
@@ -226,6 +238,7 @@ impl KrunFunctions {
         let set_port_map = load_sym!(krun_set_port_map);
         let add_disk2 = load_sym!(krun_add_disk2);
         let add_disk4 = load_optional_sym!("krun_add_disk4");
+        let add_vhost_user_device = load_optional_sym!("krun_add_vhost_user_device");
         let add_vsock_port2 = load_sym!(krun_add_vsock_port2);
         let add_virtiofs = load_sym!(krun_add_virtiofs);
         let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
@@ -264,6 +277,7 @@ impl KrunFunctions {
             set_port_map,
             add_disk2,
             add_disk4,
+            add_vhost_user_device,
             add_vsock_port2,
             add_virtiofs,
             add_virtiofs3,

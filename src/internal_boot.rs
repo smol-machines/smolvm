@@ -711,6 +711,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         published_sockets: &config.published_sockets,
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         extra_disks: &config.extra_disks,
+        vhost_user_blk: &config.vhost_user_blk,
         dns_filter_enabled: config
             .dns_filter_hosts
             .as_ref()

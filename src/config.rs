@@ -399,6 +399,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<crate::data::disk::AttachedDisk>,
 
+    /// vhost-user block backends (`--vhost-user-blk`), re-attached on every start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vhost_user_blk: Vec<crate::data::disk::VhostUserBlk>,
+
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
@@ -719,6 +723,7 @@ impl VmRecord {
             mem,
             block_io: Default::default(),
             disks: Vec::new(),
+            vhost_user_blk: Vec::new(),
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -793,6 +798,7 @@ impl VmRecord {
             mem,
             block_io: Default::default(),
             disks: Vec::new(),
+            vhost_user_blk: Vec::new(),
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -1030,6 +1036,7 @@ impl VmRecord {
             overlay_gib: self.overlay_gb,
             block_io: self.block_io,
             disks: self.disks.clone(),
+            vhost_user_blk: self.vhost_user_blk.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),

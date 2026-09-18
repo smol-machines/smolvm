@@ -557,6 +557,9 @@ pub struct LaunchConfig<'a> {
     pub packed_layers_dir: Option<&'a Path>,
     /// Additional disk images (path, read_only, format). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool, DiskFormat)],
+    /// Block devices served by external vhost-user backends, attached after the
+    /// disks above.
+    pub vhost_user_blk: &'a [crate::data::disk::VhostUserBlk],
     /// Whether DNS filtering was configured for this launch, even if the
     /// host-side proxy socket could not be created.
     pub dns_filter_enabled: bool,
@@ -614,6 +617,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         published_sockets,
         packed_layers_dir,
         extra_disks,
+        vhost_user_blk,
         dns_filter_enabled,
         egress_refresh_hosts,
         egress_telemetry,
@@ -1531,6 +1535,74 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             }
             tracing::debug!(disk = i, path = %disk_path.display(), read_only, "added extra disk");
+        }
+
+        // vhost-user block devices. The backend owns the storage and the guest's
+        // virtqueues are proxied to it, so the data path skips the host kernel
+        // entirely — the shape a polled userspace target like SPDK exposes.
+        for (i, dev) in vhost_user_blk.iter().enumerate() {
+            let Some(add_vhost_user_device) = krun.add_vhost_user_device else {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add vhost-user block device",
+                    "this libkrun was built without vhost-user support (krun_add_vhost_user_device missing)",
+                ));
+            };
+            let socket = try_or_free_ctx!(
+                path_to_cstring(&dev.socket),
+                "add vhost-user block device",
+                "socket path contains null byte"
+            );
+            let name = try_or_free_ctx!(
+                CString::new(format!("vhost-user-blk{i}")),
+                "add vhost-user block device",
+                "device name contains null byte"
+            );
+            // libkrun reads `num_queues` sizes when a count is given, and treats
+            // a zero count as "ask the backend", where the array is a
+            // 0-terminated sentinel list instead.
+            let sizes: Vec<u16> = if dev.queue_size == 0 {
+                Vec::new()
+            } else {
+                vec![dev.queue_size; dev.num_queues as usize]
+            };
+            let sizes_ptr = if sizes.is_empty() {
+                std::ptr::null()
+            } else {
+                sizes.as_ptr()
+            };
+            let result = unsafe {
+                add_vhost_user_device(
+                    ctx,
+                    crate::data::disk::VIRTIO_DEVICE_BLOCK,
+                    socket.as_ptr(),
+                    name.as_ptr(),
+                    dev.num_queues,
+                    sizes_ptr,
+                )
+            };
+            if result < 0 {
+                krun_free_ctx(ctx);
+                // ENOTSUP means the symbol resolved but this libkrun was built
+                // without the vhost-user feature, which is a different problem
+                // from a backend that is not listening. Blaming the backend for
+                // it sends the caller looking in the wrong place.
+                let detail = if result == -libc::ENOTSUP {
+                    "this libkrun was built without vhost-user support".to_string()
+                } else {
+                    format!(
+                        "connecting to {} failed (error {result}) — is the backend running and listening?",
+                        dev.socket.display()
+                    )
+                };
+                return Err(Error::agent("add vhost-user block device", detail));
+            }
+            tracing::debug!(
+                device = i,
+                socket = %dev.socket.display(),
+                num_queues = dev.num_queues,
+                "added vhost-user block device"
+            );
         }
 
         // Add vsock port for control channel (critical - host-guest communication)

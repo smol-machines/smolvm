@@ -150,6 +150,94 @@ fn host_mount_of(_device: &std::path::Path) -> Option<String> {
     None
 }
 
+/// A block device served by an external vhost-user backend (SPDK, QEMU's
+/// `vhost-user-blk`, `vhost-device-blk`), attached by connecting to its socket.
+///
+/// Unlike [`AttachedDisk`], smolvm never opens the storage: the backend owns it
+/// and the guest's virtqueues are proxied straight there, so the data path skips
+/// the host kernel entirely. That is how a polled userspace target like SPDK is
+/// reached, and it is the shape a storage fabric already exposes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VhostUserBlk {
+    /// Absolute path to the backend's Unix socket. The backend must be running
+    /// and listening before the machine starts.
+    pub socket: std::path::PathBuf,
+    /// Number of virtqueues. `0` asks the backend (requires multi-queue support).
+    #[serde(default)]
+    pub num_queues: u16,
+    /// Size of each virtqueue. `0` leaves libkrun's default (256).
+    #[serde(default)]
+    pub queue_size: u16,
+}
+
+/// The virtio device type ID for a block device, per the virtio specification.
+/// `krun_add_vhost_user_device` takes the ID directly and does not interpret it,
+/// so the backend defines the semantics and the frontend proxies the queues and
+/// the config space.
+pub const VIRTIO_DEVICE_BLOCK: u32 = 2;
+
+impl VhostUserBlk {
+    /// Parse `--vhost-user-blk` — a socket path, optionally followed by
+    /// `,queues=N` and `,queue-size=M`.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut parts = spec.split(',');
+        let raw = parts.next().unwrap_or("").trim();
+        if raw.is_empty() {
+            return Err("vhost-user socket path is empty".to_string());
+        }
+        let socket = std::path::PathBuf::from(raw);
+        if !socket.is_absolute() {
+            return Err(format!(
+                "{raw}: vhost-user socket path must be absolute (the VM is launched from a different working directory)"
+            ));
+        }
+        let mut out = Self {
+            socket,
+            num_queues: 0,
+            queue_size: 0,
+        };
+        for opt in parts {
+            let opt = opt.trim();
+            if opt.is_empty() {
+                continue;
+            }
+            let (key, value) = opt
+                .split_once('=')
+                .ok_or_else(|| format!("{opt}: expected queues=N or queue-size=M"))?;
+            let parsed: u16 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("{opt}: {value} is not a queue count"))?;
+            match key.trim() {
+                "queues" => out.num_queues = parsed,
+                "queue-size" => out.queue_size = parsed,
+                other => {
+                    return Err(format!(
+                        "{other}: unknown option, expected queues or queue-size"
+                    ))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reject what cannot work before the machine is recorded.
+    ///
+    /// The socket itself is deliberately not required to exist yet: a backend is
+    /// often started alongside the machine, and demanding it at create time
+    /// would force an ordering the caller may not control. A wrong path surfaces
+    /// at start, where the connection is actually made.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.num_queues == 0 && self.queue_size > 0 {
+            return Err(format!(
+                "{}: queue-size needs an explicit queues=N (auto-detected queue counts use the backend's sizes)",
+                self.socket.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The on-disk format of `path`, read from its magic bytes.
 ///
 /// Mirrors the launcher's own detection so an attached disk is declared the way
@@ -332,6 +420,56 @@ mod attached_disk_tests {
             .unwrap_err();
             assert!(err.contains("cannot open for read-write"), "{err}");
         }
+    }
+
+    #[test]
+    fn vhost_user_parses_a_socket_with_optional_queue_options() {
+        let plain = VhostUserBlk::parse("/var/run/spdk/vhost.sock").unwrap();
+        assert_eq!(
+            plain.socket,
+            std::path::PathBuf::from("/var/run/spdk/vhost.sock")
+        );
+        assert_eq!(
+            (plain.num_queues, plain.queue_size),
+            (0, 0),
+            "0 = ask the backend"
+        );
+
+        // The shape a SPDK deployment actually uses.
+        let tuned =
+            VhostUserBlk::parse("/var/run/spdk/vhost.sock,queues=2,queue-size=128").unwrap();
+        assert_eq!((tuned.num_queues, tuned.queue_size), (2, 128));
+        tuned.validate().unwrap();
+    }
+
+    #[test]
+    fn vhost_user_rejects_what_cannot_work() {
+        assert!(VhostUserBlk::parse("").is_err());
+        assert!(
+            VhostUserBlk::parse("relative.sock")
+                .unwrap_err()
+                .contains("must be absolute"),
+            "the VM launches from a different working directory"
+        );
+        assert!(VhostUserBlk::parse("/s.sock,queues=abc").is_err());
+        assert!(VhostUserBlk::parse("/s.sock,bogus=1")
+            .unwrap_err()
+            .contains("unknown option"));
+
+        // A size without a count is ambiguous: libkrun reads the size array only
+        // when an explicit count is given, so the size would be silently ignored.
+        let err = VhostUserBlk::parse("/s.sock,queue-size=128")
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("needs an explicit queues=N"), "{err}");
+    }
+
+    /// The device type is handed to libkrun uninterpreted, so it must be the
+    /// virtio ID for block or the guest binds the wrong driver.
+    #[test]
+    fn block_device_type_is_the_virtio_id() {
+        assert_eq!(VIRTIO_DEVICE_BLOCK, 2);
     }
 
     /// An attached qcow2 must be declared qcow2: told it is raw, libkrun exposes

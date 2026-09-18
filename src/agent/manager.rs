@@ -2406,6 +2406,7 @@ impl AgentManager {
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
+            vhost_user_blk: resources_for_config.vhost_user_blk.clone(),
             extra_disks: {
                 let mut __d = features.extra_disks;
                 // `--disk` values recorded on the machine, re-attached on every

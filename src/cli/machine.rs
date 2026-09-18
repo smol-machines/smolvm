@@ -658,6 +658,18 @@ pub struct RunCmd {
     /// from its data.
     #[arg(long = "disk", value_name = "PATH[:ro]", help_heading = "Resources")]
     pub disk: Vec<String>,
+    /// Attach a block device served by an external vhost-user backend, e.g.
+    /// SPDK (repeatable): `--vhost-user-blk /var/run/spdk/vhost.sock`. Optional
+    /// `,queues=N,queue-size=M` match the backend's virtqueue setup. smolvm
+    /// never opens the storage — the guest's queues go straight to the backend,
+    /// skipping the host kernel, which is how a polled userspace target is
+    /// reached. The backend must be listening before the machine starts.
+    #[arg(
+        long = "vhost-user-blk",
+        value_name = "SOCKET[,queues=N,queue-size=M]",
+        help_heading = "Resources"
+    )]
+    pub vhost_user_blk: Vec<String>,
 
     /// Load VM configuration from a Smolfile (TOML)
     #[arg(
@@ -1267,6 +1279,7 @@ impl RunCmd {
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
         params.disks = parse_attached_disks(&self.disk)?;
+        params.vhost_user_blk = parse_vhost_user_blk(&self.vhost_user_blk)?;
         params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
@@ -1589,6 +1602,7 @@ impl RunCmd {
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
             disks: Vec::new(),
+            vhost_user_blk: Vec::new(),
         };
         validate_requested_network_backend(
             &resources,
@@ -3285,6 +3299,14 @@ pub struct CreateCmd {
     /// from its data.
     #[arg(long = "disk", value_name = "PATH[:ro]")]
     pub disk: Vec<String>,
+    /// Attach a block device served by an external vhost-user backend, e.g.
+    /// SPDK (repeatable): `--vhost-user-blk /var/run/spdk/vhost.sock`. Optional
+    /// `,queues=N,queue-size=M` match the backend's virtqueue setup. smolvm
+    /// never opens the storage — the guest's queues go straight to the backend,
+    /// skipping the host kernel, which is how a polled userspace target is
+    /// reached. The backend must be listening before the machine starts.
+    #[arg(long = "vhost-user-blk", value_name = "SOCKET[,queues=N,queue-size=M]")]
+    pub vhost_user_blk: Vec<String>,
 
     /// Mount host directory (can be used multiple times). Also accepts
     /// S3-compatible object storage, mounted inside the guest on every start:
@@ -3444,6 +3466,20 @@ pub struct CreateCmd {
     pub command: Vec<String>,
 }
 
+/// Parse and validate every `--vhost-user-blk` value.
+fn parse_vhost_user_blk(specs: &[String]) -> smolvm::Result<Vec<smolvm::data::disk::VhostUserBlk>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let dev = smolvm::data::disk::VhostUserBlk::parse(spec)
+                .map_err(|e| smolvm::Error::agent("attach vhost-user block device", e))?;
+            dev.validate()
+                .map_err(|e| smolvm::Error::agent("attach vhost-user block device", e))?;
+            Ok(dev)
+        })
+        .collect()
+}
+
 /// Parse and validate every `--disk` value.
 ///
 /// Validation happens at create/run time rather than at boot: a machine
@@ -3550,6 +3586,7 @@ impl CreateCmd {
         // recorded against an unreadable device would fail every start with a
         // virtio-blk error that says nothing about which disk or why.
         params.disks = parse_attached_disks(&self.disk)?;
+        params.vhost_user_blk = parse_vhost_user_blk(&self.vhost_user_blk)?;
 
         // Resolve the image source on the host now, AFTER the CLI flag and the
         // Smolfile have been merged, so both take the same path: a registry
@@ -3603,6 +3640,7 @@ impl CreateCmd {
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
             disks: Vec::new(),
+            vhost_user_blk: Vec::new(),
         };
         // Reject zero-valued resources before the machine is persisted.
         // Without this, `machine create` succeeds and the failure only
@@ -3817,6 +3855,7 @@ impl CreateCmd {
         };
         let params = vm_common::CreateVmParams {
             disks: Vec::new(),
+            vhost_user_blk: Vec::new(),
             nested_virt: self.nested_virt,
             secret_refs: manifest.secret_refs,
             name,
@@ -3940,6 +3979,7 @@ impl CreateCmd {
             overlay_gib: params.overlay_gb,
             block_io: params.block_io,
             disks: Vec::new(),
+            vhost_user_blk: Vec::new(),
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
         resources.validate()?;
