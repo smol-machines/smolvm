@@ -3,7 +3,7 @@
 //!
 //! A fork snapshots a running, forkable machine's RAM, device state, and disks,
 //! gives the clone private copy-on-write layers, and lets the caller boot the
-//! clone from that exact boundary. Linux/x86_64 and macOS resume the source
+//! clone from that exact boundary. Linux and macOS resume the source
 //! immediately on new private layers; other hosts retain a frozen CoW base.
 //! The boot itself differs between callers (the CLI uses `start_vm_named`; the
 //! API uses `AgentManager`), so it stays out of here; everything up to and
@@ -437,11 +437,14 @@ fn fork_base_already_paused(status: &str) -> bool {
 /// Linux/KVM and macOS/HVF can atomically checkpoint a fork generation and
 /// resume the source on private RAM and disk layers. Other hosts retain the
 /// established frozen fork-base behavior.
+///
+/// aarch64 Linux joined this once libkrun could stream a retained RAM
+/// generation there; the generation copy itself is host-side and carries no
+/// architecture of its own. Without it a branch left the source frozen, which
+/// is a different machine than the one the caller branched — and a frozen
+/// source cannot be exec'd, only stopped or deleted.
 pub fn fork_continue_enabled() -> bool {
-    cfg!(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        target_os = "macos"
-    ))
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1984,7 +1987,7 @@ pub fn prepare_held_fork(
 /// Preparation is transactional: if any clone fails, all clone records and
 /// disks created by this call are removed.
 ///
-/// Linux/x86_64 and macOS resume the source after atomically rotating its
+/// Linux and macOS resume the source after atomically rotating its
 /// writable disks; other hosts retain the source in its paused copy-on-write
 /// state. A later direct fork captures current state; explicit pool
 /// replenishment can reuse its retained generation.
