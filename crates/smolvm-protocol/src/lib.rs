@@ -313,6 +313,8 @@ pub const ONLINE_FILESYSTEM_GROWTH_CAPABILITY: &str = "online-filesystem-growth-
 
 /// Agent can online and verify CPUs after the VMM creates them.
 pub const ONLINE_CPU_GROWTH_CAPABILITY: &str = "online-cpu-growth-v1";
+/// Guest can offline non-boot CPUs and verify the resulting online set.
+pub const OFFLINE_CPU_SHRINK_CAPABILITY: &str = "offline-cpu-shrink-v1";
 
 /// Agent can online and verify a RAM range already added by the VMM.
 pub const ONLINE_MEMORY_GROWTH_CAPABILITY: &str = "online-memory-growth-v1";
@@ -331,6 +333,8 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Offline trailing CPUs after the host verifies runtime shrink support.
+    OfflineCpus { target_count: u8 },
     /// Online existing guest memory blocks; never create or offline memory.
     OnlineMemory {
         /// Guest physical address of the first block.
@@ -851,6 +855,9 @@ impl AgentRequest {
             }
             AgentRequest::OnlineCpus { target_count } => {
                 format!("OnlineCpus {{ target_count: {target_count} }}")
+            }
+            AgentRequest::OfflineCpus { target_count } => {
+                format!("OfflineCpus {{ target_count: {target_count} }}")
             }
             AgentRequest::GrowFilesystem {
                 disk,
