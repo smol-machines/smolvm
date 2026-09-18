@@ -16,6 +16,8 @@ pub(crate) struct ResizeIntent {
     pub token: String,
     pub pid: i32,
     pub started: u64,
+    #[serde(default)]
+    pub boot_id: Option<String>,
     pub target: ResizeTarget,
 }
 
@@ -184,6 +186,7 @@ impl SmolvmDb {
         if pid <= 0 {
             return Err(Error::agent("live resize", "invalid VMM process identity"));
         }
+        let boot_id = crate::agent::live_resize::host_boot_id()?;
         self.with_durable_resize_write(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
                 .db_err("begin resize intent")?;
@@ -197,13 +200,13 @@ impl SmolvmDb {
                 .optional().db_err("read resize intent")?;
             let intent = if let Some(bytes) = bytes {
                 let intent: ResizeIntent = serde_json::from_slice(&bytes).db_err("decode resize intent")?;
-                if intent.pid != pid || intent.started != started || intent.target != target {
+                if intent.pid != pid || intent.started != started || intent.boot_id != boot_id || intent.target != target {
                     return Err(Error::agent_conflict("live resize",
                         "an unfinished resize belongs to a different target or VM incarnation; reconcile it before another resize"));
                 }
                 intent
             } else {
-                let intent = ResizeIntent { token: Self::create_reservation_token(), pid, started, target };
+                let intent = ResizeIntent { token: Self::create_reservation_token(), pid, started, boot_id, target };
                 tx.execute("INSERT INTO vm_resize_intents (name, data) VALUES (?1, ?2)",
                     params![name, serde_json::to_vec(&intent).db_err("encode resize intent")?])
                     .db_err("save resize intent")?;
