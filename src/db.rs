@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod resize;
-pub(crate) use resize::{ResizeIntent, ResizeTarget, ResizeReceipt, ResizeReceiptState};
+pub(crate) use resize::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget};
 
 /// SQLite busy_timeout: how long a blocked writer waits for the write lock
 /// before returning SQLITE_BUSY. Set high enough to survive burst contention
@@ -607,8 +607,11 @@ impl SmolvmDb {
                         params![name],
                     )
                     .db_err("remove VM resize intent")?;
-                    tx.execute("DELETE FROM vm_resize_receipts WHERE name = ?1", params![name])
-                        .db_err("remove VM resize receipts")?;
+                    tx.execute(
+                        "DELETE FROM vm_resize_receipts WHERE name = ?1",
+                        params![name],
+                    )
+                    .db_err("remove VM resize receipts")?;
                     // A retained checkpoint only means anything while its golden
                     // process is alive, so it dies with the record rather than
                     // waiting for a sweep that only the pool controller runs.

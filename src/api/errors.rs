@@ -29,6 +29,12 @@ pub enum ApiError {
     CloneIdentityRejuvenationFailed(String),
     /// Bad request - invalid input (400).
     BadRequest(String),
+    /// Durable refusal: retries of this operation cannot apply the resize.
+    ResizeRejected {
+        operation_id: String,
+        runtime: crate::agent::live_resize::RuntimeIdentity,
+        message: String,
+    },
     /// Request timeout (408).
     Timeout,
     /// Temporarily unavailable (503).
@@ -59,6 +65,20 @@ struct ErrorResponse {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
+            ApiError::ResizeRejected {
+                operation_id,
+                runtime,
+                message,
+            } => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "code": "RESIZE_REJECTED", "error": message,
+                        "operationId": operation_id, "runtime": runtime,
+                    })),
+                )
+                    .into_response();
+            }
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
@@ -160,6 +180,29 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.into_response().status(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn resize_rejection_identifies_the_terminal_operation() {
+        let runtime = crate::agent::live_resize::RuntimeIdentity {
+            pid: 123,
+            start_time: 456,
+            boot_id: Some("boot-1".into()),
+        };
+        let response = ApiError::ResizeRejected {
+            operation_id: "resize-1".into(),
+            runtime: runtime.clone(),
+            message: "memory must be aligned".into(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "RESIZE_REJECTED");
+        assert_eq!(body["operationId"], "resize-1");
+        assert_eq!(body["runtime"], serde_json::to_value(runtime).unwrap());
     }
 
     #[tokio::test]

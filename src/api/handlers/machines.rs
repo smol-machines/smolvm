@@ -4365,8 +4365,18 @@ pub async fn resize_machine(
             other => ApiError::from(other),
         })?;
         return match record {
-            crate::agent::live_resize::ResizeOutcome::Applied(record) => Ok(Json(record_to_info(&name, &record))),
-            crate::agent::live_resize::ResizeOutcome::Rejected { operation_id, runtime, message } => Err(ApiError::ResizeRejected { operation_id, runtime, message }),
+            crate::agent::live_resize::ResizeOutcome::Applied(record) => {
+                Ok(Json(record_to_info(&name, &record)))
+            }
+            crate::agent::live_resize::ResizeOutcome::Rejected {
+                operation_id,
+                runtime,
+                message,
+            } => Err(ApiError::ResizeRejected {
+                operation_id,
+                runtime,
+                message,
+            }),
         };
     }
     if req.expected_runtime.is_some() || req.operation_id.is_some() {
@@ -5484,6 +5494,7 @@ mod tests {
         let req = ResizeMachineRequest {
             storage_gb: Some(10),
             expected_runtime: None,
+            operation_id: None,
             overlay_gb: None,
             cpus: None,
             mem: None,
@@ -5501,6 +5512,7 @@ mod tests {
         let req = ResizeMachineRequest {
             storage_gb: None,
             expected_runtime: None,
+            operation_id: None,
             overlay_gb: None,
             cpus: None,
             mem: None,
@@ -5515,6 +5527,7 @@ mod tests {
         let req = ResizeMachineRequest {
             storage_gb: Some(30),
             expected_runtime: None,
+            operation_id: None,
             overlay_gb: None,
             cpus: None,
             mem: None,

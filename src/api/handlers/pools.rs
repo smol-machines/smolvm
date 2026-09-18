@@ -1060,6 +1060,7 @@ fn lease_batch_error(error: ApiError) -> (&'static str, String) {
         ApiError::Timeout => ("TIMEOUT", "request timed out".into()),
         ApiError::Unavailable(message) => ("UNAVAILABLE", message),
         ApiError::Internal(message) => ("INTERNAL_ERROR", message),
+        ApiError::ResizeRejected { message, .. } => ("RESIZE_REJECTED", message),
     }
 }
 
