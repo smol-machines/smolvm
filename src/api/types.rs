@@ -880,7 +880,7 @@ pub struct StopResponse {
 // Resize Types
 // ============================================================================
 
-/// Request to grow running CPU, RAM, or disk resources.
+/// Request to resize running CPU, RAM, or disk resources.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResizeMachineRequest {
@@ -893,7 +893,7 @@ pub struct ResizeMachineRequest {
     /// Total usable RAM allocation in MiB (live growth, optional).
     #[serde(default, rename = "memoryMb")]
     pub mem: Option<u32>,
-    /// Total guest CPU count (live growth, optional).
+    /// Target online CPU count; shrinking requires a compatible Linux x86_64 runtime and agent.
     #[serde(default)]
     pub cpus: Option<u8>,
     /// Storage disk size in GiB (expand only, optional).

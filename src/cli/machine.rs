@@ -4842,11 +4842,13 @@ impl LsCmd {
 // Resize Command
 // ============================================================================
 
-/// Grow a machine's resources without rebooting a running workload.
+/// Resize a machine's resources without rebooting a running workload.
 ///
 /// Running machines online added resources immediately when the runtime and
 /// guest support hot-add. Stopped machines retain disk expansion support;
 /// use `update` for stopped CPU/RAM settings. Sizes are absolute targets.
+/// CPU shrinking requires Linux x86_64 and a compatible runtime and agent.
+/// RAM and disk shrinking are rejected without reducing capacity.
 ///
 /// Examples:
 ///   smolvm machine resize --name my-vm --storage 50
@@ -4867,7 +4869,7 @@ pub struct ResizeCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Target online vCPU count (grow only)
+    /// Target online vCPU count (shrink supported on compatible Linux x86_64 runtimes)
     #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u8).range(1..))]
     pub cpus: Option<u8>,
 
