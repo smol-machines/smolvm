@@ -1,4 +1,4 @@
-//! Verified guest-side resource growth; never shrink or repair offline.
+//! Verified guest-side resource changes; never shrink mounted filesystems.
 
 use smolvm_protocol::{error_codes, AgentResponse, ManagedDisk};
 use std::collections::BTreeSet;
@@ -236,6 +236,76 @@ pub(crate) fn online_cpus(count: u8, client_fd: Option<RawFd>) -> AgentResponse 
         },
         _ => AgentResponse::error(
             "CPU online count could not be verified; reconcile before retrying",
+            error_codes::INTERNAL_ERROR,
+        ),
+    }
+}
+
+fn cpu_offline_plan(
+    present: &BTreeSet<u32>,
+    online: &BTreeSet<u32>,
+    count: u8,
+) -> io::Result<Vec<u32>> {
+    let target: BTreeSet<_> = (0..u32::from(count)).collect();
+    if count == 0 || !online.is_subset(present) || !target.is_subset(online) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CPU shrink must retain CPU0 and all requested CPUs already online",
+        ));
+    }
+    Ok(online.difference(&target).rev().copied().collect())
+}
+
+pub(crate) fn offline_cpus(count: u8, client_fd: Option<RawFd>) -> AgentResponse {
+    let Ok(_guard) = CPU_RESIZE.try_lock() else {
+        return AgentResponse::error(
+            "another CPU resize is in progress",
+            error_codes::INVALID_REQUEST,
+        );
+    };
+    let read = |name| {
+        parse_cpu_list(&std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/{name}"
+        ))?)
+    };
+    let plan = read("present").and_then(|present| {
+        read("online").and_then(|online| cpu_offline_plan(&present, &online, count))
+    });
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            return AgentResponse::error(
+                format!("cannot offline CPUs: {error}"),
+                error_codes::INVALID_REQUEST,
+            )
+        }
+    };
+    if !plan.is_empty() {
+        // Let the kernel migrate tasks and veto unsafe CPU removal. A partial
+        // operation is reported as such; never lower host quota on this error.
+        let script = plan
+            .iter()
+            .map(|cpu| format!("printf 0 > /sys/devices/system/cpu/cpu{cpu}/online"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let result = crate::handle_vm_exec(
+            &["/bin/sh".into(), "-ec".into(), script],
+            &[],
+            None,
+            Some(120_000),
+            client_fd,
+            None,
+        );
+        if !matches!(result, AgentResponse::Completed { exit_code: 0, .. }) {
+            return AgentResponse::error("CPU offlining incomplete; host limits must remain unchanged; retry the same target to reconcile any CPUs already offlined", error_codes::INTERNAL_ERROR);
+        }
+    }
+    match read("online") {
+        Ok(online) if online == (0..u32::from(count)).collect() => AgentResponse::Ok {
+            data: Some(serde_json::json!({"online_cpus": count})),
+        },
+        _ => AgentResponse::error(
+            "CPU offline count could not be verified; host limits must remain unchanged",
             error_codes::INTERNAL_ERROR,
         ),
     }
@@ -618,6 +688,27 @@ mod tests {
             vec![3]
         );
         assert!(cpu_online_plan(&parse_cpu_list("0,2-3").unwrap(), &online, 4).is_err());
+    }
+
+    #[test]
+    fn cpu_shrink_preserves_boot_cpu_and_reconciles_partial_progress() {
+        let present = parse_cpu_list("0-7").unwrap();
+        assert_eq!(
+            cpu_offline_plan(&present, &parse_cpu_list("0-5").unwrap(), 2).unwrap(),
+            vec![5, 4, 3, 2]
+        );
+        assert_eq!(
+            cpu_offline_plan(&present, &parse_cpu_list("0-1,4").unwrap(), 2).unwrap(),
+            vec![4]
+        );
+        assert!(
+            cpu_offline_plan(&present, &parse_cpu_list("0-1").unwrap(), 2)
+                .unwrap()
+                .is_empty()
+        );
+        for (online, target) in [("0-3", 0), ("1-3", 2), ("0,2-3", 2), ("0-1", 3), ("0-8", 2)] {
+            assert!(cpu_offline_plan(&present, &parse_cpu_list(online).unwrap(), target).is_err());
+        }
     }
 
     #[test]

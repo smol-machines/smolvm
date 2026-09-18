@@ -1769,6 +1769,31 @@ impl AgentClient {
         }
     }
 
+    /// Offline only trailing CPUs. Runtime capability must be checked by the
+    /// caller before this request; success means the exact guest set was read back.
+    pub fn offline_cpus(&mut self, target_count: u8) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY)? {
+            return Err(Error::agent(
+                "offline CPUs",
+                "running guest lacks safe CPU shrink support",
+            ));
+        }
+        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(130))?;
+        match self.request(&AgentRequest::OfflineCpus { target_count })? {
+            AgentResponse::Ok { data: Some(data) }
+                if data.get("online_cpus").and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(target_count)) =>
+            {
+                Ok(())
+            }
+            AgentResponse::Error { message, .. } => Err(Error::agent("offline CPUs", message)),
+            _ => Err(Error::agent(
+                "offline CPUs",
+                "guest did not verify the requested CPU count",
+            )),
+        }
+    }
+
     /// Online only an existing block-aligned RAM range after runtime hot-add.
     pub fn online_memory(&mut self, start_address: u64, length_bytes: u64) -> Result<()> {
         if !self.supports_capability(smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY)? {
