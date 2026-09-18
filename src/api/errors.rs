@@ -31,8 +31,11 @@ pub enum ApiError {
     BadRequest(String),
     /// Durable refusal: retries of this operation cannot apply the resize.
     ResizeRejected {
+        /// Request identity whose rejection has been persisted.
         operation_id: String,
+        /// Machine incarnation to which the decision applies.
         runtime: crate::agent::live_resize::RuntimeIdentity,
+        /// Reason the operation was refused before changing resources.
         message: String,
     },
     /// Request timeout (408).
