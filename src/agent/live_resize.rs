@@ -717,6 +717,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replacement_requires_proof_the_previous_runtime_is_gone() {
+        let intent = ResizeIntent {
+            token: "old".into(),
+            pid: 123,
+            started: 45,
+            boot_id: Some("boot-1".into()),
+            target: ResizeTarget::Cpus(4),
+        };
+        assert!(!previous_runtime_gone(
+            &intent,
+            Some("boot-1"),
+            true,
+            Some(45)
+        ));
+        assert!(!previous_runtime_gone(&intent, Some("boot-1"), true, None));
+        assert!(!previous_runtime_gone(&intent, None, true, None));
+        assert!(previous_runtime_gone(&intent, Some("boot-1"), false, None));
+        assert!(previous_runtime_gone(
+            &intent,
+            Some("boot-1"),
+            true,
+            Some(46)
+        ));
+        assert!(previous_runtime_gone(
+            &intent,
+            Some("boot-2"),
+            true,
+            Some(45)
+        ));
+    }
+
+    #[test]
     fn pending_resize_cannot_cross_host_boots_even_with_identical_pid_and_start() {
         let mut intent = ResizeIntent {
             token: "operation".into(),
