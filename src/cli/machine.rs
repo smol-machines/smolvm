@@ -899,7 +899,14 @@ fn bake_start_args<'a>(
     proxy: Option<&'a str>,
     no_proxy: Option<&'a str>,
 ) -> Vec<&'a str> {
-    let mut start = vec!["machine", "start", "--name", tmp];
+    // Provision the temp machine (pull image + run init) but never launch its
+    // workload. The bake only needs the image layers and init's effects on
+    // disk for the snapshot; running a workload is pointless and, worse, would
+    // require a runnable command inside the image. The placeholder `/bin/true`
+    // it was created with does not exist in minimal images (scratch, distroless,
+    // `hello-world`), so launching it failed the whole bake. Skipping the
+    // launch makes the cache work for any image (#1334).
+    let mut start = vec!["machine", "start", "--name", tmp, "--no-workload"];
     if let Some(p) = proxy {
         start.push("--proxy");
         start.push(p);
@@ -2213,10 +2220,11 @@ impl RunCmd {
 mod tests {
     #[test]
     fn bake_start_forwards_proxy_when_set() {
-        // No proxy: plain start.
+        // No proxy: plain start. The bake always provisions only (never launches
+        // the workload), so `--no-workload` is present regardless of proxy.
         assert_eq!(
             super::bake_start_args("t", None, None),
-            ["machine", "start", "--name", "t"]
+            ["machine", "start", "--name", "t", "--no-workload"]
         );
         // Proxy only.
         assert_eq!(
@@ -2226,6 +2234,7 @@ mod tests {
                 "start",
                 "--name",
                 "t",
+                "--no-workload",
                 "--proxy",
                 "http://host.smolvm.internal:8118"
             ]
@@ -2238,12 +2247,30 @@ mod tests {
                 "start",
                 "--name",
                 "t",
+                "--no-workload",
                 "--proxy",
                 "http://p:3128",
                 "--no-proxy",
                 "localhost,.internal"
             ]
         );
+    }
+
+    #[test]
+    fn bake_start_always_provisions_only() {
+        // The bake must never launch the image's workload: it only needs the
+        // pulled layers and init's effects for the snapshot, and minimal images
+        // (scratch, distroless, hello-world) have no runnable no-op to launch.
+        for args in [
+            super::bake_start_args("t", None, None),
+            super::bake_start_args("t", Some("http://p:3128"), None),
+            super::bake_start_args("t", Some("http://p:3128"), Some("localhost")),
+        ] {
+            assert!(
+                args.contains(&"--no-workload"),
+                "bake start must be provision-only: {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -4148,6 +4175,13 @@ pub struct StartCmd {
     #[arg(long, value_name = "MIB", requires = "fork_pool_size")]
     pub cuda_vram_limit_mib: Option<std::num::NonZeroU64>,
 
+    /// Provision the machine (pull the image, run init) but do not launch the
+    /// image's workload — the machine boots to the bare agent. Used by the
+    /// `--oci-cache`/init bake to cache an image without running it, and without
+    /// depending on a runnable no-op existing inside the image.
+    #[arg(long = "no-workload", hide = true)]
+    pub no_workload: bool,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -4174,6 +4208,7 @@ impl StartCmd {
             no_proxy.as_deref(),
             /* from_snapshot */ false,
             fork,
+            self.no_workload,
         ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
@@ -5770,6 +5805,7 @@ impl MonitorCmd {
                 None,
                 /* from_snapshot */ false,
                 vm_common::ForkLaunch::default(),
+                /* no_workload */ false,
             )?;
         }
 
@@ -5953,6 +5989,7 @@ impl MonitorCmd {
                         None,
                         /* from_snapshot */ false,
                         vm_common::ForkLaunch::default(),
+                        /* no_workload */ false,
                     ) {
                         Ok(()) => {
                             println!("  machine restarted");

@@ -1286,6 +1286,10 @@ fn boot_prepared_fork(
                 defer_running_persistence: retry_gate.is_some(),
                 ..Default::default()
             },
+            // A clone inherits the golden's running workload from the snapshot
+            // (from_snapshot = true already skips relaunch); never provision-only.
+            /* no_workload */
+            false,
         )
     };
     let started = match retry_gate {
@@ -1496,9 +1500,10 @@ pub fn start_vm_named(
     no_proxy: Option<&str>,
     from_snapshot: bool,
     fork: ForkLaunch,
+    no_workload: bool,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
-    start_vm_named_with_db(&db, name, proxy, no_proxy, from_snapshot, fork)
+    start_vm_named_with_db(&db, name, proxy, no_proxy, from_snapshot, fork, no_workload)
 }
 
 fn start_vm_named_with_db(
@@ -1508,6 +1513,7 @@ fn start_vm_named_with_db(
     no_proxy: Option<&str>,
     from_snapshot: bool,
     mut fork: ForkLaunch,
+    no_workload: bool,
 ) -> smolvm::Result<()> {
     use smolvm::Error;
 
@@ -1832,7 +1838,17 @@ fn start_vm_named_with_db(
         // Remote volumes are mounted natively by the agent between the
         // container's create and start, and a mount that never appears
         // fails the start there — so no host-side preflight is needed.
-        if !from_snapshot {
+        if no_workload {
+            // Provision-only start (the `--oci-cache`/init bake): the image is
+            // pulled and init has run, which is all the snapshot needs. Launching
+            // the workload would be wasted work and would require a runnable
+            // command inside the image, which minimal images (scratch, distroless,
+            // `hello-world`) do not have. Boot to the bare agent instead.
+            tracing::info!(
+                machine = name,
+                "provision-only start (--no-workload): image and init are staged; not launching the workload"
+            );
+        } else if !from_snapshot {
             if let Err(e) = smolvm::workload::launch_image_workload(
                 &mut client,
                 name,
