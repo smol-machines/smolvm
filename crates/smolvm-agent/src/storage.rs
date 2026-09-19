@@ -3310,6 +3310,8 @@ impl OverlaySetup {
         if self.merged_path.exists() && is_mountpoint(&self.merged_path) {
             if mounted_overlay_is_healthy(&self.merged_path) {
                 info!(workload_id = %self.workload_id, "reusing existing persistent overlay");
+                // Intent: persistent-overlay DNS follows the active backend (INTENT.md).
+                refresh_overlay_resolver(&self.merged_path)?;
                 self.create_bundle()?;
                 return Ok(self.into_overlay_info());
             }
@@ -3336,6 +3338,7 @@ impl OverlaySetup {
         // Upper layer exists from a previous session — remount preserving it
         if self.upper_path.exists() {
             info!(workload_id = %self.workload_id, "remounting persistent overlay with existing upper layer");
+            refresh_overlay_resolver(&self.upper_path)?;
 
             // overlayfs requires an empty work directory at mount time
             if self.work_path.exists() {
@@ -3358,6 +3361,19 @@ impl OverlaySetup {
         info!(workload_id = %self.workload_id, "creating new persistent overlay");
         self.execute(lowerdirs)
     }
+}
+
+// Intent: INTENT.md, persistent-overlay resolver refresh only.
+// Mounted overlays must be written through merged, never their live upperdir.
+fn refresh_overlay_resolver(root: &Path) -> Result<()> {
+    let path = root.join("etc/resolv.conf");
+    std::fs::write(&path, overlay_resolv_conf_contents()).map_err(|error| {
+        warn!(path = %path.display(), error = %error, "persistent overlay resolver refresh failed");
+        StorageError::new(format!(
+            "refresh persistent overlay resolver {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn overlay_resolv_conf_contents() -> String {

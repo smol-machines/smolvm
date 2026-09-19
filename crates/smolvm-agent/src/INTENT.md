@@ -1,0 +1,9 @@
+# Persistent resolver refresh and bounded shutdown evidence
+
+Sean requested reliable warm-fleet operation; Root authorized these source corrections. Dewey publishes the already reviewed source on2026-09-19. The resolver repair follows the active network DNS policy on reuse/remount without rewriting other persistent overlay contents. Write failures return Result errors and warn with the affected path. Mounted overlays are written through merged, never the live upper directory. DNS filtering and explicit overrides keep existing precedence.
+
+The signal handler emits one fixed bounded JSON event to its existing stderr channel before sync and exit. It uses the existing async-signal-safe write syscall, with no allocation, locks, credentials or retry loop. Short/error writes may lose that evidence; absence is not proof no signal happened. Shutdown semantics are unchanged. The diagnostic is observational, not a prerequisite for the resolver repair or a claimed fork fix.
+
+Run locally: `python3 -B -Werror -m unittest discover -s tests -p 'test_agent_persistent_resolver.py'` and the corresponding `test_agent_signal_receipt.py`. The tests compile exact source snippets against bounded filesystem/syscall fixtures. Before the patch, current upstream013f877 fails eight resolver cases and three signal cases; after it, all pass. The resolver harness allows unused fixture declarations; this is not a full-agent warning-clean claim. Existing private agent build retained two libc::time_t deprecation warnings.
+
+The source patch is an exact forward application of the qualified private delta. Current upstream storage contains unrelated subsequent changes, so its complete file hash differs from the prior built659c source; the edited functions are identical. No existing binary, provenance stamp or runtime closure changes in this source publication. Full current-upstream agent/runtime build and cross-platform qualification remain separate.

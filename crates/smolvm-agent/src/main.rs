@@ -1469,7 +1469,15 @@ fn setup_persistent_rootfs() {
 #[cfg(target_os = "linux")]
 fn setup_signal_handlers() {
     // SAFETY: Signal handler that calls sync() - sync is async-signal-safe
-    unsafe extern "C" fn handle_term_signal(_sig: libc::c_int) {
+    unsafe extern "C" fn handle_term_signal(sig: libc::c_int) {
+        // Intent: INTENT.md; fixed bounded JSON, no allocation/locks/credentials.
+        // FD2 is the existing krun-stderr/agent-console channel; emit before shutdown.
+        let receipt: &[u8] = match sig {
+            libc::SIGTERM => b"{\"event\":\"smol_hotfork_agent_signal\",\"signal\":15}\n",
+            libc::SIGINT => b"{\"event\":\"smol_hotfork_agent_signal\",\"signal\":2}\n",
+            _ => b"{\"event\":\"smol_hotfork_agent_signal\",\"signal\":\"unexpected\"}\n",
+        };
+        let _ = libc::write(libc::STDERR_FILENO, receipt.as_ptr().cast(), receipt.len());
         // sync() is async-signal-safe, so we can call it from a signal handler
         libc::sync();
         // Exit cleanly
