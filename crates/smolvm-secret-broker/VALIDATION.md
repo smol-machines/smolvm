@@ -101,7 +101,48 @@ sudo python3 -B crates/smolvm-secret-broker/tests/service_acceptance.py \
   --observer-uid 1000 --observer-gid 1000
 ```
 
-Production readiness is still withheld pending machine-bound authorization and
+At that stage, production readiness was withheld pending machine-bound authorization and
 branch/restore policy, integrated isolated deployment, cross-platform validation,
 and security review. The above is evidence for individual safeguards, not a
 claim that those remaining boundaries are solved.
+
+## Process-bound Linux deployment — 2026-09-19
+
+Default startup now requires Linux Unix-socket process binding. TCP/bearer-only
+compatibility mode needs an explicit `allow_bearer_only: true`; it cannot be
+combined as an alternate listener for a process-bound broker.
+
+The integrated systemd + real KVM VM + dotenvx 2.28.0 lifecycle passed with:
+
+- Service credentials and dotenvx decryption keys isolated from UID 1000.
+- Missing authorization denied, then the explicitly authorized VMM succeeded.
+- Child carrying its parent's token denied, including an inherited live TLS
+  connection; the parent's live session remained usable.
+- Explicit child authorization succeeded, and the old parent grant stopped.
+- Restarted child denied until its new process incarnation was authorized.
+- Unrelated host process denied; deleting the authorization record denied use.
+- Malformed or public-readable authorization records denied; restoring a valid
+  private record recovered access without restarting the service.
+- Portable checkpoint capture rejected published sockets explicitly, without
+  creating an artifact. No portable broker-attachment restore claim is made.
+
+This uses PID, UID, process start ticks and boot ID from the kernel, not headers
+or guest labels. Clones share a UID, making UID-only authorization insufficient.
+The administrator owns the authorization file outside machine state; changes
+are checked at acceptance, each request and after body collection.
+
+Two deployment corrections came from real runs: `--branchable` belongs on
+`machine start`, not `create`; dotenvx under DynamicUser requires a private
+runtime home. The failed runs were cleaned up and are not counted as passes.
+
+Eleven unit tests pass. The integrated tests use synthetic credentials, Alpine
+and curl/Python, not real customer accounts. This is a Linux-admin-managed first
+slice, not automated Smol Cloud provisioning, cross-platform process identity or
+an independently audited guarantee. The source's existing published-socket
+checkpoint guard remains in force.
+
+The lightweight no-VM acceptance also checks Unix process binding, missing and
+stale identities, so those checks run in both native Linux CI jobs. Its first
+Unix client probe failed because Python's TCP client sets TCP_NODELAY on an
+AF_UNIX socket; the test now uses a Unix-specific connection implementation.
+This was a test-client error, not a broker authorization failure.

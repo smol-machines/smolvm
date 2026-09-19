@@ -29,13 +29,88 @@ const RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 type Reply = Response<Full<Bytes>>;
 
+/// Kernel-observed Unix peer, never accepted from an HTTP header or guest.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PeerIdentity {
+    pid: i32,
+    uid: u32,
+    start_ticks: u64,
+    boot_id: String,
+}
+
+impl PeerIdentity {
+    #[cfg(target_os = "linux")]
+    fn read(pid: i32, uid: u32) -> Result<Self> {
+        anyhow::ensure!(pid > 0, "invalid peer pid");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        // comm can contain spaces and parentheses. Field 22 follows the last ')'.
+        let start_ticks = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+            .context("missing process start time")?
+            .parse()?;
+        Ok(Self {
+            pid,
+            uid,
+            start_ticks,
+            boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+                .trim()
+                .to_owned(),
+        })
+    }
+
+    fn is_current(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            Self::read(self.pid, self.uid).is_ok_and(|current| current == *self)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+}
+
+/// Print-only administrative helper. Authorization still requires publishing
+/// this record into the separately protected peer_identity_file.
+pub fn process_identity(pid: i32) -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        anyhow::ensure!(pid > 0, "invalid process pid");
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        let uid = status
+            .lines()
+            .find(|line| line.starts_with("Uid:"))
+            .and_then(|line| line.split_whitespace().nth(2))
+            .context("missing effective uid")?
+            .parse()?;
+        let identity = PeerIdentity::read(pid, uid)?;
+        Ok(serde_json::json!({"pid": identity.pid, "uid": identity.uid,
+            "start_ticks": identity.start_ticks, "boot_id": identity.boot_id})
+        .to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        bail!("process-bound authorization is currently Linux-only")
+    }
+}
+
 /// References only. Never deserialize this from a guest or an untrusted API.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub listen: SocketAddr,
+    pub listen: Option<SocketAddr>,
     /// Optional private host socket for Smol's backend-independent vsock mount.
     pub unix_socket: Option<PathBuf>,
+    /// Linux-only host-admin authorization for one VMM process incarnation.
+    /// Requires a Unix-only listener. Missing/replaced records fail closed.
+    pub peer_identity_file: Option<PathBuf>,
+    /// Compatibility/testing only: capability holders may connect from any
+    /// local process. Never implicitly downgrade process-bound authorization.
+    #[serde(default)]
+    pub allow_bearer_only: bool,
     pub certificate: PathBuf,
     pub private_key: PathBuf,
     /// Contents are the proxy Basic password (username is `smol`). Read anew
@@ -155,8 +230,26 @@ pub struct Broker {
 
 impl Broker {
     pub fn new(config: Config) -> Result<Arc<Self>> {
-        if !config.listen.ip().is_loopback() {
+        if config
+            .listen
+            .is_some_and(|address| !address.ip().is_loopback())
+        {
             bail!("experimental broker must listen on loopback");
+        }
+        if config.listen.is_none() && config.unix_socket.is_none() {
+            bail!("at least one listener is required");
+        }
+        if config.peer_identity_file.is_none() && !config.allow_bearer_only {
+            bail!("configure peer_identity_file; bearer-only mode requires explicit opt-in");
+        }
+        if let Some(identity_file) = &config.peer_identity_file {
+            if !cfg!(target_os = "linux") || config.listen.is_some() || config.unix_socket.is_none()
+            {
+                bail!("process-bound authorization requires a Linux Unix-only listener");
+            }
+            if !identity_file.is_absolute() {
+                bail!("peer identity file must be absolute");
+            }
         }
         #[cfg(not(unix))]
         if config.unix_socket.is_some() {
@@ -255,8 +348,23 @@ impl Broker {
         }))
     }
 
-    pub fn listen_address(&self) -> SocketAddr {
+    pub fn listen_address(&self) -> Option<SocketAddr> {
         self.config.listen
+    }
+
+    pub fn process_bound(&self) -> bool {
+        self.config.peer_identity_file.is_some()
+    }
+
+    fn peer_authorized(&self, peer: Option<&PeerIdentity>) -> bool {
+        let Some(path) = self.config.peer_identity_file.as_deref() else {
+            return true;
+        };
+        let Some(peer) = peer else { return false };
+        read_private(path)
+            .ok()
+            .and_then(|record| serde_json::from_str::<PeerIdentity>(&record).ok())
+            .is_some_and(|allowed| allowed == *peer && peer.is_current())
     }
 
     pub fn unix_socket_path(&self) -> Option<&Path> {
@@ -290,7 +398,7 @@ impl Broker {
             let broker = self.clone();
             tasks.spawn(async move {
                 let _permit = permit;
-                let _ = tokio::time::timeout(DEADLINE, broker.connection(stream)).await;
+                let _ = tokio::time::timeout(DEADLINE, broker.connection(stream, None)).await;
             });
             while tasks.try_join_next().is_some() {}
         }
@@ -301,6 +409,17 @@ impl Broker {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             let (stream, _) = listener.accept().await?;
+            #[cfg(target_os = "linux")]
+            let peer = stream
+                .peer_cred()
+                .ok()
+                .and_then(|cred| PeerIdentity::read(cred.pid()?, cred.uid()).ok());
+            #[cfg(not(target_os = "linux"))]
+            let peer = None;
+            if !self.peer_authorized(peer.as_ref()) {
+                drop(stream);
+                continue;
+            }
             let Ok(permit) = self.permits.clone().try_acquire_owned() else {
                 drop(stream);
                 continue;
@@ -308,13 +427,13 @@ impl Broker {
             let broker = self.clone();
             tasks.spawn(async move {
                 let _permit = permit;
-                let _ = tokio::time::timeout(DEADLINE, broker.connection(stream)).await;
+                let _ = tokio::time::timeout(DEADLINE, broker.connection(stream, peer)).await;
             });
             while tasks.try_join_next().is_some() {}
         }
     }
 
-    async fn connection<S>(self: Arc<Self>, stream: S)
+    async fn connection<S>(self: Arc<Self>, stream: S, peer: Option<PeerIdentity>)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -323,9 +442,11 @@ impl Broker {
         let (send, receive) = tokio::sync::oneshot::channel();
         let sender = Arc::new(std::sync::Mutex::new(Some(send)));
         let broker = self.clone();
+        let tunnel_peer = peer.clone();
         let service = service_fn(move |mut request: Request<Incoming>| {
             let broker = broker.clone();
             let sender = sender.clone();
+            let peer = tunnel_peer.clone();
             async move {
                 let auth = request
                     .headers()
@@ -339,6 +460,7 @@ impl Broker {
                     .count()
                     != 1
                     || !broker.authorized(auth)
+                    || !broker.peer_authorized(peer.as_ref())
                 {
                     response(
                         StatusCode::PROXY_AUTHENTICATION_REQUIRED,
@@ -389,9 +511,10 @@ impl Broker {
         let service = service_fn(move |request| {
             let broker = broker.clone();
             let auth = auth.clone();
+            let peer = peer.clone();
             async move {
                 let reply = broker
-                    .forward(index, auth.as_str(), request)
+                    .forward(index, auth.as_str(), peer.as_ref(), request)
                     .await
                     .unwrap_or_else(|_| {
                         response(StatusCode::BAD_GATEWAY, "credential service unavailable")
@@ -405,8 +528,14 @@ impl Broker {
             .await;
     }
 
-    async fn forward(&self, index: usize, auth: &str, request: Request<Incoming>) -> Result<Reply> {
-        if !self.authorized(auth) {
+    async fn forward(
+        &self,
+        index: usize,
+        auth: &str,
+        peer: Option<&PeerIdentity>,
+        request: Request<Incoming>,
+    ) -> Result<Reply> {
+        if !self.authorized(auth) || !self.peer_authorized(peer) {
             return Ok(response(StatusCode::FORBIDDEN, "access revoked"));
         }
         let grant = &self.config.grants[index];
@@ -501,7 +630,7 @@ impl Broker {
         // Body collection yields to the runtime. An administrator may revoke
         // access while a client is uploading; recheck at the dispatch boundary.
         // Requests already dispatched upstream cannot be recalled.
-        if !self.authorized(auth) {
+        if !self.authorized(auth) || !self.peer_authorized(peer) {
             return Ok(response(StatusCode::FORBIDDEN, "access revoked"));
         }
         let secret = grant.read_secret()?;
@@ -610,6 +739,46 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_identity_rejects_other_process_incarnations() {
+        let identity =
+            PeerIdentity::read(std::process::id() as i32, unsafe { libc::geteuid() }).unwrap();
+        assert!(identity.is_current());
+        let mut stale = identity.clone();
+        stale.start_ticks += 1;
+        assert!(!stale.is_current());
+        stale = identity.clone();
+        stale.boot_id.push_str("-different-boot");
+        assert!(!stale.is_current());
+        assert!(PeerIdentity::read(0, identity.uid).is_err());
+    }
+
+    #[test]
+    fn process_binding_cannot_have_a_tcp_alternative() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:8443", "unix_socket": "/run/broker.sock",
+            "peer_identity_file": "/run/identity", "certificate": "/missing/cert",
+            "private_key": "/missing/key", "access_token_file": "/missing/access", "grants": []
+        }))
+        .unwrap();
+        assert!(Broker::new(config)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Unix-only"));
+    }
+
+    #[test]
+    fn grants_are_read_only_by_default() {
+        let grant: Grant = serde_json::from_value(serde_json::json!({
+            "host": "api.example.com", "placeholder": "SMOL_PLACEHOLDER_EXAMPLE_KEY",
+            "header": "authorization", "secret_file": "/private/key"
+        }))
+        .unwrap();
+        assert_eq!(grant.methods, ["GET", "HEAD"]);
+    }
 
     #[test]
     fn credential_source_is_explicit_and_environment_names_are_validated() {

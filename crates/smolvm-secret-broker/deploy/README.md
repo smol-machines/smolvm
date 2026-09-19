@@ -35,7 +35,9 @@ model and configure narrowly scoped upstream credentials before deploying:
 
 ```json
 {
-  "listen": "127.0.0.1:8443",
+  "listen": null,
+  "unix_socket": "/run/smolvm-secret-broker/broker.sock",
+  "peer_identity_file": "/run/smolvm-secret-broker/identity",
   "certificate": "/run/smolvm-secret-broker/leaf",
   "private_key": "/run/smolvm-secret-broker/key",
   "access_token_file": "/run/smolvm-secret-broker/access",
@@ -51,9 +53,32 @@ model and configure narrowly scoped upstream credentials before deploying:
 ```
 
 4. Install the unit root-owned in `/etc/systemd/system`, reload systemd, and
-   start it. Only its loopback proxy endpoint and the public CA may be exposed
-   to the workload. Do not widen the private directory/socket permissions to
-   accommodate an isolated VMM UID; that needs a separately authorized bridge.
+   start it. Attach only `/run/smolvm-secret-broker/broker.sock` using the existing
+   `--mount-socket` option and copy the public CA into the guest. Never mount the
+   runtime directory. This works with TSI and does not expose host networking.
+   The directory is traverse-only (0711), credentials remain 0600, and the socket
+   accepts a connection only after checking kernel-reported PID/UID and process
+   start time against the protected authorization record.
+5. After starting the machine, use `machine status --json` to obtain its VMM PID.
+   `smolvm-secret-broker identity VMM_PID` prints a JSON record with PID, effective
+   UID, start ticks and host boot ID. A trusted administrator publishes this as
+   the configured `identity` file, mode 0600, owned by the service UID (the owner
+   of `/run/smolvm-secret-broker`). Use a temporary file in that directory and
+   rename to publish atomically. No authorization record means no access.
+
+One broker authorizes one process incarnation. To serve independent simultaneous
+machines, use separate service/config/runtime instances and distinct access
+tokens. Children share their source's host UID, so **UID alone is insufficient**.
+The broker checks the full process identity at accept, per HTTP request and again
+after reading the request body. A child or restarted VM requires a new explicit
+grant; a token inherited from its parent does not suffice. Replacing the record
+transfers access; deleting it revokes subsequent dispatches. The helper only
+prints process metadata; it does not grant access or attest machine ownership.
+
+The record belongs outside the VM and its snapshots. Portable checkpoint capture
+currently rejects published sockets in SmolVM. That guard remains: this PR does
+not promise portable restore with the broker attachment. The operator must attach
+and authorize any new/restored process separately. No guest API can issue grants.
 
 `LoadCredential` and the private tmpfs copies are startup snapshots. To rotate
 or revoke access in this deployment, the administrator updates the root-owned
@@ -62,14 +87,42 @@ Changing source files alone does not update the running service. Restart can
 leave the outcome of an already-dispatched upstream operation unknown; do not
 automatically retry non-idempotent API operations.
 
-The standalone dotenvx integration remains available, but wrapping the broker
-under the desktop user's identity is not equivalent to this separation. A
-dotenvx service wrapper must run under the separate identity and protect its
-decryption keys there too; that combined deployment is not validated yet.
+Dotenvx must also run under the service identity, never the agent's identity.
+For encrypted-env mode, replace `secret_file` with `secret_env`, load the encrypted
+env and decryption-key files with `LoadCredential`, copy them to private runtime
+files, and wrap only the broker with `dotenvx run`. Supply a private runtime home
+to dotenvx: DynamicUser has no normal home, and dotenvx otherwise fails before
+launching. The provided launcher enables this with a root-owned systemd override:
 
-## Remaining launch gates
+```ini
+[Service]
+Environment=SMOL_BROKER_DOTENVX=/usr/local/bin/dotenvx
+Environment=HOME=/run/smolvm-secret-broker/home
+LoadCredential=env:/etc/smolvm-secret-broker/.env
+LoadCredential=envkeys:/etc/smolvm-secret-broker/.env.keys
+```
 
-Machine-specific credentials/attachment, authorization renewal on branch and
-restore, fleet/control-plane wiring, full auditability and independent security
-review remain outstanding. This template does not turn copyable proxy tokens
-into workload identity or remove those production gates.
+Use the tested dotenvx 2.28.0 flags or validate changes on an upgrade. The `secret`
+credential loaded by the base template is unused when the config uses `secret_env`;
+it can be an empty private file, not a second plaintext copy of the upstream key.
+
+Combined acceptance:
+
+```sh
+sudo python3 -B crates/smolvm-secret-broker/tests/service_acceptance.py \
+  --broker /absolute/path/to/smolvm-secret-broker \
+  --observer-uid 1000 --observer-gid 1000 \
+  --smolvm /absolute/path/to/smolvm --dotenvx /absolute/path/to/dotenvx
+```
+
+The test checks parent access, denial of copied child tokens and inherited live
+TLS sessions, explicit child authorization, restart reauthorization and revocation.
+It also verifies that the ordinary desktop UID cannot read credential files.
+
+## Scope limits
+
+Fleet/control-plane automation, macOS/Windows process-bound transport and an
+independent security review are not included. HTTP/1.1 bounded non-streaming APIs
+are supported; this is not an unrestricted tunnel or a general-purpose gateway.
+The compatibility `allow_bearer_only` mode is off by default and must not be used
+as a substitute for process binding. Every host administrator remains trusted.

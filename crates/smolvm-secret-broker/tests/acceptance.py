@@ -17,6 +17,7 @@ import selectors
 import signal
 import socket
 import ssl
+import sys
 import subprocess
 import tempfile
 import threading
@@ -132,6 +133,7 @@ def main():
                                     start_new_session=True, env=environment)
 
         config.write_text(json.dumps({
+            "allow_bearer_only": True,
             "listen": "127.0.0.1:0", "certificate": str(leaf), "private_key": str(key),
             "access_token_file": str(access), "upstream_ca": str(cert),
             "unix_socket": str(socket_path) if args.backend == "tsi" else None,
@@ -275,6 +277,57 @@ def main():
                 proxy_port = original_port
                 stop(negative)
 
+            if sys.platform.startswith("linux"):
+                bound_config = json.loads(config.read_text())
+                bound_socket = root / "bound.sock"
+                identity = root / "identity"
+                bound_config.update(listen=None, allow_bearer_only=False,
+                                    unix_socket=str(bound_socket), peer_identity_file=str(identity))
+                bound_path = root / "bound.json"
+                bound_path.write_text(json.dumps(bound_config))
+                bound = launch(bound_path)
+                try:
+                    with selectors.DefaultSelector() as ready:
+                        ready.register(bound.stdout, selectors.EVENT_READ)
+                        assert ready.select(timeout=10)
+                    assert "process-bound Unix socket" in bound.stdout.readline()
+
+                    def bound_request(require_success=False):
+                        class UnixHTTPS(http.client.HTTPSConnection):
+                            def connect(self):
+                                self.sock = socket.socket(socket.AF_UNIX)
+                                self.sock.settimeout(5)
+                                self.sock.connect(str(bound_socket))
+                                self._tunnel()
+                                self.sock = context.wrap_socket(self.sock, server_hostname="localhost")
+                        conn = UnixHTTPS("localhost", context=context, timeout=5)
+                        conn.set_tunnel("localhost", port, headers={"Proxy-Authorization": auth})
+                        try:
+                            conn.request("GET", "/", headers={"Authorization": "Bearer " + PLACEHOLDER})
+                            response = conn.getresponse()
+                            response.read()
+                            return response.status
+                        except (OSError, http.client.HTTPException):
+                            if require_success:
+                                raise
+                            return None
+                        finally:
+                            conn.close()
+
+                    assert bound_request() is None
+                    record = json.loads(run(args.broker, "identity", str(os.getpid())).stdout)
+                    write_private(identity, json.dumps(record))
+                    bound_result = bound_request(require_success=True)
+                    assert bound_result == 200, f"authorized Unix response: {bound_result}"
+                    record["start_ticks"] += 1
+                    write_private(identity, json.dumps(record))
+                    assert bound_request() is None
+                    identity.unlink()
+                    assert bound_request() is None
+                    checks.append("Linux process binding requires a current host-owned record")
+                finally:
+                    stop(bound)
+
             if args.backend == "tsi":
                 # A normal service-manager stop must clean the private socket
                 # and allow restart on the exact same endpoint.
@@ -354,7 +407,7 @@ curl --fail --silent --show-error --max-time 15 -H "Authorization: Bearer $TEST_
                 assert failed.returncode in (22, 56) and expected_status in failed.stderr, "guest must receive an explicit broker denial"
                 checks.append("real VM: removed access/credential fails closed")
             print(json.dumps({"passed": checks, "real_vm": bool(args.smolvm), "backend": args.backend,
-                              "dotenvx": bool(args.dotenvx), "production_ready": False}, indent=2))
+                              "dotenvx": bool(args.dotenvx), "scope": "local acceptance, not cloud or cross-platform validation"}, indent=2))
         finally:
             try:
                 if created:

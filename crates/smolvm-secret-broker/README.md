@@ -1,7 +1,8 @@
-# Credential broker: first functional slice
+# Credential broker
 
-**Experimental. Synthetic/local testing only; not a production security boundary
-or a completed cloud integration.** This standalone host process lets
+**Scope: administrator-managed Linux deployment, not a completed cloud integration.**
+The default requires process-bound Unix transport; bearer-only TCP is an explicit
+compatibility/testing option, not machine identity. This standalone host process lets
 an ordinary HTTP client use a placeholder environment variable while the
 upstream credential stays outside the workload. Existing `--secret-env` and
 `--secret-file` semantics are unchanged: those still expose values to the guest.
@@ -42,6 +43,7 @@ submitted by a guest or untrusted fleet API:
 
 ```json
 {
+  "allow_bearer_only": true,
   "listen": "127.0.0.1:8443",
   "certificate": "/private/broker/server-chain.pem",
   "private_key": "/private/broker/server.key",
@@ -56,6 +58,9 @@ submitted by a guest or untrusted fleet API:
   }]
 }
 ```
+
+The example above is the compatibility test interface. For deployed workloads,
+use the [process-bound service configuration](deploy/README.md) instead.
 
 Supply a server certificate covering the configured destinations, signed by a
 dedicated development CA. Only the CA's **public certificate** enters the guest;
@@ -179,18 +184,23 @@ and its tested limits. The template is not installed automatically. Same-user
 dotenvx testing and isolated-service testing are separate acceptance cases;
 neither establishes a complete desktop-to-cloud deployment.
 
-- This initial proxy capability is guest-visible and copyable. It is **not**
-  host-attested machine identity. Branches/checkpoints copying it share the same
-  authorization until revoked. Independent child identity, restore reauthorization,
-  and per-machine gateway attachment still need lifecycle integration.
+The combined Linux isolated-service + dotenvx + real-VM test now covers branch
+and restart authorization, including a live TLS session at the branch boundary.
+Portable capture currently refuses published sockets in SmolVM; do not remove
+that guard or claim checkpoint/restore support for this attachment. A restored
+machine must be attached and authorized by its administrator as a new process.
+
+- The proxy token is guest-visible and copyable. In process-bound mode it is
+  necessary but not sufficient: the host-admin record must also authorize the
+  kernel-observed peer. Compatibility bearer-only mode does not have that property.
 - The test keeps public egress for Alpine/curl setup. It verifies the protected
   broker path and blocked unrelated host access, not universal forced proxying.
   A guest can bypass proxy environment variables, but gets no upstream key by
   doing so. Production gateway-only routing needs host-enforced policy.
-- A host-level agent with the administrator's permissions can read broker files
-  or memory. This prototype does not provide privilege separation from that actor.
-- Host authorization does not constrain API actions. Use narrow upstream keys;
-  resource/method/body policy belongs in the broker/provider integration.
+- A host-level agent with root/sudo can read broker files or memory. Service
+  separation protects against ordinary users, not the host administrator.
+- Method restrictions do not constrain every API action. Use narrow upstream keys;
+  provider-specific resource/body policy is not implemented.
 - Public fleet APIs, dotenvx gateway-specific integration, CLI/SDK automatic attachment and trust provisioning,
-  branch/restore acceptance, OS privilege separation, cross-platform QA, and
-  independent security review remain before a production claim.
+  portable attachment restore, cross-platform process-bound QA and independent
+  security review remain outside this Linux-only slice.
