@@ -37,3 +37,33 @@ branch/restore reauthorization, automatic attachment/trust setup, public cloud
 integration, host-admin separation, enforced gateway-only public egress,
 cross-platform acceptance and security review are still outstanding. Existing
 secret injection and machine lifecycle semantics have not been changed.
+
+## TSI and dotenvx follow-up — 2026-09-19
+
+- Added an optional private Unix broker listener carried over existing
+  `--mount-socket`/vsock. A guest-local socat listener accepts ordinary HTTPS
+  proxy clients; machine networking remains TSI, not an implicit virtio-net fallback.
+- Linux TSI + file-backed credentials: full acceptance passed, including a real
+  Alpine guest, unchanged curl, credential substitution and removal.
+- Linux TSI + dotenvx 2.28.0: full acceptance passed using an encrypted synthetic
+  `.env`, explicit private `.env.keys`, and `dotenvx run` wrapping only the broker.
+  The broker config references `secret_env`; no upstream credential is passed to
+  Smol or the guest. Access-token removal returns an explicit proxy denial.
+- Linux virtio-net + dotenvx 2.28.0: the same encrypted-env acceptance passed,
+  including strict-egress refusal of the unrelated host service.
+- Dotenvx binary came from its official GitHub v2.28.0 release and matched the
+  release's SHA-256 checksum manifest. It was not installed globally.
+- `cargo test`: 8/8 tests passed; clippy passed with warnings denied. Socket tests
+  cover private permissions, existing paths, cleanup, and replacement preservation.
+- One early dotenvx fixture command wrote its synthetic `.env.keys` into the
+  worktree rather than the temporary directory. It was removed; the harness now
+  explicitly sets both cwd and `-fk` to its private temporary directory. No real
+  credentials were used.
+- A TSI test incorrectly reused the virtio-net gateway address for an unrelated
+  egress probe; the exec exceeded its 15-second harness timeout despite curl's
+  two-second timeout. It is not counted as a pass or an egress guarantee. The
+  TSI test now validates the socket bridge instead. General TSI egress/timeout
+  behavior was not changed by this work.
+
+Remaining limits above still apply. In particular this is not branch-safe
+machine identity, cloud integration, or a production-ready security boundary.

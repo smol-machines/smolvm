@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import secrets
 import selectors
+import signal
 import ssl
 import subprocess
 import tempfile
@@ -31,10 +32,25 @@ def write_private(path, text):
     path.chmod(0o600)
 
 
+def stop(process):
+    # Every broker/wrapper is started in its own session. Stop the complete
+    # owned group, including the child of `dotenvx run`, never other brokers.
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGINT)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--broker", required=True)
     parser.add_argument("--smolvm")
+    parser.add_argument("--backend", choices=["virtio-net", "tsi"], default="virtio-net")
+    parser.add_argument("--dotenvx", help="Test encrypted dotenvx host-environment credentials")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="smol-broker-qa-") as directory:
         root = Path(directory)
@@ -91,13 +107,33 @@ def main():
         thread.start()
         port = server.server_port
         config = root / "config.json"
+        socket_path = root / "broker.sock"
+        env_file = root / ".env"
+        if args.dotenvx:
+            write_private(env_file, "SMOL_BROKER_QA_UPSTREAM_KEY=" + real + "\n")
+            run(args.dotenvx, "encrypt", "--no-native", "--no-armor", "--no-1password", "--no-bitwarden",
+                "-f", str(env_file), "-fk", str(root / ".env.keys"), cwd=root)
+            assert real not in env_file.read_text() and "encrypted:" in env_file.read_text()
+            (root / ".env.keys").chmod(0o600)
+
+        def launch(path):
+            command = [args.broker, str(path)]
+            if args.dotenvx:
+                command = [args.dotenvx, "run", "--quiet", "--strict", "--no-native", "--no-armor",
+                           "--no-1password", "--no-bitwarden", "-f", str(env_file), "-fk", str(root / ".env.keys"), "--", *command]
+            environment = os.environ.copy()
+            environment.pop("SMOL_BROKER_QA_UPSTREAM_KEY", None)
+            return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    start_new_session=True, env=environment)
+
         config.write_text(json.dumps({
             "listen": "127.0.0.1:0", "certificate": str(leaf), "private_key": str(key),
             "access_token_file": str(access), "upstream_ca": str(cert),
+            "unix_socket": str(socket_path) if args.backend == "tsi" else None,
             "grants": [{"host": "localhost", "port": port, "placeholder": PLACEHOLDER,
-                        "header": "authorization", "secret_file": str(credential)}],
+                        "header": "authorization", **({"secret_env": "SMOL_BROKER_QA_UPSTREAM_KEY"} if args.dotenvx else {"secret_file": str(credential)})}],
         }))
-        process = subprocess.Popen([args.broker, str(config)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = launch(config)
         name = "broker-qa-" + secrets.token_hex(6)
         created = False
         checks = []
@@ -170,20 +206,24 @@ def main():
             persistent.close()
             write_private(access, token)
             checks.append("revocation on an already-established TLS connection")
-            write_private(credential, secrets.token_hex(24))
-            assert request() == (200, b'{"authorized": true}')
-            credential.unlink()
-            assert request()[0] == 502
-            write_private(credential, real)
-            checks.append("credential rotation and removal without restarting")
+            if args.dotenvx:
+                checks.append("dotenvx encrypted .env decrypted only into host broker environment")
+            else:
+                write_private(credential, secrets.token_hex(24))
+                assert request() == (200, b'{"authorized": true}')
+                credential.unlink()
+                assert request()[0] == 502
+                write_private(credential, real)
+                checks.append("credential rotation and removal without restarting")
 
             # Trusting the proxy must not implicitly trust the upstream. With
             # the private upstream CA omitted, the same request must fail.
             untrusted = root / "untrusted-upstream.json"
             untrusted_config = json.loads(config.read_text())
             del untrusted_config["upstream_ca"]
+            untrusted_config.pop("unix_socket", None)
             untrusted.write_text(json.dumps(untrusted_config))
-            negative = subprocess.Popen([args.broker, str(untrusted)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            negative = launch(untrusted)
             original_port = proxy_port
             try:
                 with selectors.DefaultSelector() as ready:
@@ -198,28 +238,35 @@ def main():
                 checks.append("untrusted upstream TLS rejected before credential-bearing HTTP")
             finally:
                 proxy_port = original_port
-                negative.terminate()
-                try:
-                    negative.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    negative.kill()
-                    negative.wait()
+                stop(negative)
 
             if args.smolvm:
                 # Existing machine verbs only. No real credential is passed to
                 # the CLI, guest, mount, or proxy environment.
                 # Existing host-owned exact-port bridge; do not expose all host
                 # loopback services or weaken the network's internal-IP floor.
-                os.environ["SMOLVM_GUEST_HOST_SERVICE"] = f"7443:{proxy_port}"
-                os.environ["SMOLVM_EGRESS_FLOOR"] = "strict"
+                if args.backend == "tsi":
+                    os.environ.pop("SMOLVM_GUEST_HOST_SERVICE", None)
+                    bridge = ["--mount-socket", str(socket_path) + ":/run/smol-broker.sock"]
+                    proxy_host = "127.0.0.1"
+                else:
+                    os.environ["SMOLVM_GUEST_HOST_SERVICE"] = f"7443:{proxy_port}"
+                    os.environ["SMOLVM_EGRESS_FLOOR"] = "strict"
+                    bridge = []
+                    proxy_host = "100.96.0.1"
                 run(args.smolvm, "machine", "create", "--name", name, "--cpus", "1", "--mem", "512",
-                    "--storage", "2", "--overlay", "1", "--net-backend", "virtio-net", "--net", "--image", "alpine:3.20")
+                    "--storage", "2", "--overlay", "1", "--net-backend", args.backend, "--net", "--image", "alpine:3.20", *bridge)
                 created = True
                 run(args.smolvm, "machine", "start", "--name", name)
-                run(args.smolvm, "machine", "exec", "--name", name, "--", "apk", "add", "--no-cache", "curl")
+                run(args.smolvm, "machine", "exec", "--name", name, "--", "apk", "add", "--no-cache", "curl", "socat")
                 run(args.smolvm, "machine", "cp", str(cert), name + ":/tmp/broker-ca.pem")
+                if args.backend == "tsi":
+                    run(args.smolvm, "machine", "exec", "--name", name, "--detach", "--", "socat",
+                        "TCP4-LISTEN:7443,bind=127.0.0.1,reuseaddr,fork", "UNIX-CONNECT:/run/smol-broker.sock")
+                    run(args.smolvm, "machine", "exec", "--name", name, "--", "sh", "-c",
+                        "for i in 1 2 3 4 5; do nc -z 127.0.0.1 7443 && exit 0; sleep 0.2; done; exit 1")
                 script = f"""set -eu
-export https_proxy=http://smol:{token}@100.96.0.1:7443
+export https_proxy=http://smol:{token}@{proxy_host}:7443
 export HTTPS_PROXY="$https_proxy"
 export no_proxy= NO_PROXY=
 export CURL_CA_BUNDLE=/tmp/broker-ca.pem
@@ -233,30 +280,36 @@ curl --fail --silent --show-error --max-time 15 -H "Authorization: Bearer $TEST_
                     raise RuntimeError("guest request failed: " + error.stderr) from None
                 assert '"authorized": true' in result.stdout, result.stdout + result.stderr
                 checks.append("real VM: unchanged curl HTTPS request with placeholder environment")
-                before = len(seen)
-                denied = subprocess.run([args.smolvm, "machine", "exec", "--name", name, "--", "curl",
-                    "--noproxy", "*", "--silent", "--show-error", "--max-time", "2", "--insecure",
-                    f"https://100.96.0.1:{port}/"], text=True, capture_output=True, timeout=15)
-                assert denied.returncode != 0 and len(seen) == before
-                checks.append("real VM: strict egress blocks unrelated host service (even without certificate checking)")
+                if args.backend == "virtio-net":
+                    before = len(seen)
+                    denied = subprocess.run([args.smolvm, "machine", "exec", "--name", name, "--", "curl",
+                        "--noproxy", "*", "--silent", "--show-error", "--max-time", "2", "--insecure",
+                        f"https://100.96.0.1:{port}/"], text=True, capture_output=True, timeout=15)
+                    assert denied.returncode != 0 and len(seen) == before
+                    checks.append("real VM: strict egress blocks unrelated host service")
+                else:
+                    run(args.smolvm, "machine", "exec", "--name", name, "--", "sh", "-c",
+                        "test -S /run/smol-broker.sock && test ! -e " + str(key))
+                    checks.append("real VM: TSI broker uses mounted socket, not host-network listener exposure")
                 guest_env = run(args.smolvm, "machine", "exec", "--name", name, "--", "env")
                 assert real not in guest_env.stdout
-                credential.unlink()
+                if args.dotenvx:
+                    access.unlink()
+                    expected_status = "407"
+                else:
+                    credential.unlink()
+                    expected_status = "502"
                 failed = subprocess.run([args.smolvm, "machine", "exec", "--name", name, "--", "sh", "-c", script], text=True, capture_output=True, timeout=30)
-                assert failed.returncode == 22 and "502" in failed.stderr, "guest must receive a broker denial after credential removal"
-                checks.append("real VM: removed credential fails closed")
-            print(json.dumps({"passed": checks, "real_vm": bool(args.smolvm), "production_ready": False}, indent=2))
+                assert failed.returncode in (22, 56) and expected_status in failed.stderr, "guest must receive an explicit broker denial"
+                checks.append("real VM: removed access/credential fails closed")
+            print(json.dumps({"passed": checks, "real_vm": bool(args.smolvm), "backend": args.backend,
+                              "dotenvx": bool(args.dotenvx), "production_ready": False}, indent=2))
         finally:
             try:
                 if created:
                     run(args.smolvm, "machine", "delete", "--name", name, "-f")
             finally:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                stop(process)
                 server.shutdown()
                 server.server_close()
 

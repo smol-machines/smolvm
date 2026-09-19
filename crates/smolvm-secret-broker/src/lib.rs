@@ -34,6 +34,8 @@ type Reply = Response<Full<Bytes>>;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
+    /// Optional private host socket for Smol's backend-independent vsock mount.
+    pub unix_socket: Option<PathBuf>,
     pub certificate: PathBuf,
     pub private_key: PathBuf,
     /// Contents are the proxy Basic password (username is `smol`). Read anew
@@ -57,7 +59,42 @@ pub struct Grant {
     pub header: String,
     /// Plaintext read per authorized request. An external manager can rotate
     /// or remove this file; no resolved value is persisted by the broker.
-    pub secret_file: PathBuf,
+    pub secret_file: Option<PathBuf>,
+    /// Host broker environment only (e.g. populated by `dotenvx run`).
+    /// Environment rotation requires restarting the broker.
+    pub secret_env: Option<String>,
+}
+
+impl Grant {
+    fn read_secret(&self) -> Result<Zeroizing<String>> {
+        match (&self.secret_file, &self.secret_env) {
+            (Some(path), None) => read_private(path),
+            (None, Some(name)) if valid_env_name(name) => {
+                let value = Zeroizing::new(
+                    std::env::var(name)
+                        .map_err(|_| anyhow::anyhow!("host credential environment unavailable"))?,
+                );
+                validate_value(&value)?;
+                Ok(value)
+            }
+            _ => bail!("configure exactly one secret_file or valid secret_env"),
+        }
+    }
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn validate_value(value: &str) -> Result<()> {
+    if value.len() < 16 || value.len() > 8192 || value.bytes().any(|b| b.is_ascii_control()) {
+        bail!("credential must contain 16..8192 non-control bytes");
+    }
+    Ok(())
 }
 
 fn https_port() -> u16 {
@@ -98,9 +135,7 @@ fn read_private(path: &Path) -> Result<Zeroizing<String>> {
     file.take(8193).read_to_string(&mut value)?;
     let trimmed = value.trim_end_matches(['\r', '\n']).to_owned();
     *value = trimmed;
-    if value.len() < 16 || value.len() > 8192 || value.bytes().any(|b| b.is_ascii_control()) {
-        bail!("credential must contain 16..8192 non-control bytes");
-    }
+    validate_value(&value)?;
     Ok(value)
 }
 
@@ -108,12 +143,17 @@ pub struct Broker {
     config: Config,
     tls: TlsAcceptor,
     client: reqwest::Client,
+    permits: Arc<Semaphore>,
 }
 
 impl Broker {
     pub fn new(config: Config) -> Result<Arc<Self>> {
         if !config.listen.ip().is_loopback() {
             bail!("experimental broker must listen on loopback");
+        }
+        #[cfg(not(unix))]
+        if config.unix_socket.is_some() {
+            bail!("Unix broker socket is unsupported on this platform");
         }
         if config.grants.is_empty() {
             bail!("at least one grant is required");
@@ -154,7 +194,7 @@ impl Broker {
             }) {
                 bail!("duplicate destination or placeholder");
             }
-            read_private(&grant.secret_file).context("invalid secret reference")?;
+            grant.read_secret().context("invalid secret reference")?;
         }
         let certs = rustls_pemfile::certs(&mut BufReader::new(std::fs::File::open(
             &config.certificate,
@@ -194,11 +234,16 @@ impl Broker {
             config,
             tls: TlsAcceptor::from(Arc::new(tls)),
             client: client.build()?,
+            permits: Arc::new(Semaphore::new(32)),
         }))
     }
 
     pub fn listen_address(&self) -> SocketAddr {
         self.config.listen
+    }
+
+    pub fn unix_socket_path(&self) -> Option<&Path> {
+        self.config.unix_socket.as_deref()
     }
 
     fn authorized(&self, presented: &str) -> bool {
@@ -216,11 +261,10 @@ impl Broker {
     /// Bounded connections and deadlines include idle clients and TLS setup.
     /// Dropping this future aborts all handlers (no detached secret holders).
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<()> {
-        let permits = Arc::new(Semaphore::new(32));
         let mut tasks = tokio::task::JoinSet::new();
         loop {
-            let permit = permits.clone().acquire_owned().await?;
             let (stream, _) = listener.accept().await?;
+            let permit = self.permits.clone().acquire_owned().await?;
             let broker = self.clone();
             tasks.spawn(async move {
                 let _permit = permit;
@@ -230,7 +274,25 @@ impl Broker {
         }
     }
 
-    async fn connection(self: Arc<Self>, stream: tokio::net::TcpStream) {
+    #[cfg(unix)]
+    pub async fn serve_unix(self: Arc<Self>, listener: tokio::net::UnixListener) -> Result<()> {
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let permit = self.permits.clone().acquire_owned().await?;
+            let broker = self.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                let _ = tokio::time::timeout(DEADLINE, broker.connection(stream)).await;
+            });
+            while tasks.try_join_next().is_some() {}
+        }
+    }
+
+    async fn connection<S>(self: Arc<Self>, stream: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         // A oneshot transfers the upgrade to this connection task, so its
         // timeout and semaphore also cover the intercepted TLS session.
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -398,7 +460,7 @@ impl Broker {
             header::ACCEPT_ENCODING,
             header::HeaderValue::from_static("identity"),
         );
-        let secret = read_private(&grant.secret_file)?;
+        let secret = grant.read_secret()?;
         let mut value = header::HeaderValue::from_str(&format!("{prefix}{}", secret.as_str()))?;
         value.set_sensitive(true);
         headers.insert(
@@ -504,6 +566,28 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_source_is_explicit_and_environment_names_are_validated() {
+        let mut grant = Grant {
+            host: "example.com".into(),
+            port: 443,
+            placeholder: "SMOL_PLACEHOLDER_TEST_KEY".into(),
+            header: "authorization".into(),
+            secret_file: None,
+            secret_env: None,
+        };
+        assert!(grant.read_secret().is_err());
+        grant.secret_env = Some("1INVALID".into());
+        assert!(grant.read_secret().is_err());
+        grant.secret_env = Some("SMOL_BROKER_UNIT_ABSENT_CREDENTIAL_0192".into());
+        assert!(grant.read_secret().is_err());
+        grant.secret_file = Some(PathBuf::from("/not-read"));
+        assert!(grant.read_secret().is_err());
+        assert!(valid_env_name("GITHUB_TOKEN"));
+        assert!(!valid_env_name("GITHUB_TOKEN=secret"));
+        assert!(!valid_env_name(""));
+    }
 
     #[test]
     fn constant_time_comparison_matches_only_equal_values() {
