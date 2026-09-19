@@ -17,6 +17,7 @@ use smolvm::secrets::SecretRef;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm_protocol::ImageInfo;
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::io::Write;
 
 // ============================================================================
@@ -2643,6 +2644,20 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // Confirm deletion unless --force (or --cascade, which is already an
     // explicit "remove this and its clones" and runs unattended).
     if !force && !options.cascade {
+        // Without a terminal there is nobody to answer the prompt: the read
+        // below would see EOF, take it as "no", and return Ok — leaving a
+        // script that believed it had cleaned up with a machine still on disk.
+        // Refuse loudly instead, and name the flag the caller needs.
+        if !std::io::stdin().is_terminal() {
+            return Err(smolvm::Error::agent(
+                "delete",
+                format!(
+                    "machine '{name}' needs confirmation but stdin is not a terminal; \
+                     pass --force to delete it, or --cascade to remove it together with \
+                     any machines branched from it"
+                ),
+            ));
+        }
         eprint!("Delete machine '{}'? [y/N] ", name);
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_ok() {

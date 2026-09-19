@@ -169,6 +169,38 @@ test_create_warns_on_flags_after_separator() {
 }
 
 # =============================================================================
+# Delete Guards
+# =============================================================================
+
+# A delete that needs confirmation must fail when no terminal can answer the
+# prompt. Reading EOF as "no" and returning success left scripted cleanups
+# believing they had removed a machine that was still on disk.
+test_delete_without_terminal_fails() {
+    local name="clitest-notty-$$"
+    local output listing
+    local rc=0
+    $SMOLVM machine create --name "$name" >/dev/null 2>&1 || return 1
+    # The suite runs under `set -e`, so the expected non-zero exit has to be
+    # consumed here rather than aborting the function. Capture the listing
+    # too: piping into `grep -q` under `pipefail` reports failure when the
+    # match is found, because the early exit SIGPIPEs the producer.
+    output=$($SMOLVM machine delete --name "$name" 2>&1 </dev/null) || rc=$?
+    listing=$($SMOLVM machine ls 2>/dev/null || true)
+    $SMOLVM machine delete --name "$name" -f >/dev/null 2>&1 || true
+    [[ $rc -ne 0 ]] && [[ "$listing" == *"$name"* ]] && [[ "$output" == *"not a terminal"* ]]
+}
+
+# --force is the documented way through, and must still work unattended.
+test_delete_force_without_terminal_succeeds() {
+    local name="clitest-force-$$"
+    $SMOLVM machine create --name "$name" >/dev/null 2>&1 || return 1
+    $SMOLVM machine delete --name "$name" -f >/dev/null 2>&1 </dev/null || return 1
+    local listing
+    listing=$($SMOLVM machine ls 2>/dev/null || true)
+    [[ "$listing" != *"$name"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -182,6 +214,8 @@ run_test "vm alias works" test_vm_alias || true
 run_test "Invalid subcommand fails" test_invalid_subcommand || true
 run_test "Machine create flags" test_machine_create_flags || true
 run_test "Machine run flags" test_machine_run_flags || true
+run_test "Delete without terminal fails" test_delete_without_terminal_fails || true
+run_test "Delete --force without terminal succeeds" test_delete_force_without_terminal_succeeds || true
 run_test "Machine create warns on flags after --" test_create_warns_on_flags_after_separator || true
 
 print_summary "CLI Tests"
