@@ -1683,6 +1683,22 @@ impl AgentClient {
         expect_data(resp, "storage status")
     }
 
+    /// List the entries of a guest directory.
+    ///
+    /// Agents older than this request reject it as an unknown variant, so a
+    /// caller should treat an error as "not available" rather than a failure.
+    pub fn list_directory(&mut self, path: &str) -> Result<Vec<smolvm_protocol::DirectoryEntry>> {
+        let resp = self.request(&AgentRequest::ListDirectory {
+            path: path.to_string(),
+        })?;
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            entries: Vec<smolvm_protocol::DirectoryEntry>,
+        }
+        let listing: Listing = expect_data(resp, "list directory")?;
+        Ok(listing.entries)
+    }
+
     /// The guest's own view of machine memory.
     ///
     /// Agents older than this request reject it as an unknown variant, so

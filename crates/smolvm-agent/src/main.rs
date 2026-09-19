@@ -2349,6 +2349,8 @@ fn handle_request(
 
         AgentRequest::FormatStorage => handle_format_storage(),
 
+        AgentRequest::ListDirectory { path } => handle_list_directory(&path),
+
         AgentRequest::StorageStatus => handle_storage_status(),
         AgentRequest::MemoryStatus => handle_memory_status(),
 
@@ -3417,12 +3419,18 @@ fn handle_streaming_file_read(
         }
     };
     if !metadata.is_file() {
+        // Say "is a directory" specifically. A caller that asked for a path
+        // without knowing what it is can then ask for the listing instead,
+        // which it cannot do if a directory, a socket and a device all report
+        // the same thing.
+        let detail = if metadata.is_dir() {
+            format!("is a directory: {}", path)
+        } else {
+            format!("not a regular file: {}", path)
+        };
         send_response(
             stream,
-            &AgentResponse::error(
-                format!("not a regular file: {}", path),
-                error_codes::FILE_IO_FAILED,
-            ),
+            &AgentResponse::error(detail, error_codes::FILE_IO_FAILED),
         )?;
         return Ok(());
     }
@@ -6664,6 +6672,93 @@ fn handle_streaming_export_layer(
 }
 
 /// Handle storage status request.
+/// Build the entry list for a directory.
+///
+/// Shared with the namespace helper so a listing taken inside the workload
+/// container is identical to one taken in the VM base.
+///
+/// Entries are sorted by name so a caller diffing two listings sees real
+/// changes rather than filesystem ordering. Symlinks are reported as
+/// `"symlink"` without being followed: resolving here would let a link inside
+/// the guest decide what the host is told about, and a caller that wants the
+/// target can ask for it by path.
+pub(crate) fn list_directory_entries(
+    path: &str,
+) -> std::result::Result<Vec<smolvm_protocol::DirectoryEntry>, String> {
+    use smolvm_protocol::DirectoryEntry;
+
+    let read = std::fs::read_dir(path).map_err(|e| format!("list directory {path}: {e}"))?;
+    let mut entries: Vec<DirectoryEntry> = Vec::new();
+    for entry in read.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            // A name that is not UTF-8 cannot survive the JSON round trip;
+            // skipping it beats failing the whole listing.
+            continue;
+        };
+        // `symlink_metadata` describes the link itself, so a dangling link is
+        // still listed rather than erroring the entry away.
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        let ft = meta.file_type();
+        let kind = if ft.is_symlink() {
+            "symlink"
+        } else if ft.is_dir() {
+            "dir"
+        } else if ft.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        entries.push(DirectoryEntry {
+            name,
+            kind: kind.to_string(),
+            size: if ft.is_file() { meta.len() } else { 0 },
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+/// List a guest directory, inside the workload container when there is one.
+///
+/// An image machine's files live in the container's mount namespace, which is
+/// where `FileRead` already looks; listing the VM base instead would report an
+/// empty or entirely different tree.
+fn handle_list_directory(path: &str) -> AgentResponse {
+    // Mirror the read path exactly. An image machine's files live in the
+    // workload container's mount namespace; without one, the path still has to
+    // be resolved through the active persistent overlay, which is also what
+    // rejects a symlink escaping the overlay or the workspace. Listing the raw
+    // path instead reports the VM base, which for `/root` is simply empty.
+    let entries = match nsfile::GuestNs::for_workload() {
+        nsfile::GuestNs::Container(ns) => ns.list(path),
+        nsfile::GuestNs::Root(_) => match resolve_guest_io_path(path, FilePathAccess::Read) {
+            Ok(resolved) => list_directory_entries(&resolved.to_string_lossy()),
+            Err(resp) => return resp,
+        },
+    };
+    match entries {
+        Ok(entries) => match serde_json::to_value(&entries) {
+            Ok(entries) => AgentResponse::Ok {
+                data: Some(serde_json::json!({ "entries": entries })),
+            },
+            Err(e) => AgentResponse::error(
+                format!("serialize directory listing: {e}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        },
+        Err(message) => {
+            let code = if message.contains("os error 2") || message.contains("No such file") {
+                error_codes::NOT_FOUND
+            } else {
+                error_codes::FILE_IO_FAILED
+            };
+            AgentResponse::error(message, code)
+        }
+    }
+}
+
 fn handle_storage_status() -> AgentResponse {
     AgentResponse::from_result(storage::status(), error_codes::STATUS_FAILED)
 }
@@ -7323,6 +7418,90 @@ mod bg_reap_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A listing is what a caller uses to decide where to recurse and what to
+    /// download, so the shape matters: names only, sorted, with sizes only
+    /// where they mean something.
+    #[test]
+    fn listing_reports_sorted_names_with_kinds_and_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zebra.txt"), b"1234567890").unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), b"abc").unwrap();
+        std::fs::create_dir(dir.path().join("middle")).unwrap();
+
+        let resp = handle_list_directory(dir.path().to_str().unwrap());
+        let AgentResponse::Ok { data: Some(data) } = resp else {
+            panic!("expected a listing, got {resp:?}");
+        };
+        let entries = data["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["alpha.txt", "middle", "zebra.txt"],
+            "sorted by name"
+        );
+
+        assert_eq!(entries[0]["kind"], "file");
+        assert_eq!(entries[0]["size"], 3);
+        assert_eq!(entries[1]["kind"], "dir");
+        assert_eq!(entries[1]["size"], 0, "size is meaningless for a directory");
+        assert_eq!(entries[2]["size"], 10);
+    }
+
+    /// A missing directory must be distinguishable from an empty one, or a
+    /// caller cannot tell "nothing here" from "wrong path".
+    #[test]
+    fn a_missing_directory_is_an_error_not_an_empty_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = handle_list_directory(dir.path().join("nope").to_str().unwrap());
+        let AgentResponse::Error { code, .. } = resp else {
+            panic!("expected an error, got {resp:?}");
+        };
+        assert_eq!(code.as_deref(), Some("NOT_FOUND"));
+
+        let empty = handle_list_directory(dir.path().to_str().unwrap());
+        let AgentResponse::Ok { data: Some(data) } = empty else {
+            panic!("an empty directory still lists");
+        };
+        assert!(data["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// Symlinks are reported without being followed: resolving in the guest
+    /// would let a link decide what the host is told about.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_reported_as_a_symlink_and_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("real.txt", dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("gone.txt", dir.path().join("dangling.txt")).unwrap();
+
+        let AgentResponse::Ok { data: Some(data) } =
+            handle_list_directory(dir.path().to_str().unwrap())
+        else {
+            panic!("expected a listing");
+        };
+        let entries = data["entries"].as_array().unwrap();
+        let kind_of = |n: &str| {
+            entries
+                .iter()
+                .find(|e| e["name"] == n)
+                .unwrap_or_else(|| panic!("{n} missing from listing"))["kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(kind_of("link.txt"), "symlink");
+        assert_eq!(
+            kind_of("dangling.txt"),
+            "symlink",
+            "a dangling link is still listed"
+        );
+        assert_eq!(kind_of("real.txt"), "file");
+    }
+
     use super::*;
 
     #[cfg(target_os = "linux")]

@@ -682,6 +682,16 @@ pub enum AgentRequest {
         path: String,
     },
 
+    /// List the entries of a guest directory.
+    ///
+    /// Kept separate from [`AgentRequest::FileRead`], which streams bytes: a
+    /// listing is small and structured, and a caller that has to discover what
+    /// exists would otherwise guess names and read a 404 for each miss.
+    ListDirectory {
+        /// Absolute directory path in the VM filesystem.
+        path: String,
+    },
+
     /// Stream a tar archive of a guest directory without creating a guest-side
     /// temporary file. Used by staged mounts to batch many small files across
     /// vsock instead of paying one virtiofs round trip per file.
@@ -825,6 +835,7 @@ impl AgentRequest {
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
+            AgentRequest::ListDirectory { .. } => "ListDirectory".into(),
             AgentRequest::ArchiveDirectory { .. } => "ArchiveDirectory".into(),
             // Pod requests: spec/process JSON may carry env secrets — emit ids only.
             AgentRequest::PodCreate { id, .. } => format!("PodCreate {{ id: {id} }}"),
@@ -846,6 +857,23 @@ impl AgentRequest {
             },
         }
     }
+}
+
+/// One entry of a [`AgentRequest::ListDirectory`] result.
+///
+/// Deliberately small: a name, what it is, and a size. A caller discovering a
+/// tree wants to know where to recurse and what is worth downloading, and
+/// anything richer invites the listing being used as a stat cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    /// Entry name, not a path: no separators, relative to the directory listed.
+    pub name: String,
+    /// `"file"`, `"dir"`, `"symlink"`, or `"other"` for sockets, devices and
+    /// fifos, which a caller can see but should not try to download.
+    pub kind: String,
+    /// Size in bytes. Zero for anything that is not a regular file.
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// Agent response types.

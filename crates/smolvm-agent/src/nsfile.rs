@@ -59,6 +59,7 @@ pub fn helper_requested() -> bool {
 /// Protocol, chosen so the parent never buffers a whole file:
 /// * `read`  — stdout gets `OK <size>\n` then exactly `<size>` raw bytes, or
 ///   `ERR <message>\n`.
+/// * `list`  — stdout gets `OK <json>\n`, the JSON being the entry array.
 /// * `write` — raw bytes arrive on stdin until EOF; stdout gets `OK\n` or
 ///   `ERR <message>\n`. mode/uid/gid are positional with `-` meaning
 ///   "not requested".
@@ -88,6 +89,7 @@ pub fn run_helper() -> i32 {
 
     let result = match op {
         "read" => helper_read(&path),
+        "list" => helper_list(&path),
         "write" => helper_write(&path, mode, uid, gid),
         "connect" => helper_connect(&path),
         _ => Err("unknown op".to_string()),
@@ -144,7 +146,13 @@ fn helper_read(path: &str) -> Result<(), String> {
     // device never EOFs. Both must be refused BEFORE the header commits us to a
     // byte count.
     if !meta.is_file() {
-        return Err(format!("not a regular file: {path}"));
+        // See the note in the in-VM path: a directory is named specifically so
+        // the caller can retry as a listing.
+        return Err(if meta.is_dir() {
+            format!("is a directory: {path}")
+        } else {
+            format!("not a regular file: {path}")
+        });
     }
     let size = meta.len();
     let mut out = std::io::stdout().lock();
@@ -153,6 +161,20 @@ fn helper_read(path: &str) -> Result<(), String> {
     std::io::copy(&mut file, &mut out).map_err(|e| format!("read {path}: {e}"))?;
     out.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// List a directory inside the container's mount namespace.
+///
+/// One line of JSON rather than the `read` protocol's raw byte stream: a
+/// listing is small and structured, and the parent wants to parse it rather
+/// than copy it.
+fn helper_list(path: &str) -> Result<(), String> {
+    let entries = crate::list_directory_entries(path)?;
+    let json = serde_json::to_string(&entries).map_err(|e| format!("serialize listing: {e}"))?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(format!("OK {json}\n").as_bytes())
+        .map_err(|e| format!("write listing: {e}"))?;
+    out.flush().map_err(|e| format!("flush listing: {e}"))
 }
 
 fn helper_write(
@@ -445,6 +467,24 @@ impl ContainerNs {
             size,
             reader: reader.take(size),
         })
+    }
+
+    /// List a directory inside the container.
+    pub fn list(&self, path: &str) -> Result<Vec<smolvm_protocol::DirectoryEntry>, String> {
+        let out = Command::new(AGENT_BINARY)
+            .args([HELPER_ARG, "list", &self.pid.to_string(), path])
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("spawn ns-file helper: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().next().unwrap_or("").trim_end();
+        if let Some(msg) = line.strip_prefix("ERR ") {
+            return Err(msg.to_string());
+        }
+        let json = line
+            .strip_prefix("OK ")
+            .ok_or_else(|| format!("ns-file helper: bad header {line:?}"))?;
+        serde_json::from_str(json).map_err(|e| format!("parse listing: {e}"))
     }
 
     /// Write `data` to `path` inside the container, atomically, applying `mode`
