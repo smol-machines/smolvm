@@ -642,6 +642,189 @@ pub fn set_managed_vmm_memory_limit(
     Ok(false)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn raised_memory_budget(
+    current: VmmMemoryBudget,
+    requested: VmmMemoryBudget,
+) -> Result<VmmMemoryBudget> {
+    if current.max_bytes == 0
+        || current.high_bytes > current.max_bytes
+        || requested.max_bytes == 0
+        || requested.high_bytes > requested.max_bytes
+    {
+        return Err(Error::config("RAM resize", "invalid memory budget"));
+    }
+    // A branch source can already carry retained-generation or capture
+    // allowances. Raising live RAM must never remove those allowances.
+    Ok(VmmMemoryBudget {
+        max_bytes: current.max_bytes.max(requested.max_bytes),
+        high_bytes: current.high_bytes.max(requested.high_bytes),
+    })
+}
+
+/// Raise and verify a VMM's owned memory limits before publishing more guest
+/// RAM. `requested` includes all retained-generation allowances, not just the
+/// guest's new size. Idempotent retries cannot lower an existing allowance.
+/// Returns false for an externally managed/shared cgroup, which the caller
+/// must admit against separately rather than changing its limits.
+#[cfg(target_os = "linux")]
+pub fn raise_managed_vmm_memory_budget(
+    machine: &str,
+    pid: Pid,
+    started: Option<u64>,
+    requested: VmmMemoryBudget,
+) -> Result<bool> {
+    if !is_our_process_strict(pid, started) {
+        return Err(Error::agent("RAM resize", "VMM process identity changed"));
+    }
+    let Some(dir) = cgroup_v2_process_dir(pid) else {
+        return Ok(false);
+    };
+    let leaf = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let systemd_owned = leaf == crate::systemd_scope::scope_name(machine);
+    if !systemd_owned && leaf != format!("vm-{pid}") {
+        return Ok(false);
+    }
+    let read_budget = || -> Result<VmmMemoryBudget> {
+        let read = |file: &str| -> Result<u64> {
+            std::fs::read_to_string(dir.join(file))
+                .map_err(|error| {
+                    Error::agent("RAM resize", format!("cannot read {file}: {error}"))
+                })?
+                .trim()
+                .parse()
+                .map_err(|_| {
+                    Error::agent(
+                        "RAM resize",
+                        format!("owned VM {file} must have a finite memory limit"),
+                    )
+                })
+        };
+        Ok(VmmMemoryBudget {
+            max_bytes: read("memory.max")?,
+            high_bytes: read("memory.high")?,
+        })
+    };
+    let before = read_budget()?;
+    let target = raised_memory_budget(before, requested)?;
+    if !is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "RAM resize",
+            "VMM process identity changed before limit update",
+        ));
+    }
+    if target != before {
+        if systemd_owned {
+            crate::systemd_scope::set_scope_memory_max(
+                machine,
+                target.max_bytes,
+                target.high_bytes,
+            )?;
+        } else {
+            // Raise the hard ceiling first; a failed second write leaves a
+            // conservative reclaim threshold and is safe to retry.
+            write_cgroup(&dir, "memory.max", &target.max_bytes.to_string())
+                .and_then(|()| write_cgroup(&dir, "memory.high", &target.high_bytes.to_string()))
+                .map_err(|error| {
+                    Error::agent(
+                        "RAM resize",
+                        format!(
+                            "memory limit update incomplete: {error}; guest RAM has not been added"
+                        ),
+                    )
+                })?;
+        }
+    }
+    let actual = read_budget()?;
+    if actual != target
+        || !is_our_process_strict(pid, started)
+        || cgroup_v2_process_dir(pid).as_ref() != Some(&dir)
+    {
+        return Err(Error::agent(
+            "RAM resize",
+            "memory limits or VMM identity changed during resize; guest RAM has not been added",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+/// Report that this host has no Linux managed-scope memory limit to update.
+pub fn raise_managed_vmm_memory_budget(
+    _machine: &str,
+    _pid: Pid,
+    _started: Option<u64>,
+    _requested: VmmMemoryBudget,
+) -> Result<bool> {
+    Ok(false)
+}
+
+/// Update only a verified VMM's own CPU quota, never a shared enclosing cgroup.
+#[cfg(target_os = "linux")]
+pub fn set_managed_vmm_cpu_count(
+    machine: &str,
+    pid: Pid,
+    started: Option<u64>,
+    cpus: u8,
+) -> Result<bool> {
+    if cpus == 0 || !is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "CPU resize",
+            "invalid CPU count or VMM process identity changed",
+        ));
+    }
+    let Some(dir) = cgroup_v2_process_dir(pid) else {
+        return Ok(false);
+    };
+    let leaf = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if leaf == crate::systemd_scope::scope_name(machine) {
+        crate::systemd_scope::set_scope_cpu_count(machine, cpus)?;
+    } else if leaf == format!("vm-{pid}") {
+        write_cgroup(
+            &dir,
+            "cpu.max",
+            &format!(
+                "{} {}",
+                u64::from(cpus) * CGROUP_CPU_PERIOD_US,
+                CGROUP_CPU_PERIOD_US
+            ),
+        )
+        .map_err(|error| Error::agent("CPU resize", format!("cannot update CPU quota: {error}")))?;
+    } else {
+        return Ok(false);
+    }
+    let quota = std::fs::read_to_string(dir.join("cpu.max"))
+        .map_err(|error| Error::agent("CPU resize", format!("cannot verify CPU quota: {error}")))?;
+    let values: Vec<_> = quota.split_whitespace().collect();
+    let verified = match values.as_slice() {
+        [quota, period] => match (quota.parse::<u64>(), period.parse::<u64>()) {
+            (Ok(quota), Ok(period)) if period > 0 => {
+                period.checked_mul(u64::from(cpus)) == Some(quota)
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !verified || !is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "CPU resize",
+            "CPU quota or VMM identity could not be verified after update",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+/// Report that this host has no Linux managed-scope CPU quota to update.
+pub fn set_managed_vmm_cpu_count(
+    _machine: &str,
+    _pid: Pid,
+    _started: Option<u64>,
+    _cpus: u8,
+) -> Result<bool> {
+    Ok(false)
+}
+
 /// Bound each CUDA fork-pool VM to its configured CPU count or an even share
 /// of the host, whichever is smaller. Preserve two vCPUs when the configured
 /// VM and host permit it because single-vCPU CUDA forkable guests do not reach
@@ -1887,7 +2070,8 @@ pub fn is_alive(pid: Pid) -> bool {
         return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     }
     // A CLI cannot waitpid() a VM owned by serve. An exited child still has
-    // a PID until that parent reaps it, but no workload or open files remain.
+    // a PID until that parent reaps it. A zombie *leader*, however, can still
+    // have other threads completing exit and retaining the VM's cgroup/files.
     // Do not make cleanup depend on the parent's next supervisor tick.
     // Unreadable or malformed procfs data is not evidence of exit.
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -1897,11 +2081,18 @@ pub fn is_alive(pid: Pid) -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_stat_has_exited(stat: &str) -> bool {
-    matches!(
-        stat.rsplit_once(") ")
-            .and_then(|(_, fields)| fields.split_ascii_whitespace().next()),
-        Some("Z" | "X" | "x")
-    )
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    let mut fields = fields.split_ascii_whitespace();
+    // Field 3 (state).
+    let state = fields.next();
+    // Field 20 (num_threads), after consuming field 3 above.
+    let threads = fields.nth(16).and_then(|value| value.parse::<u64>().ok());
+    // Do not release ownership while another thread can still touch memory or
+    // disks. The one remaining unreaped zombie belongs to its original parent.
+    // Truncated/unknown thread counts are not evidence of complete exit.
+    matches!(state, Some("Z" | "X" | "x")) && threads == Some(1)
 }
 
 /// Check if a process is alive (Windows).
@@ -2306,6 +2497,168 @@ fn finite_cgroup_memory_headroom(mut dir: std::path::PathBuf) -> Option<(u64, u6
         }
     }
     tightest_limit.zip(tightest_headroom)
+}
+
+/// Unlike telemetry, admission must not silently ignore an unreadable limit.
+/// The cgroup-v2 root has no memory controller files; every non-root ancestor
+/// of a memory-controlled VM must provide both counters.
+#[cfg(target_os = "linux")]
+fn constrain_memory_to_ancestors(
+    mut stats: HostMemoryStats,
+    mut dir: &std::path::Path,
+    root: &std::path::Path,
+) -> std::io::Result<HostMemoryStats> {
+    use std::io::{Error as IoError, ErrorKind};
+    if !dir.starts_with(root) {
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "cgroup outside hierarchy",
+        ));
+    }
+    while dir != root {
+        let max = std::fs::read_to_string(dir.join("memory.max"))?;
+        let current = std::fs::read_to_string(dir.join("memory.current"))?;
+        let current: u64 = current
+            .trim()
+            .parse()
+            .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid memory.current"))?;
+        if max.trim() != "max" {
+            let max: u64 = max
+                .trim()
+                .parse()
+                .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid memory.max"))?;
+            stats.total_bytes = stats.total_bytes.min(max);
+            stats.available_bytes = stats.available_bytes.min(max.saturating_sub(current));
+        }
+        dir = dir
+            .parent()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing cgroup parent"))?;
+    }
+    Ok(stats)
+}
+
+/// Capacity outside the VM's owned leaf, whose limit is raised separately.
+/// Sampling the API process instead is incorrect when it lives in a different
+/// slice. This is a preflight, not a reservation against concurrent consumers.
+#[cfg(target_os = "linux")]
+pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMemoryStats> {
+    let verify = || is_our_process_strict(pid, started);
+    if !verify() {
+        return Err(Error::agent("RAM resize", "VMM process identity changed"));
+    }
+    require_resize_memory_controller(std::path::Path::new("/sys/fs/cgroup"))?;
+    let dir = cgroup_v2_process_dir(pid)
+        .ok_or_else(|| Error::agent("RAM resize", "cannot resolve VMM memory hierarchy"))?;
+    let stats = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_host_meminfo(&contents))
+        .ok_or_else(|| Error::agent("RAM resize", "cannot verify host memory headroom"))?;
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let parent = if dir == root {
+        root
+    } else {
+        dir.parent()
+            .ok_or_else(|| Error::agent("RAM resize", "missing VMM cgroup parent"))?
+    };
+    let stats = constrain_memory_to_ancestors(stats, parent, root).map_err(|error| {
+        Error::agent(
+            "RAM resize",
+            format!("cannot verify VMM parent memory headroom: {error}"),
+        )
+    })?;
+    if !verify() || cgroup_v2_process_dir(pid).as_ref() != Some(&dir) {
+        return Err(Error::agent(
+            "RAM resize",
+            "VMM identity or memory hierarchy changed",
+        ));
+    }
+    Ok(stats)
+}
+
+/// Conservative admission for Mac VM growth; macOS has no managed cgroup cap.
+#[cfg(target_os = "macos")]
+pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMemoryStats> {
+    if !is_our_process_strict(pid, started) {
+        return Err(Error::agent("RAM resize", "VMM process identity changed"));
+    }
+    // macOS has no cgroup-equivalent VM budget. Admit against free and
+    // purgeable physical pages only, not swap or speculative compression.
+    // This is a conservative preflight, not a reservation against other apps.
+    unsafe extern "C" {
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    let unavailable = || Error::agent("RAM resize", "cannot verify Mac memory headroom");
+    let mut total = 0u64;
+    let mut total_len = std::mem::size_of_val(&total);
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: each output is correctly sized for its native ABI; the acquired
+    // host send right is released even if reading statistics fails.
+    #[allow(deprecated)] // libc retains the native Mach ABI; no mach2 dependency needed.
+    let (sysctl_result, vm_result, page_size) = unsafe {
+        let sysctl_result = libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut total as *mut u64).cast(),
+            &mut total_len,
+            std::ptr::null_mut(),
+            0,
+        );
+        let host = libc::mach_host_self();
+        let vm_result = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast(),
+            &mut count,
+        );
+        mach_port_deallocate(libc::mach_task_self(), host);
+        (sysctl_result, vm_result, libc::sysconf(libc::_SC_PAGESIZE))
+    };
+    if sysctl_result != 0
+        || total_len != 8
+        || total == 0
+        || vm_result != libc::KERN_SUCCESS
+        || count != libc::HOST_VM_INFO64_COUNT
+        || page_size <= 0
+    {
+        return Err(unavailable());
+    }
+    // SAFETY: host_statistics64 succeeded and returned the complete structure.
+    let stats = unsafe { stats.assume_init() };
+    let available = (u64::from(stats.free_count) + u64::from(stats.purgeable_count))
+        .checked_mul(page_size as u64)
+        .ok_or_else(unavailable)?;
+    if !is_our_process_strict(pid, started) {
+        return Err(Error::agent("RAM resize", "VMM process identity changed"));
+    }
+    Ok(HostMemoryStats {
+        total_bytes: total,
+        available_bytes: available.min(total),
+    })
+}
+
+/// Missing controllers are not unlimited budgets. Ancestor counter read
+/// failures remain separate errors and must still fail closed.
+#[cfg(target_os = "linux")]
+fn require_resize_memory_controller(root: &std::path::Path) -> Result<()> {
+    let controllers =
+        std::fs::read_to_string(root.join("cgroup.controllers")).map_err(|error| {
+            Error::agent(
+                "RAM resize",
+                format!(
+                    "cannot verify host cgroup controllers: {error}; guest RAM has not changed"
+                ),
+            )
+        })?;
+    if !controllers.split_whitespace().any(|name| name == "memory") {
+        return Err(Error::config(
+            "RAM resize",
+            "live RAM growth requires an enabled and delegated cgroup-v2 memory controller to enforce VM limits; it is unavailable in this host hierarchy; check the host boot configuration and cgroup delegation; guest RAM has not changed",
+        ));
+    }
+    Ok(())
 }
 
 /// Report effective host memory available to SmolVM.
@@ -3245,6 +3598,54 @@ mod tests {
     }
 
     #[test]
+    fn raising_memory_limits_preserves_lineage_allowances_and_is_idempotent() {
+        let existing = VmmMemoryBudget {
+            high_bytes: 700,
+            max_bytes: 800,
+        };
+        let small = VmmMemoryBudget {
+            high_bytes: 300,
+            max_bytes: 400,
+        };
+        assert_eq!(raised_memory_budget(existing, small).unwrap(), existing);
+        let larger = VmmMemoryBudget {
+            high_bytes: 900,
+            max_bytes: 1000,
+        };
+        let raised = raised_memory_budget(existing, larger).unwrap();
+        assert_eq!(raised, larger);
+        assert_eq!(raised_memory_budget(raised, larger).unwrap(), raised);
+        let mixed = raised_memory_budget(
+            existing,
+            VmmMemoryBudget {
+                high_bytes: 600,
+                max_bytes: 900,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mixed,
+            VmmMemoryBudget {
+                high_bytes: 700,
+                max_bytes: 900
+            }
+        );
+        for invalid in [
+            VmmMemoryBudget {
+                high_bytes: 1,
+                max_bytes: 0,
+            },
+            VmmMemoryBudget {
+                high_bytes: 901,
+                max_bytes: 900,
+            },
+        ] {
+            assert!(raised_memory_budget(existing, invalid).is_err());
+            assert!(raised_memory_budget(invalid, existing).is_err());
+        }
+    }
+
+    #[test]
     fn a_forkable_vm_gets_room_for_its_unreclaimable_memfd() {
         // Preserve the conservative allowance for private COW pages in
         // addition to the original shared backing.
@@ -3371,13 +3772,111 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn zombie_leader_with_remaining_threads_has_not_exited() {
+        // Captured immediately after the 1060 MiB workload's stop returned.
+        // The leader is Z, but field 20 (num_threads) is still two and the
+        // kernel reports its cgroup populated. Reusing the scope is premature.
+        let stat = "376791 (libkrun VM) Z 1 376791 376782 0 -1 4228364 69130 0 0 0 1002 143 0 0 20 0 2 0 153760195 0 0";
+        assert!(!linux_stat_has_exited(stat));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resize_admission_checks_every_vm_parent_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let outer = root.path().join("fleet");
+        let inner = outer.join("tenant");
+        std::fs::create_dir_all(&inner).unwrap();
+        let write = |dir: &std::path::Path, max: &str, current: &str| {
+            std::fs::write(dir.join("memory.max"), max).unwrap();
+            std::fs::write(dir.join("memory.current"), current).unwrap();
+        };
+        let host = HostMemoryStats {
+            total_bytes: 10000,
+            available_bytes: 8000,
+        };
+        write(&outer, "4000", "3500");
+        write(&inner, "max", "1000");
+        assert_eq!(
+            constrain_memory_to_ancestors(host, &inner, root.path()).unwrap(),
+            HostMemoryStats {
+                total_bytes: 4000,
+                available_bytes: 500
+            }
+        );
+        // A tighter child matters even though the host and outer slice fit.
+        write(&inner, "2000", "1800");
+        assert_eq!(
+            constrain_memory_to_ancestors(host, &inner, root.path()).unwrap(),
+            HostMemoryStats {
+                total_bytes: 2000,
+                available_bytes: 200
+            }
+        );
+        write(&inner, "2000", "2100");
+        assert_eq!(
+            constrain_memory_to_ancestors(host, &inner, root.path())
+                .unwrap()
+                .available_bytes,
+            0
+        );
+        for (max, current) in [("garbage", "1"), ("max", "garbage"), ("-1", "0")] {
+            write(&inner, max, current);
+            assert!(constrain_memory_to_ancestors(host, &inner, root.path()).is_err());
+        }
+        write(&inner, "max", "0");
+        std::fs::remove_file(outer.join("memory.max")).unwrap();
+        assert!(constrain_memory_to_ancestors(host, &inner, root.path()).is_err());
+        assert_eq!(
+            constrain_memory_to_ancestors(host, root.path(), root.path()).unwrap(),
+            host
+        );
+        assert!(
+            constrain_memory_to_ancestors(host, std::path::Path::new("/outside"), root.path())
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resize_admission_requires_available_memory_controller() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cgroup.controllers");
+        assert!(require_resize_memory_controller(root.path()).is_err());
+        for controllers in ["", "cpuset cpu io pids\n", "memory_extra\n"] {
+            std::fs::write(&path, controllers).unwrap();
+            let error = require_resize_memory_controller(root.path()).unwrap_err();
+            assert!(error.to_string().contains("memory controller"));
+            assert!(error.to_string().contains("guest RAM has not changed"));
+        }
+        std::fs::write(&path, "cpuset cpu io memory pids\n").unwrap();
+        require_resize_memory_controller(root.path()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(require_resize_memory_controller(root.path()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn exited_state_requires_a_complete_procfs_state_field() {
         for state in ["Z", "X", "x"] {
+            let mut fields = vec!["0"; 18];
+            fields[0] = state;
+            fields[17] = "1";
             assert!(linux_stat_has_exited(&format!(
-                "123 (worker) {state} 1 2 3"
+                "123 (worker) {}",
+                fields.join(" ")
             )));
+            for threads in ["0", "2", "256", "unknown"] {
+                fields[17] = threads;
+                assert!(!linux_stat_has_exited(&format!(
+                    "123 (worker) {}",
+                    fields.join(" ")
+                )));
+            }
         }
         for stat in [
+            "123 (worker) Z 1 2 3",
             "123 (worker) R 1 2 3",
             "123 (worker) D 1 2 3",
             "123 (worker) T 1 2 3",

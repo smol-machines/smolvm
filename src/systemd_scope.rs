@@ -293,6 +293,41 @@ pub fn set_scope_memory_max(
     Ok(())
 }
 
+/// Update the CPU quota of an existing transient VM scope without restarting it.
+pub fn set_scope_cpu_count(machine_id: &str, cpus: u8) -> Result<()> {
+    if cpus == 0 {
+        return Err(Error::config("CPU resize", "CPU count must be nonzero"));
+    }
+    let busctl = busctl_path()
+        .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot update CPU quota"))?;
+    let mut cmd = Command::new(busctl);
+    cmd.args([
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "SetUnitProperties",
+        "sba(sv)",
+        &scope_name(machine_id),
+        "true",
+        "1",
+        "CPUQuotaPerSecUSec",
+        "t",
+        &(u64::from(cpus) * 1_000_000).to_string(),
+    ]);
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if !out.status.success() {
+        return Err(Error::agent(
+            "CPU resize",
+            format!(
+                "scope quota update failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Force-kill a VM's transient scope: SIGKILL every process in its cgroup.
 ///
 /// This is the AUTHORITATIVE teardown when the pid-based delete can't confirm

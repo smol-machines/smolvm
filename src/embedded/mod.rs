@@ -5,4 +5,4 @@ mod handle;
 mod runtime;
 
 pub use control::MachineSpec;
-pub use runtime::{runtime, EmbeddedRuntime};
+pub use runtime::{runtime, EmbeddedRuntime, ResizeSpec};

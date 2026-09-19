@@ -65,7 +65,6 @@ impl ForkSourceLock {
         Ok(Self { _file: file })
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn try_acquire_at(path: &Path) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -95,8 +94,7 @@ pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
     ForkSourceLock::acquire_at(&fork_source_lock_path(source))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
+pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::try_acquire_at(&fork_source_lock_path(source))
 }
@@ -205,7 +203,13 @@ fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
     if result != 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+        {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, error))
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -1471,6 +1475,31 @@ fn fork_lineage_memory_budget(
     })
 }
 
+/// Compute the complete live-growth budget while the caller holds the source
+/// lock. Old generations are conservatively charged at the new guest size;
+/// never omit their allowance when raising a branch source's usable RAM.
+#[cfg(target_os = "linux")]
+pub(crate) fn live_resize_memory_budget(
+    db: &SmolvmDb,
+    name: &str,
+    record: &VmRecord,
+    target_mib: u32,
+) -> Result<crate::process::VmmMemoryBudget> {
+    let retained = db.retained_fork_snapshot(name)?;
+    let generations = referenced_fork_generation_count(
+        db,
+        name,
+        &vm_data_dir(name).join("s"),
+        retained.as_ref(),
+    )?;
+    let mut target = record.clone();
+    target.mem = target_mib;
+    fork_lineage_memory_budget(
+        &target,
+        generations + u64::from(source_has_private_ram_backing(record)),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn source_has_private_ram_backing(record: &VmRecord) -> bool {
     record.pid_start_time.is_some() && record.fork_lineage_pid_start_time == record.pid_start_time
@@ -2014,6 +2043,7 @@ pub(crate) fn prepare_forks_reusing(
     reuse_live_snapshot: bool,
 ) -> Result<PreparedForkBatch> {
     let preparation_started = std::time::Instant::now();
+    db.require_completed_resize(golden)?;
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
     }

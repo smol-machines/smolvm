@@ -199,6 +199,9 @@ pub fn launch_agent_vm_dynamic(
     {
         free_ctx_on_err!("krun_set_vm_config failed");
     }
+    if unsafe { krun.configure_live_resize(ctx, config.resources.cpus) } < 0 {
+        free_ctx_on_err!("libkrun live resize configuration failed");
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         let cpu_profile_result = unsafe { (krun.set_cpu_template)(ctx, 1) };

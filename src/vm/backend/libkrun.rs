@@ -138,6 +138,10 @@ impl LibkrunVm {
                 krun_free_ctx(ctx);
                 return Err(Error::vm_creation("failed to set VM config"));
             }
+            if krun.configure_live_resize(ctx, config.cpus) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::vm_creation("live resize configuration failed"));
+            }
 
             // Set root filesystem via the root virtiofs tag (upstream removed
             // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).

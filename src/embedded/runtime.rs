@@ -14,6 +14,46 @@ use smolvm_protocol::ImageInfo;
 
 type SharedHandle = Arc<Mutex<VmHandle>>;
 
+/// Absolute resource targets for a running machine, never increments.
+/// CPU, RAM and disk growth currently require separate requests; both disks
+/// may grow in one request. Shrinking is rejected by the runtime.
+#[derive(Clone, Debug, Default)]
+pub struct ResizeSpec {
+    /// Total online virtual CPUs requested.
+    pub cpus: Option<u8>,
+    /// Total guest RAM requested, in MiB.
+    pub memory_mib: Option<u32>,
+    /// Total managed storage disk capacity requested, in GiB.
+    pub storage_gib: Option<u64>,
+    /// Total writable root overlay capacity requested, in GiB.
+    pub overlay_gib: Option<u64>,
+}
+
+impl ResizeSpec {
+    fn validate(&self) -> Result<()> {
+        let kinds = usize::from(self.cpus.is_some())
+            + usize::from(self.memory_mib.is_some())
+            + usize::from(self.storage_gib.is_some() || self.overlay_gib.is_some());
+        if kinds != 1 {
+            return Err(Error::config(
+                "live resize",
+                "specify exactly one resource kind: CPUs, RAM, or disks",
+            ));
+        }
+        if self.cpus == Some(0)
+            || self.memory_mib == Some(0)
+            || self.storage_gib == Some(0)
+            || self.overlay_gib == Some(0)
+        {
+            return Err(Error::config(
+                "live resize",
+                "resource targets must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Stateful runtime shared by all embedded machine objects in this process.
 pub struct EmbeddedRuntime {
     db: SmolvmDb,
@@ -39,6 +79,30 @@ impl EmbeddedRuntime {
     /// Create a persisted machine record.
     pub fn create_machine(&self, spec: MachineSpec) -> Result<()> {
         self.with_name_lock(&spec.name, || control::create_vm(&self.db, &spec))
+    }
+
+    /// Grow a running machine without restarting it, returning verified state.
+    ///
+    /// Uses the same durable intent, admission checks and cross-process source
+    /// lock as the CLI/API. After an interrupted call, retry the same absolute
+    /// targets; a different pending target is refused rather than overwritten.
+    /// This does not start a stopped machine implicitly.
+    pub fn resize_machine(&self, name: &str, spec: ResizeSpec) -> Result<crate::config::VmRecord> {
+        spec.validate()?;
+        self.with_name_lock(name, || {
+            if let Some(cpus) = spec.cpus {
+                crate::agent::live_resize::grow_cpus(&self.db, name, cpus)
+            } else if let Some(memory) = spec.memory_mib {
+                crate::agent::live_resize::grow_memory(&self.db, name, memory)
+            } else {
+                crate::agent::live_resize::grow_disks(
+                    &self.db,
+                    name,
+                    spec.storage_gib,
+                    spec.overlay_gib,
+                )
+            }
+        })
     }
 
     /// Create a persisted image machine with its launch-time environment,
@@ -900,6 +964,54 @@ pub fn runtime() -> Result<Arc<EmbeddedRuntime>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_resize_validates_targets_before_machine_access() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        for spec in [
+            ResizeSpec::default(),
+            ResizeSpec {
+                cpus: Some(0),
+                ..Default::default()
+            },
+            ResizeSpec {
+                memory_mib: Some(0),
+                ..Default::default()
+            },
+            ResizeSpec {
+                storage_gib: Some(0),
+                ..Default::default()
+            },
+            ResizeSpec {
+                overlay_gib: Some(0),
+                ..Default::default()
+            },
+            ResizeSpec {
+                cpus: Some(4),
+                memory_mib: Some(2048),
+                ..Default::default()
+            },
+            ResizeSpec {
+                cpus: Some(4),
+                storage_gib: Some(8),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                runtime.resize_machine("absent", spec),
+                Err(Error::Config { .. })
+            ));
+        }
+        assert!(ResizeSpec {
+            storage_gib: Some(8),
+            overlay_gib: Some(4),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(runtime.db.pending_resize_names().unwrap().is_empty());
+        assert!(runtime.name_locks.read().unwrap().is_empty());
+    }
 
     fn test_db() -> SmolvmDb {
         static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

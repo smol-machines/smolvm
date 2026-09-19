@@ -308,10 +308,56 @@ mod shutdown_compat_tests {
     }
 }
 
+/// Agent supports guarded online growth of mounted managed ext4 filesystems.
+pub const ONLINE_FILESYSTEM_GROWTH_CAPABILITY: &str = "online-filesystem-growth-v1";
+
+/// Agent can online and verify CPUs after the VMM creates them.
+pub const ONLINE_CPU_GROWTH_CAPABILITY: &str = "online-cpu-growth-v1";
+/// Guest can offline non-boot CPUs and verify the resulting online set.
+pub const OFFLINE_CPU_SHRINK_CAPABILITY: &str = "offline-cpu-shrink-v1";
+
+/// Agent can online and verify a RAM range already added by the VMM.
+pub const ONLINE_MEMORY_GROWTH_CAPABILITY: &str = "online-memory-growth-v1";
+
+/// Managed writable disk, never an arbitrary guest path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedDisk {
+    /// Persistent workspace and image storage disk.
+    Storage,
+    /// Writable guest root filesystem overlay disk.
+    Overlay,
+}
+
 /// Agent request types (for image management and OCI operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Offline trailing CPUs after the host verifies runtime shrink support.
+    OfflineCpus {
+        /// Retained online CPU count, starting at CPU0; must be nonzero.
+        target_count: u8,
+    },
+    /// Online existing guest memory blocks; never create or offline memory.
+    OnlineMemory {
+        /// Guest physical address of the first block.
+        start_address: u64,
+        /// Length of the existing, block-aligned range in bytes.
+        length_bytes: u64,
+    },
+    /// Online CPUs already created by the VMM, without offlining existing CPUs.
+    OnlineCpus {
+        /// Total CPU count, using consecutive CPU IDs starting at zero.
+        target_count: u8,
+    },
+    /// Grow a mounted filesystem after the VMM publishes its new capacity.
+    /// Never formats, repairs, unmounts, or shrinks the filesystem.
+    GrowFilesystem {
+        /// Managed disk whose mounted filesystem should grow.
+        disk: ManagedDisk,
+        /// Exact capacity in bytes already published by the VMM.
+        expected_bytes: u64,
+    },
     /// Ping to check if agent is alive.
     Ping,
 
@@ -804,6 +850,24 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::OnlineMemory {
+                start_address,
+                length_bytes,
+            } => {
+                format!("OnlineMemory {{ start_address: {start_address}, length_bytes: {length_bytes} }}")
+            }
+            AgentRequest::OnlineCpus { target_count } => {
+                format!("OnlineCpus {{ target_count: {target_count} }}")
+            }
+            AgentRequest::OfflineCpus { target_count } => {
+                format!("OfflineCpus {{ target_count: {target_count} }}")
+            }
+            AgentRequest::GrowFilesystem {
+                disk,
+                expected_bytes,
+            } => {
+                format!("GrowFilesystem {{ disk: {disk:?}, expected_bytes: {expected_bytes} }}")
+            }
             AgentRequest::Ping => "Ping".into(),
             AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
             AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),
@@ -1467,6 +1531,63 @@ impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_growth_roundtrips_numeric_geometry_only() {
+        let request = super::AgentRequest::OnlineMemory {
+            start_address: 1 << 30,
+            length_bytes: 128 << 20,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<super::AgentRequest>(&wire).unwrap(),
+            super::AgentRequest::OnlineMemory {
+                start_address: 1073741824,
+                length_bytes: 134217728
+            }
+        ));
+        for invalid in [
+            r#"{"method":"online_memory","start_address":-1,"length_bytes":4096}"#,
+            r#"{"method":"online_memory","start_address":"/dev/mem","length_bytes":4096}"#,
+        ] {
+            assert!(serde_json::from_str::<super::AgentRequest>(invalid).is_err());
+        }
+    }
+    #[test]
+    fn cpu_growth_roundtrips_a_numeric_count_only() {
+        let req = super::AgentRequest::OnlineCpus { target_count: 4 };
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<super::AgentRequest>(&wire).unwrap(),
+            super::AgentRequest::OnlineCpus { target_count: 4 }
+        ));
+        assert!(serde_json::from_str::<super::AgentRequest>(
+            r#"{"method":"online_cpus","target_count":256}"#
+        )
+        .is_err());
+    }
+    #[test]
+    fn filesystem_growth_uses_only_managed_disk_names() {
+        use super::{AgentRequest, ManagedDisk};
+        let request = AgentRequest::GrowFilesystem {
+            disk: ManagedDisk::Storage,
+            expected_bytes: 2147483648,
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["method"], "grow_filesystem");
+        assert_eq!(wire["disk"], "storage");
+        assert!(matches!(
+            serde_json::from_value::<AgentRequest>(wire).unwrap(),
+            AgentRequest::GrowFilesystem {
+                disk: ManagedDisk::Storage,
+                expected_bytes: 2147483648
+            }
+        ));
+        assert!(serde_json::from_str::<AgentRequest>(
+            r#"{"method":"grow_filesystem","disk":"/dev/vdc","expected_bytes":2147483648}"#
+        )
+        .is_err());
+    }
+
     use super::*;
 
     #[test]

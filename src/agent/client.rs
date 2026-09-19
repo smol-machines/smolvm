@@ -1678,6 +1678,8 @@ impl AgentClient {
     }
 
     /// Get storage status.
+    ///
+    /// Reports current guest storage usage, independently of configured limits.
     pub fn storage_status(&mut self) -> Result<StorageStatus> {
         let resp = self.request(&AgentRequest::StorageStatus)?;
         expect_data(resp, "storage status")
@@ -1697,6 +1699,130 @@ impl AgentClient {
         }
         let listing: Listing = expect_data(resp, "list directory")?;
         Ok(listing.entries)
+    }
+
+    /// Grow a mounted managed filesystem after its disk capacity was increased.
+    /// Check capability before changing the backing: old running guests must
+    /// not be left with a partially applied resize they cannot complete.
+    pub fn grow_filesystem(
+        &mut self,
+        disk: smolvm_protocol::ManagedDisk,
+        expected_bytes: u64,
+    ) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY)? {
+            return Err(Error::agent(
+                "grow filesystem",
+                "running guest agent does not support online filesystem growth",
+            ));
+        }
+        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(130))?;
+        match self.request(&AgentRequest::GrowFilesystem {
+            disk,
+            expected_bytes,
+        })? {
+            AgentResponse::Ok { data: Some(data) }
+                if data.get("device_bytes").and_then(serde_json::Value::as_u64)
+                    == Some(expected_bytes)
+                    && data
+                        .get("filesystem_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|bytes| bytes > 0 && bytes <= expected_bytes) =>
+            {
+                Ok(())
+            }
+            AgentResponse::Completed {
+                exit_code, stderr, ..
+            } => Err(Error::agent(
+                "grow filesystem",
+                format!(
+                    "online resize exited {exit_code}: {}",
+                    String::from_utf8_lossy(&stderr)
+                ),
+            )),
+            AgentResponse::Error { message, .. } => Err(Error::agent("grow filesystem", message)),
+            _ => Err(Error::agent("grow filesystem", "unexpected response type")),
+        }
+    }
+
+    /// Online CPUs only after the VMM has created them. Callers must check
+    /// capability before host-side mutation and reconcile partial failures.
+    pub fn online_cpus(&mut self, target_count: u8) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY)? {
+            return Err(Error::agent(
+                "online CPUs",
+                "running guest agent does not support online CPU growth",
+            ));
+        }
+        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(130))?;
+        match self.request(&AgentRequest::OnlineCpus { target_count })? {
+            AgentResponse::Ok { data: Some(data) }
+                if data.get("online_cpus").and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(target_count)) =>
+            {
+                Ok(())
+            }
+            AgentResponse::Error { message, .. } => Err(Error::agent("online CPUs", message)),
+            _ => Err(Error::agent(
+                "online CPUs",
+                "guest did not verify the requested CPU count",
+            )),
+        }
+    }
+
+    /// Offline only trailing CPUs. Runtime capability must be checked by the
+    /// caller before this request; success means the exact guest set was read back.
+    pub fn offline_cpus(&mut self, target_count: u8) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY)? {
+            return Err(Error::agent(
+                "offline CPUs",
+                "running guest lacks safe CPU shrink support",
+            ));
+        }
+        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(130))?;
+        match self.request(&AgentRequest::OfflineCpus { target_count })? {
+            AgentResponse::Ok { data: Some(data) }
+                if data.get("online_cpus").and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(target_count)) =>
+            {
+                Ok(())
+            }
+            AgentResponse::Error { message, .. } => Err(Error::agent("offline CPUs", message)),
+            _ => Err(Error::agent(
+                "offline CPUs",
+                "guest did not verify the requested CPU count",
+            )),
+        }
+    }
+
+    /// Online only an existing block-aligned RAM range after runtime hot-add.
+    pub fn online_memory(&mut self, start_address: u64, length_bytes: u64) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY)? {
+            return Err(Error::agent(
+                "online RAM",
+                "running guest agent does not support RAM growth",
+            ));
+        }
+        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(130))?;
+        match self.request(&AgentRequest::OnlineMemory {
+            start_address,
+            length_bytes,
+        })? {
+            AgentResponse::Ok { data: Some(data) }
+                if data
+                    .get("start_address")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(start_address)
+                    && data.get("online_bytes").and_then(serde_json::Value::as_u64)
+                        == Some(length_bytes) =>
+            {
+                Ok(())
+            }
+            AgentResponse::Error { message, .. } => Err(Error::agent("online RAM", message)),
+            _ => Err(Error::agent(
+                "online RAM",
+                "guest did not verify the requested RAM range",
+            )),
+        }
     }
 
     /// The guest's own view of machine memory.
