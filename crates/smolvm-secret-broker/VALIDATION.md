@@ -67,3 +67,41 @@ secret injection and machine lifecycle semantics have not been changed.
 
 Remaining limits above still apply. In particular this is not branch-safe
 machine identity, cloud integration, or a production-ready security boundary.
+
+## Service and request-lifecycle hardening — 2026-09-19
+
+- Linux TSI and virtio-net real-VM acceptance passed again with dotenvx 2.28.0
+  after hardening. TSI additionally verified SIGTERM cleanup and same-socket
+  restart. These use the published 1.16.2 runtime and synthetic credentials.
+- A slow-body revocation regression returned HTTP 200 with the previous
+  dispatch behavior (one control run), then HTTP 403 with the additional
+  dispatch-time authorization check. No credential-bearing HTTP reached the
+  upstream in the fixed case. This does not cancel operations already dispatched.
+- A separate root-authorized transient systemd test passed with DynamicUser,
+  private runtime storage, LoadCredential, a 256 MiB memory cap and 96-task cap.
+  UID 1000 could not read the source credentials, runtime credentials, TLS key,
+  or broker process environment; an authenticated HTTPS request still succeeded.
+  The service and fixtures were removed afterwards.
+- LoadCredential exposed root-owned 0440 files, which the broker refused.
+  The service launcher copies them into its private tmpfs runtime directory as
+  0600 files. Credential permission checks were not weakened. Restart is required
+  to load changed source credentials in this deployment.
+- The service test and real-VM tests are separate: isolated-service plus VM
+  attachment, dotenvx under that service identity, and fleet UID attachment have
+  not yet been validated together. Host root/sudo can still read secrets.
+- Eight unit tests, package formatting and clippy with warnings denied passed.
+  Offline synthetic acceptance now runs in the existing native Linux x86_64
+  and ARM64 CI jobs; remote CI has not yet been run on this branch.
+
+Reproduce the isolated-service acceptance (Linux/systemd, scoped root access):
+
+```sh
+sudo python3 -B crates/smolvm-secret-broker/tests/service_acceptance.py \
+  --broker /absolute/path/to/smolvm-secret-broker \
+  --observer-uid 1000 --observer-gid 1000
+```
+
+Production readiness is still withheld pending machine-bound authorization and
+branch/restore policy, integrated isolated deployment, cross-platform validation,
+and security review. The above is evidence for individual safeguards, not a
+claim that those remaining boundaries are solved.

@@ -270,6 +270,11 @@ jobs:
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
+      - name: Credential broker acceptance (no VM or real credentials)
+        run: |
+          cargo test -p smolvm-secret-broker --target ${{ matrix.target }} --locked
+          cargo build -p smolvm-secret-broker --target ${{ matrix.target }} --locked
+          python3 -B crates/smolvm-secret-broker/tests/acceptance.py --broker target/${{ matrix.target }}/debug/smolvm-secret-broker --backend tsi
       # Note: Full VM integration tests (and critest CRI conformance) require
       # KVM + real libkrun. Run those locally on a machine with KVM access.
 

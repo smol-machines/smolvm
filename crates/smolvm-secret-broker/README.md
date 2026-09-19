@@ -51,6 +51,7 @@ submitted by a guest or untrusted fleet API:
     "port": 443,
     "placeholder": "SMOL_PLACEHOLDER_EXAMPLE_KEY",
     "header": "authorization",
+    "methods": ["GET", "HEAD"],
     "secret_file": "/private/broker/upstream-key"
   }]
 }
@@ -147,6 +148,9 @@ trusted host-side manager can populate the same environment/file seam.
 
 ## Enforced behavior
 
+- Grants default to GET and HEAD. Administrators must explicitly allow POST,
+  PUT, PATCH, DELETE or OPTIONS where needed; method restrictions do not replace
+  narrowly scoped upstream credentials.
 - Authenticated CONNECT to exact configured DNS host and port only. No raw
   tunnels; TLS is terminated locally and upstream TLS is independently verified.
 - Request Host must match CONNECT; absolute-form targets and upgrades are
@@ -155,18 +159,25 @@ trusted host-side manager can populate the same environment/file seam.
   `X-API-Key` are substituted. No body/query, Basic-auth, signing, or arbitrary
   header substitution. Other detected placeholder locations are rejected.
 - Authorization is reread on every HTTP request, including keep-alive requests;
-  rotation/removal rejects subsequent uses of an old capability. An already
+  it is checked again after receiving the body, before upstream dispatch.
+  Rotation/removal rejects subsequent uses of an old capability. An already
   dispatched upstream operation cannot be revoked or undone.
 - Upstream credentials are read per request (environment values do not refresh
   from `.env` files without restarting). Missing/unreadable credentials fail
   closed with a generic error; no plaintext fallback and no request-value logs.
 - Maximum 32 active sessions, 30 seconds per session, 1 MiB request bodies and
   4 MiB response bodies. HTTP/1.1 only; no streaming/WebSockets or encoded bodies.
+  Overloaded connections are closed rather than queued outside the deadline.
 - Hop-by-hop/proxy credentials are stripped. Plaintext credential reflection in
   upstream response headers/body is refused. This is defense in depth, not DLP:
   a trusted upstream can encode or transform a credential and return it.
 
 ## Explicit remaining boundaries
+
+See [the Linux service template](deploy/README.md) for a separately owned broker
+and its tested limits. The template is not installed automatically. Same-user
+dotenvx testing and isolated-service testing are separate acceptance cases;
+neither establishes a complete desktop-to-cloud deployment.
 
 - This initial proxy capability is guest-visible and copyable. It is **not**
   host-attested machine identity. Branches/checkpoints copying it share the same

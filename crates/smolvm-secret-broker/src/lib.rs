@@ -57,12 +57,19 @@ pub struct Grant {
     pub placeholder: String,
     /// Only Authorization and X-API-Key are currently supported.
     pub header: String,
+    /// Explicit upstream operations. Read-only unless the administrator opts in.
+    #[serde(default = "read_methods")]
+    pub methods: Vec<String>,
     /// Plaintext read per authorized request. An external manager can rotate
     /// or remove this file; no resolved value is persisted by the broker.
     pub secret_file: Option<PathBuf>,
     /// Host broker environment only (e.g. populated by `dotenvx run`).
     /// Environment rotation requires restarting the broker.
     pub secret_env: Option<String>,
+}
+
+fn read_methods() -> Vec<String> {
+    vec!["GET".into(), "HEAD".into()]
 }
 
 impl Grant {
@@ -179,6 +186,16 @@ impl Broker {
             if !matches!(grant.header.as_str(), "authorization" | "x-api-key") {
                 bail!("unsupported credential header");
             }
+            if grant.methods.is_empty()
+                || grant.methods.iter().any(|m| {
+                    !matches!(
+                        m.as_str(),
+                        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+                    )
+                })
+            {
+                bail!("grant methods must explicitly name supported HTTP operations");
+            }
             if !grant.placeholder.starts_with("SMOL_PLACEHOLDER_")
                 || grant.placeholder.len() < 24
                 || !grant
@@ -264,7 +281,12 @@ impl Broker {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             let (stream, _) = listener.accept().await?;
-            let permit = self.permits.clone().acquire_owned().await?;
+            let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+                // Close overload immediately, rather than queueing an accepted
+                // socket outside the session deadline indefinitely.
+                drop(stream);
+                continue;
+            };
             let broker = self.clone();
             tasks.spawn(async move {
                 let _permit = permit;
@@ -279,7 +301,10 @@ impl Broker {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             let (stream, _) = listener.accept().await?;
-            let permit = self.permits.clone().acquire_owned().await?;
+            let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
             let broker = self.clone();
             tasks.spawn(async move {
                 let _permit = permit;
@@ -307,7 +332,14 @@ impl Broker {
                     .get(header::PROXY_AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                let reply = if !broker.authorized(auth) {
+                let reply = if request
+                    .headers()
+                    .get_all(header::PROXY_AUTHORIZATION)
+                    .iter()
+                    .count()
+                    != 1
+                    || !broker.authorized(auth)
+                {
                     response(
                         StatusCode::PROXY_AUTHENTICATION_REQUIRED,
                         "proxy authorization required",
@@ -378,6 +410,12 @@ impl Broker {
             return Ok(response(StatusCode::FORBIDDEN, "access revoked"));
         }
         let grant = &self.config.grants[index];
+        if !grant.methods.iter().any(|m| m == request.method().as_str()) {
+            return Ok(response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "operation not authorized",
+            ));
+        }
         let authority = if grant.port == 443 {
             grant.host.clone()
         } else {
@@ -460,6 +498,12 @@ impl Broker {
             header::ACCEPT_ENCODING,
             header::HeaderValue::from_static("identity"),
         );
+        // Body collection yields to the runtime. An administrator may revoke
+        // access while a client is uploading; recheck at the dispatch boundary.
+        // Requests already dispatched upstream cannot be recalled.
+        if !self.authorized(auth) {
+            return Ok(response(StatusCode::FORBIDDEN, "access revoked"));
+        }
         let secret = grant.read_secret()?;
         let mut value = header::HeaderValue::from_str(&format!("{prefix}{}", secret.as_str()))?;
         value.set_sensitive(true);
@@ -574,6 +618,7 @@ mod tests {
             port: 443,
             placeholder: "SMOL_PLACEHOLDER_TEST_KEY".into(),
             header: "authorization".into(),
+            methods: read_methods(),
             secret_file: None,
             secret_env: None,
         };

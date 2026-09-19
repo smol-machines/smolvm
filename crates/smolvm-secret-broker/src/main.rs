@@ -33,8 +33,23 @@ async fn main() -> Result<()> {
     tokio::select! {
         result = broker.serve(listener) => result,
         result = unix_server => result,
-        result = tokio::signal::ctrl_c() => { result?; Ok(()) }
+        result = shutdown_signal() => { result?; Ok(()) }
     }
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => { result?; }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }
 
 #[cfg(unix)]

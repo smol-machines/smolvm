@@ -15,6 +15,7 @@ from pathlib import Path
 import secrets
 import selectors
 import signal
+import socket
 import ssl
 import subprocess
 import tempfile
@@ -98,6 +99,10 @@ def main():
                 with contextlib.suppress(BrokenPipeError, ConnectionResetError):
                     self.wfile.write(payload)
 
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.do_GET()
+
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
         server.daemon_threads = True
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -131,7 +136,7 @@ def main():
             "access_token_file": str(access), "upstream_ca": str(cert),
             "unix_socket": str(socket_path) if args.backend == "tsi" else None,
             "grants": [{"host": "localhost", "port": port, "placeholder": PLACEHOLDER,
-                        "header": "authorization", **({"secret_env": "SMOL_BROKER_QA_UPSTREAM_KEY"} if args.dotenvx else {"secret_file": str(credential)})}],
+                        "header": "authorization", "methods": ["GET", "POST"], **({"secret_env": "SMOL_BROKER_QA_UPSTREAM_KEY"} if args.dotenvx else {"secret_file": str(credential)})}],
         }))
         process = launch(config)
         name = "broker-qa-" + secrets.token_hex(6)
@@ -178,6 +183,11 @@ def main():
                 finally:
                     conn.close()
             checks.append("wrong capability and destination denied")
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as duplicate:
+                duplicate.sendall((f"CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n"
+                                   f"Proxy-Authorization: {auth}\r\nProxy-Authorization: {auth}\r\n\r\n").encode())
+                assert b" 407 " in duplicate.recv(4096).split(b"\r\n", 1)[0]
+            checks.append("duplicate proxy authorization denied")
             count = len(seen)
             for kwargs, expected in [
                 ({"header_value": "Bearer wrong"}, 403),
@@ -187,6 +197,8 @@ def main():
                 ({"body": PLACEHOLDER, "method": "POST"}, 403),
                 ({"body": "x" * (1024 * 1024 + 1), "method": "POST"}, 413),
                 ({"extra": {"Upgrade": "websocket"}}, 400),
+                ({"method": "DELETE"}, 405),
+                ({"method": "TRACE"}, 405),
             ]:
                 assert request(**kwargs)[0] == expected, kwargs.keys()
             assert len(seen) == count
@@ -206,6 +218,29 @@ def main():
             persistent.close()
             write_private(access, token)
             checks.append("revocation on an already-established TLS connection")
+
+            # Send headers before revocation and the body afterwards. Checking
+            # authorization only at the beginning of forward() is insufficient.
+            slow = connect()
+            slow.connect()
+            slow.sock.sendall((f"POST / HTTP/1.1\r\nHost: localhost:{port}\r\n"
+                               f"Authorization: Bearer {PLACEHOLDER}\r\nContent-Length: 1\r\n"
+                               "Expect: 100-continue\r\n\r\n").encode())
+            interim = b""
+            while b"\r\n\r\n" not in interim:
+                interim += slow.sock.recv(4096)
+            assert b"100 Continue" in interim, interim
+            before = len(seen)
+            write_private(access, secrets.token_hex(24))
+            slow.sock.sendall(b"x")
+            answer = http.client.HTTPResponse(slow.sock)
+            answer.begin()
+            assert answer.status == 403, answer.status
+            answer.read()
+            assert len(seen) == before
+            slow.close()
+            write_private(access, token)
+            checks.append("revocation while request body is in flight prevents upstream dispatch")
             if args.dotenvx:
                 checks.append("dotenvx encrypted .env decrypted only into host broker environment")
             else:
@@ -239,6 +274,22 @@ def main():
             finally:
                 proxy_port = original_port
                 stop(negative)
+
+            if args.backend == "tsi":
+                # A normal service-manager stop must clean the private socket
+                # and allow restart on the exact same endpoint.
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=10)
+                assert not socket_path.exists(), "SIGTERM left a stale broker socket"
+                process = launch(config)
+                with selectors.DefaultSelector() as ready:
+                    ready.register(process.stdout, selectors.EVENT_READ)
+                    assert ready.select(timeout=10)
+                restarted = process.stdout.readline().strip()
+                assert restarted.startswith("credential broker listening on "), restarted
+                proxy_port = int(restarted.rsplit(":", 1)[1])
+                assert request() == (200, b'{"authorized": true}')
+                checks.append("SIGTERM cleans socket and same-path restart serves requests")
 
             if args.smolvm:
                 # Existing machine verbs only. No real credential is passed to
