@@ -97,6 +97,44 @@ test_secret_reaches_guest_init() {
 }
 
 # =============================================================================
+# 2b. The cached run path delivers the secret too.
+#
+# `machine run --oci-cache` bakes an init layer and then serves the workload
+# through the packed-run path. That path took no secret refs, so the flag was
+# accepted and the variable arrived empty, while the same run without
+# --oci-cache delivered it.
+# =============================================================================
+test_secret_reaches_guest_with_oci_cache() {
+    local output
+    output=$($SMOLVM machine run --oci-cache -I alpine --net \
+        --secret-env "$SECRET_NAME=$SECRET_NAME" \
+        -- sh -c "printenv $SECRET_NAME" 2>&1)
+    [[ "$output" == *"$SECRET_VALUE"* ]]
+}
+
+# =============================================================================
+# 2c. Smolfile init steps take the same cached path by default.
+#
+# Any `machine run` with init steps routes through the bake even without
+# --oci-cache, so the same gap applied to a run that never asked for the cache.
+# The secret is supplied by the flag here: a Smolfile [secrets] entry on this
+# path is rejected before the workload starts, which is a separate defect.
+# =============================================================================
+test_secret_reaches_guest_on_cached_init_run() {
+    local smolfile="$SECRET_TMPDIR/Smolfile.cached"
+    cat > "$smolfile" <<EOF
+cpus = 1
+memory = 512
+init = ["echo init-$$"]
+EOF
+    local output
+    output=$($SMOLVM machine run --smolfile "$smolfile" -I alpine --net \
+        --secret-env "$SECRET_NAME=$SECRET_NAME" \
+        -- sh -c "printenv $SECRET_NAME" 2>&1)
+    [[ "$output" == *"$SECRET_VALUE"* ]]
+}
+
+# =============================================================================
 # 3. INVARIANT: the plaintext never lands in the persisted DB record.
 # =============================================================================
 test_plaintext_not_in_db() {
@@ -162,6 +200,8 @@ log_info "Test secret exported as host env var '$SECRET_NAME' (from_env source)"
 
 run_test "Secret plaintext reaches guest via exec" test_secret_reaches_guest_exec || true
 run_test "Secret plaintext reaches guest via init" test_secret_reaches_guest_init || true
+run_test "Secret plaintext reaches guest through the cached run path" test_secret_reaches_guest_with_oci_cache || true
+run_test "Secret plaintext reaches guest on a cached init run" test_secret_reaches_guest_on_cached_init_run || true
 run_test "INVARIANT: plaintext never in DB record" test_plaintext_not_in_db || true
 run_test "INVARIANT: plaintext never in .smolmachine pack" test_plaintext_not_in_pack || true
 run_test "Secret re-resolves after restart" test_secret_reresolves_after_restart || true

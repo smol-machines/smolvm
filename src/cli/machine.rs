@@ -1195,6 +1195,8 @@ impl RunCmd {
                 // `--from` rejects the egress flags at parse time
                 // (`conflicts_with_all`), so there is no policy to carry.
                 egress: None,
+                // `--from` rejects `--secret-env`/`--secret-file` at parse time.
+                secret_refs: std::collections::BTreeMap::new(),
             }
             .run();
         }
@@ -1351,6 +1353,9 @@ impl RunCmd {
                         allowed_cidrs: params.allowed_cidrs.clone(),
                         dns_filter_hosts: params.dns_filter_hosts.clone(),
                     }),
+                    // The same refs the direct boot path resolves: the run's env gets
+                    // them, the baked artifact never does.
+                    secret_refs: params.secret_refs.clone(),
                 }
                 .run();
             }
@@ -1499,6 +1504,9 @@ impl RunCmd {
                     allowed_cidrs: params.allowed_cidrs.clone(),
                     dns_filter_hosts: params.dns_filter_hosts.clone(),
                 }),
+                // The bake never sees these: only the run's env does, so the cached
+                // artifact and its cache key stay secret-free.
+                secret_refs: params.secret_refs.clone(),
             }
             .run();
         }

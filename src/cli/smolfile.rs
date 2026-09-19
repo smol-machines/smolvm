@@ -687,7 +687,15 @@ init = ["echo init"]
         // setting the command line leaves out, and the command line wins for
         // each one it gives.
         use crate::cli::pack_run::resolve_packed_launch;
-        let launch = resolve_packed_launch(&manifest, &[], &[], None, None).unwrap();
+        let launch = resolve_packed_launch(
+            &manifest,
+            &[],
+            &[],
+            None,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(launch.command, vec!["/bin/sh", "-c", "sleep infinity"]);
         assert!(launch
             .env
@@ -700,6 +708,7 @@ init = ["echo init"]
             &["GREETING=bye".to_string()],
             Some("/tmp".to_string()),
             Some("0".to_string()),
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(overridden.command, vec!["id"]);

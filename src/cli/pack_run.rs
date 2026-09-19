@@ -297,6 +297,13 @@ pub struct PackRunCmd {
     /// manifest-driven behavior.
     #[clap(skip)]
     pub egress: Option<ResolvedEgressPolicy>,
+
+    /// Secret refs already parsed by `machine run` from `--secret-env` and
+    /// `--secret-file` when it serves a run through this command instead of the
+    /// direct boot path. Not a CLI flag: direct `pack run` invocations carry
+    /// none, so a packed artifact still cannot bring its own resolvable secret.
+    #[clap(skip)]
+    pub secret_refs: std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 }
 
 /// Network policy resolved from `--allow-cidr`/`--allow-host`/
@@ -1032,10 +1039,11 @@ pub(crate) fn resolve_packed_launch(
     cli_env: &[String],
     cli_workdir: Option<String>,
     cli_user: Option<String>,
+    cli_secret_refs: &std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 ) -> smolvm::Result<PackedLaunch> {
     Ok(PackedLaunch {
         command: build_command(manifest, cli_command),
-        env: build_env(manifest, cli_env)?,
+        env: build_env(manifest, cli_env, cli_secret_refs)?,
         workdir: cli_workdir.or_else(|| manifest.workdir.clone()),
         user: cli_user.or_else(|| manifest.user.clone()),
     })
@@ -1045,6 +1053,7 @@ pub(crate) fn resolve_packed_launch(
 fn build_env(
     manifest: &smolvm_pack::PackManifest,
     cli_env: &[String],
+    cli_secret_refs: &std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 ) -> smolvm::Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = manifest
         .env
@@ -1085,6 +1094,17 @@ fn build_env(
         }
     }
 
+    // Refs the host user passed on their own command line, so TrustedLocal
+    // rather than the Untrusted scope a packed manifest gets. Applied after the
+    // CLI env loop to match the direct boot path, which extends the launch env
+    // with the resolved tuples last. Tuples are plaintext; do not log them.
+    for key in cli_secret_refs.keys() {
+        env.retain(|(k, _)| k != key);
+    }
+    env.extend(crate::cli::vm_common::resolve_secret_refs_for_env(
+        cli_secret_refs,
+    )?);
+
     Ok(env)
 }
 
@@ -1109,6 +1129,7 @@ fn execute_command(
         &args.env,
         args.workdir.clone(),
         args.user.clone(),
+        &args.secret_refs,
     )?;
     if args.auto_graph {
         smolvm::util::enable_cuda_auto_graph_env(&mut env);
@@ -1518,6 +1539,7 @@ fn run_ephemeral(
             // Construct PackRunCmd from PackedRunArgs and delegate to existing path
             let cmd = PackRunCmd {
                 sidecar: Some(sidecar_path),
+                secret_refs: std::collections::BTreeMap::new(),
                 command: args.command,
                 interactive: args.interactive,
                 tty: args.tty,
@@ -1845,7 +1867,15 @@ fn run_from_cache(
     let mut client = wait_for_agent(&vsock_path, debug)?;
 
     let params = ExecParams {
-        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
+        launch: resolve_packed_launch(
+            manifest,
+            &args.command,
+            &args.env,
+            args.workdir,
+            args.user,
+            // A packed stub takes no secret flags of its own.
+            &std::collections::BTreeMap::new(),
+        )?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -2264,7 +2294,15 @@ fn daemon_exec(
     // Virtiofs devices are fixed at boot — exec cannot add new host mounts.
     let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
     let params = ExecParams {
-        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
+        launch: resolve_packed_launch(
+            manifest,
+            &args.command,
+            &args.env,
+            args.workdir,
+            args.user,
+            // A packed stub takes no secret flags of its own.
+            &std::collections::BTreeMap::new(),
+        )?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -2381,6 +2419,84 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `machine run --oci-cache --secret-env KEK=USER` accepted the flag and the
+    // guest saw an empty KEK, because the cached branch routes the run through
+    // this command and the parsed refs had nowhere to travel. The same run
+    // without --oci-cache delivered the value.
+    #[test]
+    fn cli_secret_refs_are_resolved_into_the_run_env() {
+        let manifest = smolvm_pack::PackManifest::new(
+            "alpine".to_string(),
+            "sha256:0".to_string(),
+            "linux/arm64".to_string(),
+            "linux/arm64".to_string(),
+        );
+        std::env::set_var("SMOLVM_TEST_PACK_SECRET_SRC", "from-the-host");
+        let mut refs = std::collections::BTreeMap::new();
+        refs.insert(
+            "KEK".to_string(),
+            smolvm::secrets::env_ref("SMOLVM_TEST_PACK_SECRET_SRC"),
+        );
+
+        let env = build_env(&manifest, &[], &refs).expect("the host env var resolves");
+
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "KEK")
+                .map(|(_, v)| v.as_str()),
+            Some("from-the-host")
+        );
+        std::env::remove_var("SMOLVM_TEST_PACK_SECRET_SRC");
+    }
+
+    #[test]
+    fn a_cli_secret_ref_wins_over_an_env_flag_of_the_same_key() {
+        // The direct boot path extends the launch env with the resolved tuples
+        // after the --env list, so the secret wins there. Match it here, or the
+        // same command would deliver different values on the two paths.
+        let manifest = smolvm_pack::PackManifest::new(
+            "alpine".to_string(),
+            "sha256:0".to_string(),
+            "linux/arm64".to_string(),
+            "linux/arm64".to_string(),
+        );
+        std::env::set_var("SMOLVM_TEST_PACK_SECRET_WINS", "from-the-secret");
+        let mut refs = std::collections::BTreeMap::new();
+        refs.insert(
+            "KEK".to_string(),
+            smolvm::secrets::env_ref("SMOLVM_TEST_PACK_SECRET_WINS"),
+        );
+
+        let env = build_env(&manifest, &["KEK=from-the-flag".to_string()], &refs)
+            .expect("the host env var resolves");
+
+        assert_eq!(
+            env.iter()
+                .filter(|(k, _)| k == "KEK")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["from-the-secret"]
+        );
+        std::env::remove_var("SMOLVM_TEST_PACK_SECRET_WINS");
+    }
+
+    #[test]
+    fn a_direct_pack_run_carries_no_cli_secret_refs() {
+        // A packed artifact still may not bring its own resolvable secret: the
+        // field is skipped by clap, so only machine run can populate it.
+        let manifest = smolvm_pack::PackManifest::new(
+            "alpine".to_string(),
+            "sha256:0".to_string(),
+            "linux/arm64".to_string(),
+            "linux/arm64".to_string(),
+        );
+
+        let env = build_env(&manifest, &["A=1".to_string()], &Default::default())
+            .expect("no refs to resolve");
+
+        assert_eq!(env, vec![("A".to_string(), "1".to_string())]);
+    }
 
     #[test]
     fn resolved_policy_decides_network_instead_of_the_baked_manifest() {
