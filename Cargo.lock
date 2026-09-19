@@ -3328,6 +3328,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "smolvm-secret-broker"
+version = "1.16.2"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "reqwest",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "zeroize",
+]
+
+[[package]]
 name = "smolvm-shim"
 version = "0.1.0"
 dependencies = [
