@@ -10,6 +10,19 @@ name="cpu-$(basename "$root")"
 owned=("$name")
 machine() { "$binary" machine "$@"; }
 guest() { machine exec --name "$name" -- sh -ec "$1"; }
+quota() {
+    if test "${SMOLVM_TEST_REQUIRE_CPU_QUOTA:-0}" != 1; then return; fi
+    python3 - "$(machine data-dir --name "$name")" "$1" <<'PY'
+import pathlib, sys
+pid = int((pathlib.Path(sys.argv[1]) / 'agent.pid').read_text().splitlines()[0])
+entry = next(line for line in pathlib.Path(f'/proc/{pid}/cgroup').read_text().splitlines() if line.startswith('0::'))
+directory = pathlib.Path('/sys/fs/cgroup') / entry[3:].lstrip('/')
+budget, period = (directory / 'cpu.max').read_text().split()
+assert budget != 'max', f'VMM has no CPU quota: {directory}'
+assert int(budget) == int(period) * int(sys.argv[2]), (budget, period, sys.argv[2])
+print(f'verified_host_cpu_quota={sys.argv[2]} pid={pid}')
+PY
+}
 cleanup() {
     result=$?
     trap - EXIT
@@ -34,10 +47,12 @@ cleanup() {
 trap cleanup EXIT
 machine create --name "$name" --cpus 4 --mem 512 --storage 1 --overlay 1
 machine start --name "$name" --branchable
+quota 4
 boot=$(guest 'cat /proc/sys/kernel/random/boot_id')
 guest 'echo parent >/dev/shm/state; (while :; do date +%s >/run/heartbeat; sleep 1; done) >/run/workload.log 2>&1 & echo $! >/run/workload.pid'
 pid=$(guest 'cat /run/workload.pid')
 machine resize --name "$name" --cpus 2
+quota 2
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-1'
 test "$(guest 'cat /proc/sys/kernel/random/boot_id')" = "$boot"
 guest "kill -0 $pid"
@@ -54,6 +69,7 @@ if machine resize --name "$name" --storage 0; then exit 1; fi
 test "$(guest "awk '/^MemTotal:/ {print \$2}' /proc/meminfo")" = "$memory_before"
 test "$(guest 'cat /sys/class/block/vda/size')" = "$disk_before"
 machine resize --name "$name" --cpus 1
+quota 1
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0'
 machine resize --name "$name" --cpus 2
 mkdir -m 700 "$root/artifacts"
@@ -64,10 +80,12 @@ name="${name}-restored"
 owned+=("$name")
 machine create --name "$name" --from "$root/artifacts/shrunk.smolcheckpoint"
 machine start --name "$name" --branchable
+quota 2
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-1; test "$(cat /dev/shm/state)" = parent'
 test "$(guest 'cat /proc/sys/kernel/random/boot_id')" = "$boot"
 guest "kill -0 $pid"
 machine resize --name "$name" --cpus 4
+quota 4
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-3; taskset -c 3 true'
 machine resize --name "$name" --cpus 2
 parent=$name
@@ -76,8 +94,10 @@ owned+=("$name")
 machine branch --from "$parent" --name "$name" --branchable
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-1; echo child >/dev/shm/state'
 machine resize --name "$name" --cpus 4
+quota 4
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-3; taskset -c 3 true'
 name=$parent
+quota 2
 guest 'test "$(cat /dev/shm/state)" = parent; test "$(cat /sys/devices/system/cpu/online)" = 0-1'
 if test -n "${SMOLVM_TEST_LEGACY_LIB_DIR:-}"; then
     name="${parent}-legacy"
