@@ -49,8 +49,13 @@ machine create --name "$name" --cpus 4 --mem 512 --storage 1 --overlay 1
 machine start --name "$name" --branchable
 quota 4
 boot=$(guest 'cat /proc/sys/kernel/random/boot_id')
-guest 'echo parent >/dev/shm/state; (while :; do date +%s >/run/heartbeat; sleep 1; done) >/run/workload.log 2>&1 & echo $! >/run/workload.pid'
+guest 'echo parent >/dev/shm/state; taskset -c 3 sh -ec "while :; do date +%s >/run/heartbeat; sleep 1; done" >/run/workload.log 2>&1 & echo $! >/run/workload.pid'
 pid=$(guest 'cat /run/workload.pid')
+for attempt in $(seq 1 20); do
+    if guest 'test -s /run/heartbeat'; then break; fi
+    sleep 0.1
+done
+guest "test -s /run/heartbeat; grep -Eq '^Cpus_allowed_list:[[:space:]]*3$' /proc/$pid/status"
 machine resize --name "$name" --cpus 2
 quota 2
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-1'
