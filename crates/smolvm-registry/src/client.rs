@@ -824,6 +824,26 @@ impl RegistryClient {
     /// single-platform manifest bytes. Shared by `pull` and `inspect` so both
     /// resolve a multi-arch tag identically (a plain manifest passes through).
     pub async fn get_manifest_resolved(&self, repo: &str, reference: &str) -> Result<Vec<u8>> {
+        // The guest is always Linux; only the architecture varies by host.
+        let platform = OciPlatform {
+            os: "linux".to_string(),
+            architecture: OciPlatform::current().architecture,
+            variant: None,
+        };
+        self.get_manifest_resolved_platform(repo, reference, &platform)
+            .await
+    }
+
+    /// Like [`get_manifest_resolved`], but resolves an OCI image index to the
+    /// CALLER's `platform` instead of this host's. Needed when the consumer is
+    /// not the local machine — e.g. `pack create --oci-platform linux/amd64`
+    /// sizing a build VM on an arm64 host.
+    pub async fn get_manifest_resolved_platform(
+        &self,
+        repo: &str,
+        reference: &str,
+        platform: &OciPlatform,
+    ) -> Result<Vec<u8>> {
         let (doc_bytes, content_type) = self.get_manifest_raw(repo, reference).await?;
 
         let is_index = content_type.contains(INDEX_MEDIA_TYPE)
@@ -839,20 +859,19 @@ impl RegistryClient {
         }
 
         let index: OciIndex = serde_json::from_slice(&doc_bytes)?;
-        // .smolmachine sidecars are cross-platform — libkrun is provided by the
-        // installed CLI, not bundled — so only the GUEST architecture matters, and
-        // the guest is always Linux. An index entry must therefore be keyed
-        // `linux/<arch>`; match it strictly. A wrong/missing `os` is bad index data
-        // and must fail loudly (the error below lists what was published) rather than
-        // be silently tolerated. The host OS is irrelevant to which sidecar to pull.
-        let arch = OciPlatform::current().architecture;
+        // Match the requested platform strictly on os+architecture. A
+        // wrong/missing `os` is bad index data and must fail loudly (the error
+        // below lists what was published) rather than be silently tolerated.
+        // Variants (e.g. arm/v7) are not distinguished, matching the guest's
+        // own platform selection.
+        let want = platform.label();
         let entry = index
             .manifests
             .iter()
             .find(|m| {
                 m.platform
                     .as_ref()
-                    .is_some_and(|p| p.os == "linux" && p.architecture == arch)
+                    .is_some_and(|p| p.os == platform.os && p.architecture == platform.architecture)
             })
             .ok_or_else(|| {
                 let available: Vec<String> = index
@@ -861,7 +880,7 @@ impl RegistryClient {
                     .filter_map(|m| m.platform.as_ref().map(|p| p.label()))
                     .collect();
                 RegistryError::InvalidManifest(format!(
-                    "no linux/{arch} build available for this machine; the registry has: {}",
+                    "no {want} build available for this machine; the registry has: {}",
                     if available.is_empty() {
                         "(none)".into()
                     } else {
@@ -869,7 +888,7 @@ impl RegistryClient {
                     }
                 ))
             })?;
-        tracing::info!(arch = %arch, digest = %entry.digest, "selected index entry");
+        tracing::info!(platform = %want, digest = %entry.digest, "selected index entry");
         Ok(self.get_manifest_raw(repo, &entry.digest).await?.0)
     }
 

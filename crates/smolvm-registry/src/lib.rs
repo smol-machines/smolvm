@@ -94,9 +94,18 @@ impl OciPlatform {
     /// platform descriptor, normalizing the arch (`x86_64`→`amd64`,
     /// `aarch64`→`arm64`) so index entries and `current()` always agree.
     pub fn parse(host_platform: &str) -> Self {
-        let (os, arch) = host_platform
-            .split_once('/')
-            .unwrap_or(("linux", host_platform));
+        // OCI platform is `os/arch[/variant]`; a bare `arch` defaults os to
+        // linux. Splitting on the FIRST slash and keeping the rest as arch
+        // would turn `linux/arm/v7` into arch `arm/v7`, which can never equal
+        // an index entry's `architecture` (`arm`) — the variant is a separate
+        // field, not part of the arch.
+        let mut parts = host_platform.split('/');
+        let (os, arch, variant) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(os), Some(arch), variant) => (os, arch, variant),
+            (Some(arch), None, _) => ("linux", arch, None),
+            // split() always yields at least one item; unreachable in practice.
+            _ => ("linux", host_platform, None),
+        };
         let architecture = match arch {
             "x86_64" => "amd64",
             "aarch64" => "arm64",
@@ -105,7 +114,7 @@ impl OciPlatform {
         Self {
             os: os.to_string(),
             architecture: architecture.to_string(),
-            variant: None,
+            variant: variant.map(str::to_string),
         }
     }
 
@@ -255,6 +264,13 @@ mod platform_tests {
         assert_eq!(OciPlatform::parse("linux/amd64").label(), "linux/amd64");
         // Missing slash → defaults os to linux.
         assert_eq!(OciPlatform::parse("amd64").os, "linux");
+        // A variant is its own field, not part of the arch — `linux/arm/v7`
+        // must match an index entry whose architecture is `arm`.
+        let v = OciPlatform::parse("linux/arm/v7");
+        assert_eq!(
+            (v.os.as_str(), v.architecture.as_str(), v.variant.as_deref()),
+            ("linux", "arm", Some("v7"))
+        );
     }
 
     #[test]

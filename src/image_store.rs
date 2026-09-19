@@ -28,6 +28,48 @@ use crate::{Error, Result};
 /// The registry authorizes `repository:<repo>:pull` for the caller's credentials
 /// during resolution; an unauthorized caller is rejected here.
 pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+    let manifest_bytes = resolved_manifest(reference, auth, None).await?;
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(&manifest_bytes))
+    ))
+}
+
+/// Resolve `reference` to its platform manifest and return the summed
+/// `layers[].size` — the image's total COMPRESSED footprint, authorized with
+/// `auth`. `oci_platform` selects the index entry the way the guest's pull
+/// would (`None` = this host's architecture, matching `authorized_digest`).
+///
+/// Callers use this to provision for an image BEFORE it is pulled: the
+/// manifest is the only pre-pull bound on how much data the pull will write.
+/// The returned bytes are compressed; extraction inflates them.
+pub async fn image_compressed_size(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<u64> {
+    let manifest_bytes = resolved_manifest(reference, auth, oci_platform).await?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("image-size", format!("bad manifest JSON: {e}")))?;
+    let layers = manifest["layers"].as_array().ok_or_else(|| {
+        Error::agent(
+            "image-size",
+            "resolved manifest has no layers array".to_string(),
+        )
+    })?;
+    Ok(layers.iter().map(|l| l["size"].as_u64().unwrap_or(0)).sum())
+}
+
+/// Resolve `reference` against the candidate registries the guest would try and
+/// return the platform manifest's bytes, authorized with `auth`.
+///
+/// The registry authorizes `repository:<repo>:pull` for the caller's credentials
+/// during resolution; an unauthorized caller is rejected here.
+async fn resolved_manifest(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<Vec<u8>> {
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
     let want = parsed
@@ -42,16 +84,18 @@ pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<Strin
     // Resolve the registry the way the GUEST does — via `registry_pull_hosts`, not
     // the configured default — so the host-side gate targets the same registry the
     // in-guest pull would (a bare `alpine` is Docker Hub, not the smol registry).
+    let platform = oci_platform.map(smolvm_registry::OciPlatform::parse);
     let mut first_err: Option<String> = None;
     for host in &crate::registry::registry_pull_hosts(reference) {
         let client = registry_client(host, &config, auth);
         let repo = repo_for(host, &parsed);
-        match client.get_manifest_resolved(&repo, &want).await {
+        let resolved = match &platform {
+            Some(p) => client.get_manifest_resolved_platform(&repo, &want, p).await,
+            None => client.get_manifest_resolved(&repo, &want).await,
+        };
+        match resolved {
             Ok(manifest_bytes) => {
-                return Ok(format!(
-                    "sha256:{}",
-                    hex::encode(Sha256::digest(&manifest_bytes))
-                ));
+                return Ok(manifest_bytes);
             }
             // Keep the FIRST failure. `registry_pull_hosts` is a DNS allow-list,
             // not a list of real endpoints — Docker Hub yields
