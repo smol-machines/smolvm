@@ -1377,24 +1377,6 @@ impl RunCmd {
             && image_bakeable(params.image.as_deref())
             && (!params.init.is_empty() || self.oci_cache)
         {
-            // `--oci-cache` needs an explicit workload for the same reason the
-            // non-cached path does: with no command the baked artifact's own
-            // entrypoint is a `/bin/true` no-op, so the run would exit 0 having
-            // done nothing. Fail with the same guidance instead of pretending.
-            if self.oci_cache
-                && self.command.is_empty()
-                && !self.interactive
-                && self.smolfile.is_none()
-                && params.entrypoint.is_empty()
-                && params.cmd.is_empty()
-            {
-                return Err(Error::config(
-                    "machine run",
-                    "--oci-cache needs a command to run: pass one after `--`, use -it for a \
-                     shell, or supply a Smolfile with an entrypoint/cmd"
-                        .to_string(),
-                ));
-            }
             // Auth gate: resolve + authorize the image on the HOST before baking
             // or serving a cached bake. A private image the caller cannot pull is
             // rejected here — the same registry-authorization gate the cloud path
@@ -1407,15 +1389,49 @@ impl RunCmd {
             // tracks the image's CONTENT: when a mutable tag moves upstream the key
             // changes and the new content is baked, instead of serving the first
             // run's image forever.
+            //
+            // The same resolution also yields the image's own ENTRYPOINT/CMD.
+            // The bake records `/bin/true` as the artifact's command (so `start`
+            // runs init alone), which discards the image's default command; a run
+            // that supplies none of its own would otherwise fall through to that
+            // no-op and do nothing. We carry the image's command here so it runs,
+            // exactly as the non-cached path does from image metadata (#1334).
             let mut resolved_digest = None;
+            let mut image_entrypoint: Vec<String> = Vec::new();
+            let mut image_cmd: Vec<String> = Vec::new();
             if self.oci_cache {
                 if let Some(image) = params.image.as_deref() {
                     let auth = smolvm::registry::PullAuth::FromConfig;
                     let rt = tokio::runtime::Runtime::new()
                         .map_err(|e| Error::config("oci-cache", e.to_string()))?;
-                    resolved_digest =
-                        Some(rt.block_on(smolvm::image_store::authorized_digest(image, &auth))?);
+                    let cfg =
+                        rt.block_on(smolvm::image_store::authorized_image_config(image, &auth))?;
+                    resolved_digest = Some(cfg.digest);
+                    image_entrypoint = cfg.entrypoint;
+                    image_cmd = cfg.cmd;
                 }
+            }
+            // Fail only when there is genuinely nothing to run: no CLI command,
+            // no Smolfile entrypoint/cmd, no image default command, and no `-it`
+            // to drop into a shell. When the image declares its own command, a
+            // bare `--oci-cache --image X` runs it — matching `docker run` and
+            // the non-cached path.
+            if self.oci_cache
+                && self.command.is_empty()
+                && !self.interactive
+                && self.smolfile.is_none()
+                && params.entrypoint.is_empty()
+                && params.cmd.is_empty()
+                && image_entrypoint.is_empty()
+                && image_cmd.is_empty()
+            {
+                return Err(Error::config(
+                    "machine run",
+                    "--oci-cache needs a command to run: the image declares no entrypoint or \
+                     cmd, so pass one after `--`, use -it for a shell, or supply a Smolfile \
+                     with an entrypoint/cmd"
+                        .to_string(),
+                ));
             }
             let cached = ensure_init_layer(
                 &params,
@@ -1425,14 +1441,24 @@ impl RunCmd {
                 self.proxy_opts.resolved_proxy()?.as_deref(),
                 self.proxy_opts.no_proxy().as_deref(),
             )?;
-            // The real workload: CLI trailing args win, else the Smolfile's
-            // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
+            // Resolve the workload the same way the non-cached path does, since
+            // the baked artifact's own command is a `/bin/true` no-op: CLI
+            // trailing args > Smolfile entrypoint+cmd > image entrypoint+cmd >
+            // default (a shell for foreground/interactive runs, idle for detach).
             let command = if !self.command.is_empty() {
                 self.command.clone()
-            } else {
+            } else if !params.entrypoint.is_empty() || !params.cmd.is_empty() {
                 let mut c = params.entrypoint.clone();
                 c.extend(params.cmd.clone());
                 c
+            } else if !image_entrypoint.is_empty() || !image_cmd.is_empty() {
+                let mut c = image_entrypoint.clone();
+                c.extend(image_cmd.clone());
+                c
+            } else if self.detach {
+                DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
+            } else {
+                vec![DEFAULT_SHELL_CMD.to_string()]
             };
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(cached),
