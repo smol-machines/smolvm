@@ -126,6 +126,44 @@ test_update_env_applied_on_start() {
     [[ "$val" == "hello" ]] || { echo "expected MY_VAR=hello, got: $val"; return 1; }
 }
 
+test_update_allow_host_applied_on_start() {
+    # A stopped machine could not gain or lose an allowed host: the host list was
+    # written once at create and never by update, so a new host stayed
+    # unresolvable on the next start no matter how the Smolfile was edited.
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
+    $SMOLVM machine create --net --image alpine --name default \
+        --allow-host dl-cdn.alpinelinux.org 2>&1 || return 1
+
+    # The host allowed at create resolves; one that was never allowed does not.
+    $SMOLVM machine start 2>&1 || return 1
+    $SMOLVM machine exec -- getent hosts dl-cdn.alpinelinux.org >/dev/null 2>&1 || {
+        echo "expected the create-time host to resolve"; return 1
+    }
+    $SMOLVM machine exec -- getent hosts registry.npmjs.org >/dev/null 2>&1 && {
+        echo "registry.npmjs.org resolved before it was allowed"; return 1
+    }
+    $SMOLVM machine stop 2>/dev/null || true
+
+    # Adding it on the stopped machine makes it resolve on the next start.
+    $SMOLVM machine update --name default --allow-host registry.npmjs.org 2>&1 || return 1
+    $SMOLVM machine start 2>&1 || return 1
+    $SMOLVM machine exec -- getent hosts registry.npmjs.org >/dev/null 2>&1 || {
+        echo "expected the added host to resolve after update"; return 1
+    }
+    $SMOLVM machine stop 2>/dev/null || true
+
+    # Removing a host closes it again on the next start.
+    $SMOLVM machine update --name default --remove-allow-host dl-cdn.alpinelinux.org 2>&1 || return 1
+    $SMOLVM machine start 2>&1 || return 1
+    local removed_resolves=0
+    $SMOLVM machine exec -- getent hosts dl-cdn.alpinelinux.org >/dev/null 2>&1 && removed_resolves=1
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
+
+    [[ $removed_resolves -eq 0 ]] || { echo "removed host still resolves"; return 1; }
+}
+
 test_exec_image_large_stdout_does_not_crash_vm() {
     # Same test but for image-backed exec (the actual bug path)
     $SMOLVM machine stop 2>/dev/null || true
@@ -380,6 +418,7 @@ run_test "Create with --image" test_create_with_image || true
 run_test "Create with --image + env" test_create_with_image_and_env || true
 run_test "Update: settings applied on next start + refuses running VM" test_update_settings_applied_on_start || true
 run_test "Update: env var applied on next start (image-based)" test_update_env_applied_on_start || true
+run_test "Update: allowed host added and removed on next start" test_update_allow_host_applied_on_start || true
 run_test "Exec: large stdout does not crash VM (image-backed)" test_exec_image_large_stdout_does_not_crash_vm || true
 run_test "Exec: large stdout does not crash VM (joined exec)" test_exec_joined_large_stdout_does_not_crash_vm || true
 run_test "Exec-join: exec joins main workload container" test_exec_joins_main_container || true
