@@ -7,34 +7,15 @@ an ordinary HTTP client use a placeholder environment variable while the
 upstream credential stays outside the workload. Existing `--secret-env` and
 `--secret-file` semantics are unchanged: those still expose values to the guest.
 
-## Run the acceptance test
+This integration connects applications inside Smol VMs to a host-side broker.
+It does not yet provide a gateway running inside a VM or in the cloud for
+applications that remain on the developer's desktop.
+
+## Build
 
 ```sh
 cargo build -p smolvm-secret-broker
-cargo test -p smolvm-secret-broker
-python3 crates/smolvm-secret-broker/tests/acceptance.py \
-  --broker target/debug/smolvm-secret-broker
-
-# Add a real Linux VM (KVM and a working Smol runtime required):
-python3 crates/smolvm-secret-broker/tests/acceptance.py \
-  --broker target/debug/smolvm-secret-broker --smolvm /path/to/smolvm
-
-# TSI networking, with the credential connection over a mounted vsock socket:
-python3 crates/smolvm-secret-broker/tests/acceptance.py \
-  --broker target/debug/smolvm-secret-broker --smolvm /path/to/smolvm \
-  --backend tsi
-
-# Also exercise real dotenvx decryption of a temporary encrypted .env:
-python3 crates/smolvm-secret-broker/tests/acceptance.py \
-  --broker target/debug/smolvm-secret-broker --smolvm /path/to/smolvm \
-  --backend tsi --dotenvx /path/to/dotenvx
 ```
-
-The test creates its own CA, TLS service, private credential files and optional
-512 MiB Alpine VM. Only installing Alpine/curl needs internet. It uses synthetic
-random credentials, checks command exit codes, and deletes its VM and fixtures
-on completion. It leaves unrelated machines and system trust stores untouched.
-Do not interrupt it with SIGKILL; that can prevent cleanup.
 
 ## Interface
 
@@ -68,12 +49,6 @@ neither its private key nor the broker's private key does. Private reference fil
 must be absolute, regular, owner-private files, containing 16–8192 bytes. Their
 directories must not be guest-writable. The host administrator is trusted.
 
-For local testing, Smol's existing internal `SMOLVM_GUEST_HOST_SERVICE` bridge
-maps exactly one guest gateway port to this loopback listener. The acceptance
-test sets `SMOLVM_EGRESS_FLOOR=strict` and uses virtio-net; it does not grant
-general host-loopback access. This internal bridge is not yet a public broker
-attachment API and must not overwrite an existing rollout-service mapping.
-
 ### TSI transport
 
 TSI does not have the virtio-net gateway-port mapping. On Unix hosts, configure
@@ -98,8 +73,8 @@ The workload's standard HTTPS proxy is then `http://smol:ACCESS_TOKEN@127.0.0.1:
 This listener is guest-local; vsock carries its bytes to the private host socket.
 The application needs no socket-specific client API. Provision the public CA and
 placeholder environment as above. The broker and VMM must have permission to
-access the private socket; the test uses a same-user local CLI, not isolated fleet
-UIDs. No permissions are widened automatically.
+access the private socket. Use the service configuration for process-bound access
+across isolated UIDs; no permissions are widened automatically.
 
 This does **not** repair TSI's general egress filtering or make it equivalent to
 strict virtio-net networking. Do not apply virtio-net gateway addresses or claim
@@ -179,28 +154,29 @@ trusted host-side manager can populate the same environment/file seam.
 
 ## Explicit remaining boundaries
 
-See [the Linux service template](deploy/README.md) for a separately owned broker
-and its tested limits. The template is not installed automatically. Same-user
-dotenvx testing and isolated-service testing are separate acceptance cases;
-neither establishes a complete desktop-to-cloud deployment.
-
-The combined Linux isolated-service + dotenvx + real-VM test now covers branch
-and restart authorization, including a live TLS session at the branch boundary.
-Portable capture currently refuses published sockets in SmolVM; do not remove
-that guard or claim checkpoint/restore support for this attachment. A restored
-machine must be attached and authorized by its administrator as a new process.
+The [Linux service template](deploy/README.md) requires administrator setup.
+Branches and restarted machines require explicit authorization. Portable capture
+currently rejects published sockets, including this attachment.
 
 - The proxy token is guest-visible and copyable. In process-bound mode it is
   necessary but not sufficient: the host-admin record must also authorize the
   kernel-observed peer. Compatibility bearer-only mode does not have that property.
-- The test keeps public egress for Alpine/curl setup. It verifies the protected
-  broker path and blocked unrelated host access, not universal forced proxying.
-  A guest can bypass proxy environment variables, but gets no upstream key by
+- A guest can bypass proxy environment variables, but gets no upstream key by
   doing so. Production gateway-only routing needs host-enforced policy.
 - A host-level agent with root/sudo can read broker files or memory. Service
   separation protects against ordinary users, not the host administrator.
 - Method restrictions do not constrain every API action. Use narrow upstream keys;
   provider-specific resource/body policy is not implemented.
 - Public fleet APIs, dotenvx gateway-specific integration, CLI/SDK automatic attachment and trust provisioning,
-  portable attachment restore, cross-platform process-bound QA and independent
-  security review remain outside this Linux-only slice.
+  portable attachment restore and cross-platform process-bound transport are
+  not implemented.
+
+## Development
+
+```sh
+cargo test -p smolvm-secret-broker
+python3 crates/smolvm-secret-broker/tests/acceptance.py \
+  --broker target/debug/smolvm-secret-broker
+```
+
+The test scripts include options for real-VM and isolated-service runs.

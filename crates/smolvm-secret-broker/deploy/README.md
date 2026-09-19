@@ -1,4 +1,4 @@
-# Linux service separation (not a cloud integration)
+# Linux service setup
 
 This template keeps broker administration and credentials separate from an
 unprivileged desktop/agent user. The admin installs root-owned binaries/config
@@ -6,17 +6,6 @@ and systemd creates an ephemeral service identity. The agent must have **no
 sudo, root access, systemd administration, or permission to change these files**.
 This cannot protect against a host administrator. On a development host where
 the agent has unrestricted passwordless sudo, use a separately administered host.
-
-The root-only test `tests/service_acceptance.py` provisions the same hardening
-properties in a transient service, checks HTTPS substitution, and verifies that
-an ordinary host UID cannot read source credentials, runtime copies or the
-broker's process environment. It stops the service and removes its fixtures.
-
-```sh
-sudo python3 -B crates/smolvm-secret-broker/tests/service_acceptance.py \
-  --broker /absolute/path/to/smolvm-secret-broker \
-  --observer-uid 1000 --observer-gid 1000
-```
 
 ## Administrator setup
 
@@ -76,8 +65,7 @@ transfers access; deleting it revokes subsequent dispatches. The helper only
 prints process metadata; it does not grant access or attest machine ownership.
 
 The record belongs outside the VM and its snapshots. Portable checkpoint capture
-currently rejects published sockets in SmolVM. That guard remains: this PR does
-not promise portable restore with the broker attachment. The operator must attach
+currently rejects published sockets in SmolVM, including this attachment. The operator must attach
 and authorize any new/restored process separately. No guest API can issue grants.
 
 `LoadCredential` and the private tmpfs copies are startup snapshots. To rotate
@@ -102,27 +90,14 @@ LoadCredential=env:/etc/smolvm-secret-broker/.env
 LoadCredential=envkeys:/etc/smolvm-secret-broker/.env.keys
 ```
 
-Use the tested dotenvx 2.28.0 flags or validate changes on an upgrade. The `secret`
+The launcher uses dotenvx 2.28.0 flags. The `secret`
 credential loaded by the base template is unused when the config uses `secret_env`;
 it can be an empty private file, not a second plaintext copy of the upstream key.
 
-Combined acceptance:
-
-```sh
-sudo python3 -B crates/smolvm-secret-broker/tests/service_acceptance.py \
-  --broker /absolute/path/to/smolvm-secret-broker \
-  --observer-uid 1000 --observer-gid 1000 \
-  --smolvm /absolute/path/to/smolvm --dotenvx /absolute/path/to/dotenvx
-```
-
-The test checks parent access, denial of copied child tokens and inherited live
-TLS sessions, explicit child authorization, restart reauthorization and revocation.
-It also verifies that the ordinary desktop UID cannot read credential files.
-
 ## Scope limits
 
-Fleet/control-plane automation, macOS/Windows process-bound transport and an
-independent security review are not included. HTTP/1.1 bounded non-streaming APIs
+Fleet/control-plane automation and macOS/Windows process-bound transport are
+not included. HTTP/1.1 bounded non-streaming APIs
 are supported; this is not an unrestricted tunnel or a general-purpose gateway.
 The compatibility `allow_bearer_only` mode is off by default and must not be used
 as a substitute for process binding. Every host administrator remains trusted.
