@@ -2971,9 +2971,9 @@ impl ExecCmd {
 
         // Load machine record for workdir and image info
         let name = self.name.clone().unwrap_or_else(|| "default".to_string());
-        let record = smolvm::db::SmolvmDb::open()
-            .ok()
-            .and_then(|db| db.get_vm(&name).ok().flatten());
+        // Intent: plans/2026-09-19-machine-exec-record-errors.md.
+        // A database failure is not an instruction to execute in the bare VM.
+        let record = smolvm::db::SmolvmDb::open()?.get_vm(&name)?;
 
         // Resolve workdir: CLI --workdir flag takes priority over Smolfile/machine config
         let workdir = self
