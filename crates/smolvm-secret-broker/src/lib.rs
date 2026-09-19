@@ -1,6 +1,6 @@
-//! Experimental, explicit HTTPS proxy. Only host-owned configuration may create
-//! a broker. This is not a public fleet API or a machine-identity implementation.
-//! Credentials never enter the guest; a revocable proxy capability does.
+//! Explicit HTTPS credential broker with administrator-owned configuration.
+//! Run beside a workload VM with process binding, or inside a dedicated gateway
+//! VM for desktop clients. Credentials stay on the broker side of that boundary.
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -107,8 +107,9 @@ pub struct Config {
     /// Linux-only host-admin authorization for one VMM process incarnation.
     /// Requires a Unix-only listener. Missing/replaced records fail closed.
     pub peer_identity_file: Option<PathBuf>,
-    /// Compatibility/testing only: capability holders may connect from any
-    /// local process. Never implicitly downgrade process-bound authorization.
+    /// Capability clients, including desktop clients of a gateway VM. Holders
+    /// may connect from any process; this does not attest workload identity.
+    /// Never implicitly downgrade process-bound authorization.
     #[serde(default)]
     pub allow_bearer_only: bool,
     pub certificate: PathBuf,

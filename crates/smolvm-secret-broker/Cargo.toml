@@ -3,7 +3,7 @@ name = "smolvm-secret-broker"
 version = "1.16.2"
 edition = "2021"
 license = "Apache-2.0"
-description = "Opt-in host-side HTTPS credential broker for Smol workloads"
+description = "HTTPS credential broker for Smol workloads and desktop gateway VMs"
 
 [dependencies]
 anyhow = "1"

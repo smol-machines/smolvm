@@ -1,15 +1,17 @@
 # Credential broker
 
-**Scope: administrator-managed Linux deployment, not a completed cloud integration.**
-The default requires process-bound Unix transport; bearer-only TCP is an explicit
-compatibility/testing option, not machine identity. This standalone host process lets
+**Scope: administrator-managed deployment, not a completed cloud integration.**
+This standalone broker lets
 an ordinary HTTP client use a placeholder environment variable while the
 upstream credential stays outside the workload. Existing `--secret-env` and
 `--secret-file` semantics are unchanged: those still expose values to the guest.
 
-This integration connects applications inside Smol VMs to a host-side broker.
-It does not yet provide a gateway running inside a VM or in the cloud for
-applications that remain on the developer's desktop.
+Choose the direction that fits your workflow:
+
+- [Desktop applications → gateway VM](deploy/GATEWAY.md): keep the agent and
+  application local; run dotenvx and the broker in a separately administered VM.
+- [Applications in Smol → host broker](deploy/README.md): authorize each Linux
+  VMM process explicitly, including branches and restarts.
 
 ## Build
 
@@ -40,8 +42,8 @@ submitted by a guest or untrusted fleet API:
 }
 ```
 
-The example above is the compatibility test interface. For deployed workloads,
-use the [process-bound service configuration](deploy/README.md) instead.
+For a gateway VM use the [desktop gateway configuration](deploy/GATEWAY.md).
+For applications in Smol use the [process-bound service configuration](deploy/README.md).
 
 Supply a server certificate covering the configured destinations, signed by a
 dedicated development CA. Only the CA's **public certificate** enters the guest;
@@ -161,6 +163,8 @@ currently rejects published sockets, including this attachment.
 - The proxy token is guest-visible and copyable. In process-bound mode it is
   necessary but not sufficient: the host-admin record must also authorize the
   kernel-observed peer. Compatibility bearer-only mode does not have that property.
+  Desktop gateway clients deliberately use scoped capabilities over the private
+  gateway transport instead of claiming a guest process identity.
 - A guest can bypass proxy environment variables, but gets no upstream key by
   doing so. Production gateway-only routing needs host-enforced policy.
 - A host-level agent with root/sudo can read broker files or memory. Service

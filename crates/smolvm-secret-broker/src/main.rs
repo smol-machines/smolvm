@@ -32,7 +32,14 @@ async fn main() -> Result<()> {
         println!("credential broker listening on {}", listener.local_addr()?);
         Some(listener)
     } else {
-        println!("credential broker listening on process-bound Unix socket");
+        println!(
+            "credential broker listening on {}Unix socket",
+            if broker.process_bound() {
+                "process-bound "
+            } else {
+                "capability-authorized "
+            }
+        );
         None
     };
     let unix_broker = broker.clone();
