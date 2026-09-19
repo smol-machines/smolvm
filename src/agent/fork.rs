@@ -3558,13 +3558,73 @@ pub fn fail_closed_on_rejuvenation<F: FnOnce()>(
     }
 }
 
-/// Allocate a currently-free host TCP port by binding to port 0 and reading back
-/// the OS-assigned port. Used to give each clone distinct inbound forwards.
+/// Lowest port handed out to a clone. Linux allocates ephemeral ports from
+/// 32768 upward, so staying below that keeps the kernel from handing the same
+/// number to an unrelated outbound connection.
+const CLONE_PORT_FLOOR: u16 = 20_000;
+/// One past the highest port handed out to a clone.
+const CLONE_PORT_CEILING: u16 = 32_000;
+
+/// Allocate a host TCP port for a clone's inbound forward.
+///
+/// Binding port 0 and reading the assignment back is the obvious way to do
+/// this and the wrong one: that yields an *ephemeral* port, and dropping the
+/// listener returns the number to the kernel's pool. Anything the host dials
+/// between here and the clone's own bind — an image pull, most reliably — can
+/// be given that exact port, and the clone then fails to start with "Address
+/// already in use". Allocating below the ephemeral range instead means only
+/// another deliberate bind can collide, which the free check below catches.
 fn alloc_free_host_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|addr| addr.port())
+    let span = u32::from(CLONE_PORT_CEILING - CLONE_PORT_FLOOR);
+    for _ in 0..256 {
+        let offset = host_random_u16()? % span as u16;
+        let port = CLONE_PORT_FLOOR + offset;
+        // Binding confirms the port is free; dropping it immediately is safe
+        // here because nothing else will be *assigned* this number.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Two random bytes from the host RNG, for choosing a clone's host port.
+fn host_random_u16() -> Option<u16> {
+    use std::io::Read;
+    let mut bytes = [0u8; 2];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(u16::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod clone_port_tests {
+    use super::*;
+
+    #[test]
+    fn a_clone_port_never_comes_from_the_ephemeral_range() {
+        // The kernel allocates ephemeral ports from 32768 up. A clone port
+        // drawn from there is handed back on close and can be taken by any
+        // outbound connection before the clone binds it.
+        for _ in 0..64 {
+            let port = alloc_free_host_port().expect("a free port");
+            assert!(
+                (CLONE_PORT_FLOOR..CLONE_PORT_CEILING).contains(&port),
+                "{port} is outside the reserved range"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_clones_are_given_distinct_ports() {
+        let mut reserved = HashSet::new();
+        let ports: Vec<u16> = (0..8)
+            .map(|_| alloc_free_host_port_excluding(&mut reserved).expect("a free port"))
+            .collect();
+        let unique: HashSet<u16> = ports.iter().copied().collect();
+        assert_eq!(unique.len(), ports.len(), "ports repeated: {ports:?}");
+    }
 }
 
 fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
