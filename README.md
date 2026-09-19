@@ -171,17 +171,12 @@ Use This For
 **Sandbox untrusted code.** Run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
 
 ```bash
-# network is off by default, so untrusted code can't phone home
-smolvm machine run --image alpine -- nslookup example.com
-# fails: no network access
-
-# lock down egress: only allow specific hosts
+# egress is granted one host at a time, and the allow list is enforced
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://registry.npmjs.org
-# works: allowed host
-
-smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://google.com
-# fails: not in allow list
 ```
+
+Full documentation, including what the network does when you leave `--net` off, is
+[docs/sandbox](docs/sandbox/README.md).
 
 **Pack into portable executables.** Turn any workload into a self-contained binary. All dependencies are pre-baked, so there is no install step and no runtime downloads, and it boots in <200ms.
 
