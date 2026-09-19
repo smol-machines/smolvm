@@ -179,8 +179,4 @@ currently rejects published sockets, including this attachment.
 
 ```sh
 cargo test -p smolvm-secret-broker
-python3 crates/smolvm-secret-broker/tests/acceptance.py \
-  --broker target/debug/smolvm-secret-broker
 ```
-
-The test scripts include options for real-VM and isolated-service runs.
