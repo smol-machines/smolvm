@@ -2761,11 +2761,25 @@ impl AgentManager {
 
             // Process identity is not proof that guest writes reached disk. A slow
             // flush must not turn a graceful stop into an unannounced power cut.
-            if !acked && process::is_alive(pid) {
-                return Err(Error::agent(
-                    "stop agent",
-                    format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {}", shutdown.unwrap_err()),
-                ));
+            // Spec: plans/2026-09-19-stop-ack-late-exit.md. EOF can precede
+            // process exit. Observe only: missing acknowledgment never permits
+            // a signal, and process death is not filesystem-sync confirmation.
+            if let Err(error) = shutdown {
+                let exited = !process::is_alive(pid)
+                    || (process::is_our_process_strict(pid, start_time)
+                        && process::poll_for_exit(pid, AGENT_STOP_TIMEOUT).is_some()
+                        && !process::is_alive(pid));
+                if !exited {
+                    return Err(Error::agent(
+                        "stop agent",
+                        format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {error}"),
+                    ));
+                }
+                tracing::warn!(
+                    pid, %error,
+                    "VM exited without shutdown acknowledgment; filesystem synchronization unconfirmed"
+                );
+                return Ok(());
             }
             acked
         };
