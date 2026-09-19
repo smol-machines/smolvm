@@ -42,6 +42,125 @@ pub fn default_dns_addr() -> IpAddr {
     host_dns()
 }
 
+/// systemd-resolved's uplink resolver list.
+///
+/// On such a host `/etc/resolv.conf` is a symlink to the stub file, whose only
+/// nameserver is the local stub (127.0.0.53); this file carries the real
+/// uplinks the stub forwards to.
+const SYSTEMD_RESOLVED_UPLINK: &str = "/run/systemd/resolve/resolv.conf";
+
+/// Where [`effective_dns`] found the resolver it returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsSource {
+    /// The caller passed `--dns`.
+    Override,
+    /// The host's `/etc/resolv.conf`.
+    HostResolvConf,
+    /// systemd-resolved's uplink list, because every `/etc/resolv.conf` entry
+    /// was the local stub and TSI cannot reach it.
+    SystemdUplink,
+    /// The host has no resolver this backend can use, so the backend keeps its
+    /// own default (the public resolvers).
+    BackendDefault,
+}
+
+/// The resolver a launched guest should send its DNS to.
+///
+/// `addr` is `None` when the host offers nothing usable, which leaves the
+/// backend on its own default rather than inventing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveDns {
+    /// The resolver, or `None` to keep the backend default.
+    pub addr: Option<Ipv4Addr>,
+    /// Which rule produced it.
+    pub source: DnsSource,
+}
+
+/// Resolve the guest's resolver once, at launch, for either backend.
+///
+/// An explicit `--dns` wins. Otherwise the guest inherits the host's own
+/// resolver, so a machine on a network that blocks the public resolvers (a VPN
+/// with leak protection, a campus or corporate resolver) resolves names without
+/// the caller having to discover and pass `--dns` first.
+pub fn effective_dns(
+    dns_override: Option<Ipv4Addr>,
+    backend: crate::network::EffectiveNetworkBackend,
+) -> EffectiveDns {
+    let resolv_conf = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let uplink = std::fs::read_to_string(SYSTEMD_RESOLVED_UPLINK).unwrap_or_default();
+    let effective = select_dns(dns_override, backend, &resolv_conf, &uplink);
+    if effective.source == DnsSource::BackendDefault
+        && backend != crate::network::EffectiveNetworkBackend::None
+    {
+        // Names the one case operators hit and cannot otherwise see: a host whose
+        // only nameservers are IPv6, which `--dns <IP>` (an `Ipv4Addr`) cannot express.
+        tracing::debug!(
+            "no IPv4 host resolver this backend can reach; guest keeps the public resolvers"
+        );
+    }
+    effective
+}
+
+/// The pure half of [`effective_dns`], with both files supplied.
+fn select_dns(
+    dns_override: Option<Ipv4Addr>,
+    backend: crate::network::EffectiveNetworkBackend,
+    resolv_conf: &str,
+    systemd_uplink: &str,
+) -> EffectiveDns {
+    use crate::network::EffectiveNetworkBackend;
+
+    if let Some(addr) = dns_override {
+        return EffectiveDns {
+            addr: Some(addr),
+            source: DnsSource::Override,
+        };
+    }
+    let found = match backend {
+        EffectiveNetworkBackend::None => None,
+        // The gateway forwards guest queries from a host UDP socket, so a host
+        // loopback stub is reachable and is taken as-is.
+        EffectiveNetworkBackend::VirtioNet => nameservers_v4(resolv_conf)
+            .next()
+            .map(|addr| (addr, DnsSource::HostResolvConf)),
+        // TSI does not translate a guest loopback destination to the host's
+        // loopback, so a stub address would leave the guest talking to itself.
+        EffectiveNetworkBackend::Tsi => nameservers_v4(resolv_conf)
+            .find(|addr| !addr.is_loopback())
+            .map(|addr| (addr, DnsSource::HostResolvConf))
+            .or_else(|| {
+                nameservers_v4(systemd_uplink)
+                    .find(|addr| !addr.is_loopback())
+                    .map(|addr| (addr, DnsSource::SystemdUplink))
+            }),
+    };
+    match found {
+        Some((addr, source)) => EffectiveDns {
+            addr: Some(addr),
+            source,
+        },
+        None => EffectiveDns {
+            addr: None,
+            source: DnsSource::BackendDefault,
+        },
+    }
+}
+
+/// Every IPv4 nameserver in a resolv.conf, in file order.
+///
+/// IPv6 entries are skipped: the resolver is carried as an `Ipv4Addr` all the
+/// way to `--dns` and the virtio gateway's upstream.
+fn nameservers_v4(contents: &str) -> impl Iterator<Item = Ipv4Addr> + '_ {
+    contents.lines().filter_map(|line| {
+        let line = line.trim();
+        let addr = line.strip_prefix("nameserver")?.trim();
+        match addr.parse::<IpAddr>().ok()? {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        }
+    })
+}
+
 /// TCP port mapping from host to guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
@@ -286,6 +405,106 @@ impl PortMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::EffectiveNetworkBackend;
+
+    // The resolver a guest actually gets. Issue #1191: every pull went to
+    // 1.1.1.1, so on a network that blocks the public resolvers (a VPN with
+    // leak protection, a campus resolver) no image could be pulled at all.
+    // The two backends differ on loopback and that difference is load-bearing:
+    // measured on a systemd-resolved host with 1.1.1.1 and 8.8.8.8 dropped,
+    // `--dns 127.0.0.53` pulls under virtio-net and fails under TSI with
+    // "read udp 127.0.0.1:37080->127.0.0.53:53: read: connection refused",
+    // because TSI leaves a loopback destination on the guest's own loopback.
+    const CAMPUS: &str = "nameserver 128.112.128.12\nnameserver 128.112.128.79\n";
+    const STUB: &str = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
+    const UPLINK: &str = "nameserver 192.168.5.2\nsearch mynetworksettings.com\n";
+
+    #[test]
+    fn explicit_dns_wins_on_both_backends() {
+        let nine = Ipv4Addr::new(9, 9, 9, 9);
+        for backend in [
+            EffectiveNetworkBackend::Tsi,
+            EffectiveNetworkBackend::VirtioNet,
+        ] {
+            let chosen = select_dns(Some(nine), backend, CAMPUS, UPLINK);
+            assert_eq!(chosen.addr, Some(nine));
+            assert_eq!(chosen.source, DnsSource::Override);
+        }
+    }
+
+    #[test]
+    fn a_non_loopback_host_resolver_is_taken_by_both_backends() {
+        let campus = Ipv4Addr::new(128, 112, 128, 12);
+        for backend in [
+            EffectiveNetworkBackend::Tsi,
+            EffectiveNetworkBackend::VirtioNet,
+        ] {
+            let chosen = select_dns(None, backend, CAMPUS, "");
+            assert_eq!(chosen.addr, Some(campus));
+            assert_eq!(chosen.source, DnsSource::HostResolvConf);
+        }
+    }
+
+    #[test]
+    fn virtio_net_takes_a_loopback_stub_but_tsi_reaches_past_it_to_the_uplink() {
+        let virtio = select_dns(None, EffectiveNetworkBackend::VirtioNet, STUB, UPLINK);
+        assert_eq!(virtio.addr, Some(Ipv4Addr::new(127, 0, 0, 53)));
+        assert_eq!(virtio.source, DnsSource::HostResolvConf);
+
+        let tsi = select_dns(None, EffectiveNetworkBackend::Tsi, STUB, UPLINK);
+        assert_eq!(tsi.addr, Some(Ipv4Addr::new(192, 168, 5, 2)));
+        assert_eq!(tsi.source, DnsSource::SystemdUplink);
+    }
+
+    #[test]
+    fn tsi_keeps_the_backend_default_when_every_host_resolver_is_loopback() {
+        let chosen = select_dns(None, EffectiveNetworkBackend::Tsi, STUB, "");
+        assert_eq!(chosen.addr, None);
+        assert_eq!(chosen.source, DnsSource::BackendDefault);
+    }
+
+    #[test]
+    fn an_empty_resolv_conf_keeps_the_backend_default() {
+        for backend in [
+            EffectiveNetworkBackend::Tsi,
+            EffectiveNetworkBackend::VirtioNet,
+        ] {
+            let chosen = select_dns(None, backend, "", "");
+            assert_eq!(chosen.addr, None);
+            assert_eq!(chosen.source, DnsSource::BackendDefault);
+        }
+    }
+
+    #[test]
+    fn an_ipv6_only_host_keeps_the_backend_default() {
+        // `--dns` and the gateway's upstream are both `Ipv4Addr`, so a v6-only
+        // host has nothing to hand the guest and must keep the public resolvers.
+        let v6 = "nameserver 2606:4700:4700::1111\nnameserver fe80::1\n";
+        for backend in [
+            EffectiveNetworkBackend::Tsi,
+            EffectiveNetworkBackend::VirtioNet,
+        ] {
+            let chosen = select_dns(None, backend, v6, "");
+            assert_eq!(chosen.addr, None);
+            assert_eq!(chosen.source, DnsSource::BackendDefault);
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_network_gets_no_resolver() {
+        let chosen = select_dns(None, EffectiveNetworkBackend::None, CAMPUS, UPLINK);
+        assert_eq!(chosen.addr, None);
+        assert_eq!(chosen.source, DnsSource::BackendDefault);
+    }
+
+    #[test]
+    fn a_v6_nameserver_never_shadows_the_v4_one_behind_it() {
+        // File order matters: the v6 entry is first, and skipping it must not
+        // also skip the usable v4 resolver on the next line.
+        let mixed = "nameserver 2606:4700:4700::1111\nnameserver 128.112.128.12\n";
+        let chosen = select_dns(None, EffectiveNetworkBackend::Tsi, mixed, "");
+        assert_eq!(chosen.addr, Some(Ipv4Addr::new(128, 112, 128, 12)));
+    }
 
     #[test]
     fn test_cidrs_contain_ip() {
