@@ -144,6 +144,10 @@ Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
 source in memory; `machine checkpoint` saves that same state as a durable
 `.smolcheckpoint` artifact that can be restored later or elsewhere.
 
+Building checkpoint tooling in Rust? [`smolvm-checkpoint`](crates/smolvm-checkpoint)
+provides incremental storage, verified file restoration, and portable export
+without depending on the VM runtime.
+
 ### Snapshot a machine into a reusable image
 
 You don't need a Dockerfile to keep an environment. Set a machine up however you

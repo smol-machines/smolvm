@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/smolvm-checkpoint",
     "crates/smolvm-agent",
     "crates/smolvm-cuda",
     "crates/smolvm-cuda-guest",
@@ -38,6 +39,7 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
+smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.16.2" }
 smolvm-network = { path = "crates/smolvm-network", version = "1.16.2" }
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.16.2" }
 smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.16.2" }

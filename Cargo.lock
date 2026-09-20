@@ -3141,6 +3141,7 @@ dependencies = [
  "sha1",
  "sha2",
  "smolfile",
+ "smolvm-checkpoint",
  "smolvm-cuda",
  "smolvm-network",
  "smolvm-pack",
@@ -3187,6 +3188,22 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "zstd",
+]
+
+[[package]]
+name = "smolvm-checkpoint"
+version = "1.16.2"
+dependencies = [
+ "hex",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smolvm-pack",
+ "tempfile",
+ "tracing",
  "zstd",
 ]
 

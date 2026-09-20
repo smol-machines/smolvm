@@ -1,0 +1,22 @@
+[package]
+name = "smolvm-checkpoint"
+version = "1.16.2"
+edition = "2021"
+description = "Incremental checkpoint storage and portable export for SmolVM"
+license = "Apache-2.0"
+repository = "https://github.com/smol-machines/smolvm"
+readme = "README.md"
+
+[dependencies]
+smolvm-pack = { path = "../smolvm-pack", version = "1.16.2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+ring = "0.17.14"
+zstd = "0.13"
+tempfile = "3"
+tracing = "0.1"
+libc = "0.2"
+
+[dev-dependencies]
+sha2 = "0.10"
