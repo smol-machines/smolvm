@@ -1202,6 +1202,9 @@ impl RunCmd {
                 // `--from` rejects the egress flags at parse time
                 // (`conflicts_with_all`), so there is no policy to carry.
                 egress: None,
+                // `--from` conflicts with `--secret-env`/`--secret-file` at parse
+                // time, so there are never CLI secret refs to forward here.
+                secret_refs: Default::default(),
             }
             .run();
         }
@@ -1358,6 +1361,7 @@ impl RunCmd {
                         allowed_cidrs: params.allowed_cidrs.clone(),
                         dns_filter_hosts: params.dns_filter_hosts.clone(),
                     }),
+                    secret_refs: params.secret_refs.clone(),
                 }
                 .run();
             }
@@ -1506,6 +1510,7 @@ impl RunCmd {
                     allowed_cidrs: params.allowed_cidrs.clone(),
                     dns_filter_hosts: params.dns_filter_hosts.clone(),
                 }),
+                secret_refs: params.secret_refs.clone(),
             }
             .run();
         }

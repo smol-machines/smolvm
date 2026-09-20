@@ -297,6 +297,15 @@ pub struct PackRunCmd {
     /// manifest-driven behavior.
     #[clap(skip)]
     pub egress: Option<ResolvedEgressPolicy>,
+
+    /// Secret refs the LOCAL caller supplied on the CLI (`--secret-env` /
+    /// `--secret-file`), keyed by guest env var. `machine run` sets these when it
+    /// serves a run through this command; a direct `pack run` carries none. They
+    /// are resolved `TrustedLocal` at exec — distinct from the manifest's own
+    /// refs, which stay `Untrusted` — so the caller's own env/files resolve while
+    /// a portable artifact's refs still cannot. Not a CLI flag.
+    #[clap(skip)]
+    pub secret_refs: std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 }
 
 /// Network policy resolved from `--allow-cidr`/`--allow-host`/
@@ -1030,12 +1039,13 @@ pub(crate) fn resolve_packed_launch(
     manifest: &smolvm_pack::PackManifest,
     cli_command: &[String],
     cli_env: &[String],
+    cli_secret_refs: &std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
     cli_workdir: Option<String>,
     cli_user: Option<String>,
 ) -> smolvm::Result<PackedLaunch> {
     Ok(PackedLaunch {
         command: build_command(manifest, cli_command),
-        env: build_env(manifest, cli_env)?,
+        env: build_env(manifest, cli_env, cli_secret_refs)?,
         workdir: cli_workdir.or_else(|| manifest.workdir.clone()),
         user: cli_user.or_else(|| manifest.user.clone()),
     })
@@ -1045,6 +1055,7 @@ pub(crate) fn resolve_packed_launch(
 fn build_env(
     manifest: &smolvm_pack::PackManifest,
     cli_env: &[String],
+    cli_secret_refs: &std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 ) -> smolvm::Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = manifest
         .env
@@ -1075,6 +1086,21 @@ fn build_env(
             smolvm::secrets::ResolutionScope::Untrusted,
         )?,
     ));
+
+    // Secrets the local caller passed on the CLI (`--secret-env`/`--secret-file`)
+    // are their own, so resolve them `TrustedLocal` — the scope the manifest's
+    // refs are denied. They override a manifest env/secret of the same key
+    // (explicit caller intent beats the baked artifact); an explicit `--env`
+    // below still wins over a `--secret-env` of the same name. Without this the
+    // cached/pack-run path silently dropped CLI secrets that the direct
+    // `machine run` path honors.
+    for (key, value) in smolvm::secrets::expose_into_env(smolvm::secrets::resolve_refs_to_env(
+        cli_secret_refs,
+        smolvm::secrets::ResolutionScope::TrustedLocal,
+    )?) {
+        env.retain(|(k, _)| k != &key);
+        env.push((key, value));
+    }
 
     // CLI env overrides manifest env and resolved secrets
     for spec in cli_env {
@@ -1107,6 +1133,7 @@ fn execute_command(
         manifest,
         &args.command,
         &args.env,
+        &args.secret_refs,
         args.workdir.clone(),
         args.user.clone(),
     )?;
@@ -1541,6 +1568,8 @@ fn run_ephemeral(
                 debug,
                 cuda: args.cuda,
                 auto_graph: false,
+                // A standalone packed binary carries no CLI secret refs.
+                secret_refs: Default::default(),
             };
             cmd.run()
         }
@@ -1845,7 +1874,14 @@ fn run_from_cache(
     let mut client = wait_for_agent(&vsock_path, debug)?;
 
     let params = ExecParams {
-        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
+        launch: resolve_packed_launch(
+            manifest,
+            &args.command,
+            &args.env,
+            &std::collections::BTreeMap::new(),
+            args.workdir,
+            args.user,
+        )?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -2264,7 +2300,14 @@ fn daemon_exec(
     // Virtiofs devices are fixed at boot — exec cannot add new host mounts.
     let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
     let params = ExecParams {
-        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
+        launch: resolve_packed_launch(
+            manifest,
+            &args.command,
+            &args.env,
+            &std::collections::BTreeMap::new(),
+            args.workdir,
+            args.user,
+        )?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -2381,6 +2424,62 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for #1315: CLI `--secret-env`/`--secret-file` refs must reach
+    /// the workload env when a run is served through the pack-run path (e.g.
+    /// `--oci-cache`), resolved TrustedLocal — where the manifest's own refs are
+    /// denied. Before the fix these CLI secrets were silently dropped.
+    #[test]
+    fn cli_secret_refs_resolve_and_override_manifest_env() {
+        use std::collections::BTreeMap;
+        // Unique name so parallel tests don't collide on process-global env.
+        let src = "GATE_1315_SECRET_SRC";
+        std::env::set_var(src, "hunter2");
+
+        let mut manifest = smolvm_pack::PackManifest::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        // A manifest env the CLI secret of the same key must override.
+        manifest.env = vec!["KEK=from-manifest".to_string()];
+
+        let mut cli_secret_refs: BTreeMap<String, smolvm::secrets::SecretRef> = BTreeMap::new();
+        cli_secret_refs.insert("KEK".to_string(), smolvm::secrets::env_ref(src));
+
+        let env = build_env(&manifest, &[], &cli_secret_refs).expect("build_env");
+        let kek: Vec<&String> = env
+            .iter()
+            .filter(|(k, _)| k == "KEK")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            kek,
+            vec!["hunter2"],
+            "CLI secret resolves and overrides manifest env"
+        );
+
+        // An explicit --env still wins over a --secret-env of the same key.
+        let env2 = build_env(
+            &manifest,
+            &["KEK=from-cli-env".to_string()],
+            &cli_secret_refs,
+        )
+        .expect("build_env");
+        let kek2: Vec<&String> = env2
+            .iter()
+            .filter(|(k, _)| k == "KEK")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            kek2,
+            vec!["from-cli-env"],
+            "explicit --env beats --secret-env"
+        );
+
+        std::env::remove_var(src);
+    }
 
     #[test]
     fn resolved_policy_decides_network_instead_of_the_baked_manifest() {
