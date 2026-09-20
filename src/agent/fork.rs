@@ -2051,6 +2051,18 @@ pub(crate) fn prepare_forks_reusing(
         }
     }
 
+    // Reserve every port the engine has already handed out, including the
+    // golden's own. Clone ports are auto-allocated below, and the allocator
+    // only probes whether a port is listening *right now* - which a stopped
+    // machine is not, even though it still owns its port. Without this, a
+    // clone can be given a stopped machine's port and that machine then fails
+    // to bind when it restarts.
+    let recorded = db.list_vms()?;
+    reserve_recorded_host_ports(
+        recorded.iter().map(|(_, record)| record.ports.as_slice()),
+        &mut reserved_ports,
+    );
+
     let golden_rec = db
         .get_vm(golden)?
         .ok_or_else(|| Error::vm_not_found(golden))?;
@@ -3627,6 +3639,19 @@ mod clone_port_tests {
     }
 }
 
+/// Add every recorded host port to `reserved`, whatever state its machine is
+/// in, so the auto-allocator never hands out a port another machine owns.
+fn reserve_recorded_host_ports<'a>(
+    recorded: impl Iterator<Item = &'a [(u16, u16)]>,
+    reserved: &mut HashSet<u16>,
+) {
+    for ports in recorded {
+        for (host, _guest) in ports {
+            reserved.insert(*host);
+        }
+    }
+}
+
 fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
     for _ in 0..128 {
         let port = alloc_free_host_port()?;
@@ -3659,6 +3684,29 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_machines_port_is_still_reserved_against_clones() {
+        // The allocator's bind probe cannot see a stopped machine's port, so
+        // the reservation has to come from the record, not from the kernel.
+        let running: [(u16, u16); 1] = [(23_996, 80)];
+        let stopped: [(u16, u16); 1] = [(24_100, 8080)];
+        let mut reserved = HashSet::new();
+        reserve_recorded_host_ports(
+            [running.as_slice(), stopped.as_slice()].into_iter(),
+            &mut reserved,
+        );
+        assert!(reserved.contains(&23_996));
+        assert!(reserved.contains(&24_100));
+
+        for _ in 0..64 {
+            let Some(port) = alloc_free_host_port_excluding(&mut reserved) else {
+                break;
+            };
+            assert_ne!(port, 23_996);
+            assert_ne!(port, 24_100);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
