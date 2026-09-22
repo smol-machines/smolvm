@@ -597,6 +597,12 @@ impl SmolvmDb {
                         .db_err(format!("deserialize vm record '{}'", name))?;
                     tx.execute("DELETE FROM vms WHERE name = ?1", params![name])
                         .db_err(format!("remove vm '{}'", name))?;
+                    // Reusing a name starts a new lifetime; delayed requests
+                    // from the deleted machine must never capture it.
+                    tx.execute(
+                        "UPDATE vm_pause_operations SET consumed = 1 WHERE name = ?1 AND consumed = 0",
+                        params![name],
+                    ).db_err("retire deleted machine's pause intents")?;
                     // A retained checkpoint only means anything while its golden
                     // process is alive, so it dies with the record rather than
                     // waiting for a sweep that only the pool controller runs.
@@ -2270,6 +2276,10 @@ mod tests {
         assert!(db.claim_pause_operation("saved", "save-1", true).is_err());
         db.claim_pause_operation("saved", "save-2", true).unwrap();
         assert!(db.claim_pause_operation("saved", "save-1", true).is_err());
+        db.remove_vm("saved").unwrap();
+        db.insert_vm("saved", &record).unwrap();
+        assert!(db.claim_pause_operation("saved", "save-2", true).is_err());
+        db.claim_pause_operation("saved", "save-3", true).unwrap();
     }
 
     #[test]
