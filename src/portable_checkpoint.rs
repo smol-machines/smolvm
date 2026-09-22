@@ -2528,7 +2528,11 @@ fn share_service_owned_backing(
     input.set_permissions(std::fs::Permissions::from_mode(0o444))?;
     match std::fs::hard_link(source, destination) {
         Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => return Ok(false),
+        // A different filesystem, or a base already linked into as many
+        // machines as the filesystem allows (ext4: 65,000), gets a private copy.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EXDEV | libc::EMLINK)) => {
+            return Ok(false)
+        }
         Err(error) => return Err(error.into()),
     }
     let linked = std::fs::symlink_metadata(destination)?;
@@ -2678,6 +2682,12 @@ fn protect_restore_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a restore gives the captured writable disk a copy-on-write top
+/// instead of copying it. Opt-in while the approach is evaluated.
+fn cow_restore_enabled() -> bool {
+    std::env::var("SMOLVM_RESTORE_COW_DISK").is_ok_and(|value| value == "1")
+}
+
 /// Install verified checkpoint state before a machine is launched.
 pub fn install(
     extracted: &Path,
@@ -2741,11 +2751,38 @@ pub fn install(
         let staged_disks = partial.join("disks");
         std::fs::create_dir(&staged_disks)
             .map_err(|error| Error::agent("stage checkpoint disks", error.to_string()))?;
+        // Names to move into the machine directory, and the copy-on-write tops
+        // to create over a captured writable disk once its base is in place.
+        let mut staged_names: Vec<String> = Vec::new();
+        let mut cow_tops: Vec<crate::agent::DiskOverlaySpec> = Vec::new();
         for disk in &checkpoint.disks {
             for (index, file) in disk.files.iter().enumerate() {
                 let started = std::time::Instant::now();
                 let staged = staged_disks.join(&file.target);
                 let source = extracted.join(&file.asset.path);
+                if index == 0
+                    && disk.files.len() == 1
+                    && file.format == "raw"
+                    && cow_restore_enabled()
+                {
+                    // Copying the captured disk is most of a restore. Treat it
+                    // as an immutable base instead, shared like a deeper layer,
+                    // and give this machine a thin qcow2 top of its own.
+                    let base_name = format!(".smolcheckpoint-{}-base.raw", disk.role);
+                    let staged_base = staged_disks.join(&base_name);
+                    #[cfg(target_os = "linux")]
+                    promote_retained_backing(extracted, &source, &file.asset)?;
+                    link_or_copy_verified_sparse(&source, &staged_base, &file.asset)?;
+                    cow_tops.push((
+                        vm_data_dir.join(Path::new(&file.target).with_extension("qcow2")),
+                        vm_data_dir.join(&base_name),
+                        crate::data::disk::DiskFormat::Raw,
+                    ));
+                    staged_names.push(base_name);
+                    tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "cow_top", "checkpoint disk installed");
+                    continue;
+                }
+                staged_names.push(file.target.clone());
                 if index == 0 {
                     // The active top layer is writable after resume and must
                     // never alias the immutable extraction cache.
@@ -2799,17 +2836,15 @@ pub fn install(
                 }
             }
         }
-        for disk in &checkpoint.disks {
-            for file in &disk.files {
-                // The staged chain is already private (top) or has an owned
-                // hard link (immutable backing). Move those exact inodes into
-                // the launcher's disk namespace instead of copying them again.
-                std::fs::rename(
-                    destination.join("disks").join(&file.target),
-                    vm_data_dir.join(&file.target),
-                )
+        // The staged chain is already private (top) or has an owned hard link
+        // (immutable backing). Move those exact inodes into the launcher's disk
+        // namespace instead of copying them again.
+        for name in &staged_names {
+            std::fs::rename(destination.join("disks").join(name), vm_data_dir.join(name))
                 .map_err(|error| Error::agent("publish checkpoint disk", error.to_string()))?;
-            }
+        }
+        crate::agent::create_disk_overlays(&cow_tops)?;
+        for disk in &checkpoint.disks {
             std::fs::write(vm_data_dir.join(format!("{}.formatted", disk.role)), b"1").map_err(
                 |error| Error::agent("mark checkpoint disk formatted", error.to_string()),
             )?;
