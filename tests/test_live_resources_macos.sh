@@ -75,7 +75,10 @@ machine resize --name "$name" --cpus 3
 machine resize --name "$name" --cpus 4
 guest 'test "$(cat /sys/devices/system/cpu/online)" = 0-3; taskset -c 3 sh -ec "test 1 -eq 1"'
 machine resize --name "$name" --mem 1024
-machine resize --name "$name" --mem 1024 --cpus 4
+if machine resize --name "$name" --mem 1024 --cpus 4 >"$root/mixed-resize.log" 2>&1; then exit 1; fi
+grep -q 'resize CPUs, RAM, and disks in separate requests' "$root/mixed-resize.log"
+machine resize --name "$name" --mem 1024
+machine resize --name "$name" --cpus 4
 if machine resize --name "$name" --mem 512; then exit 1; fi
 if machine resize --name "$name" --cpus 2; then exit 1; fi
 if machine resize --name "$name" --cpus 17; then exit 1; fi
