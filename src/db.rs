@@ -268,6 +268,14 @@ impl SmolvmDb {
                  owner_pid INTEGER NOT NULL,
                  created_at INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS vm_pause_operations (
+                 name TEXT NOT NULL,
+                 operation TEXT NOT NULL,
+                 consumed INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (name, operation)
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS vm_pause_active
+                 ON vm_pause_operations(name) WHERE consumed = 0;
              CREATE TABLE IF NOT EXISTS config (
                  key TEXT PRIMARY KEY NOT NULL,
                  value TEXT NOT NULL
@@ -732,7 +740,7 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, false)
+        self.update_vm_with_durability(name, f, false, false)
     }
 
     /// Persist a recovery boundary before releasing its live execution state.
@@ -740,7 +748,60 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, true)
+        self.update_vm_with_durability(name, f, true, false)
+    }
+
+    /// Commit resumed execution and retire retry keys in the same transaction.
+    pub(crate) fn finish_saved_execution<F>(&self, name: &str, f: F) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord),
+    {
+        self.update_vm_with_durability(name, f, true, true)
+    }
+
+    /// A consumed key can never initiate a second pause after a successful resume.
+    pub(crate) fn pause_operation_is_active(&self, name: &str, operation: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM vm_pause_operations WHERE name = ?1 AND operation = ?2 AND consumed = 0)", params![name, operation], |row| row.get(0)).db_err("read pause operation")
+        })
+    }
+
+    /// Recognize an already completed resume without touching a later pause.
+    pub(crate) fn pause_operation_was_consumed(&self, name: &str, operation: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM vm_pause_operations WHERE name = ?1 AND operation = ?2 AND consumed = 1)", params![name, operation], |row| row.get(0)).db_err("read completed pause operation")
+        })
+    }
+
+    /// Persist the retry identity before starting a capture.
+    pub(crate) fn claim_pause_operation(
+        &self,
+        name: &str,
+        operation: &str,
+        may_start: bool,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("PRAGMA synchronous=FULL;").db_err("enable durable pause intent")?;
+            let result = (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).db_err("begin pause intent")?;
+                let consumed: Option<bool> = tx.query_row(
+                    "SELECT consumed FROM vm_pause_operations WHERE name = ?1 AND operation = ?2",
+                    params![name, operation], |row| row.get(0),
+                ).optional().db_err("read pause intent")?;
+                match consumed {
+                    Some(true) => return Err(Error::agent_conflict("pause machine", "this pause operation has already been resumed")),
+                    Some(false) => return Ok(()),
+                    None if !may_start => return Err(Error::agent_conflict("pause machine", "machine has a different saved execution")),
+                    None => {}
+                }
+                let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM vm_pause_operations WHERE name = ?1 AND consumed = 0)", params![name], |row| row.get(0)).db_err("read active pause intent")?;
+                if active { return Err(Error::agent_conflict("pause machine", "another pause operation is pending")); }
+                tx.execute("INSERT INTO vm_pause_operations (name, operation) VALUES (?1, ?2)", params![name, operation]).db_err("record pause intent")?;
+                tx.commit().db_err("commit pause intent")
+            })();
+            conn.execute_batch("PRAGMA synchronous=NORMAL;").db_err("restore database policy")?;
+            result
+        })
     }
 
     fn update_vm_with_durability<F>(
@@ -748,6 +809,7 @@ impl SmolvmDb {
         name: &str,
         f: F,
         durable: bool,
+        finish_pause: bool,
     ) -> Result<Option<VmRecord>>
     where
         F: FnOnce(&mut VmRecord),
@@ -778,6 +840,13 @@ impl SmolvmDb {
                         let mut record: VmRecord = serde_json::from_slice(&bytes)
                             .db_err(format!("deserialize vm record '{}'", name))?;
                         f(&mut record);
+                        if finish_pause {
+                            tx.execute(
+                                "UPDATE vm_pause_operations SET consumed = 1 WHERE name = ?1 AND consumed = 0",
+                                params![name],
+                            )
+                            .db_err("retire pause intents")?;
+                        }
                         let new_data = serde_json::to_vec(&record).db_err("serialize vm record")?;
                         tx.execute(
                             "UPDATE vms SET data = ?2 WHERE name = ?1",
@@ -2182,6 +2251,25 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = SmolvmDb::open_at(&path).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn pause_retry_keys_survive_reopen_and_cannot_pause_resumed_execution() {
+        let (dir, db) = temp_db();
+        let record = VmRecord::new("saved".into(), 1, 512, vec![], vec![], false);
+        db.insert_vm("saved", &record).unwrap();
+        db.claim_pause_operation("saved", "save-1", true).unwrap();
+        db.claim_pause_operation("saved", "save-1", false).unwrap();
+        assert!(db.claim_pause_operation("saved", "save-2", true).is_err());
+        drop(db);
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        assert!(db.pause_operation_is_active("saved", "save-1").unwrap());
+        db.finish_saved_execution("saved", |r| r.state = RecordState::Running)
+            .unwrap();
+        assert!(!db.pause_operation_is_active("saved", "save-1").unwrap());
+        assert!(db.claim_pause_operation("saved", "save-1", true).is_err());
+        db.claim_pause_operation("saved", "save-2", true).unwrap();
+        assert!(db.claim_pause_operation("saved", "save-1", true).is_err());
     }
 
     #[test]

@@ -72,8 +72,82 @@ impl EmbeddedRuntime {
 
     /// Save execution durably and stop at that exact boundary.
     pub fn pause_machine(&self, name: &str) -> Result<()> {
+        self.pause_machine_inner(name, None)
+    }
+
+    /// Retry a durable pause without ever pausing a later resumed execution.
+    pub fn pause_machine_with_operation(&self, name: &str, operation: &str) -> Result<()> {
+        if operation.is_empty()
+            || operation.len() > 128
+            || !operation
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(Error::agent_conflict(
+                "pause machine",
+                "invalid pause operation identifier",
+            ));
+        }
+        self.pause_machine_inner(name, Some(operation))
+    }
+
+    fn pause_machine_inner(&self, name: &str, operation: Option<&str>) -> Result<()> {
         self.with_name_lock(name, || {
-            let record = control::get_record(&self.db, name)?;
+            let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
+            let mut record = control::get_record(&self.db, name)?;
+            if let Some(operation) = operation {
+                self.db.claim_pause_operation(
+                    name,
+                    operation,
+                    record.paused_checkpoint.is_none(),
+                )?;
+                // The previous capture process may have died while holding the
+                // source frozen. No other capture can own it once this lock is held.
+                if record.state == RecordState::Pausing && record.is_process_alive() {
+                    let _source = crate::agent::fork::lock_fork_source(name)?;
+                    let socket = crate::agent::fork::control_socket_path(name);
+                    let status = crate::agent::fork::control_socket_cmd(&socket, "STATUS")?;
+                    if status.trim() == "OK paused" {
+                        let reply = crate::agent::fork::control_socket_cmd(&socket, "RESUME")?;
+                        if !reply.starts_with("OK") {
+                            return Err(Error::agent("recover interrupted pause", reply));
+                        }
+                    } else if status.trim() != "OK running" {
+                        return Err(Error::agent("recover interrupted pause", status));
+                    }
+                    record = self
+                        .db
+                        .update_vm_durable(name, |r| {
+                            r.paused_checkpoint = None;
+                            r.state = RecordState::Running;
+                        })?
+                        .ok_or_else(|| Error::vm_not_found(name))?;
+                }
+                if record.state == RecordState::Paused && record.is_process_alive() {
+                    let _source = crate::agent::fork::lock_fork_source(name)?;
+                    let path = record.paused_checkpoint.as_ref().ok_or_else(|| {
+                        Error::agent("pause machine", "saved execution is missing")
+                    })?;
+                    crate::portable_checkpoint::verified_sidecar_footer(path)?;
+                    let status = crate::agent::fork::control_socket_cmd(
+                        &crate::agent::fork::control_socket_path(name),
+                        "STATUS",
+                    )?;
+                    if status.trim() != "OK paused" {
+                        return Err(Error::agent_conflict(
+                            "pause machine",
+                            "source is still running; refusing to stop newer execution",
+                        ));
+                    }
+                    crate::agent::AgentManager::for_vm_with_sizes(
+                        name,
+                        record.storage_gb,
+                        record.overlay_gb,
+                    )?
+                    .stop_paused()?;
+                    self.remove_cached_handle(name)?;
+                }
+            }
             if record.state == RecordState::Paused && !record.is_process_alive() {
                 let path = record.paused_checkpoint.as_ref().ok_or_else(|| {
                     Error::agent("pause machine", "paused machine has no checkpoint")
@@ -148,20 +222,44 @@ impl EmbeddedRuntime {
 
     /// Restore the saved execution under the original machine name.
     pub fn resume_machine(&self, name: &str) -> Result<()> {
-        self.resume_machine_inner(name, false)
+        self.resume_machine_inner(name, false, None)
     }
 
     /// Resume execution without tying its lifetime to this runtime handle.
     pub fn resume_machine_detached(&self, name: &str) -> Result<()> {
-        self.resume_machine_inner(name, true)
+        self.resume_machine_inner(name, true, None)
     }
 
-    fn resume_machine_inner(&self, name: &str, detached: bool) -> Result<()> {
+    /// Resume only the pause identified by this retry key.
+    pub fn resume_machine_detached_with_operation(
+        &self,
+        name: &str,
+        operation: &str,
+    ) -> Result<()> {
+        self.resume_machine_inner(name, true, Some(operation))
+    }
+
+    fn resume_machine_inner(
+        &self,
+        name: &str,
+        detached: bool,
+        operation: Option<&str>,
+    ) -> Result<()> {
         self.with_name_lock(name, || {
+            let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let _source = crate::agent::fork::lock_fork_source(name)?;
             let record = control::get_record(&self.db, name)?;
+            if let Some(operation) = operation {
+                if !self.db.pause_operation_is_active(name, operation)? {
+                    if self.db.pause_operation_was_consumed(name, operation)? && record.paused_checkpoint.is_none() && record.is_process_alive() {
+                        return Ok(());
+                    }
+                    return Err(Error::agent_conflict("resume machine", "this is not the machine's active pause operation"));
+                }
+            }
             if record.paused_checkpoint.is_none() {
                 if record.state == RecordState::Running && record.is_process_alive() {
+                    self.db.finish_saved_execution(name, |_| {})?;
                     return Ok(());
                 }
                 return Err(Error::agent_conflict("resume machine", "machine is not paused; use start for a fresh boot"));
@@ -178,7 +276,7 @@ impl EmbeddedRuntime {
                     } else if status.trim() != "OK running" {
                         return Err(Error::agent("resume interrupted pause", status));
                     }
-                    self.db.update_vm_durable(name, |record| {
+                    self.db.finish_saved_execution(name, |record| {
                         record.paused_checkpoint = None;
                         record.state = RecordState::Running;
                     })?;

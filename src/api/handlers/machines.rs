@@ -3707,6 +3707,13 @@ pub async fn release_held_fork(
     Ok(Json(record_to_info(&clone, &updated)))
 }
 
+/// Optional identity used to fence delayed cloud retries.
+#[derive(Default, serde::Deserialize)]
+pub struct PauseOperationQuery {
+    /// The same identifier must be reused for all attempts of one pause.
+    pub operation_id: Option<String>,
+}
+
 /// Save execution durably before stopping the machine.
 #[utoipa::path(post, path = "/api/v1/machines/{name}/pause", tag = "Machines",
     params(("name" = String, Path, description = "Machine name")),
@@ -3714,8 +3721,9 @@ pub async fn release_held_fork(
 pub async fn pause_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<PauseOperationQuery>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    saved_execution_operation(state, name, false).await
+    saved_execution_operation(state, name, false, query.operation_id).await
 }
 
 /// Resume saved execution under the same machine name.
@@ -3725,14 +3733,16 @@ pub async fn pause_machine(
 pub async fn resume_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<PauseOperationQuery>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    saved_execution_operation(state, name, true).await
+    saved_execution_operation(state, name, true, query.operation_id).await
 }
 
 async fn saved_execution_operation(
     state: Arc<ApiState>,
     name: String,
     resume: bool,
+    operation: Option<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     let guard = state.lifecycle_lock(&name).lock_owned().await;
     // The operation owns its lock even if the HTTP caller disconnects.
@@ -3750,7 +3760,14 @@ async fn saved_execution_operation(
                     entry.lock().manager.mark_stopped();
                 }
             }
-            runtime.resume_machine_detached(&name)
+            match operation {
+                Some(operation) => {
+                    runtime.resume_machine_detached_with_operation(&name, &operation)
+                }
+                None => runtime.resume_machine_detached(&name),
+            }
+        } else if let Some(operation) = operation {
+            runtime.pause_machine_with_operation(&name, &operation)
         } else {
             runtime.pause_machine(&name)
         }
@@ -3775,10 +3792,20 @@ async fn saved_execution_operation(
 pub async fn paused_checkpoint(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<PauseOperationQuery>,
 ) -> Result<Response<Body>, ApiError> {
     let guard = state.lifecycle_lock(&name).lock_owned().await;
     let file = tokio::task::spawn_blocking(move || {
         let _guard = guard;
+        let _operation = crate::agent::fork::lock_saved_execution(&name)?;
+        if let Some(operation) = query.operation_id {
+            if !state.db().pause_operation_is_active(&name, &operation)? {
+                return Err(SmolvmError::agent_conflict(
+                    "download saved execution",
+                    "pause operation is no longer active",
+                ));
+            }
+        }
         let _source = crate::agent::fork::lock_fork_source(&name)?;
         let record = state
             .db()

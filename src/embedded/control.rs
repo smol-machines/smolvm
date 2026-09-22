@@ -165,7 +165,7 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
     )?;
     let pid = started.handle.child_pid();
     let pid_start_time = pid.and_then(crate::process::process_start_time);
-    db.update_vm_durable(name, |record| {
+    db.finish_saved_execution(name, |record| {
         record.state = RecordState::Running;
         record.pid = pid;
         record.pid_start_time = pid_start_time;

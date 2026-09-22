@@ -85,6 +85,9 @@ workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
 
 ### Branch a running machine
 
+To stop a machine without losing its running execution, use
+[`machine pause` and `machine resume`](docs/pause-resume.md).
+
 A branch is a live fork: an independent copy-on-write child that resumes with
 the source's running processes, memory, and disk. Start the source as
 branchable, then branch it:
