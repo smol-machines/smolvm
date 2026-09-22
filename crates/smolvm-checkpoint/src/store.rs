@@ -636,7 +636,12 @@ pub fn lineage_of(directory: &Path) -> io::Result<Vec<Generation>> {
 /// `None` for the checkpoint's own generation and `Some(id)` for a retained
 /// ancestor.
 pub fn resolve_generation(directory: &Path, at: &str) -> io::Result<Option<String>> {
-    let lineage = lineage_of(directory)?;
+    resolve_in(&lineage_of(directory)?, at)
+}
+
+/// [`resolve_generation`] against an already-listed history (a directory's
+/// [`lineage_of`], or a file's manifest history via [`generations_from_history`]).
+pub fn resolve_in(lineage: &[Generation], at: &str) -> io::Result<Option<String>> {
     let at = at.trim();
     let generation = if let Some(depth) = at.strip_prefix('~') {
         let depth: usize = depth
@@ -665,6 +670,118 @@ pub fn resolve_generation(directory: &Path, at: &str) -> io::Result<Option<Strin
         first
     };
     Ok(generation.retained.then(|| generation.id.clone()))
+}
+
+/// The history a `Chunked` checkpoint file advertises in its manifest, in the
+/// same shape as [`lineage_of`]: the file's own generation first.
+pub fn generations_from_history(
+    history: &[smolvm_pack::format::CheckpointGeneration],
+) -> Vec<Generation> {
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, generation)| Generation {
+            id: generation.lineage.id.clone(),
+            parent: generation.lineage.parent.clone(),
+            machine: generation.lineage.machine.clone(),
+            created_at: generation.lineage.created_at.clone(),
+            data_bytes: generation.data_bytes,
+            retained: index > 0,
+        })
+        .collect()
+}
+
+/// Export `directory` as ONE file that carries its history: the checkpoint's
+/// index, the indexes of up to `limit` retained generations, and every object
+/// any of them references, packed as a `Chunked` checkpoint. Restoring such a
+/// file unpacks it into a directory checkpoint, so `--at` works on it exactly
+/// as on the directory. `decorate` lets the caller stamp the outer manifest
+/// (format version); the per-generation manifests inside are untouched.
+///
+/// Returns the file size and how many earlier generations it carries. With no
+/// retained generations (or `limit == 0`) this is a plain [`export`].
+pub fn export_with_history(
+    directory: &Path,
+    limit: usize,
+    output: &Path,
+    decorate: impl FnOnce(&mut PackManifest),
+) -> io::Result<(u64, usize)> {
+    let lineage = lineage_of(directory)?;
+    let retained: Vec<&Generation> = lineage.iter().skip(1).take(limit).collect();
+    if retained.is_empty() {
+        return export(directory, output).map(|bytes| (bytes, 0));
+    }
+    if output.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "checkpoint output exists",
+        ));
+    }
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .prefix(".checkpoint-export-")
+        .tempdir_in(parent)?;
+    let staging = temporary.path().join("staging");
+    fs::create_dir_all(staging.join("objects"))?;
+    let own = read_index(directory)?;
+    fs::copy(directory.join(INDEX), staging.join(INDEX))?;
+    let mut hashes: HashSet<String> = HashSet::new();
+    let mut indexes = vec![own];
+    for generation in &retained {
+        let source = directory.join(GENERATIONS).join(&generation.id);
+        let target = staging.join(GENERATIONS).join(&generation.id);
+        fs::create_dir_all(&target)?;
+        fs::copy(source.join(INDEX), target.join(INDEX))?;
+        indexes.push(read_index_from(&source.join(INDEX))?);
+    }
+    for index in &indexes {
+        for hash in index.files.iter().flat_map(|f| f.chunks.iter().flatten()) {
+            hashes.insert(hash.clone());
+        }
+    }
+    let objects = directory.join("objects");
+    for hash in &hashes {
+        let source = objects.join(hash);
+        let target = staging.join("objects").join(hash);
+        if fs::hard_link(&source, &target).is_err() {
+            fs::copy(&source, &target)?;
+        }
+    }
+    let mut manifest = indexes.remove(0).manifest;
+    {
+        let checkpoint = manifest
+            .checkpoint
+            .as_mut()
+            .ok_or_else(|| invalid("stored checkpoint has no live-state manifest"))?;
+        checkpoint.payload = smolvm_pack::format::CheckpointLayout::Chunked;
+        checkpoint.history = lineage
+            .iter()
+            .take(retained.len() + 1)
+            .map(|generation| smolvm_pack::format::CheckpointGeneration {
+                lineage: smolvm_pack::format::CheckpointLineage {
+                    id: generation.id.clone(),
+                    parent: generation.parent.clone(),
+                    machine: generation.machine.clone(),
+                    created_at: generation.created_at.clone(),
+                },
+                data_bytes: generation.data_bytes,
+            })
+            .collect();
+    }
+    decorate(&mut manifest);
+    let collector =
+        smolvm_pack::assets::AssetCollector::new(staging).map_err(|e| invalid(e.to_string()))?;
+    let artifact = temporary.path().join("export.smolcheckpoint");
+    let info = smolvm_pack::packer::Packer::new(manifest)
+        .with_asset_collector(collector)
+        .pack_artifact(&artifact)
+        .map_err(|e| invalid(e.to_string()))?;
+    File::open(&artifact)?.sync_all()?;
+    publish(&artifact, output)?;
+    Ok((info.total_size, retained.len()))
 }
 
 /// Where a checkpoint id was published within a store, so a later capture of
@@ -2349,6 +2466,8 @@ mod tests {
                 machine: "m".into(),
                 created_at: created_at.into(),
             }),
+            payload: Default::default(),
+            history: Vec::new(),
         });
         manifest
     }
@@ -2598,6 +2717,77 @@ mod tests {
             vec![1u8; 64]
         );
         assert_eq!(find_generation_source(&cache, G3).unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_history_file_carries_every_generation_it_was_exported_with() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        let a = vec![0xAAu8; CHUNK_SIZE + 5];
+        let mut b = a.clone();
+        b[0] = 0xBB;
+        capture_generation(&cache, &first, &a, G1, None, "2026-01-01T00:00:00Z");
+        capture_generation(
+            &cache,
+            &second,
+            &b,
+            G2,
+            Some(&first),
+            "2026-01-02T00:00:00Z",
+        );
+        let file = root.path().join("history.smolcheckpoint");
+        let (bytes, carried) = export_with_history(&second, 32, &file, |manifest| {
+            manifest.checkpoint.as_mut().unwrap().version = 99;
+        })
+        .unwrap();
+        assert!(bytes > 0);
+        assert_eq!(carried, 1);
+        // The outer manifest is readable without unpacking and lists the history.
+        let outer = smolvm_pack::packer::read_manifest_from_sidecar(&file).unwrap();
+        let checkpoint = outer.checkpoint.unwrap();
+        assert_eq!(
+            checkpoint.payload,
+            smolvm_pack::format::CheckpointLayout::Chunked
+        );
+        assert_eq!(checkpoint.version, 99);
+        let ids: Vec<&str> = checkpoint
+            .history
+            .iter()
+            .map(|g| g.lineage.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![G2, G1]);
+        assert_eq!(
+            resolve_in(&generations_from_history(&checkpoint.history), "~1").unwrap(),
+            Some(G1.to_string())
+        );
+        // Unpacked, it is a directory checkpoint again — every generation restores.
+        let unpacked = root.path().join("unpacked");
+        smolvm_pack::assets::decompress_assets_from_file(&file, &unpacked).unwrap();
+        let ids: Vec<String> = lineage_of(&unpacked)
+            .unwrap()
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(ids, vec![G2.to_string(), G1.to_string()]);
+        let out = root.path().join("g1");
+        materialize_at(&unpacked, G1, &out).unwrap();
+        assert_eq!(fs::read(out.join("checkpoint/memory.bin")).unwrap(), a);
+        let own = root.path().join("own");
+        materialize(&unpacked, &own).unwrap();
+        assert_eq!(fs::read(own.join("checkpoint/memory.bin")).unwrap(), b);
+        // With nothing retained the export is the classic single-generation file.
+        let single = root.path().join("single.smolcheckpoint");
+        assert_eq!(
+            export_with_history(&first, 32, &single, |_| {}).unwrap().1,
+            0
+        );
+        let outer = smolvm_pack::packer::read_manifest_from_sidecar(&single).unwrap();
+        assert_eq!(
+            outer.checkpoint.unwrap().payload,
+            smolvm_pack::format::CheckpointLayout::Assets
+        );
     }
 
     #[test]

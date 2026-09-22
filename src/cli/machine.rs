@@ -3715,14 +3715,23 @@ impl CreateCmd {
         }
 
         // Read manifest from the sidecar to get image metadata.
-        let stored = sidecar_path.is_dir();
-        let footer = if stored {
+        let footer = if sidecar_path.is_dir() {
             None
         } else {
             Some(smolvm::portable_checkpoint::verified_sidecar_footer(
                 sidecar_path,
             )?)
         };
+        // A verified single file carrying its history unpacks into a directory
+        // checkpoint; everything below then follows the stored-checkpoint path.
+        let unpacked = match footer {
+            Some(_) => smolvm::portable_checkpoint::unpack_verified_history_file(sidecar_path)?,
+            None => None,
+        };
+        let sidecar_path: &std::path::Path =
+            unpacked.as_ref().map(|d| d.path()).unwrap_or(sidecar_path);
+        let stored = sidecar_path.is_dir();
+        let footer = if unpacked.is_some() { None } else { footer };
         let generation =
             smolvm::portable_checkpoint::resolve_generation(sidecar_path, self.at.as_deref())?;
         let manifest = if stored {

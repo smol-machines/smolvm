@@ -22,6 +22,11 @@ use std::path::{Path, PathBuf};
 
 /// Current portable-checkpoint metadata version.
 pub const FORMAT_VERSION: u32 = 4;
+/// Format version of a checkpoint file that carries its history (a packed
+/// checkpoint store, see `CheckpointLayout::Chunked`). Distinct from
+/// [`FORMAT_VERSION`] so runtimes that predate history refuse such files with
+/// a version message instead of failing on missing assets.
+pub const HISTORY_FORMAT_VERSION: u32 = 5;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
@@ -348,6 +353,81 @@ pub fn resolve_generation(artifact: &Path, at: Option<&str>) -> Result<Option<St
     ))
 }
 
+/// If `artifact` is a single file carrying its history (`Chunked` payload),
+/// unpack it into a private directory checkpoint and return that directory;
+/// restore and export then treat it exactly like a stored checkpoint. `None`
+/// for directories and classic single-generation files.
+pub fn unpack_history_file(artifact: &Path) -> Result<Option<tempfile::TempDir>> {
+    if !artifact.is_file() {
+        return Ok(None);
+    }
+    // Integrity first: nothing in the file is parsed before its checksum holds.
+    verified_sidecar_footer(artifact)?;
+    unpack_verified_history_file(artifact)
+}
+
+/// [`unpack_history_file`] for a file whose checksum the caller has already
+/// verified, so the file is read only once more.
+pub fn unpack_verified_history_file(artifact: &Path) -> Result<Option<tempfile::TempDir>> {
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint manifest", error.to_string()))?;
+    let Some(checkpoint) = manifest.checkpoint.as_ref() else {
+        return Ok(None);
+    };
+    if checkpoint.payload != smolvm_pack::format::CheckpointLayout::Chunked {
+        return Ok(None);
+    }
+    validate_compatibility(checkpoint)?;
+    let root = crate::agent::vm_cache_root().join("checkpoint-unpack");
+    std::fs::create_dir_all(&root)
+        .map_err(|error| Error::agent("prepare checkpoint unpack", error.to_string()))?;
+    let directory = tempfile::Builder::new()
+        .prefix(".unpack-")
+        .tempdir_in(&root)
+        .map_err(|error| Error::agent("prepare checkpoint unpack", error.to_string()))?;
+    smolvm_pack::assets::decompress_assets_from_file(artifact, directory.path())
+        .map_err(|error| Error::agent("unpack checkpoint history", error.to_string()))?;
+    if !directory.path().join("checkpoint.json").is_file() {
+        return Err(Error::agent(
+            "unpack checkpoint history",
+            "the file's payload is not a checkpoint store",
+        ));
+    }
+    Ok(Some(directory))
+}
+
+/// Export from a stored checkpoint (or a history file): one generation when
+/// `at` is given, otherwise a single file carrying up to `history` earlier
+/// generations. Returns the file size and how many earlier generations it
+/// carries.
+pub fn export_checkpoint(
+    source: &Path,
+    at: Option<&str>,
+    history: usize,
+    output: &Path,
+) -> Result<(u64, usize)> {
+    let unpacked = unpack_history_file(source)?;
+    let source: &Path = unpacked.as_ref().map(|d| d.path()).unwrap_or(source);
+    if !source.is_dir() {
+        return Err(Error::config(
+            "export checkpoint",
+            "the source must be a stored checkpoint directory or a file that carries its history",
+        ));
+    }
+    if let Some(at) = at {
+        let generation = resolve_generation(source, Some(at))?;
+        return crate::checkpoint_store::export_at(source, generation.as_deref(), output)
+            .map(|bytes| (bytes, 0))
+            .map_err(|error| Error::agent("export checkpoint", error.to_string()));
+    }
+    crate::checkpoint_store::export_with_history(source, history, output, |manifest| {
+        if let Some(checkpoint) = manifest.checkpoint.as_mut() {
+            checkpoint.version = HISTORY_FORMAT_VERSION;
+        }
+    })
+    .map_err(|error| Error::agent("export checkpoint", error.to_string()))
+}
+
 /// [`restore_from_path`] at a chosen generation (see [`resolve_generation`]).
 pub fn restore_from_path_at(
     db: &crate::db::SmolvmDb,
@@ -355,7 +435,6 @@ pub fn restore_from_path_at(
     artifact: &Path,
     at: Option<&str>,
 ) -> Result<()> {
-    let generation = resolve_generation(artifact, at)?;
     let mut phase = std::time::Instant::now();
     crate::data::validate_vm_name(name, "machine name")
         .map_err(|reason| Error::config("restore checkpoint", reason))?;
@@ -371,6 +450,15 @@ pub fn restore_from_path_at(
     } else {
         None
     };
+    // A verified history file becomes a directory checkpoint for the rest of
+    // the restore; classic files and directories pass through unchanged.
+    let unpacked = match footer {
+        Some(_) => unpack_verified_history_file(artifact)?,
+        None => None,
+    };
+    let artifact: &Path = unpacked.as_ref().map(|d| d.path()).unwrap_or(artifact);
+    let footer = if unpacked.is_some() { None } else { footer };
+    let generation = resolve_generation(artifact, at)?;
     let manifest = if footer.is_none() {
         crate::checkpoint_store::read_manifest_at(artifact, generation.as_deref())
             .map_err(|error| Error::agent("read stored checkpoint", error.to_string()))?
@@ -1272,6 +1360,8 @@ pub(crate) fn capture_to_path_with_source_release(
             machine: name.to_string(),
             created_at: checkpoint_created_at.clone(),
         }),
+        payload: Default::default(),
+        history: Vec::new(),
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
@@ -2221,12 +2311,16 @@ fn describe_sparse_asset(path: &Path, relative_path: &str) -> Result<CheckpointA
 
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
-    if checkpoint.version != FORMAT_VERSION {
+    let required = match checkpoint.payload {
+        smolvm_pack::format::CheckpointLayout::Assets => FORMAT_VERSION,
+        smolvm_pack::format::CheckpointLayout::Chunked => HISTORY_FORMAT_VERSION,
+    };
+    if checkpoint.version != required {
         return Err(Error::agent(
             "restore checkpoint",
             format!(
                 "unsupported checkpoint version {} (runtime requires {})",
-                checkpoint.version, FORMAT_VERSION
+                checkpoint.version, required
             ),
         ));
     }
@@ -3431,6 +3525,8 @@ mod tests {
             workload: None,
             network: Some(CheckpointNetwork::default()),
             lineage: None,
+            payload: Default::default(),
+            history: Vec::new(),
         };
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
@@ -4061,10 +4157,18 @@ mod tests {
             workload: None,
             network: Some(CheckpointNetwork::default()),
             lineage: None,
+            payload: Default::default(),
+            history: Vec::new(),
         };
         validate_compatibility(&metadata).unwrap();
         metadata.version = FORMAT_VERSION - 1;
         assert!(validate_compatibility(&metadata).is_err());
+        // A history file needs its own version, and only that version.
+        metadata.payload = smolvm_pack::format::CheckpointLayout::Chunked;
+        metadata.version = FORMAT_VERSION;
+        assert!(validate_compatibility(&metadata).is_err());
+        metadata.version = HISTORY_FORMAT_VERSION;
+        validate_compatibility(&metadata).unwrap();
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

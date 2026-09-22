@@ -350,6 +350,30 @@ pub struct CheckpointLineage {
     pub created_at: String,
 }
 
+/// How a portable checkpoint file lays out its payload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointLayout {
+    /// The classic single generation: the assets tarball holds the state,
+    /// memory image and disks directly.
+    #[default]
+    Assets,
+    /// A checkpoint store directory packed whole — content-addressed objects
+    /// plus one index per generation — so the file carries its history and
+    /// any generation in it can be restored.
+    Chunked,
+}
+
+/// One generation summarized in a checkpoint file's history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointGeneration {
+    /// Identity and parent of the generation.
+    #[serde(flatten)]
+    pub lineage: CheckpointLineage,
+    /// Bytes of actual data the generation describes.
+    pub data_bytes: u64,
+}
+
 /// One integrity-protected file belonging to a portable live checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointAsset {
@@ -534,6 +558,14 @@ pub struct PortableCheckpointManifest {
     /// checkpoints written before lineage was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<CheckpointLineage>,
+    /// Payload layout. `Chunked` files use a distinct format version so
+    /// runtimes that predate them refuse them clearly.
+    #[serde(default)]
+    pub payload: CheckpointLayout,
+    /// The generations a `Chunked` file carries, this one first. Empty for a
+    /// single-generation file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<CheckpointGeneration>,
 }
 
 /// Manifest describing the packed image and configuration.

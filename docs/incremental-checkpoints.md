@@ -77,7 +77,7 @@ smolvm machine checkpoint-log ./after.smolcheckpoint
 smolvm machine create --name rollback --from ./after.smolcheckpoint --at ~2
 smolvm machine create --name rollback --from ./after.smolcheckpoint --at 0c7a44e1
 
-# Export one generation as a single portable file.
+# Export one generation as a single-generation portable file.
 smolvm machine checkpoint --export-from ./after.smolcheckpoint --at ~1 \
   --output ./before.smolcheckpoint
 
@@ -85,10 +85,22 @@ smolvm machine checkpoint --export-from ./after.smolcheckpoint --at ~1 \
 smolvm machine checkpoint-log --store ./checkpoints --machine worker
 ```
 
-A single-file `.smolcheckpoint` is one generation: it carries its own lineage
-record (id and parent) but retains no ancestors. Checkpoints written before
-lineage existed have no history; captures of a machine restored from one start
-a new chain.
+`--export-from` produces a single file that **carries its history**: the
+retained generations and their shared objects are packed together, so the one
+file can be sent anywhere and restored at any point in it (`--at` works on the
+file exactly as on the directory). `--history N` limits how many generations
+the file carries; `--history 0`, or `--at`, exports one generation in the
+classic layout. Runtimes that predate history refuse a history file with a
+version message rather than misreading it.
+
+```sh
+smolvm machine checkpoint --export-from ./after.smolcheckpoint -o ./history.smolcheckpoint
+smolvm machine checkpoint-log ./history.smolcheckpoint          # read from the manifest
+smolvm machine create --name rollback --from ./history.smolcheckpoint --at ~2
+```
+
+Checkpoints written before lineage existed have no history; captures of a
+machine restored from one start a new chain.
 
 ## Periodic checkpoints
 
