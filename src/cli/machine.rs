@@ -1177,6 +1177,7 @@ impl RunCmd {
             }
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(from),
+                local_bake: false,
                 command: self.command,
                 interactive: self.interactive,
                 tty: self.tty,
@@ -1326,6 +1327,7 @@ impl RunCmd {
                 };
                 return crate::cli::pack_run::PackRunCmd {
                     sidecar: Some(sidecar),
+                    local_bake: false,
                     command,
                     interactive: self.interactive,
                     tty: self.tty,
@@ -1473,6 +1475,7 @@ impl RunCmd {
             };
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(cached),
+                local_bake: true,
                 command,
                 interactive: self.interactive,
                 tty: self.tty,

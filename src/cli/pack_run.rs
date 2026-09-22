@@ -280,6 +280,14 @@ pub struct PackRunCmd {
     #[arg(long)]
     pub debug: bool,
 
+    /// The sidecar is an image cache this engine baked for itself
+    /// (`machine run --oci-cache`), not a pack someone published. It carries
+    /// the agent of whichever engine baked it, but boots this engine's own
+    /// agent, so the layer decisions are made for that agent and an entry
+    /// staged by an older engine gets its layers unpacked on the host.
+    #[arg(skip)]
+    pub local_bake: bool,
+
     /// Enable CUDA-over-vsock: run a host CUDA server and bridge the guest's
     /// CUDA client to it. Also enabled automatically when the packed machine
     /// was created with CUDA, or via `SMOLVM_CUDA=1`.
@@ -443,12 +451,13 @@ impl PackRunCmd {
         let cache_dir = extract::get_cache_dir(footer.checksum)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-        extract::extract_sidecar(
+        extract::extract_sidecar_for_agent(
             &sidecar_path,
             &cache_dir,
             &footer,
             self.force_extract,
             self.debug,
+            self.local_bake.then_some(smolvm::VERSION),
         )
         .map_err(|e| Error::agent("extract assets", e.to_string()))?;
 
@@ -456,7 +465,14 @@ impl PackRunCmd {
         //    concurrent runs of the same checksum don't conflict on
         //    storage.ext4 / agent.sock.  tempdir_in gives us a truly unique
         //    directory that survives PID reuse and abrupt termination.
-        let rootfs_path = cache_dir.join("agent-rootfs");
+        // A locally baked image cache boots this engine's agent: the packed one
+        // is whatever engine baked it, and the layer decisions above were made
+        // for the engine's. A published pack keeps the agent it shipped with.
+        let rootfs_path = if self.local_bake {
+            smolvm::agent::AgentManager::default_rootfs_path()?
+        } else {
+            cache_dir.join("agent-rootfs")
+        };
         let lib_dir = resolve_lib_dir(&cache_dir, self.debug)?;
         let layers_lease = extract::acquire_layers_lease(&cache_dir, self.debug)
             .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
@@ -1545,6 +1561,7 @@ fn run_ephemeral(
             // Construct PackRunCmd from PackedRunArgs and delegate to existing path
             let cmd = PackRunCmd {
                 sidecar: Some(sidecar_path),
+                local_bake: false,
                 command: args.command,
                 interactive: args.interactive,
                 tty: args.tty,
