@@ -1240,14 +1240,16 @@ fn capture_with_completion(
     log_phase(name, "capture_manifest", &mut phase);
     // Everything consumed below is capture-owned. Packaging and publication
     // must not serialize new branches or other operations on the live source.
-    #[cfg(target_os = "linux")]
-    if streamed_memory.is_some() {
-        memory_reservation
-            .as_mut()
-            .unwrap()
-            .allow_concurrent_branches();
-    }
     if !stop_after_capture {
+        #[cfg(target_os = "linux")]
+        if streamed_memory.is_some() {
+            // Pause keeps this lock through durability and shutdown. Marking
+            // it released would make reservation cleanup lock it a second time.
+            memory_reservation
+                .as_mut()
+                .unwrap()
+                .allow_concurrent_branches();
+        }
         drop(source_lock.take());
         release_source.take().unwrap()();
     }

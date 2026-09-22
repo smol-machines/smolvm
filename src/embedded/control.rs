@@ -161,6 +161,9 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<Sta
         LaunchFeatures {
             resume_paused: true,
             watch_parent: detached.then_some(false),
+            // A same-machine restore keeps its existing owner, rather than
+            // inferring a new UID from the temporary snapshot's directory depth.
+            uid_share_dir: Some(crate::agent::vm_data_dir(name)),
             ..Default::default()
         },
     )?;
