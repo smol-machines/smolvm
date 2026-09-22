@@ -745,16 +745,18 @@ impl ApiState {
         }
     }
 
-    /// List all machines.
+    /// List all machines, ordered by name.
     pub fn list_machines(&self) -> Vec<MachineInfo> {
         let machines = self.machines.read();
-        machines
+        let mut infos: Vec<MachineInfo> = machines
             .iter()
             .map(|(name, entry)| {
                 let entry = entry.lock();
                 machine_entry_to_info(name.clone(), &entry)
             })
-            .collect()
+            .collect();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        infos
     }
 
     /// Check if a machine exists.

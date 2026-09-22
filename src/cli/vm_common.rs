@@ -2956,7 +2956,11 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
 /// List all machines.
 pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
     let config = SmolvmConfig::load()?;
-    let vms: Vec<_> = config.list_vms().collect();
+    // The config holds machines in a HashMap, whose iteration order is seeded
+    // afresh in every process, so an unsorted listing reshuffles on each run
+    // (`watch smolvm machine ls` jumps around). Sort by name for a stable view.
+    let mut vms: Vec<_> = config.list_vms().collect();
+    vms.sort_by_key(|(name, _)| *name);
 
     let empty_label = "No machines found";
 
