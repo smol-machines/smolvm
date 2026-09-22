@@ -68,6 +68,7 @@
 //! |-------|------|-------------|
 //! | `allow_hosts` | string[] | Allowed hostnames (resolved to IPs at start) |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
+//! | `deny_cidrs` | string[] | Denied CIDR ranges, checked before the allow rules |
 //!
 //! ### `[branch]` — Branchable launch and CUDA capacity
 //!
@@ -163,6 +164,7 @@
 //! [network]
 //! allow_hosts = ["pypi.org"]
 //! allow_cidrs = ["10.0.0.0/8"]
+//! deny_cidrs = ["192.168.0.0/16"]
 //!
 //! [branch]
 //! enabled = true
@@ -341,6 +343,11 @@ pub struct NetworkConfig {
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
+    /// Denied egress CIDR ranges, evaluated before the allow rules: a
+    /// destination inside one is unreachable even when `allow_cidrs` or a
+    /// resolved `allow_hosts` answer covers it.
+    #[serde(default)]
+    pub deny_cidrs: Vec<String>,
 }
 
 /// Branchable launch and CUDA branch-capacity policy.

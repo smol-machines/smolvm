@@ -601,6 +601,7 @@ fn restored_record(
     record.storage_gb = checkpoint.storage_gib;
     record.overlay_gb = checkpoint.overlay_gib;
     record.allowed_cidrs = network.and_then(|network| network.allowed_cidrs.clone());
+    record.denied_cidrs = network.and_then(|network| network.denied_cidrs.clone());
     record.dns_filter_hosts = network.and_then(|network| network.dns_filter_hosts.clone());
     record.network_backend = restored_network_backend(checkpoint)?;
     record.dns = network
@@ -1779,6 +1780,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         dns: vm.dns.map(|dns| dns.to_string()),
         network_name: vm.network_name.clone(),
         allowed_cidrs: vm.allowed_cidrs.clone(),
+        denied_cidrs: vm.denied_cidrs.clone(),
         dns_filter_hosts: vm.dns_filter_hosts.clone(),
     }
 }
