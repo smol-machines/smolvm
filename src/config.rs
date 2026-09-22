@@ -619,6 +619,12 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_lineage_pid_start_time: Option<u64>,
 
+    /// The checkpoint this machine's state continues from: the last checkpoint
+    /// captured from it, or the one it was restored from. The next capture
+    /// records it as its parent, which is what links checkpoints into history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_head: Option<String>,
+
     /// Persistent container-overlay owner inherited from the root of a fork
     /// lineage. A clone's live overlay keeps its original on-disk name across
     /// every generation; descendants must continue addressing that root name.
@@ -763,6 +769,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            checkpoint_head: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
@@ -837,6 +844,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            checkpoint_head: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,

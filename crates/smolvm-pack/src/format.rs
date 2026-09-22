@@ -331,6 +331,25 @@ pub enum PackMode {
     Vm,
 }
 
+/// Where a checkpoint sits in its machine's history.
+///
+/// Every capture is a node: `parent` is the checkpoint the source machine was
+/// last captured to or restored from, so repeated captures of one machine form
+/// a chain and a restore-then-capture forms a branch. Ids are random and
+/// unique per capture; they carry no content meaning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointLineage {
+    /// This checkpoint's id (32 lowercase hex characters).
+    pub id: String,
+    /// The checkpoint this one continues from, when the source had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Machine the state was captured from.
+    pub machine: String,
+    /// When the capture was published (RFC 3339).
+    pub created_at: String,
+}
+
 /// One integrity-protected file belonging to a portable live checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointAsset {
@@ -511,6 +530,10 @@ pub struct PortableCheckpointManifest {
     /// Host networking reconstructed around the restored VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<CheckpointNetwork>,
+    /// Position in the source machine's checkpoint history. Absent on
+    /// checkpoints written before lineage was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<CheckpointLineage>,
 }
 
 /// Manifest describing the packed image and configuration.

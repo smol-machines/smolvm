@@ -832,6 +832,7 @@ pub async fn capture_portable_checkpoint(
                 prepared_cache_budget_bytes,
                 ..Default::default()
             },
+            crate::portable_checkpoint::DEFAULT_HISTORY,
             move || drop(guard),
         )
     })

@@ -340,6 +340,9 @@ pub enum MachineCmd {
     /// Remove unused objects from a checkpoint store
     CheckpointPrune(super::pack::PruneCheckpointStoreCmd),
 
+    /// Show the history a checkpoint carries, or every checkpoint in a store
+    CheckpointLog(super::pack::CheckpointLogCmd),
+
     /// Assign parameters and release one held branch-pool slot
     #[command(name = "branch-release", visible_alias = "fork-release")]
     BranchRelease(ForkReleaseCmd),
@@ -422,6 +425,7 @@ impl MachineCmd {
             MachineCmd::Branch(cmd) => cmd.run(),
             MachineCmd::Checkpoint(cmd) => cmd.run(),
             MachineCmd::CheckpointPrune(cmd) => cmd.run(),
+            MachineCmd::CheckpointLog(cmd) => cmd.run(),
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -3488,6 +3492,12 @@ pub struct CreateCmd {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
 
+    /// With --from <checkpoint>: restore an earlier generation the checkpoint
+    /// retains — `~N` (N back along its history), a generation id, or an id
+    /// prefix. See `machine checkpoint-log`.
+    #[arg(long, value_name = "GENERATION", requires = "from")]
+    pub at: Option<String>,
+
     /// Command to run as the machine's persistent workload (image machines).
     /// Launched as a detached container on every `start`, so it stays running
     /// (e.g. a pre-warmed browser to be branched). Without this, the image's own
@@ -3713,8 +3723,10 @@ impl CreateCmd {
                 sidecar_path,
             )?)
         };
+        let generation =
+            smolvm::portable_checkpoint::resolve_generation(sidecar_path, self.at.as_deref())?;
         let manifest = if stored {
-            smolvm::checkpoint_store::read_manifest(sidecar_path)
+            smolvm::checkpoint_store::read_manifest_at(sidecar_path, generation.as_deref())
                 .map_err(|e| smolvm::Error::agent("read stored checkpoint", e.to_string()))?
         } else {
             smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
@@ -4022,6 +4034,12 @@ impl CreateCmd {
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.workload.as_ref())
                 .map(|workload| workload.overlay_owner.clone());
+            // The new machine continues the restored generation's history, so
+            // its next checkpoint records that generation as parent.
+            record.checkpoint_head = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.lineage.as_ref())
+                .map(|lineage| lineage.id.clone());
         }
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
 
@@ -4050,7 +4068,11 @@ impl CreateCmd {
 
             println!("Extracting .smolmachine assets...");
             let result = if stored {
-                smolvm::portable_checkpoint::materialize_for_restore(sidecar_path, &cache_dir)?;
+                smolvm::portable_checkpoint::materialize_for_restore_at(
+                    sidecar_path,
+                    &cache_dir,
+                    generation.as_deref(),
+                )?;
                 Ok((cache_dir.clone(), None))
             } else if smolvm_pack::extract::shared_extract_enabled() {
                 #[cfg(target_os = "linux")]

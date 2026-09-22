@@ -239,6 +239,21 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
 /// base. Both the CLI and the API restore paths go through here so the base
 /// policy lives in one place.
 pub fn materialize_for_restore(artifact: &Path, cache_dir: &Path) -> Result<()> {
+    materialize_for_restore_at(artifact, cache_dir, None)
+}
+
+/// [`materialize_for_restore`] for a retained ancestor generation. Ancestors
+/// skip the restore base: the base tracks the checkpoint's own generation.
+pub fn materialize_for_restore_at(
+    artifact: &Path,
+    cache_dir: &Path,
+    generation: Option<&str>,
+) -> Result<()> {
+    if let Some(generation) = generation {
+        return crate::checkpoint_store::materialize_at(artifact, generation, cache_dir)
+            .map(|_| ())
+            .map_err(|error| Error::agent("materialize checkpoint generation", error.to_string()));
+    }
     let base = crate::agent::restore_base_dir();
     let started = std::time::Instant::now();
     crate::checkpoint_store::materialize_with_base(artifact, cache_dir, Some(&base))
@@ -309,6 +324,38 @@ pub struct CaptureResult {
 /// state, and the machine remains checkpointable so it can immediately serve
 /// as a reusable rollback/fork root.
 pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) -> Result<()> {
+    restore_from_path_at(db, name, artifact, None)
+}
+
+/// Resolve `--at` against a checkpoint: `None` (or `~0`) is the checkpoint's
+/// own generation; anything else must name an ancestor a stored checkpoint
+/// retains. A single-file checkpoint holds exactly one generation.
+pub fn resolve_generation(artifact: &Path, at: Option<&str>) -> Result<Option<String>> {
+    let Some(at) = at.map(str::trim).filter(|at| !at.is_empty()) else {
+        return Ok(None);
+    };
+    if artifact.is_dir() {
+        return crate::checkpoint_store::resolve_generation(artifact, at)
+            .map_err(|error| Error::config("checkpoint generation", error.to_string()));
+    }
+    if at == "~0" {
+        return Ok(None);
+    }
+    Err(Error::config(
+        "checkpoint generation",
+        "a single-file checkpoint holds one generation; earlier ones are kept only by \
+         checkpoints captured with --store",
+    ))
+}
+
+/// [`restore_from_path`] at a chosen generation (see [`resolve_generation`]).
+pub fn restore_from_path_at(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    artifact: &Path,
+    at: Option<&str>,
+) -> Result<()> {
+    let generation = resolve_generation(artifact, at)?;
     let mut phase = std::time::Instant::now();
     crate::data::validate_vm_name(name, "machine name")
         .map_err(|reason| Error::config("restore checkpoint", reason))?;
@@ -325,7 +372,7 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
         None
     };
     let manifest = if footer.is_none() {
-        crate::checkpoint_store::read_manifest(artifact)
+        crate::checkpoint_store::read_manifest_at(artifact, generation.as_deref())
             .map_err(|error| Error::agent("read stored checkpoint", error.to_string()))?
     } else {
         smolvm_pack::packer::read_manifest_from_sidecar(artifact)
@@ -383,7 +430,7 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
             smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, footer, false, false)
                 .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
         } else {
-            materialize_for_restore(artifact, &cache_dir)?;
+            materialize_for_restore_at(artifact, &cache_dir, generation.as_deref())?;
         }
         log_phase(name, "restore_extract", &mut phase);
         install(&cache_dir, &vm_data, checkpoint)?;
@@ -611,6 +658,11 @@ fn restored_record(
             Error::config("restore checkpoint DNS", error.to_string())
         })?;
     record.network_name = network.and_then(|network| network.network_name.clone());
+    // The restored machine continues this checkpoint's history.
+    record.checkpoint_head = checkpoint
+        .lineage
+        .as_ref()
+        .map(|lineage| lineage.id.clone());
     record.entrypoint = manifest.entrypoint.clone();
     record.cmd = manifest.cmd.clone();
     record.env = crate::util::parse_env_list(&manifest.env);
@@ -796,7 +848,41 @@ pub fn capture_to_path(
     output: &Path,
     options: &CaptureOptions,
 ) -> Result<CaptureResult> {
-    capture_to_path_with_source_release(name, output, options, || {})
+    capture_to_path_with_history(name, output, options, DEFAULT_HISTORY)
+}
+
+/// Ancestor generations a stored checkpoint retains unless told otherwise —
+/// the same depth the live branch lineage allows.
+pub const DEFAULT_HISTORY: usize = 32;
+
+/// [`capture_to_path`] with an explicit number of ancestor generations to
+/// retain in a stored checkpoint (`0` keeps none; standalone files never
+/// retain any). Lineage ids and parents are recorded either way.
+pub fn capture_to_path_with_history(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    history: usize,
+) -> Result<CaptureResult> {
+    capture_to_path_with_source_release(name, output, options, history, || {})
+}
+
+/// A fresh checkpoint id: 128 random bits as lowercase hex.
+fn new_checkpoint_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("operating system randomness");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Move the machine's checkpoint head to `id` after a capture or restore.
+fn set_checkpoint_head(name: &str, id: &str) {
+    let result = crate::db::SmolvmDb::open().and_then(|db| {
+        db.update_vm(name, |record| record.checkpoint_head = Some(id.to_string()))
+            .map(|_| ())
+    });
+    if let Err(error) = result {
+        tracing::warn!(machine = %name, %error, "checkpoint head not recorded");
+    }
 }
 
 /// Release API lifecycle ownership only after all input state belongs to this
@@ -805,6 +891,7 @@ pub(crate) fn capture_to_path_with_source_release(
     name: &str,
     output: &Path,
     options: &CaptureOptions,
+    history: usize,
     release_source: impl FnOnce(),
 ) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
@@ -926,6 +1013,11 @@ pub(crate) fn capture_to_path_with_source_release(
         .vms
         .get(name)
         .expect("validated checkpoint source must remain in its loaded config");
+    // This capture's place in the machine's history: a new node whose parent
+    // is whatever the machine was last captured to or restored from.
+    let checkpoint_id = new_checkpoint_id();
+    let checkpoint_created_at =
+        humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
     let control = crate::agent::fork::control_socket_path(name);
     let runtime_capture = runtime_capture_dir(name, vm)?;
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
@@ -1174,6 +1266,12 @@ pub(crate) fn capture_to_path_with_source_release(
         disks: checkpoint_disks,
         workload: checkpoint_workload(name, vm),
         network: Some(checkpoint_network(vm)),
+        lineage: Some(smolvm_pack::format::CheckpointLineage {
+            id: checkpoint_id.clone(),
+            parent: vm.checkpoint_head.clone(),
+            machine: name.to_string(),
+            created_at: checkpoint_created_at.clone(),
+        }),
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
@@ -1199,6 +1297,35 @@ pub(crate) fn capture_to_path_with_source_release(
         temp_dir
             .close()
             .map_err(|e| Error::agent("remove checkpoint staging", e.to_string()))?;
+        // Keep the parent's generations in this checkpoint so it can restore
+        // any point in its history on its own; unchanged chunks are links.
+        let store = options
+            .store_dir
+            .as_ref()
+            .and_then(|store| store.canonicalize().ok());
+        if let (Some(store), Some(parent)) = (store.as_ref(), vm.checkpoint_head.as_deref()) {
+            match crate::checkpoint_store::find_generation_source(store, parent) {
+                Ok(Some((source, own))) => {
+                    let start = (!own).then_some(parent);
+                    match writer.retain_generations_from(directory.path(), &source, start, history)
+                    {
+                        Ok(retained) => {
+                            tracing::info!(retained, parent, "checkpoint history retained")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, parent, "checkpoint history not retained")
+                        }
+                    }
+                }
+                Ok(None) => tracing::info!(
+                    parent,
+                    "parent checkpoint not in this store; history starts here"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, parent, "checkpoint lineage index unreadable")
+                }
+            }
+        }
         let stats = writer
             .finish(directory.path(), manifest, files)
             .map_err(|e| Error::agent("finish checkpoint index", e.to_string()))?;
@@ -1211,6 +1338,24 @@ pub(crate) fn capture_to_path_with_source_release(
         );
         crate::checkpoint_store::publish(directory.path(), output)
             .map_err(|e| Error::agent("publish stored checkpoint", e.to_string()))?;
+        if let Some(store) = store.as_ref() {
+            let published = output
+                .canonicalize()
+                .unwrap_or_else(|_| output.to_path_buf());
+            if let Err(error) = crate::checkpoint_store::record_lineage(
+                store,
+                &crate::checkpoint_store::LineageRecord {
+                    id: checkpoint_id.clone(),
+                    parent: vm.checkpoint_head.clone(),
+                    machine: name.to_string(),
+                    created_at: checkpoint_created_at.clone(),
+                    path: published.to_string_lossy().into_owned(),
+                },
+            ) {
+                tracing::warn!(%error, "checkpoint lineage not recorded in store");
+            }
+        }
+        set_checkpoint_head(name, &checkpoint_id);
         return Ok(CaptureResult {
             size_bytes: stats.new_bytes,
             reused_bytes: stats.reused_bytes,
@@ -1264,6 +1409,7 @@ pub(crate) fn capture_to_path_with_source_release(
         }
         log_phase(name, "capture_retain_prepared", &mut phase);
     }
+    set_checkpoint_head(name, &checkpoint_id);
     Ok(CaptureResult {
         reused_bytes: 0,
         size_bytes: info.total_size,
@@ -2848,6 +2994,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn single_file_checkpoints_hold_one_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("one.smolcheckpoint");
+        std::fs::write(&file, b"not really a checkpoint").unwrap();
+        assert_eq!(resolve_generation(&file, None).unwrap(), None);
+        assert_eq!(resolve_generation(&file, Some("~0")).unwrap(), None);
+        assert_eq!(resolve_generation(&file, Some(" ")).unwrap(), None);
+        assert!(resolve_generation(&file, Some("~1")).is_err());
+        assert!(resolve_generation(&file, Some("0123456789ab")).is_err());
+    }
+
+    #[test]
     fn completed_memory_staging_preserves_owned_inode_after_source_removal() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
@@ -3272,6 +3430,7 @@ mod tests {
             ],
             workload: None,
             network: Some(CheckpointNetwork::default()),
+            lineage: None,
         };
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
@@ -3331,7 +3490,18 @@ mod tests {
             "linux/amd64".into(),
             "linux/amd64".into(),
         );
+        remote.lineage = Some(smolvm_pack::format::CheckpointLineage {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            parent: None,
+            machine: "remote-source".into(),
+            created_at: "2026-09-22T00:00:00Z".into(),
+        });
         let restored = restored_record("local-restore", &manifest, &remote).unwrap();
+        // The restored machine continues the checkpoint's history.
+        assert_eq!(
+            restored.checkpoint_head.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(
             restored.fork_overlay_owner.as_deref(),
             Some("remote-source")
@@ -3890,6 +4060,7 @@ mod tests {
             disks: Vec::new(),
             workload: None,
             network: Some(CheckpointNetwork::default()),
+            lineage: None,
         };
         validate_compatibility(&metadata).unwrap();
         metadata.version = FORMAT_VERSION - 1;
