@@ -7,7 +7,7 @@ use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -67,7 +67,7 @@ fn retained_fork_lineage(vms: &[(String, VmRecord)]) -> HashSet<String> {
 /// Shared API server state.
 pub struct ApiState {
     /// Registry of machine managers by name.
-    machines: RwLock<HashMap<String, Arc<parking_lot::Mutex<MachineEntry>>>>,
+    machines: RwLock<BTreeMap<String, Arc<parking_lot::Mutex<MachineEntry>>>>,
     /// Reserved machine names (creation in progress).
     /// This prevents race conditions during machine creation.
     reserved_names: RwLock<HashSet<String>>,
@@ -303,7 +303,7 @@ impl ApiState {
             ApiError::internal(format!("failed to initialize database tables: {}", e))
         })?;
         Ok(Self {
-            machines: RwLock::new(HashMap::new()),
+            machines: RwLock::new(BTreeMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
@@ -322,7 +322,7 @@ impl ApiState {
     /// Useful for testing with temporary databases.
     pub fn with_db(db: SmolvmDb) -> Self {
         Self {
-            machines: RwLock::new(HashMap::new()),
+            machines: RwLock::new(BTreeMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
@@ -745,18 +745,16 @@ impl ApiState {
         }
     }
 
-    /// List all machines, ordered by name.
+    /// List all machines, in name order.
     pub fn list_machines(&self) -> Vec<MachineInfo> {
         let machines = self.machines.read();
-        let mut infos: Vec<MachineInfo> = machines
+        machines
             .iter()
             .map(|(name, entry)| {
                 let entry = entry.lock();
                 machine_entry_to_info(name.clone(), &entry)
             })
-            .collect();
-        infos.sort_by(|a, b| a.name.cmp(&b.name));
-        infos
+            .collect()
     }
 
     /// Check if a machine exists.

@@ -17,7 +17,7 @@ use crate::pool::{
 };
 use parking_lot::{Condvar, Mutex};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -2148,7 +2148,7 @@ impl SmolvmDb {
     }
 
     /// Load all config settings and VM records in a single transaction.
-    pub fn load_all(&self) -> Result<(HashMap<String, String>, HashMap<String, VmRecord>)> {
+    pub fn load_all(&self) -> Result<(HashMap<String, String>, BTreeMap<String, VmRecord>)> {
         self.with_conn(|conn| {
             let tx = conn.transaction().db_err("begin read transaction")?;
 
@@ -2170,7 +2170,7 @@ impl SmolvmDb {
                 }
             }
 
-            let mut vms = HashMap::new();
+            let mut vms = BTreeMap::new();
             {
                 let mut stmt = tx
                     .prepare_cached("SELECT name, data FROM vms")

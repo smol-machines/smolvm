@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::network::NetworkBackend;
 use serde::{Deserialize, Serialize};
 pub use smolvm_protocol::publish_socket::SocketDirection;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// A user-published host↔guest Unix-socket bridge (`--expose-socket` /
 /// `--mount-socket`), persisted on the VM record. The vsock port is assigned at
@@ -208,8 +208,9 @@ pub struct SmolvmConfig {
     /// Storage volume path (macOS only, for case-sensitive filesystem).
     #[cfg(target_os = "macos")]
     pub storage_volume: String,
-    /// Registry of known VMs (by name) - in-memory cache.
-    pub vms: HashMap<String, VmRecord>,
+    /// Registry of known VMs (by name) - in-memory cache. Ordered by name so
+    /// every listing comes out the same way; a hash map reshuffles per process.
+    pub vms: BTreeMap<String, VmRecord>,
 }
 
 impl SmolvmConfig {
@@ -226,7 +227,7 @@ impl SmolvmConfig {
             default_dns: network::default_dns(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
-            vms: HashMap::new(),
+            vms: BTreeMap::new(),
         })
     }
 }
@@ -333,7 +334,7 @@ impl SmolvmConfig {
         self.vms.get(id)
     }
 
-    /// List all VM records.
+    /// List all VM records, in name order.
     pub fn list_vms(&self) -> impl Iterator<Item = (&String, &VmRecord)> {
         self.vms.iter()
     }
