@@ -3699,7 +3699,7 @@ mod tests {
     ))]
     #[test]
     fn seccomp_allows_path_following_xattr_syscalls() {
-        let program = build_seccomp_program(true).expect("build seccomp program");
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
         unsafe {
             let pid = libc::fork();
             assert!(pid >= 0, "fork failed");
