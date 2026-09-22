@@ -2127,7 +2127,7 @@ async fn create_machine_inner(
     let guard = ReservationGuard::new(&state, name.clone())?;
 
     // Create manager (does not boot the VM)
-    let manager = tokio::task::spawn_blocking({
+    let mut manager = tokio::task::spawn_blocking({
         let name = name.clone();
         let storage_gb = restored_storage_gb;
         let overlay_gb = restored_overlay_gb;
@@ -2317,6 +2317,18 @@ async fn create_machine_inner(
     }
 
     if manifest_checkpoint.is_some() {
+        // Install may publish a disk under a different name than the one the
+        // manager opened (a copy-on-write top is `.qcow2`, not `.raw`), so
+        // resolve the disks again rather than launch from a stale handle.
+        manager = tokio::task::spawn_blocking({
+            let name = name.clone();
+            move || {
+                AgentManager::for_vm_with_sizes(&name, restored_storage_gb, restored_overlay_gb)
+                    .map_err(|e| ApiError::internal(format!("reopen restored disks: {e}")))
+            }
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
         crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
     }
     let resources = ResourceSpec {
