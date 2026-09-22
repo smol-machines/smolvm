@@ -1887,7 +1887,8 @@ pub fn is_alive(pid: Pid) -> bool {
         return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     }
     // A CLI cannot waitpid() a VM owned by serve. An exited child still has
-    // a PID until that parent reaps it, but no workload or open files remain.
+    // a PID until that parent reaps it. A zombie leader can still have live
+    // worker threads holding sockets, so check the thread count as well.
     // Do not make cleanup depend on the parent's next supervisor tick.
     // Unreadable or malformed procfs data is not evidence of exit.
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -1897,11 +1898,16 @@ pub fn is_alive(pid: Pid) -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_stat_has_exited(stat: &str) -> bool {
-    matches!(
-        stat.rsplit_once(") ")
-            .and_then(|(_, fields)| fields.split_ascii_whitespace().next()),
-        Some("Z" | "X" | "x")
-    )
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    let mut fields = fields.split_ascii_whitespace();
+    if !matches!(fields.next(), Some("Z" | "X" | "x")) {
+        return false;
+    }
+    // num_threads is field 20, sixteen fields after ppid (field 4).
+    // Missing or malformed metadata is not proof that the group has exited.
+    fields.nth(16).and_then(|count| count.parse::<u64>().ok()) == Some(1)
 }
 
 /// Check if a process is alive (Windows).
@@ -3374,7 +3380,7 @@ mod tests {
     fn exited_state_requires_a_complete_procfs_state_field() {
         for state in ["Z", "X", "x"] {
             assert!(linux_stat_has_exited(&format!(
-                "123 (worker) {state} 1 2 3"
+                "123 (worker) {state} 1 2 3 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0"
             )));
         }
         for stat in [
@@ -3383,6 +3389,7 @@ mod tests {
             "123 (worker) T 1 2 3",
             "123 (name with ) Z inside) S 1 2 3",
             "123 (worker) Zombie 1 2 3",
+            "123 (worker) Z 1 2 3",
             "123 (worker) ",
             "unreadable",
         ] {
@@ -3390,6 +3397,94 @@ mod tests {
         }
         assert!(!is_alive(0));
         assert!(!is_alive(-1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_leader_fixture() {
+        let Some(path) = std::env::var_os("SMOLVM_TEST_EXITED_LEADER") else {
+            return;
+        };
+        extern "C" fn exit_thread(_: libc::c_int) {
+            unsafe { libc::syscall(libc::SYS_exit, 0) };
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pid = unsafe { libc::getpid() };
+        // Exit only the subprocess's harness main thread. This test thread
+        // keeps the listener alive until the parent closes stdin.
+        unsafe {
+            libc::signal(
+                libc::SIGUSR1,
+                exit_thread as *const () as libc::sighandler_t,
+            );
+            libc::syscall(libc::SYS_tgkill, pid, pid, libc::SIGUSR1);
+        }
+        std::fs::write(path, listener.local_addr().unwrap().to_string()).unwrap();
+        let _ = std::io::Read::read_exact(&mut std::io::stdin(), &mut [0]);
+        unsafe { libc::_exit(0) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_worker_keeps_process_alive_after_leader_exit() {
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                drop(self.0.stdin.take());
+                let _ = self.0.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let fixture = Fixture(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::exited_leader_fixture",
+                    "--nocapture",
+                ])
+                .env("SMOLVM_TEST_EXITED_LEADER", &ready)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = fixture.0.id() as Pid;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            if ready.exists() && stat.rsplit_once(") ").unwrap().1.starts_with("Z ") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "leader did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let address = std::fs::read_to_string(ready).unwrap();
+        assert!(
+            std::net::TcpListener::bind(&address).is_err(),
+            "worker owns port"
+        );
+        assert!(
+            is_alive(pid),
+            "stop must wait for workers, not just the leader"
+        );
+        assert!(try_wait(pid).is_none());
+        drop(fixture);
+        assert!(std::net::TcpListener::bind(address).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_leader_with_live_threads_is_not_an_exited_process() {
+        // /proc/PID/stat fields 3 (state) and 20 (num_threads). A group
+        // leader can exit before workers release the shared socket table.
+        for state in ["Z", "X", "x"] {
+            for threads in ["2", "64"] {
+                let stat =
+                    format!("123 (worker) {state} 1 2 3 0 0 0 0 0 0 0 0 0 0 0 20 0 {threads} 0");
+                assert!(!linux_stat_has_exited(&stat), "{stat}");
+            }
+        }
     }
 
     #[test]
