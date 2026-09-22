@@ -3086,7 +3086,6 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn single_file_checkpoints_hold_one_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -3099,6 +3098,7 @@ mod tests {
         assert!(resolve_generation(&file, Some("0123456789ab")).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn completed_memory_staging_preserves_owned_inode_after_source_removal() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
