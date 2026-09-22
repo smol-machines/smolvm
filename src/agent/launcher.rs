@@ -251,6 +251,8 @@ pub fn create_disk_overlays(specs: &[DiskOverlaySpec]) -> Result<()> {
 /// on manager/launcher functions.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchFeatures {
+    /// Explicitly restore a paused machine; never permit a silent cold boot.
+    pub resume_paused: bool,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<std::path::PathBuf>,
     /// Enable CUDA-over-vsock: smolvm starts a host CUDA server and the guest

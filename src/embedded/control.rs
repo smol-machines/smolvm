@@ -154,6 +154,27 @@ fn start_vm_from_record(record: &VmRecord) -> Result<StartedVm> {
     launch_from_record(record, LaunchFeatures::default())
 }
 
+pub(crate) fn resume_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
+    let record = get_record(db, name)?;
+    let started = launch_from_record(
+        &record,
+        LaunchFeatures {
+            resume_paused: true,
+            ..Default::default()
+        },
+    )?;
+    let pid = started.handle.child_pid();
+    let pid_start_time = pid.and_then(crate::process::process_start_time);
+    db.update_vm_durable(name, |record| {
+        record.state = RecordState::Running;
+        record.pid = pid;
+        record.pid_start_time = pid_start_time;
+        record.paused_checkpoint = None;
+    })?
+    .ok_or_else(|| Error::vm_not_found(name))?;
+    Ok(started)
+}
+
 fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures) -> LaunchFeatures {
     if features.dns_filter_hosts.is_none() {
         features.dns_filter_hosts = record.dns_filter_hosts.clone();

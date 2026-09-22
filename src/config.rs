@@ -44,6 +44,10 @@ pub enum RecordState {
     Running,
     /// VM exited cleanly.
     Stopped,
+    /// Execution is saved durably; use resume rather than a fresh boot.
+    Paused,
+    /// A final execution boundary is being saved before stopping.
+    Pausing,
     /// VM crashed or error.
     Failed,
     /// libkrun VMM process is alive but the guest agent is not
@@ -71,6 +75,8 @@ impl std::fmt::Display for RecordState {
             RecordState::Created => write!(f, "created"),
             RecordState::Running => write!(f, "running"),
             RecordState::Stopped => write!(f, "stopped"),
+            RecordState::Paused => write!(f, "paused"),
+            RecordState::Pausing => write!(f, "pausing"),
             RecordState::Failed => write!(f, "failed"),
             RecordState::Unreachable => write!(f, "unreachable"),
             RecordState::Frozen => write!(f, "frozen"),
@@ -372,6 +378,10 @@ pub struct VmRecord {
     /// VM lifecycle state.
     #[serde(default)]
     pub state: RecordState,
+
+    /// Durable execution state retained until a successful explicit resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_checkpoint: Option<std::path::PathBuf>,
 
     /// Process ID when running.
     #[serde(default)]
@@ -713,6 +723,7 @@ impl VmRecord {
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
+            paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
             cpus,
@@ -787,6 +798,7 @@ impl VmRecord {
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
+            paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
             cpus,

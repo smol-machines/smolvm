@@ -732,40 +732,71 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
+        self.update_vm_with_durability(name, f, false)
+    }
+
+    /// Persist a recovery boundary before releasing its live execution state.
+    pub fn update_vm_durable<F>(&self, name: &str, f: F) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord),
+    {
+        self.update_vm_with_durability(name, f, true)
+    }
+
+    fn update_vm_with_durability<F>(
+        &self,
+        name: &str,
+        f: F,
+        durable: bool,
+    ) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord),
+    {
         self.with_conn(|conn| {
-            // Reserve the writer before reading. A deferred transaction can
-            // fail with SQLITE_BUSY_SNAPSHOT when it upgrades to a write.
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .db_err("begin transaction")?;
+            if durable {
+                conn.execute_batch("PRAGMA synchronous=FULL;")
+                    .db_err("enable durable VM update")?;
+            }
+            let result = (|| {
+                // Reserve the writer before reading. A deferred transaction can
+                // fail with SQLITE_BUSY_SNAPSHOT when it upgrades to a write.
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .db_err("begin transaction")?;
 
-            let data: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT data FROM vms WHERE name = ?1",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .optional()
-                .db_err(format!("get vm '{}'", name))?;
-
-            let updated = match data {
-                Some(bytes) => {
-                    let mut record: VmRecord = serde_json::from_slice(&bytes)
-                        .db_err(format!("deserialize vm record '{}'", name))?;
-                    f(&mut record);
-                    let new_data = serde_json::to_vec(&record).db_err("serialize vm record")?;
-                    tx.execute(
-                        "UPDATE vms SET data = ?2 WHERE name = ?1",
-                        params![name, new_data],
+                let data: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT data FROM vms WHERE name = ?1",
+                        params![name],
+                        |row| row.get(0),
                     )
-                    .db_err(format!("update vm '{}'", name))?;
-                    Some(record)
-                }
-                None => None,
-            };
+                    .optional()
+                    .db_err(format!("get vm '{}'", name))?;
 
-            tx.commit().db_err("commit vm update")?;
-            Ok(updated)
+                let updated = match data {
+                    Some(bytes) => {
+                        let mut record: VmRecord = serde_json::from_slice(&bytes)
+                            .db_err(format!("deserialize vm record '{}'", name))?;
+                        f(&mut record);
+                        let new_data = serde_json::to_vec(&record).db_err("serialize vm record")?;
+                        tx.execute(
+                            "UPDATE vms SET data = ?2 WHERE name = ?1",
+                            params![name, new_data],
+                        )
+                        .db_err(format!("update vm '{}'", name))?;
+                        Some(record)
+                    }
+                    None => None,
+                };
+
+                tx.commit().db_err("commit vm update")?;
+                Ok(updated)
+            })();
+            if durable {
+                conn.execute_batch("PRAGMA synchronous=NORMAL;")
+                    .db_err("restore VM update policy")?;
+            }
+            result
         })
     }
 

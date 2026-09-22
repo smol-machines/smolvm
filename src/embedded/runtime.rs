@@ -70,6 +70,144 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Save execution durably and stop at that exact boundary.
+    pub fn pause_machine(&self, name: &str) -> Result<()> {
+        self.with_name_lock(name, || {
+            let record = control::get_record(&self.db, name)?;
+            if record.state == RecordState::Paused && !record.is_process_alive() {
+                let path = record.paused_checkpoint.as_ref().ok_or_else(|| {
+                    Error::agent("pause machine", "paused machine has no checkpoint")
+                })?;
+                crate::portable_checkpoint::verified_sidecar_footer(path)?;
+                return Ok(());
+            }
+            if record.paused_checkpoint.is_some() {
+                return Err(Error::agent_conflict(
+                    "pause machine",
+                    "a previous pause needs recovery; use resume",
+                ));
+            }
+            let output = crate::agent::vm_data_dir(name).join(format!(
+                "pause-{}.smolcheckpoint",
+                crate::db::SmolvmDb::create_reservation_token()
+            ));
+            let result = crate::portable_checkpoint::capture_and_stop_to_path(
+                name,
+                &output,
+                &Default::default(),
+                |stage| {
+                    self.db
+                        .update_vm_durable(name, |record| {
+                            record.paused_checkpoint = Some(output.clone());
+                            record.state = match stage {
+                                crate::portable_checkpoint::PauseCaptureStage::Capturing => {
+                                    RecordState::Pausing
+                                }
+                                crate::portable_checkpoint::PauseCaptureStage::Durable => {
+                                    RecordState::Paused
+                                }
+                            };
+                        })?
+                        .ok_or_else(|| Error::vm_not_found(name))?;
+                    Ok(())
+                },
+            );
+            if let Err(error) = result {
+                // Capture's guard has resumed the original on failure. Never
+                // erase the durable recovery point if the process is gone.
+                let running = record.is_process_alive()
+                    && crate::agent::fork::control_socket_cmd(
+                        &crate::agent::fork::control_socket_path(name),
+                        "STATUS",
+                    )
+                    .is_ok_and(|status| status.trim() == "OK running");
+                if running {
+                    self.db.update_vm_durable(name, |record| {
+                        if record.paused_checkpoint.as_ref() == Some(&output) {
+                            record.paused_checkpoint = None;
+                            record.state = RecordState::Running;
+                        }
+                    })?;
+                    if output.exists() {
+                        if let Err(cleanup) = std::fs::remove_file(&output) {
+                            tracing::warn!(%cleanup, "could not remove failed pause artifact");
+                        }
+                    }
+                }
+                return Err(error);
+            }
+            self.remove_cached_handle(name)?;
+            self.db.update_vm(name, |record| {
+                record.state = RecordState::Paused;
+                record.pid = None;
+                record.pid_start_time = None;
+            })?;
+            Ok(())
+        })
+    }
+
+    /// Restore the saved execution under the original machine name.
+    pub fn resume_machine(&self, name: &str) -> Result<()> {
+        self.resume_machine_inner(name, false)
+    }
+
+    /// Resume execution without tying its lifetime to this runtime handle.
+    pub fn resume_machine_detached(&self, name: &str) -> Result<()> {
+        self.resume_machine_inner(name, true)
+    }
+
+    fn resume_machine_inner(&self, name: &str, detached: bool) -> Result<()> {
+        self.with_name_lock(name, || {
+            let _source = crate::agent::fork::lock_fork_source(name)?;
+            let record = control::get_record(&self.db, name)?;
+            if record.paused_checkpoint.is_none() {
+                if record.state == RecordState::Running && record.is_process_alive() {
+                    return Ok(());
+                }
+                return Err(Error::agent_conflict("resume machine", "machine is not paused; use start for a fresh boot"));
+            }
+            if record.is_process_alive() {
+                let control_socket = crate::agent::fork::control_socket_path(name);
+                let status = crate::agent::fork::control_socket_cmd(&control_socket, "STATUS")?;
+                if record.state == RecordState::Pausing {
+                    // The capture owner exited before committing durability.
+                    // Recover the original rather than replaying an uncertain artifact.
+                    if status.trim() == "OK paused" {
+                        let reply = crate::agent::fork::control_socket_cmd(&control_socket, "RESUME")?;
+                        if !reply.starts_with("OK") { return Err(Error::agent("resume interrupted pause", reply)); }
+                    } else if status.trim() != "OK running" {
+                        return Err(Error::agent("resume interrupted pause", status));
+                    }
+                    self.db.update_vm_durable(name, |record| {
+                        record.paused_checkpoint = None;
+                        record.state = RecordState::Running;
+                    })?;
+                    return Ok(());
+                }
+                if status.trim() != "OK paused" {
+                    return Err(Error::agent_conflict("resume machine", "source is still running; refusing to replace its execution"));
+                }
+                crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?.stop_paused()?;
+            }
+            self.remove_cached_handle(name)?;
+            crate::portable_checkpoint::prepare_paused_restore(&record)?;
+            let started = control::resume_vm(&self.db, name)?;
+            if detached {
+                started.handle.detach();
+            } else {
+                self.insert_handle(name, started.handle)?;
+            }
+            // A successfully resumed VM owns its installed RAM/disk backing;
+            // the transport artifact is no longer its recovery authority.
+            if let Some(path) = record.paused_checkpoint {
+                if let Err(error) = std::fs::remove_file(&path) {
+                    tracing::warn!(%error, path = %path.display(), "could not remove consumed pause artifact");
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Create a stopped machine from a portable live checkpoint artifact.
     ///
     /// Its first start resumes the captured execution state. The restored
@@ -122,6 +260,15 @@ impl EmbeddedRuntime {
     /// Start or reconnect to a persisted machine and cache its handle.
     pub fn start_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            if control::get_record(&self.db, name)?
+                .paused_checkpoint
+                .is_some()
+            {
+                return Err(Error::agent_conflict(
+                    "start machine",
+                    "machine is paused; use resume",
+                ));
+            }
             if let Some(handle) = self.cached_handle(name)? {
                 let alive = lock_handle(&handle)?.is_process_alive();
                 if alive {
@@ -151,6 +298,15 @@ impl EmbeddedRuntime {
     /// disks and replaces its control socket, destroying the fork source.
     pub fn connect_or_start_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            if control::get_record(&self.db, name)?
+                .paused_checkpoint
+                .is_some()
+            {
+                return Err(Error::agent_conflict(
+                    "start machine",
+                    "machine has saved execution; use resume",
+                ));
+            }
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
                     return Ok(());
@@ -395,6 +551,12 @@ impl EmbeddedRuntime {
         self.with_name_lock(name, || {
             let _source_lock = crate::agent::fork::lock_fork_source(name)?;
             let record = control::get_record(&self.db, name)?;
+            if record.paused_checkpoint.is_some() {
+                return Err(Error::agent_conflict(
+                    "stop machine",
+                    "machine has saved execution; use resume or delete",
+                ));
+            }
             let dependents = self.db.dependent_clones(name)?;
             if !dependents.is_empty() {
                 return Err(Error::agent(
@@ -454,7 +616,9 @@ impl EmbeddedRuntime {
                 crate::agent::state_probe::recover_unreachable_machine_in_db(&record, &self.db)?;
             } else if matches!(
                 state,
-                crate::config::RecordState::Stopped | crate::config::RecordState::Created
+                crate::config::RecordState::Stopped
+                    | crate::config::RecordState::Created
+                    | crate::config::RecordState::Paused
             ) {
                 // A graceful stop already synchronized staged mounts. Do not
                 // reconnect to the now-absent agent and fail a subsequent delete.
@@ -754,6 +918,15 @@ impl EmbeddedRuntime {
 
     /// Return whether the machine process is currently running.
     pub fn is_running(&self, name: &str) -> bool {
+        if self
+            .db
+            .get_vm(name)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.paused_checkpoint.is_some())
+        {
+            return false;
+        }
         if let Ok(Some(handle)) = self.cached_handle(name) {
             if let Ok(handle) = handle.lock() {
                 return handle.is_process_alive();
@@ -769,6 +942,11 @@ impl EmbeddedRuntime {
 
     /// Get the current machine state as a string.
     pub fn state(&self, name: &str) -> String {
+        if let Ok(Some(record)) = self.db.get_vm(name) {
+            if record.paused_checkpoint.is_some() {
+                return record.state.to_string();
+            }
+        }
         if let Ok(Some(handle)) = self.cached_handle(name) {
             if let Ok(handle) = handle.lock() {
                 return handle.state();
@@ -783,6 +961,15 @@ impl EmbeddedRuntime {
     }
 
     fn started_handle(&self, name: &str) -> Result<SharedHandle> {
+        if control::get_record(&self.db, name)?
+            .paused_checkpoint
+            .is_some()
+        {
+            return Err(Error::agent_conflict(
+                "access machine",
+                "machine is pausing or paused; use resume",
+            ));
+        }
         self.cached_handle(name)?
             .ok_or_else(|| Error::InvalidState {
                 expected: "started".into(),
@@ -926,6 +1113,30 @@ mod tests {
             // Spread the rest so a new spec field does not break the fixtures.
             ..MachineSpec::default()
         }
+    }
+
+    #[test]
+    fn saved_execution_cannot_be_started_or_accessed_as_a_fresh_machine() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        runtime.create_machine(test_spec("saved", true)).unwrap();
+        db.update_vm_durable("saved", |r| {
+            r.state = RecordState::Paused;
+            r.paused_checkpoint = Some("missing.smolcheckpoint".into());
+        })
+        .unwrap();
+        assert_eq!(runtime.state("saved"), "paused");
+        assert!(!runtime.is_running("saved"));
+        assert!(runtime.start_machine("saved").is_err());
+        assert!(runtime.connect_or_start_machine("saved").is_err());
+        assert!(runtime.started_handle("saved").is_err());
+        assert!(runtime.pause_machine("saved").is_err());
+        assert!(db
+            .get_vm("saved")
+            .unwrap()
+            .unwrap()
+            .paused_checkpoint
+            .is_some());
     }
 
     #[test]

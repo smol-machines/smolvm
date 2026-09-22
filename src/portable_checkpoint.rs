@@ -651,6 +651,13 @@ struct SavedVmPause {
 }
 
 impl SavedVmPause {
+    fn stop(&mut self, name: &str, record: &VmRecord) -> Result<()> {
+        crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?
+            .stop_paused()?;
+        self.armed = false;
+        Ok(())
+    }
+
     fn resume(&mut self) -> Result<()> {
         if !self.armed {
             return Ok(());
@@ -807,6 +814,37 @@ pub(crate) fn capture_to_path_with_source_release(
     options: &CaptureOptions,
     release_source: impl FnOnce(),
 ) -> Result<CaptureResult> {
+    capture_with_completion(name, output, options, release_source, false, |_| Ok(()))
+}
+
+/// Durable lifecycle boundaries for an owner coordinating a pause.
+pub enum PauseCaptureStage {
+    /// Persist intent before freezing the guest.
+    Capturing,
+    /// Persist the resume point before terminating the frozen VM.
+    Durable,
+}
+
+/// Capture one final execution boundary and stop without running the guest again.
+/// `publish_resume_point` must durably record how to resume before the VM exits.
+/// Any error before that commit resumes the original guest.
+pub fn capture_and_stop_to_path(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
+) -> Result<CaptureResult> {
+    capture_with_completion(name, output, options, || {}, true, publish_resume_point)
+}
+
+fn capture_with_completion(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    release_source: impl FnOnce(),
+    stop_after_capture: bool,
+    mut publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
+) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
     let mut phase = started;
     if options.store_dir.is_some() && options.staging_dir.is_some() {
@@ -920,12 +958,22 @@ pub(crate) fn capture_to_path_with_source_release(
     // fork can never overlap or produce two competing source generations.
     // Hold it through the RAM worker: its cgroup reservation must not race a
     // fork resizing the same scope. Release before packaging and compression.
-    let source_lock = crate::agent::fork::lock_fork_source(name)?;
+    let mut source_lock = Some(crate::agent::fork::lock_fork_source(name)?);
+    let mut release_source = Some(release_source);
     let config = validated_capture_source(name)?;
     let vm = config
         .vms
         .get(name)
         .expect("validated checkpoint source must remain in its loaded config");
+    if stop_after_capture {
+        let db = crate::db::SmolvmDb::open()?;
+        if !db.dependent_clones(name)?.is_empty() {
+            return Err(Error::agent_conflict(
+                "pause machine",
+                "cannot pause a machine while branches depend on its live state",
+            ));
+        }
+    }
     let control = crate::agent::fork::control_socket_path(name);
     let runtime_capture = runtime_capture_dir(name, vm)?;
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
@@ -945,6 +993,9 @@ pub(crate) fn capture_to_path_with_source_release(
             == "OK sparse-stream-v1 ownership-v1";
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
+    if stop_after_capture {
+        publish_resume_point(PauseCaptureStage::Capturing)?;
+    }
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
     let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
@@ -990,8 +1041,18 @@ pub(crate) fn capture_to_path_with_source_release(
         &mut phase,
     );
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
-    pause.resume()?;
-    log_phase(name, "capture_disks_and_resume", &mut phase);
+    if !stop_after_capture {
+        pause.resume()?;
+    }
+    log_phase(
+        name,
+        if stop_after_capture {
+            "capture_disks_held"
+        } else {
+            "capture_disks_and_resume"
+        },
+        &mut phase,
+    );
     let source_pause = pause_started.elapsed();
 
     let mut sparse_socket = if prepared && sparse_capable {
@@ -1186,8 +1247,10 @@ pub(crate) fn capture_to_path_with_source_release(
             .unwrap()
             .allow_concurrent_branches();
     }
-    drop(source_lock);
-    release_source();
+    if !stop_after_capture {
+        drop(source_lock.take());
+        release_source.take().unwrap()();
+    }
 
     if let Some((directory, mut writer)) = stored {
         let mut files = writer
@@ -1211,10 +1274,18 @@ pub(crate) fn capture_to_path_with_source_release(
         );
         crate::checkpoint_store::publish(directory.path(), output)
             .map_err(|e| Error::agent("publish stored checkpoint", e.to_string()))?;
+        if stop_after_capture {
+            publish_resume_point(PauseCaptureStage::Durable)?;
+            pause.stop(name, vm)?;
+        }
         return Ok(CaptureResult {
             size_bytes: stats.new_bytes,
             reused_bytes: stats.reused_bytes,
-            source_pause,
+            source_pause: if stop_after_capture {
+                pause_started.elapsed()
+            } else {
+                source_pause
+            },
             elapsed: started.elapsed(),
         });
     }
@@ -1264,10 +1335,18 @@ pub(crate) fn capture_to_path_with_source_release(
         }
         log_phase(name, "capture_retain_prepared", &mut phase);
     }
+    if stop_after_capture {
+        publish_resume_point(PauseCaptureStage::Durable)?;
+        pause.stop(name, vm)?;
+    }
     Ok(CaptureResult {
         reused_bytes: 0,
         size_bytes: info.total_size,
-        source_pause,
+        source_pause: if stop_after_capture {
+            pause_started.elapsed()
+        } else {
+            source_pause
+        },
         elapsed: started.elapsed(),
     })
 }
@@ -2771,8 +2850,48 @@ pub fn discard_transport_pack(vm_data_dir: &Path) -> Result<()> {
 /// inherited crun container ID so later `machine exec` calls join the restored
 /// workload instead of silently creating a second container.
 pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
-    crate::agent::fork::rejuvenate_clone(name, record)?;
+    if record.paused_checkpoint.is_none() {
+        crate::agent::fork::rejuvenate_clone(name, record)?;
+    }
     crate::agent::fork::release_forkpoint(name, &record.fork_env)
+}
+
+/// Prepare an explicit same-machine resume. The durable artifact stays intact
+/// if extraction, installation, or the subsequent boot fails.
+pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
+    let artifact = record.paused_checkpoint.as_ref().ok_or_else(|| {
+        Error::agent_conflict("resume machine", "machine has no saved execution state")
+    })?;
+    if record.is_process_alive() {
+        return Err(Error::agent_conflict(
+            "resume machine",
+            "source VM has not stopped",
+        ));
+    }
+    let footer = verified_sidecar_footer(artifact)?;
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|e| Error::agent("read paused checkpoint", e.to_string()))?;
+    let checkpoint = manifest
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| Error::agent("resume machine", "artifact has no execution state"))?;
+    validate_compatibility(checkpoint)?;
+    let vm_data = crate::agent::vm_data_dir(&record.name);
+    let staged = tempfile::Builder::new()
+        .prefix("resume-")
+        .tempdir_in(&vm_data)?;
+    smolvm_pack::extract::extract_sidecar(artifact, staged.path(), &footer, false, false)
+        .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
+    // A failed earlier restore may have left a partial installation. No VMM
+    // is alive and the verified artifact remains the authoritative copy.
+    for dir in [INSTALLED_DIR, READONLY_INPUT_DIR] {
+        match std::fs::remove_dir_all(vm_data.join(dir)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    install(staged.path(), &vm_data, checkpoint)
 }
 
 /// Return the pending one-shot checkpoint directory for a machine, if any.

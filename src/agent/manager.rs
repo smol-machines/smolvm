@@ -1603,6 +1603,24 @@ impl AgentManager {
         resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
+        if let Some(name) = self.name() {
+            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                if record.paused_checkpoint.is_some() && !features.resume_paused {
+                    return Err(Error::agent_conflict(
+                        "start machine",
+                        "machine is paused; use resume to preserve its execution state",
+                    ));
+                }
+                if features.resume_paused
+                    && crate::portable_checkpoint::pending_dir(&vm_data_dir(name)).is_none()
+                {
+                    return Err(Error::agent_conflict(
+                        "resume machine",
+                        "no prepared checkpoint; refusing a fresh boot",
+                    ));
+                }
+            }
+        }
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
         // so the comparison below is accurate even for detached VMs.

@@ -439,7 +439,10 @@ impl ApiState {
             // process is no longer alive.  Machines in "created" state (pid=None)
             // have never been started and must be preserved — they are valid
             // configs waiting for a start call.
-            if record.pid.is_some() && !record.is_process_alive() {
+            if record.paused_checkpoint.is_none()
+                && record.pid.is_some()
+                && !record.is_process_alive()
+            {
                 if retained_lineage.contains(&name) {
                     tracing::warn!(
                         machine = %name,
@@ -2108,6 +2111,21 @@ mod tests {
     // ========================================================================
     // Startup reconciliation tests
     // ========================================================================
+
+    #[test]
+    fn saved_execution_survives_reconciliation_with_a_stale_pid() {
+        let (_dir, state) = temp_api_state();
+        let name = "durable-paused-reconciliation";
+        let mut record = VmRecord::new(name.into(), 1, 512, vec![], vec![], false);
+        record.pid = Some(i32::MAX);
+        record.state = RecordState::Paused;
+        record.paused_checkpoint = Some("saved.smolcheckpoint".into());
+        state.db.insert_vm(name, &record).unwrap();
+        assert!(state.load_persisted_machines().contains(&name.to_string()));
+        let retained = state.db.get_vm(name).unwrap().unwrap();
+        assert_eq!(retained.state, RecordState::Paused);
+        assert_eq!(retained.paused_checkpoint, record.paused_checkpoint);
+    }
 
     #[test]
     fn test_load_persisted_machines_removes_dead_records() {

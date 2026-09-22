@@ -2624,6 +2624,12 @@ pub async fn start_machine(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
+    if record.paused_checkpoint.is_some() {
+        return Err(ApiError::Conflict(
+            "machine has saved execution; use resume".into(),
+        ));
+    }
+
     // Resolve via the shared probe (PID + vsock ping) so we don't
     // mistake a zombie VMM (live PID, dead agent) for Running — the
     // CLI's `start --name` handles this same case; the API must
@@ -3701,6 +3707,70 @@ pub async fn release_held_fork(
     Ok(Json(record_to_info(&clone, &updated)))
 }
 
+/// Save execution durably before stopping the machine.
+#[utoipa::path(post, path = "/api/v1/machines/{name}/pause", tag = "Machines",
+    params(("name" = String, Path, description = "Machine name")),
+    responses((status = 200, description = "Machine paused", body = MachineInfo)))]
+pub async fn pause_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    saved_execution_operation(state, name, false).await
+}
+
+/// Resume saved execution under the same machine name.
+#[utoipa::path(post, path = "/api/v1/machines/{name}/resume", tag = "Machines",
+    params(("name" = String, Path, description = "Machine name")),
+    responses((status = 200, description = "Machine resumed", body = MachineInfo)))]
+pub async fn resume_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    saved_execution_operation(state, name, true).await
+}
+
+async fn saved_execution_operation(
+    state: Arc<ApiState>,
+    name: String,
+    resume: bool,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let guard = state.lifecycle_lock(&name).lock_owned().await;
+    // The operation owns its lock even if the HTTP caller disconnects.
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let runtime = crate::embedded::EmbeddedRuntime::with_db(state.db().clone());
+        if resume {
+            let record = state
+                .db()
+                .get_vm(&name)
+                .map_err(ApiError::database)?
+                .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+            if !record.is_process_alive() {
+                if let Ok(entry) = state.get_machine(&name) {
+                    entry.lock().manager.mark_stopped();
+                }
+            }
+            runtime.resume_machine_detached(&name)
+        } else {
+            runtime.pause_machine(&name)
+        }
+        .map_err(ApiError::from)?;
+        if !resume {
+            if let Ok(entry) = state.get_machine(&name) {
+                entry.lock().manager.mark_stopped();
+            }
+        }
+        let record = state
+            .db()
+            .get_vm(&name)
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+        Ok(Json(record_to_info(&name, &record)))
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
 /// Stop a machine.
 #[utoipa::path(
     post,
@@ -3738,6 +3808,12 @@ pub async fn stop_machine(
         .lookup_vm(&name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    if record.paused_checkpoint.is_some() {
+        return Err(ApiError::Conflict(
+            "machine has saved execution; use resume or delete".into(),
+        ));
+    }
 
     // Resolve the control-plane state, not only PID liveness. A non-Linux fork
     // base is genuinely Frozen and its source VMM owns the RAM backing, so it
