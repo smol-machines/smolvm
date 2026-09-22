@@ -296,7 +296,7 @@ Platform Support
 Known Limitations
 -----------------
 
-* Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
+* Network is opt-in (`--net` on `machine create`). The default backend carries TCP and UDP without emulating a network card, so the guest shows no `eth0` and `ping` fails with `Network unreachable` even while HTTP works — check connectivity with `wget` or `curl`, not `ping`. Pass `--net-backend virtio-net` for a real interface, an address of its own, and ICMP.
 * Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace, so your host directory is used instead.
 * macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
