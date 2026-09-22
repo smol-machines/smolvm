@@ -289,7 +289,7 @@ impl EmbeddedRuntime {
             }
             self.remove_cached_handle(name)?;
             crate::portable_checkpoint::prepare_paused_restore(&record)?;
-            let started = control::resume_vm(&self.db, name)?;
+            let started = control::resume_vm(&self.db, name, detached)?;
             if detached {
                 started.handle.detach();
             } else {

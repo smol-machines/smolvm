@@ -154,12 +154,13 @@ fn start_vm_from_record(record: &VmRecord) -> Result<StartedVm> {
     launch_from_record(record, LaunchFeatures::default())
 }
 
-pub(crate) fn resume_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
+pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<StartedVm> {
     let record = get_record(db, name)?;
     let started = launch_from_record(
         &record,
         LaunchFeatures {
             resume_paused: true,
+            watch_parent: detached.then_some(false),
             ..Default::default()
         },
     )?;
