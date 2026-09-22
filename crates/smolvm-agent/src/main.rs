@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
 mod crun;
+mod live_resources;
 mod shutdown;
 mod shutdown_freeze;
 
@@ -241,6 +242,9 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    if live_resources::filesystem_helper_requested() {
+        std::process::exit(live_resources::run_filesystem_helper());
+    }
     if process::container_init_requested() {
         std::process::exit(process::run_container_init());
     }
@@ -2320,6 +2324,12 @@ fn handle_request(
         AgentRequest::Ping
         | AgentRequest::NetworkTest { .. }
         | AgentRequest::VmExec { .. }
+        // Live growth only accepts an already-mounted disk. Never enter the
+        // boot-time mount/format fallback as a side effect of this request.
+        | AgentRequest::GrowFilesystem { .. }
+        | AgentRequest::OnlineCpus { .. }
+        | AgentRequest::OfflineCpus { .. }
+        | AgentRequest::OnlineMemory { .. }
         | AgentRequest::Shutdown { .. } => {}
         _ => {
             ensure_storage_mounted();
@@ -2331,6 +2341,10 @@ fn handle_request(
             let capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
+                smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
+                smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_string(),
+                smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_string(),
+                smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_string(),
             ];
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,
@@ -2360,6 +2374,20 @@ fn handle_request(
         AgentRequest::ListDirectory { path } => handle_list_directory(&path),
 
         AgentRequest::StorageStatus => handle_storage_status(),
+        AgentRequest::OnlineCpus { target_count } => {
+            live_resources::online_cpus(target_count, client_fd)
+        }
+        AgentRequest::OfflineCpus { target_count } => {
+            live_resources::offline_cpus(target_count, client_fd)
+        }
+        AgentRequest::OnlineMemory {
+            start_address,
+            length_bytes,
+        } => live_resources::online_memory(start_address, length_bytes, client_fd),
+        AgentRequest::GrowFilesystem {
+            disk,
+            expected_bytes,
+        } => live_resources::grow_filesystem(disk, expected_bytes, client_fd),
         AgentRequest::MemoryStatus => handle_memory_status(),
 
         AgentRequest::BranchpointWait { timeout_ms } => {

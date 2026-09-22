@@ -680,6 +680,9 @@ pub struct CreateMachineRequest {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineInfo {
+    /// Process identity for conditional live mutations; absent when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::agent::live_resize::RuntimeIdentity>,
     /// Machine name.
     #[schema(example = "my-vm")]
     pub name: String,
@@ -877,10 +880,22 @@ pub struct StopResponse {
 // Resize Types
 // ============================================================================
 
-/// Request to resize a machine's disk resources.
+/// Request to resize running CPU, RAM, or disk resources.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResizeMachineRequest {
+    /// Stable operation identity for safe retries; requires expectedRuntime.
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    /// Refuse growth if this observed runtime has exited or been replaced.
+    #[serde(default)]
+    pub expected_runtime: Option<crate::agent::live_resize::RuntimeIdentity>,
+    /// Total usable RAM allocation in MiB (live growth, optional).
+    #[serde(default, rename = "memoryMb")]
+    pub mem: Option<u32>,
+    /// Target online CPU count; shrinking requires a compatible Linux x86_64 runtime and agent.
+    #[serde(default)]
+    pub cpus: Option<u8>,
     /// Storage disk size in GiB (expand only, optional).
     #[serde(default)]
     #[schema(example = 50)]

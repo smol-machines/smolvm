@@ -78,6 +78,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     let stats = pid.and_then(crate::process::process_stats);
     let memory_stats = pid.and_then(crate::process::process_memory_stats);
     MachineInfo {
+        runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name: name.to_string(),
         image: record.image.clone(),
         state: actual_state.to_string(),
@@ -4313,7 +4314,7 @@ async fn delete_one_transaction(
         (status = 200, description = "Machine resized", body = MachineInfo),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "Machine is running", body = ApiErrorResponse),
+        (status = 409, description = "Machine state or shared disks prevent resizing", body = ApiErrorResponse),
         (status = 500, description = "Resize failed", body = ApiErrorResponse)
     )
 )]
@@ -4329,7 +4330,7 @@ pub async fn resize_machine(
     // update), so hold the lock across the whole operation as the other lifecycle
     // handlers do — the state check below is only meaningful under it.
     let lifecycle = state.lifecycle_lock(&name);
-    let _guard = lifecycle.lock().await;
+    let guard = lifecycle.lock_owned().await;
 
     let record = state
         .lookup_vm(&name)
@@ -4337,6 +4338,71 @@ pub async fn resize_machine(
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     let actual_state = record.actual_state();
+    if actual_state == RecordState::Running {
+        let resource_kinds = u8::from(req.cpus.is_some())
+            + u8::from(req.mem.is_some())
+            + u8::from(req.storage_gb.is_some() || req.overlay_gb.is_some());
+        if resource_kinds > 1 {
+            return Err(ApiError::BadRequest(
+                "resize CPUs, RAM, and disks in separate requests".into(),
+            ));
+        }
+        let db = state.db().clone();
+        let resize_name = name.clone();
+        let record = tokio::task::spawn_blocking(move || {
+            // Keep lifecycle ownership if the HTTP request is cancelled while
+            // a disk or filesystem operation is still running.
+            let _guard = guard;
+            let target = if let Some(cpus) = req.cpus {
+                crate::db::ResizeTarget::Cpus(cpus)
+            } else if let Some(mem) = req.mem {
+                crate::db::ResizeTarget::Memory(mem)
+            } else {
+                crate::db::ResizeTarget::Disks {
+                    storage: req.storage_gb,
+                    overlay: req.overlay_gb,
+                }
+            };
+            crate::agent::live_resize::grow_checked(
+                &db,
+                &resize_name,
+                target,
+                req.expected_runtime.as_ref(),
+                req.operation_id.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("live resize task failed: {error}")))?
+        .map_err(|error| match error {
+            crate::Error::Config { .. } => ApiError::BadRequest(error.to_string()),
+            other => ApiError::from(other),
+        })?;
+        return match record {
+            crate::agent::live_resize::ResizeOutcome::Applied(record) => {
+                Ok(Json(record_to_info(&name, &record)))
+            }
+            crate::agent::live_resize::ResizeOutcome::Rejected {
+                operation_id,
+                runtime,
+                message,
+            } => Err(ApiError::ResizeRejected {
+                operation_id,
+                runtime,
+                message,
+            }),
+        };
+    }
+    if req.expected_runtime.is_some() || req.operation_id.is_some() {
+        return Err(ApiError::Conflict(
+            "observed machine runtime is no longer running; inspect it before resizing".into(),
+        ));
+    }
+    if req.cpus.is_some() || req.mem.is_some() {
+        return Err(ApiError::BadRequest(
+            "live CPU/RAM resize requires a running machine; use update for a stopped machine"
+                .into(),
+        ));
+    }
     match actual_state {
         RecordState::Stopped | RecordState::Created => {}
         _ => {
@@ -5440,7 +5506,11 @@ mod tests {
 
         let req = ResizeMachineRequest {
             storage_gb: Some(10),
+            expected_runtime: None,
+            operation_id: None,
             overlay_gb: None,
+            cpus: None,
+            mem: None,
         };
         let result = resize_machine(State(state), Path("test-vm".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
@@ -5454,7 +5524,11 @@ mod tests {
 
         let req = ResizeMachineRequest {
             storage_gb: None,
+            expected_runtime: None,
+            operation_id: None,
             overlay_gb: None,
+            cpus: None,
+            mem: None,
         };
         let result = resize_machine(State(state), Path("test-vm".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
@@ -5465,7 +5539,11 @@ mod tests {
         let (_dir, state) = setup_test_state();
         let req = ResizeMachineRequest {
             storage_gb: Some(30),
+            expected_runtime: None,
+            operation_id: None,
             overlay_gb: None,
+            cpus: None,
+            mem: None,
         };
         let result = resize_machine(State(state), Path("nonexistent".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));

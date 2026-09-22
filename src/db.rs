@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod resize;
+pub(crate) use resize::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget};
+
 /// SQLite busy_timeout: how long a blocked writer waits for the write lock
 /// before returning SQLITE_BUSY. Set high enough to survive burst contention
 /// from concurrent CLI processes (e.g., 10-20 VMs starting simultaneously).
@@ -271,6 +274,16 @@ impl SmolvmDb {
              CREATE TABLE IF NOT EXISTS config (
                  key TEXT PRIMARY KEY NOT NULL,
                  value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS vm_resize_intents (
+                 name TEXT PRIMARY KEY NOT NULL,
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS vm_resize_receipts (
+                 name TEXT NOT NULL,
+                 operation_id TEXT NOT NULL,
+                 data BLOB NOT NULL,
+                 PRIMARY KEY (name, operation_id)
              );
              CREATE TABLE IF NOT EXISTS fork_pools (
                  name TEXT PRIMARY KEY NOT NULL,
@@ -589,6 +602,16 @@ impl SmolvmDb {
                         .db_err(format!("deserialize vm record '{}'", name))?;
                     tx.execute("DELETE FROM vms WHERE name = ?1", params![name])
                         .db_err(format!("remove vm '{}'", name))?;
+                    tx.execute(
+                        "DELETE FROM vm_resize_intents WHERE name = ?1",
+                        params![name],
+                    )
+                    .db_err("remove VM resize intent")?;
+                    tx.execute(
+                        "DELETE FROM vm_resize_receipts WHERE name = ?1",
+                        params![name],
+                    )
+                    .db_err("remove VM resize receipts")?;
                     // A retained checkpoint only means anything while its golden
                     // process is alive, so it dies with the record rather than
                     // waiting for a sweep that only the pool controller runs.
