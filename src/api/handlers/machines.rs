@@ -3771,6 +3771,51 @@ async fn saved_execution_operation(
     .map_err(ApiError::internal)?
 }
 
+/// Download a paused machine's saved execution without consuming it.
+pub async fn paused_checkpoint(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Response<Body>, ApiError> {
+    let guard = state.lifecycle_lock(&name).lock_owned().await;
+    let file = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let _source = crate::agent::fork::lock_fork_source(&name)?;
+        let record = state
+            .db()
+            .get_vm(&name)?
+            .ok_or_else(|| SmolvmError::vm_not_found(&name))?;
+        if record.state != RecordState::Paused || record.is_process_alive() {
+            return Err(SmolvmError::agent_conflict(
+                "download paused checkpoint",
+                "machine must be paused",
+            ));
+        }
+        let path = record.paused_checkpoint.ok_or_else(|| {
+            SmolvmError::agent_conflict(
+                "download paused checkpoint",
+                "machine has no saved execution",
+            )
+        })?;
+        crate::portable_checkpoint::verified_sidecar_footer(&path)?;
+        std::fs::File::open(path).map_err(SmolvmError::from)
+    })
+    .await?
+    .map_err(ApiError::from)?;
+    let size = file.metadata().map_err(ApiError::internal)?.len();
+    // The open descriptor survives deletion of the machine or a concurrent
+    // resume; downloading never takes ownership of its recovery artifact.
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.smolmachines.checkpoint",
+        )
+        .header(header::CONTENT_LENGTH, size)
+        .body(Body::from_stream(tokio_util::io::ReaderStream::new(
+            tokio::fs::File::from_std(file),
+        )))
+        .map_err(ApiError::internal)
+}
+
 /// Stop a machine.
 #[utoipa::path(
     post,

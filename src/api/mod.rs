@@ -288,6 +288,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         )
         .route("/{id}/stop", post(handlers::machines::stop_machine))
         .route("/{id}/pause", post(handlers::machines::pause_machine))
+        .route(
+            "/{id}/pause/checkpoint",
+            get(handlers::machines::paused_checkpoint),
+        )
         .route("/{id}/resume", post(handlers::machines::resume_machine))
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
