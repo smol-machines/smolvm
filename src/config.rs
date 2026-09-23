@@ -518,6 +518,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
 
+    /// IPv4 subnet for the guest link (virtio-net only). None = `100.96.0.0/30`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_subnet: Option<String>,
+
     /// OCI image for auto-container creation on start.
     #[serde(default)]
     pub image: Option<String>,
@@ -761,6 +765,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             network_name: None,
+            guest_subnet: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -837,6 +842,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             network_name: None,
+            guest_subnet: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -1054,6 +1060,7 @@ impl VmRecord {
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
+            guest_subnet: self.guest_subnet.clone(),
         }
     }
 }

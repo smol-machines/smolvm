@@ -589,6 +589,13 @@ pub struct RunCmd {
     #[arg(long, value_name = "IP", help_heading = "Network")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// IPv4 subnet for the guest link, e.g. 10.200.0.0/30 (implies --net,
+    /// virtio-net). The gateway and resolver take the first address, the guest
+    /// the second. Use it when the guest runs Tailscale or another VPN that
+    /// claims the default 100.96.0.0/30.
+    #[arg(long, value_name = "CIDR", value_parser = parse_guest_subnet, help_heading = "Network")]
+    pub guest_subnet: Option<String>,
+
     /// Join a named inter-VM network (implies --net, virtio-net only): members
     /// get distinct addresses and can reach each other directly
     #[arg(long = "network", value_name = "NAME", help_heading = "Network")]
@@ -1054,6 +1061,10 @@ fn ensure_init_layer(
             create.push("--dns".into());
             create.push(dns.to_string());
         }
+        if let Some(subnet) = &params.guest_subnet {
+            create.push("--guest-subnet".into());
+            create.push(subnet.clone());
+        }
         for c in params.allowed_cidrs.iter().flatten() {
             create.push("--allow-cidr".into());
             create.push(c.clone());
@@ -1289,6 +1300,7 @@ impl RunCmd {
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
+        params.guest_subnet = self.guest_subnet.clone();
         params.disks = parse_attached_disks(&self.disk)?;
         params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
@@ -1631,6 +1643,7 @@ impl RunCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             network_name: params.network_name.clone(),
+            guest_subnet: params.guest_subnet.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             nested_virt: self.nested_virt,
@@ -3397,6 +3410,13 @@ pub struct CreateCmd {
     #[arg(long, value_name = "IP")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// IPv4 subnet for the guest link, e.g. 10.200.0.0/30 (implies --net,
+    /// virtio-net). The gateway and resolver take the first address, the guest
+    /// the second. Use it when the guest runs Tailscale or another VPN that
+    /// claims the default 100.96.0.0/30.
+    #[arg(long, value_name = "CIDR", value_parser = parse_guest_subnet)]
+    pub guest_subnet: Option<String>,
+
     /// Join a named inter-VM network (implies --net, virtio-net only): members
     /// get distinct addresses and can reach each other directly
     #[arg(long = "network", value_name = "NAME")]
@@ -3528,6 +3548,13 @@ pub struct CreateCmd {
 /// Validation happens at create/run time rather than at boot: a machine
 /// recorded against an unreadable device would otherwise fail every start with
 /// a virtio-blk error that names neither the disk nor the reason.
+/// Clap value parser for `--guest-subnet`: validate, and store the canonical form.
+fn parse_guest_subnet(value: &str) -> Result<String, String> {
+    value
+        .parse::<smolvm_network::GuestSubnet>()
+        .map(|subnet| subnet.to_string())
+}
+
 fn parse_attached_disks(specs: &[String]) -> smolvm::Result<Vec<smolvm::data::disk::AttachedDisk>> {
     specs
         .iter()
@@ -3625,6 +3652,7 @@ impl CreateCmd {
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
+        params.guest_subnet = self.guest_subnet.clone();
         // Attached host disks are validated at create, not at start: a machine
         // recorded against an unreadable device would fail every start with a
         // virtio-blk error that says nothing about which disk or why.
@@ -3672,6 +3700,7 @@ impl CreateCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             network_name: params.network_name.clone(),
+            guest_subnet: params.guest_subnet.clone(),
             gpu: params.gpu,
             nested_virt: params.nested_virt,
             gpu_vram_mib: params.gpu_vram_mib,
@@ -3760,6 +3789,7 @@ impl CreateCmd {
                 || self.net
                 || self.net_backend.is_some()
                 || self.dns.is_some()
+                || self.guest_subnet.is_some()
                 || self.network_name.is_some()
                 || !self.allow_cidr.is_empty()
                 || !self.allow_host.is_empty()
@@ -3905,6 +3935,10 @@ impl CreateCmd {
             Some(checkpoint) => smolvm::portable_checkpoint::restored_network_backend(checkpoint)?,
             None => None,
         };
+        let checkpoint_subnet = match checkpoint.as_ref() {
+            Some(checkpoint) => smolvm::portable_checkpoint::restored_guest_subnet(checkpoint)?,
+            None => None,
+        };
         let params = vm_common::CreateVmParams {
             disks: Vec::new(),
             nested_virt: self.nested_virt,
@@ -3946,6 +3980,7 @@ impl CreateCmd {
             network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
             network_name: self.network_name.clone(),
+            guest_subnet: checkpoint_subnet.or_else(|| self.guest_subnet.clone()),
             init: self.init.clone(),
             env: {
                 let mut env = manifest.env;
@@ -4021,6 +4056,7 @@ impl CreateCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             network_name: params.network_name.clone(),
+            guest_subnet: params.guest_subnet.clone(),
             gpu: params.gpu,
             nested_virt: params.nested_virt,
             gpu_vram_mib: params.gpu_vram_mib,

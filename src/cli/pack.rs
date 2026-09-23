@@ -606,6 +606,7 @@ impl PackCreateCmd {
                 network_backend: None,
                 dns: None,
                 network_name: None,
+                guest_subnet: None,
                 gpu: false,
                 nested_virt: false,
                 cuda: false,

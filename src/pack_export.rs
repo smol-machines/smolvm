@@ -501,6 +501,7 @@ impl ExportVm {
                 disks: Vec::new(),
                 allowed_cidrs: None,
                 network_name: None,
+                guest_subnet: None,
             },
             features,
         ) {
@@ -1484,6 +1485,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             disks: Vec::new(),
             allowed_cidrs: None,
             network_name: None,
+            guest_subnet: None,
         },
         features,
     )?;

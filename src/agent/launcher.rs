@@ -1181,11 +1181,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
                 }
 
-                let mut guest_network = GuestNetworkConfig::default();
+                let mut guest_network = crate::network::launch::apply_guest_subnet(
+                    GuestNetworkConfig::default(),
+                    resources,
+                )
+                .inspect_err(|_| krun_free_ctx(ctx))?;
                 guest_network.host_service = crate::network::launch::guest_host_service()
                     .map_err(|reason| Error::config("configure guest rollout ingress", reason))?;
                 // A custom resolver (--dns) becomes the gateway's upstream: the
-                // guest still points at the gateway (100.96.0.1), which forwards
+                // guest still points at the gateway (100.96.0.1 by default), which forwards
                 // queries to this address instead of the default.
                 if let Some(dns) = resources.dns {
                     guest_network.upstream_dns = dns;

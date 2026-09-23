@@ -512,6 +512,7 @@ impl ApiState {
                 allowed_cidrs: record.allowed_cidrs.clone(),
                 allowed_hosts: record.dns_filter_hosts.clone(),
                 network_backend: record.network_backend,
+                guest_subnet: record.guest_subnet.clone(),
             };
 
             // Create AgentManager and try to reconnect
@@ -1049,6 +1050,7 @@ impl ApiState {
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
         record.network_backend = reg.resources.network_backend;
+        record.guest_subnet = reg.resources.guest_subnet.clone();
         // GPU flags (previously dropped here, so API-created machines
         // silently lost CUDA/GPU on restart).
         record.gpu = reg.resources.gpu;
@@ -1675,6 +1677,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // does not expose it, so API-launched VMs inherit the backend default.
         dns: None,
         network_name: None,
+        guest_subnet: spec.guest_subnet.clone(),
     }
 }
 
@@ -1694,6 +1697,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         // back from the source record (see the MachineEntry reload path).
         allowed_hosts: None,
         network_backend: res.network_backend,
+        guest_subnet: res.guest_subnet,
     }
 }
 
@@ -1886,6 +1890,7 @@ mod tests {
             allowed_cidrs: None,
             allowed_hosts: None,
             network_backend: None,
+            guest_subnet: None,
         };
         let res = resource_spec_to_vm_resources(&spec, false);
         assert_eq!(res.cpus, DEFAULT_MICROVM_CPU_COUNT);
@@ -1948,6 +1953,7 @@ mod tests {
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     network_backend: None,
+                    guest_subnet: None,
                 },
                 restart: RestartConfig::default(),
                 network: false,
@@ -2006,6 +2012,7 @@ mod tests {
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     network_backend: None,
+                    guest_subnet: None,
                 },
                 restart: RestartConfig::default(),
                 network: false,
@@ -2075,6 +2082,7 @@ mod tests {
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     network_backend: None,
+                    guest_subnet: None,
                 },
                 restart: RestartConfig::default(),
                 network: false,

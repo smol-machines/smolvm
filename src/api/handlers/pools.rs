@@ -110,6 +110,7 @@ fn add_rollout_access_assignment(
     assignment: &mut Vec<(String, String)>,
     lease_id: &str,
     access: &crate::api::types::RolloutLeaseAccess,
+    gateway: std::net::Ipv4Addr,
 ) -> Result<(), ApiError> {
     crate::api::rollout::validate_name("rollout executor", &access.executor)
         .map_err(ApiError::from)?;
@@ -123,7 +124,7 @@ fn add_rollout_access_assignment(
         ),
         (
             crate::api::guest_rollout::ROLLOUT_URL_ENV.into(),
-            crate::api::guest_rollout::lease_rollout_url(&access.executor),
+            crate::api::guest_rollout::lease_rollout_url(gateway, &access.executor),
         ),
         (
             crate::api::guest_rollout::ROLLOUT_EXECUTOR_ENV.into(),
@@ -839,7 +840,12 @@ async fn acquire_lease_inner(
             .get(&access.executor)
             .await
             .map_err(ApiError::from)?;
-        add_rollout_access_assignment(&mut assignment, &lease_id, access)?;
+        add_rollout_access_assignment(
+            &mut assignment,
+            &lease_id,
+            access,
+            crate::api::guest_rollout::guest_gateway(&golden),
+        )?;
     }
     if pool.admission_device_ordinal().is_some()
         && assignment
@@ -1566,10 +1572,13 @@ mod tests {
             executor: "executor-a".into(),
             policy: "policy-3".into(),
         };
+        let gateway = std::net::Ipv4Addr::new(100, 96, 0, 1);
         let mut first = vec![("LEARNER".into(), "3".into())];
         let mut retry = first.clone();
-        add_rollout_access_assignment(&mut first, "lease-1111111111111111", &access).unwrap();
-        add_rollout_access_assignment(&mut retry, "lease-2222222222222222", &access).unwrap();
+        add_rollout_access_assignment(&mut first, "lease-1111111111111111", &access, gateway)
+            .unwrap();
+        add_rollout_access_assignment(&mut retry, "lease-2222222222222222", &access, gateway)
+            .unwrap();
         assert!(idempotent_assignment_matches(&first, &retry));
         assert_ne!(
             first
@@ -1581,7 +1590,7 @@ mod tests {
         );
         assert!(first.contains(&(
             crate::api::guest_rollout::ROLLOUT_URL_ENV.into(),
-            crate::api::guest_rollout::lease_rollout_url("executor-a")
+            crate::api::guest_rollout::lease_rollout_url(gateway, "executor-a")
         )));
 
         retry

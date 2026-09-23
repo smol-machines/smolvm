@@ -132,6 +132,13 @@ pub struct ResourceSpec {
     /// lighter outbound-only backend (rejected alongside published `ports`).
     #[serde(default)]
     pub network_backend: Option<crate::network::NetworkBackend>,
+    /// IPv4 subnet the guest link is drawn from (virtio-net only), e.g.
+    /// `10.200.0.0/30`. The gateway and the guest's resolver take the first host
+    /// address and the guest the second. Omit for the default `100.96.0.0/30`,
+    /// which collides with Tailscale or carrier NAT running inside the guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "10.200.0.0/30")]
+    pub guest_subnet: Option<String>,
 }
 
 // ============================================================================
@@ -628,6 +635,13 @@ pub struct CreateMachineRequest {
     /// path), so that combination is rejected.
     #[serde(default)]
     pub network_backend: Option<crate::network::NetworkBackend>,
+    /// IPv4 subnet the guest link is drawn from (virtio-net only), e.g.
+    /// `10.200.0.0/30`. The gateway and the guest's resolver take the first host
+    /// address and the guest the second. Omit for the default `100.96.0.0/30`,
+    /// which collides with Tailscale or carrier NAT running inside the guest.
+    #[serde(default)]
+    #[schema(example = "10.200.0.0/30")]
+    pub guest_subnet: Option<String>,
     /// Restart policy configuration.
     #[serde(default)]
     pub restart: Option<RestartSpec>,

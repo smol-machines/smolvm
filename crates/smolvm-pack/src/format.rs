@@ -464,6 +464,10 @@ pub struct CheckpointNetwork {
     /// Named local inter-VM network joined by the captured machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
+    /// Subnet of the captured guest link, when not the default. The restored
+    /// guest keeps its address in memory, so the host side must match it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_subnet: Option<String>,
     /// Captured outbound CIDR allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,

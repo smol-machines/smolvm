@@ -1738,6 +1738,23 @@ async fn create_machine_inner(
     // wiring — mirroring the CLI and `validate_requested_network_backend`. Only
     // an EXPLICIT TSI choice alongside ports is a misconfig (TSI is
     // outbound-only and would silently never accept connections).
+    let guest_subnet = req
+        .guest_subnet
+        .as_deref()
+        .map(|subnet| {
+            subnet
+                .parse::<smolvm_network::GuestSubnet>()
+                .map(|subnet| subnet.to_string())
+                .map_err(ApiError::BadRequest)
+        })
+        .transpose()?;
+    if guest_subnet.is_some() && req.network_backend == Some(crate::network::NetworkBackend::Tsi) {
+        return Err(ApiError::BadRequest(
+            "guestSubnet requires networkBackend 'virtio-net' (TSI has no guest link); \
+             omit networkBackend or set it to 'virtio-net'"
+                .to_string(),
+        ));
+    }
     if !req.ports.is_empty() && req.network_backend == Some(crate::network::NetworkBackend::Tsi) {
         return Err(ApiError::BadRequest(
             "published ports require networkBackend 'virtio-net' (TSI is outbound-only); \
@@ -2097,6 +2114,7 @@ async fn create_machine_inner(
             || req.storage_gb.is_some()
             || req.overlay_gb.is_some()
             || req.network_backend.is_some()
+            || req.guest_subnet.is_some()
             || req.docker_socket
         {
             return Err(ApiError::BadRequest(
@@ -2344,6 +2362,13 @@ async fn create_machine_inner(
         allowed_cidrs: normalized_cidrs,
         allowed_hosts: restored_allowed_hosts,
         network_backend: restored_network_backend,
+        // A restored guest already has its captured address in memory, so the
+        // checkpoint's subnet wins over anything requested.
+        guest_subnet: match manifest_checkpoint.as_ref() {
+            Some(checkpoint) => crate::portable_checkpoint::restored_guest_subnet(checkpoint)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+            None => guest_subnet,
+        },
     };
 
     // Validate request-body secret refs before persisting. Untrusted
@@ -5427,6 +5452,7 @@ mod tests {
             allowed_cidrs: None,
             allowed_hosts: None,
             network_backend: None,
+            guest_subnet: None,
             restart: None,
             image: None,
             from: None,

@@ -189,6 +189,101 @@ impl GuestNetworkConfig {
     }
 }
 
+/// The IPv4 subnet a machine's link is drawn from, when it is not the default
+/// `100.96.0.0/30`.
+///
+/// The default sits in the RFC 6598 shared address space (`100.64.0.0/10`),
+/// which Tailscale and carrier NAT also claim; a guest running either routes its
+/// own gateway away and loses the resolver on it. The gateway takes the first
+/// host address and the guest the second, and the guest's resolver stays on the
+/// gateway, so everything that addressed `100.96.0.1` moves with the subnet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestSubnet {
+    network: Ipv4Addr,
+    prefix_len: u8,
+}
+
+impl GuestSubnet {
+    /// Gateway (host side) address: the subnet's first host address.
+    pub fn gateway(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.network) + 1)
+    }
+
+    /// Guest address: the subnet's second host address.
+    pub fn guest(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.network) + 2)
+    }
+
+    /// Prefix length the guest configures on its interface.
+    pub fn prefix_len(&self) -> u8 {
+        self.prefix_len
+    }
+}
+
+impl std::str::FromStr for GuestSubnet {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (addr, prefix) = s
+            .trim()
+            .split_once('/')
+            .ok_or_else(|| format!("guest subnet '{s}' must be an IPv4 CIDR like 10.200.0.0/30"))?;
+        let addr: Ipv4Addr = addr
+            .parse()
+            .map_err(|_| format!("guest subnet '{s}': '{addr}' is not an IPv4 address"))?;
+        let prefix_len: u8 = prefix
+            .parse()
+            .map_err(|_| format!("guest subnet '{s}': '{prefix}' is not a prefix length"))?;
+        // /30 is the smallest subnet with room for a gateway and a guest;
+        // shorter than /8 would swallow whole address classes.
+        if !(8..=30).contains(&prefix_len) {
+            return Err(format!(
+                "guest subnet '{s}': prefix must be between /8 and /30"
+            ));
+        }
+        let mask = u32::MAX << (32 - prefix_len);
+        let network = Ipv4Addr::from(u32::from(addr) & mask);
+        if network != addr {
+            return Err(format!(
+                "guest subnet '{s}' has host bits set; did you mean {network}/{prefix_len}?"
+            ));
+        }
+        let first = network.octets()[0];
+        if network.is_loopback()
+            || network.is_link_local()
+            || network.is_multicast()
+            || first == 0
+            || first >= 240
+        {
+            return Err(format!(
+                "guest subnet '{s}' is in a reserved range (0/8, loopback, link-local, multicast or 240/4)"
+            ));
+        }
+        Ok(Self {
+            network,
+            prefix_len,
+        })
+    }
+}
+
+impl fmt::Display for GuestSubnet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
+impl GuestNetworkConfig {
+    /// Move the guest link onto `subnet`: guest, gateway and the guest's
+    /// resolver (which is the gateway) all follow it.
+    pub fn with_guest_subnet(mut self, subnet: GuestSubnet) -> Self {
+        self.guest_ip = subnet.guest();
+        self.gateway_ip = subnet.gateway();
+        self.prefix_len = subnet.prefix_len();
+        self.dns_server = subnet.gateway();
+        self
+    }
+}
+
 /// Filename of the per-VM egress denial audit log, created beside the vsock
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
@@ -469,5 +564,40 @@ mod tests {
         let first = host_has_ipv6_route();
         let second = host_has_ipv6_route();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn guest_subnet_derives_gateway_guest_and_resolver() {
+        let subnet: GuestSubnet = "10.200.0.0/30".parse().unwrap();
+        assert_eq!(subnet.gateway(), Ipv4Addr::new(10, 200, 0, 1));
+        assert_eq!(subnet.guest(), Ipv4Addr::new(10, 200, 0, 2));
+        assert_eq!(subnet.to_string(), "10.200.0.0/30");
+
+        let config =
+            GuestNetworkConfig::default().with_guest_subnet("172.31.8.0/24".parse().unwrap());
+        assert_eq!(config.gateway_ip, Ipv4Addr::new(172, 31, 8, 1));
+        assert_eq!(config.guest_ip, Ipv4Addr::new(172, 31, 8, 2));
+        assert_eq!(config.dns_server, config.gateway_ip);
+        assert_eq!(config.prefix_len, 24);
+    }
+
+    #[test]
+    fn guest_subnet_rejects_bad_input() {
+        for bad in [
+            "10.200.0.0",     // no prefix
+            "10.200.0.1/30",  // host bits set
+            "10.200.0.0/31",  // no room for gateway + guest
+            "10.0.0.0/7",     // too wide
+            "127.0.0.0/8",    // loopback
+            "169.254.0.0/30", // link-local (cloud metadata)
+            "224.0.0.0/30",   // multicast
+            "0.0.0.0/30",
+            "fd00::/64",
+        ] {
+            assert!(
+                bad.parse::<GuestSubnet>().is_err(),
+                "{bad} should be rejected"
+            );
+        }
     }
 }

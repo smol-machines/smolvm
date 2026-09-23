@@ -471,6 +471,8 @@ pub struct CreateVmParams {
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub network_name: Option<String>,
+    /// Canonical `--guest-subnet` CIDR, when set.
+    pub guest_subnet: Option<String>,
     pub init: Vec<String>,
     pub env: Vec<String>,
     pub workdir: Option<String>,
@@ -729,6 +731,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.network_name = params.network_name.clone();
+    record.guest_subnet = params.guest_subnet.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
     // Persist nesting the same way: `machine start` rebuilds resources from the
     // record, so a flag that only reaches the create-time launch is silently
@@ -1935,6 +1938,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.network_backend = o.network_backend;
     r.dns = o.dns;
     r.network_name = o.network_name.clone();
+    r.guest_subnet = o.guest_subnet.clone();
     r.storage_gb = o.storage_gb;
     r.overlay_gb = o.overlay_gb;
     r.block_io = o.block_io;
@@ -2006,6 +2010,7 @@ pub struct DefaultVmOverrides {
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub network_name: Option<String>,
+    pub guest_subnet: Option<String>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub block_io: smolvm::data::resources::BlockIoEngine,
@@ -2054,6 +2059,7 @@ impl DefaultVmOverrides {
             network_backend: params.network_backend,
             dns: params.dns,
             network_name: params.network_name.clone(),
+            guest_subnet: params.guest_subnet.clone(),
             storage_gb: params.storage_gb,
             overlay_gb: params.overlay_gb,
             block_io: params.block_io,

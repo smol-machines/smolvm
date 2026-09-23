@@ -715,6 +715,24 @@ impl Drop for RestoreReservation {
     }
 }
 
+/// Guest subnet a checkpoint must be restored on.
+///
+/// The restored guest keeps its captured address in memory, so the host side
+/// of the link has to come back on the same subnet, whatever the restore asks.
+pub fn restored_guest_subnet(checkpoint: &PortableCheckpointManifest) -> Result<Option<String>> {
+    checkpoint
+        .network
+        .as_ref()
+        .and_then(|network| network.guest_subnet.as_deref())
+        .map(|subnet| {
+            subnet
+                .parse::<smolvm_network::GuestSubnet>()
+                .map(|subnet| subnet.to_string())
+                .map_err(|error| Error::config("restore checkpoint guest subnet", error))
+        })
+        .transpose()
+}
+
 fn restored_record(
     name: &str,
     manifest: &PackManifest,
@@ -746,6 +764,7 @@ fn restored_record(
             Error::config("restore checkpoint DNS", error.to_string())
         })?;
     record.network_name = network.and_then(|network| network.network_name.clone());
+    record.guest_subnet = restored_guest_subnet(checkpoint)?;
     // The restored machine continues this checkpoint's history.
     record.checkpoint_head = checkpoint
         .lineage
@@ -2031,6 +2050,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         backend,
         dns: vm.dns.map(|dns| dns.to_string()),
         network_name: vm.network_name.clone(),
+        guest_subnet: vm.guest_subnet.clone(),
         allowed_cidrs: vm.allowed_cidrs.clone(),
         dns_filter_hosts: vm.dns_filter_hosts.clone(),
     }
@@ -3809,7 +3829,16 @@ mod tests {
             machine: "remote-source".into(),
             created_at: "2026-09-22T00:00:00Z".into(),
         });
+        remote.network = Some(CheckpointNetwork {
+            enabled: true,
+            backend: Some("virtio-net".into()),
+            guest_subnet: Some("10.200.0.0/30".into()),
+            ..Default::default()
+        });
         let restored = restored_record("local-restore", &manifest, &remote).unwrap();
+        // The restored guest still has its captured address, so the host side
+        // must come back on the same subnet.
+        assert_eq!(restored.guest_subnet.as_deref(), Some("10.200.0.0/30"));
         // The restored machine continues the checkpoint's history.
         assert_eq!(
             restored.checkpoint_head.as_deref(),
@@ -4301,6 +4330,7 @@ mod tests {
         record.restart.policy = crate::config::RestartPolicy::OnFailure;
         record.restart.max_retries = 7;
         record.restart.max_backoff_secs = 19;
+        record.guest_subnet = Some("10.200.0.0/30".to_string());
 
         validate_capture_profile(&record).expect("image + network + ports must be portable");
         let workload = checkpoint_workload(&record.name, &record).unwrap();
@@ -4312,6 +4342,7 @@ mod tests {
         let network = checkpoint_network(&record);
         assert!(network.enabled);
         assert_eq!(network.backend.as_deref(), Some("virtio-net"));
+        assert_eq!(network.guest_subnet.as_deref(), Some("10.200.0.0/30"));
         assert_eq!(
             network.ports,
             vec![CheckpointPort {

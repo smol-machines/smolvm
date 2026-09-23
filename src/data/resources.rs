@@ -109,6 +109,12 @@ pub struct VmResources {
     /// isolated from each other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
+    /// IPv4 subnet the guest link is drawn from (virtio-net only), e.g.
+    /// `10.200.0.0/30`: gateway and resolver take the first host address, the
+    /// guest the second. None = the default `100.96.0.0/30`, which collides
+    /// with Tailscale or carrier NAT running inside the guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_subnet: Option<String>,
 }
 
 /// Minimum memory required for the VM to boot (kernel + agent).
@@ -189,6 +195,7 @@ impl Default for VmResources {
             allowed_cidrs: None,
             dns: None,
             network_name: None,
+            guest_subnet: None,
         }
     }
 }

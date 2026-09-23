@@ -81,9 +81,21 @@ pub(crate) fn issue_lease_credential(lease_id: &str) -> Result<String, getrandom
     Ok(format!("{lease_id}.{}", hex::encode(secret)))
 }
 
-/// URL presented to a guest after its rollout scope has been validated.
-pub(crate) fn lease_rollout_url(executor: &str) -> String {
-    format!("http://100.96.0.1:{GUEST_ROLLOUT_PORT}/api/v1/rollout-executors/{executor}")
+/// URL presented to a guest after its rollout scope has been validated. The
+/// rollout ingress listens on the guest's gateway, which moves with the
+/// machine's guest subnet.
+pub(crate) fn lease_rollout_url(gateway: std::net::Ipv4Addr, executor: &str) -> String {
+    format!("http://{gateway}:{GUEST_ROLLOUT_PORT}/api/v1/rollout-executors/{executor}")
+}
+
+/// Gateway address of a machine's guest link.
+pub(crate) fn guest_gateway(record: &crate::config::VmRecord) -> std::net::Ipv4Addr {
+    record
+        .guest_subnet
+        .as_deref()
+        .and_then(|subnet| subnet.parse::<smolvm_network::GuestSubnet>().ok())
+        .map(|subnet| subnet.gateway())
+        .unwrap_or(smolvm_network::GuestNetworkConfig::default().gateway_ip)
 }
 
 fn assignment_value<'a>(lease: &'a ForkLeaseRecord, key: &str) -> Option<&'a str> {
@@ -438,6 +450,21 @@ mod tests {
         assert_eq!(
             router.oneshot(revoked).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn rollout_url_follows_the_guest_subnet() {
+        let mut record =
+            crate::config::VmRecord::new("golden".into(), 1, 128, vec![], vec![], true);
+        assert_eq!(
+            lease_rollout_url(guest_gateway(&record), "e"),
+            format!("http://100.96.0.1:{GUEST_ROLLOUT_PORT}/api/v1/rollout-executors/e")
+        );
+        record.guest_subnet = Some("10.200.0.0/30".into());
+        assert_eq!(
+            lease_rollout_url(guest_gateway(&record), "e"),
+            format!("http://10.200.0.1:{GUEST_ROLLOUT_PORT}/api/v1/rollout-executors/e")
         );
     }
 }
