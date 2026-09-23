@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-checkpoint"
-version = "1.17.0"
+version = "1.18.0"
 edition = "2021"
 description = "Incremental checkpoint storage and portable export for SmolVM"
 license = "Apache-2.0"
