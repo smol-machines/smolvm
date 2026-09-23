@@ -23,6 +23,11 @@ use std::path::{Path, PathBuf};
 
 /// Current portable-checkpoint metadata version.
 pub const FORMAT_VERSION: u32 = 4;
+/// Format version of a checkpoint file that carries its history (a packed
+/// checkpoint store, see `CheckpointLayout::Chunked`). Distinct from
+/// [`FORMAT_VERSION`] so runtimes that predate history refuse such files with
+/// a version message instead of failing on missing assets.
+pub const HISTORY_FORMAT_VERSION: u32 = 5;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
@@ -244,6 +249,21 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
 /// base. Both the CLI and the API restore paths go through here so the base
 /// policy lives in one place.
 pub fn materialize_for_restore(artifact: &Path, cache_dir: &Path) -> Result<()> {
+    materialize_for_restore_at(artifact, cache_dir, None)
+}
+
+/// [`materialize_for_restore`] for a retained ancestor generation. Ancestors
+/// skip the restore base: the base tracks the checkpoint's own generation.
+pub fn materialize_for_restore_at(
+    artifact: &Path,
+    cache_dir: &Path,
+    generation: Option<&str>,
+) -> Result<()> {
+    if let Some(generation) = generation {
+        return crate::checkpoint_store::materialize_at(artifact, generation, cache_dir)
+            .map(|_| ())
+            .map_err(|error| Error::agent("materialize checkpoint generation", error.to_string()));
+    }
     let base = crate::agent::restore_base_dir();
     let started = std::time::Instant::now();
     crate::checkpoint_store::materialize_with_base(artifact, cache_dir, Some(&base))
@@ -314,6 +334,112 @@ pub struct CaptureResult {
 /// state, and the machine remains checkpointable so it can immediately serve
 /// as a reusable rollback/fork root.
 pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) -> Result<()> {
+    restore_from_path_at(db, name, artifact, None)
+}
+
+/// Resolve `--at` against a checkpoint: `None` (or `~0`) is the checkpoint's
+/// own generation; anything else must name an ancestor a stored checkpoint
+/// retains. A single-file checkpoint holds exactly one generation.
+pub fn resolve_generation(artifact: &Path, at: Option<&str>) -> Result<Option<String>> {
+    let Some(at) = at.map(str::trim).filter(|at| !at.is_empty()) else {
+        return Ok(None);
+    };
+    if artifact.is_dir() {
+        return crate::checkpoint_store::resolve_generation(artifact, at)
+            .map_err(|error| Error::config("checkpoint generation", error.to_string()));
+    }
+    if at == "~0" {
+        return Ok(None);
+    }
+    Err(Error::config(
+        "checkpoint generation",
+        "a single-file checkpoint holds one generation; earlier ones are kept only by \
+         checkpoints captured with --store",
+    ))
+}
+
+/// If `artifact` is a single file carrying its history (`Chunked` payload),
+/// unpack it into a private directory checkpoint and return that directory;
+/// restore and export then treat it exactly like a stored checkpoint. `None`
+/// for directories and classic single-generation files.
+pub fn unpack_history_file(artifact: &Path) -> Result<Option<tempfile::TempDir>> {
+    if !artifact.is_file() {
+        return Ok(None);
+    }
+    // Integrity first: nothing in the file is parsed before its checksum holds.
+    verified_sidecar_footer(artifact)?;
+    unpack_verified_history_file(artifact)
+}
+
+/// [`unpack_history_file`] for a file whose checksum the caller has already
+/// verified, so the file is read only once more.
+pub fn unpack_verified_history_file(artifact: &Path) -> Result<Option<tempfile::TempDir>> {
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint manifest", error.to_string()))?;
+    let Some(checkpoint) = manifest.checkpoint.as_ref() else {
+        return Ok(None);
+    };
+    if checkpoint.payload != smolvm_pack::format::CheckpointLayout::Chunked {
+        return Ok(None);
+    }
+    validate_compatibility(checkpoint)?;
+    let root = crate::agent::vm_cache_root().join("checkpoint-unpack");
+    std::fs::create_dir_all(&root)
+        .map_err(|error| Error::agent("prepare checkpoint unpack", error.to_string()))?;
+    let directory = tempfile::Builder::new()
+        .prefix(".unpack-")
+        .tempdir_in(&root)
+        .map_err(|error| Error::agent("prepare checkpoint unpack", error.to_string()))?;
+    smolvm_pack::assets::decompress_assets_from_file(artifact, directory.path())
+        .map_err(|error| Error::agent("unpack checkpoint history", error.to_string()))?;
+    if !directory.path().join("checkpoint.json").is_file() {
+        return Err(Error::agent(
+            "unpack checkpoint history",
+            "the file's payload is not a checkpoint store",
+        ));
+    }
+    Ok(Some(directory))
+}
+
+/// Export from a stored checkpoint (or a history file): one generation when
+/// `at` is given, otherwise a single file carrying up to `history` earlier
+/// generations. Returns the file size and how many earlier generations it
+/// carries.
+pub fn export_checkpoint(
+    source: &Path,
+    at: Option<&str>,
+    history: usize,
+    output: &Path,
+) -> Result<(u64, usize)> {
+    let unpacked = unpack_history_file(source)?;
+    let source: &Path = unpacked.as_ref().map(|d| d.path()).unwrap_or(source);
+    if !source.is_dir() {
+        return Err(Error::config(
+            "export checkpoint",
+            "the source must be a stored checkpoint directory or a file that carries its history",
+        ));
+    }
+    if let Some(at) = at {
+        let generation = resolve_generation(source, Some(at))?;
+        return crate::checkpoint_store::export_at(source, generation.as_deref(), output)
+            .map(|bytes| (bytes, 0))
+            .map_err(|error| Error::agent("export checkpoint", error.to_string()));
+    }
+    crate::checkpoint_store::export_with_history(source, history, output, |manifest| {
+        if let Some(checkpoint) = manifest.checkpoint.as_mut() {
+            checkpoint.version = HISTORY_FORMAT_VERSION;
+        }
+    })
+    .map_err(|error| Error::agent("export checkpoint", error.to_string()))
+}
+
+/// [`restore_from_path`] at a chosen generation (see [`resolve_generation`]).
+pub fn restore_from_path_at(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    artifact: &Path,
+    at: Option<&str>,
+) -> Result<()> {
     let mut phase = std::time::Instant::now();
     crate::data::validate_vm_name(name, "machine name")
         .map_err(|reason| Error::config("restore checkpoint", reason))?;
@@ -329,8 +455,17 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
     } else {
         None
     };
+    // A verified history file becomes a directory checkpoint for the rest of
+    // the restore; classic files and directories pass through unchanged.
+    let unpacked = match footer {
+        Some(_) => unpack_verified_history_file(artifact)?,
+        None => None,
+    };
+    let artifact: &Path = unpacked.as_ref().map(|d| d.path()).unwrap_or(artifact);
+    let footer = if unpacked.is_some() { None } else { footer };
+    let generation = resolve_generation(artifact, at)?;
     let manifest = if footer.is_none() {
-        crate::checkpoint_store::read_manifest(artifact)
+        crate::checkpoint_store::read_manifest_at(artifact, generation.as_deref())
             .map_err(|error| Error::agent("read stored checkpoint", error.to_string()))?
     } else {
         smolvm_pack::packer::read_manifest_from_sidecar(artifact)
@@ -388,7 +523,7 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
             smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, footer, false, false)
                 .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
         } else {
-            materialize_for_restore(artifact, &cache_dir)?;
+            materialize_for_restore_at(artifact, &cache_dir, generation.as_deref())?;
         }
         log_phase(name, "restore_extract", &mut phase);
         install(&cache_dir, &vm_data, checkpoint)?;
@@ -620,6 +755,11 @@ fn restored_record(
             Error::config("restore checkpoint DNS", error.to_string())
         })?;
     record.network_name = network.and_then(|network| network.network_name.clone());
+    // The restored machine continues this checkpoint's history.
+    record.checkpoint_head = checkpoint
+        .lineage
+        .as_ref()
+        .map(|lineage| lineage.id.clone());
     record.entrypoint = manifest.entrypoint.clone();
     record.cmd = manifest.cmd.clone();
     record.env = crate::util::parse_env_list(&manifest.env);
@@ -812,7 +952,41 @@ pub fn capture_to_path(
     output: &Path,
     options: &CaptureOptions,
 ) -> Result<CaptureResult> {
-    capture_to_path_with_source_release(name, output, options, || {})
+    capture_to_path_with_history(name, output, options, DEFAULT_HISTORY)
+}
+
+/// Ancestor generations a stored checkpoint retains unless told otherwise —
+/// the same depth the live branch lineage allows.
+pub const DEFAULT_HISTORY: usize = 32;
+
+/// [`capture_to_path`] with an explicit number of ancestor generations to
+/// retain in a stored checkpoint (`0` keeps none; standalone files never
+/// retain any). Lineage ids and parents are recorded either way.
+pub fn capture_to_path_with_history(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    history: usize,
+) -> Result<CaptureResult> {
+    capture_to_path_with_source_release(name, output, options, history, || {})
+}
+
+/// A fresh checkpoint id: 128 random bits as lowercase hex.
+fn new_checkpoint_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("operating system randomness");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Move the machine's checkpoint head to `id` after a capture or restore.
+fn set_checkpoint_head(name: &str, id: &str) {
+    let result = crate::db::SmolvmDb::open().and_then(|db| {
+        db.update_vm(name, |record| record.checkpoint_head = Some(id.to_string()))
+            .map(|_| ())
+    });
+    if let Err(error) = result {
+        tracing::warn!(machine = %name, %error, "checkpoint head not recorded");
+    }
 }
 
 /// Release API lifecycle ownership only after all input state belongs to this
@@ -821,9 +995,18 @@ pub(crate) fn capture_to_path_with_source_release(
     name: &str,
     output: &Path,
     options: &CaptureOptions,
+    history: usize,
     release_source: impl FnOnce(),
 ) -> Result<CaptureResult> {
-    capture_with_completion(name, output, options, release_source, false, |_| Ok(()))
+    capture_with_completion(
+        name,
+        output,
+        options,
+        history,
+        release_source,
+        false,
+        |_| Ok(()),
+    )
 }
 
 /// Durable lifecycle boundaries for an owner coordinating a pause.
@@ -843,13 +1026,22 @@ pub fn capture_and_stop_to_path(
     options: &CaptureOptions,
     publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
 ) -> Result<CaptureResult> {
-    capture_with_completion(name, output, options, || {}, true, publish_resume_point)
+    capture_with_completion(
+        name,
+        output,
+        options,
+        DEFAULT_HISTORY,
+        || {},
+        true,
+        publish_resume_point,
+    )
 }
 
 fn capture_with_completion(
     name: &str,
     output: &Path,
     options: &CaptureOptions,
+    history: usize,
     release_source: impl FnOnce(),
     stop_after_capture: bool,
     mut publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
@@ -974,6 +1166,11 @@ fn capture_with_completion(
         .vms
         .get(name)
         .expect("validated checkpoint source must remain in its loaded config");
+    // This capture's place in the machine's history: a new node whose parent
+    // is whatever the machine was last captured to or restored from.
+    let checkpoint_id = new_checkpoint_id();
+    let checkpoint_created_at =
+        humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
     if stop_after_capture {
         let db = crate::db::SmolvmDb::open()?;
         if !db.dependent_clones(name)?.is_empty() {
@@ -1251,6 +1448,14 @@ fn capture_with_completion(
         workload: checkpoint_workload(name, vm),
         network: Some(checkpoint_network(vm)),
         packed_layers,
+        lineage: Some(smolvm_pack::format::CheckpointLineage {
+            id: checkpoint_id.clone(),
+            parent: vm.checkpoint_head.clone(),
+            machine: name.to_string(),
+            created_at: checkpoint_created_at.clone(),
+        }),
+        payload: Default::default(),
+        history: Vec::new(),
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
@@ -1280,6 +1485,35 @@ fn capture_with_completion(
         temp_dir
             .close()
             .map_err(|e| Error::agent("remove checkpoint staging", e.to_string()))?;
+        // Keep the parent's generations in this checkpoint so it can restore
+        // any point in its history on its own; unchanged chunks are links.
+        let store = options
+            .store_dir
+            .as_ref()
+            .and_then(|store| store.canonicalize().ok());
+        if let (Some(store), Some(parent)) = (store.as_ref(), vm.checkpoint_head.as_deref()) {
+            match crate::checkpoint_store::find_generation_source(store, parent) {
+                Ok(Some((source, own))) => {
+                    let start = (!own).then_some(parent);
+                    match writer.retain_generations_from(directory.path(), &source, start, history)
+                    {
+                        Ok(retained) => {
+                            tracing::info!(retained, parent, "checkpoint history retained")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, parent, "checkpoint history not retained")
+                        }
+                    }
+                }
+                Ok(None) => tracing::info!(
+                    parent,
+                    "parent checkpoint not in this store; history starts here"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, parent, "checkpoint lineage index unreadable")
+                }
+            }
+        }
         let stats = writer
             .finish(directory.path(), manifest, files)
             .map_err(|e| Error::agent("finish checkpoint index", e.to_string()))?;
@@ -1292,10 +1526,28 @@ fn capture_with_completion(
         );
         crate::checkpoint_store::publish(directory.path(), output)
             .map_err(|e| Error::agent("publish stored checkpoint", e.to_string()))?;
+        if let Some(store) = store.as_ref() {
+            let published = output
+                .canonicalize()
+                .unwrap_or_else(|_| output.to_path_buf());
+            if let Err(error) = crate::checkpoint_store::record_lineage(
+                store,
+                &crate::checkpoint_store::LineageRecord {
+                    id: checkpoint_id.clone(),
+                    parent: vm.checkpoint_head.clone(),
+                    machine: name.to_string(),
+                    created_at: checkpoint_created_at.clone(),
+                    path: published.to_string_lossy().into_owned(),
+                },
+            ) {
+                tracing::warn!(%error, "checkpoint lineage not recorded in store");
+            }
+        }
         if stop_after_capture {
             publish_resume_point(PauseCaptureStage::Durable)?;
             pause.stop(name, vm)?;
         }
+        set_checkpoint_head(name, &checkpoint_id);
         return Ok(CaptureResult {
             size_bytes: stats.new_bytes,
             reused_bytes: stats.reused_bytes,
@@ -1357,6 +1609,7 @@ fn capture_with_completion(
         publish_resume_point(PauseCaptureStage::Durable)?;
         pause.stop(name, vm)?;
     }
+    set_checkpoint_head(name, &checkpoint_id);
     Ok(CaptureResult {
         reused_bytes: 0,
         size_bytes: info.total_size,
@@ -2297,12 +2550,16 @@ fn describe_sparse_asset(path: &Path, relative_path: &str) -> Result<CheckpointA
 
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
-    if checkpoint.version != FORMAT_VERSION {
+    let required = match checkpoint.payload {
+        smolvm_pack::format::CheckpointLayout::Assets => FORMAT_VERSION,
+        smolvm_pack::format::CheckpointLayout::Chunked => HISTORY_FORMAT_VERSION,
+    };
+    if checkpoint.version != required {
         return Err(Error::agent(
             "restore checkpoint",
             format!(
                 "unsupported checkpoint version {} (runtime requires {})",
-                checkpoint.version, FORMAT_VERSION
+                checkpoint.version, required
             ),
         ));
     }
@@ -2681,7 +2938,11 @@ fn share_service_owned_backing(
     input.set_permissions(std::fs::Permissions::from_mode(0o444))?;
     match std::fs::hard_link(source, destination) {
         Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => return Ok(false),
+        // A different filesystem, or a base already linked into as many
+        // machines as the filesystem allows (ext4: 65,000), gets a private copy.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EXDEV | libc::EMLINK)) => {
+            return Ok(false)
+        }
         Err(error) => return Err(error.into()),
     }
     let linked = std::fs::symlink_metadata(destination)?;
@@ -2831,6 +3092,22 @@ fn protect_restore_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a restore may give the captured writable disk a copy-on-write top
+/// instead of copying it. On by default; `SMOLVM_RESTORE_COW_DISK=0` restores
+/// the full copy.
+#[cfg(target_os = "linux")]
+fn cow_restore_enabled() -> bool {
+    std::env::var("SMOLVM_RESTORE_COW_DISK").map_or(true, |value| value != "0")
+}
+
+/// Whether two paths name the same file.
+#[cfg(target_os = "linux")]
+fn same_inode(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
 /// Install verified checkpoint state before a machine is launched.
 pub fn install(
     extracted: &Path,
@@ -2894,11 +3171,49 @@ pub fn install(
         let staged_disks = partial.join("disks");
         std::fs::create_dir(&staged_disks)
             .map_err(|error| Error::agent("stage checkpoint disks", error.to_string()))?;
+        // Names to move into the machine directory, and the copy-on-write tops
+        // to create over a captured writable disk once its base is in place.
+        let mut staged_names: Vec<String> = Vec::new();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut cow_tops: Vec<crate::agent::DiskOverlaySpec> = Vec::new();
         for disk in &checkpoint.disks {
             for (index, file) in disk.files.iter().enumerate() {
                 let started = std::time::Instant::now();
                 let staged = staged_disks.join(&file.target);
                 let source = extracted.join(&file.asset.path);
+                #[cfg(target_os = "linux")]
+                if index == 0
+                    && disk.files.len() == 1
+                    && file.format == "raw"
+                    && cow_restore_enabled()
+                {
+                    // Copying the captured disk is most of a restore. Share it
+                    // as an immutable base instead, like a deeper layer, and
+                    // give this machine a thin qcow2 top of its own. Only a
+                    // base that really is shared earns the extra layer; a
+                    // private copy is simply this machine's writable disk.
+                    let base_name = format!(".smolcheckpoint-{}-base.raw", disk.role);
+                    let staged_base = staged_disks.join(&base_name);
+                    promote_retained_backing(extracted, &source, &file.asset)?;
+                    link_or_copy_verified_sparse(&source, &staged_base, &file.asset)?;
+                    if same_inode(&source, &staged_base)? {
+                        cow_tops.push((
+                            vm_data_dir.join(Path::new(&file.target).with_extension("qcow2")),
+                            vm_data_dir.join(&base_name),
+                            crate::data::disk::DiskFormat::Raw,
+                        ));
+                        staged_names.push(base_name);
+                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "cow_top", "checkpoint disk installed");
+                    } else {
+                        std::fs::rename(&staged_base, &staged).map_err(|error| {
+                            Error::agent("stage checkpoint disk", error.to_string())
+                        })?;
+                        staged_names.push(file.target.clone());
+                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = true, "checkpoint disk installed");
+                    }
+                    continue;
+                }
+                staged_names.push(file.target.clone());
                 if index == 0 {
                     // The active top layer is writable after resume and must
                     // never alias the immutable extraction cache.
@@ -2952,17 +3267,15 @@ pub fn install(
                 }
             }
         }
-        for disk in &checkpoint.disks {
-            for file in &disk.files {
-                // The staged chain is already private (top) or has an owned
-                // hard link (immutable backing). Move those exact inodes into
-                // the launcher's disk namespace instead of copying them again.
-                std::fs::rename(
-                    destination.join("disks").join(&file.target),
-                    vm_data_dir.join(&file.target),
-                )
+        // The staged chain is already private (top) or has an owned hard link
+        // (immutable backing). Move those exact inodes into the launcher's disk
+        // namespace instead of copying them again.
+        for name in &staged_names {
+            std::fs::rename(destination.join("disks").join(name), vm_data_dir.join(name))
                 .map_err(|error| Error::agent("publish checkpoint disk", error.to_string()))?;
-            }
+        }
+        crate::agent::create_disk_overlays(&cow_tops)?;
+        for disk in &checkpoint.disks {
             std::fs::write(vm_data_dir.join(format!("{}.formatted", disk.role)), b"1").map_err(
                 |error| Error::agent("mark checkpoint disk formatted", error.to_string()),
             )?;
@@ -3119,6 +3432,18 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_file_checkpoints_hold_one_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("one.smolcheckpoint");
+        std::fs::write(&file, b"not really a checkpoint").unwrap();
+        assert_eq!(resolve_generation(&file, None).unwrap(), None);
+        assert_eq!(resolve_generation(&file, Some("~0")).unwrap(), None);
+        assert_eq!(resolve_generation(&file, Some(" ")).unwrap(), None);
+        assert!(resolve_generation(&file, Some("~1")).is_err());
+        assert!(resolve_generation(&file, Some("0123456789ab")).is_err());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -3547,6 +3872,9 @@ mod tests {
             workload: None,
             network: Some(CheckpointNetwork::default()),
             packed_layers: None,
+            lineage: None,
+            payload: Default::default(),
+            history: Vec::new(),
         };
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
@@ -3562,9 +3890,32 @@ mod tests {
         );
         assert!(machine.path().join("storage.formatted").is_file());
         assert!(machine.path().join("overlay.formatted").is_file());
+        // A base this host cannot share stays a private writable copy: no
+        // copy-on-write layer, and never an alias of the extraction cache.
+        #[cfg(target_os = "linux")]
+        let shared = crate::process::vm_uid_drop_active();
+        #[cfg(not(target_os = "linux"))]
+        let shared = false;
+        if !shared {
+            assert!(!machine.path().join("storage.qcow2").exists());
+            assert!(!machine
+                .path()
+                .join(".smolcheckpoint-storage-base.raw")
+                .exists());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            if !shared {
+                assert_ne!(
+                    std::fs::metadata(source.join("disks/storage/0"))
+                        .unwrap()
+                        .ino(),
+                    std::fs::metadata(machine.path().join("storage.raw"))
+                        .unwrap()
+                        .ino()
+                );
+            }
             assert_ne!(
                 std::fs::metadata(source.join("memory.bin")).unwrap().ino(),
                 std::fs::metadata(machine.path().join(INSTALLED_DIR).join("memory.bin"))
@@ -3606,7 +3957,18 @@ mod tests {
             "linux/amd64".into(),
             "linux/amd64".into(),
         );
+        remote.lineage = Some(smolvm_pack::format::CheckpointLineage {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            parent: None,
+            machine: "remote-source".into(),
+            created_at: "2026-09-22T00:00:00Z".into(),
+        });
         let restored = restored_record("local-restore", &manifest, &remote).unwrap();
+        // The restored machine continues the checkpoint's history.
+        assert_eq!(
+            restored.checkpoint_head.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(
             restored.fork_overlay_owner.as_deref(),
             Some("remote-source")
@@ -4199,6 +4561,9 @@ mod tests {
             workload: None,
             network: Some(CheckpointNetwork::default()),
             packed_layers: None,
+            lineage: None,
+            payload: Default::default(),
+            history: Vec::new(),
         }
     }
 
@@ -4208,6 +4573,12 @@ mod tests {
         validate_compatibility(&metadata).unwrap();
         metadata.version = FORMAT_VERSION - 1;
         assert!(validate_compatibility(&metadata).is_err());
+        // A history file needs its own version, and only that version.
+        metadata.payload = smolvm_pack::format::CheckpointLayout::Chunked;
+        metadata.version = FORMAT_VERSION;
+        assert!(validate_compatibility(&metadata).is_err());
+        metadata.version = HISTORY_FORMAT_VERSION;
+        validate_compatibility(&metadata).unwrap();
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

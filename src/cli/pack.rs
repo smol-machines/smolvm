@@ -77,6 +77,18 @@ pub struct CheckpointCmd {
     /// Export a stored checkpoint directory as one portable file.
     #[arg(long, value_name = "CHECKPOINT", conflicts_with = "store")]
     pub export_from: Option<PathBuf>,
+    /// With --export-from: which generation to export — `~N` (N back along
+    /// the history, `~0` is the checkpoint itself), a generation id, or an id
+    /// prefix. See `machine checkpoint-log`.
+    #[arg(long, value_name = "GENERATION", requires = "export_from")]
+    pub at: Option<String>,
+    /// How many earlier generations to carry: with --store, the new checkpoint
+    /// retains them so any can be restored from it alone; with --export-from,
+    /// the exported file carries them (0 exports one generation in the classic
+    /// layout readable by older runtimes). Unchanged chunks are shared either
+    /// way, so history costs only the differences.
+    #[arg(long, value_name = "N", default_value_t = smolvm::portable_checkpoint::DEFAULT_HISTORY)]
+    pub history: usize,
 
     /// Reuse unchanged chunks here; output becomes a self-contained directory
     /// on the same filesystem (copy the whole directory to move it).
@@ -107,19 +119,28 @@ impl CheckpointCmd {
     /// Capture and package a live machine at one RAM/disk consistency boundary.
     pub fn run(self) -> smolvm::Result<()> {
         if let Some(source) = self.export_from {
-            let bytes = smolvm::checkpoint_store::export(&source, &self.output)
-                .map_err(|e| smolvm::Error::agent("export checkpoint", e.to_string()))?;
+            let (bytes, carried) = smolvm::portable_checkpoint::export_checkpoint(
+                &source,
+                self.at.as_deref(),
+                self.history,
+                &self.output,
+            )?;
             println!(
-                "Exported checkpoint to {} ({} MiB)",
+                "Exported checkpoint to {} ({} MiB{})",
                 self.output.display(),
-                bytes / (1024 * 1024)
+                bytes / (1024 * 1024),
+                if carried > 0 {
+                    format!(", carrying {carried} earlier generation(s)")
+                } else {
+                    String::new()
+                }
             );
             return Ok(());
         }
         let name = self
             .name
             .ok_or_else(|| smolvm::Error::config("checkpoint", "--name is required"))?;
-        let result = smolvm::portable_checkpoint::capture_to_path(
+        let result = smolvm::portable_checkpoint::capture_to_path_with_history(
             &name,
             &self.output,
             &smolvm::portable_checkpoint::CaptureOptions {
@@ -129,6 +150,7 @@ impl CheckpointCmd {
                 lib_dir: self.lib_dir,
                 rootfs_dir: self.rootfs_dir,
             },
+            self.history,
         )?;
         println!(
             "Source resumed after {:.3}s; packaging continued in the background",
@@ -150,6 +172,128 @@ impl CheckpointCmd {
         }
         Ok(())
     }
+}
+
+/// Show the history a checkpoint carries, or every checkpoint a store knows.
+#[derive(Args, Debug)]
+pub struct CheckpointLogCmd {
+    /// A stored checkpoint directory: lists its own generation and every
+    /// earlier one it retains, newest first.
+    #[arg(
+        value_name = "CHECKPOINT",
+        required_unless_present = "store",
+        conflicts_with = "store"
+    )]
+    pub checkpoint: Option<PathBuf>,
+    /// A checkpoint store: lists every checkpoint published into it, oldest
+    /// first, with its parent.
+    #[arg(long, value_name = "DIR")]
+    pub store: Option<PathBuf>,
+    /// Only checkpoints of this machine (with --store).
+    #[arg(long, value_name = "NAME", requires = "store")]
+    pub machine: Option<String>,
+}
+
+impl CheckpointLogCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        if let Some(store) = self.store {
+            let records = smolvm::checkpoint_store::list_lineage(&store).map_err(|e| {
+                smolvm::Error::agent("read checkpoint store lineage", e.to_string())
+            })?;
+            let mut shown = 0;
+            for record in records.iter().filter(|r| {
+                self.machine
+                    .as_deref()
+                    .is_none_or(|m| m == record_machine(r))
+            }) {
+                let present = if std::path::Path::new(&record.path).is_dir() {
+                    ""
+                } else {
+                    "  (directory removed)"
+                };
+                println!(
+                    "{}  {}  {:<20}  parent {}  {}{}",
+                    &record.id[..12],
+                    record.created_at,
+                    record.machine,
+                    record
+                        .parent
+                        .as_deref()
+                        .map_or("-".to_string(), |p| p[..12].to_string()),
+                    record.path,
+                    present
+                );
+                shown += 1;
+            }
+            if shown == 0 {
+                println!("no checkpoints recorded in {}", store.display());
+            }
+            return Ok(());
+        }
+        let checkpoint = self
+            .checkpoint
+            .expect("clap requires a checkpoint or --store");
+        let generations = if checkpoint.is_file() {
+            // Files describe their history in the manifest; no unpacking needed.
+            let manifest = smolvm_pack::packer::read_manifest_from_sidecar(&checkpoint)
+                .map_err(|e| smolvm::Error::agent("read checkpoint manifest", e.to_string()))?;
+            let checkpoint_manifest = manifest.checkpoint.ok_or_else(|| {
+                smolvm::Error::config("checkpoint-log", "not a checkpoint artifact")
+            })?;
+            if checkpoint_manifest.history.is_empty() {
+                match checkpoint_manifest.lineage {
+                    Some(lineage) => vec![smolvm::checkpoint_store::Generation {
+                        id: lineage.id,
+                        parent: lineage.parent,
+                        machine: lineage.machine,
+                        created_at: lineage.created_at,
+                        data_bytes: 0,
+                        retained: false,
+                    }],
+                    None => Vec::new(),
+                }
+            } else {
+                smolvm::checkpoint_store::generations_from_history(&checkpoint_manifest.history)
+            }
+        } else {
+            smolvm::checkpoint_store::lineage_of(&checkpoint)
+                .map_err(|e| smolvm::Error::agent("read checkpoint history", e.to_string()))?
+        };
+        if generations.is_empty() {
+            println!(
+                "{} predates checkpoint history (no lineage recorded)",
+                checkpoint.display()
+            );
+            return Ok(());
+        }
+        for (depth, generation) in generations.iter().enumerate() {
+            let size = if generation.data_bytes > 0 {
+                format!("{} MiB data", generation.data_bytes / (1024 * 1024))
+            } else {
+                String::new()
+            };
+            println!(
+                "~{depth:<3} {}  {}  {:<20}  {size}{}",
+                &generation.id[..12],
+                generation.created_at,
+                generation.machine,
+                if generation.retained {
+                    ""
+                } else {
+                    "  (this checkpoint)"
+                }
+            );
+        }
+        println!(
+            "restore any of them: smolvm machine create --name <new> --from {} --at ~N",
+            checkpoint.display()
+        );
+        Ok(())
+    }
+}
+
+fn record_machine(record: &smolvm::checkpoint_store::LineageRecord) -> &str {
+    &record.machine
 }
 
 /// Reclaim checkpoint cache objects that no retained checkpoint references.

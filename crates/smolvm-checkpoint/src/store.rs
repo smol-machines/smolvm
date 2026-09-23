@@ -16,6 +16,13 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 const VERSION: u32 = 1;
 const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
 const INDEX: &str = "checkpoint.json";
+/// Directory inside a stored checkpoint holding the indexes of the ancestor
+/// generations it retains (see [`Writer::retain_generations`]).
+pub const GENERATIONS: &str = "generations";
+/// Directory inside a store recording where each checkpoint id was published.
+const LINEAGE_DIR: &str = "lineage";
+/// Upper bound on ancestor generations one checkpoint retains.
+pub const MAX_RETAINED_GENERATIONS: usize = 256;
 const CAPTURE_MARKER: &str = ".capture-owner";
 const CAPTURE_MAGIC: &[u8] = b"smolvm-checkpoint-capture-v1\n";
 const OBJECT_STAGING_PREFIX: &str = ".checkpoint-object-";
@@ -467,6 +474,430 @@ impl Writer {
     }
 }
 
+impl Writer {
+    /// Retain `parent`'s generation, and every generation `parent` retains, in
+    /// the checkpoint being written at `directory`: their indexes are copied
+    /// under [`GENERATIONS`] and every object they reference is hard-linked
+    /// into this checkpoint's `objects`, so any of them can be restored from
+    /// this directory alone. Shared chunks cost nothing beyond the link — the
+    /// history is stored as differences. Returns how many generations were
+    /// retained; `limit` bounds the depth (newest first).
+    pub fn retain_generations(
+        &mut self,
+        directory: &Path,
+        parent: &Path,
+        limit: usize,
+    ) -> io::Result<usize> {
+        self.retain_generations_from(directory, parent, None, limit)
+    }
+
+    /// [`retain_generations`](Self::retain_generations) starting at generation
+    /// `start` within `source`'s history rather than at `source` itself — used
+    /// when the parent's own directory is gone but another checkpoint in the
+    /// store still retains it.
+    pub fn retain_generations_from(
+        &mut self,
+        directory: &Path,
+        source: &Path,
+        start: Option<&str>,
+        limit: usize,
+    ) -> io::Result<usize> {
+        let limit = limit.min(MAX_RETAINED_GENERATIONS);
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut sources: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let mut started = start.is_none();
+        for generation in lineage_of(source)? {
+            if !started {
+                started = start == Some(generation.id.as_str());
+                if !started {
+                    continue;
+                }
+            }
+            let path = if generation.retained {
+                source.join(GENERATIONS).join(&generation.id).join(INDEX)
+            } else {
+                source.join(INDEX)
+            };
+            sources.push((generation.id, path));
+        }
+        if !started {
+            return Err(invalid("start generation is not in the source's history"));
+        }
+        sources.truncate(limit);
+        let parent_objects = source.join("objects");
+        let generations = directory.join(GENERATIONS);
+        let mut retained = 0;
+        for (id, index_path) in sources {
+            let index = read_index_from(&index_path)?;
+            for hash in index.files.iter().flat_map(|f| f.chunks.iter().flatten()) {
+                let destination = self.objects.join(hash);
+                if destination.exists() {
+                    continue;
+                }
+                let source = parent_objects.join(hash);
+                let source = if source.is_file() {
+                    source
+                } else {
+                    self.cache.join(hash)
+                };
+                match fs::hard_link(&source, &destination) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let target = generations.join(&id);
+            fs::create_dir_all(&target)?;
+            fs::copy(&index_path, target.join(INDEX))?;
+            retained += 1;
+        }
+        if retained > 0 {
+            File::open(&generations)?.sync_all()?;
+        }
+        Ok(retained)
+    }
+}
+
+/// One generation reachable from a stored checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    /// Checkpoint id of this generation.
+    pub id: String,
+    /// Id of the generation it continues from, when known.
+    pub parent: Option<String>,
+    /// Machine the generation was captured from.
+    pub machine: String,
+    /// When it was published (RFC 3339).
+    pub created_at: String,
+    /// Bytes of actual data the generation describes (holes and zero chunks
+    /// excluded), the figure a restore has to materialize.
+    pub data_bytes: u64,
+    /// `false` for the checkpoint's own generation, `true` for a retained ancestor.
+    pub retained: bool,
+}
+
+fn generation_of(index: &Index, retained: bool) -> Option<Generation> {
+    let lineage = index.manifest.checkpoint.as_ref()?.lineage.as_ref()?;
+    Some(Generation {
+        id: lineage.id.clone(),
+        parent: lineage.parent.clone(),
+        machine: lineage.machine.clone(),
+        created_at: lineage.created_at.clone(),
+        data_bytes: index.files.iter().map(data_size).sum(),
+        retained,
+    })
+}
+
+/// The checkpoint's own generation followed by the ancestors it retains,
+/// newest first along the parent chain. A checkpoint written before lineage
+/// was recorded yields an empty list.
+pub fn lineage_of(directory: &Path) -> io::Result<Vec<Generation>> {
+    let Some(own) = generation_of(&read_index(directory)?, false) else {
+        return Ok(Vec::new());
+    };
+    let mut retained: HashMap<String, Generation> = HashMap::new();
+    let generations = directory.join(GENERATIONS);
+    if generations.is_dir() {
+        for entry in fs::read_dir(&generations)? {
+            let entry = entry?;
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !valid_generation_id(&id) || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Some(generation) =
+                generation_of(&read_index_from(&entry.path().join(INDEX))?, true)
+            {
+                if generation.id == id {
+                    retained.insert(id, generation);
+                }
+            }
+        }
+    }
+    let mut chain = vec![own];
+    while let Some(parent) = chain.last().and_then(|g| g.parent.clone()) {
+        match retained.remove(&parent) {
+            Some(generation) => chain.push(generation),
+            None => break,
+        }
+    }
+    // Generations kept from an older lineage that this chain no longer links
+    // to are still restorable; list them after the chain.
+    let mut leftovers: Vec<Generation> = retained.into_values().collect();
+    leftovers.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    chain.extend(leftovers);
+    Ok(chain)
+}
+
+/// Resolve a user-supplied generation reference against `directory`: `~N`
+/// (N generations back along the chain; `~0` is the checkpoint itself), a
+/// full id, or an unambiguous id prefix of at least eight characters. Returns
+/// `None` for the checkpoint's own generation and `Some(id)` for a retained
+/// ancestor.
+pub fn resolve_generation(directory: &Path, at: &str) -> io::Result<Option<String>> {
+    resolve_in(&lineage_of(directory)?, at)
+}
+
+/// [`resolve_generation`] against an already-listed history (a directory's
+/// [`lineage_of`], or a file's manifest history via [`generations_from_history`]).
+pub fn resolve_in(lineage: &[Generation], at: &str) -> io::Result<Option<String>> {
+    let at = at.trim();
+    let generation = if let Some(depth) = at.strip_prefix('~') {
+        let depth: usize = depth
+            .parse()
+            .map_err(|_| invalid("generation must be ~N, an id, or an id prefix"))?;
+        lineage.get(depth).ok_or_else(|| {
+            invalid(format!(
+                "this checkpoint keeps {} earlier generation(s); ~{depth} is out of range",
+                lineage.len().saturating_sub(1)
+            ))
+        })?
+    } else {
+        if at.len() < 8 || !at.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid(
+                "generation must be ~N, an id, or an id prefix of 8+ hex characters",
+            ));
+        }
+        let at = at.to_ascii_lowercase();
+        let mut matches = lineage.iter().filter(|g| g.id.starts_with(&at));
+        let first = matches
+            .next()
+            .ok_or_else(|| invalid(format!("no generation matches {at}")))?;
+        if matches.next().is_some() {
+            return Err(invalid(format!("generation prefix {at} is ambiguous")));
+        }
+        first
+    };
+    Ok(generation.retained.then(|| generation.id.clone()))
+}
+
+/// The history a `Chunked` checkpoint file advertises in its manifest, in the
+/// same shape as [`lineage_of`]: the file's own generation first.
+pub fn generations_from_history(
+    history: &[smolvm_pack::format::CheckpointGeneration],
+) -> Vec<Generation> {
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, generation)| Generation {
+            id: generation.lineage.id.clone(),
+            parent: generation.lineage.parent.clone(),
+            machine: generation.lineage.machine.clone(),
+            created_at: generation.lineage.created_at.clone(),
+            data_bytes: generation.data_bytes,
+            retained: index > 0,
+        })
+        .collect()
+}
+
+/// Export `directory` as ONE file that carries its history: the checkpoint's
+/// index, the indexes of up to `limit` retained generations, and every object
+/// any of them references, packed as a `Chunked` checkpoint. Restoring such a
+/// file unpacks it into a directory checkpoint, so `--at` works on it exactly
+/// as on the directory. `decorate` lets the caller stamp the outer manifest
+/// (format version); the per-generation manifests inside are untouched.
+///
+/// Returns the file size and how many earlier generations it carries. With no
+/// retained generations (or `limit == 0`) this is a plain [`export`].
+pub fn export_with_history(
+    directory: &Path,
+    limit: usize,
+    output: &Path,
+    decorate: impl FnOnce(&mut PackManifest),
+) -> io::Result<(u64, usize)> {
+    let lineage = lineage_of(directory)?;
+    let retained: Vec<&Generation> = lineage.iter().skip(1).take(limit).collect();
+    if retained.is_empty() {
+        return export(directory, output).map(|bytes| (bytes, 0));
+    }
+    if output.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "checkpoint output exists",
+        ));
+    }
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .prefix(".checkpoint-export-")
+        .tempdir_in(parent)?;
+    let staging = temporary.path().join("staging");
+    fs::create_dir_all(staging.join("objects"))?;
+    let own = read_index(directory)?;
+    fs::copy(directory.join(INDEX), staging.join(INDEX))?;
+    let mut hashes: HashSet<String> = HashSet::new();
+    let mut indexes = vec![own];
+    for generation in &retained {
+        let source = directory.join(GENERATIONS).join(&generation.id);
+        let target = staging.join(GENERATIONS).join(&generation.id);
+        fs::create_dir_all(&target)?;
+        fs::copy(source.join(INDEX), target.join(INDEX))?;
+        indexes.push(read_index_from(&source.join(INDEX))?);
+    }
+    for index in &indexes {
+        for hash in index.files.iter().flat_map(|f| f.chunks.iter().flatten()) {
+            hashes.insert(hash.clone());
+        }
+    }
+    let objects = directory.join("objects");
+    for hash in &hashes {
+        let source = objects.join(hash);
+        let target = staging.join("objects").join(hash);
+        if fs::hard_link(&source, &target).is_err() {
+            fs::copy(&source, &target)?;
+        }
+    }
+    let mut manifest = indexes.remove(0).manifest;
+    {
+        let checkpoint = manifest
+            .checkpoint
+            .as_mut()
+            .ok_or_else(|| invalid("stored checkpoint has no live-state manifest"))?;
+        checkpoint.payload = smolvm_pack::format::CheckpointLayout::Chunked;
+        checkpoint.history = lineage
+            .iter()
+            .take(retained.len() + 1)
+            .map(|generation| smolvm_pack::format::CheckpointGeneration {
+                lineage: smolvm_pack::format::CheckpointLineage {
+                    id: generation.id.clone(),
+                    parent: generation.parent.clone(),
+                    machine: generation.machine.clone(),
+                    created_at: generation.created_at.clone(),
+                },
+                data_bytes: generation.data_bytes,
+            })
+            .collect();
+    }
+    decorate(&mut manifest);
+    let collector =
+        smolvm_pack::assets::AssetCollector::new(staging).map_err(|e| invalid(e.to_string()))?;
+    let artifact = temporary.path().join("export.smolcheckpoint");
+    let info = smolvm_pack::packer::Packer::new(manifest)
+        .with_asset_collector(collector)
+        .pack_artifact(&artifact)
+        .map_err(|e| invalid(e.to_string()))?;
+    File::open(&artifact)?.sync_all()?;
+    publish(&artifact, output)?;
+    Ok((info.total_size, retained.len()))
+}
+
+/// Where a checkpoint id was published within a store, so a later capture of
+/// the same machine can find its parent and retain it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageRecord {
+    /// Checkpoint id.
+    pub id: String,
+    /// Id of the checkpoint it continues from, when the source had one.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Machine it was captured from.
+    pub machine: String,
+    /// When it was published (RFC 3339).
+    pub created_at: String,
+    /// Published checkpoint directory (absolute).
+    pub path: String,
+}
+
+/// Record a published checkpoint in the store's lineage index.
+pub fn record_lineage(store: &Path, record: &LineageRecord) -> io::Result<()> {
+    if !valid_generation_id(&record.id) {
+        return Err(invalid("invalid checkpoint generation id"));
+    }
+    let dir = store.join(LINEAGE_DIR);
+    fs::create_dir_all(&dir)?;
+    let final_path = dir.join(format!("{}.json", record.id));
+    let temp = dir.join(format!(".{}.json.tmp", record.id));
+    {
+        let mut file = File::create(&temp)?;
+        serde_json::to_writer(&mut file, record)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temp, &final_path)?;
+    File::open(&dir)?.sync_all()?;
+    Ok(())
+}
+
+/// A checkpoint directory in `store` from which generation `id` can still be
+/// retained: the checkpoint itself if its directory exists, else the newest
+/// checkpoint that retains it. Returns the directory and whether `id` is that
+/// directory's own generation.
+pub fn find_generation_source(
+    store: &Path,
+    id: &str,
+) -> io::Result<Option<(std::path::PathBuf, bool)>> {
+    if let Some(record) = find_lineage(store, id)? {
+        let path = std::path::PathBuf::from(&record.path);
+        if path.join(INDEX).is_file() {
+            return Ok(Some((path, true)));
+        }
+    }
+    let mut records = list_lineage(store)?;
+    records.reverse();
+    for record in records {
+        let path = std::path::PathBuf::from(&record.path);
+        if path.join(GENERATIONS).join(id).join(INDEX).is_file() {
+            return Ok(Some((path, false)));
+        }
+    }
+    Ok(None)
+}
+
+/// Look up where a checkpoint id was published in `store`.
+pub fn find_lineage(store: &Path, id: &str) -> io::Result<Option<LineageRecord>> {
+    if !valid_generation_id(id) {
+        return Ok(None);
+    }
+    let path = store.join(LINEAGE_DIR).join(format!("{id}.json"));
+    match File::open(&path) {
+        Ok(file) => Ok(Some(serde_json::from_reader(file)?)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Every checkpoint ever published into `store`, oldest first. Records whose
+/// directory has since been deleted are included; callers check `path`.
+pub fn list_lineage(store: &Path) -> io::Result<Vec<LineageRecord>> {
+    let dir = store.join(LINEAGE_DIR);
+    let mut records = Vec::new();
+    if !dir.is_dir() {
+        return Ok(records);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".json") || name.starts_with('.') {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_reader::<_, LineageRecord>(File::open(entry.path())?) {
+            records.push(record);
+        }
+    }
+    records.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    Ok(records)
+}
+
+/// Bytes of a stored file backed by objects: every non-hole chunk, with the
+/// final chunk counted at its real length.
+fn data_size(file: &StoredFile) -> u64 {
+    let chunks = file.chunks.len();
+    file.chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, hash)| hash.is_some())
+        .map(|(index, _)| {
+            if index + 1 == chunks {
+                file.size - index as u64 * CHUNK_SIZE as u64
+            } else {
+                CHUNK_SIZE as u64
+            }
+        })
+        .sum()
+}
+
 /// One chunk of a file, as produced by the reading thread.
 enum Job {
     /// A filesystem hole of this many bytes: recorded, never read or stored.
@@ -910,9 +1341,8 @@ fn validate_index(index: &Index) -> io::Result<()> {
     Ok(())
 }
 
-fn read_index(directory: &Path) -> io::Result<Index> {
-    let path = directory.join(INDEX);
-    if fs::symlink_metadata(&path)?.len() > 256 * 1024 * 1024 {
+fn read_index_from(path: &Path) -> io::Result<Index> {
+    if fs::symlink_metadata(path)?.len() > 256 * 1024 * 1024 {
         return Err(invalid("checkpoint index too large"));
     }
     let index: Index = serde_json::from_reader(File::open(path)?)?;
@@ -920,9 +1350,40 @@ fn read_index(directory: &Path) -> io::Result<Index> {
     Ok(index)
 }
 
+fn read_index(directory: &Path) -> io::Result<Index> {
+    read_index_from(&directory.join(INDEX))
+}
+
+fn valid_generation_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Path of the index describing `generation`: the checkpoint's own index for
+/// `None`, or the retained copy of an ancestor's index.
+fn index_path(directory: &Path, generation: Option<&str>) -> io::Result<std::path::PathBuf> {
+    match generation {
+        None => Ok(directory.join(INDEX)),
+        Some(id) if valid_generation_id(id) => Ok(directory.join(GENERATIONS).join(id).join(INDEX)),
+        Some(_) => Err(invalid("invalid checkpoint generation id")),
+    }
+}
+
+fn read_index_at(directory: &Path, generation: Option<&str>) -> io::Result<Index> {
+    read_index_from(&index_path(directory, generation)?)
+}
+
 /// Read and validate the object index before allocating restore resources.
 pub fn read_manifest(directory: &Path) -> io::Result<PackManifest> {
-    let manifest = read_index(directory)?.manifest;
+    read_manifest_at(directory, None)
+}
+
+/// [`read_manifest`] for the checkpoint's own generation (`None`) or one of the
+/// ancestor generations it retains.
+pub fn read_manifest_at(directory: &Path, generation: Option<&str>) -> io::Result<PackManifest> {
+    let manifest = read_index_at(directory, generation)?.manifest;
     if manifest.checkpoint.is_none() {
         return Err(invalid("stored checkpoint has no live-state manifest"));
     }
@@ -933,6 +1394,17 @@ pub fn read_manifest(directory: &Path) -> io::Result<PackManifest> {
 /// an object shared with a retained checkpoint.
 pub fn materialize(directory: &Path, output: &Path) -> io::Result<PackManifest> {
     materialize_with_base(directory, output, None)
+}
+
+/// [`materialize`] for a retained ancestor generation of `directory`. Every
+/// object an ancestor needs was hard-linked into the checkpoint when it was
+/// retained, so this works even after the ancestor's own directory is gone.
+pub fn materialize_at(
+    directory: &Path,
+    generation: &str,
+    output: &Path,
+) -> io::Result<PackManifest> {
+    materialize_generation(directory, Some(generation), output, None)
 }
 
 /// Like [`materialize`], but when `base` holds a pristine materialization of
@@ -948,7 +1420,16 @@ pub fn materialize_with_base(
     output: &Path,
     base: Option<&Path>,
 ) -> io::Result<PackManifest> {
-    let index = read_index(directory)?;
+    materialize_generation(directory, None, output, base)
+}
+
+fn materialize_generation(
+    directory: &Path,
+    generation: Option<&str>,
+    output: &Path,
+    base: Option<&Path>,
+) -> io::Result<PackManifest> {
+    let index = read_index_at(directory, generation)?;
     // Hold the base's shared lock for the whole restore: a concurrent
     // promotion takes it exclusively, so the files cloned below always belong
     // to the same base whose index the diff trusts.
@@ -1506,6 +1987,13 @@ pub fn publish(_source: &Path, _destination: &Path) -> io::Result<()> {
 
 /// Make a stored directory independently transportable as a single file.
 pub fn export(directory: &Path, output: &Path) -> io::Result<u64> {
+    export_at(directory, None, output)
+}
+
+/// [`export`] for the checkpoint's own generation (`None`) or a retained
+/// ancestor. The exported file is a single generation: it keeps its lineage
+/// record (id and parent) but retains no ancestors of its own.
+pub fn export_at(directory: &Path, generation: Option<&str>, output: &Path) -> io::Result<u64> {
     if output.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1520,7 +2008,7 @@ pub fn export(directory: &Path, output: &Path) -> io::Result<u64> {
         .prefix(".checkpoint-export-")
         .tempdir_in(parent)?;
     let staging = temporary.path().join("staging");
-    let manifest = materialize(directory, &staging)?;
+    let manifest = materialize_generation(directory, generation, &staging, None)?;
     let collector =
         smolvm_pack::assets::AssetCollector::new(staging).map_err(|e| invalid(e.to_string()))?;
     let artifact = temporary.path().join("export.smolcheckpoint");
@@ -1944,6 +2432,399 @@ mod tests {
             )
             .unwrap();
         writer.finish(directory, manifest(), vec![file]).unwrap()
+    }
+
+    fn lineage_manifest(id: &str, parent: Option<&str>, created_at: &str) -> PackManifest {
+        use smolvm_pack::format::{
+            CheckpointAsset, CheckpointCpuContract, CheckpointLineage, PortableCheckpointManifest,
+        };
+        let mut manifest = manifest();
+        let asset = |path: &str| CheckpointAsset {
+            path: path.into(),
+            size: 0,
+            sha256: String::new(),
+        };
+        manifest.checkpoint = Some(PortableCheckpointManifest {
+            version: 1,
+            runtime_abi: "test".into(),
+            host_platform: "linux/amd64".into(),
+            cpu_contract: CheckpointCpuContract::LinuxKvmIntelPortableV1,
+            cpus: 1,
+            memory_mib: 64,
+            storage_gib: None,
+            overlay_gib: None,
+            device_profile: "test".into(),
+            state: asset("checkpoint/checkpoint.bin"),
+            memory: asset("checkpoint/memory.bin"),
+            layout: asset("checkpoint/layout.json"),
+            disks: Vec::new(),
+            workload: None,
+            network: None,
+            packed_layers: None,
+            lineage: Some(CheckpointLineage {
+                id: id.into(),
+                parent: parent.map(str::to_string),
+                machine: "m".into(),
+                created_at: created_at.into(),
+            }),
+            payload: Default::default(),
+            history: Vec::new(),
+        });
+        manifest
+    }
+
+    /// Capture `bytes` as generation `id`, retaining `parent`'s generations.
+    fn capture_generation(
+        cache: &Path,
+        directory: &Path,
+        bytes: &[u8],
+        id: &str,
+        parent: Option<&Path>,
+        created_at: &str,
+    ) -> usize {
+        fs::create_dir(directory).unwrap();
+        let mut writer = Writer::new(cache, directory).unwrap();
+        let file = writer
+            .ingest(
+                "checkpoint/memory.bin",
+                bytes.len() as u64,
+                0o600,
+                &mut &*bytes,
+            )
+            .unwrap();
+        let retained = match parent {
+            Some(parent) => writer.retain_generations(directory, parent, 32).unwrap(),
+            None => 0,
+        };
+        let parent_id = parent.and_then(|p| lineage_of(p).unwrap().first().map(|g| g.id.clone()));
+        writer
+            .finish(
+                directory,
+                lineage_manifest(id, parent_id.as_deref(), created_at),
+                vec![file],
+            )
+            .unwrap();
+        retained
+    }
+
+    const G1: &str = "11111111111111111111111111111111";
+    const G2: &str = "22222222222222222222222222222222";
+    const G3: &str = "33333333333333333333333333333333";
+
+    #[test]
+    #[cfg(unix)]
+    fn a_checkpoint_retains_its_ancestors_and_restores_any_of_them() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let third = root.path().join("third");
+        let a = vec![0x11u8; CHUNK_SIZE + 10];
+        let mut b = a.clone();
+        b[CHUNK_SIZE + 3] = 0x22; // only the second chunk changes
+        let c = vec![0x33u8; CHUNK_SIZE / 2];
+
+        assert_eq!(
+            capture_generation(&cache, &first, &a, G1, None, "2026-01-01T00:00:00Z"),
+            0
+        );
+        assert_eq!(
+            capture_generation(
+                &cache,
+                &second,
+                &b,
+                G2,
+                Some(&first),
+                "2026-01-02T00:00:00Z"
+            ),
+            1
+        );
+        assert_eq!(
+            capture_generation(
+                &cache,
+                &third,
+                &c,
+                G3,
+                Some(&second),
+                "2026-01-03T00:00:00Z"
+            ),
+            2
+        );
+
+        let chain: Vec<(String, Option<String>, bool)> = lineage_of(&third)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.id, g.parent, g.retained))
+            .collect();
+        assert_eq!(
+            chain,
+            vec![
+                (G3.into(), Some(G2.into()), false),
+                (G2.into(), Some(G1.into()), true),
+                (G1.into(), None, true),
+            ]
+        );
+        // The newest checkpoint alone can restore every generation, even after
+        // the older directories are gone.
+        fs::remove_dir_all(&first).unwrap();
+        fs::remove_dir_all(&second).unwrap();
+        assert_eq!(resolve_generation(&third, "~0").unwrap(), None);
+        assert_eq!(resolve_generation(&third, "~1").unwrap(), Some(G2.into()));
+        assert_eq!(
+            resolve_generation(&third, "11111111").unwrap(),
+            Some(G1.into())
+        );
+        assert!(resolve_generation(&third, "~3").is_err());
+        assert!(resolve_generation(&third, "zz").is_err());
+        for (generation, expected) in [(Some(G1), &a), (Some(G2), &b)] {
+            let out = root.path().join(format!("restore-{}", generation.unwrap()));
+            materialize_generation(&third, generation, &out, None).unwrap();
+            assert_eq!(
+                fs::read(out.join("checkpoint/memory.bin")).unwrap(),
+                *expected
+            );
+        }
+        let own = root.path().join("restore-own");
+        materialize(&third, &own).unwrap();
+        assert_eq!(fs::read(own.join("checkpoint/memory.bin")).unwrap(), c);
+        assert_eq!(
+            read_manifest_at(&third, Some(G1))
+                .unwrap()
+                .checkpoint
+                .unwrap()
+                .lineage
+                .unwrap()
+                .id,
+            G1
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn retained_generations_survive_prune_and_a_depth_limit_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let third = root.path().join("third");
+        capture_generation(&cache, &first, &[1u8; 64], G1, None, "2026-01-01T00:00:00Z");
+        capture_generation(
+            &cache,
+            &second,
+            &[2u8; 64],
+            G2,
+            Some(&first),
+            "2026-01-02T00:00:00Z",
+        );
+        fs::create_dir(&third).unwrap();
+        let mut writer = Writer::new(&cache, &third).unwrap();
+        let file = writer
+            .ingest("checkpoint/memory.bin", 64, 0o600, &mut &[3u8; 64][..])
+            .unwrap();
+        assert_eq!(writer.retain_generations(&third, &second, 1).unwrap(), 1);
+        writer
+            .finish(
+                &third,
+                lineage_manifest(G3, Some(G2), "2026-01-03T00:00:00Z"),
+                vec![file],
+            )
+            .unwrap();
+        drop(writer);
+        fs::remove_dir_all(&first).unwrap();
+        fs::remove_dir_all(&second).unwrap();
+        prune(&cache).unwrap();
+        let ids: Vec<String> = lineage_of(&third)
+            .unwrap()
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(ids, vec![G3.to_string(), G2.to_string()]);
+        let out = root.path().join("g2");
+        materialize_at(&third, G2, &out).unwrap();
+        assert_eq!(
+            fs::read(out.join("checkpoint/memory.bin")).unwrap(),
+            vec![2u8; 64]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_deleted_parent_is_retained_from_whichever_checkpoint_still_holds_it() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let (first, second, third) = (
+            root.path().join("first"),
+            root.path().join("second"),
+            root.path().join("third"),
+        );
+        capture_generation(&cache, &first, &[1u8; 64], G1, None, "2026-01-01T00:00:00Z");
+        capture_generation(
+            &cache,
+            &second,
+            &[2u8; 64],
+            G2,
+            Some(&first),
+            "2026-01-02T00:00:00Z",
+        );
+        for (id, path, parent) in [(G1, &first, None), (G2, &second, Some(G1))] {
+            record_lineage(
+                &cache,
+                &LineageRecord {
+                    id: id.into(),
+                    parent: parent.map(str::to_string),
+                    machine: "m".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    path: path.to_string_lossy().into_owned(),
+                },
+            )
+            .unwrap();
+        }
+        // A machine restored at G1 captures again after G1's directory is gone:
+        // G2 still holds G1, so the new checkpoint continues from it.
+        fs::remove_dir_all(&first).unwrap();
+        let (source, own) = find_generation_source(&cache, G1).unwrap().unwrap();
+        assert_eq!((source.as_path(), own), (second.as_path(), false));
+        fs::create_dir(&third).unwrap();
+        let mut writer = Writer::new(&cache, &third).unwrap();
+        let file = writer
+            .ingest("checkpoint/memory.bin", 64, 0o600, &mut &[3u8; 64][..])
+            .unwrap();
+        assert_eq!(
+            writer
+                .retain_generations_from(&third, &source, Some(G1), 32)
+                .unwrap(),
+            1
+        );
+        assert!(writer
+            .retain_generations_from(&third, &source, Some(G3), 32)
+            .is_err());
+        writer
+            .finish(
+                &third,
+                lineage_manifest(G3, Some(G1), "2026-01-03T00:00:00Z"),
+                vec![file],
+            )
+            .unwrap();
+        let ids: Vec<String> = lineage_of(&third)
+            .unwrap()
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(ids, vec![G3.to_string(), G1.to_string()]);
+        let out = root.path().join("g1");
+        materialize_at(&third, G1, &out).unwrap();
+        assert_eq!(
+            fs::read(out.join("checkpoint/memory.bin")).unwrap(),
+            vec![1u8; 64]
+        );
+        assert_eq!(find_generation_source(&cache, G3).unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_history_file_carries_every_generation_it_was_exported_with() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        let a = vec![0xAAu8; CHUNK_SIZE + 5];
+        let mut b = a.clone();
+        b[0] = 0xBB;
+        capture_generation(&cache, &first, &a, G1, None, "2026-01-01T00:00:00Z");
+        capture_generation(
+            &cache,
+            &second,
+            &b,
+            G2,
+            Some(&first),
+            "2026-01-02T00:00:00Z",
+        );
+        let file = root.path().join("history.smolcheckpoint");
+        let (bytes, carried) = export_with_history(&second, 32, &file, |manifest| {
+            manifest.checkpoint.as_mut().unwrap().version = 99;
+        })
+        .unwrap();
+        assert!(bytes > 0);
+        assert_eq!(carried, 1);
+        // The outer manifest is readable without unpacking and lists the history.
+        let outer = smolvm_pack::packer::read_manifest_from_sidecar(&file).unwrap();
+        let checkpoint = outer.checkpoint.unwrap();
+        assert_eq!(
+            checkpoint.payload,
+            smolvm_pack::format::CheckpointLayout::Chunked
+        );
+        assert_eq!(checkpoint.version, 99);
+        let ids: Vec<&str> = checkpoint
+            .history
+            .iter()
+            .map(|g| g.lineage.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![G2, G1]);
+        assert_eq!(
+            resolve_in(&generations_from_history(&checkpoint.history), "~1").unwrap(),
+            Some(G1.to_string())
+        );
+        // Unpacked, it is a directory checkpoint again — every generation restores.
+        let unpacked = root.path().join("unpacked");
+        smolvm_pack::assets::decompress_assets_from_file(&file, &unpacked).unwrap();
+        let ids: Vec<String> = lineage_of(&unpacked)
+            .unwrap()
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(ids, vec![G2.to_string(), G1.to_string()]);
+        let out = root.path().join("g1");
+        materialize_at(&unpacked, G1, &out).unwrap();
+        assert_eq!(fs::read(out.join("checkpoint/memory.bin")).unwrap(), a);
+        let own = root.path().join("own");
+        materialize(&unpacked, &own).unwrap();
+        assert_eq!(fs::read(own.join("checkpoint/memory.bin")).unwrap(), b);
+        // With nothing retained the export is the classic single-generation file.
+        let single = root.path().join("single.smolcheckpoint");
+        assert_eq!(
+            export_with_history(&first, 32, &single, |_| {}).unwrap().1,
+            0
+        );
+        let outer = smolvm_pack::packer::read_manifest_from_sidecar(&single).unwrap();
+        assert_eq!(
+            outer.checkpoint.unwrap().payload,
+            smolvm_pack::format::CheckpointLayout::Assets
+        );
+    }
+
+    #[test]
+    fn the_store_lineage_index_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let record = LineageRecord {
+            id: G1.into(),
+            parent: None,
+            machine: "m".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            path: "/tmp/first.smolcheckpoint".into(),
+        };
+        record_lineage(root.path(), &record).unwrap();
+        let child = LineageRecord {
+            id: G2.into(),
+            parent: Some(G1.into()),
+            created_at: "2026-01-02T00:00:00Z".into(),
+            ..record.clone()
+        };
+        record_lineage(root.path(), &child).unwrap();
+        assert_eq!(find_lineage(root.path(), G1).unwrap(), Some(record.clone()));
+        assert_eq!(find_lineage(root.path(), "nope").unwrap(), None);
+        let ids: Vec<String> = list_lineage(root.path())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec![G1.to_string(), G2.to_string()]);
+        assert!(record_lineage(
+            root.path(),
+            &LineageRecord {
+                id: "bad".into(),
+                ..record
+            }
+        )
+        .is_err());
     }
 
     /// A restore against a base only rewrites the chunks that differ; the

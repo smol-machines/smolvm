@@ -296,6 +296,11 @@ fn packed_agent_mounts_userxattr(version: &str) -> bool {
 /// live in the `user.overlay.*` namespace; the guest then mounts the overlay
 /// with `userxattr`. Read by the agent.
 pub const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+/// Written beside the extraction marker once every staged layer tar has been
+/// unpacked on the host with its ownership recorded in the override xattr.
+/// A cache hit reads this instead of listing (and on macOS mounting) the
+/// layers to learn that nothing is left to upgrade.
+const HOST_LAYERS_MARKER: &str = ".smolvm-host-layers";
 /// The xattr libkrun's virtiofs server reads ownership and mode from (the
 /// rootless-containers convention, `uid:gid:0mode`). Writing it lets an
 /// unprivileged host hand the guest an image's exact owners, setuid bits and
@@ -1636,9 +1641,38 @@ pub fn extract_sidecar(
     force: bool,
     debug: bool,
 ) -> std::io::Result<()> {
+    extract_sidecar_for_agent(sidecar_path, cache_dir, footer, force, debug, None)
+}
+
+/// [`extract_sidecar`] for a pack that will boot a different agent than the
+/// one it carries.
+///
+/// The layer decisions here -- whether the host unpacks the image and
+/// describes its ownership through the override xattr, or stages the tars for
+/// the guest -- depend on what the agent that mounts them can do, and the
+/// sidecar's manifest only knows the agent that was packed. A locally baked
+/// image cache (`machine run --oci-cache`) boots the running engine's own
+/// agent instead, so its caller passes that engine's version as
+/// `agent_version`; `None` keeps the manifest's.
+pub fn extract_sidecar_for_agent(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    footer: &PackFooter,
+    force: bool,
+    debug: bool,
+    agent_version: Option<&str>,
+) -> std::io::Result<()> {
     // Private per-machine caches are LRU-capped after extraction; the shared
     // store opts out (see `extract_sidecar_capped`).
-    extract_sidecar_capped(sidecar_path, cache_dir, footer, force, debug, true)
+    extract_sidecar_capped(
+        sidecar_path,
+        cache_dir,
+        footer,
+        force,
+        debug,
+        true,
+        agent_version,
+    )
 }
 
 /// Core of [`extract_sidecar`]. `cap_cache` runs the LRU size-cap on
@@ -1659,6 +1693,7 @@ fn extract_sidecar_capped(
     force: bool,
     debug: bool,
     cap_cache: bool,
+    agent_version: Option<&str>,
 ) -> std::io::Result<()> {
     if !sidecar_path.exists() {
         return Err(std::io::Error::new(
@@ -1691,6 +1726,16 @@ fn extract_sidecar_capped(
         if debug {
             eprintln!("debug: assets already extracted (possibly by another process)");
         }
+        // An entry extracted before this host could unpack layers itself (an
+        // older engine, or a pack whose own agent could not use the result)
+        // still holds staged tars, and would hand them to the guest on every
+        // start. Finish the job here, once, under the same lock.
+        let upgraded = upgrade_staged_layers(sidecar_path, cache_dir, agent_version, debug)?;
+        if upgraded && cap_cache {
+            if let Some(root) = cache_dir.parent() {
+                evict_cache_to_size_protecting(root, pack_cache_max_bytes(root), Some(cache_dir));
+            }
+        }
         // Lock released on drop of lock_file
         return Ok(());
     }
@@ -1702,7 +1747,7 @@ fn extract_sidecar_capped(
         let _ = fs::remove_dir_all(cache_dir);
     }
 
-    let result = extract_sidecar_inner(sidecar_path, cache_dir, footer, debug);
+    let result = extract_sidecar_inner(sidecar_path, cache_dir, footer, debug, agent_version);
 
     // If extraction failed mid-stream, partially extracted files remain on
     // disk without a completion marker. Subsequent retries hit the same
@@ -1883,7 +1928,7 @@ pub fn extract_sidecar_shared(
     // entries are maintained explicitly by `smolvm pack prune`, which treats
     // each machine's `.pack-shared` pointer as a durable lease and therefore
     // cannot delete a pack mounted by a running or stopped VM.
-    extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false)?;
+    extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false, None)?;
     let overlap = cfg!(target_os = "linux")
         && !was_extracted
         && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
@@ -2330,11 +2375,75 @@ fn restrict_to_owner(dir: &Path) {
 }
 
 /// Inner extraction logic (called under the lock).
+/// Unpack, on the host, the layer tars an earlier extraction left staged for
+/// the guest, when this host can now describe their ownership through the
+/// override xattr and the agent that will boot them honors it.
+///
+/// An extraction is a one-shot: the marker freezes whatever layer decision the
+/// engine of the day made. An entry made before the host could unpack layers
+/// itself therefore keeps handing its tars to the guest, which unpacks the
+/// whole image on every fresh machine -- tens of seconds for a large image,
+/// forever, unless the user clears the cache by hand. This runs on every cache
+/// hit, does nothing once the entry carries [`HOST_LAYERS_MARKER`] or when the
+/// decision still says "guest", and otherwise finishes the extraction the way a
+/// fresh one would. The tars stay in place: a guest that already mounted them
+/// keeps reading them, and the unpack is idempotent per layer, so an
+/// interrupted upgrade simply resumes on the next hit.
+///
+/// Returns whether any layer was unpacked, so the caller knows the entry grew.
+fn upgrade_staged_layers(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    agent_version: Option<&str>,
+    debug: bool,
+) -> std::io::Result<bool> {
+    if cache_dir.join(HOST_LAYERS_MARKER).exists() || !has_layer_tars(cache_dir) {
+        return Ok(false);
+    }
+    let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
+    let agent = agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str()));
+    if !host_layers_via_override_stat(agent, cache_dir) {
+        return Ok(false);
+    }
+    // The stacking order the guest needs: the manifest's, else the one the
+    // staging extraction recorded against the tars.
+    let layer_order: Vec<String> = match manifest.as_ref() {
+        Some(m) if !m.assets.layers.is_empty() => m
+            .assets
+            .layers
+            .iter()
+            .filter_map(|l| layer_id_from_asset_path(&l.path))
+            .collect(),
+        _ => fs::read_to_string(cache_dir.join("layers").join(LAYER_ORDER_FILE))
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    eprintln!(
+        "Unpacking this image's layers on the host once, so later machines start without \
+         unpacking them themselves..."
+    );
+    if debug {
+        eprintln!(
+            "debug: upgrading staged layers in {} to host-unpacked layers",
+            cache_dir.display()
+        );
+    }
+    post_process_extraction(cache_dir, &layer_order, false, debug, true)?;
+    Ok(true)
+}
+
 fn extract_sidecar_inner(
     sidecar_path: &Path,
     cache_dir: &Path,
     footer: &PackFooter,
     debug: bool,
+    agent_version: Option<&str>,
 ) -> std::io::Result<()> {
     fs::create_dir_all(cache_dir)?;
 
@@ -2384,7 +2493,10 @@ fn extract_sidecar_inner(
         })
         .unwrap_or_default();
 
-    let pack_version = manifest.as_ref().map(|m| m.smolvm_version.as_str());
+    // What the agent that boots this pack can do decides how its layers are
+    // presented; that is the packed agent unless the caller boots its own.
+    let pack_version =
+        agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str()));
     let host_layers =
         has_layer_tars(cache_dir) && host_layers_via_override_stat(pack_version, cache_dir);
     let guest_unpacks_layers =
@@ -2788,6 +2900,7 @@ fn post_process_extraction(
 
         if owner_xattr {
             fs::write(extract_dir.join(OPAQUE_XATTR_MARKER), "user\n")?;
+            fs::write(cache_dir.join(HOST_LAYERS_MARKER), "")?;
         }
         // Record the manifest's layer order so the guest stacks overlayfs
         // lowerdirs correctly (layer dirs are named by digest and don't sort
@@ -5163,6 +5276,90 @@ mod tests {
         assert!(packed_agent_mounts_userxattr("1.16.2"));
         assert!(packed_agent_mounts_userxattr("1.17.0"));
         assert!(packed_agent_mounts_userxattr("2.0.0"));
+    }
+
+    /// A cache entry whose layers were staged for the guest: one layer tar,
+    /// the stacking order beside it, and the completion marker that freezes
+    /// the decision.
+    fn staged_cache_entry(root: &Path, layer_id: &str) -> PathBuf {
+        let cache_dir = root.join("entry");
+        let layers = cache_dir.join("layers");
+        fs::create_dir_all(&layers).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o600);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_size(1);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "secret", &b"s"[..])
+            .unwrap();
+        fs::write(
+            layers.join(format!("{layer_id}.tar")),
+            builder.into_inner().unwrap(),
+        )
+        .unwrap();
+        fs::write(layers.join(LAYER_ORDER_FILE), layer_id).unwrap();
+        fs::write(cache_dir.join(EXTRACTION_MARKER), "").unwrap();
+        cache_dir
+    }
+
+    /// The upgrade is decided for the agent that will boot the entry: a pack
+    /// that carries an agent unable to mount the override xattr keeps its
+    /// staged tars, and an entry already unpacked on the host is left alone.
+    #[test]
+    fn staged_layers_stay_staged_unless_the_booting_agent_can_use_host_layers() {
+        let root = tempfile::tempdir().unwrap();
+        let cache_dir = staged_cache_entry(root.path(), "aaaa");
+        let no_sidecar = root.path().join("missing.smolmachine");
+        assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, Some("1.16.0"), false).unwrap());
+        assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, None, false).unwrap());
+        assert!(!cache_dir.join(HOST_LAYERS_MARKER).exists());
+        assert!(cache_dir.join("layers").join("aaaa.tar").is_file());
+        fs::write(cache_dir.join(HOST_LAYERS_MARKER), "").unwrap();
+        assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, Some("9.0.0"), false).unwrap());
+    }
+
+    /// A cache hit finishes an extraction that an older engine left staged:
+    /// the tars are unpacked on the host with their ownership in the override
+    /// xattr, the entry is marked so the next hit does nothing, and the tars
+    /// stay for any guest already reading them. Linux only: on macOS the
+    /// unpacked layers live in a case-sensitive volume this test would have
+    /// to mount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cache_hit_unpacks_staged_layers_on_the_host_for_an_agent_that_can_use_them() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        set_host_layers_probe(|| true);
+        let cache_dir = staged_cache_entry(root.path(), "bbbb");
+        let no_sidecar = root.path().join("missing.smolmachine");
+        let engine = env!("CARGO_PKG_VERSION");
+        assert!(upgrade_staged_layers(&no_sidecar, &cache_dir, Some(engine), false).unwrap());
+        assert!(cache_dir.join(HOST_LAYERS_MARKER).exists());
+        let layers = cache_dir.join("layers");
+        let secret = layers.join("bbbb").join("secret");
+        assert!(secret.is_file());
+        assert_eq!(
+            read_user_xattr(&secret, OVERRIDE_STAT_XATTR).as_deref(),
+            Some("1000:1000:0600")
+        );
+        assert_eq!(
+            fs::read_to_string(layers.join(OPAQUE_XATTR_MARKER))
+                .unwrap()
+                .trim(),
+            "user"
+        );
+        assert_eq!(
+            fs::read_to_string(layers.join(LAYER_ORDER_FILE)).unwrap(),
+            "bbbb"
+        );
+        assert!(layers.join("bbbb.tar").is_file());
+        assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, Some(engine), false).unwrap());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
