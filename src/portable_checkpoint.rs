@@ -2682,10 +2682,20 @@ fn protect_restore_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether a restore gives the captured writable disk a copy-on-write top
-/// instead of copying it. Opt-in while the approach is evaluated.
+/// Whether a restore may give the captured writable disk a copy-on-write top
+/// instead of copying it. On by default; `SMOLVM_RESTORE_COW_DISK=0` restores
+/// the full copy.
+#[cfg(target_os = "linux")]
 fn cow_restore_enabled() -> bool {
-    std::env::var("SMOLVM_RESTORE_COW_DISK").is_ok_and(|value| value == "1")
+    std::env::var("SMOLVM_RESTORE_COW_DISK").map_or(true, |value| value != "0")
+}
+
+/// Whether two paths name the same file.
+#[cfg(target_os = "linux")]
+fn same_inode(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
 /// Install verified checkpoint state before a machine is launched.
@@ -2754,32 +2764,43 @@ pub fn install(
         // Names to move into the machine directory, and the copy-on-write tops
         // to create over a captured writable disk once its base is in place.
         let mut staged_names: Vec<String> = Vec::new();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut cow_tops: Vec<crate::agent::DiskOverlaySpec> = Vec::new();
         for disk in &checkpoint.disks {
             for (index, file) in disk.files.iter().enumerate() {
                 let started = std::time::Instant::now();
                 let staged = staged_disks.join(&file.target);
                 let source = extracted.join(&file.asset.path);
+                #[cfg(target_os = "linux")]
                 if index == 0
                     && disk.files.len() == 1
                     && file.format == "raw"
                     && cow_restore_enabled()
                 {
-                    // Copying the captured disk is most of a restore. Treat it
-                    // as an immutable base instead, shared like a deeper layer,
-                    // and give this machine a thin qcow2 top of its own.
+                    // Copying the captured disk is most of a restore. Share it
+                    // as an immutable base instead, like a deeper layer, and
+                    // give this machine a thin qcow2 top of its own. Only a
+                    // base that really is shared earns the extra layer; a
+                    // private copy is simply this machine's writable disk.
                     let base_name = format!(".smolcheckpoint-{}-base.raw", disk.role);
                     let staged_base = staged_disks.join(&base_name);
-                    #[cfg(target_os = "linux")]
                     promote_retained_backing(extracted, &source, &file.asset)?;
                     link_or_copy_verified_sparse(&source, &staged_base, &file.asset)?;
-                    cow_tops.push((
-                        vm_data_dir.join(Path::new(&file.target).with_extension("qcow2")),
-                        vm_data_dir.join(&base_name),
-                        crate::data::disk::DiskFormat::Raw,
-                    ));
-                    staged_names.push(base_name);
-                    tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "cow_top", "checkpoint disk installed");
+                    if same_inode(&source, &staged_base)? {
+                        cow_tops.push((
+                            vm_data_dir.join(Path::new(&file.target).with_extension("qcow2")),
+                            vm_data_dir.join(&base_name),
+                            crate::data::disk::DiskFormat::Raw,
+                        ));
+                        staged_names.push(base_name);
+                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "cow_top", "checkpoint disk installed");
+                    } else {
+                        std::fs::rename(&staged_base, &staged).map_err(|error| {
+                            Error::agent("stage checkpoint disk", error.to_string())
+                        })?;
+                        staged_names.push(file.target.clone());
+                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = true, "checkpoint disk installed");
+                    }
                     continue;
                 }
                 staged_names.push(file.target.clone());
@@ -3443,9 +3464,32 @@ mod tests {
         );
         assert!(machine.path().join("storage.formatted").is_file());
         assert!(machine.path().join("overlay.formatted").is_file());
+        // A base this host cannot share stays a private writable copy: no
+        // copy-on-write layer, and never an alias of the extraction cache.
+        #[cfg(target_os = "linux")]
+        let shared = crate::process::vm_uid_drop_active();
+        #[cfg(not(target_os = "linux"))]
+        let shared = false;
+        if !shared {
+            assert!(!machine.path().join("storage.qcow2").exists());
+            assert!(!machine
+                .path()
+                .join(".smolcheckpoint-storage-base.raw")
+                .exists());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            if !shared {
+                assert_ne!(
+                    std::fs::metadata(source.join("disks/storage/0"))
+                        .unwrap()
+                        .ino(),
+                    std::fs::metadata(machine.path().join("storage.raw"))
+                        .unwrap()
+                        .ino()
+                );
+            }
             assert_ne!(
                 std::fs::metadata(source.join("memory.bin")).unwrap().ino(),
                 std::fs::metadata(machine.path().join(INSTALLED_DIR).join("memory.bin"))
