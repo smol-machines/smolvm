@@ -914,6 +914,10 @@ fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> 
 /// agent's own request loop (`invalid request: {serde error}` in
 /// smolvm-agent's `main.rs`), which must keep it stable. Anything else passes
 /// through untouched.
+///
+/// Applied once, in [`AgentClient::receive`], as the response enters — so the
+/// shared match helpers and every inline `AgentResponse::Error` match
+/// (`branchpoint_*`, `pod_*`, …) all see the rewritten message.
 fn describe_agent_error(message: String) -> String {
     let Some(rest) = message.strip_prefix("invalid request: unknown variant `") else {
         return message;
@@ -936,9 +940,7 @@ fn expect_data<T: serde::de::DeserializeOwned>(resp: AgentResponse, op: &str) ->
         } => {
             serde_json::from_value(data).map_err(|e| Error::agent("parse response", e.to_string()))
         }
-        AgentResponse::Error { message, .. } => {
-            Err(Error::agent(op, describe_agent_error(message)))
-        }
+        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
         _ => Err(Error::agent(op, "unexpected response type")),
     }
 }
@@ -1015,9 +1017,7 @@ fn branchpoint_outcome<T>(
 fn expect_ok(resp: AgentResponse, op: &str) -> Result<()> {
     match resp {
         AgentResponse::Ok { .. } => Ok(()),
-        AgentResponse::Error { message, .. } => {
-            Err(Error::agent(op, describe_agent_error(message)))
-        }
+        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
         _ => Err(Error::agent(op, "unexpected response type")),
     }
 }
@@ -1030,9 +1030,7 @@ fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, Vec<u8>, Vec<
             stdout,
             stderr,
         } => Ok((exit_code, stdout, stderr)),
-        AgentResponse::Error { message, .. } => {
-            Err(Error::agent(op, describe_agent_error(message)))
-        }
+        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
         _ => Err(Error::agent(op, "unexpected response type")),
     }
 }
@@ -2969,8 +2967,14 @@ impl AgentClient {
             return Err(e.into());
         }
 
-        let resp: AgentResponse = serde_json::from_slice(&buf)
+        let mut resp: AgentResponse = serde_json::from_slice(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
+        // Rewrite a version-skew error as it enters, so every decode site —
+        // the shared match helpers and the many inline `AgentResponse::Error`
+        // matches (branchpoint_*, pod_*, …) — reports the skew the same way.
+        if let AgentResponse::Error { message, .. } = &mut resp {
+            *message = describe_agent_error(std::mem::take(message));
+        }
         Ok(resp)
     }
 }
@@ -4033,6 +4037,39 @@ mod agent_error_skew_tests {
         ] {
             assert_eq!(describe_agent_error(msg.to_string()), msg);
         }
+    }
+
+    #[test]
+    fn receive_rewrites_the_error_as_it_enters() {
+        // The rewrite lives in `receive`, not the match helpers, so the many
+        // call sites that match `AgentResponse::Error` themselves (the
+        // branchpoint and pod families included) get the translation too.
+        use super::{AgentClient, AgentResponse, UdsStream};
+        use std::io::Write;
+
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let resp = AgentResponse::error(
+                "invalid request: unknown variant `pod_create`, expected one of `ping` \
+                 at line 1 column 22",
+                "invalid_request",
+            );
+            let body = serde_json::to_vec(&resp).unwrap();
+            server_stream
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .unwrap();
+            server_stream.write_all(&body).unwrap();
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let resp = client.receive().expect("frame decodes");
+        server.join().unwrap();
+
+        let AgentResponse::Error { message, .. } = resp else {
+            panic!("expected an error response");
+        };
+        assert!(message.contains("older than this CLI"), "{message}");
+        assert!(message.contains("pod_create"), "{message}");
     }
 }
 
