@@ -1634,6 +1634,15 @@ fn spawn_serve<S>(
 type ProcMemAdvert = (u32, Vec<(u64, u64, u64)>);
 type GuestRamAdvert = (u32, Vec<(u64, u64, u64)>);
 
+/// Flags for the accept-loop preamble/Init peeks. The accepted socket is
+/// blocking, so a plain `MSG_PEEK` waits indefinitely on a client that connects
+/// and sends nothing — and these peeks run on the accept loop, so that one client
+/// would stall every other connection. Each peek loop already retries a short
+/// read for ~1s; with `MSG_DONTWAIT` an empty socket is just another short read
+/// (`-1`/`EAGAIN`), so the loop's bound applies to it too.
+#[cfg(unix)]
+const PEEK_NONBLOCK: libc::c_int = libc::MSG_PEEK | libc::MSG_DONTWAIT;
+
 /// Consume the per-VM CUDA capacity policy (`SMVCPOL1`) when present. Older
 /// proxies send no policy; the peek leaves their first preamble or RPC frame
 /// untouched and preserves the previous unlimited behavior.
@@ -1648,7 +1657,7 @@ fn consume_policy_preamble(fd: std::os::unix::io::RawFd) -> ServeOptions {
                 fd,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
-                libc::MSG_PEEK,
+                PEEK_NONBLOCK,
             )
         };
         if n >= 8 && &buf[..8] != b"SMVCPOL1" {
@@ -1720,7 +1729,7 @@ fn consume_procmem_preamble(fd: std::os::unix::io::RawFd) -> Option<ProcMemAdver
                 fd,
                 hdr.as_mut_ptr() as *mut libc::c_void,
                 hdr.len(),
-                libc::MSG_PEEK,
+                PEEK_NONBLOCK,
             )
         };
         if n >= 8 && &hdr[..8] != b"SMVGPVM1" {
@@ -1791,7 +1800,7 @@ fn consume_ring_dir_preamble(fd: std::os::unix::io::RawFd) -> Option<String> {
                 fd,
                 hdr.as_mut_ptr() as *mut libc::c_void,
                 hdr.len(),
-                libc::MSG_PEEK,
+                PEEK_NONBLOCK,
             )
         };
         if n >= 8 && &hdr[..8] != b"SMVRDIR1" {
@@ -1842,7 +1851,7 @@ fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<GuestRamAdvert> 
                 fd,
                 hdr.as_mut_ptr() as *mut libc::c_void,
                 hdr.len(),
-                libc::MSG_PEEK,
+                PEEK_NONBLOCK,
             )
         };
         if n >= 8 && &hdr[..8] != b"SMVGRAM2" {
@@ -3523,7 +3532,7 @@ fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<(u64, u8)> {
                 fd,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
-                libc::MSG_PEEK,
+                PEEK_NONBLOCK,
             )
         };
         // Enough to decide: 8 bytes tells us magic-or-not; 16 is the full
@@ -4418,7 +4427,7 @@ fn peek_clone_token(fd: std::os::unix::io::RawFd) -> Option<u64> {
                 fd,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
-                libc::MSG_PEEK,
+                PEEK_NONBLOCK,
             )
         };
         if n >= 21 || n == 0 {
