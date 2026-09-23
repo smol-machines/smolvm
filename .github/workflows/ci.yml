@@ -136,6 +136,12 @@ jobs:
           LIBRARY_PATH: ${{ github.workspace }}/lib
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
 
+      - name: Run machine status pipe regression
+        run: cargo test --bin smolvm status_output_tests
+        env:
+          LIBRARY_PATH: ${{ github.workspace }}/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
+
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins
         env:
@@ -253,6 +259,12 @@ jobs:
           cargo test --lib --target ${{ matrix.target }}
           -p smolvm -p smolvm-pack -p smolvm-registry
           -p smolvm-protocol -p smolfile -p smolvm-cuda
+        env:
+          LIBRARY_PATH: /usr/local/lib
+          LD_LIBRARY_PATH: /usr/local/lib
+
+      - name: Run machine status pipe regression
+        run: cargo test --bin smolvm --target ${{ matrix.target }} status_output_tests
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
