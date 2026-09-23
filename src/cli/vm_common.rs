@@ -2841,12 +2841,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
 
 /// Show status of a named or default machine.
 ///
-/// The `extra` callback is invoked when the VM is running, allowing callers
-/// to display additional information (e.g., machine lists containers).
-pub fn status_vm<F>(name: &Option<String>, extra: F) -> smolvm::Result<()>
-where
-    F: FnOnce(&AgentManager),
-{
+pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
     let label = vm_label(name);
 
     // A frozen fork base's paused agent never answers; connecting to it
@@ -2859,20 +2854,27 @@ where
             .and_then(|db| db.get_vm(n).ok().flatten())
         {
             if smolvm::agent::state_probe::is_frozen_fork_base(n, &record) {
-                println!("Machine '{}': {}", label, RecordState::Frozen);
-                return Ok(());
+                return write_status_output(&format!(
+                    "Machine '{}': {}\n",
+                    label,
+                    RecordState::Frozen
+                ));
             }
         }
     }
 
     let manager = get_vm_manager(name)?;
+    // Reconnecting records the verified VM PID as a child. Status only observes
+    // it: a later output error or panic must not make Drop stop that VM.
+    manager.detach();
 
-    if manager.try_connect_existing().is_some() {
+    let output = if manager.try_connect_existing().is_some() {
         let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
-        println!("Machine '{}': running{}", label, pid_suffix);
-        print_memory_usage(&manager);
-        extra(&manager);
-        manager.detach();
+        let mut output = format!("Machine '{}': running{}\n", label, pid_suffix);
+        if let Some(memory_line) = memory_usage_line(&manager) {
+            output.push_str(&memory_line);
+        }
+        output
     } else if let Some(ref n) = name {
         // Agent not reachable. Report the precise state from the registry
         // (stopped / failed / created / unreachable), consistent with
@@ -2884,16 +2886,65 @@ where
         {
             Some(record) => {
                 let state = smolvm::agent::state_probe::resolve_state(n, &record);
-                println!("Machine '{}': {}", label, state);
+                format!("Machine '{}': {}\n", label, state)
             }
             None => return Err(smolvm::Error::vm_not_found(n)),
         }
     } else {
         // Default/unnamed VM: no record to resolve.
-        println!("Machine '{}': not running", label);
+        format!("Machine '{}': not running\n", label)
+    };
+
+    write_status_output(&output)
+}
+
+/// A closed pipe means the reader has enough status output. It is not a VM
+/// lifecycle event and should not turn an observational command into a panic.
+fn write_status_output(output: &str) -> smolvm::Result<()> {
+    write_status_output_to(&mut std::io::stdout().lock(), output)
+}
+
+fn write_status_output_to(writer: &mut impl Write, output: &str) -> smolvm::Result<()> {
+    match writer.write_all(output.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(smolvm::Error::agent(
+            "write machine status",
+            error.to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod status_output_tests {
+    use super::write_status_output_to;
+    use std::io::{self, Write};
+
+    struct FailingWriter(io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
-    Ok(())
+    #[test]
+    fn closed_status_pipe_is_success_but_other_output_errors_are_reported() {
+        let mut output = Vec::new();
+        write_status_output_to(&mut output, "Machine 'x': running\n").unwrap();
+        assert_eq!(output, b"Machine 'x': running\n");
+
+        write_status_output_to(&mut FailingWriter(io::ErrorKind::BrokenPipe), "status\n").unwrap();
+        assert!(write_status_output_to(
+            &mut FailingWriter(io::ErrorKind::PermissionDenied),
+            "status\n"
+        )
+        .is_err());
+    }
 }
 
 /// Print what the machine is actually using, asked of the guest.
@@ -2906,26 +2957,26 @@ where
 ///
 /// Silent when the machine's agent predates the request: a `status` that still
 /// reports state is more useful than one that fails over a detail.
-fn print_memory_usage(manager: &AgentManager) {
+fn memory_usage_line(manager: &AgentManager) -> Option<String> {
     let Ok(mut client) = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())
     else {
-        return;
+        return None;
     };
     let Ok(status) = client.memory_status() else {
-        return;
+        return None;
     };
     if status.total_bytes == 0 {
-        return;
+        return None;
     }
     let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let percent = status.used_bytes() as f64 * 100.0 / status.total_bytes as f64;
-    println!(
-        "  memory: {:.2} GiB of {:.2} GiB used ({:.0}%), {:.2} GiB available",
+    Some(format!(
+        "  memory: {:.2} GiB of {:.2} GiB used ({:.0}%), {:.2} GiB available\n",
         gib(status.used_bytes()),
         gib(status.total_bytes),
         percent,
         gib(status.available_bytes),
-    );
+    ))
 }
 
 /// Build the per-machine JSON object shared by `machine list --json` and
@@ -3007,8 +3058,7 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
     };
     let json = serde_json::to_string_pretty(&obj)
         .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
-    println!("{}", json);
-    Ok(())
+    write_status_output(&format!("{json}\n"))
 }
 
 // ============================================================================

@@ -3859,7 +3859,8 @@ impl CreateCmd {
                 || self.auto_graph
                 || self.docker_socket
                 || self.storage.is_some()
-                || self.overlay.is_some();
+                || self.overlay.is_some()
+                || !self.disk.is_empty();
             if topology_overridden {
                 return Err(smolvm::Error::config(
                     "create from .smolcheckpoint",
@@ -3997,7 +3998,7 @@ impl CreateCmd {
         let params = vm_common::CreateVmParams {
             credential_policy: None,
             credential_placeholders: Default::default(),
-            disks: Vec::new(),
+            disks: parse_attached_disks(&self.disk)?,
             nested_virt: self.nested_virt,
             secret_refs: manifest.secret_refs,
             name,
@@ -4125,7 +4126,7 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             block_io: params.block_io,
-            disks: Vec::new(),
+            disks: params.disks.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
         resources.validate()?;
@@ -4878,7 +4879,7 @@ impl StatusCmd {
         if self.json {
             return vm_common::status_vm_json(&self.name);
         }
-        vm_common::status_vm(&self.name, |_| {})
+        vm_common::status_vm(&self.name)
     }
 }
 

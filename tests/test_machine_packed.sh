@@ -32,13 +32,40 @@ test_create_from_smolmachine() {
     }
     [[ -f "$pack_output.smolmachine" ]] || { echo "FAIL: no sidecar"; return 1; }
 
-    # 2. Create a named machine from it
-    $SMOLVM machine create --name "$vm_name" --from "$pack_output.smolmachine" 2>&1 || return 1
+    # 2. An attached disk must survive the packed-create path and reach libkrun.
+    local attached_disk="$tmpdir/attached.img"
+    python3 -c 'import sys; open(sys.argv[1], "wb").truncate(1 << 30)' "$attached_disk"
+    $SMOLVM machine create --name "$vm_name" --from "$pack_output.smolmachine" --disk "$attached_disk" 2>&1 || return 1
+    local listed
+    listed=$($SMOLVM machine ls --json)
+    [[ "$listed" == *"$attached_disk"* ]] || {
+        echo "FAIL: --disk was not recorded for packed machine"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
 
     # 3. Start the machine (should NOT pull — uses extracted layers)
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
         echo "FAIL: start failed"
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- test -b /dev/vdc 2>&1 || {
+        echo "FAIL: attached disk is not visible as /dev/vdc"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # A pager closing stdout must neither panic nor stop the running machine.
+    local status_line
+    status_line=$($SMOLVM machine status --name "$vm_name" | head -1) || {
+        echo "FAIL: status failed when stdout closed early"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+    [[ "$status_line" == *"running"* ]] || {
+        echo "FAIL: status did not report running"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- true 2>&1 || {
+        echo "FAIL: status with closed stdout stopped the machine"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # 4. Exec works
