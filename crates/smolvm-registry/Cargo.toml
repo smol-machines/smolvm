@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = "5"
 filetime = "0.2"
+tempfile = "3"
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
 

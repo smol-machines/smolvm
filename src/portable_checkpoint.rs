@@ -1963,10 +1963,21 @@ fn checkpoint_packed_layers(name: &str, vm: &VmRecord) -> Result<Option<Checkpoi
         Some(digest) => digest,
         None => sha256_file(sidecar)?,
     };
-    Ok(Some(CheckpointPackedLayers {
-        artifact_sha256: artifact_sha256
+    let digest = format!(
+        "sha256:{}",
+        artifact_sha256
             .trim_start_matches("sha256:")
-            .to_ascii_lowercase(),
+            .to_ascii_lowercase()
+    );
+    let cache = smolvm_registry::BlobCache::open_default()
+        .map_err(|error| Error::agent("open pack cache", error.to_string()))?;
+    if cache.get(&digest).is_none() {
+        cache
+            .put_file_verified(&digest, sidecar)
+            .map_err(|error| Error::agent("cache checkpoint pack", error.to_string()))?;
+    }
+    Ok(Some(CheckpointPackedLayers {
+        artifact_sha256: digest.trim_start_matches("sha256:").to_string(),
         footer_checksum: footer.checksum,
         registry_ref: vm.source_registry_ref.clone(),
     }))

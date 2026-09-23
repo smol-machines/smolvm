@@ -5,7 +5,9 @@
 //! that records when it was last read. LRU eviction keeps total size under a
 //! configurable limit — default 5 GB, override with `SMOLVM_BLOB_CACHE_MAX_BYTES`.
 
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Default maximum blob-cache size when `SMOLVM_BLOB_CACHE_MAX_BYTES` is unset: 5 GB.
@@ -139,6 +141,48 @@ impl BlobCache {
         Ok(path)
     }
 
+    /// Import a local artifact without loading it into memory. The copied bytes
+    /// must match `digest` before they become visible to cache readers.
+    pub fn put_file_verified(&self, digest: &str, source: &Path) -> io::Result<PathBuf> {
+        if let Some(path) = self.get(digest) {
+            return Ok(path);
+        }
+        let mut source = fs::File::open(source)?;
+        // A `.partial` file is excluded from eviction until it is published.
+        let mut staged = tempfile::Builder::new()
+            .suffix(".partial")
+            .tempfile_in(&self.root)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 1024 * 1024];
+        let mut size = 0u64;
+        loop {
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            staged.write_all(&buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            size += count as u64;
+        }
+        if digest != format!("sha256:{:x}", hasher.finalize()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local pack digest changed while caching",
+            ));
+        }
+        staged.as_file().sync_all()?;
+        let path = self.blob_path(digest);
+        let current = self.total_size()?;
+        if current.saturating_add(size) > self.max_size {
+            self.evict_until(self.max_size.saturating_sub(size))?;
+        }
+        match staged.persist_noclobber(&path) {
+            Ok(_) => Ok(path),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(path),
+            Err(error) => Err(error.error),
+        }
+    }
+
     /// Total size of all cached blobs in bytes.
     pub fn total_size(&self) -> std::io::Result<u64> {
         let mut total = 0u64;
@@ -266,6 +310,29 @@ mod tests {
 
         // Hit after put.
         assert!(cache.get(digest).is_some());
+    }
+
+    #[test]
+    fn local_file_import_is_content_addressed_and_independent_of_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An artifact larger than the cache cap must still publish; its staging
+        // file must never be mistaken for an evictable blob.
+        let cache = BlobCache::open(tmp.path().join("cache"), 8).unwrap();
+        let source = tmp.path().join("pack.smolmachine");
+        fs::write(&source, b"packed layers").unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(b"packed layers"));
+        let wrong = format!("sha256:{:x}", Sha256::digest(b"other layers"));
+
+        assert_eq!(
+            cache.put_file_verified(&wrong, &source).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(cache.get(&wrong).is_none());
+
+        let cached = cache.put_file_verified(&digest, &source).unwrap();
+        fs::remove_file(&source).unwrap();
+        assert_eq!(fs::read(&cached).unwrap(), b"packed layers");
+        assert_eq!(cache.get(&digest), Some(cached));
     }
 
     #[test]
