@@ -88,4 +88,8 @@ pub struct BootConfig {
     /// virtio-net backend. See `agent::pod_net`.
     #[serde(default)]
     pub pod_netns: Option<PathBuf>,
+    /// Credential policy to enforce for this machine: the boot subprocess runs
+    /// the interceptor beside the network stack and mounts the machine CA.
+    #[serde(default)]
+    pub credentials: Option<crate::credentials::CredentialLaunch>,
 }

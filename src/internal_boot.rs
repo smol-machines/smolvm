@@ -717,6 +717,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
             .is_some_and(|hosts| !hosts.is_empty()),
         egress_refresh_hosts: config.dns_filter_hosts.clone(),
         pod_net: pod_net_launch,
+        credentials: config.credentials.as_ref(),
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

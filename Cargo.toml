@@ -10,6 +10,7 @@ members = [
     "crates/smolvm-cudart-shim",
     "crates/smolvm-nvml-shim",
     "crates/smolvm-network",
+    "crates/smolvm-credentials",
     "crates/smolvm-oci-layer",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
@@ -39,6 +40,7 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
+smolvm-credentials = { path = "crates/smolvm-credentials", version = "1.17.0" }
 smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.17.0" }
 smolvm-network = { path = "crates/smolvm-network", version = "1.17.0" }
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.17.0" }

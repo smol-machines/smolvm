@@ -78,6 +78,27 @@ fn create_flags_in_workload(command: &[String]) -> Vec<String> {
     found
 }
 
+/// Fold `--credential` flags into the create parameters, after any Smolfile
+/// `[[network.credentials]]` entries. A credential policy needs the network.
+fn merge_cli_credentials(
+    params: &mut vm_common::CreateVmParams,
+    flags: &[String],
+) -> smolvm::Result<()> {
+    if flags.is_empty() {
+        return Ok(());
+    }
+    let mut policy = params.credential_policy.take().unwrap_or_default();
+    for spec in flags {
+        policy.credentials.push(
+            smolvm::credentials::parse_credential_flag(spec)
+                .map_err(|e| smolvm::Error::config("--credential", e))?,
+        );
+    }
+    params.net = true;
+    params.credential_policy = Some(policy);
+    Ok(())
+}
+
 fn resolve_egress_flags(
     mut allow_cidr: Vec<String>,
     allow_host: Vec<String>,
@@ -608,6 +629,18 @@ pub struct RunCmd {
     /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
     pub allow_host: Vec<String>,
+
+    /// Bind a credential the workload may use without ever seeing it:
+    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
+    /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
+    /// requests to the listed hosts. Can be used multiple times; implies --net.
+    #[arg(
+        long = "credential",
+        value_name = "NAME=ENV_VAR@HOST",
+        help_heading = "Network"
+    )]
+    pub credential: Vec<String>,
 
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long, help_heading = "Network")]
@@ -1315,6 +1348,10 @@ impl RunCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        merge_cli_credentials(&mut params, &self.credential)?;
+        // Ephemeral machines boot before their record exists: mint placeholders
+        // now so the launch, the workload env and the record all agree.
+        vm_common::prepare_params_credentials(&mut params)?;
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins).
         for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
@@ -1715,6 +1752,15 @@ impl RunCmd {
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
+            credentials: params.credential_policy.as_ref().and_then(|policy| {
+                smolvm::credentials::CredentialLaunch::from_parts(
+                    &vm_name,
+                    policy,
+                    &params.credential_placeholders,
+                    &params.secret_refs,
+                    None,
+                )
+            }),
             // A foreground ephemeral VM exists only to serve this command, so bind
             // its lifetime to this process. Without the watchdog the VM survives a
             // SIGKILL of the CLI — which is how orchestrators (and CI) enforce
@@ -1849,7 +1895,7 @@ impl RunCmd {
         // `params.env`, so the plaintext values never touch the persisted
         // VM record — only the refs are stored (via DefaultVmOverrides), and
         // they get re-resolved at each subsequent `machine start`.
-        let resolved_secrets = vm_common::resolve_secret_refs_for_env(&params.secret_refs)?;
+        let resolved_secrets = vm_common::params_secret_env(&params)?;
 
         if freshly_started && !params.init.is_empty() {
             // Route through `run_init_commands` so init runs inside the
@@ -3430,6 +3476,14 @@ pub struct CreateCmd {
     #[arg(long = "allow-host", value_name = "HOSTNAME")]
     pub allow_host: Vec<String>,
 
+    /// Bind a credential the workload may use without ever seeing it:
+    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
+    /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
+    /// requests to the listed hosts. Can be used multiple times; implies --net.
+    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST")]
+    pub credential: Vec<String>,
+
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long)]
     pub outbound_localhost_only: bool,
@@ -3686,6 +3740,7 @@ impl CreateCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        merge_cli_credentials(&mut params, &self.credential)?;
         params.published_sockets =
             parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
@@ -3940,6 +3995,8 @@ impl CreateCmd {
             None => None,
         };
         let params = vm_common::CreateVmParams {
+            credential_policy: None,
+            credential_placeholders: Default::default(),
             disks: Vec::new(),
             nested_virt: self.nested_virt,
             secret_refs: manifest.secret_refs,

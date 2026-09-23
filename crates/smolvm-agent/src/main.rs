@@ -85,6 +85,7 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod branchpoint;
+mod credentials;
 mod cuda;
 mod dirwatch;
 mod disk_trim;
@@ -3882,6 +3883,7 @@ fn write_oci_bundle(
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
     vulkan::inject_into_container(&mut spec, rootfs_path);
+    credentials::inject_into_container(&mut spec, rootfs_path, mounts);
     spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
@@ -5098,6 +5100,7 @@ fn spawn_interactive_command(
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
     vulkan::inject_into_container(&mut spec, rootfs_path);
+    credentials::inject_into_container(&mut spec, rootfs_path, mounts);
 
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;

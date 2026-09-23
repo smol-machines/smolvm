@@ -190,6 +190,16 @@ smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget 
 # fails: not in allow list
 ```
 
+**Let untrusted code use a credential it can never read.** The guest gets a placeholder; the host swaps in the real key only on HTTPS requests to the hosts you name. See [docs/credential-substitution.md](docs/credential-substitution.md).
+
+```bash
+NOTION_API_KEY=secret_… smolvm machine run --image alpine \
+  --credential notion=NOTION_API_KEY@api.notion.com -- sh -c \
+  'apk add -q curl; echo $NOTION_API_KEY; curl -s -H "Authorization: Bearer $NOTION_API_KEY" https://api.notion.com/v1/users/me'
+# SMOL_PLACEHOLDER_NOTION_…   <- what the workload sees
+# {"object":"user",...}        <- what Notion received
+```
+
 **Pack into portable executables.** Turn any workload into a self-contained binary. All dependencies are pre-baked, so there is no install step and no runtime downloads, and it boots in <200ms.
 
 ```bash

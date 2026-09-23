@@ -156,6 +156,10 @@ pub struct GuestNetworkConfig {
     pub upstream_dns: Ipv4Addr,
     /// Optional dedicated host service reachable only through the gateway IP.
     pub host_service: Option<GatewayHostService>,
+    /// Credential interceptor for this machine. When set, guest HTTPS flows are
+    /// dialed to this loopback endpoint (prefixed with an authenticated
+    /// preamble naming the real destination) instead of the destination itself.
+    pub intercept: Option<InterceptEndpoint>,
 }
 
 /// Exact guest gateway port mapped to one smolvm-owned host loopback port.
@@ -185,6 +189,7 @@ impl GuestNetworkConfig {
                 IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
             },
             host_service: None,
+            intercept: None,
         }
     }
 }
@@ -283,6 +288,8 @@ impl GuestNetworkConfig {
         self
     }
 }
+
+pub use smolvm_protocol::InterceptEndpoint;
 
 /// Filename of the per-VM egress denial audit log, created beside the vsock
 /// socket by the launcher and read back by the host's `read_egress_denials`.
@@ -488,6 +495,7 @@ pub fn start_virtio_network(
             prefix_len6: guest_network.prefix_len6,
             upstream_dns: guest_network.upstream_dns,
             host_service: guest_network.host_service,
+            intercept: guest_network.intercept,
             mtu: 1500,
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),

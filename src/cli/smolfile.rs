@@ -169,6 +169,8 @@ pub fn build_create_params(
                 gpu_vram_mib: None,
                 rosetta: false,
                 dns_filter_hosts: None,
+                credential_policy: None,
+                credential_placeholders: Default::default(),
                 published_sockets: Vec::new(),
                 source_smolmachine: None,
             });
@@ -313,7 +315,11 @@ pub fn build_create_params(
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
     // --allow-cidr / --allow-host / [network] / --dns implies --net
-    let net = if !allowed_cidrs_vec.is_empty() || !sf_allow_hosts.is_empty() || cli_dns.is_some() {
+    let net = if !allowed_cidrs_vec.is_empty()
+        || !sf_allow_hosts.is_empty()
+        || !network.credentials.is_empty()
+        || cli_dns.is_some()
+    {
         true
     } else {
         net
@@ -409,6 +415,12 @@ pub fn build_create_params(
         } else {
             Some(sf_allow_hosts)
         },
+        credential_policy: (!network.credentials.is_empty()).then_some(
+            smolvm::credentials::CredentialPolicy {
+                credentials: network.credentials,
+            },
+        ),
+        credential_placeholders: Default::default(),
         published_sockets: Vec::new(),
         source_smolmachine: None,
     })
@@ -542,10 +554,9 @@ pub fn resolve_pack_config(
         // matching the same logic in build_create_params().
         // Preserve the tri-state: None = unspecified, Some = explicit.
         net: {
-            let network_section_implies_net = sf
-                .network
-                .as_ref()
-                .is_some_and(|n| !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty());
+            let network_section_implies_net = sf.network.as_ref().is_some_and(|n| {
+                !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty() || !n.credentials.is_empty()
+            });
             if network_section_implies_net {
                 Some(true)
             } else {

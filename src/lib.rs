@@ -67,6 +67,7 @@ pub mod api;
 #[cfg(target_os = "linux")]
 pub mod artifact_cache;
 pub mod config;
+pub mod credentials;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,
 // so the module (and its callers in cuda_host) are unix-only.

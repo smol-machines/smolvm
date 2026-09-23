@@ -325,6 +325,7 @@ impl Supervisor {
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
                 dns_filter_hosts,
+                entry.credentials.clone(),
             )?;
             features.cuda_fork_pool_size = cuda_fork_pool_size;
             features.cuda_vram_limit_mib = cuda_vram_limit_mib;

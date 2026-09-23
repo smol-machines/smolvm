@@ -122,6 +122,14 @@ pub struct ResourceSpec {
     /// them by name. Combine with `allowed_cidrs` to also permit fixed ranges.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+    /// Credential bindings substituted by the host: the workload receives a
+    /// placeholder in each `environment_variable` and the real value is
+    /// injected only on HTTPS requests to that binding's `allowed_hosts`.
+    /// Values are never part of the request; the host resolves each binding
+    /// from its own secret store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub credentials: Option<smolvm_protocol::CredentialPolicy>,
     /// Network backend: `tsi` (outbound-only) or `virtio-net`.
     ///
     /// When omitted the backend is chosen from context: machines managed by
@@ -624,6 +632,12 @@ pub struct CreateMachineRequest {
     /// names are learned into the egress allow-list.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+    /// Credential bindings substituted by the host on the way out (see
+    /// `ResourceSpec::credentials`). Placeholders replace the values in the
+    /// workload environment; the request never carries a credential value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub credentials: Option<smolvm_protocol::CredentialPolicy>,
     /// Network backend: `tsi` (outbound-only) or `virtio-net`.
     ///
     /// When omitted, machines created through the API default to `virtio-net`:

@@ -1485,6 +1485,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
     MachineEntry {
         manager,
         image: record.image.clone(),
+        credentials: crate::credentials::CredentialLaunch::for_record(&record.name, record),
         mounts,
         ports,
         resources: ResourceSpec {
@@ -2376,6 +2377,7 @@ async fn create_machine_inner(
         block_io: req.block_io,
         allowed_cidrs: normalized_cidrs,
         allowed_hosts: restored_allowed_hosts,
+        credentials: req.credentials.clone(),
         network_backend: restored_network_backend,
         // A restored guest already has its captured address in memory, so the
         // checkpoint's subnet wins over anything requested.
@@ -2858,6 +2860,7 @@ pub async fn start_machine(
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
+    let credential_launch = crate::credentials::CredentialLaunch::for_record(&name, &record);
     let record_golden = record.golden.clone();
     let record_fork_overlay_owner = record.vm_uid_owner().map(str::to_string);
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
@@ -2873,6 +2876,7 @@ pub async fn start_machine(
             Some(&name_clone),
             source_smolmachine.as_deref(),
             dns_filter_hosts,
+            credential_launch,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // A fork clone shares its golden's uid. On a cold (re)start there is no
@@ -2933,9 +2937,7 @@ pub async fn start_machine(
         let mut command = record.entrypoint.clone();
         command.extend(record.cmd.clone());
         let mut env = record.env.clone();
-        env.extend(crate::secrets::expose_into_env(
-            super::record_secret_refs_env(&entry)?,
-        ));
+        env.extend(super::record_secret_refs_env(&entry)?);
         // Remote volumes mount inside the workload container; build the mount
         // script here and let the agent run it ahead of the image-resolved
         // command, so a service image's own entrypoint is preserved.
@@ -3555,6 +3557,7 @@ async fn boot_prepared_fork_inner(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
             record.dns_filter_hosts.clone(),
+            crate::credentials::CredentialLaunch::for_record(&clone_b, &record),
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
@@ -5488,6 +5491,7 @@ mod tests {
 
     fn minimal_create_request() -> CreateMachineRequest {
         CreateMachineRequest {
+            credentials: None,
             name: Some("test-vm".to_string()),
             cpus: None,
             mem: None,

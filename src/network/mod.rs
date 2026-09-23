@@ -8,7 +8,7 @@ pub mod policy;
 
 pub use backend::NetworkBackend;
 pub use launch::{
-    plan_launch_network, validate_requested_network_backend, EffectiveNetworkBackend,
-    LaunchNetworkPlan,
+    plan_launch_network, plan_launch_network_with, validate_requested_network_backend,
+    EffectiveNetworkBackend, LaunchNetworkPlan,
 };
 pub use policy::get_dns_server;

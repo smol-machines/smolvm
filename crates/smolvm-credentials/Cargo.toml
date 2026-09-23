@@ -1,0 +1,33 @@
+[package]
+name = "smolvm-credentials"
+version = "1.17.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Credential substitution for Smol machines: policy, resolvers and the transparent HTTPS interceptor"
+
+[lib]
+name = "smolvm_credentials"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false }
+getrandom = { version = "0.3", features = ["std"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+serde_json = "1"
+smolvm-protocol = { path = "../smolvm-protocol", version = "1.17.0" }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tracing = { workspace = true }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"

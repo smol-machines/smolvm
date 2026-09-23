@@ -107,6 +107,20 @@ pub fn plan_launch_network(
     dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> LaunchNetworkPlan {
+    plan_launch_network_with(resources, dns_filter_hosts, port_count, false)
+}
+
+/// [`plan_launch_network`] for a machine that may also carry a credential
+/// policy. Credential substitution is enforced by the host-side virtio-net
+/// stack, so a policy implies networking and steers the default backend to
+/// virtio-net exactly as an egress allow-list does. An explicit TSI choice is
+/// refused at launch.
+pub fn plan_launch_network_with(
+    resources: &VmResources,
+    dns_filter_hosts: Option<&[String]>,
+    port_count: usize,
+    has_credentials: bool,
+) -> LaunchNetworkPlan {
     let has_ports = port_count > 0;
     let has_cidr_policy = resources
         .allowed_cidrs
@@ -123,7 +137,8 @@ pub fn plan_launch_network(
         || has_cidr_policy
         || has_dns_filter
         || has_fabric
-        || has_guest_subnet;
+        || has_guest_subnet
+        || has_credentials;
 
     if !wants_network {
         return LaunchNetworkPlan {
@@ -161,6 +176,7 @@ pub fn plan_launch_network(
         if has_ports
             || fleet_mode
             || has_cidr_policy
+            || has_credentials
             || has_dns_filter
             || has_host_service
             || has_fabric

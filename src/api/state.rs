@@ -137,6 +137,8 @@ pub struct ApiState {
 pub struct MachineEntry {
     /// Resolved workload image, matching the persisted machine record.
     pub image: Option<String>,
+    /// Credential policy launch description, when the machine has one.
+    pub credentials: Option<crate::credentials::CredentialLaunch>,
     /// The agent manager for this machine.
     pub manager: AgentManager,
     /// Host mounts configured for this machine.
@@ -513,6 +515,7 @@ impl ApiState {
                 block_io: Some(record.block_io),
                 allowed_cidrs: record.allowed_cidrs.clone(),
                 allowed_hosts: record.dns_filter_hosts.clone(),
+                credentials: record.credential_policy.clone(),
                 network_backend: record.network_backend,
                 guest_subnet: record.guest_subnet.clone(),
             };
@@ -543,6 +546,10 @@ impl ApiState {
                         name.clone(),
                         Arc::new(parking_lot::Mutex::new(MachineEntry {
                             image: record.image.clone(),
+                            credentials: crate::credentials::CredentialLaunch::for_record(
+                                &record.name,
+                                &record,
+                            ),
                             manager,
                             mounts,
                             ports,
@@ -1051,6 +1058,13 @@ impl ApiState {
         // dropped here, so API-created machines silently lost both).
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
+        if let Some(policy) = reg.resources.credentials.clone().filter(|p| !p.is_empty()) {
+            record.credential_placeholders = crate::credentials::prepare_policy(
+                &policy,
+                reg.resources.allowed_hosts.as_deref(),
+            )?;
+            record.credential_policy = Some(policy);
+        }
         record.network_backend = reg.resources.network_backend;
         record.guest_subnet = reg.resources.guest_subnet.clone();
         // GPU flags (previously dropped here, so API-created machines
@@ -1102,6 +1116,10 @@ impl ApiState {
                     name,
                     Arc::new(parking_lot::Mutex::new(MachineEntry {
                         image: record.image.clone(),
+                        credentials: crate::credentials::CredentialLaunch::for_record(
+                            &record.name,
+                            &record,
+                        ),
                         manager: reg.manager,
                         mounts: reg.mounts,
                         ports: reg.ports,
@@ -1351,6 +1369,7 @@ pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
     dns_filter_hosts: Option<Vec<String>>,
+    credentials: Option<crate::credentials::CredentialLaunch>,
 ) -> crate::Result<crate::agent::LaunchFeatures> {
     let features = crate::agent::LaunchFeatures::default();
     let mut features = match machine_name {
@@ -1364,6 +1383,7 @@ pub fn build_launch_features(
     // starts the DNS filter for these names and learns their answers into the
     // egress allow-list (parity with the CLI `--allow-host` path).
     features.dns_filter_hosts = dns_filter_hosts;
+    features.credentials = credentials;
     Ok(features)
 }
 
@@ -1417,6 +1437,7 @@ pub async fn ensure_machine_running(
                 entry.manager.name(),
                 entry.source_smolmachine.as_deref(),
                 entry.resources.allowed_hosts.clone(),
+                entry.credentials.clone(),
             )?
         };
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
@@ -1539,10 +1560,10 @@ async fn relaunch_image_workload(
     let mut command = record.entrypoint.clone();
     command.extend(record.cmd.clone());
     let mut env = record.env.clone();
-    env.extend(crate::secrets::expose_into_env(
+    env.extend(
         crate::api::handlers::record_secret_refs_env(entry)
             .map_err(|e| crate::Error::agent("resolve workload secrets", format!("{e:?}")))?,
-    ));
+    );
     // Remote volumes mount inside the workload container; build the mount script
     // here and let the agent run it ahead of the image-resolved command, so a
     // service image's own entrypoint is preserved rather than clobbered.
@@ -1699,6 +1720,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         // VmResources has no hostname allow-list; callers that need it graft it
         // back from the source record (see the MachineEntry reload path).
         allowed_hosts: None,
+        credentials: None,
         network_backend: res.network_backend,
         guest_subnet: res.guest_subnet,
     }
@@ -1892,6 +1914,7 @@ mod tests {
             block_io: None,
             allowed_cidrs: None,
             allowed_hosts: None,
+            credentials: None,
             network_backend: None,
             guest_subnet: None,
         };
@@ -1910,11 +1933,11 @@ mod tests {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
         let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
-        let features = build_launch_features(None, None, Some(hosts.clone())).unwrap();
+        let features = build_launch_features(None, None, Some(hosts.clone()), None).unwrap();
         assert_eq!(features.dns_filter_hosts, Some(hosts));
 
         // No hostname policy stays None (unrestricted egress, unchanged behavior).
-        let features = build_launch_features(None, None, None).unwrap();
+        let features = build_launch_features(None, None, None, None).unwrap();
         assert_eq!(features.dns_filter_hosts, None);
     }
 
@@ -1940,6 +1963,7 @@ mod tests {
         state.insert_machine(
             name,
             MachineEntry {
+                credentials: None,
                 manager: AgentManager::for_vm(name).unwrap(),
                 image: None,
                 mounts: vec![],
@@ -1955,6 +1979,7 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    credentials: None,
                     network_backend: None,
                     guest_subnet: None,
                 },
@@ -1999,6 +2024,7 @@ mod tests {
         state.insert_machine(
             "remove-test-m1",
             MachineEntry {
+                credentials: None,
                 manager,
                 image: None,
                 mounts: vec![],
@@ -2014,6 +2040,7 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    credentials: None,
                     network_backend: None,
                     guest_subnet: None,
                 },
@@ -2069,6 +2096,7 @@ mod tests {
         state.insert_machine(
             "busy-m1",
             MachineEntry {
+                credentials: None,
                 manager,
                 image: None,
                 mounts: vec![],
@@ -2084,6 +2112,7 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    credentials: None,
                     network_backend: None,
                     guest_subnet: None,
                 },

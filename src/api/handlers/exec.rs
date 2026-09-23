@@ -72,7 +72,7 @@ pub async fn exec_command(
     let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
     let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
     let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(record_env);
     env.extend(crate::secrets::expose_into_env(req_env));
 
     // Detached/background: spawn the process and return its PID immediately, so a
@@ -239,7 +239,7 @@ pub async fn exec_stream(
 
     let command = req.command.clone();
     let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(record_env);
     env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let user = req.user.clone();
@@ -382,7 +382,7 @@ pub async fn run_command(
     let image = req.image.clone();
     let command = req.command.clone();
     let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(record_env);
     env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let user = req.user.clone();

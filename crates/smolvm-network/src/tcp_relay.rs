@@ -72,7 +72,15 @@ pub struct TcpRelayTable {
     /// One authenticated smolvm-owned loopback service allowed through the
     /// otherwise-denied gateway address.
     host_service: Option<crate::GatewayHostService>,
+    /// Credential interceptor. Guest flows to [`INTERCEPTED_PORT`] are dialed
+    /// here — after the egress check admitted the real destination — so the
+    /// interceptor can substitute credentials without the guest being able to
+    /// route around it. `None` relays every flow directly.
+    intercept: Option<crate::InterceptEndpoint>,
 }
+
+/// Destination port whose guest flows go through the credential interceptor.
+pub const INTERCEPTED_PORT: u16 = 443;
 
 /// Newly established guest connection ready for a host relay thread.
 ///
@@ -136,6 +144,12 @@ pub enum RelayTarget {
     Connect(SocketAddr),
     /// Use an already-accepted host `TcpStream` from a published port listener.
     Attached(TcpStream),
+    /// Dial the credential interceptor and announce the guest's real
+    /// destination in an authenticated preamble before relaying guest bytes.
+    Intercept {
+        endpoint: crate::InterceptEndpoint,
+        destination: SocketAddr,
+    },
 }
 
 /// Host relay termination state shared between the poll loop and the relay thread.
@@ -208,6 +222,30 @@ impl TcpRelayTable {
             egress,
             gateway_ips,
             host_service,
+            intercept: None,
+        }
+    }
+
+    /// Route guest flows to [`INTERCEPTED_PORT`] through a credential
+    /// interceptor instead of dialing their destination directly.
+    pub fn with_intercept(mut self, intercept: Option<crate::InterceptEndpoint>) -> Self {
+        self.intercept = intercept;
+        self
+    }
+
+    /// Relay target for a guest-initiated flow that egress already admitted.
+    fn outbound_target(&self, destination: SocketAddr) -> RelayTarget {
+        match self.intercept {
+            Some(endpoint)
+                if destination.port() == INTERCEPTED_PORT
+                    && !self.gateway_ips.contains(&destination.ip()) =>
+            {
+                RelayTarget::Intercept {
+                    endpoint,
+                    destination,
+                }
+            }
+            _ => RelayTarget::Connect(self.host_connect_addr(destination)),
         }
     }
 
@@ -347,7 +385,7 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: RelayTarget::Connect(self.host_connect_addr(destination)),
+                    relay_target: self.outbound_target(destination),
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -761,6 +799,22 @@ fn tcp_relay_loop(
             );
             stream
         }
+        RelayTarget::Intercept {
+            endpoint,
+            destination,
+        } => {
+            virtio_net_log!(
+                "virtio-net: redirecting guest flow to credential interceptor destination={} interceptor={}",
+                destination,
+                endpoint.addr
+            );
+            // The preamble is written blocking, before any guest byte: it is a
+            // few dozen bytes to a loopback listener and must precede the TLS
+            // ClientHello the guest sends next.
+            let mut stream = TcpStream::connect(endpoint.addr)?;
+            endpoint.write_preamble(&mut stream, destination)?;
+            stream
+        }
     };
     stream.set_nonblocking(true)?;
 
@@ -1118,6 +1172,79 @@ mod tests {
 
         assert_eq!(relay_exit, RelayExitMode::Graceful);
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn intercept_target_announces_the_destination_before_guest_bytes() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = crate::InterceptEndpoint {
+            addr: listener.local_addr().unwrap(),
+            token: [0x5a; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+
+        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (to_smoltcp_tx, to_smoltcp_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let wake_pipe = Arc::new(WakePipe::new());
+        let exit_state = RelayExitState::new();
+        from_smoltcp_tx.send(b"\x16\x03\x01hello".to_vec()).unwrap();
+        drop(from_smoltcp_tx);
+
+        let interceptor = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let announced = endpoint.read_preamble(&mut stream).unwrap();
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).unwrap();
+            stream.write_all(b"ack").unwrap();
+            (announced, buf[..n].to_vec())
+        });
+
+        let relay_exit = tcp_relay_loop(
+            destination,
+            RelayTarget::Intercept {
+                endpoint,
+                destination,
+            },
+            from_smoltcp_rx,
+            to_smoltcp_tx,
+            wake_pipe,
+            &exit_state,
+        )
+        .unwrap();
+        assert_eq!(relay_exit, RelayExitMode::Graceful);
+        let (announced, first_bytes) = interceptor.join().unwrap();
+        assert_eq!(announced, destination);
+        assert_eq!(first_bytes, b"\x16\x03\x01hello");
+        assert_eq!(to_smoltcp_rx.recv().unwrap(), b"ack");
+    }
+
+    #[test]
+    fn only_https_flows_are_redirected_to_the_interceptor() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            token: [0; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let gateway = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None)
+            .with_intercept(Some(endpoint));
+        let https = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let http = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 80);
+        let gateway_https = SocketAddr::new(gateway, 443);
+        assert!(matches!(
+            table.outbound_target(https),
+            RelayTarget::Intercept { destination, .. } if destination == https
+        ));
+        assert!(matches!(table.outbound_target(http), RelayTarget::Connect(addr) if addr == http));
+        assert!(matches!(
+            table.outbound_target(gateway_https),
+            RelayTarget::Connect(addr) if addr.ip().is_loopback()
+        ));
+        let plain = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+        assert!(
+            matches!(plain.outbound_target(https), RelayTarget::Connect(addr) if addr == https)
+        );
     }
 
     #[test]

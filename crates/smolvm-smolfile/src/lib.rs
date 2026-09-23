@@ -68,6 +68,30 @@
 //! |-------|------|-------------|
 //! | `allow_hosts` | string[] | Allowed hostnames (resolved to IPs at start) |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
+//! | `credentials` | table[] | Credential bindings (see below) |
+//!
+//! #### `[[network.credentials]]` — Credential substitution
+//!
+//! The workload sees only an opaque placeholder in `environment_variable`. The
+//! host intercepts HTTPS to the binding's `allowed_hosts`, swaps the
+//! placeholder for the real value, and forwards the request; the value is read
+//! from the `[secrets]` reference of the same variable name, or from the host
+//! environment variable of that name (for example under `dotenvx run`). The
+//! credential is never sent to any other host, whatever `allow_hosts` permits.
+//!
+//! | Field | Type | Description |
+//! |-------|------|-------------|
+//! | `name` | string | Binding name |
+//! | `environment_variable` | string | Guest variable that receives the placeholder |
+//! | `allowed_hosts` | string[] | Exact hosts the credential may be sent to |
+//! | `methods` | string[] | Optional HTTP method allow-list (default: all) |
+//!
+//! ```toml
+//! [[network.credentials]]
+//! name = "notion"
+//! environment_variable = "NOTION_API_KEY"
+//! allowed_hosts = ["api.notion.com"]
+//! ```
 //!
 //! ### `[branch]` — Branchable launch and CUDA capacity
 //!
@@ -341,6 +365,11 @@ pub struct NetworkConfig {
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
+    /// Credential bindings (`[[network.credentials]]`). The guest receives a
+    /// placeholder in each `environment_variable`; the host substitutes the
+    /// real value on HTTPS requests to the binding's `allowed_hosts` only.
+    #[serde(default)]
+    pub credentials: Vec<smolvm_protocol::CredentialBinding>,
 }
 
 /// Branchable launch and CUDA branch-capacity policy.

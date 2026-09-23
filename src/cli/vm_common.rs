@@ -513,6 +513,12 @@ pub struct CreateVmParams {
     pub rosetta: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Credential bindings (from `--credential` / `[[network.credentials]]`).
+    pub credential_policy: Option<smolvm::credentials::CredentialPolicy>,
+    /// Placeholders already minted for `credential_policy`. Empty until the
+    /// record is built, except on the ephemeral `run` path, which mints them
+    /// before boot so the launch and the record agree.
+    pub credential_placeholders: BTreeMap<String, String>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     pub published_sockets: Vec<smolvm::config::PublishedSocketConfig>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
@@ -543,13 +549,48 @@ pub fn resolve_secret_refs_for_env(
 /// touches the record or the DB.
 pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String, String)>> {
     let mut env = record.env.clone();
+    // A variable bound to a credential never carries plaintext into the guest:
+    // its secret reference feeds the host interceptor and the guest gets the
+    // placeholder instead.
+    let (refs, credential_env) = smolvm::credentials::workload_env(
+        record.credential_policy.as_ref(),
+        &record.credential_placeholders,
+        &record.secret_refs,
+    );
     env.extend(smolvm::secrets::expose_into_env(
         smolvm::secrets::resolve_refs_to_env(
-            &record.secret_refs,
+            &refs,
             smolvm::secrets::ResolutionScope::RecordReplay,
         )?,
     ));
+    env.extend(credential_env);
     Ok(env)
+}
+
+/// The `run` counterpart of [`record_env_with_secrets`]: resolve the create
+/// parameters' secret refs (minus credential-bound ones) and append the
+/// credential placeholders and trust variables. Plaintext, do not log.
+pub fn params_secret_env(params: &CreateVmParams) -> smolvm::Result<Vec<(String, String)>> {
+    let (refs, credential_env) = smolvm::credentials::workload_env(
+        params.credential_policy.as_ref(),
+        &params.credential_placeholders,
+        &params.secret_refs,
+    );
+    let mut env = resolve_secret_refs_for_env(&refs)?;
+    env.extend(credential_env);
+    Ok(env)
+}
+
+/// Validate a `run` machine's credential policy and mint its placeholders
+/// ahead of boot. No-op without a policy.
+pub fn prepare_params_credentials(params: &mut CreateVmParams) -> smolvm::Result<()> {
+    if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
+        if params.credential_placeholders.is_empty() {
+            params.credential_placeholders =
+                smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?;
+        }
+    }
+    Ok(())
 }
 
 /// Create a named machine configuration (does not start it).
@@ -758,6 +799,14 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
+    if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
+        record.credential_placeholders = if params.credential_placeholders.is_empty() {
+            smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?
+        } else {
+            params.credential_placeholders.clone()
+        };
+        record.credential_policy = Some(policy.clone());
+    }
     record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
     record.labels = params.labels.clone();
@@ -1679,6 +1728,7 @@ fn start_vm_named_with_db(
         expose_docker: record.docker_socket,
         published_sockets: record.published_sockets.clone(),
         dns_filter_hosts: record.dns_filter_hosts.clone(),
+        credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
         // 0700 data dir.
@@ -1957,6 +2007,8 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.cuda = o.cuda;
     r.docker_socket = o.docker_socket;
     r.dns_filter_hosts = o.dns_filter_hosts.clone();
+    r.credential_policy = o.credential_policy.clone();
+    r.credential_placeholders = o.credential_placeholders.clone();
     r.gpu = if o.gpu { Some(true) } else { None };
     r.gpu_vram_mib = o.gpu_vram_mib;
     r.rosetta = if o.rosetta { Some(true) } else { None };
@@ -2029,6 +2081,8 @@ pub struct DefaultVmOverrides {
     pub cuda: bool,
     pub docker_socket: bool,
     pub dns_filter_hosts: Option<Vec<String>>,
+    pub credential_policy: Option<smolvm::credentials::CredentialPolicy>,
+    pub credential_placeholders: BTreeMap<String, String>,
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,
     pub rosetta: bool,
@@ -2076,6 +2130,8 @@ impl DefaultVmOverrides {
             cuda: params.cuda,
             docker_socket: params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
+            credential_policy: params.credential_policy.clone().filter(|p| !p.is_empty()),
+            credential_placeholders: params.credential_placeholders.clone(),
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
             rosetta: false,

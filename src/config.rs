@@ -601,6 +601,18 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
 
+    /// Credential bindings the workload may use through the host interceptor
+    /// (`[[network.credentials]]` / `--credential`). Names and destinations
+    /// only; values are resolved on the host per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_policy: Option<smolvm_protocol::CredentialPolicy>,
+
+    /// Binding name → placeholder handed to the guest in the bound variable.
+    /// Minted once at create and kept stable so processes captured in a
+    /// checkpoint or fork keep working after restore.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub credential_placeholders: std::collections::BTreeMap<String, String>,
+
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
     pub ephemeral: bool,
@@ -788,6 +800,8 @@ impl VmRecord {
             cuda_preload_modules: false,
             docker_socket: false,
             dns_filter_hosts: None,
+            credential_policy: None,
+            credential_placeholders: std::collections::BTreeMap::new(),
             ephemeral: false,
             source_smolmachine: None,
             source_registry_ref: None,
@@ -866,6 +880,8 @@ impl VmRecord {
             cuda_preload_modules: false,
             docker_socket: false,
             dns_filter_hosts: None,
+            credential_policy: None,
+            credential_placeholders: std::collections::BTreeMap::new(),
             ephemeral: false,
             source_smolmachine: None,
             source_registry_ref: None,
@@ -999,10 +1015,11 @@ impl VmRecord {
         ) {
             return Ok(());
         }
-        let plan = crate::network::plan_launch_network(
+        let plan = crate::network::plan_launch_network_with(
             &self.vm_resources(),
             self.dns_filter_hosts.as_deref(),
             self.ports.len(),
+            self.credential_policy.is_some(),
         );
         if plan.has_network() {
             return Ok(());
@@ -1034,10 +1051,11 @@ impl VmRecord {
                  the workload container's mount namespace",
             ));
         }
-        let plan = crate::network::plan_launch_network(
+        let plan = crate::network::plan_launch_network_with(
             &self.vm_resources(),
             self.dns_filter_hosts.as_deref(),
             self.ports.len(),
+            self.credential_policy.is_some(),
         );
         if !plan.has_network() {
             return Err(crate::Error::config(

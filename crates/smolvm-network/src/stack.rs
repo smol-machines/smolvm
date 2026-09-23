@@ -128,6 +128,8 @@ pub struct VirtioPollConfig {
     pub upstream_dns: Ipv4Addr,
     /// Dedicated loopback service reachable only at the guest-visible gateway.
     pub host_service: Option<crate::GatewayHostService>,
+    /// Credential interceptor guest HTTPS flows are redirected to.
+    pub intercept: Option<crate::InterceptEndpoint>,
     /// IP-level MTU.
     pub mtu: usize,
 }
@@ -252,7 +254,8 @@ fn run_network_stack(
         gateway_addrs.to_vec(),
         config.host_service,
     )
-    .with_published_port_seed(port_seed);
+    .with_published_port_seed(port_seed)
+    .with_intercept(config.intercept);
     let mut relay_spawn_attempts = 0_u64;
     let mut relay_spawn_successes = 0_u64;
     let mut relay_spawn_failures = 0_u64;
@@ -1344,6 +1347,7 @@ mod tests {
             prefix_len6: 64,
             upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
             host_service: None,
+            intercept: None,
             mtu: 1500,
         };
         let queues = NetworkFrameQueues::shared(32);
