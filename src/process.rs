@@ -831,6 +831,13 @@ fn build_seccomp_program(
         // VMM still can't escalate — the kernel enforces CAP_SETUID regardless,
         // so the syscall just EPERMs. Matches virtiofsd's own allowlist.
         libc::SYS_setresuid, libc::SYS_setresgid,
+        // The RAM generation worker (a fork of the VMM taken while a live
+        // snapshot is retained) reads device windows such as a virtio-fs DAX
+        // window through its own address space with process_vm_readv, because a
+        // DAX mapping can run past the end of its host file and a plain read of
+        // that page raises SIGBUS. Reading its own pid only: with per-VM uid
+        // isolation the only processes it could otherwise reach are its own VM's.
+        libc::SYS_process_vm_readv,
     ];
 
     // An async block ring is created with R_DISABLED, fixed-file-only and
