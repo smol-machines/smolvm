@@ -133,3 +133,30 @@ pub fn registry() -> &'static [&'static dyn VsockService] {
         &DockerSocketService,
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_agent_entry_bridges_socket_and_activates_guest_side() {
+        let socket = Path::new("/tmp/ssh-agent.sock");
+        let inputs = VsockServiceInputs {
+            ssh_agent_socket: Some(socket),
+            dns_filter_socket: None,
+            cuda_socket: None,
+            docker_socket: None,
+        };
+
+        let active = registry()
+            .iter()
+            .filter_map(|service| service.resolve(&inputs))
+            .find(|service| service.name == "SSH agent forwarding")
+            .expect("SSH agent service should be registered");
+
+        assert_eq!(active.port, ports::SSH_AGENT);
+        assert!(!active.listen);
+        assert_eq!(active.socket, socket);
+        assert_eq!(active.guest_env, &[("SMOLVM_SSH_AGENT", "1")]);
+    }
+}

@@ -51,6 +51,35 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the host SSH-agent socket when forwarding is requested.
+fn resolve_ssh_agent_socket(enabled: bool) -> smolvm::Result<Option<PathBuf>> {
+    resolve_ssh_agent_socket_value(enabled, std::env::var_os("SSH_AUTH_SOCK"))
+}
+
+/// Resolve SSH-agent forwarding from an explicit environment value.
+///
+/// Keeping the environment lookup separate makes the launch-time contract
+/// testable without mutating the process environment.
+fn resolve_ssh_agent_socket_value(
+    enabled: bool,
+    socket: Option<std::ffi::OsString>,
+) -> smolvm::Result<Option<PathBuf>> {
+    if !enabled {
+        return Ok(None);
+    }
+
+    socket
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::config(
+                "--ssh-agent",
+                "SSH_AUTH_SOCK is not set. Start an SSH agent with: eval $(ssh-agent) && ssh-add",
+            )
+        })
+}
+
 /// Resolve the agent-ready timeout, honoring `SMOLVM_AGENT_READY_TIMEOUT_SECS`.
 fn agent_ready_timeout() -> Duration {
     let secs = std::env::var("SMOLVM_AGENT_READY_TIMEOUT_SECS")
@@ -246,6 +275,10 @@ pub struct PackRunCmd {
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
+
+    /// Forward the host SSH agent into the VM via a vsock bridge.
+    #[arg(long, help_heading = "Security")]
+    pub ssh_agent: bool,
 
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
@@ -446,6 +479,7 @@ impl PackRunCmd {
                 ));
             }
         }
+        let ssh_agent_socket = resolve_ssh_agent_socket(self.ssh_agent)?;
 
         // 6. Extract assets to cache (locked to prevent concurrent extraction races)
         let cache_dir = extract::get_cache_dir(footer.checksum)
@@ -619,6 +653,7 @@ impl PackRunCmd {
                     } else {
                         None
                     },
+                    ssh_agent_socket: ssh_agent_socket.as_deref(),
                     dns_filter_hosts,
                 };
 
@@ -674,7 +709,7 @@ impl PackRunCmd {
                 mounts: mounts.clone(),
                 ports: ports.clone(),
                 resources: resources.clone(),
-                ssh_agent_socket: None,
+                ssh_agent_socket,
                 cuda: false,
                 expose_docker: false,
                 published_sockets: Vec::new(),
@@ -1355,6 +1390,10 @@ struct PackedRunArgs {
     #[arg(long = "net-backend", value_enum)]
     net_backend: Option<NetworkBackend>,
 
+    /// Forward the host SSH agent into the VM via a vsock bridge.
+    #[arg(long)]
+    ssh_agent: bool,
+
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
     cpus: Option<u8>,
@@ -1425,6 +1464,10 @@ struct PackedStartArgs {
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum)]
     net_backend: Option<NetworkBackend>,
+
+    /// Forward the host SSH agent into the VM via a vsock bridge.
+    #[arg(long)]
+    ssh_agent: bool,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1575,6 +1618,7 @@ fn run_ephemeral(
                 port: args.port,
                 net: args.net,
                 net_backend: args.net_backend,
+                ssh_agent: args.ssh_agent,
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1687,6 +1731,7 @@ fn run_from_cache(
     let vsock_path = runtime_dir.path().join("agent.sock");
 
     let storage_gib = storage_gib_for_manifest(args.storage, manifest);
+    let ssh_agent_socket = resolve_ssh_agent_socket(args.ssh_agent)?;
 
     let template = manifest
         .assets
@@ -1764,6 +1809,7 @@ fn run_from_cache(
             // CUDA-over-vsock for the persistent/daemon packed paths is not
             // wired yet; the `run` path starts the host server.
             cuda_socket: None,
+            ssh_agent_socket: ssh_agent_socket.as_deref(),
             // Packed binaries carry no egress flags; policy comes only from a
             // `machine run` hand-off.
             dns_filter_hosts: None,
@@ -1813,7 +1859,7 @@ fn run_from_cache(
             mounts: mounts.clone(),
             ports: ports.clone(),
             resources: resources.clone(),
-            ssh_agent_socket: None,
+            ssh_agent_socket,
             cuda: false,
             expose_docker: false,
             published_sockets: Vec::new(),
@@ -2102,6 +2148,7 @@ fn daemon_start(
         println!("Daemon already running (PID: {})", pid);
         return Ok(());
     }
+    let ssh_agent_socket = resolve_ssh_agent_socket(args.ssh_agent)?;
 
     // Clean up stale PID/socket files from previous runs
     if let Err(e) = std::fs::remove_file(daemon.join("agent.pid")) {
@@ -2220,6 +2267,7 @@ fn daemon_start(
             // CUDA-over-vsock for the persistent/daemon packed paths is not
             // wired yet; the `run` path starts the host server.
             cuda_socket: None,
+            ssh_agent_socket: ssh_agent_socket.as_deref(),
             // Packed binaries carry no egress flags; policy comes only from a
             // `machine run` hand-off.
             dns_filter_hosts: None,
@@ -2539,5 +2587,25 @@ mod tests {
         assert!(effective_network(None, true, false, false));
         assert!(effective_network(None, false, true, false));
         assert!(effective_network(None, false, false, true));
+    }
+
+    #[test]
+    fn ssh_agent_forwarding_is_disabled_without_flag() {
+        assert_eq!(resolve_ssh_agent_socket_value(false, None).unwrap(), None);
+    }
+
+    #[test]
+    fn ssh_agent_forwarding_requires_a_host_socket() {
+        let error = resolve_ssh_agent_socket_value(true, None).unwrap_err();
+        assert!(error.to_string().contains("SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn ssh_agent_forwarding_uses_the_host_socket_path() {
+        let socket = std::ffi::OsString::from("/tmp/ssh-agent.sock");
+        assert_eq!(
+            resolve_ssh_agent_socket_value(true, Some(socket)).unwrap(),
+            Some(PathBuf::from("/tmp/ssh-agent.sock"))
+        );
     }
 }

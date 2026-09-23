@@ -6,9 +6,11 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
+use crate::agent::vsock_service;
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::backend::TSI_FEATURE_HIJACK_INET;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+
 use smolvm_network::PortMapping as VirtioPortMapping;
 use smolvm_network::{start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
 use smolvm_protocol::{guest_env, ports};
@@ -74,6 +76,10 @@ pub struct PackedLaunchConfig<'a> {
     /// `cuda_host` server loaded the real driver. Mirrors the non-packed
     /// launcher's `cuda_socket`.
     pub cuda_socket: Option<&'a Path>,
+    /// Host SSH-agent socket bridged into the guest via the SSH-agent vsock
+    /// service. The guest agent activates its side through `SMOLVM_SSH_AGENT`.
+    pub ssh_agent_socket: Option<&'a Path>,
+
     /// Hostnames the egress policy permits resolving and connecting to
     /// (`--allow-host`), mirroring the main launcher's `egress_refresh_hosts`.
     /// Owned because the launch runs in a forked child that outlives the
@@ -705,22 +711,36 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_add_vsock_port2 failed");
     }
 
-    // Bridge the guest CUDA client (vsock port `ports::CUDA`) to the host CUDA
-    // server socket. `listen=false`: the guest connects out and libkrun forwards
-    // to the AF_UNIX path where `cuda_host::start` is serving. Mirrors the
-    // non-packed launcher; keeps this launcher policy-free (the caller owns the
-    // server lifecycle).
-    if let Some(cuda_sock) = config.cuda_socket {
-        let cuda_sock_c = try_or_free_ctx!(
-            path_to_cstring(cuda_sock),
-            "cuda socket path contains null byte"
+    // Guest↔host vsock services. The registry owns both sides of each bridge:
+    // the host port registration below and the guest activation env injected
+    // while building the init environment.
+    let vsock_inputs = vsock_service::VsockServiceInputs {
+        ssh_agent_socket: config.ssh_agent_socket,
+        dns_filter_socket: None,
+        cuda_socket: config.cuda_socket,
+        docker_socket: None,
+    };
+    let active_vsock: Vec<_> = vsock_service::registry()
+        .iter()
+        .filter_map(|svc| svc.resolve(&vsock_inputs))
+        .collect();
+    for svc in &active_vsock {
+        debug_assert_ne!(
+            svc.port,
+            ports::AGENT_CONTROL,
+            "{} would shadow the agent control channel",
+            svc.name
         );
-        // SAFETY: ctx is valid, cuda_sock_c is a valid C string.
-        if unsafe { (krun.add_vsock_port2)(ctx, ports::CUDA, cuda_sock_c.as_ptr(), false) } < 0 {
-            free_ctx_on_err!("krun_add_vsock_port2 (CUDA) failed");
+        let service_socket = try_or_free_ctx!(
+            path_to_cstring(svc.socket),
+            "vsock service socket path contains null byte"
+        );
+        if unsafe { (krun.add_vsock_port2)(ctx, svc.port, service_socket.as_ptr(), svc.listen) } < 0
+        {
+            free_ctx_on_err!(format!("krun_add_vsock_port2 ({}) failed", svc.name));
         }
         if config.debug {
-            eprintln!("debug: CUDA-over-vsock bridged to {}", cuda_sock.display());
+            eprintln!("debug: {} bridged to {}", svc.name, svc.socket.display());
         }
     }
 
@@ -792,14 +812,11 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    // The packed launcher wires CUDA directly instead of going through the
-    // shared vsock-service builder, so it must carry the same guest feature
-    // sentinel explicitly. Without it the agent never stages the bundled
-    // shims and `pack run --cuda` boots a CUDA bridge that workloads cannot use.
-    if config.cuda_socket.is_some() {
-        let cuda_env = format!("{}={}", guest_env::CUDA_ZEROCOPY, guest_env::VALUE_ON);
-        if let Ok(cstr) = CString::new(cuda_env) {
-            env_strings.push(cstr);
+    // Activate the guest side of each enabled vsock service. These env vars
+    // come from the same registry that wired the host ports above.
+    for svc in &active_vsock {
+        for (key, value) in svc.guest_env {
+            env_strings.push(cstr(&format!("{key}={value}")));
         }
     }
 

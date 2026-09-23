@@ -198,6 +198,14 @@ smolvm pack create --image python:3.12-alpine -o ./python312
 # Python 3.12.x, isolated: no pyenv/venv/conda needed
 ```
 
+Packaged runs can forward the host SSH agent without copying private keys into the guest:
+
+```bash
+./python312 run --net --ssh-agent -- git clone git@github.com:org/private-repo.git
+```
+
+This requires `SSH_AUTH_SOCK` to point to a running host SSH agent. Forward the agent only to workloads you trust; the guest can request signatures while it is running.
+
 **Use local container images** for CI, air-gapped hosts, and fast iteration. Feed `--image` a `docker save` / `podman save` archive, pipe one on stdin, or point it at an unpacked rootfs directory. Image work is delegated to your container tooling; smolvm just boots the result.
 
 ```bash
