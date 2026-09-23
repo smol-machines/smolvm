@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::network::NetworkBackend;
 use serde::{Deserialize, Serialize};
 pub use smolvm_protocol::publish_socket::SocketDirection;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// A user-published host↔guest Unix-socket bridge (`--expose-socket` /
 /// `--mount-socket`), persisted on the VM record. The vsock port is assigned at
@@ -44,6 +44,10 @@ pub enum RecordState {
     Running,
     /// VM exited cleanly.
     Stopped,
+    /// Execution is saved durably; use resume rather than a fresh boot.
+    Paused,
+    /// A final execution boundary is being saved before stopping.
+    Pausing,
     /// VM crashed or error.
     Failed,
     /// libkrun VMM process is alive but the guest agent is not
@@ -71,6 +75,8 @@ impl std::fmt::Display for RecordState {
             RecordState::Created => write!(f, "created"),
             RecordState::Running => write!(f, "running"),
             RecordState::Stopped => write!(f, "stopped"),
+            RecordState::Paused => write!(f, "paused"),
+            RecordState::Pausing => write!(f, "pausing"),
             RecordState::Failed => write!(f, "failed"),
             RecordState::Unreachable => write!(f, "unreachable"),
             RecordState::Frozen => write!(f, "frozen"),
@@ -202,8 +208,9 @@ pub struct SmolvmConfig {
     /// Storage volume path (macOS only, for case-sensitive filesystem).
     #[cfg(target_os = "macos")]
     pub storage_volume: String,
-    /// Registry of known VMs (by name) - in-memory cache.
-    pub vms: HashMap<String, VmRecord>,
+    /// Registry of known VMs (by name) - in-memory cache. Ordered by name so
+    /// every listing comes out the same way; a hash map reshuffles per process.
+    pub vms: BTreeMap<String, VmRecord>,
 }
 
 impl SmolvmConfig {
@@ -220,7 +227,7 @@ impl SmolvmConfig {
             default_dns: network::default_dns(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
-            vms: HashMap::new(),
+            vms: BTreeMap::new(),
         })
     }
 }
@@ -327,7 +334,7 @@ impl SmolvmConfig {
         self.vms.get(id)
     }
 
-    /// List all VM records.
+    /// List all VM records, in name order.
     pub fn list_vms(&self) -> impl Iterator<Item = (&String, &VmRecord)> {
         self.vms.iter()
     }
@@ -372,6 +379,10 @@ pub struct VmRecord {
     /// VM lifecycle state.
     #[serde(default)]
     pub state: RecordState,
+
+    /// Durable execution state retained until a successful explicit resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_checkpoint: Option<std::path::PathBuf>,
 
     /// Process ID when running.
     #[serde(default)]
@@ -719,6 +730,7 @@ impl VmRecord {
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
+            paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
             cpus,
@@ -794,6 +806,7 @@ impl VmRecord {
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
+            paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
             cpus,

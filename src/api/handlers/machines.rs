@@ -2128,7 +2128,7 @@ async fn create_machine_inner(
     let guard = ReservationGuard::new(&state, name.clone())?;
 
     // Create manager (does not boot the VM)
-    let manager = tokio::task::spawn_blocking({
+    let mut manager = tokio::task::spawn_blocking({
         let name = name.clone();
         let storage_gb = restored_storage_gb;
         let overlay_gb = restored_overlay_gb;
@@ -2318,6 +2318,18 @@ async fn create_machine_inner(
     }
 
     if manifest_checkpoint.is_some() {
+        // Install may publish a disk under a different name than the one the
+        // manager opened (a copy-on-write top is `.qcow2`, not `.raw`), so
+        // resolve the disks again rather than launch from a stale handle.
+        manager = tokio::task::spawn_blocking({
+            let name = name.clone();
+            move || {
+                AgentManager::for_vm_with_sizes(&name, restored_storage_gb, restored_overlay_gb)
+                    .map_err(|e| ApiError::internal(format!("reopen restored disks: {e}")))
+            }
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
         crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
     }
     let resources = ResourceSpec {
@@ -2624,6 +2636,12 @@ pub async fn start_machine(
         .lookup_vm(&name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    if record.paused_checkpoint.is_some() {
+        return Err(ApiError::Conflict(
+            "machine has saved execution; use resume".into(),
+        ));
+    }
 
     // Resolve via the shared probe (PID + vsock ping) so we don't
     // mistake a zombie VMM (live PID, dead agent) for Running — the
@@ -3702,6 +3720,142 @@ pub async fn release_held_fork(
     Ok(Json(record_to_info(&clone, &updated)))
 }
 
+/// Optional identity used to fence delayed cloud retries.
+#[derive(Default, serde::Deserialize)]
+pub struct PauseOperationQuery {
+    /// The same identifier must be reused for all attempts of one pause.
+    pub operation_id: Option<String>,
+}
+
+/// Save execution durably before stopping the machine.
+#[utoipa::path(post, path = "/api/v1/machines/{name}/pause", tag = "Machines",
+    params(("name" = String, Path, description = "Machine name")),
+    responses((status = 200, description = "Machine paused", body = MachineInfo)))]
+pub async fn pause_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Query(query): Query<PauseOperationQuery>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    saved_execution_operation(state, name, false, query.operation_id).await
+}
+
+/// Resume saved execution under the same machine name.
+#[utoipa::path(post, path = "/api/v1/machines/{name}/resume", tag = "Machines",
+    params(("name" = String, Path, description = "Machine name")),
+    responses((status = 200, description = "Machine resumed", body = MachineInfo)))]
+pub async fn resume_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Query(query): Query<PauseOperationQuery>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    saved_execution_operation(state, name, true, query.operation_id).await
+}
+
+async fn saved_execution_operation(
+    state: Arc<ApiState>,
+    name: String,
+    resume: bool,
+    operation: Option<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let guard = state.lifecycle_lock(&name).lock_owned().await;
+    // The operation owns its lock even if the HTTP caller disconnects.
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let runtime = crate::embedded::EmbeddedRuntime::with_db(state.db().clone());
+        if resume {
+            let record = state
+                .db()
+                .get_vm(&name)
+                .map_err(ApiError::database)?
+                .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+            if !record.is_process_alive() {
+                if let Ok(entry) = state.get_machine(&name) {
+                    entry.lock().manager.mark_stopped();
+                }
+            }
+            match operation {
+                Some(operation) => {
+                    runtime.resume_machine_detached_with_operation(&name, &operation)
+                }
+                None => runtime.resume_machine_detached(&name),
+            }
+        } else if let Some(operation) = operation {
+            runtime.pause_machine_with_operation(&name, &operation)
+        } else {
+            runtime.pause_machine(&name)
+        }
+        .map_err(ApiError::from)?;
+        if !resume {
+            if let Ok(entry) = state.get_machine(&name) {
+                entry.lock().manager.mark_stopped();
+            }
+        }
+        let record = state
+            .db()
+            .get_vm(&name)
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+        Ok(Json(record_to_info(&name, &record)))
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
+/// Download a paused machine's saved execution without consuming it.
+pub async fn paused_checkpoint(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Query(query): Query<PauseOperationQuery>,
+) -> Result<Response<Body>, ApiError> {
+    let guard = state.lifecycle_lock(&name).lock_owned().await;
+    let file = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let _operation = crate::agent::fork::lock_saved_execution(&name)?;
+        if let Some(operation) = query.operation_id {
+            if !state.db().pause_operation_is_active(&name, &operation)? {
+                return Err(SmolvmError::agent_conflict(
+                    "download saved execution",
+                    "pause operation is no longer active",
+                ));
+            }
+        }
+        let _source = crate::agent::fork::lock_fork_source(&name)?;
+        let record = state
+            .db()
+            .get_vm(&name)?
+            .ok_or_else(|| SmolvmError::vm_not_found(&name))?;
+        if record.state != RecordState::Paused || record.is_process_alive() {
+            return Err(SmolvmError::agent_conflict(
+                "download paused checkpoint",
+                "machine must be paused",
+            ));
+        }
+        let path = record.paused_checkpoint.ok_or_else(|| {
+            SmolvmError::agent_conflict(
+                "download paused checkpoint",
+                "machine has no saved execution",
+            )
+        })?;
+        crate::portable_checkpoint::verified_sidecar_footer(&path)?;
+        std::fs::File::open(path).map_err(SmolvmError::from)
+    })
+    .await?
+    .map_err(ApiError::from)?;
+    let size = file.metadata().map_err(ApiError::internal)?.len();
+    // The open descriptor survives deletion of the machine or a concurrent
+    // resume; downloading never takes ownership of its recovery artifact.
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.smolmachines.checkpoint",
+        )
+        .header(header::CONTENT_LENGTH, size)
+        .body(Body::from_stream(tokio_util::io::ReaderStream::new(
+            tokio::fs::File::from_std(file),
+        )))
+        .map_err(ApiError::internal)
+}
+
 /// Stop a machine.
 #[utoipa::path(
     post,
@@ -3739,6 +3893,12 @@ pub async fn stop_machine(
         .lookup_vm(&name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    if record.paused_checkpoint.is_some() {
+        return Err(ApiError::Conflict(
+            "machine has saved execution; use resume or delete".into(),
+        ));
+    }
 
     // Resolve the control-plane state, not only PID liveness. A non-Linux fork
     // base is genuinely Frozen and its source VMM owns the RAM backing, so it

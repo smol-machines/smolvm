@@ -203,6 +203,32 @@ pub(crate) fn expand_sparse_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> 
             ),
         )
     })?;
+    // A qcow2 disk's size is its header's virtual size, not its file length:
+    // lengthening the file only pads the image and the guest never sees it.
+    if let Some(current_size) = qcow2_virtual_size(path)? {
+        if new_size_bytes == current_size {
+            return Ok(());
+        }
+        if new_size_bytes < current_size {
+            return Err(Error::storage(
+                "expand disk",
+                format!(
+                    "new size ({} GiB) must be larger than current size ({} GiB). Shrinking is not supported.",
+                    new_size_gb,
+                    current_size / BYTES_PER_GIB
+                ),
+            ));
+        }
+        tracing::info!(
+            path = %path.display(),
+            disk_type = D::NAME,
+            current_gb = current_size / BYTES_PER_GIB,
+            new_gb = new_size_gb,
+            "expanding {} qcow2 disk",
+            D::NAME
+        );
+        return set_qcow2_virtual_size(path, new_size_bytes);
+    }
     let current_size = std::fs::metadata(path)
         .map_err(|e| Error::storage("get disk metadata", e.to_string()))?
         .len();
@@ -327,6 +353,41 @@ pub(crate) fn format_disk_with_mkfs<D: DiskType>(disk_path: &Path) -> Result<()>
         D::NAME
     );
     Ok(())
+}
+
+/// Byte offset of the virtual disk size in a qcow2 header (big-endian u64).
+const QCOW2_SIZE_OFFSET: u64 = 24;
+
+/// The virtual size recorded in a qcow2 header, or `None` for any other file.
+fn qcow2_virtual_size(path: &Path) -> Result<Option<u64>> {
+    use std::io::Read;
+    let mut header = [0u8; 32];
+    let mut file =
+        std::fs::File::open(path).map_err(|e| Error::storage("open disk", e.to_string()))?;
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(Error::storage("read disk header", e.to_string())),
+    }
+    if header[..4] != *b"QFI\xfb" {
+        return Ok(None);
+    }
+    Ok(Some(u64::from_be_bytes(header[24..32].try_into().unwrap())))
+}
+
+/// Grow a qcow2 image by rewriting its header's virtual size. Clusters past
+/// the old end are unallocated, so they read through to any backing file and
+/// as zeros past its end; the L1 table grows on the first write that needs it.
+fn set_qcow2_virtual_size(path: &Path, new_size_bytes: u64) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| Error::storage("open disk for expansion", e.to_string()))?;
+    file.seek(SeekFrom::Start(QCOW2_SIZE_OFFSET))
+        .and_then(|_| file.write_all(&new_size_bytes.to_be_bytes()))
+        .and_then(|()| file.sync_all())
+        .map_err(|e| Error::storage("write qcow2 size", e.to_string()))
 }
 
 pub(crate) fn write_last_byte(
@@ -860,6 +921,43 @@ mod tests {
         assert!(
             err.contains("cannot hold") || err.contains("resize2fs failed"),
             "{err}"
+        );
+    }
+
+    /// A qcow2 disk grows by its header's virtual size; its file (and so every
+    /// cluster and the backing reference) is left exactly as it was.
+    #[test]
+    fn expand_grows_a_qcow2_disk_by_its_virtual_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage.qcow2");
+        let mut image = vec![0u8; 4096];
+        image[..4].copy_from_slice(b"QFI\xfb");
+        image[4..8].copy_from_slice(&3u32.to_be_bytes());
+        image[24..32].copy_from_slice(&(80 * BYTES_PER_GIB).to_be_bytes());
+        image[512..520].copy_from_slice(b"backing!");
+        std::fs::write(&path, &image).unwrap();
+
+        expand_sparse_disk::<crate::data::disk::Storage>(&path, 100).unwrap();
+        let grown = std::fs::read(&path).unwrap();
+        assert_eq!(
+            grown.len(),
+            image.len(),
+            "the file itself must not be padded"
+        );
+        assert_eq!(
+            u64::from_be_bytes(grown[24..32].try_into().unwrap()),
+            100 * BYTES_PER_GIB
+        );
+        assert_eq!(grown[..24], image[..24]);
+        assert_eq!(grown[32..], image[32..]);
+
+        // Idempotent at the same size, and never shrinks.
+        expand_sparse_disk::<crate::data::disk::Storage>(&path, 100).unwrap();
+        let err = expand_sparse_disk::<crate::data::disk::Storage>(&path, 90).unwrap_err();
+        assert!(format!("{err}").contains("Shrinking is not supported"));
+        assert_eq!(
+            u64::from_be_bytes(std::fs::read(&path).unwrap()[24..32].try_into().unwrap()),
+            100 * BYTES_PER_GIB
         );
     }
 

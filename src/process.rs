@@ -808,6 +808,17 @@ fn build_seccomp_program(
         libc::SYS_fchmod, libc::SYS_fdatasync, libc::SYS_utimensat, libc::SYS_copy_file_range,
         libc::SYS_fsetxattr, libc::SYS_fremovexattr,
         libc::SYS_lgetxattr, libc::SYS_lsetxattr, libc::SYS_llistxattr, libc::SYS_lremovexattr,
+        // The PATH-following pair, which the fd/symlink variants above cannot
+        // stand in for. `user.containers.override_stat` is read and written
+        // through an `O_PATH` fd — which `f*xattr` rejects with EBADF — so
+        // passthrough.rs reaches it by its `/proc/self/fd/N` magic link
+        // (`read_override` / `write_override`). That link must be FOLLOWED to
+        // land on the real inode, so `l*xattr`, which would operate on the link
+        // itself, is equally unusable. Omitting these killed any guest whose
+        // PID 1 stats early and often — systemd never finished booting, dying on
+        // SIGSYS with syscall 191 under `enforce`. `list`/`remove` have no bare
+        // caller, so they stay out: this list is an allowlist, not a family.
+        libc::SYS_getxattr, libc::SYS_setxattr,
         // virtiofs scopes each request to the guest process's uid/gid before
         // touching the host fs (so DAC checks run as the guest user, not as a
         // root VMM) via per-thread setres{u,g}id — passthrough.rs `scoped_cred!`
@@ -3671,6 +3682,62 @@ mod tests {
             assert!(
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
                 "guardian chmod should survive seccomp, status={status:#x}"
+            );
+        }
+    }
+
+    /// The converse of the test above: a syscall the VMM legitimately issues must
+    /// SURVIVE `enforce`. `getxattr` is the regression that motivated this —
+    /// virtiofs reads `user.containers.override_stat` through an `O_PATH` fd's
+    /// `/proc/self/fd` link, so it must use the path-following variant, and its
+    /// absence killed every systemd guest with SIGSYS mid-boot. The child exits 0
+    /// only if it ran the syscall and lived; the filter killing it yields SIGSYS
+    /// instead, which is the failure this pins.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_allows_path_following_xattr_syscalls() {
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                // Both are expected to FAIL (no such xattr) — what matters is
+                // that the kernel returns an error instead of raising SIGSYS.
+                let path = c"/proc/self/exe";
+                let name = c"user.containers.override_stat";
+                let mut buf = [0u8; 64];
+                libc::syscall(
+                    libc::SYS_getxattr,
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+                libc::syscall(
+                    libc::SYS_setxattr,
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_ptr(),
+                    0usize,
+                    0,
+                );
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS),
+                "path-following xattr syscalls must not be killed by the filter"
+            );
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "child should run both syscalls and exit cleanly, status={status:#x}"
             );
         }
     }

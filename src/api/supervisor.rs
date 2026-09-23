@@ -138,6 +138,10 @@ impl Supervisor {
         // Machine is dead — try to retrieve its exit code via waitpid
         // and persist it so the restart policy can use it.
         if let Ok(Some(record)) = self.state.db().get_vm(name) {
+            if record.paused_checkpoint.is_some() {
+                self.next_restart_at.remove(name);
+                return Ok(());
+            }
             // A recovered manager can lack a child handle and its PID file
             // can be missing while the database still identifies a live VMM.
             // Do not erase that identity or schedule another launch.

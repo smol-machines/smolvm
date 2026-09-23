@@ -350,6 +350,12 @@ pub enum MachineCmd {
     /// Stop a running machine
     Stop(StopCmd),
 
+    /// Save RAM and disk durably, then stop at the saved execution boundary
+    Pause(PauseCmd),
+
+    /// Resume saved execution in the same machine
+    Resume(ResumeCmd),
+
     /// Delete a machine configuration
     #[command(visible_alias = "rm")]
     Delete(DeleteCmd),
@@ -428,6 +434,8 @@ impl MachineCmd {
             MachineCmd::CheckpointLog(cmd) => cmd.run(),
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
+            MachineCmd::Pause(cmd) => cmd.run(),
+            MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
@@ -1181,6 +1189,7 @@ impl RunCmd {
             }
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(from),
+                local_bake: false,
                 command: self.command,
                 interactive: self.interactive,
                 tty: self.tty,
@@ -1330,6 +1339,7 @@ impl RunCmd {
                 };
                 return crate::cli::pack_run::PackRunCmd {
                     sidecar: Some(sidecar),
+                    local_bake: false,
                     command,
                     interactive: self.interactive,
                     tty: self.tty,
@@ -1477,6 +1487,7 @@ impl RunCmd {
             };
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(cached),
+                local_bake: true,
                 command,
                 interactive: self.interactive,
                 tty: self.tty,
@@ -4655,6 +4666,34 @@ pub struct StopCmd {
     /// Machine to stop (default: "default")
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct PauseCmd {
+    #[arg(short = 'n', long)]
+    pub name: String,
+}
+
+impl PauseCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        smolvm::embedded::EmbeddedRuntime::new()?.pause_machine(&self.name)?;
+        println!("Machine '{}' paused", self.name);
+        Ok(())
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct ResumeCmd {
+    #[arg(short = 'n', long)]
+    pub name: String,
+}
+
+impl ResumeCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        smolvm::embedded::EmbeddedRuntime::new()?.resume_machine_detached(&self.name)?;
+        println!("Machine '{}' resumed", self.name);
+        Ok(())
+    }
 }
 
 impl StopCmd {

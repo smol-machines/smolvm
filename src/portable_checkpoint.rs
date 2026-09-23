@@ -791,6 +791,13 @@ struct SavedVmPause {
 }
 
 impl SavedVmPause {
+    fn stop(&mut self, name: &str, record: &VmRecord) -> Result<()> {
+        crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?
+            .stop_paused()?;
+        self.armed = false;
+        Ok(())
+    }
+
     fn resume(&mut self) -> Result<()> {
         if !self.armed {
             return Ok(());
@@ -982,6 +989,54 @@ pub(crate) fn capture_to_path_with_source_release(
     history: usize,
     release_source: impl FnOnce(),
 ) -> Result<CaptureResult> {
+    capture_with_completion(
+        name,
+        output,
+        options,
+        history,
+        release_source,
+        false,
+        |_| Ok(()),
+    )
+}
+
+/// Durable lifecycle boundaries for an owner coordinating a pause.
+pub enum PauseCaptureStage {
+    /// Persist intent before freezing the guest.
+    Capturing,
+    /// Persist the resume point before terminating the frozen VM.
+    Durable,
+}
+
+/// Capture one final execution boundary and stop without running the guest again.
+/// `publish_resume_point` must durably record how to resume before the VM exits.
+/// Any error before that commit resumes the original guest.
+pub fn capture_and_stop_to_path(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
+) -> Result<CaptureResult> {
+    capture_with_completion(
+        name,
+        output,
+        options,
+        DEFAULT_HISTORY,
+        || {},
+        true,
+        publish_resume_point,
+    )
+}
+
+fn capture_with_completion(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    history: usize,
+    release_source: impl FnOnce(),
+    stop_after_capture: bool,
+    mut publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
+) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
     let mut phase = started;
     if options.store_dir.is_some() && options.staging_dir.is_some() {
@@ -1095,7 +1150,8 @@ pub(crate) fn capture_to_path_with_source_release(
     // fork can never overlap or produce two competing source generations.
     // Hold it through the RAM worker: its cgroup reservation must not race a
     // fork resizing the same scope. Release before packaging and compression.
-    let source_lock = crate::agent::fork::lock_fork_source(name)?;
+    let mut source_lock = Some(crate::agent::fork::lock_fork_source(name)?);
+    let mut release_source = Some(release_source);
     let config = validated_capture_source(name)?;
     let vm = config
         .vms
@@ -1106,6 +1162,15 @@ pub(crate) fn capture_to_path_with_source_release(
     let checkpoint_id = new_checkpoint_id();
     let checkpoint_created_at =
         humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+    if stop_after_capture {
+        let db = crate::db::SmolvmDb::open()?;
+        if !db.dependent_clones(name)?.is_empty() {
+            return Err(Error::agent_conflict(
+                "pause machine",
+                "cannot pause a machine while branches depend on its live state",
+            ));
+        }
+    }
     let control = crate::agent::fork::control_socket_path(name);
     let runtime_capture = runtime_capture_dir(name, vm)?;
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
@@ -1125,6 +1190,9 @@ pub(crate) fn capture_to_path_with_source_release(
             == "OK sparse-stream-v1 ownership-v1";
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
+    if stop_after_capture {
+        publish_resume_point(PauseCaptureStage::Capturing)?;
+    }
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
     let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
@@ -1170,8 +1238,18 @@ pub(crate) fn capture_to_path_with_source_release(
         &mut phase,
     );
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
-    pause.resume()?;
-    log_phase(name, "capture_disks_and_resume", &mut phase);
+    if !stop_after_capture {
+        pause.resume()?;
+    }
+    log_phase(
+        name,
+        if stop_after_capture {
+            "capture_disks_held"
+        } else {
+            "capture_disks_and_resume"
+        },
+        &mut phase,
+    );
     let source_pause = pause_started.elapsed();
 
     let mut sparse_socket = if prepared && sparse_capable {
@@ -1367,15 +1445,19 @@ pub(crate) fn capture_to_path_with_source_release(
     log_phase(name, "capture_manifest", &mut phase);
     // Everything consumed below is capture-owned. Packaging and publication
     // must not serialize new branches or other operations on the live source.
-    #[cfg(target_os = "linux")]
-    if streamed_memory.is_some() {
-        memory_reservation
-            .as_mut()
-            .unwrap()
-            .allow_concurrent_branches();
+    if !stop_after_capture {
+        #[cfg(target_os = "linux")]
+        if streamed_memory.is_some() {
+            // Pause keeps this lock through durability and shutdown. Marking
+            // it released would make reservation cleanup lock it a second time.
+            memory_reservation
+                .as_mut()
+                .unwrap()
+                .allow_concurrent_branches();
+        }
+        drop(source_lock.take());
+        release_source.take().unwrap()();
     }
-    drop(source_lock);
-    release_source();
 
     if let Some((directory, mut writer)) = stored {
         let mut files = writer
@@ -1445,11 +1527,19 @@ pub(crate) fn capture_to_path_with_source_release(
                 tracing::warn!(%error, "checkpoint lineage not recorded in store");
             }
         }
+        if stop_after_capture {
+            publish_resume_point(PauseCaptureStage::Durable)?;
+            pause.stop(name, vm)?;
+        }
         set_checkpoint_head(name, &checkpoint_id);
         return Ok(CaptureResult {
             size_bytes: stats.new_bytes,
             reused_bytes: stats.reused_bytes,
-            source_pause,
+            source_pause: if stop_after_capture {
+                pause_started.elapsed()
+            } else {
+                source_pause
+            },
             elapsed: started.elapsed(),
         });
     }
@@ -1499,11 +1589,19 @@ pub(crate) fn capture_to_path_with_source_release(
         }
         log_phase(name, "capture_retain_prepared", &mut phase);
     }
+    if stop_after_capture {
+        publish_resume_point(PauseCaptureStage::Durable)?;
+        pause.stop(name, vm)?;
+    }
     set_checkpoint_head(name, &checkpoint_id);
     Ok(CaptureResult {
         reused_bytes: 0,
         size_bytes: info.total_size,
-        source_pause,
+        source_pause: if stop_after_capture {
+            pause_started.elapsed()
+        } else {
+            source_pause
+        },
         elapsed: started.elapsed(),
     })
 }
@@ -2687,7 +2785,11 @@ fn share_service_owned_backing(
     input.set_permissions(std::fs::Permissions::from_mode(0o444))?;
     match std::fs::hard_link(source, destination) {
         Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => return Ok(false),
+        // A different filesystem, or a base already linked into as many
+        // machines as the filesystem allows (ext4: 65,000), gets a private copy.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EXDEV | libc::EMLINK)) => {
+            return Ok(false)
+        }
         Err(error) => return Err(error.into()),
     }
     let linked = std::fs::symlink_metadata(destination)?;
@@ -2837,6 +2939,22 @@ fn protect_restore_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a restore may give the captured writable disk a copy-on-write top
+/// instead of copying it. On by default; `SMOLVM_RESTORE_COW_DISK=0` restores
+/// the full copy.
+#[cfg(target_os = "linux")]
+fn cow_restore_enabled() -> bool {
+    std::env::var("SMOLVM_RESTORE_COW_DISK").map_or(true, |value| value != "0")
+}
+
+/// Whether two paths name the same file.
+#[cfg(target_os = "linux")]
+fn same_inode(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
 /// Install verified checkpoint state before a machine is launched.
 pub fn install(
     extracted: &Path,
@@ -2900,11 +3018,49 @@ pub fn install(
         let staged_disks = partial.join("disks");
         std::fs::create_dir(&staged_disks)
             .map_err(|error| Error::agent("stage checkpoint disks", error.to_string()))?;
+        // Names to move into the machine directory, and the copy-on-write tops
+        // to create over a captured writable disk once its base is in place.
+        let mut staged_names: Vec<String> = Vec::new();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut cow_tops: Vec<crate::agent::DiskOverlaySpec> = Vec::new();
         for disk in &checkpoint.disks {
             for (index, file) in disk.files.iter().enumerate() {
                 let started = std::time::Instant::now();
                 let staged = staged_disks.join(&file.target);
                 let source = extracted.join(&file.asset.path);
+                #[cfg(target_os = "linux")]
+                if index == 0
+                    && disk.files.len() == 1
+                    && file.format == "raw"
+                    && cow_restore_enabled()
+                {
+                    // Copying the captured disk is most of a restore. Share it
+                    // as an immutable base instead, like a deeper layer, and
+                    // give this machine a thin qcow2 top of its own. Only a
+                    // base that really is shared earns the extra layer; a
+                    // private copy is simply this machine's writable disk.
+                    let base_name = format!(".smolcheckpoint-{}-base.raw", disk.role);
+                    let staged_base = staged_disks.join(&base_name);
+                    promote_retained_backing(extracted, &source, &file.asset)?;
+                    link_or_copy_verified_sparse(&source, &staged_base, &file.asset)?;
+                    if same_inode(&source, &staged_base)? {
+                        cow_tops.push((
+                            vm_data_dir.join(Path::new(&file.target).with_extension("qcow2")),
+                            vm_data_dir.join(&base_name),
+                            crate::data::disk::DiskFormat::Raw,
+                        ));
+                        staged_names.push(base_name);
+                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "cow_top", "checkpoint disk installed");
+                    } else {
+                        std::fs::rename(&staged_base, &staged).map_err(|error| {
+                            Error::agent("stage checkpoint disk", error.to_string())
+                        })?;
+                        staged_names.push(file.target.clone());
+                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = true, "checkpoint disk installed");
+                    }
+                    continue;
+                }
+                staged_names.push(file.target.clone());
                 if index == 0 {
                     // The active top layer is writable after resume and must
                     // never alias the immutable extraction cache.
@@ -2958,17 +3114,15 @@ pub fn install(
                 }
             }
         }
-        for disk in &checkpoint.disks {
-            for file in &disk.files {
-                // The staged chain is already private (top) or has an owned
-                // hard link (immutable backing). Move those exact inodes into
-                // the launcher's disk namespace instead of copying them again.
-                std::fs::rename(
-                    destination.join("disks").join(&file.target),
-                    vm_data_dir.join(&file.target),
-                )
+        // The staged chain is already private (top) or has an owned hard link
+        // (immutable backing). Move those exact inodes into the launcher's disk
+        // namespace instead of copying them again.
+        for name in &staged_names {
+            std::fs::rename(destination.join("disks").join(name), vm_data_dir.join(name))
                 .map_err(|error| Error::agent("publish checkpoint disk", error.to_string()))?;
-            }
+        }
+        crate::agent::create_disk_overlays(&cow_tops)?;
+        for disk in &checkpoint.disks {
             std::fs::write(vm_data_dir.join(format!("{}.formatted", disk.role)), b"1").map_err(
                 |error| Error::agent("mark checkpoint disk formatted", error.to_string()),
             )?;
@@ -3011,8 +3165,48 @@ pub fn discard_transport_pack(vm_data_dir: &Path) -> Result<()> {
 /// inherited crun container ID so later `machine exec` calls join the restored
 /// workload instead of silently creating a second container.
 pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
-    crate::agent::fork::rejuvenate_clone(name, record)?;
+    if record.paused_checkpoint.is_none() {
+        crate::agent::fork::rejuvenate_clone(name, record)?;
+    }
     crate::agent::fork::release_forkpoint(name, &record.fork_env)
+}
+
+/// Prepare an explicit same-machine resume. The durable artifact stays intact
+/// if extraction, installation, or the subsequent boot fails.
+pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
+    let artifact = record.paused_checkpoint.as_ref().ok_or_else(|| {
+        Error::agent_conflict("resume machine", "machine has no saved execution state")
+    })?;
+    if record.is_process_alive() {
+        return Err(Error::agent_conflict(
+            "resume machine",
+            "source VM has not stopped",
+        ));
+    }
+    let footer = verified_sidecar_footer(artifact)?;
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|e| Error::agent("read paused checkpoint", e.to_string()))?;
+    let checkpoint = manifest
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| Error::agent("resume machine", "artifact has no execution state"))?;
+    validate_compatibility(checkpoint)?;
+    let vm_data = crate::agent::vm_data_dir(&record.name);
+    let staged = tempfile::Builder::new()
+        .prefix("resume-")
+        .tempdir_in(&vm_data)?;
+    smolvm_pack::extract::extract_sidecar(artifact, staged.path(), &footer, false, false)
+        .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
+    // A failed earlier restore may have left a partial installation. No VMM
+    // is alive and the verified artifact remains the authoritative copy.
+    for dir in [INSTALLED_DIR, READONLY_INPUT_DIR] {
+        match std::fs::remove_dir_all(vm_data.join(dir)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    install(staged.path(), &vm_data, checkpoint)
 }
 
 /// Return the pending one-shot checkpoint directory for a machine, if any.
@@ -3542,9 +3736,32 @@ mod tests {
         );
         assert!(machine.path().join("storage.formatted").is_file());
         assert!(machine.path().join("overlay.formatted").is_file());
+        // A base this host cannot share stays a private writable copy: no
+        // copy-on-write layer, and never an alias of the extraction cache.
+        #[cfg(target_os = "linux")]
+        let shared = crate::process::vm_uid_drop_active();
+        #[cfg(not(target_os = "linux"))]
+        let shared = false;
+        if !shared {
+            assert!(!machine.path().join("storage.qcow2").exists());
+            assert!(!machine
+                .path()
+                .join(".smolcheckpoint-storage-base.raw")
+                .exists());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            if !shared {
+                assert_ne!(
+                    std::fs::metadata(source.join("disks/storage/0"))
+                        .unwrap()
+                        .ino(),
+                    std::fs::metadata(machine.path().join("storage.raw"))
+                        .unwrap()
+                        .ino()
+                );
+            }
             assert_ne!(
                 std::fs::metadata(source.join("memory.bin")).unwrap().ino(),
                 std::fs::metadata(machine.path().join(INSTALLED_DIR).join("memory.bin"))

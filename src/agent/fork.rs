@@ -95,6 +95,15 @@ pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
     ForkSourceLock::acquire_at(&fork_source_lock_path(source))
 }
 
+/// Serialize pause/resume retries before taking the capture's source lock.
+pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
+    validate_vm_name(source, "saved execution")
+        .map_err(|error| Error::config("saved execution", error))?;
+    ForkSourceLock::acquire_at(
+        &fork_source_lock_path(source).with_extension("pause-operation.lock"),
+    )
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;

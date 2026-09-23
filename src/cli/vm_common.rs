@@ -1539,6 +1539,12 @@ fn start_vm_named_with_db(
     // case where `start` later said "already running" but every
     // `exec` failed.
     match smolvm::agent::state_probe::resolve_state(name, &record) {
+        RecordState::Paused | RecordState::Pausing => {
+            return Err(Error::agent(
+                "start",
+                "machine has saved execution; use resume",
+            ));
+        }
         RecordState::Running => {
             let pid_suffix = format_pid_suffix(record.pid);
             println!("Machine '{}' already running{}", name, pid_suffix);
@@ -2224,6 +2230,13 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             return Err(smolvm::Error::vm_not_found(name));
         }
     };
+
+    if record.paused_checkpoint.is_some() {
+        return Err(smolvm::Error::agent(
+            "stop",
+            "machine has saved execution; use resume or delete",
+        ));
+    }
 
     // Resolve via the shared probe so an `Unreachable` VM (live PID,
     // dead agent) is correctly stopped instead of skipped with a
