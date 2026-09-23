@@ -1286,6 +1286,13 @@ pub async fn restore_portable_checkpoint(
     request: axum::extract::Request,
 ) -> Result<Json<MachineInfo>, ApiError> {
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
+    // Pull credential for the pack a checkpoint's layers come from, sent as a
+    // header so it stays out of URLs and request logs.
+    let registry_token = request
+        .headers()
+        .get("x-smolvm-registry-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let ports: Vec<PortSpec> = options
         .ports
         .as_deref()
@@ -1436,6 +1443,7 @@ pub async fn restore_portable_checkpoint(
         "name": name,
         "from": restore_path.to_string_lossy(),
         "ports": ports,
+        "registryIdentityToken": registry_token,
     }))
     .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
     // create_machine consumes and verifies the artifact before this TempDir is
@@ -1748,6 +1756,9 @@ async fn create_machine_inner(
     // If registry_ref is set, pull the artifact from the registry and treat as `from`
     #[cfg(not(target_os = "linux"))]
     let mut req = req;
+    // Where a pack came from, kept on the machine so a live checkpoint of it can
+    // name the pack for a host that has to fetch it.
+    let mut pack_registry_ref: Option<String> = None;
     if let Some(ref registry_ref) = req.registry_ref.clone() {
         let pulled_path = pull_from_registry(
             registry_ref,
@@ -1757,6 +1768,7 @@ async fn create_machine_inner(
         .await?;
         req.from = Some(pulled_path);
         req.registry_ref = None;
+        pack_registry_ref = Some(registry_ref.clone());
     }
 
     // An `image` can also name a smolmachine pack artifact (e.g.
@@ -1776,6 +1788,7 @@ async fn create_machine_inner(
         if let Some(sidecar) = sidecar {
             req.from = Some(sidecar.to_string_lossy().into_owned());
             req.image = None;
+            pack_registry_ref = Some(image);
         }
     }
 
@@ -2156,50 +2169,8 @@ async fn create_machine_inner(
         tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
             let path = std::path::Path::new(&sidecar_path);
             let cache_dir = crate::agent::machine_layers_cache_dir(&name);
-            let result = (|| {
-                let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
-                    .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
-                if smolvm_pack::extract::shared_extract_enabled() {
-                    #[cfg(target_os = "linux")]
-                    {
-                        // Shared content-addressed store: extract the build-constant
-                        // pack ONCE per node into `_shared/<checksum>` (root-owned,
-                        // read-only) instead of a private per-machine copy, and drop a
-                        // pointer beside this machine. The per-machine `pack` dir is
-                        // left an empty mountpoint that the boot path idmap-binds the
-                        // shared copy onto (mapping on-disk uid 0 -> the VM's dropped
-                        // uid), so a 28.6 MB / 362-file agent-rootfs decodes once per
-                        // node rather than once per machine — the cold-start tax this
-                        // removes — with the per-VM uid isolation (#456) preserved.
-                        crate::artifact_cache::materialize_shared_pack_lease(
-                            path, &footer, &cache_dir, false,
-                        )
-                        .map_err(|e| {
-                            ApiError::internal(format!("extract sidecar (shared): {}", e))
-                        })?;
-                        Ok(())
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    unreachable!("shared pack extraction is Linux-only")
-                } else {
-                    // Per-machine extraction: macOS case-sensitive layers volume
-                    // (owned 1:1 by the machine), or the `SMOLVM_DISABLE_SHARED_EXTRACT`
-                    // kill-switch. Wipe any prior cache first for a clean slate.
-                    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-                    match std::fs::remove_dir_all(&cache_dir) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => {
-                            return Err(ApiError::internal(format!(
-                                "clear packed layers cache: {}",
-                                e
-                            )));
-                        }
-                    }
-                    smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
-                        .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))
-                }
-            })();
+            let result = crate::portable_checkpoint::materialize_pack_layers(&name, path)
+                .map_err(|e| ApiError::internal(e.to_string()));
             // Detach the case-sensitive volume mounted during extraction so a
             // created-but-unstarted machine leaves nothing mounted, and so the
             // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
@@ -2316,6 +2287,50 @@ async fn create_machine_inner(
         }
     }
 
+    // A checkpoint of a pack machine needs that pack's layers mounted again, so
+    // the restored machine gets the same virtio-fs device it was captured with.
+    let mut restored_pack: Option<(String, Option<String>)> = None;
+    if let Some(packed) = manifest_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.packed_layers.clone())
+    {
+        let attached = async {
+            let sidecar = checkpoint_pack_sidecar(
+                &packed,
+                req.registry_identity_token.as_deref(),
+                &req.blob_peers,
+            )
+            .await?;
+            let name = name.clone();
+            let sidecar_for_task = sidecar.clone();
+            let packed_for_task = packed.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::portable_checkpoint::verify_checkpoint_pack(
+                    &sidecar_for_task,
+                    &packed_for_task,
+                )?;
+                crate::portable_checkpoint::materialize_pack_layers(&name, &sidecar_for_task)
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            Ok::<_, ApiError>(sidecar)
+        }
+        .await;
+        match attached {
+            Ok(sidecar) => {
+                restored_pack = Some((
+                    sidecar.to_string_lossy().into_owned(),
+                    packed.registry_ref.clone(),
+                ))
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(vm_data_dir(&name));
+                return Err(error);
+            }
+        }
+    }
+
     if manifest_checkpoint.is_some() {
         crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
     }
@@ -2387,11 +2402,20 @@ async fn create_machine_inner(
         init_completed: manifest_checkpoint.is_some(),
         docker_socket: req.docker_socket,
         image,
-        source_smolmachine: if manifest_checkpoint.is_some() {
-            // A checkpoint pack is a transport envelope, not an OCI-layer
-            // source. Persisting it here would make start attach an extra
-            // virtiofs device and violate the captured device topology.
+        source_registry_ref: if manifest_checkpoint.is_some() {
+            restored_pack
+                .as_ref()
+                .and_then(|(_, reference)| reference.clone())
+        } else if source_smolmachine.is_some() {
+            pack_registry_ref
+        } else {
             None
+        },
+        source_smolmachine: if manifest_checkpoint.is_some() {
+            // The checkpoint pack itself is a transport envelope, not an
+            // OCI-layer source. Only the pack the captured machine mounted its
+            // layers from (reattached above) belongs to the device topology.
+            restored_pack.map(|(sidecar, _)| sidecar)
         } else {
             source_smolmachine
         },
@@ -4750,6 +4774,36 @@ fn is_ssrf_prone_registry_host(host: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// The `.smolmachine` a checkpoint's image layers came from: this host's copy
+/// when it has one, otherwise pulled from the registry reference the checkpoint
+/// recorded and checked to be the very same artifact.
+async fn checkpoint_pack_sidecar(
+    packed: &smolvm_pack::format::CheckpointPackedLayers,
+    identity_token: Option<&str>,
+    blob_peers: &[String],
+) -> Result<std::path::PathBuf, ApiError> {
+    if let Some(path) = crate::portable_checkpoint::cached_checkpoint_pack(packed) {
+        return Ok(path);
+    }
+    let reference = packed.registry_ref.as_deref().ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "this checkpoint mounts image layers from pack sha256:{}, which this host does \
+             not have, and it records no registry reference to fetch it from",
+            packed.artifact_sha256
+        ))
+    })?;
+    let pulled = pull_smolmachine(reference, identity_token, blob_peers).await?;
+    let expected = format!("sha256:{}", packed.artifact_sha256);
+    if pulled.digest != expected {
+        return Err(ApiError::Conflict(format!(
+            "{reference} now resolves to {} but this checkpoint was captured with {expected}; \
+             the pack it needs is no longer published under that reference",
+            pulled.digest
+        )));
+    }
+    Ok(pulled.path)
 }
 
 async fn pull_from_registry(

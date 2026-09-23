@@ -195,6 +195,8 @@ pub struct MachineRegistration {
     pub image: Option<String>,
     /// Path to .smolmachine sidecar this machine was created from.
     pub source_smolmachine: Option<String>,
+    /// Registry reference that sidecar was pulled from, if any.
+    pub source_registry_ref: Option<String>,
     /// Container entrypoint (from manifest).
     pub entrypoint: Vec<String>,
     /// Container cmd (from manifest).
@@ -1058,6 +1060,7 @@ impl ApiState {
         record.docker_socket = reg.docker_socket;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
+        record.source_registry_ref = reg.source_registry_ref.clone();
         record.entrypoint = reg.entrypoint;
         record.cmd = reg.cmd;
         record.env = reg.env;

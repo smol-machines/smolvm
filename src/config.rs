@@ -607,6 +607,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
 
+    /// Registry reference `source_smolmachine` was pulled from, if any. Carried
+    /// into a live checkpoint so another host can fetch the same pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_registry_ref: Option<String>,
+
     /// Name of the golden VM this machine was forked from, if any. A clone's
     /// block disks are copy-on-write overlays backed by the golden's disks, so
     /// the golden must outlive its clones. The disk *format* is not recorded
@@ -774,6 +779,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            source_registry_ref: None,
             golden: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
@@ -849,6 +855,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            source_registry_ref: None,
             golden: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,

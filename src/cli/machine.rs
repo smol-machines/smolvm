@@ -4125,6 +4125,15 @@ impl CreateCmd {
                 let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
                 smolvm::portable_checkpoint::install(&pack_content_dir, &vm_data_dir, checkpoint)?;
                 smolvm::portable_checkpoint::discard_transport_pack(&vm_data_dir)?;
+                if let Some((sidecar, reference)) =
+                    smolvm::portable_checkpoint::attach_cached_checkpoint_pack(
+                        &name_for_layers,
+                        checkpoint,
+                    )?
+                {
+                    record.source_smolmachine = Some(sidecar);
+                    record.source_registry_ref = reference;
+                }
             }
 
             reservation.commit(&record)?;

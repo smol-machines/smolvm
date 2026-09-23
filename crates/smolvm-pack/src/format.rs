@@ -511,6 +511,25 @@ pub struct PortableCheckpointManifest {
     /// Host networking reconstructed around the restored VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<CheckpointNetwork>,
+    /// The `.smolmachine` whose image layers the captured machine mounted from
+    /// the host. They are not in the artifact, so a restore must attach the same
+    /// pack again to reproduce the captured device topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packed_layers: Option<CheckpointPackedLayers>,
+}
+
+/// Identity of the pack a checkpointed machine mounted its image layers from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointPackedLayers {
+    /// SHA-256 of the whole `.smolmachine` file (its registry blob digest),
+    /// lowercase hex without the `sha256:` prefix.
+    pub artifact_sha256: String,
+    /// The pack footer's checksum, which keys its extracted layers.
+    pub footer_checksum: u32,
+    /// Registry reference the machine was created from, for fetching the pack
+    /// on a host that does not already have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_ref: Option<String>,
 }
 
 /// Manifest describing the packed image and configuration.
