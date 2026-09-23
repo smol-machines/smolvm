@@ -50,6 +50,12 @@ const CUDA_ERROR_INVALID_RESOURCE_HANDLE: c_int = 400;
 const CUDA_ERROR_ILLEGAL_STATE: c_int = 401;
 const CUDA_ERROR_NO_DEVICE: c_int = 100;
 const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
+/// `cudaErrorNoKernelImageForDevice` — same value as the driver's
+/// `CUDA_ERROR_NO_BINARY_FOR_GPU`.
+const CUDA_ERROR_NO_KERNEL_IMAGE_FOR_DEVICE: c_int = 209;
+/// `cudaErrorUnsupportedPtxVersion` — same value as the driver's
+/// `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`.
+const CUDA_ERROR_UNSUPPORTED_PTX_VERSION: c_int = 222;
 const CUDA_ERROR_UNKNOWN: c_int = 999;
 
 // cudaMemcpyKind
@@ -338,6 +344,13 @@ fn map_err(e: CudaRpcError) -> c_int {
             1 => CUDA_ERROR_INVALID_VALUE,
             2 => CUDA_ERROR_MEMORY_ALLOCATION,
             200 | 218 => CUDA_ERROR_INVALID_VALUE, // invalid image / PTX
+            // A binary with no code for this GPU's architecture (e.g. a
+            // framework build predating the GPU) or PTX newer than the host
+            // driver. Frameworks turn these into actionable messages ("no
+            // kernel image is available for execution on the device");
+            // flattening them to UNKNOWN hid the cause.
+            209 => CUDA_ERROR_NO_KERNEL_IMAGE_FOR_DEVICE,
+            222 => CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
             400 => CUDA_ERROR_INVALID_RESOURCE_HANDLE,
             801 => CUDA_ERROR_NOT_SUPPORTED,
             // Driver and Runtime capture failures intentionally use the same
@@ -5144,6 +5157,12 @@ pub extern "C" fn cudaGetErrorString(error: c_int) -> *const c_char {
         CUDA_ERROR_INVALID_DEVICE_POINTER => c"invalid device pointer",
         CUDA_ERROR_INVALID_RESOURCE_HANDLE => c"invalid resource handle",
         CUDA_ERROR_NO_DEVICE => c"no CUDA-capable device is detected",
+        CUDA_ERROR_NO_KERNEL_IMAGE_FOR_DEVICE => {
+            c"no kernel image is available for execution on the device"
+        }
+        CUDA_ERROR_UNSUPPORTED_PTX_VERSION => {
+            c"the provided PTX was compiled with an unsupported toolchain."
+        }
         _ => c"unknown error",
     };
     s.as_ptr()
@@ -5221,6 +5240,11 @@ pub extern "C" fn cudaGetErrorName(error: c_int) -> *const c_char {
         CUDA_ERROR_INVALID_VALUE => c"cudaErrorInvalidValue",
         CUDA_ERROR_MEMORY_ALLOCATION => c"cudaErrorMemoryAllocation",
         CUDA_ERROR_INITIALIZATION => c"cudaErrorInitializationError",
+        CUDA_ERROR_INVALID_DEVICE_POINTER => c"cudaErrorInvalidDevicePointer",
+        CUDA_ERROR_INVALID_RESOURCE_HANDLE => c"cudaErrorInvalidResourceHandle",
+        CUDA_ERROR_NO_DEVICE => c"cudaErrorNoDevice",
+        CUDA_ERROR_NO_KERNEL_IMAGE_FOR_DEVICE => c"cudaErrorNoKernelImageForDevice",
+        CUDA_ERROR_UNSUPPORTED_PTX_VERSION => c"cudaErrorUnsupportedPtxVersion",
         _ => c"cudaErrorUnknown",
     };
     s.as_ptr()
@@ -6237,6 +6261,29 @@ mod tests {
         for code in 900..=910 {
             assert_eq!(map_err(CudaRpcError::Cuda(code)), code);
         }
+    }
+
+    // A GPU newer than the framework's build (no SASS/PTX for its arch) or PTX
+    // newer than the host driver must surface as the runtime's own codes, not
+    // UNKNOWN — torch keys its "no kernel image" diagnosis off 209.
+    #[test]
+    fn architecture_mismatch_errors_preserve_runtime_codes() {
+        assert_eq!(
+            map_err(CudaRpcError::Cuda(209)),
+            CUDA_ERROR_NO_KERNEL_IMAGE_FOR_DEVICE
+        );
+        assert_eq!(
+            map_err(CudaRpcError::Cuda(222)),
+            CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+        );
+        let text = |code| unsafe { CStr::from_ptr(cudaGetErrorString(code)) };
+        let name = |code| unsafe { CStr::from_ptr(cudaGetErrorName(code)) };
+        assert_eq!(
+            text(209),
+            c"no kernel image is available for execution on the device"
+        );
+        assert_eq!(name(209), c"cudaErrorNoKernelImageForDevice");
+        assert_eq!(name(222), c"cudaErrorUnsupportedPtxVersion");
     }
 
     #[test]
