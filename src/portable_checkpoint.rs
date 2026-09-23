@@ -36,6 +36,8 @@ pub const DEVICE_PROFILE: &str = "smolvm-basic-v1";
 /// layers. Distinct so a runtime that cannot re-attach the pack refuses the
 /// checkpoint instead of resuming into a device layout it does not reproduce.
 pub const DEVICE_PROFILE_PACKED_LAYERS: &str = "smolvm-packed-layers-v1";
+const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Directory inside an extracted artifact containing live state.
 pub const ASSET_DIR: &str = "checkpoint";
 
@@ -1197,6 +1199,7 @@ fn capture_with_completion(
         && !retain
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
+    let max_memory_image = max_checkpoint_memory_image(vm.mem, vm.source_smolmachine.is_some())?;
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
     if stop_after_capture {
@@ -1204,13 +1207,23 @@ fn capture_with_completion(
     }
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
+    // Deferred RAM capture rebases the live source's mappings. A packed
+    // image's virtio-fs DAX window contains file mappings that must remain
+    // intact for the source to keep executing after the checkpoint.
+    let use_deferred_save =
+        !cfg!(all(target_os = "linux", target_arch = "x86_64")) || vm.source_smolmachine.is_none();
+    let command = if use_deferred_save {
+        "PREPARE_SAVE"
+    } else {
+        "SAVE"
+    };
     let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
         &control,
-        &format!("PREPARE_SAVE {}", runtime_snapshot.display()),
+        &format!("{command} {}", runtime_snapshot.display()),
         std::time::Duration::from_secs(30 * 60),
     )?;
-    let prepared = reply.starts_with("OK");
-    tracing::info!(machine = name, command = "PREPARE_SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
+    let prepared = use_deferred_save && reply.starts_with("OK");
+    tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     if !prepared
         && options.store_dir.is_none()
         && (reply.starts_with("ERR ENOTSUP") || reply.trim() == "ERR EINVAL unknown command")
@@ -1275,38 +1288,56 @@ fn capture_with_completion(
     };
     let mut streamed_memory = match sparse_socket.as_mut() {
         Some(stream) => Some(
-            smolvm_pack::checkpoint_stream::CheckpointStream::read(
-                stream,
-                (u64::from(vm.mem) + 2048) * 1024 * 1024,
-            )
-            .map_err(|e| Error::agent("read sparse checkpoint boundary", e.to_string()))?,
+            smolvm_pack::checkpoint_stream::CheckpointStream::read(stream, max_memory_image)
+                .map_err(|e| Error::agent("read sparse checkpoint boundary", e.to_string()))?,
         ),
         None => None,
     };
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
-        let mut stream = crate::platform::uds::UdsStream::connect(&pause.control)
-            .map_err(|e| Error::agent("connect checkpoint stream", e.to_string()))?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(30 * 60)))
-            .map_err(|e| Error::agent("configure checkpoint stream", e.to_string()))?;
-        writeln!(stream, "FINISH_SAVE_STREAM {}", runtime_snapshot.display())
-            .map_err(|e| Error::agent("request checkpoint stream", e.to_string()))?;
-        let memory = writer
-            .ingest_memory(&mut stream, (u64::from(vm.mem) + 2048) * 1024 * 1024)
-            .map_err(|e| Error::agent("store checkpoint memory", e.to_string()))?;
-        let mut reply = String::new();
-        stream
-            .take(4096)
-            .read_to_string(&mut reply)
-            .map_err(|e| Error::agent("complete checkpoint stream", e.to_string()))?;
-        tracing::info!(machine = name, command = "FINISH_SAVE_STREAM", reply = ?reply.trim(), "checkpoint memory protocol reply");
-        if !reply.starts_with("OK saved (") {
-            return Err(Error::agent("complete checkpoint stream", reply));
+        if prepared {
+            let mut stream = crate::platform::uds::UdsStream::connect(&pause.control)
+                .map_err(|e| Error::agent("connect checkpoint stream", e.to_string()))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30 * 60)))
+                .map_err(|e| Error::agent("configure checkpoint stream", e.to_string()))?;
+            writeln!(stream, "FINISH_SAVE_STREAM {}", runtime_snapshot.display())
+                .map_err(|e| Error::agent("request checkpoint stream", e.to_string()))?;
+            let memory = writer
+                .ingest_memory(&mut stream, max_memory_image)
+                .map_err(|e| Error::agent("store checkpoint memory", e.to_string()))?;
+            let mut reply = String::new();
+            stream
+                .take(4096)
+                .read_to_string(&mut reply)
+                .map_err(|e| Error::agent("complete checkpoint stream", e.to_string()))?;
+            tracing::info!(machine = name, command = "FINISH_SAVE_STREAM", reply = ?reply.trim(), "checkpoint memory protocol reply");
+            if !reply.starts_with("OK saved (") {
+                return Err(Error::agent("complete checkpoint stream", reply));
+            }
+            pause.prepared_save = None;
+            Some(memory)
+        } else {
+            let path = runtime_snapshot.join("memory.bin");
+            let mut file = std::fs::File::open(&path)
+                .map_err(|e| Error::agent("read checkpoint memory", e.to_string()))?;
+            let size = file
+                .metadata()
+                .map_err(|e| Error::agent("inspect checkpoint memory", e.to_string()))?
+                .len();
+            if size == 0 || size > max_memory_image {
+                return Err(Error::agent(
+                    "store checkpoint memory",
+                    "checkpoint RAM image exceeds configured memory layout",
+                ));
+            }
+            Some(
+                writer
+                    .ingest("checkpoint/memory.bin", size, 0o600, &mut file)
+                    .map_err(|e| Error::agent("store checkpoint memory", e.to_string()))?,
+            )
         }
-        pause.prepared_save = None;
-        Some(memory)
     } else {
         if prepared && streamed_memory.is_none() {
             let reply = crate::agent::fork::control_socket_cmd_with_timeout(
@@ -2559,6 +2590,21 @@ fn describe_sparse_asset(path: &Path, relative_path: &str) -> Result<CheckpointA
     })
 }
 
+/// Bound a RAM image by configured guest RAM and the devices' mapped windows.
+/// Capture and restore must use the same bound for packed-layer machines.
+fn max_checkpoint_memory_image(memory_mib: u32, packed_layers: bool) -> Result<u64> {
+    let packed_layers_window = if packed_layers {
+        crate::agent::virtiofs::packed_layers_dax_window()
+    } else {
+        0
+    };
+    u64::from(memory_mib)
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| bytes.checked_add(FIXED_MEMORY_OVERHEAD_BYTES))
+        .and_then(|bytes| bytes.checked_add(packed_layers_window))
+        .ok_or_else(|| Error::agent("checkpoint memory", "memory size overflow"))
+}
+
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
     let required = match checkpoint.payload {
@@ -2675,20 +2721,8 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     // for those non-configured mappings.
     const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
-    const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-    let configured_memory = u64::from(checkpoint.memory_mib)
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| Error::agent("restore checkpoint", "memory size overflow"))?;
-    // A packed-layers device adds its own DAX window to the mapped regions.
-    let packed_layers_window = if checkpoint.packed_layers.is_some() {
-        crate::agent::virtiofs::packed_layers_dax_window()
-    } else {
-        0
-    };
-    let max_memory_image = configured_memory
-        .checked_add(FIXED_MEMORY_OVERHEAD_BYTES)
-        .and_then(|bytes| bytes.checked_add(packed_layers_window))
-        .ok_or_else(|| Error::agent("restore checkpoint", "memory size overflow"))?;
+    let max_memory_image =
+        max_checkpoint_memory_image(checkpoint.memory_mib, checkpoint.packed_layers.is_some())?;
     if checkpoint.state.size == 0
         || checkpoint.state.size > MAX_STATE_BYTES
         || checkpoint.layout.size == 0
@@ -4523,6 +4557,11 @@ mod tests {
 
         metadata.device_profile = DEVICE_PROFILE_PACKED_LAYERS.to_string();
         validate_compatibility(&metadata).unwrap();
+        metadata.memory.size = max_checkpoint_memory_image(metadata.memory_mib, true).unwrap();
+        validate_compatibility(&metadata).unwrap();
+        metadata.memory.size += 1;
+        assert!(validate_compatibility(&metadata).is_err());
+        metadata.memory.size = 1;
 
         // And the profile without a pack to reattach.
         metadata.packed_layers = None;
