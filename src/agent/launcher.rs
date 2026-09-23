@@ -1181,14 +1181,39 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     }
                 }
 
-                // TSI terminates guest connects inside libkrun, where the relay
-                // that redirects HTTPS to the interceptor cannot see them.
-                if credentials.is_some() {
-                    krun_free_ctx(ctx);
-                    return Err(Error::config(
-                        "configure credentials",
-                        "credential substitution needs the virtio-net network backend",
-                    ));
+                // TSI terminates guest connects inside libkrun, so redirecting
+                // HTTPS flows to the interceptor needs the fork's hook; without
+                // it a credential policy cannot be enforced on this backend.
+                if let Some(credentials) = credentials {
+                    let Some(set_intercept) = krun.set_stream_intercept else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure credentials",
+                            "this libkrun cannot redirect TSI flows (krun_set_stream_intercept not found); \
+                             use the default virtio-net backend or update libkrun",
+                        ));
+                    };
+                    let interceptor = credentials.start_interceptor().inspect_err(|_| {
+                        krun_free_ctx(ctx);
+                    })?;
+                    let endpoint = interceptor.endpoint();
+                    let addr = CString::new(endpoint.addr.to_string()).expect("socket address");
+                    let token: String = endpoint.token.iter().map(|b| format!("{b:02x}")).collect();
+                    let token = CString::new(token).expect("hex token");
+                    if set_intercept(
+                        ctx,
+                        addr.as_ptr(),
+                        token.as_ptr(),
+                        smolvm_network::tcp_relay::INTERCEPTED_PORT,
+                    ) < 0
+                    {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure credentials",
+                            "krun_set_stream_intercept failed",
+                        ));
+                    }
+                    _credential_interceptor = Some(interceptor);
                 }
 
                 tracing::info!("network backend: tsi");

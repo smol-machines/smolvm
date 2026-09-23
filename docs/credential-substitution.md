@@ -146,9 +146,10 @@ fine.
 
 ## Backends and limits
 
-- A credential policy selects the `virtio-net` backend (like `--allow-host`
-  does). `--net-backend tsi` is refused at start: TSI connects terminate inside
-  libkrun, where the flow cannot be redirected to the interceptor.
+- A credential policy selects the `virtio-net` backend by default (like
+  `--allow-host` does). `--net-backend tsi` works only with a libkrun that
+  provides `krun_set_stream_intercept`; otherwise start fails with a message
+  saying so.
 - Interception covers port 443. Plaintext HTTP on port 80 and other ports are
   relayed without substitution.
 - The guest side is HTTP/1.1 (the interceptor negotiates `http/1.1` only);

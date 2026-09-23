@@ -82,6 +82,9 @@ pub struct TcpRelayTable {
 /// Destination port whose guest flows go through the credential interceptor.
 pub const INTERCEPTED_PORT: u16 = 443;
 
+/// Upper bound on the interceptor's own connect to the destination.
+const INTERCEPT_VERDICT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Newly established guest connection ready for a host relay thread.
 ///
 /// The poll loop emits these once the guest-side smoltcp socket reaches
@@ -813,6 +816,11 @@ fn tcp_relay_loop(
             // ClientHello the guest sends next.
             let mut stream = TcpStream::connect(endpoint.addr)?;
             endpoint.write_preamble(&mut stream, destination)?;
+            // The interceptor dials the destination before answering; a
+            // failure aborts the flow as a failed direct connect would.
+            stream.set_read_timeout(Some(INTERCEPT_VERDICT_TIMEOUT))?;
+            smolvm_protocol::intercept::read_verdict(&mut stream)?;
+            stream.set_read_timeout(None)?;
             stream
         }
     };
@@ -1195,6 +1203,9 @@ mod tests {
         let interceptor = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let announced = endpoint.read_preamble(&mut stream).unwrap();
+            stream
+                .write_all(&[smolvm_protocol::intercept::VERDICT_CONNECTED])
+                .unwrap();
             let mut buf = [0u8; 64];
             let n = stream.read(&mut buf).unwrap();
             stream.write_all(b"ack").unwrap();

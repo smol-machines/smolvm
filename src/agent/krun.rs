@@ -107,6 +107,11 @@ pub struct KrunFunctions {
             *const *const libc::c_char,
         ) -> i32,
     >,
+    /// Redirect guest TSI stream connects to one destination port through a
+    /// host loopback interceptor (`krun_set_stream_intercept`). Optional: only
+    /// smolvm's libkrun fork provides it.
+    pub set_stream_intercept:
+        Option<unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u16) -> i32>,
     pub add_net_unixstream: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
     >,
@@ -235,6 +240,7 @@ impl KrunFunctions {
         let add_vsock = load_sym!(krun_add_vsock);
         let add_virtio_console_default = load_sym!(krun_add_virtio_console_default);
         let set_egress_policy = load_optional_sym!("krun_set_egress_policy");
+        let set_stream_intercept = load_optional_sym!("krun_set_stream_intercept");
         let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
@@ -273,6 +279,7 @@ impl KrunFunctions {
             add_vsock,
             add_virtio_console_default,
             set_egress_policy,
+            set_stream_intercept,
             add_net_unixstream,
             get_egress_handle,
             set_gpu_options2,

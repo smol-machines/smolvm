@@ -28,7 +28,9 @@ use hyper::{
     header, server::conn::http1, service::service_fn, Method, Request, Response, StatusCode,
 };
 use hyper_util::rt::TokioIo;
-use smolvm_protocol::intercept::{InterceptEndpoint, PREAMBLE_LEN, TOKEN_LEN};
+use smolvm_protocol::intercept::{
+    connect_verdict, preamble_len, InterceptEndpoint, HEADER_LEN, TOKEN_LEN,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -195,6 +197,15 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
         .await
         .context("preamble timeout")??;
 
+    // Reach the destination before the guest's connect completes, and report
+    // the outcome, so an unreachable destination fails the guest's connect
+    // (letting it try another address) instead of an established stream.
+    let upstream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(destination))
+        .await
+        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
+    stream.write_all(&[connect_verdict(&upstream)]).await?;
+    let upstream = upstream.context("upstream connect")?;
+
     let mut buffered = Vec::with_capacity(2048);
     let peek = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         loop {
@@ -217,28 +228,31 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
 
     match peek {
         Peek::ServerName(host) if state.policy.bindings_for_host(&host).next().is_some() => {
+            // The upstream client opens its own verified connection.
+            drop(upstream);
             terminate(state, stream, buffered, host, destination).await
         }
         Peek::ServerName(_) | Peek::NoServerName | Peek::Incomplete => {
-            passthrough(stream, buffered, destination).await
+            passthrough(stream, upstream, buffered).await
         }
     }
 }
 
 async fn read_preamble(state: &State, stream: &mut TcpStream) -> Result<SocketAddr> {
-    let mut preamble = [0u8; PREAMBLE_LEN];
-    stream.read_exact(&mut preamble).await?;
-    Ok(state.endpoint.parse_preamble(&preamble)?)
+    let mut header = [0u8; HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    let total = preamble_len(&header).context("preamble family")?;
+    let mut full = header.to_vec();
+    full.resize(total, 0);
+    stream.read_exact(&mut full[HEADER_LEN..]).await?;
+    Ok(state.endpoint.read_preamble(&full[..])?)
 }
 
 async fn passthrough(
     mut guest: TcpStream,
+    mut upstream: TcpStream,
     buffered: Vec<u8>,
-    destination: SocketAddr,
 ) -> Result<()> {
-    let mut upstream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(destination))
-        .await
-        .context("upstream connect timeout")??;
     let _ = upstream.set_nodelay(true);
     upstream.write_all(&buffered).await?;
     let _ = tokio::io::copy_bidirectional(&mut guest, &mut upstream).await;
@@ -834,6 +848,9 @@ mod tests {
         let mut tcp = TcpStream::connect(f.interceptor.endpoint().addr).await?;
         tcp.write_all(&f.interceptor.endpoint().preamble(f.upstream.addr))
             .await?;
+        let mut verdict = [0xffu8; 1];
+        tcp.read_exact(&mut verdict).await?;
+        assert_eq!(verdict[0], 0, "interceptor could not reach the upstream");
         let connector = TlsConnector::from(client_config(trusted_pem));
         let name = ServerName::try_from(sni.to_string()).unwrap();
         let mut tls = connector.connect(name, tcp).await?;
@@ -928,6 +945,25 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(seen, vec![(String::new(), "/public".to_string())]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reports_an_unreachable_destination_before_the_guest_sends() {
+        let f = fixture().await;
+        // A port nothing listens on: the guest's connect must fail, not
+        // succeed and then drop mid-handshake.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = closed.local_addr().unwrap();
+        drop(closed);
+        let mut tcp = TcpStream::connect(f.interceptor.endpoint().addr)
+            .await
+            .unwrap();
+        tcp.write_all(&f.interceptor.endpoint().preamble(destination))
+            .await
+            .unwrap();
+        let mut verdict = [0u8; 1];
+        tcp.read_exact(&mut verdict).await.unwrap();
+        assert_eq!(verdict[0], 111, "expected ECONNREFUSED");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

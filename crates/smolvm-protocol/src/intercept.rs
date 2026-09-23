@@ -1,57 +1,111 @@
 //! Host-side stream interception handshake.
 //!
-//! When a machine carries a credential policy, the virtio-net relay in
-//! `smolvm-network` redirects guest HTTPS flows to an interceptor listening on
-//! host loopback instead of dialing the destination directly. It prefixes the
-//! redirected byte stream with a fixed-size preamble that names the destination
-//! the guest actually asked for and proves the connection came from the
-//! machine's own relay rather than from an arbitrary host process that found
-//! the loopback port.
+//! When a machine carries a credential policy, its network backend redirects
+//! selected guest TCP flows (HTTPS by default) to an interceptor listening on
+//! host loopback instead of dialing the destination directly. The redirecting
+//! side — the virtio-net relay in `smolvm-network`, or libkrun's TSI muxer —
+//! prefixes the redirected byte stream with a fixed-size preamble that names
+//! the destination the guest actually asked for and proves the connection came
+//! from the machine's own backend rather than from an arbitrary host process
+//! that found the loopback port.
 //!
 //! Wire layout (all integers big-endian):
 //!
 //! ```text
 //! magic    8 bytes  "SMOLICPT"
+//! version  1 byte   1
 //! token   32 bytes  per-machine secret shared with the interceptor
+//! family   1 byte   4 or 6
 //! port     2 bytes  destination port
-//! address 16 bytes  destination IP (IPv4 as an IPv4-mapped IPv6 address)
+//! address  4 or 16  destination IP
 //! ```
 //!
-//! Guest payload follows immediately; the guest never sees the preamble.
+//! The interceptor answers with one byte before any payload flows: `0` once
+//! it has connected to the destination, otherwise the Linux errno of that
+//! connect. libkrun's TSI muxer reports it to the guest as the result of the
+//! guest's own connect, so a guest with an unreachable IPv6 route still falls
+//! back to IPv4 exactly as it would without interception. Guest payload then
+//! follows; the guest never sees the preamble or the verdict.
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 8] = b"SMOLICPT";
+const VERSION: u8 = 1;
 /// Bytes of shared secret carried in every preamble.
 pub const TOKEN_LEN: usize = 32;
-/// Total preamble length.
-pub const PREAMBLE_LEN: usize = MAGIC.len() + TOKEN_LEN + 2 + 16;
+/// Bytes of preamble before the destination address.
+pub const HEADER_LEN: usize = MAGIC.len() + 1 + TOKEN_LEN + 1 + 2;
+
+/// Total preamble length implied by an already-read fixed header, or `None`
+/// if the family byte is invalid. Lets an async reader size its second read.
+pub fn preamble_len(header: &[u8]) -> Option<usize> {
+    match header.get(HEADER_LEN - 3)? {
+        4 => Some(HEADER_LEN + 4),
+        6 => Some(HEADER_LEN + 16),
+        _ => None,
+    }
+}
+
+/// Verdict byte for a destination the interceptor reached.
+pub const VERDICT_CONNECTED: u8 = 0;
+
+/// Verdict byte for the interceptor's connect to the real destination: `0`, or
+/// the Linux errno the guest should see (guests are Linux whatever the host).
+pub fn connect_verdict<T>(result: &io::Result<T>) -> u8 {
+    const ENETUNREACH: u8 = 101;
+    const ETIMEDOUT: u8 = 110;
+    const ECONNREFUSED: u8 = 111;
+    const EHOSTUNREACH: u8 = 113;
+    match result {
+        Ok(_) => VERDICT_CONNECTED,
+        Err(e) => match e.kind() {
+            io::ErrorKind::NetworkUnreachable => ENETUNREACH,
+            io::ErrorKind::HostUnreachable => EHOSTUNREACH,
+            io::ErrorKind::TimedOut => ETIMEDOUT,
+            _ => ECONNREFUSED,
+        },
+    }
+}
+
+/// Read the interceptor's verdict; an error carries the errno it reported.
+pub fn read_verdict<R: Read>(mut r: R) -> io::Result<()> {
+    let mut verdict = [0u8; 1];
+    r.read_exact(&mut verdict)?;
+    match verdict[0] {
+        VERDICT_CONNECTED => Ok(()),
+        errno => Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("interceptor could not reach the destination (errno {errno})"),
+        )),
+    }
+}
 
 /// Where a backend redirects intercepted flows, and the secret it must present.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InterceptEndpoint {
     /// Loopback listener owned by the interceptor.
     pub addr: SocketAddr,
-    /// Secret shared between the interceptor and the machine's relay only.
+    /// Secret shared between the interceptor and the machine's backend only.
     pub token: [u8; TOKEN_LEN],
 }
 
 impl InterceptEndpoint {
     /// Encode the preamble for one redirected flow.
-    pub fn preamble(&self, destination: SocketAddr) -> [u8; PREAMBLE_LEN] {
-        let ip = match destination.ip() {
-            IpAddr::V4(ip) => ip.to_ipv6_mapped(),
-            IpAddr::V6(ip) => ip,
-        };
-        let mut out = [0u8; PREAMBLE_LEN];
-        let (magic, rest) = out.split_at_mut(MAGIC.len());
-        let (token, rest) = rest.split_at_mut(TOKEN_LEN);
-        let (port, address) = rest.split_at_mut(2);
-        magic.copy_from_slice(MAGIC);
-        token.copy_from_slice(&self.token);
-        port.copy_from_slice(&destination.port().to_be_bytes());
-        address.copy_from_slice(&ip.octets());
+    pub fn preamble(&self, destination: SocketAddr) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + 16);
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        out.extend_from_slice(&self.token);
+        match destination.ip() {
+            IpAddr::V4(_) => out.push(4),
+            IpAddr::V6(_) => out.push(6),
+        }
+        out.extend_from_slice(&destination.port().to_be_bytes());
+        match destination.ip() {
+            IpAddr::V4(ip) => out.extend_from_slice(&ip.octets()),
+            IpAddr::V6(ip) => out.extend_from_slice(&ip.octets()),
+        }
         out
     }
 
@@ -60,14 +114,22 @@ impl InterceptEndpoint {
         w.write_all(&self.preamble(destination))
     }
 
-    /// Authenticate a preamble and return the destination the guest dialed. A
-    /// wrong magic or token is `InvalidData`; the token comparison does not
+    /// Read and authenticate a preamble from an accepted connection.
+    ///
+    /// Returns the destination the guest dialed. A wrong magic, version or
+    /// token is reported as `InvalidData` after consuming the fixed header so
+    /// the caller can simply drop the connection; the token comparison does not
     /// short-circuit on the first differing byte.
-    pub fn parse_preamble(&self, preamble: &[u8; PREAMBLE_LEN]) -> io::Result<SocketAddr> {
-        let (magic, rest) = preamble.split_at(MAGIC.len());
+    pub fn read_preamble<R: Read>(&self, mut r: R) -> io::Result<SocketAddr> {
+        let mut header = [0u8; HEADER_LEN];
+        r.read_exact(&mut header)?;
+        let (magic, rest) = header.split_at(MAGIC.len());
+        let (version, rest) = rest.split_first().expect("fixed header");
         let (token, rest) = rest.split_at(TOKEN_LEN);
-        let (port, address) = rest.split_at(2);
-        let mut mismatch = (magic != MAGIC) as u8;
+        let (family, port) = rest.split_first().expect("fixed header");
+        let port = u16::from_be_bytes([port[0], port[1]]);
+
+        let mut mismatch = (magic != MAGIC) as u8 | (*version != VERSION) as u8;
         for (a, b) in token.iter().zip(self.token.iter()) {
             mismatch |= a ^ b;
         }
@@ -77,16 +139,25 @@ impl InterceptEndpoint {
                 "intercept preamble rejected",
             ));
         }
-        let address: [u8; 16] = address.try_into().expect("fixed layout");
-        let ip = Ipv6Addr::from(address).to_canonical();
-        Ok(SocketAddr::new(ip, u16::from_be_bytes([port[0], port[1]])))
-    }
-
-    /// Read and authenticate a preamble from an accepted connection.
-    pub fn read_preamble<R: Read>(&self, mut r: R) -> io::Result<SocketAddr> {
-        let mut preamble = [0u8; PREAMBLE_LEN];
-        r.read_exact(&mut preamble)?;
-        self.parse_preamble(&preamble)
+        let ip = match family {
+            4 => {
+                let mut octets = [0u8; 4];
+                r.read_exact(&mut octets)?;
+                IpAddr::V4(Ipv4Addr::from(octets))
+            }
+            6 => {
+                let mut octets = [0u8; 16];
+                r.read_exact(&mut octets)?;
+                IpAddr::V6(Ipv6Addr::from(octets))
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "intercept preamble has an unknown address family",
+                ))
+            }
+        };
+        Ok(SocketAddr::new(ip, port))
     }
 }
 
@@ -109,7 +180,10 @@ mod tests {
             "[2606:2800:220:1:248:1893:25c8:1946]:8443",
         ] {
             let dst: SocketAddr = dst.parse().unwrap();
-            assert_eq!(ep.parse_preamble(&ep.preamble(dst)).unwrap(), dst);
+            let bytes = ep.preamble(dst);
+            let mut cursor = std::io::Cursor::new(bytes);
+            assert_eq!(ep.read_preamble(&mut cursor).unwrap(), dst);
+            assert_eq!(cursor.position() as usize, cursor.get_ref().len());
         }
     }
 
@@ -117,13 +191,41 @@ mod tests {
     fn rejects_wrong_token_and_magic() {
         let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let bytes = endpoint(1).preamble(dst);
-        let err = endpoint(2).parse_preamble(&bytes).unwrap_err();
+        let err = endpoint(2).read_preamble(&bytes[..]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let mut bad_magic = endpoint(1).preamble(dst);
         bad_magic[0] = b'X';
-        let err = endpoint(1).parse_preamble(&bad_magic).unwrap_err();
+        let err = endpoint(1).read_preamble(&bad_magic[..]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn preamble_len_follows_the_family_byte() {
+        let dst4: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let dst6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let p4 = endpoint(1).preamble(dst4);
+        let p6 = endpoint(1).preamble(dst6);
+        assert_eq!(preamble_len(&p4[..HEADER_LEN]), Some(p4.len()));
+        assert_eq!(preamble_len(&p6[..HEADER_LEN]), Some(p6.len()));
+        // Too short to hold the family byte, or a family we do not speak.
+        assert_eq!(preamble_len(&p4[..HEADER_LEN - 4]), None);
+        let mut bad_family = p4.clone();
+        bad_family[HEADER_LEN - 3] = 5;
+        assert_eq!(preamble_len(&bad_family[..HEADER_LEN]), None);
+    }
+
+    #[test]
+    fn verdicts_carry_the_connect_outcome() {
+        let unreachable: io::Result<()> = Err(io::ErrorKind::HostUnreachable.into());
+        assert_eq!(connect_verdict(&Ok::<(), io::Error>(())), VERDICT_CONNECTED);
+        assert_eq!(connect_verdict(&unreachable), 113);
+        read_verdict(&[VERDICT_CONNECTED][..]).unwrap();
+        assert!(read_verdict(&[113u8][..]).is_err());
+        assert_eq!(
+            read_verdict(&[][..]).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
