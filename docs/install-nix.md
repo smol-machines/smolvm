@@ -51,8 +51,6 @@ loaded and your user is in the `kvm` group.
   users once that PR is merged**, so check for an unmerged `nix-bump-*` branch
   if the flake lags the latest release. `./scripts/update-nix-hashes.sh VERSION`
   refreshes the hashes by hand from a release's `checksums.sha256`; set
-  `version` first, since it rewrites only the hashes. CI runs
-  `./scripts/check-nix-hashes.sh`, which fails when the pinned hashes do not
-  match the release the pinned version names.
+  `version` first, since it rewrites only the hashes.
 - A submission to the upstream **nixpkgs** collection is planned so
   `nix profile install nixpkgs#smolvm` works without referencing this flake.

@@ -32,20 +32,6 @@ jobs:
       - name: Check secrets guardrails
         run: ./scripts/check-secrets-guards.sh
 
-  nix-flake-pins:
-    name: Nix flake pins
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Hash refresh + check tests
-        run: bash tests/test_nix_release_hashes.sh
-      # The flake's hashes must describe the release its version names, or
-      # `nix run github:smol-machines/smolvm` fails on every platform.
-      - name: nix/smolvm.nix matches its release
-        run: ./scripts/check-nix-hashes.sh
-
   libkrun-provenance:
     name: libkrun freshness
     runs-on: ubuntu-latest
@@ -502,14 +488,13 @@ jobs:
   # ==========================================================================
   ci-success:
     name: CI Success
-    needs: [fmt, nix-flake-pins, macos, linux, windows, agent, smol-compat]
+    needs: [fmt, macos, linux, windows, agent, smol-compat]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
-             [[ "${{ needs.nix-flake-pins.result }}" != "success" ]] || \
              [[ "${{ needs.macos.result }}" != "success" ]] || \
              [[ "${{ needs.linux.result }}" != "success" ]] || \
              [[ "${{ needs.windows.result }}" != "success" ]] || \

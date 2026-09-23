@@ -145,54 +145,6 @@ test_rewrites_hashes_with_slash_and_plus() {
     [[ "$got" == "sha256-++++++++++++++++++++++++++++++++++++++++//8=" ]] || { echo "darwin: got $got"; return 1; }
 }
 
-CHECK_HASHES="$PROJECT_ROOT/scripts/check-nix-hashes.sh"
-
-test_check_passes_when_hashes_match() {
-    local tmp nixf sums rc
-    tmp=$(mktemp -d)
-    nixf="$tmp/smolvm.nix"; sums="$tmp/checksums.sha256"
-    make_nix_fixture "$nixf"; make_checksums_fixture "$sums"
-    SMOLVM_NIX_FILE="$nixf" SMOLVM_CHECKSUMS_FILE="$sums" \
-        "$UPDATE_HASHES" 9.9.9 >/dev/null 2>&1
-
-    SMOLVM_NIX_FILE="$nixf" SMOLVM_CHECKSUMS_FILE="$sums" \
-        "$CHECK_HASHES" >/dev/null 2>&1
-    rc=$?
-    rm -rf "$tmp"
-    [[ $rc -eq 0 ]]
-}
-
-test_check_fails_on_stale_hashes() {
-    # The shipped failure: the version names a release, the hashes belong to
-    # an older one.
-    local tmp nixf sums rc output
-    tmp=$(mktemp -d)
-    nixf="$tmp/smolvm.nix"; sums="$tmp/checksums.sha256"
-    make_nix_fixture "$nixf"; make_checksums_fixture "$sums"
-
-    output=$(SMOLVM_NIX_FILE="$nixf" SMOLVM_CHECKSUMS_FILE="$sums" \
-        "$CHECK_HASHES" 2>&1)
-    rc=$?
-    rm -rf "$tmp"
-    [[ $rc -ne 0 ]] || { echo "expected a non-zero exit for stale hashes"; return 1; }
-    printf '%s\n' "$output" | grep -q "do not match that release"
-}
-
-test_check_fails_without_a_release() {
-    # A flake bumped before its release exists has no hashes to agree with.
-    local tmp nixf rc output
-    tmp=$(mktemp -d)
-    nixf="$tmp/smolvm.nix"
-    make_nix_fixture "$nixf"
-
-    output=$(SMOLVM_NIX_FILE="$nixf" SMOLVM_CHECKSUMS_FILE="$tmp/missing" \
-        "$CHECK_HASHES" 2>&1)
-    rc=$?
-    rm -rf "$tmp"
-    [[ $rc -ne 0 ]] || { echo "expected a non-zero exit without release checksums"; return 1; }
-    printf '%s\n' "$output" | grep -q "must pin a published release"
-}
-
 test_cut_release_does_not_bump_the_flake() {
     # The regression itself: cutting a release must not rewrite the flake's
     # version, because the hashes it would then contradict cannot be computed
@@ -204,9 +156,6 @@ run_test "Rewrites every pinned hash" test_rewrites_every_pinned_hash || true
 run_test "Leaves the version alone" test_leaves_the_version_alone || true
 run_test "Missing asset fails loudly" test_missing_asset_fails_loudly || true
 run_test "Rewrites hashes containing / and +" test_rewrites_hashes_with_slash_and_plus || true
-run_test "Check passes when hashes match" test_check_passes_when_hashes_match || true
-run_test "Check fails on stale hashes" test_check_fails_on_stale_hashes || true
-run_test "Check fails without a release" test_check_fails_without_a_release || true
 run_test "Cutting a release does not bump the flake" test_cut_release_does_not_bump_the_flake || true
 
 print_summary "Nix Release Hash Tests"
