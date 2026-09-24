@@ -82,7 +82,8 @@ pub fn read_verdict<R: Read>(mut r: R) -> io::Result<()> {
 }
 
 /// Where a backend redirects intercepted flows, and the secret it must present.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InterceptEndpoint {
     /// Loopback listener owned by the interceptor.
     pub addr: SocketAddr,

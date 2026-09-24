@@ -2084,6 +2084,20 @@ impl AgentManager {
             }
         }
 
+        if let Some(endpoint) = &features.external_interceptor {
+            launcher::validate_external_interceptor(
+                endpoint,
+                &resources,
+                features.credentials.is_some(),
+                features.pod_netns.is_some(),
+            )?;
+            if features.snapshot_dir.is_some() || features.forkable {
+                return Err(Error::config(
+                    "egress interceptor",
+                    "external interception does not support checkpoint or branch launches",
+                ));
+            }
+        }
         if let Some(snapshot) = features.snapshot_dir.as_deref() {
             crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
         }
@@ -2423,6 +2437,7 @@ impl AgentManager {
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
+            external_interceptor: features.external_interceptor,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
             extra_disks: {
@@ -2464,8 +2479,13 @@ impl AgentManager {
             .join("boot-config.json");
         let config_json = serde_json::to_vec(&config)
             .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
-        std::fs::write(&config_path, &config_json)
+        let mut config_file = tempfile::NamedTempFile::new_in(config_path.parent().unwrap())
+            .map_err(|e| Error::agent("create boot config", e.to_string()))?;
+        std::io::Write::write_all(&mut config_file, &config_json)
             .map_err(|e| Error::agent("write boot config", e.to_string()))?;
+        config_file
+            .persist(&config_path)
+            .map_err(|e| Error::agent("persist boot config", e.to_string()))?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
             "boot: config written"

@@ -89,8 +89,8 @@ pub use client::{
 pub use fsnotify_watch::FsNotifyWatcher;
 pub use krun::{host_layers_supported, KrunFunctions};
 pub use launcher::{
-    create_disk_overlays, find_lib_dir, launch_agent_vm, DiskOverlaySpec, LaunchConfig,
-    LaunchFeatures, VmDisks,
+    create_disk_overlays, find_lib_dir, launch_agent_vm, validate_external_interceptor,
+    DiskOverlaySpec, LaunchConfig, LaunchFeatures, VmDisks,
 };
 pub use manager::cleanup_dead_vm_runtime;
 pub(crate) use manager::cleanup_dead_vm_runtime_in_db;

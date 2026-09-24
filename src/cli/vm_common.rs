@@ -1364,8 +1364,7 @@ fn boot_prepared_fork(
             },
             // A clone inherits the golden's running workload from the snapshot
             // (from_snapshot = true already skips relaunch); never provision-only.
-            /* no_workload */
-            false,
+            StartOptions::default(),
         )
     };
     let started = match retry_gate {
@@ -1565,6 +1564,12 @@ pub(crate) fn default_workload_to_image(
     }
 }
 
+#[derive(Default)]
+pub struct StartOptions {
+    pub no_workload: bool,
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+}
+
 /// Start a named machine that has a config record.
 ///
 /// Uses direct DB operations instead of SmolvmConfig::load() to avoid
@@ -1576,10 +1581,10 @@ pub fn start_vm_named(
     no_proxy: Option<&str>,
     from_snapshot: bool,
     fork: ForkLaunch,
-    no_workload: bool,
+    options: StartOptions,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
-    start_vm_named_with_db(&db, name, proxy, no_proxy, from_snapshot, fork, no_workload)
+    start_vm_named_with_db(&db, name, proxy, no_proxy, from_snapshot, fork, options)
 }
 
 fn start_vm_named_with_db(
@@ -1589,9 +1594,13 @@ fn start_vm_named_with_db(
     no_proxy: Option<&str>,
     from_snapshot: bool,
     mut fork: ForkLaunch,
-    no_workload: bool,
+    options: StartOptions,
 ) -> smolvm::Result<()> {
     use smolvm::Error;
+    let StartOptions {
+        no_workload,
+        external_interceptor,
+    } = options;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
@@ -1601,6 +1610,21 @@ fn start_vm_named_with_db(
     let restoring_checkpoint =
         smolvm::portable_checkpoint::pending_dir(&smolvm::agent::vm_data_dir(name)).is_some();
     let from_snapshot = from_snapshot || restoring_checkpoint;
+    if let Some(endpoint) = &external_interceptor {
+        smolvm::agent::validate_external_interceptor(
+            endpoint,
+            &record.vm_resources(),
+            record.credential_policy.is_some(),
+            false,
+        )?;
+        if from_snapshot || fork.forkable || record.forkable_on_start() {
+            return Err(Error::config(
+                "egress interceptor",
+                "external interception does not support checkpoint or branch launches",
+            ));
+        }
+    }
+
     // A Smolfile-declared fork base starts forkable without requiring the user
     // to repeat `--forkable`. Older records that persisted a CUDA pool before
     // the explicit field existed get the same behavior, but clones remain
@@ -1622,6 +1646,12 @@ fn start_vm_named_with_db(
             ));
         }
         RecordState::Running => {
+            if external_interceptor.is_some() {
+                return Err(Error::config(
+                    "egress interceptor",
+                    "stop the running machine before binding an interceptor",
+                ));
+            }
             let pid_suffix = format_pid_suffix(record.pid);
             println!("Machine '{}' already running{}", name, pid_suffix);
             return Ok(());
@@ -1753,6 +1783,7 @@ fn start_vm_named_with_db(
         published_sockets: record.published_sockets.clone(),
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
+        external_interceptor,
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
         // 0700 data dir.

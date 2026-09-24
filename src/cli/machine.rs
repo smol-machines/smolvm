@@ -2829,6 +2829,32 @@ mod tests {
     }
 
     #[test]
+    fn external_interceptor_requires_a_named_start() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "start",
+            "--name",
+            "worker",
+            "--egress-interceptor",
+            "/tmp/interceptor.json",
+        ]);
+        let MachineCmd::Start(cmd) = cli.command else {
+            panic!("expected machine start command");
+        };
+        assert_eq!(
+            cmd.egress_interceptor,
+            Some(PathBuf::from("/tmp/interceptor.json"))
+        );
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "start",
+            "--egress-interceptor",
+            "/tmp/interceptor.json",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn block_io_defaults_to_unset_and_accepts_async() {
         let cli = TestMachineCli::parse_from(["machine", "create", "--name", "default"]);
         let MachineCmd::Create(cmd) = cli.command else {
@@ -4386,6 +4412,11 @@ pub struct StartCmd {
     #[arg(long = "no-workload", hide = true)]
     pub no_workload: bool,
 
+    /// Route outbound TCP through a host interceptor described by a local JSON
+    /// file (addr and 32-byte token). Other outbound datagrams except DNS are denied.
+    #[arg(long, value_name = "PATH", requires = "name")]
+    pub egress_interceptor: Option<PathBuf>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -4412,7 +4443,20 @@ impl StartCmd {
             no_proxy.as_deref(),
             /* from_snapshot */ false,
             fork,
-            self.no_workload,
+            vm_common::StartOptions {
+                no_workload: self.no_workload,
+                external_interceptor: self
+                    .egress_interceptor
+                    .as_deref()
+                    .map(|path| {
+                        let bytes = std::fs::read(path).map_err(|e| {
+                            smolvm::Error::config("egress interceptor", e.to_string())
+                        })?;
+                        serde_json::from_slice(&bytes)
+                            .map_err(|e| smolvm::Error::config("egress interceptor", e.to_string()))
+                    })
+                    .transpose()?,
+            },
         ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
@@ -6044,7 +6088,7 @@ impl MonitorCmd {
                 None,
                 /* from_snapshot */ false,
                 vm_common::ForkLaunch::default(),
-                /* no_workload */ false,
+                vm_common::StartOptions::default(),
             )?;
         }
 
@@ -6228,7 +6272,7 @@ impl MonitorCmd {
                         None,
                         /* from_snapshot */ false,
                         vm_common::ForkLaunch::default(),
-                        /* no_workload */ false,
+                        vm_common::StartOptions::default(),
                     ) {
                         Ok(()) => {
                             println!("  machine restarted");

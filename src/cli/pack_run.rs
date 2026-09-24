@@ -722,6 +722,7 @@ impl PackRunCmd {
                 extra_disks: vec![],
                 pod_netns: None,
                 credentials: None,
+                external_interceptor: None,
             };
 
             let config_path = runtime_dir.path().join("boot-config.json");
@@ -1870,6 +1871,7 @@ fn run_from_cache(
             extra_disks: vec![],
             pod_netns: None,
             credentials: None,
+            external_interceptor: None,
         };
         let config_path = runtime_dir.path().join("boot-config.json");
         let config_json = serde_json::to_vec(&boot_config)

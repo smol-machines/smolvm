@@ -92,4 +92,7 @@ pub struct BootConfig {
     /// the interceptor beside the network stack and mounts the machine CA.
     #[serde(default)]
     pub credentials: Option<crate::credentials::CredentialLaunch>,
+    /// Launch-scoped host interceptor; never copied to the machine record.
+    #[serde(default)]
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 }
