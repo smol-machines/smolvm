@@ -880,8 +880,20 @@ fn build_seccomp_program(
         libc::SYS_inotify_init,
         libc::SYS_arch_prctl,
     ]);
+    // arm64 has no legacy `rename`/`unlink`/`mkdir`, only the `*at` forms, so each
+    // x86_64 legacy entry above needs its `*at` counterpart here. `renameat` was
+    // the one missing: glibc turns every rename(2) into `renameat` (38) on arm64,
+    // so a guest renaming a file through the virtiofs share had the VMM issue a
+    // syscall this list did not allow — logged on every ARM worker, and a killed
+    // VM under `enforce`, which is why the ARM fleet could not leave `audit`.
+    // `renameat2` does not cover it: it is a different syscall number.
     #[cfg(target_arch = "aarch64")]
-    allowed.extend_from_slice(&[libc::SYS_unlinkat, libc::SYS_renameat2, libc::SYS_mkdirat]);
+    allowed.extend_from_slice(&[
+        libc::SYS_unlinkat,
+        libc::SYS_renameat,
+        libc::SYS_renameat2,
+        libc::SYS_mkdirat,
+    ]);
 
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         allowed.iter().map(|&nr| (nr, Vec::new())).collect();
@@ -3696,6 +3708,54 @@ mod tests {
                 "guardian chmod should survive seccomp, status={status:#x}"
             );
         }
+    }
+
+    /// arm64's rename path. glibc implements rename(2) as `renameat` there, and
+    /// the VMM renames files whenever a guest does through virtiofs, so a missing
+    /// entry killed ARM VMs under `enforce`. Performs a REAL rename through the
+    /// filter: the child must survive AND the file must actually have moved,
+    /// which also proves the allowed call is the one that did the work.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn seccomp_allows_renameat_on_aarch64() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from = dir.path().join("before");
+        let to = dir.path().join("after");
+        std::fs::write(&from, b"x").expect("seed file");
+        let from_c = std::ffi::CString::new(from.as_os_str().as_encoded_bytes()).unwrap();
+        let to_c = std::ffi::CString::new(to.as_os_str().as_encoded_bytes()).unwrap();
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let rc = libc::syscall(
+                    libc::SYS_renameat,
+                    libc::AT_FDCWD,
+                    from_c.as_ptr(),
+                    libc::AT_FDCWD,
+                    to_c.as_ptr(),
+                );
+                libc::_exit(if rc == 0 { 0 } else { 3 });
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS),
+                "renameat must not be killed by the filter on aarch64"
+            );
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "renameat should succeed under the filter, status={status:#x}"
+            );
+        }
+        assert!(
+            to.exists() && !from.exists(),
+            "the rename should actually have happened"
+        );
     }
 
     /// The converse of the test above: a syscall the VMM legitimately issues must
