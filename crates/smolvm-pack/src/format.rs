@@ -585,6 +585,11 @@ pub struct PortableCheckpointManifest {
     /// single-generation file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<CheckpointGeneration>,
+    /// The machine's credential CA (certificate and signing key). The captured
+    /// guest trusts this CA, so a restore keeps it instead of minting a new
+    /// one the guest would reject. Absent for machines without credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ca: Option<CheckpointAsset>,
 }
 
 /// Identity of the pack a checkpointed machine mounted its image layers from.

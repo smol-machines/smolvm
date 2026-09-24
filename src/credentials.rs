@@ -22,9 +22,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Name of the directory inside a machine's data dir that holds its
+/// credential CA.
+pub const CA_DIR_NAME: &str = "credentials";
+
 /// Per-machine directory holding the credential CA (`ca.key` + `guest/ca.pem`).
 pub fn ca_dir(machine: &str) -> PathBuf {
-    crate::agent::vm_data_dir(machine).join("credentials")
+    crate::agent::vm_data_dir(machine).join(CA_DIR_NAME)
 }
 
 /// Validate a policy against the machine's hostname allow-list and mint its

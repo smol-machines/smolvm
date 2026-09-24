@@ -20,12 +20,17 @@ use zeroize::Zeroizing;
 
 pub use smolvm_protocol::credentials::GUEST_CA_FILE;
 const CA_KEY_FILE: &str = "ca.key";
+/// Machine name the CA was generated for. Part of its subject, so a CA that
+/// moves to another machine (a restored checkpoint) still signs as itself.
+const CA_NAME_FILE: &str = "ca.name";
 /// Subdirectory holding only what the guest may see. Mount this, never the
 /// directory that also holds the signing key.
 pub const GUEST_SUBDIR: &str = "guest";
 
 /// A CA able to mint leaves for intercepted hosts.
 pub struct MachineCa {
+    /// Machine the CA was generated for; its subject is derived from this.
+    name: String,
     /// The certificate the guest trusts, exactly as written to `ca.pem`.
     cert_pem: String,
     cert_der: CertificateDer<'static>,
@@ -72,6 +77,7 @@ impl MachineCa {
         });
         let cert = params.self_signed(&key).context("self-sign CA")?;
         Ok(Self {
+            name: machine.to_string(),
             cert_pem: cert.pem(),
             cert_der: cert.der().clone(),
             issuer: cert,
@@ -87,6 +93,7 @@ impl MachineCa {
         std::fs::create_dir_all(&guest).with_context(|| format!("create {}", guest.display()))?;
         std::fs::write(dir.join(GUEST_CA_FILE), &self.cert_pem)?;
         std::fs::write(guest.join(GUEST_CA_FILE), &self.cert_pem)?;
+        std::fs::write(dir.join(CA_NAME_FILE), &self.name)?;
         let key_path = dir.join(CA_KEY_FILE);
         std::fs::write(&key_path, Zeroizing::new(self.key.serialize_pem()))?;
         #[cfg(unix)]
@@ -97,8 +104,12 @@ impl MachineCa {
         Ok(())
     }
 
-    /// Load a CA previously written by [`MachineCa::save`] for `machine`.
+    /// Load a CA previously written by [`MachineCa::save`]. `machine` names
+    /// it only when the directory predates the recorded name.
     pub fn load(dir: &Path, machine: &str) -> Result<Self> {
+        let name = std::fs::read_to_string(dir.join(CA_NAME_FILE))
+            .map(|name| name.trim().to_string())
+            .unwrap_or_else(|_| machine.to_string());
         let cert_pem = std::fs::read_to_string(dir.join(GUEST_CA_FILE))
             .with_context(|| format!("read {}", dir.join(GUEST_CA_FILE).display()))?;
         let key_pem = Zeroizing::new(
@@ -109,10 +120,11 @@ impl MachineCa {
         let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .next()
             .context("CA certificate missing")??;
-        let issuer = ca_params(machine)
+        let issuer = ca_params(&name)
             .self_signed(&key)
             .context("rebuild CA issuer")?;
         Ok(Self {
+            name,
             cert_pem,
             cert_der,
             issuer,
@@ -130,6 +142,46 @@ impl MachineCa {
     /// The guest-visible subdirectory of a CA directory.
     pub fn guest_dir(dir: &Path) -> std::path::PathBuf {
         dir.join(GUEST_SUBDIR)
+    }
+
+    /// The CA as one portable document (name, certificate and signing key),
+    /// for a live checkpoint whose captured guest already trusts it. Holds
+    /// the private key: write it only where the checkpoint itself is kept.
+    pub fn export(&self) -> Zeroizing<String> {
+        Zeroizing::new(
+            serde_json::json!({
+                "name": self.name,
+                "certificate": self.cert_pem,
+                "key": *Zeroizing::new(self.key.serialize_pem()),
+            })
+            .to_string(),
+        )
+    }
+
+    /// Rebuild a CA from [`MachineCa::export`].
+    pub fn import(document: &str) -> Result<Self> {
+        let mut value: serde_json::Value =
+            serde_json::from_str(document).context("parse exported CA")?;
+        let mut take = |key: &str| match value.get_mut(key).map(serde_json::Value::take) {
+            Some(serde_json::Value::String(text)) => Ok(Zeroizing::new(text)),
+            _ => anyhow::bail!("exported CA has no {key}"),
+        };
+        let name = take("name")?.to_string();
+        let cert_pem = take("certificate")?.to_string();
+        let key = KeyPair::from_pem(&take("key")?).context("parse exported CA key")?;
+        let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .next()
+            .context("exported CA has no certificate")??;
+        let issuer = ca_params(&name)
+            .self_signed(&key)
+            .context("rebuild CA issuer")?;
+        Ok(Self {
+            name,
+            cert_pem,
+            cert_der,
+            issuer,
+            key,
+        })
     }
 
     /// PEM of the public certificate — what the guest trusts.
@@ -188,6 +240,48 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn a_ca_moved_to_another_machine_still_signs_as_itself() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::client::WebPkiServerVerifier;
+        use rustls_pki_types::{ServerName, UnixTime};
+
+        let original = MachineCa::generate("cred", &["api.example.com".to_string()]).unwrap();
+        let exported = original.export();
+        // A restore installs the CA under the new machine's name.
+        let dir = tempfile::tempdir().unwrap();
+        MachineCa::import(&exported)
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+        let moved = MachineCa::load(dir.path(), "cred-restored").unwrap();
+        assert_eq!(moved.certificate_pem(), original.certificate_pem());
+
+        // The guest trusts the original certificate; leaves from the moved CA
+        // must chain to it.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(original.cert_der.clone()).unwrap();
+        let verifier = WebPkiServerVerifier::builder_with_provider(
+            std::sync::Arc::new(roots),
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let (chain, _key) = moved.issue_leaf("api.example.com").unwrap();
+        verifier
+            .verify_server_cert(
+                &chain[0],
+                &chain[1..],
+                &ServerName::try_from("api.example.com").unwrap(),
+                &[],
+                UnixTime::now(),
+            )
+            .expect("a leaf from the moved CA verifies against the original");
+
+        assert!(MachineCa::import("{}").is_err());
+        assert!(MachineCa::import("not json").is_err());
     }
 
     #[test]

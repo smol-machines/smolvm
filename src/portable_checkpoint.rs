@@ -1454,6 +1454,7 @@ fn capture_with_completion(
     manifest.cpus = vm.cpus;
     manifest.mem = vm.mem;
     let packed_layers = checkpoint_packed_layers(name, vm)?;
+    let credential_ca = checkpoint_credential_ca(name, vm, &snapshot_dir)?;
     manifest.checkpoint = Some(PortableCheckpointManifest {
         version: FORMAT_VERSION,
         runtime_abi: RUNTIME_ABI.to_string(),
@@ -1520,6 +1521,7 @@ fn capture_with_completion(
         }),
         payload: Default::default(),
         history: Vec::new(),
+        credential_ca,
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
@@ -2221,6 +2223,75 @@ pub fn restored_network_backend(
             format!("checkpoint uses unknown network backend '{other}'"),
         )),
     }
+}
+
+/// Artifact path of a captured machine's credential CA.
+const CREDENTIAL_CA_ASSET: &str = "checkpoint/credential-ca.json";
+/// An exported CA is a name, one certificate and one key; anything larger is
+/// not one.
+const MAX_CREDENTIAL_CA_BYTES: u64 = 64 * 1024;
+
+/// Stage the machine's credential CA beside the captured state. The guest in
+/// this checkpoint trusts that CA (its trust bundle is in the captured RAM),
+/// so a restore must keep signing with it; a freshly minted CA would make
+/// every intercepted request fail TLS. `None` without a credential policy or
+/// before the CA was first created.
+fn checkpoint_credential_ca(
+    name: &str,
+    vm: &VmRecord,
+    snapshot_dir: &Path,
+) -> Result<Option<CheckpointAsset>> {
+    let Some(launch) = crate::credentials::CredentialLaunch::for_record(name, vm) else {
+        return Ok(None);
+    };
+    if !smolvm_credentials::MachineCa::exists(&launch.ca_dir) {
+        return Ok(None);
+    }
+    let ca = smolvm_credentials::MachineCa::load(&launch.ca_dir, &launch.ca_owner)
+        .map_err(|e| Error::agent("capture credential CA", format!("{e:#}")))?;
+    let path = snapshot_dir.join("credential-ca.json");
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&path)
+            .and_then(|mut file| file.write_all(ca.export().as_bytes()))
+            .map_err(|e| Error::agent("stage credential CA", e.to_string()))?;
+    }
+    describe_asset(&path, CREDENTIAL_CA_ASSET).map(Some)
+}
+
+/// Install a checkpoint's credential CA as the restored machine's own, so its
+/// interceptor signs with the CA the captured guest already trusts. The staged
+/// copy is removed once the CA is in place.
+fn install_credential_ca(
+    extracted: &Path,
+    vm_data_dir: &Path,
+    partial: &Path,
+    asset: &CheckpointAsset,
+) -> Result<()> {
+    if asset.path != CREDENTIAL_CA_ASSET || asset.size > MAX_CREDENTIAL_CA_BYTES {
+        return Err(Error::agent(
+            "install checkpoint",
+            format!("unexpected credential CA asset '{}'", asset.path),
+        ));
+    }
+    let staged = partial.join("credential-ca.json");
+    copy_verified(&extracted.join(CREDENTIAL_CA_ASSET), &staged, asset, false)?;
+    let document = zeroize::Zeroizing::new(
+        std::fs::read_to_string(&staged)
+            .map_err(|e| Error::agent("read checkpoint credential CA", e.to_string()))?,
+    );
+    let _ = std::fs::remove_file(&staged);
+    smolvm_credentials::MachineCa::import(&document)
+        .and_then(|ca| ca.save(&vm_data_dir.join(crate::credentials::CA_DIR_NAME)))
+        .map_err(|e| Error::agent("install checkpoint credential CA", format!("{e:#}")))
 }
 
 fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
@@ -3250,6 +3321,9 @@ pub fn install(
                 "checkpoint payload installed"
             );
         }
+        if let Some(asset) = &checkpoint.credential_ca {
+            install_credential_ca(extracted, vm_data_dir, &partial, asset)?;
+        }
 
         let staged_disks = partial.join("disks");
         std::fs::create_dir(&staged_disks)
@@ -3904,6 +3978,44 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_credential_ca_becomes_the_restored_machines_ca() {
+        let extracted = tempfile::tempdir().unwrap();
+        std::fs::create_dir(extracted.path().join(ASSET_DIR)).unwrap();
+        let source = extracted.path().join(CREDENTIAL_CA_ASSET);
+        let original =
+            smolvm_credentials::MachineCa::generate("cred", &["httpbin.org".to_string()]).unwrap();
+        std::fs::write(&source, original.export().as_bytes()).unwrap();
+        let asset = describe_asset(&source, CREDENTIAL_CA_ASSET).unwrap();
+        assert!(!asset.sha256.is_empty(), "the CA asset is checksummed");
+
+        let machine = tempfile::tempdir().unwrap();
+        let partial = tempfile::tempdir().unwrap();
+        install_credential_ca(extracted.path(), machine.path(), partial.path(), &asset).unwrap();
+        let ca_dir = machine.path().join(crate::credentials::CA_DIR_NAME);
+        let installed = smolvm_credentials::MachineCa::load(&ca_dir, "cred-restored").unwrap();
+        assert_eq!(installed.certificate_pem(), original.certificate_pem());
+        assert!(
+            std::fs::read_dir(partial.path()).unwrap().next().is_none(),
+            "the staged copy holding the key is removed"
+        );
+
+        // A tampered CA fails its checksum; a CA under another path is refused.
+        std::fs::write(&source, b"{}").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        assert!(
+            install_credential_ca(extracted.path(), other.path(), partial.path(), &asset).is_err()
+        );
+        let misplaced = CheckpointAsset {
+            path: "checkpoint/memory.bin".into(),
+            ..asset
+        };
+        assert!(
+            install_credential_ca(extracted.path(), other.path(), partial.path(), &misplaced)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn install_verifies_and_consumes_checkpoint() {
         let extracted = tempfile::tempdir().unwrap();
         let source = extracted.path().join(ASSET_DIR);
@@ -3958,6 +4070,7 @@ mod tests {
             lineage: None,
             payload: Default::default(),
             history: Vec::new(),
+            credential_ca: None,
         };
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
@@ -4697,6 +4810,7 @@ mod tests {
             lineage: None,
             payload: Default::default(),
             history: Vec::new(),
+            credential_ca: None,
         }
     }
 

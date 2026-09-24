@@ -2469,6 +2469,7 @@ mod tests {
             }),
             payload: Default::default(),
             history: Vec::new(),
+            credential_ca: None,
         });
         manifest
     }
