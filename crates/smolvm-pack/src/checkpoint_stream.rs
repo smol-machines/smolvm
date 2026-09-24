@@ -1,6 +1,6 @@
 //! Bounded checkpoint RAM input for packing without a temporary memory file.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// A captured CPU/layout boundary and an immutable sparse RAM stream.
 ///
@@ -13,6 +13,8 @@ pub struct CheckpointStream<'a> {
     logical: u64,
     ranges: Vec<(u64, u64)>,
     consumed: bool,
+    copy: Option<std::fs::File>,
+    copy_failed: bool,
 }
 
 fn invalid() -> io::Error {
@@ -88,7 +90,22 @@ impl<'a> CheckpointStream<'a> {
             logical,
             ranges,
             consumed: false,
+            copy: None,
+            copy_failed: false,
         })
+    }
+
+    /// Also write the RAM image, unpacked and sparse, to `file` while packing,
+    /// so the capture can keep a ready-to-restore copy without writing the
+    /// holes or decompressing the artifact again. Best-effort: a failed copy
+    /// never fails packing; see [`Self::memory_copied`].
+    pub fn copy_memory_to(&mut self, file: std::fs::File) {
+        self.copy = Some(file);
+    }
+
+    /// Whether the copy requested by [`Self::copy_memory_to`] is complete.
+    pub fn memory_copied(&self) -> bool {
+        self.consumed && self.copy.is_some() && !self.copy_failed
     }
 
     /// Captured CPU/device bytes; the caller must validate the runtime format.
@@ -137,9 +154,36 @@ impl<'a> CheckpointStream<'a> {
             extra.set_is_extended((index + 1) * 21 < rest.len());
             archive.get_mut().write_all(extra.as_bytes())?;
         }
-        let copied = io::copy(&mut (&mut *self.source).take(stored), archive.get_mut())?;
-        if copied != stored {
-            return Err(io::ErrorKind::UnexpectedEof.into());
+        match self.copy.take() {
+            None => {
+                let copied = io::copy(&mut (&mut *self.source).take(stored), archive.get_mut())?;
+                if copied != stored {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+            }
+            Some(mut copy) => {
+                // The payload is the ranges' bytes back to back, in order.
+                let mut buffer = vec![0; 1024 * 1024];
+                for &(offset, len) in &self.ranges {
+                    if len > 0 && !self.copy_failed {
+                        self.copy_failed = copy.seek(SeekFrom::Start(offset)).is_err();
+                    }
+                    let mut left = len;
+                    while left > 0 {
+                        let chunk = left.min(buffer.len() as u64) as usize;
+                        self.source.read_exact(&mut buffer[..chunk])?;
+                        archive.get_mut().write_all(&buffer[..chunk])?;
+                        if !self.copy_failed {
+                            self.copy_failed = copy.write_all(&buffer[..chunk]).is_err();
+                        }
+                        left -= chunk as u64;
+                    }
+                }
+                if !self.copy_failed {
+                    self.copy_failed = copy.set_len(self.logical).is_err();
+                }
+                self.copy = Some(copy);
+            }
         }
         let padding = (512 - stored % 512) % 512;
         archive.get_mut().write_all(&[0; 512][..padding as usize])?;

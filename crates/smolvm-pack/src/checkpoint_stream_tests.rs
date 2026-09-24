@@ -174,3 +174,27 @@ fn extended_sparse_headers_preserve_every_range() {
     }
     assert_eq!(restored, expected);
 }
+
+#[test]
+fn memory_copy_matches_the_unpacked_entry_without_changing_the_archive() {
+    let good = wire(b"OK saved (8192 bytes, 1 regions)\n");
+    let pack = |copy: Option<std::fs::File>| {
+        let mut input = good.as_slice();
+        let mut stream = CheckpointStream::read(&mut input, 8192).unwrap();
+        let copying = copy.is_some();
+        if let Some(file) = copy {
+            stream.copy_memory_to(file);
+        }
+        let mut archive = tar::Builder::new(Vec::new());
+        stream.append(&mut archive).unwrap();
+        assert_eq!(stream.memory_copied(), copying);
+        archive.into_inner().unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.bin");
+    let with_copy = pack(Some(std::fs::File::create(&path).unwrap()));
+    assert_eq!(with_copy, pack(None));
+    let mut expected = vec![0; 8192];
+    expected[1024..1027].copy_from_slice(b"RAM");
+    assert_eq!(std::fs::read(&path).unwrap(), expected);
+}
