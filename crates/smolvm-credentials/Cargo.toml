@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-credentials"
-version = "1.18.1"
+version = "1.18.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Credential substitution for Smol machines: policy, resolvers and the transparent HTTPS interceptor"
@@ -23,7 +23,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 serde_json = "1"
-smolvm-protocol = { path = "../smolvm-protocol", version = "1.18.1" }
+smolvm-protocol = { path = "../smolvm-protocol", version = "1.18.2" }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = { workspace = true }
