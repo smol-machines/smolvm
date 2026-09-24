@@ -782,6 +782,12 @@ pub struct CaptureCheckpointQuery {
     /// Stable id to file the produced artifact under in the node-local cache,
     /// so a later restore of this checkpoint on this node needs no download.
     pub cache_key: Option<String>,
+    /// JSON array of pre-signed object-store URLs to PUT the artifact to,
+    /// instead of streaming it back to the caller. The artifact is split into
+    /// that many contiguous parts, uploaded concurrently in order, for the
+    /// caller to join; the reply is then a small JSON summary and the artifact
+    /// never crosses the control plane.
+    pub upload_urls: Option<String>,
 }
 
 /// Capture a live checkpoint of a running machine and stream it back as a
@@ -803,6 +809,11 @@ pub async fn capture_portable_checkpoint(
         .lookup_vm(&name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+    let upload_urls = capture_options
+        .upload_urls
+        .as_deref()
+        .map(checked_upload_urls)
+        .transpose()?;
 
     let mut transfer_builder = tempfile::Builder::new();
     transfer_builder.prefix("checkpoint-transfer-");
@@ -825,7 +836,7 @@ pub async fn capture_portable_checkpoint(
     });
     // Keep staging alive until the background capture finishes, even on disconnect.
     let (transfer, result) = with_owned_transfer(transfer, move |_dir| {
-        crate::portable_checkpoint::capture_to_path_with_source_release(
+        crate::portable_checkpoint::capture_to_path_deferring_retention(
             &capture_name,
             &capture_path,
             &crate::portable_checkpoint::CaptureOptions {
@@ -837,10 +848,21 @@ pub async fn capture_portable_checkpoint(
         )
     })
     .await?;
-    let result = result.map_err(checkpoint_capture_error)?;
+    let (result, retention) = result.map_err(checkpoint_capture_error)?;
     let transfer = CheckpointTransfer {
         _directory: Some(transfer),
         artifact: artifact.clone(),
+    };
+    // Retention reads the artifact, so it runs before the transfer is released,
+    // but off the request path: nothing the caller does waits on it.
+    let finish = move |transfer: CheckpointTransfer| {
+        let Some(retention) = retention else {
+            return;
+        };
+        tokio::task::spawn_blocking(move || {
+            retention.run(&transfer.artifact);
+            drop(transfer);
+        });
     };
 
     if let Some(key) = capture_options.cache_key {
@@ -851,6 +873,17 @@ pub async fn capture_portable_checkpoint(
             tracing::warn!(%error, "checkpoint cache task failed");
         }
     }
+    if let Some(urls) = upload_urls {
+        let size = upload_checkpoint(&artifact, urls).await?;
+        finish(transfer);
+        return Ok(axum::response::IntoResponse::into_response(Json(
+            serde_json::json!({
+                "uploaded": true,
+                "sizeBytes": size,
+                "pauseMs": result.source_pause.as_millis() as u64,
+            }),
+        )));
+    }
     #[cfg(target_os = "linux")]
     let prepared_reference = crate::artifact_cache::prepared_checkpoint_reference(&artifact).ok();
     let mut file = tokio::fs::File::open(&artifact)
@@ -860,11 +893,14 @@ pub async fn capture_portable_checkpoint(
     let stream = async_stream::stream! {
         // Keeping the TempDir in the stream owns the artifact until the client
         // finishes or disconnects; dropping the body cleans it up either way.
-        let _transfer = transfer;
+        let transfer = transfer;
         let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
             match file.read(&mut buffer).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    finish(transfer);
+                    break;
+                }
                 Ok(count) => {
                     yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&buffer[..count]));
                 }
@@ -899,6 +935,103 @@ pub async fn capture_portable_checkpoint(
         )
         .body(Body::from_stream(stream))
         .map_err(|error| ApiError::internal(format!("build checkpoint response: {error}")))
+}
+
+/// Most parts a capture may be uploaded in; the object store joins at most 32.
+const MAX_UPLOAD_PARTS: usize = 32;
+
+/// Contiguous `(start, length)` ranges splitting `size` bytes into `parts`
+/// near-equal pieces; trailing pieces are empty when there are more parts
+/// than bytes.
+fn upload_part_ranges(size: u64, parts: usize) -> Vec<(u64, u64)> {
+    let part_size = size.div_ceil(parts as u64);
+    (0..parts as u64)
+        .map(|index| {
+            let start = (index * part_size).min(size);
+            (start, part_size.min(size - start))
+        })
+        .collect()
+}
+
+fn checked_upload_urls(raw: &str) -> Result<Vec<reqwest::Url>, ApiError> {
+    let urls: Vec<String> = serde_json::from_str(raw)
+        .map_err(|error| ApiError::BadRequest(format!("invalid upload_urls: {error}")))?;
+    if urls.is_empty() || urls.len() > MAX_UPLOAD_PARTS {
+        return Err(ApiError::BadRequest(format!(
+            "upload_urls must name 1 to {MAX_UPLOAD_PARTS} parts"
+        )));
+    }
+    urls.iter()
+        .map(|url| checked_checkpoint_source(url))
+        .collect()
+}
+
+/// PUT a captured artifact to pre-signed object-store URLs, one contiguous part
+/// per URL, all at once. One stream to the store tops out far below what a node
+/// can push, so the parts go in parallel.
+///
+/// The object store acknowledges a single-request upload only once the object
+/// is durable, so a success here means every part is safely stored.
+async fn upload_checkpoint(
+    artifact: &std::path::Path,
+    urls: Vec<reqwest::Url>,
+) -> Result<u64, ApiError> {
+    use tokio::io::AsyncSeekExt;
+    let size = tokio::fs::metadata(artifact)
+        .await
+        .map_err(|error| ApiError::internal(format!("stat checkpoint artifact: {error}")))?
+        .len();
+    // Same policy as the restore fetch: no redirects, so the host allow-list
+    // cannot be escaped by a 302.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(1800))
+        .build()
+        .map_err(|error| ApiError::internal(format!("build checkpoint upload client: {error}")))?;
+    let ranges = upload_part_ranges(size, urls.len());
+    let uploads =
+        urls.into_iter()
+            .zip(ranges)
+            .enumerate()
+            .map(|(index, (url, (start, length)))| {
+                let client = client.clone();
+                async move {
+                    let mut file = tokio::fs::File::open(artifact).await.map_err(|error| {
+                        ApiError::internal(format!("open checkpoint artifact: {error}"))
+                    })?;
+                    file.seek(std::io::SeekFrom::Start(start))
+                        .await
+                        .map_err(|error| {
+                            ApiError::internal(format!("seek checkpoint artifact: {error}"))
+                        })?;
+                    let body = reqwest::Body::wrap_stream(
+                        tokio_util::io::ReaderStream::with_capacity(file.take(length), 1024 * 1024),
+                    );
+                    let response = client
+                        .put(url)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_LENGTH, length)
+                        .body(body)
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            ApiError::internal(format!(
+                                "upload checkpoint part {index} to object store: {}",
+                                error.without_url()
+                            ))
+                        })?;
+                    if !response.status().is_success() {
+                        return Err(ApiError::internal(format!(
+                            "object store refused checkpoint part {index}: {}",
+                            response.status()
+                        )));
+                    }
+                    Ok(())
+                }
+            });
+    futures_util::future::try_join_all(uploads).await?;
+    Ok(size)
 }
 
 /// Create a machine by streaming a `.smolcheckpoint` into this node.
@@ -973,6 +1106,42 @@ fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
         )));
     }
     Ok(url)
+}
+
+#[cfg(test)]
+mod checkpoint_upload_tests {
+    use super::{checked_upload_urls, upload_part_ranges};
+
+    #[test]
+    fn part_ranges_cover_the_artifact_exactly_once() {
+        for (size, parts) in [(0, 4), (3, 4), (4, 4), (10, 4), (2_855_851_366, 4), (7, 1)] {
+            let ranges = upload_part_ranges(size, parts);
+            assert_eq!(ranges.len(), parts);
+            let mut next = 0;
+            for (start, length) in ranges {
+                assert_eq!(start, next.min(size));
+                next = start + length;
+            }
+            assert_eq!(next, size, "size {size} in {parts} parts");
+        }
+    }
+
+    #[test]
+    fn upload_urls_are_bounded_and_limited_to_the_object_store() {
+        let url = "https://bucket.storage.googleapis.com/o?X-Goog-Signature=x";
+        assert_eq!(
+            checked_upload_urls(&format!(r#"["{url}","{url}"]"#))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(checked_upload_urls("[]").is_err());
+        let many = serde_json::to_string(&vec![url; 33]).unwrap();
+        assert!(checked_upload_urls(&many).is_err());
+        assert!(checked_upload_urls(r#"["https://169.254.169.254/latest"]"#).is_err());
+        assert!(checked_upload_urls(r#"["http://storage.googleapis.com/o"]"#).is_err());
+        assert!(checked_upload_urls("not json").is_err());
+    }
 }
 
 #[cfg(test)]
