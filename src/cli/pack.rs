@@ -353,6 +353,9 @@ pub struct PackCreateCmd {
     /// Also capture the machine's /workspace, so a machine made from the pack starts with those files. It lives on the storage disk, which packs otherwise never carry.
     #[arg(long = "include-workspace", requires = "from_vm")]
     pub include_workspace: bool,
+    /// Also capture the machine's disks, so a machine made from the pack starts from them instead of unpacking the image's layers again. Makes the pack larger.
+    #[arg(long = "include-disks", requires = "from_vm")]
+    pub include_disks: bool,
 
     /// Output file path for the packed binary
     #[arg(short = 'o', long, value_name = "PATH")]
@@ -873,6 +876,7 @@ impl PackCreateCmd {
             no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
             include_workspace: self.include_workspace,
+            include_disks: self.include_disks,
         };
         let assets = smolvm::pack_export::collect_from_vm_assets(
             &mut collector,
@@ -2077,6 +2081,7 @@ mod tests {
             from_vm: None,
             rebase_from_image: false,
             include_workspace: false,
+            include_disks: false,
             output: PathBuf::from("test-output"),
             cpus: Some(2),
             mem: Some(1024),
