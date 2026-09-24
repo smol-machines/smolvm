@@ -175,7 +175,18 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     let args = scope_start_args(machine_id, pid, caps);
     let mut cmd = Command::new(&busctl);
     cmd.args(&args);
-    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    let mut out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if !out.status.success() && scope_start_collided(&out.stderr) {
+        // A previous VM of this name left its scope loaded in the `failed` state
+        // (it was SIGKILLed by `kill_scope`, or ran out of resources). systemd
+        // never garbage-collects failed units on its own, so every later start
+        // of this machine would collide forever. ResetFailedUnit only unloads a
+        // unit that is failed, so it cannot disturb a live VM's scope.
+        reset_failed_scope(&busctl, &name)?;
+        let mut cmd = Command::new(&busctl);
+        cmd.args(&args);
+        out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    }
     if !out.status.success() {
         return Err(Error::agent(
             "vm scope",
@@ -186,6 +197,33 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
         ));
     }
     tracing::info!(scope = %name, pid, "adopted VM into systemd transient scope");
+    Ok(())
+}
+
+/// Whether a StartTransientUnit failure was a name collision with a loaded unit.
+fn scope_start_collided(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("already loaded") || stderr.contains("UnitExists")
+}
+
+fn reset_failed_scope(busctl: &std::path::Path, name: &str) -> Result<()> {
+    let mut cmd = Command::new(busctl);
+    cmd.args([
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "ResetFailedUnit",
+        "s",
+        name,
+    ]);
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if out.status.success() {
+        tracing::info!(scope = %name, "reset failed VM scope left by a previous run");
+    } else {
+        // Not failed (e.g. still active): the retried start reports the real error.
+        tracing::debug!(scope = %name, stderr = %String::from_utf8_lossy(&out.stderr).trim(), "ResetFailedUnit declined");
+    }
     Ok(())
 }
 
@@ -224,8 +262,9 @@ fn scope_start_args(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Vec<String>
     }
 
     // StartTransientUnit(name: s, mode: s, properties: a(sv), aux: a(sa(sv))).
-    // mode "fail": error if the unit already exists (a stale same-name scope must
-    // have been GC'd first — it would have been, when its VM exited).
+    // mode "fail": error if the unit already exists. A scope whose VM exited
+    // cleanly is GC'd by systemd; a *failed* one is not, and adopt_into_scope
+    // resets it and retries.
     let mut args: Vec<String> = vec![
         "call".into(),
         "org.freedesktop.systemd1".into(),
@@ -416,6 +455,14 @@ mod tests {
         let out = busctl_bounded(cmd, Duration::from_secs(5)).expect("fast call");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
+    }
+
+    #[test]
+    fn scope_start_collision_is_recognized() {
+        assert!(scope_start_collided(
+            b"Call failed: Unit smolvm-vm-x.scope was already loaded or has a fragment file."
+        ));
+        assert!(!scope_start_collided(b"Call failed: Access denied"));
     }
 
     #[test]
