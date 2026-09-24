@@ -2300,6 +2300,71 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    /// One test covers every SMOLVM_MACHINE_NAME behavior, because it mutates
+    /// process env: parallel test functions sharing the variable would race.
+    #[test]
+    fn machine_name_reads_the_environment_with_the_flag_winning() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            cmd: super::MachineCmd,
+        }
+        let parse = |argv: &[&str]| Harness::try_parse_from(argv).map(|h| h.cmd);
+
+        std::env::set_var("SMOLVM_MACHINE_NAME", "workspace-vm");
+
+        // The environment fills --name on machine-selector commands.
+        let Ok(super::MachineCmd::Status(status)) = parse(&["machine", "status"]) else {
+            panic!("status must parse");
+        };
+        assert_eq!(status.name.as_deref(), Some("workspace-vm"));
+        let Ok(super::MachineCmd::Delete(delete)) = parse(&["machine", "delete", "-f"]) else {
+            panic!("delete must accept an env-supplied name");
+        };
+        assert_eq!(delete.name, "workspace-vm");
+
+        // An explicit --name always wins.
+        let Ok(super::MachineCmd::Status(status)) =
+            parse(&["machine", "status", "--name", "other"])
+        else {
+            panic!("status must parse");
+        };
+        assert_eq!(status.name.as_deref(), Some("other"));
+
+        // `machine run` deliberately ignores it: one ambient name across
+        // every ephemeral run would collide on the second concurrent run.
+        let Ok(super::MachineCmd::Run(run)) = parse(&["machine", "run", "--", "true"]) else {
+            panic!("run must parse");
+        };
+        assert!(run.name.is_none());
+
+        // `machine checkpoint --export-from` keeps working with the variable
+        // set: its --name conflicts with --export-from, so the env must not
+        // feed it. (Checkpoint's --name is excluded for exactly this reason.)
+        let Ok(super::MachineCmd::Checkpoint(checkpoint)) = parse(&[
+            "machine",
+            "checkpoint",
+            "--export-from",
+            "/tmp/x",
+            "--output",
+            "/tmp/y.smolcheckpoint",
+        ]) else {
+            panic!("checkpoint --export-from must parse with the env var set");
+        };
+        assert!(checkpoint.name.is_none());
+
+        std::env::remove_var("SMOLVM_MACHINE_NAME");
+
+        // Without the variable, nothing changes: status falls back to its
+        // default-name behavior and delete requires an explicit --name.
+        let Ok(super::MachineCmd::Status(status)) = parse(&["machine", "status"]) else {
+            panic!("status must parse");
+        };
+        assert!(status.name.is_none());
+        assert!(parse(&["machine", "delete", "-f"]).is_err());
+    }
+
     #[test]
     fn bake_start_forwards_proxy_when_set() {
         // No proxy: plain start. The bake always provisions only (never launches
@@ -3058,7 +3123,7 @@ pub struct ExecCmd {
     pub command: Vec<String>,
 
     /// Target machine (default: "default")
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
     /// Set working directory in the VM
@@ -3338,7 +3403,7 @@ impl ExecEventPrinter {
 #[derive(Args, Debug)]
 pub struct ShellCmd {
     /// Target machine (default: "default")
-    #[arg(long, short = 'n', value_name = "NAME")]
+    #[arg(long, short = 'n', value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 }
 
@@ -3379,7 +3444,7 @@ impl ShellCmd {
 #[derive(Args, Debug)]
 pub struct CreateCmd {
     /// Name for the machine (auto-generated if omitted)
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
     /// Attach metadata to the machine (repeatable), e.g.
@@ -4345,7 +4410,7 @@ impl CreateCmd {
 #[derive(Args, Debug)]
 pub struct StartCmd {
     /// Machine to start (default: "default")
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
     /// Start as a branch source: back guest RAM with a memfd (CoW-cloneable) and
@@ -4688,7 +4753,7 @@ impl ForkCmd {
 #[derive(Args, Debug)]
 pub struct ForkReleaseCmd {
     /// Held child to assign and release.
-    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    #[arg(short = 'n', long = "name", value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 
     /// Assignment parameter (repeatable, KEY=VALUE). Values override matching
@@ -4818,13 +4883,13 @@ fn forkpoint_timeout(
 #[derive(Args, Debug)]
 pub struct StopCmd {
     /// Machine to stop (default: "default")
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct PauseCmd {
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 }
 
@@ -4838,7 +4903,7 @@ impl PauseCmd {
 
 #[derive(Args, Debug)]
 pub struct ResumeCmd {
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 }
 
@@ -4870,7 +4935,7 @@ impl StopCmd {
 #[derive(Args, Debug)]
 pub struct DeleteCmd {
     /// Machine to delete
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 
     /// Skip confirmation prompt
@@ -4914,7 +4979,7 @@ impl DeleteCmd {
 #[derive(Args, Debug)]
 pub struct StatusCmd {
     /// Machine to check (default: "default")
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
     /// Output in JSON format
@@ -4943,7 +5008,7 @@ impl StatusCmd {
 #[derive(Args, Debug)]
 pub struct EgressEventsCmd {
     /// Machine to inspect (default: "default")
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
     /// Maximum number of events to show (newest kept)
@@ -5044,7 +5109,7 @@ impl LsCmd {
 ))]
 pub struct ResizeCmd {
     /// Machine to resize (default: "default")
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
     /// Storage disk size in GiB (expand only)
@@ -5094,7 +5159,7 @@ impl ResizeCmd {
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 
     /// Add volume mount. A staged mount is guest-local until sync or graceful stop;
@@ -5453,7 +5518,7 @@ impl UpdateCmd {
 #[derive(Args, Debug)]
 pub struct DataDirCmd {
     /// Machine name.
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 }
 
@@ -5480,7 +5545,7 @@ impl DataDirCmd {
 #[derive(Args, Debug)]
 pub struct NetworkTestCmd {
     /// Named machine to test (omit for default)
-    #[arg(long)]
+    #[arg(long, env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
     /// URL to test
@@ -5533,7 +5598,7 @@ impl NetworkTestCmd {
 #[derive(Args, Debug)]
 pub struct ImagesCmd {
     /// Machine to query
-    #[arg(long, required = true, value_name = "NAME")]
+    #[arg(long, required = true, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 
     /// Output in JSON format
@@ -5635,7 +5700,7 @@ impl ImagesCmd {
 #[derive(Args, Debug)]
 pub struct PruneCmd {
     /// Machine to prune
-    #[arg(long, required = true, value_name = "NAME")]
+    #[arg(long, required = true, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 
     /// Show what would be removed without actually removing
@@ -5911,7 +5976,7 @@ impl CpCmd {
 #[derive(Args, Debug)]
 pub struct SyncCmd {
     /// Machine to synchronize (default: "default")
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 }
 
@@ -5957,7 +6022,7 @@ impl SyncCmd {
 #[derive(Args, Debug)]
 pub struct MonitorCmd {
     /// Machine to monitor (default: "default")
-    #[arg(short = 'n', long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
     /// Override restart policy (never, always, on-failure, unless-stopped)

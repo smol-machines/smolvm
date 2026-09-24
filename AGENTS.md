@@ -600,7 +600,7 @@ OpenAPI spec: `smolvm serve openapi`
 
 ## Important Defaults
 
-- Machine name defaults to `"default"` when `--name` is omitted
+- Machine name defaults to `$SMOLVM_MACHINE_NAME` when set, else `"default"`, when `--name` is omitted. An explicit `--name` always wins. Meant for per-workspace tooling (direnv); `machine run`, `machine checkpoint`, and `machine branch` deliberately ignore the variable
 - Network is **off** by default (security-first)
 - CPUs: 4, Memory: 8192 MiB, Storage: 20 GiB, Overlay: 2 GiB
 - Packed binaries use the same defaults (CPUs: 4, Memory: 8192 MiB)
