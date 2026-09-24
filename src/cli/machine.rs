@@ -4177,7 +4177,7 @@ impl CreateCmd {
             params.port.len(),
         )?;
 
-        let mut record = vm_common::build_vm_record(&params)?;
+        let mut record = vm_common::build_vm_record_for(&params, checkpoint.is_some())?;
         if checkpoint.is_some() {
             record.host_uid_owner = Some(record.name.clone());
             // The restored RAM already contains the initialized guest and its

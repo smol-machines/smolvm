@@ -999,6 +999,14 @@ impl VmRecord {
         if self.source_smolmachine.is_some() {
             return Ok(());
         }
+        // A live-checkpoint restore resumes a guest whose image was pulled long
+        // ago: its RAM and disks come from the artifact and nothing is fetched.
+        // `image` is provenance here too. Without this, an offline machine could
+        // be checkpointed but never restored, which forced sandboxes that pause
+        // to keep a network device they otherwise have no use for.
+        if self.host_uid_owner.is_some() {
+            return Ok(());
+        }
         let Some(image) = self.image.as_deref() else {
             return Ok(());
         };
@@ -1186,6 +1194,15 @@ mod tests {
             "an artifact-sourced machine extracts its layers locally and must not \
              require network"
         );
+    }
+
+    #[test]
+    fn a_checkpoint_restore_needs_no_network_even_though_it_names_a_registry_image() {
+        // A restored guest's RAM and disks come from the checkpoint; `image` is
+        // provenance. Rejecting it made offline machines impossible to restore.
+        let mut r = rec_with_image("alpine:3.20", false, vec![]);
+        r.host_uid_owner = Some("restored".to_string());
+        assert!(r.validate_image_fetchable().is_ok());
     }
 
     #[test]

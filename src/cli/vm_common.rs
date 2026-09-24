@@ -666,6 +666,16 @@ impl Drop for CreateVmReservation {
 }
 
 pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
+    build_vm_record_for(params, false)
+}
+
+/// [`build_vm_record`] for a machine that is (`restoring_checkpoint`) or isn't
+/// a live-checkpoint restore. A restore is marked before validation so checks
+/// that only make sense for a fresh boot (an image pull) don't reject it.
+pub(crate) fn build_vm_record_for(
+    params: &CreateVmParams,
+    restoring_checkpoint: bool,
+) -> smolvm::Result<VmRecord> {
     // Validate name before touching the database. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`), so the name itself has
     // no impact on socket path length — only character sanity + a generous
@@ -810,6 +820,9 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
     record.labels = params.labels.clone();
+    if restoring_checkpoint {
+        record.host_uid_owner = Some(record.name.clone());
+    }
 
     // A registry image with no network can never be pulled (the guest runs the
     // pull), so refuse here rather than deferring to a `start` that must fail.
