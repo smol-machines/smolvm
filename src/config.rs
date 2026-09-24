@@ -1015,12 +1015,7 @@ impl VmRecord {
         ) {
             return Ok(());
         }
-        let plan = crate::network::plan_launch_network_with(
-            &self.vm_resources(),
-            self.dns_filter_hosts.as_deref(),
-            self.ports.len(),
-            self.credential_policy.is_some(),
-        );
+        let plan = self.launch_network_plan();
         if plan.has_network() {
             return Ok(());
         }
@@ -1051,12 +1046,7 @@ impl VmRecord {
                  the workload container's mount namespace",
             ));
         }
-        let plan = crate::network::plan_launch_network_with(
-            &self.vm_resources(),
-            self.dns_filter_hosts.as_deref(),
-            self.ports.len(),
-            self.credential_policy.is_some(),
-        );
+        let plan = self.launch_network_plan();
         if !plan.has_network() {
             return Err(crate::Error::config(
                 "create machine",
@@ -1064,6 +1054,19 @@ impl VmRecord {
             ));
         }
         Ok(())
+    }
+
+    /// The network this machine launches with. A credential policy steers the
+    /// default backend to virtio-net, so anything that records or checks the
+    /// backend (validation, checkpoint capture) must plan it the same way the
+    /// launcher does, or a restore rebuilds a different device set.
+    pub fn launch_network_plan(&self) -> crate::network::LaunchNetworkPlan {
+        crate::network::plan_launch_network_with(
+            &self.vm_resources(),
+            self.dns_filter_hosts.as_deref(),
+            self.ports.len(),
+            self.credential_policy.is_some(),
+        )
     }
 
     /// Convert record fields to VmResources.

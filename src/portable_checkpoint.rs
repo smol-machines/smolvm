@@ -2210,11 +2210,7 @@ pub fn restored_network_backend(
 }
 
 fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
-    let effective = crate::network::plan_launch_network(
-        &vm.vm_resources(),
-        vm.dns_filter_hosts.as_deref(),
-        vm.ports.len(),
-    );
+    let effective = vm.launch_network_plan();
     let backend = match effective.backend {
         crate::network::EffectiveNetworkBackend::None => None,
         crate::network::EffectiveNetworkBackend::Tsi => Some("tsi".to_string()),
@@ -4548,6 +4544,40 @@ mod tests {
                 host: 18080,
                 guest: 8080
             }]
+        );
+    }
+
+    #[test]
+    fn a_credentialed_machine_records_the_virtio_net_backend_it_runs_on() {
+        // `--net` alone launches on TSI, but a credential policy steers the
+        // default backend to virtio-net. The checkpoint must record the
+        // backend the machine actually ran on, or the restore launches TSI and
+        // libkrun cannot match the snapshot's virtio-net device.
+        let mut record = VmRecord::new(
+            "credentialed".to_string(),
+            1,
+            512,
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(checkpoint_network(&record).backend.as_deref(), Some("tsi"));
+
+        record.credential_policy = Some(crate::credentials::CredentialPolicy {
+            credentials: vec![crate::credentials::parse_credential_flag(
+                "mytok=MY_API_TOKEN@httpbin.org",
+            )
+            .unwrap()],
+        });
+        let network = checkpoint_network(&record);
+        assert_eq!(network.backend.as_deref(), Some("virtio-net"));
+        assert_eq!(
+            restored_network_backend(&PortableCheckpointManifest {
+                network: Some(network),
+                ..minimal_checkpoint_manifest()
+            })
+            .unwrap(),
+            Some(crate::network::NetworkBackend::VirtioNet)
         );
     }
 
