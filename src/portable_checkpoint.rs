@@ -3507,8 +3507,17 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .tempdir_in(&vm_data)?;
     smolvm_pack::extract::extract_sidecar(artifact, staged.path(), &footer, false, false)
         .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
-    // A failed earlier restore may have left a partial installation. No VMM
-    // is alive and the verified artifact remains the authoritative copy.
+    clear_stale_restore_state(&vm_data)?;
+    install(staged.path(), &vm_data, checkpoint)
+}
+
+/// Remove what an earlier restore left in a stopped machine's data dir before
+/// installing a new checkpoint: a partial installation from a failed restore,
+/// and the memory backing a previous restore retained as the machine's RAM. No
+/// VMM is alive (the caller checked), so nothing maps that backing any more —
+/// and leaving it makes the new restore refuse to retain its own, so a machine
+/// restored from a checkpoint could be paused but never resumed.
+fn clear_stale_restore_state(vm_data: &Path) -> Result<()> {
     for dir in [INSTALLED_DIR, READONLY_INPUT_DIR] {
         match std::fs::remove_dir_all(vm_data.join(dir)) {
             Ok(()) => {}
@@ -3516,7 +3525,12 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    install(staged.path(), &vm_data, checkpoint)
+    match std::fs::remove_file(vm_data.join(RETAINED_MEMORY_BACKING)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 /// Return the pending one-shot checkpoint directory for a machine, if any.
@@ -3589,6 +3603,18 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resuming_clears_the_memory_a_previous_restore_retained() {
+        let vm = tempfile::tempdir().unwrap();
+        std::fs::write(vm.path().join(RETAINED_MEMORY_BACKING), b"old guest ram").unwrap();
+        std::fs::create_dir_all(vm.path().join(INSTALLED_DIR)).unwrap();
+        clear_stale_restore_state(vm.path()).unwrap();
+        assert!(!vm.path().join(RETAINED_MEMORY_BACKING).exists());
+        assert!(!vm.path().join(INSTALLED_DIR).exists());
+        // Nothing to clear is not an error.
+        clear_stale_restore_state(vm.path()).unwrap();
+    }
 
     #[test]
     fn single_file_checkpoints_hold_one_generation() {
