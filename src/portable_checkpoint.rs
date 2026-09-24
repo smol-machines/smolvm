@@ -766,6 +766,20 @@ fn restored_record(
     record.overlay_gb = checkpoint.overlay_gib;
     record.allowed_cidrs = network.and_then(|network| network.allowed_cidrs.clone());
     record.dns_filter_hosts = network.and_then(|network| network.dns_filter_hosts.clone());
+    if let Some(policy) = network.and_then(|network| network.credential_policy.clone()) {
+        // The artifact is untrusted: hold its policy to the same rules create
+        // enforces, so a hand-edited checkpoint cannot carry a shape the CLI
+        // would refuse. The policy holds no secrets — values are resolved from
+        // this host's environment at request time — and the placeholders come
+        // along unchanged so the captured workload's copies keep matching.
+        policy
+            .validate(record.dns_filter_hosts.as_deref())
+            .map_err(|error| Error::config("restore checkpoint credentials", error.to_string()))?;
+        record.credential_placeholders = network
+            .map(|network| network.credential_placeholders.clone())
+            .unwrap_or_default();
+        record.credential_policy = Some(policy);
+    }
     record.network_backend = restored_network_backend(checkpoint)?;
     record.dns = network
         .and_then(|network| network.dns.as_deref())
@@ -2236,6 +2250,14 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         guest_subnet: vm.guest_subnet.clone(),
         allowed_cidrs: vm.allowed_cidrs.clone(),
         dns_filter_hosts: vm.dns_filter_hosts.clone(),
+        // The captured workload holds its placeholders (in its environment and
+        // possibly its RAM), so the policy and the exact placeholders must
+        // travel with the checkpoint or the restored machine runs with no
+        // interceptor and the workload's requests carry the bare placeholder
+        // upstream. Bindings and placeholders are not secret; the value is
+        // resolved from the restore host's environment.
+        credential_policy: vm.credential_policy.clone().filter(|p| !p.is_empty()),
+        credential_placeholders: vm.credential_placeholders.clone(),
     }
 }
 
@@ -4646,6 +4668,62 @@ mod tests {
             payload: Default::default(),
             history: Vec::new(),
         }
+    }
+
+    #[test]
+    fn credential_bindings_survive_capture_and_restore() {
+        let mut record = VmRecord::new("cred".to_string(), 2, 1024, Vec::new(), Vec::new(), true);
+        record.image = Some("alpine:3.20".to_string());
+        let policy: smolvm_protocol::CredentialPolicy = serde_json::from_str(
+            r#"{"credentials":[{"name":"mytok","environment_variable":"MY_API_TOKEN","allowed_hosts":["httpbin.org"]}]}"#,
+        )
+        .unwrap();
+        record.credential_policy = Some(policy.clone());
+        record.credential_placeholders =
+            [("mytok".to_string(), "SMOL_PLACEHOLDER_MYTOK_AA".to_string())].into();
+
+        // Capture: the envelope carries the policy and the exact placeholders
+        // the captured workload holds.
+        let network = checkpoint_network(&record);
+        assert_eq!(network.credential_policy.as_ref(), Some(&policy));
+        assert_eq!(
+            network
+                .credential_placeholders
+                .get("mytok")
+                .map(String::as_str),
+            Some("SMOL_PLACEHOLDER_MYTOK_AA")
+        );
+
+        // Restore: the record gets them back unchanged, so a placeholder the
+        // workload kept (in captured RAM or a config file) still matches the
+        // interceptor instead of traveling upstream verbatim.
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.network = Some(network);
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "alpine:3.20".to_string(),
+            "sha256:0".to_string(),
+            "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
+        );
+        let restored = restored_record("cred-restored", &manifest, &checkpoint).unwrap();
+        assert_eq!(restored.credential_policy.as_ref(), Some(&policy));
+        assert_eq!(
+            restored.credential_placeholders,
+            record.credential_placeholders
+        );
+
+        // A hand-edited artifact carrying a policy `create` would refuse is
+        // refused at restore too.
+        let bad: smolvm_protocol::CredentialPolicy = serde_json::from_str(
+            r#"{"credentials":[{"name":"mytok","environment_variable":"MY_API_TOKEN","allowed_hosts":["*"]}]}"#,
+        )
+        .unwrap();
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.network = Some(CheckpointNetwork {
+            credential_policy: Some(bad),
+            ..CheckpointNetwork::default()
+        });
+        assert!(restored_record("cred-restored", &manifest, &checkpoint).is_err());
     }
 
     #[test]

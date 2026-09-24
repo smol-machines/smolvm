@@ -836,6 +836,18 @@ impl PackCreateCmd {
             );
         }
 
+        // A plain pack carries no credential bindings either (only a live
+        // checkpoint does); a workload that expects its `--credential` env var
+        // would otherwise fail with nothing pointing at the cause.
+        if vm.credential_policy.as_ref().is_some_and(|p| !p.is_empty()) {
+            warn!(
+                "VM '{}' has credential bindings; .smolmachine artifacts do not carry them — \
+                 pass --credential again when creating machines from this artifact, or use \
+                 `machine checkpoint`, which carries the bindings",
+                vm_name
+            );
+        }
+
         println!("Packing VM '{}' snapshot...", vm_name);
 
         // 2. Create temporary staging directory

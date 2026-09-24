@@ -474,6 +474,16 @@ pub struct CheckpointNetwork {
     /// Captured outbound DNS hostname allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Captured credential bindings (`[[network.credentials]]`): binding names,
+    /// env-var names and allowed hosts — never the values, which the restore
+    /// host resolves from its own environment at request time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_policy: Option<smolvm_protocol::CredentialPolicy>,
+    /// Placeholders minted for `credential_policy` on the source machine.
+    /// Carried so a process captured holding its placeholder still matches the
+    /// restored interceptor; placeholders are opaque tokens, not secrets.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub credential_placeholders: std::collections::BTreeMap<String, String>,
 }
 
 /// Versioned host CPU compatibility contract for a live checkpoint.

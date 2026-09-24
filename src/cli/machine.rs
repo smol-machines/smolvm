@@ -3996,8 +3996,31 @@ impl CreateCmd {
             None => None,
         };
         let params = vm_common::CreateVmParams {
-            credential_policy: None,
-            credential_placeholders: Default::default(),
+            // A checkpoint carries its credential bindings and the exact
+            // placeholders the captured workload holds; `build_vm_record`
+            // keeps pre-minted placeholders rather than minting fresh ones,
+            // so the workload's copies stay valid. Restore-side validation of
+            // the untrusted policy happens in `build_vm_record`'s
+            // `prepare_policy` only when minting, so validate here too.
+            credential_policy: match checkpoint_network
+                .and_then(|captured| captured.credential_policy.clone())
+            {
+                Some(policy) => {
+                    policy
+                        .validate(dns_filter_hosts.as_deref())
+                        .map_err(|error| {
+                            smolvm::Error::config(
+                                "create from .smolmachine credentials",
+                                error.to_string(),
+                            )
+                        })?;
+                    Some(policy)
+                }
+                None => None,
+            },
+            credential_placeholders: checkpoint_network
+                .map(|captured| captured.credential_placeholders.clone())
+                .unwrap_or_default(),
             disks: parse_attached_disks(&self.disk)?,
             nested_virt: self.nested_virt,
             secret_refs: manifest.secret_refs,
