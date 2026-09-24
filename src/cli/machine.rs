@@ -3879,6 +3879,15 @@ impl CreateCmd {
                 || self.storage.is_some()
                 || self.overlay.is_some()
                 || !self.disk.is_empty();
+            // The captured workload holds the checkpoint's placeholders; a new
+            // binding would mint ones it never received.
+            if !self.credential.is_empty() {
+                return Err(smolvm::Error::config(
+                    "create from .smolcheckpoint",
+                    "a live checkpoint keeps the credential bindings it was captured with; \
+                     --credential applies only to a machine created from an image or a pack",
+                ));
+            }
             if topology_overridden {
                 return Err(smolvm::Error::config(
                     "create from .smolcheckpoint",
@@ -4013,7 +4022,7 @@ impl CreateCmd {
             Some(checkpoint) => smolvm::portable_checkpoint::restored_guest_subnet(checkpoint)?,
             None => None,
         };
-        let params = vm_common::CreateVmParams {
+        let mut params = vm_common::CreateVmParams {
             // A checkpoint carries its credential bindings and the exact
             // placeholders the captured workload holds; `build_vm_record`
             // keeps pre-minted placeholders rather than minting fresh ones,
@@ -4150,6 +4159,7 @@ impl CreateCmd {
                     .is_some_and(|checkpoint| checkpoint.packed_layers.is_some()))
             .then_some(canonical_path),
         };
+        merge_cli_credentials(&mut params, &self.credential)?;
 
         let resources = VmResources {
             cpus: params.cpus,
