@@ -2751,6 +2751,9 @@ fn prepare_clone_from_snapshot(
         clone_rec.state = crate::config::RecordState::Created;
         clone_rec.pid = None;
         clone_rec.pid_start_time = None;
+        // The clone is a new machine: report when it was created, not when its
+        // source was, so age-based cleanup never mistakes it for an old one.
+        clone_rec.created_at = crate::util::current_timestamp();
         if !spec.fork_env.is_empty() {
             clone_rec
                 .env
