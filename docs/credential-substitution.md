@@ -90,6 +90,8 @@ path, and expects the raw value back. See `crates/smolvm-credentials`.
   for `start`, `exec`, `run` and `shell`. Placeholders are minted once at
   create and stay stable for the machine's lifetime.
 - `/run/smol/credentials/ca.pem`: the machine's public CA, mounted read-only.
+  It is name-constrained to the policy's `allowed_hosts`, so clients reject
+  any certificate it signs for another domain.
   Nothing else in that directory.
 - `/run/smolvm/ca-bundle.pem`: the image's own trust roots followed by the
   machine CA, assembled by the guest agent at boot so clients keep trusting

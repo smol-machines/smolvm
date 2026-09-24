@@ -150,7 +150,13 @@ impl CredentialLaunch {
         if MachineCa::exists(&self.ca_dir) {
             return Ok(());
         }
-        MachineCa::generate(&self.ca_owner)
+        let hosts: Vec<String> = self
+            .policy
+            .credentials
+            .iter()
+            .flat_map(|binding| binding.allowed_hosts.iter().cloned())
+            .collect();
+        MachineCa::generate(&self.ca_owner, &hosts)
             .and_then(|ca| ca.save(&self.ca_dir))
             .map_err(|e| Error::config("credentials", format!("machine CA: {e:#}")))
     }

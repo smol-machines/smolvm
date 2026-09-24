@@ -802,7 +802,7 @@ mod tests {
         };
         let placeholders = crate::policy::generate_placeholders(&policy);
         let placeholder = placeholders["svc"].clone();
-        let ca = MachineCa::generate("test-machine").unwrap();
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
         let ca_pem = ca.certificate_pem().to_string();
         let interceptor = Interceptor::spawn(
             InterceptorConfig {

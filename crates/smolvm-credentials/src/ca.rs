@@ -4,12 +4,15 @@
 //! the guest dials. Those leaves are signed by a CA generated for the machine
 //! at create time: the public certificate is the only thing that enters the
 //! guest, and no two machines share a signing key, so one machine's trust
-//! store can never be used to impersonate a host toward another.
+//! store can never be used to impersonate a host toward another. The CA is
+//! name-constrained to the machine's credential hosts, so even its own key
+//! cannot mint a certificate the guest would accept for any other domain.
 
 use anyhow::{Context, Result};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose, NameConstraints,
+    SanType,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::path::Path;
@@ -50,12 +53,24 @@ fn ca_params(machine: &str) -> CertificateParams {
 }
 
 impl MachineCa {
-    /// Generate a fresh CA named after the machine.
-    pub fn generate(machine: &str) -> Result<Self> {
+    /// Generate a fresh CA named after the machine, valid only for
+    /// `permitted_hosts` (and their subdomains): a critical name constraint
+    /// makes clients reject any leaf it signs for another domain.
+    pub fn generate(machine: &str, permitted_hosts: &[String]) -> Result<Self> {
+        anyhow::ensure!(
+            !permitted_hosts.is_empty(),
+            "a machine CA needs at least one permitted host"
+        );
         let key = KeyPair::generate().context("generate CA key")?;
-        let cert = ca_params(machine)
-            .self_signed(&key)
-            .context("self-sign CA")?;
+        let mut params = ca_params(machine);
+        params.name_constraints = Some(NameConstraints {
+            permitted_subtrees: permitted_hosts
+                .iter()
+                .map(|host| GeneralSubtree::DnsName(host.clone()))
+                .collect(),
+            excluded_subtrees: Vec::new(),
+        });
+        let cert = params.self_signed(&key).context("self-sign CA")?;
         Ok(Self {
             cert_pem: cert.pem(),
             cert_der: cert.der().clone(),
@@ -155,7 +170,7 @@ mod tests {
     #[test]
     fn save_load_and_issue_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let ca = MachineCa::generate("demo").unwrap();
+        let ca = MachineCa::generate("demo", &["api.example.com".to_string()]).unwrap();
         ca.save(dir.path()).unwrap();
         assert!(MachineCa::exists(dir.path()));
         assert!(!MachineCa::guest_dir(dir.path()).join(CA_KEY_FILE).exists());
@@ -173,5 +188,39 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn leaves_verify_only_for_the_permitted_hosts() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::client::WebPkiServerVerifier;
+        use rustls_pki_types::{ServerName, UnixTime};
+
+        let ca = MachineCa::generate("demo", &["api.example.com".to_string()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.cert_der.clone()).unwrap();
+        let verifier = WebPkiServerVerifier::builder_with_provider(
+            std::sync::Arc::new(roots),
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let verify = |host: &'static str| {
+            let (chain, _key) = ca.issue_leaf(host).unwrap();
+            verifier.verify_server_cert(
+                &chain[0],
+                &chain[1..],
+                &ServerName::try_from(host).unwrap(),
+                &[],
+                UnixTime::now(),
+            )
+        };
+        verify("api.example.com").expect("the credential host verifies");
+        verify("v2.api.example.com").expect("its subdomains stay inside the constraint");
+        assert!(
+            verify("bank.example.org").is_err(),
+            "the CA key must not be able to vouch for any other domain"
+        );
+        assert!(MachineCa::generate("demo", &[]).is_err());
     }
 }
