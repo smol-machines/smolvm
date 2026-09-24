@@ -40,6 +40,10 @@ const LEASE_PAYLOAD_STAGE_ATTEMPTS: usize = 2;
 // Leave one minute for payload staging, guest release, and the durable commit
 // before the controller's five-minute activating-lease grace period expires.
 const MAX_WORKER_READY_TIMEOUT_SECS: u64 = crate::pool::FORK_LEASE_ACTIVATION_GRACE_SECS - 60;
+/// Longest a lease request may wait for the pool to provide a clean worker.
+const MAX_LEASE_WAIT_SECS: u64 = 10 * 60;
+/// Ceiling for the backoff between claim attempts while waiting for a worker.
+const LEASE_WAIT_MAX_POLL: Duration = Duration::from_millis(500);
 const DEFAULT_WORKER_READY_TIMEOUT_SECS: u64 = MAX_WORKER_READY_TIMEOUT_SECS;
 use crate::agent::fork::WORKER_READY_TIMEOUT_ENV;
 
@@ -78,6 +82,16 @@ fn validate_worker_ready_request(
         )));
     }
     Ok(Some(timeout))
+}
+
+fn validate_lease_wait(wait_secs: Option<u64>) -> Result<Duration, ApiError> {
+    let wait_secs = wait_secs.unwrap_or(0);
+    if wait_secs > MAX_LEASE_WAIT_SECS {
+        return Err(ApiError::BadRequest(format!(
+            "waitSecs must be at most {MAX_LEASE_WAIT_SECS}"
+        )));
+    }
+    Ok(Duration::from_secs(wait_secs))
 }
 
 fn worker_ready_token(pool: &str, idempotency_key: &str) -> String {
@@ -796,6 +810,7 @@ async fn acquire_lease_inner(
     );
     let worker_ready_timeout =
         validate_worker_ready_request(req.await_worker_ready, req.worker_ready_timeout_secs)?;
+    let wait = validate_lease_wait(req.wait_secs)?;
     let mut assignment = crate::util::parse_env_list(&req.env);
     crate::agent::fork::validate_fork_env(&assignment)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -860,30 +875,46 @@ async fn acquire_lease_inner(
         ));
     }
     let ttl = validate_ttl(req.ttl_secs.unwrap_or(pool.lease_ttl_secs))?;
-    let now = crate::util::current_timestamp();
-    let db = state.db().clone();
-    let pool_for_claim = pool_name.clone();
-    let key = req.idempotency_key.clone();
-    let assignment_for_claim = assignment.clone();
-    let payload_for_claim = payload_sha256.clone();
     let require_private_workspace = !files.is_empty();
-    let admission_limit = state.admission().limit(&pool);
-    let claim = tokio::task::spawn_blocking(move || {
-        db.claim_fork_pool_slot(ForkPoolSlotClaim {
-            pool_name: &pool_for_claim,
-            lease_id: &lease_id,
-            idempotency_key: &key,
-            assignment: &assignment_for_claim,
-            payload_sha256: payload_for_claim.as_deref(),
-            require_private_workspace,
-            admission_limit,
-            ttl_secs: ttl,
-            now,
+    let wait_until = tokio::time::Instant::now() + wait;
+    let mut poll = Duration::from_millis(50);
+    let mut admission_limit;
+    let claim = loop {
+        let now = crate::util::current_timestamp();
+        let db = state.db().clone();
+        let pool_for_claim = pool_name.clone();
+        let lease_for_claim = lease_id.clone();
+        let key = req.idempotency_key.clone();
+        let assignment_for_claim = assignment.clone();
+        let payload_for_claim = payload_sha256.clone();
+        admission_limit = state.admission().limit(&pool);
+        let claim = tokio::task::spawn_blocking(move || {
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: &pool_for_claim,
+                lease_id: &lease_for_claim,
+                idempotency_key: &key,
+                assignment: &assignment_for_claim,
+                payload_sha256: payload_for_claim.as_deref(),
+                require_private_workspace,
+                admission_limit,
+                ttl_secs: ttl,
+                now,
+            })
         })
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("pool claim task failed: {e}")))?
-    .map_err(ApiError::database)?;
+        .await
+        .map_err(|e| ApiError::internal(format!("pool claim task failed: {e}")))?
+        .map_err(ApiError::database)?;
+        // An unsuccessful claim commits nothing, so it can simply be retried
+        // (with the same lease id) once the controller has provisioned more
+        // workers.
+        let remaining = wait_until.saturating_duration_since(tokio::time::Instant::now());
+        if !matches!(claim, ClaimForkPoolSlot::NoReadySlot) || remaining.is_zero() {
+            break claim;
+        }
+        state.notify_pool_reconcile();
+        tokio::time::sleep(poll.min(remaining)).await;
+        poll = (poll * 2).min(LEASE_WAIT_MAX_POLL);
+    };
     let lease = match claim {
         ClaimForkPoolSlot::Existing(lease) => {
             if !idempotent_assignment_matches(&lease.assignment, &assignment)
@@ -1237,7 +1268,115 @@ mod tests {
             await_worker_ready: false,
             worker_ready_timeout_secs: None,
             rollout_access: None,
+            wait_secs: None,
         }
+    }
+
+    #[test]
+    fn lease_wait_is_bounded() {
+        assert_eq!(validate_lease_wait(None).unwrap(), Duration::ZERO);
+        assert_eq!(
+            validate_lease_wait(Some(30)).unwrap(),
+            Duration::from_secs(30)
+        );
+        let error = validate_lease_wait(Some(MAX_LEASE_WAIT_SECS + 1)).unwrap_err();
+        assert!(bad_request(error).contains("waitSecs"));
+    }
+
+    fn empty_pool_state() -> (tempfile::TempDir, Arc<ApiState>) {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&directory.path().join("test.db")).unwrap();
+        db.insert_fork_pool_if_not_exists(&crate::pool::ForkPoolRecord {
+            name: "rollouts".into(),
+            golden: "golden".into(),
+            desired_ready: 1,
+            max_active: None,
+            auto_admission: false,
+            cuda_device_ordinal: None,
+            share_weights: true,
+            freeze_source: false,
+            ready_timeout_secs: 30,
+            lease_ttl_secs: 60,
+            created_at: 100,
+            deleting: false,
+        })
+        .unwrap();
+        (directory, Arc::new(ApiState::with_db(db)))
+    }
+
+    #[tokio::test]
+    async fn lease_without_wait_fails_fast_when_no_worker_is_ready() {
+        let (_directory, state) = empty_pool_state();
+        let started = std::time::Instant::now();
+        let error = acquire_lease_inner(state, "rollouts".into(), lease_request("first"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Unavailable(_)), "{error:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn lease_wait_gives_up_after_its_deadline() {
+        let (_directory, state) = empty_pool_state();
+        let started = std::time::Instant::now();
+        let error = acquire_lease_inner(
+            state,
+            "rollouts".into(),
+            AcquireForkLeaseRequest {
+                wait_secs: Some(1),
+                ..lease_request("first")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Unavailable(_)), "{error:?}");
+        assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn lease_wait_claims_a_worker_that_becomes_ready() {
+        let (_directory, state) = empty_pool_state();
+        let db = state.db().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::task::spawn_blocking(move || {
+                let mut vm =
+                    crate::config::VmRecord::new("slot-1".into(), 1, 512, vec![], vec![], false);
+                vm.golden = Some("golden".into());
+                vm.forkpoint_held = true;
+                db.insert_vm("slot-1", &vm).unwrap();
+                assert!(db
+                    .reserve_fork_pool_slot("rollouts", "slot-1", 101)
+                    .unwrap());
+                assert!(db.mark_fork_pool_slot_ready("slot-1", 102).unwrap());
+            })
+            .await
+            .unwrap();
+        });
+        let result = acquire_lease_inner(
+            state.clone(),
+            "rollouts".into(),
+            AcquireForkLeaseRequest {
+                wait_secs: Some(10),
+                ..lease_request("first")
+            },
+        )
+        .await;
+        // The worker has no VM behind it, so activation itself fails; what
+        // matters is that the request waited and claimed the slot.
+        assert!(
+            !matches!(result, Err(ApiError::Unavailable(_))),
+            "lease gave up instead of waiting: {result:?}"
+        );
+        assert_ne!(
+            state
+                .db()
+                .get_fork_pool_slot("slot-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::pool::ForkPoolSlotState::Ready
+        );
     }
 
     #[test]

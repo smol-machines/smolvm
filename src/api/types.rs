@@ -1233,6 +1233,12 @@ pub struct AcquireForkLeaseRequest {
     /// Optional fused-rollout access granted only to this lease's executor and policy.
     #[serde(default)]
     pub rollout_access: Option<RolloutLeaseAccess>,
+    /// Wait up to this many seconds for a clean worker when none is ready,
+    /// instead of failing with 503 right away. Defaults to 0 (no wait). The
+    /// acquisition request can remain open for this duration, so clients must
+    /// use a longer request deadline.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
 }
 
 /// Preferred public name for [`AcquireForkLeaseRequest`].
