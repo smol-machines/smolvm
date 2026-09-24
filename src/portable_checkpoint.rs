@@ -1064,6 +1064,14 @@ impl DeferredRetain {
     }
 }
 
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
 /// [`capture_to_path_with_source_release`], leaving prepared-cache retention
 /// to the caller.
 pub(crate) fn capture_to_path_deferring_retention(
@@ -1275,7 +1283,6 @@ fn capture_with_completion(
         && smolvm_pack::extract::shared_extract_enabled();
     let sparse_capable = cfg!(all(target_os = "linux", target_arch = "x86_64"))
         && options.store_dir.is_none()
-        && !retain
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
     let max_memory_image = max_checkpoint_memory_image(vm.mem, vm.source_smolmachine.is_some())?;
@@ -1372,6 +1379,16 @@ fn capture_with_completion(
         ),
         None => None,
     };
+    // Retention needs the unpacked RAM image the streamed path never writes, so
+    // the stream writes it too: only the pages in use, beside the staging tree
+    // so packing does not pick it up. Sparse, it is a fraction of full RAM.
+    let prepared_memory = temp_dir.path().join("prepared-memory.bin");
+    if let Some(stream) = streamed_memory.as_mut().filter(|_| retain) {
+        match create_private_file(&prepared_memory) {
+            Ok(file) => stream.copy_memory_to(file),
+            Err(error) => tracing::warn!(%error, "streamed checkpoint will not be retained"),
+        }
+    }
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
@@ -1689,6 +1706,14 @@ fn capture_with_completion(
         packer.pack_artifact(output).map(|info| (info, None))
     }
     .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    // A streamed capture is retainable only once its RAM copy is complete.
+    #[cfg(target_os = "linux")]
+    let retain = retain
+        && streamed_memory
+            .as_ref()
+            .is_none_or(|stream| stream.memory_copied());
+    #[cfg(target_os = "linux")]
+    let streamed = streamed_memory.is_some();
     if streamed_memory.is_some() {
         pause.prepared_save = None;
         #[cfg(target_os = "linux")]
@@ -1703,6 +1728,14 @@ fn capture_with_completion(
     if retain {
         let budget = options.prepared_cache_budget_bytes.unwrap_or(0);
         let job = DeferredRetain(Box::new(move |artifact: &Path| {
+            if streamed {
+                if let Err(error) =
+                    std::fs::rename(&prepared_memory, snapshot_dir.join("memory.bin"))
+                {
+                    tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
+                    return;
+                }
+            }
             if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint_with_identity(
                 artifact,
                 &staging_dir,
