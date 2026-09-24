@@ -178,14 +178,16 @@ credential resolver:
 
 ```sh
 smolvm machine create --name worker --net --image alpine:3.20
-smolvm machine start --name worker --egress-interceptor /path/to/interceptor.json
+SMOLVM_INTERCEPTOR_TOKEN="$TOKEN" smolvm machine start --name worker \
+  --egress-interceptor 127.0.0.1:43123
 ```
 
-The JSON file contains `addr` (a loopback socket address such as
-`127.0.0.1:43123`) and `token` (an array of 32 random byte values). Keep it
-private to the host user. The endpoint is passed only to this launch; it is
-not saved in the machine definition. Supply it again after stopping the
-machine. A running machine must be stopped before changing the endpoint.
+The address must be loopback; IPv6 uses `[::1]:43123`. `TOKEN` is the same
+random 32-byte token held by the interceptor, encoded as 64 hexadecimal
+digits. It is read from the host environment, never forwarded to the guest
+or saved in the machine definition. Supply the address and token again after
+stopping the machine. A running machine must be stopped before changing the
+endpoint.
 
 This selects `virtio-net` and redirects every admitted outbound TCP connection,
 including non-HTTPS ports and IPv6, to the service. The machine's egress

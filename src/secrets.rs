@@ -511,6 +511,11 @@ pub fn resolve_refs_to_env_classified(
 pub struct Secret(Zeroizing<String>);
 
 impl Secret {
+    /// Wrap plaintext in a value that redacts debug output and zeroizes on drop.
+    pub fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+
     /// Borrow the plaintext. Each call site is a reviewable point where a
     /// secret crosses a trust boundary.
     pub fn expose(&self) -> &str {

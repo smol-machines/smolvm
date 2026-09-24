@@ -2561,6 +2561,7 @@ impl AgentManager {
             }
         }
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+            .env_remove("SMOLVM_INTERCEPTOR_TOKEN")
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
                 if watch_parent { "1" } else { "0" },
