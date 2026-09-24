@@ -234,8 +234,9 @@ impl ForkPoolController {
                     if recoverable {
                         db.mark_fork_pool_slot_ready(&machine, crate::util::current_timestamp())
                     } else {
-                        db.mark_fork_pool_slot_retiring(
+                        db.mark_fork_pool_slot_retiring_from(
                             &machine,
+                            ForkPoolSlotState::Provisioning,
                             crate::util::current_timestamp(),
                             Some("controller restarted during worker provisioning".into()),
                         )
@@ -448,9 +449,13 @@ impl ForkPoolController {
                 if !valid {
                     let db = self.state.db().clone();
                     let machine = slot.machine_name;
+                    // A lease may have claimed this worker since the slots were
+                    // listed; claiming clears `forkpoint_held`. Only a worker that
+                    // is still ready may be retired here.
                     tokio::task::spawn_blocking(move || {
-                        db.mark_fork_pool_slot_retiring(
+                        db.mark_fork_pool_slot_retiring_from(
                             &machine,
+                            ForkPoolSlotState::Ready,
                             crate::util::current_timestamp(),
                             Some("ready worker is missing, dead, or no longer held".into()),
                         )

@@ -1326,6 +1326,28 @@ impl SmolvmDb {
         )
     }
 
+    /// Retire a worker only while its slot is still in `expected`.
+    ///
+    /// The pool controller decides from a snapshot of slots and VM records. A
+    /// lease can claim a ready worker in between (clearing its
+    /// `forkpoint_held`), so an unconditional retirement would delete a worker
+    /// that was just handed to a client. Returns false when the slot moved on.
+    pub fn mark_fork_pool_slot_retiring_from(
+        &self,
+        machine_name: &str,
+        expected: ForkPoolSlotState,
+        now: u64,
+        error: Option<String>,
+    ) -> Result<bool> {
+        self.update_fork_pool_slot_state(
+            machine_name,
+            expected,
+            ForkPoolSlotState::Retiring,
+            now,
+            error,
+        )
+    }
+
     /// Retire a worker after provisioning, activation, expiry, or cancellation.
     pub fn mark_fork_pool_slot_retiring(
         &self,
@@ -3432,6 +3454,59 @@ mod tests {
             db.list_fork_pool_slots("rollouts").unwrap()[0].state,
             ForkPoolSlotState::Retiring
         );
+    }
+
+    #[test]
+    fn controller_retirement_cannot_take_a_worker_claimed_after_its_snapshot() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        // The controller lists the slot as ready...
+        assert_eq!(
+            db.list_fork_pool_slots("rollouts").unwrap()[0].state,
+            ForkPoolSlotState::Ready
+        );
+        // ...then a lease claims it, which releases the forkpoint...
+        assert!(matches!(
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-1",
+                idempotency_key: "request-1",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap(),
+            ClaimForkPoolSlot::Claimed(_)
+        ));
+        // ...so the controller's VM check now sees a worker that is not held.
+        assert!(!db.get_vm("slot-1").unwrap().unwrap().forkpoint_held);
+
+        assert!(!db
+            .mark_fork_pool_slot_retiring_from("slot-1", ForkPoolSlotState::Ready, 201, None)
+            .unwrap());
+        db.mark_fork_lease_active("lease-1", 202).unwrap();
+        assert_eq!(
+            db.get_fork_pool_slot("slot-1").unwrap().unwrap().state,
+            ForkPoolSlotState::Leased
+        );
+        assert!(db.list_retiring_fork_pool_slots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn controller_retires_a_ready_worker_that_is_still_ready() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        assert!(db
+            .mark_fork_pool_slot_retiring_from("slot-1", ForkPoolSlotState::Ready, 201, None)
+            .unwrap());
+        assert_eq!(db.list_retiring_fork_pool_slots().unwrap().len(), 1);
     }
 
     #[test]
