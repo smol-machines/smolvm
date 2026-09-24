@@ -24,6 +24,28 @@ pub struct FileUploadResponse {
     pub size: u64,
 }
 
+/// The machine's image and the persistent overlay its container runs on.
+///
+/// A fork clone's inherited overlay lives under its golden's id, which is how
+/// exec resolves it (`RunConfig::in_machine`). Keying file ops by the clone's
+/// own name mounted a fresh, empty overlay the running workload never sees, so
+/// uploads to a fork silently vanished and downloads missed the fork's files.
+async fn image_and_overlay_owner(
+    state: &ApiState,
+    id: &str,
+) -> Result<(Option<String>, String), ApiError> {
+    let record = state.lookup_vm(id).await?;
+    let overlay_owner = match &record {
+        Some(record) => crate::workload::persistent_overlay_owner_with_lineage(
+            id,
+            record.golden.as_deref(),
+            record.fork_overlay_owner.as_deref(),
+        ),
+        None => id.to_string(),
+    };
+    Ok((record.and_then(|record| record.image), overlay_owner))
+}
+
 /// Upload a file to a machine.
 ///
 /// Writes the request body as a file at the specified path inside the VM.
@@ -55,13 +77,12 @@ pub async fn upload_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
+    let (machine_image, overlay_id) = image_and_overlay_owner(&state, &id).await?;
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
     let size = body.len() as u64;
 
-    let overlay_id = id.clone();
     with_machine_client_traced(&entry, tid, move |c| {
         // For image machines, mount the per-machine persistent container overlay
         // (same id exec uses) so the file lands INSIDE the container, not the
@@ -120,12 +141,11 @@ pub async fn download_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
+    let (machine_image, overlay_id) = image_and_overlay_owner(&state, &id).await?;
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
 
-    let overlay_id = id.clone();
     let data = with_machine_client_traced(&entry, tid, move |c| {
         // Read from inside the container overlay for image machines (matching
         // upload + exec), not the agent base.
