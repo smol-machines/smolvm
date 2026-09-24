@@ -61,13 +61,22 @@ impl Shim for Service {
         // Best-effort — a missing machine (a container-task delete, or a VM
         // already cleaned by the graceful path) is not an error.
         let id = self.id.clone();
-        let _ = tokio::task::spawn_blocking(move || match smolvm::embedded::runtime() {
-            Ok(rt) => {
-                if let Err(e) = rt.delete_machine(&id) {
-                    warn!("delete_shim: reaping VM {id} failed (may already be gone): {e}");
+        let _ = tokio::task::spawn_blocking(move || {
+            match smolvm::embedded::runtime() {
+                Ok(rt) => {
+                    if let Err(e) = rt.delete_machine(&id) {
+                        warn!("delete_shim: reaping VM {id} failed (may already be gone): {e}");
+                    }
                 }
+                Err(e) => warn!("delete_shim: runtime unavailable, cannot reap VM {id}: {e}"),
             }
-            Err(e) => warn!("delete_shim: runtime unavailable, cannot reap VM {id}: {e}"),
+            // Reap the sandbox's host state root too. This path runs when the
+            // shim is torn down without a graceful sandbox delete, which is
+            // exactly when nothing else will: the VM record is gone after the
+            // reap above, so the startup reconcile cannot key off it either.
+            // Safe when this id names a container rather than a sandbox — there
+            // is simply nothing at the path.
+            crate::engine::reclaim_sandbox_share_root(&id);
         })
         .await;
         Ok(DeleteResponse {
