@@ -5393,6 +5393,13 @@ impl UpdateCmd {
                     changes.push("  cleared dns_filter_hosts".to_string());
                     r.dns_filter_hosts = None;
                 }
+                // virtio-net without networking or published ports is rejected
+                // at launch, so a machine that keeps the backend could never
+                // start again. Published ports still need it.
+                if r.ports.is_empty() && r.network_backend.is_some() {
+                    changes.push("  cleared network backend".to_string());
+                    r.network_backend = None;
+                }
             }
 
             // Env vars

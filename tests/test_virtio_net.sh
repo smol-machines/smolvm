@@ -124,6 +124,43 @@ test_machine_create_start_exec_virtio_net_works() {
     $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
 }
 
+test_machine_update_no_net_clears_virtio_net() {
+    cleanup_machine
+    local vm_name="virtio-update-no-net-test-$$"
+
+    $SMOLVM machine create --name "$vm_name" --image "$VIRTIO_TEST_IMAGE" --net --net-backend virtio-net >/dev/null 2>&1 || {
+        echo "expected virtio-net machine create to succeed"
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+    # Boot once with networking so the image is pulled; a machine without a
+    # network cannot pull it later.
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
+        echo "expected virtio-net machine start to succeed"
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+    $SMOLVM machine update --name "$vm_name" --no-net >/dev/null 2>&1 || {
+        echo "expected machine update --no-net to succeed"
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
+        echo "a virtio-net machine updated with --no-net should start without networking"
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+    local exec_output
+    exec_output=$($SMOLVM machine exec --name "$vm_name" -- sh -c 'ls /sys/class/net' 2>&1)
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    [[ "$exec_output" != *eth0* ]] || {
+        echo "machine updated with --no-net should have no network interface: $exec_output"
+        return 1
+    }
+}
+
 test_machine_run_virtio_net_works() {
     cleanup_machine
     local output
@@ -256,6 +293,7 @@ test_pack_run_virtio_net_works() {
 
 run_test "Machine create: virtio-net works" test_machine_create_virtio_net_works || true
 run_test "Machine create/start/exec: virtio-net guest networking works" test_machine_create_start_exec_virtio_net_works || true
+run_test "Machine update: --no-net clears virtio-net" test_machine_update_no_net_clears_virtio_net || true
 run_test "Machine run: virtio-net guest networking works" test_machine_run_virtio_net_works || true
 run_test "Machine run: virtio-net published TCP ports work" test_machine_run_virtio_net_port_publishing_works || true
 run_test "Machine create: policy needs virtio-net (tsi rejected)" test_machine_create_virtio_net_policy_accepted_tsi_rejected || true
