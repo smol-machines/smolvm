@@ -43,12 +43,38 @@ type RetainedSnapshotMap = Arc<
     parking_lot::Mutex<std::collections::HashMap<String, crate::agent::fork::RetainedForkSnapshot>>,
 >;
 
+/// What one fill attempt produced, for provisioning backoff.
+#[derive(Debug, Default, Clone, Copy)]
+struct FillStats {
+    ready: usize,
+    failed: usize,
+}
+
+/// Longest pause between fills of a pool whose provisioning keeps failing.
+const MAX_FILL_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Delay before the next fill after `consecutive_failures` failed fills: 1s,
+/// 2s, 4s, ... capped at [`MAX_FILL_BACKOFF`]. Without it a pool that can never
+/// boot a worker retried every reconcile tick, ~20 failed VM boots a second.
+fn fill_backoff(consecutive_failures: u32) -> Duration {
+    Duration::from_secs(1u64 << consecutive_failures.min(6)).min(MAX_FILL_BACKOFF)
+}
+
+/// A worker boot that failed restoring the golden's retained checkpoint, i.e.
+/// the checkpoint no longer matches the golden (its RAM backing moved on).
+fn is_stale_checkpoint_failure(detail: &str) -> bool {
+    detail.contains("restore checkpoint from") || detail.contains("cow-map guest memory")
+}
+
 /// Maintains each pool's clean-worker target and reaps finished leases.
 pub struct ForkPoolController {
     state: Arc<ApiState>,
     shutdown_rx: watch::Receiver<bool>,
-    fills: tokio::task::JoinSet<String>,
+    fills: tokio::task::JoinSet<(String, FillStats)>,
     filling: std::collections::HashSet<String>,
+    /// Pools whose last fills all failed: consecutive failures and the earliest
+    /// time to try again.
+    fill_backoff: std::collections::HashMap<String, (u32, tokio::time::Instant)>,
     nvml: Option<crate::api::admission::NvmlSampler>,
     host_cpu: crate::api::admission::HostCpuSampler,
     retained_snapshots: RetainedSnapshotMap,
@@ -85,6 +111,7 @@ impl ForkPoolController {
             shutdown_rx,
             fills: tokio::task::JoinSet::new(),
             filling: std::collections::HashSet::new(),
+            fill_backoff: std::collections::HashMap::new(),
             nvml,
             host_cpu: crate::api::admission::HostCpuSampler::default(),
             retained_snapshots: Arc::new(parking_lot::Mutex::new(retained_snapshots)),
@@ -136,10 +163,22 @@ impl ForkPoolController {
         }
     }
 
-    fn handle_fill_task(&mut self, result: Option<Result<String, tokio::task::JoinError>>) {
+    fn handle_fill_task(
+        &mut self,
+        result: Option<Result<(String, FillStats), tokio::task::JoinError>>,
+    ) {
         match result {
-            Some(Ok(pool_name)) => {
+            Some(Ok((pool_name, stats))) => {
                 self.filling.remove(&pool_name);
+                if stats.ready > 0 {
+                    self.fill_backoff.remove(&pool_name);
+                } else if stats.failed > 0 {
+                    let failures = self.fill_backoff.get(&pool_name).map_or(0, |(n, _)| *n) + 1;
+                    let delay = fill_backoff(failures);
+                    tracing::warn!(pool = %pool_name, failures, ?delay, "fork pool fill failed; backing off");
+                    self.fill_backoff
+                        .insert(pool_name, (failures, tokio::time::Instant::now() + delay));
+                }
             }
             Some(Err(error)) => {
                 tracing::warn!(%error, "fork pool fill task failed");
@@ -275,8 +314,18 @@ impl ForkPoolController {
             }
         }
         self.update_admission(&pools, sample_admission).await?;
+        let now = tokio::time::Instant::now();
+        self.fill_backoff
+            .retain(|name, _| pools.iter().any(|pool| &pool.name == name));
         for pool in pools.into_iter().filter(|pool| !pool.deleting) {
             if self.filling.contains(&pool.name) {
+                continue;
+            }
+            if self
+                .fill_backoff
+                .get(&pool.name)
+                .is_some_and(|(_, until)| now < *until)
+            {
                 continue;
             }
             let db = self.state.db().clone();
@@ -292,8 +341,8 @@ impl ForkPoolController {
                 let boot_slots = self.boot_slots.clone();
                 let pool_name = pool.name.clone();
                 self.fills.spawn(async move {
-                    Self::fill_pool(state, pool, retained_snapshots, boot_slots).await;
-                    pool_name
+                    let stats = Self::fill_pool(state, pool, retained_snapshots, boot_slots).await;
+                    (pool_name, stats)
                 });
             }
         }
@@ -489,7 +538,7 @@ impl ForkPoolController {
         pool: ForkPoolRecord,
         retained_snapshots: RetainedSnapshotMap,
         boot_slots: Arc<tokio::sync::Semaphore>,
-    ) {
+    ) -> FillStats {
         // A golden can produce only one RAM checkpoint at a time. Keep the
         // lifecycle lock through snapshot publication so another pool sharing
         // this golden reads the proven retained checkpoint instead of issuing
@@ -535,9 +584,35 @@ impl ForkPoolController {
             machines.push(machine);
         }
         if machines.is_empty() {
-            return;
+            return FillStats::default();
         }
 
+        // The durable record is authoritative: forking the golden directly
+        // (outside any pool) rebases its RAM and replaces or drops the retained
+        // checkpoint in the DB, which this in-memory copy never hears about.
+        // Provisioning from the stale copy then fails every boot.
+        let golden_for_sync = pool.golden.clone();
+        let db = state.db().clone();
+        match tokio::task::spawn_blocking(move || db.retained_fork_snapshot(&golden_for_sync)).await
+        {
+            Ok(Ok(durable)) => {
+                let mut snapshots = retained_snapshots.lock();
+                match durable {
+                    Some(snapshot) => {
+                        snapshots.insert(pool.golden.clone(), snapshot);
+                    }
+                    None => {
+                        snapshots.remove(&pool.golden);
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(pool = %pool.name, %error, "failed to read retained fork checkpoint")
+            }
+            Err(error) => {
+                tracing::warn!(pool = %pool.name, %error, "retained fork checkpoint task failed")
+            }
+        }
         let retained_snapshot = retained_snapshots.lock().get(&pool.golden).cloned();
         let retained_snapshot_hint = retained_snapshot.clone();
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -558,11 +633,19 @@ impl ForkPoolController {
         );
         let process_results = async {
             let mut completed = std::collections::HashSet::new();
+            let mut stats = FillStats::default();
+            let mut stale_checkpoint = false;
             while let Some((machine, result)) = result_rx.recv().await {
                 completed.insert(machine.clone());
-                Self::finish_provision(&state, &pool, machine, result).await;
+                match Self::finish_provision(&state, &pool, machine, result).await {
+                    None => stats.ready += 1,
+                    Some(detail) => {
+                        stats.failed += 1;
+                        stale_checkpoint |= is_stale_checkpoint_failure(&detail);
+                    }
+                }
             }
-            completed
+            (completed, stats, stale_checkpoint)
         };
         let manage_provision = async {
             tokio::pin!(provision);
@@ -586,7 +669,7 @@ impl ForkPoolController {
             };
             (provision_result, published_early)
         };
-        let ((provision_result, published_early), completed) =
+        let ((provision_result, published_early), (completed, mut stats, stale_checkpoint)) =
             tokio::join!(manage_provision, process_results);
 
         match provision_result {
@@ -605,11 +688,32 @@ impl ForkPoolController {
                 for machine in machines {
                     if !completed.contains(&machine) {
                         record_provision("failed", "batch");
+                        stats.failed += 1;
                         Self::retire_failed_provision(&state, machine, format!("{error:?}")).await;
                     }
                 }
             }
         }
+        if stale_checkpoint {
+            // Forget the checkpoint so the next fill takes a fresh one from the
+            // golden instead of failing on the same stale memory forever.
+            tracing::warn!(pool = %pool.name, golden = %pool.golden, "retained fork checkpoint is stale; discarding it");
+            retained_snapshots.lock().remove(&pool.golden);
+            let db = state.db().clone();
+            let golden = pool.golden.clone();
+            match tokio::task::spawn_blocking(move || db.remove_retained_fork_snapshot(&golden))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(pool = %pool.name, %error, "failed to discard stale fork checkpoint")
+                }
+                Err(error) => {
+                    tracing::warn!(pool = %pool.name, %error, "stale fork checkpoint task failed")
+                }
+            }
+        }
+        stats
     }
 
     async fn finish_provision(
@@ -617,7 +721,7 @@ impl ForkPoolController {
         pool: &ForkPoolRecord,
         machine: String,
         result: Result<crate::api::types::MachineInfo, crate::api::error::ApiError>,
-    ) {
+    ) -> Option<String> {
         let retirement_reason = match result {
             Ok(info) if info.forkpoint_held => {
                 let db = state.db().clone();
@@ -630,7 +734,7 @@ impl ForkPoolController {
                     Ok(Ok(true)) => {
                         record_provision("ready", "none");
                         tracing::info!(pool = %pool.name, machine = %machine, "fork pool worker ready");
-                        return;
+                        return None;
                     }
                     Ok(Ok(false)) => {
                         record_provision("failed", "pool_changed");
@@ -661,7 +765,8 @@ impl ForkPoolController {
                 detail
             }
         };
-        Self::retire_failed_provision(state, machine, retirement_reason).await;
+        Self::retire_failed_provision(state, machine, retirement_reason.clone()).await;
+        Some(retirement_reason)
     }
 
     async fn retire_failed_provision(state: &Arc<ApiState>, machine: String, message: String) {
@@ -706,6 +811,23 @@ fn retain_existing_checkpoint_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_backoff_grows_and_caps() {
+        assert_eq!(fill_backoff(1), Duration::from_secs(2));
+        assert_eq!(fill_backoff(3), Duration::from_secs(8));
+        assert_eq!(fill_backoff(50), MAX_FILL_BACKOFF);
+    }
+
+    #[test]
+    fn stale_checkpoint_failures_are_recognized() {
+        assert!(is_stale_checkpoint_failure(
+            "failed to boot clone: ... libkrun detail: restore checkpoint from /x/s/1: cow-map guest memory: open /proc/1/fd/9: No such device or address"
+        ));
+        assert!(!is_stale_checkpoint_failure(
+            "fork memory admission: not enough headroom"
+        ));
+    }
     use std::path::PathBuf;
 
     fn snapshot(id: &str, pid: i32) -> crate::agent::fork::RetainedForkSnapshot {
