@@ -225,6 +225,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     if features.cuda_fork_pool_size.is_none() {
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
     }
+    // Credential bindings are part of the launch too: without them the guest's
+    // placeholders go out unsubstituted, and a paused machine's snapshot — which
+    // holds the credential CA's virtio-fs device — can no longer be restored.
+    if features.credentials.is_none() {
+        features.credentials =
+            crate::credentials::CredentialLaunch::for_record(&record.name, record);
+    }
     if features.cuda_vram_limit_mib.is_none() {
         features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     }
