@@ -1,4 +1,4 @@
-name: Build libkrun (linux, glibc 2.35)
+name: Build libkrun
 
 # Rebuild the bundled linux libkrun.so on ubuntu-22.04 so its glibc floor is
 # 2.35 — the same floor the release binaries get (they also build on 22.04, see
@@ -22,6 +22,39 @@ on:
         default: false
 
 jobs:
+  macos-libkrun:
+    name: libkrun macos-aarch64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: |
+          brew trust --tap libkrun/krun
+          brew tap libkrun/krun
+          brew install virglrenderer llvm lld xz
+
+      - name: Build libkrun (BLK=1 NET=1 GPU=1)
+        run: |
+          make -C libkrun BLK=1 NET=1 GPU=1
+          cp libkrun/target/release/libkrun.dylib lib/libkrun.dylib
+          ./scripts/stamp-libkrun-provenance.sh lib --skip-libkrunfw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-macos-aarch64
+          path: |
+            lib/libkrun.dylib
+            lib/libkrun.provenance
+          if-no-files-found: error
+
   build:
     name: libkrun ${{ matrix.arch }}
     strategy:
