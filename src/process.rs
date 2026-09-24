@@ -768,6 +768,11 @@ fn build_seccomp_program(
         libc::SYS_listen, libc::SYS_accept, libc::SYS_sendto, libc::SYS_recvfrom,
         libc::SYS_sendmsg, libc::SYS_sendmmsg, libc::SYS_recvmsg, libc::SYS_setsockopt,
         libc::SYS_getsockopt, libc::SYS_shutdown,
+        // The credential interceptor runs in this process beside the network
+        // stack, and hyper writes HTTP responses to the guest with vectored
+        // writes. Without writev every intercepted HTTPS flow SIGSYS-kills the
+        // VMM under `enforce` (syscall 20 on x86_64).
+        libc::SYS_writev,
         // threads & synchronization (vCPU/worker threads, render-thread priority)
         libc::SYS_clone, libc::SYS_clone3, libc::SYS_futex, libc::SYS_set_robust_list,
         libc::SYS_set_tid_address, libc::SYS_rseq, libc::SYS_sched_yield,
@@ -3745,6 +3750,47 @@ mod tests {
             assert!(
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
                 "child should run both syscalls and exit cleanly, status={status:#x}"
+            );
+        }
+    }
+
+    /// The credential interceptor's HTTP server writes to the guest with writev;
+    /// a filter without it kills the VMM on the first intercepted request.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_allows_vectored_writes() {
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let data = *b"ok";
+                let iov = libc::iovec {
+                    iov_base: data.as_ptr() as *mut libc::c_void,
+                    iov_len: data.len(),
+                };
+                let written = libc::syscall(libc::SYS_writev, fds[1], &iov, 1);
+                libc::_exit(if written == 2 { 0 } else { 3 });
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            assert!(
+                !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS),
+                "writev must not be killed by the filter"
+            );
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "child should write through writev and exit cleanly, status={status:#x}"
             );
         }
     }
