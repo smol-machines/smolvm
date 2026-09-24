@@ -1557,12 +1557,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
                         let token = peek_clone_token(stream.as_raw_fd()).unwrap_or(0);
                         (*pid, token, stream.as_raw_fd())
                     });
-                    (
-                        ram.map(|(_, regions)| regions),
-                        rdir,
-                        policy,
-                        golden_connection,
-                    )
+                    (ram, rdir, policy, golden_connection)
                 };
                 #[cfg(not(unix))]
                 let (guest_ram, ring_dir, policy, golden_connection) =
@@ -1585,13 +1580,13 @@ pub fn run(sock: &Path) -> io::Result<()> {
 /// Serve one accepted connection on its own thread with a fresh backend, counting
 /// it against `active` for the idle watchdog. Generic over the stream type so the
 /// local UDS listener and the optional TCP listener share one path.
-/// `guest_ram`: daemon-local mappings of the VM's guest RAM (from the RAM
-/// preamble) — installing them enables the ring transport + zero-copy GPA
-/// memcpys for this connection.
+/// `guest_ram`: the VM's pid and guest-RAM regions (from the RAM preamble) —
+/// installing them lets GPA memcpys reach guest RAM directly through
+/// `/proc/<pid>/mem` instead of the socket copy.
 fn spawn_serve<S>(
     stream: S,
     active: &Arc<AtomicUsize>,
-    guest_ram: Option<Vec<(u64, u64, u64)>>,
+    guest_ram: Option<GuestRamAdvert>,
     ring_dir: Option<String>,
     options: ServeOptions,
     #[cfg(unix)] golden_connection: Option<(u32, u64, std::os::unix::io::RawFd)>,
@@ -1610,12 +1605,11 @@ fn spawn_serve<S>(
             #[cfg(unix)]
             let _golden_guard = golden_guard;
             let mut backend = make_backend();
-            if let Some(regions) = guest_ram {
-                tracing::info!(
-                    count = regions.len(),
-                    "guest-RAM mapped: zero-copy + rings enabled"
-                );
-                backend.set_guest_ram(regions);
+            if let Some((pid, regions)) = guest_ram {
+                let count = regions.len();
+                if backend.set_guest_ram_procmem(pid, regions) {
+                    tracing::info!(pid, count, "guest-RAM reachable via /proc/<pid>/mem");
+                }
             }
             smolvm_cuda::host::ring_dir_set(ring_dir);
             if let Err(e) = serve_with_options(stream, backend.as_mut(), options) {
@@ -1770,12 +1764,6 @@ fn consume_procmem_preamble(fd: std::os::unix::io::RawFd) -> Option<ProcMemAdver
     Some((pid, regions))
 }
 
-/// Consume a guest-RAM advertisement preamble if present (peek-based; absent on
-/// old proxies and non-memfd VMs). Maps the advertised regions of
-/// `/proc/<pid>/fd/<memfd>` MAP_SHARED into THIS process and returns them as
-/// `(gpa, daemon_va, len)` for `Backend::set_guest_ram`. Mappings are leaked
-/// (VM-lifetime; bounded by connections-with-adverts). Same-uid access only —
-/// exactly the trust boundary the daemon already has with its VMs.
 /// Consume a ring-dir advertisement (`SMVRDIR1` + u16 len + host path) if
 /// present. Returns the HOST directory backing the VM's dax ring mount, which
 /// `RingSetupFile` on this connection resolves file names against.
@@ -1830,6 +1818,11 @@ fn consume_ring_dir_preamble(fd: std::os::unix::io::RawFd) -> Option<String> {
     String::from_utf8(buf[10..].to_vec()).ok()
 }
 
+/// Consume a guest-RAM advertisement preamble if present (peek-based; absent on
+/// old proxies and non-memfd VMs, i.e. anything not started branchable).
+/// Returns the VM's pid and its regions as `(gpa, host_va_in_vm, len)` for
+/// `Backend::set_guest_ram_procmem`. Same-uid access only — exactly the trust
+/// boundary the daemon already has with its VMs.
 #[cfg(unix)]
 fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<GuestRamAdvert> {
     let mut hdr = [0u8; 20];
@@ -1879,10 +1872,16 @@ fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<GuestRamAdvert> 
         }
         got += r as usize;
     }
-    // One memfd PER REGION (libkrun's layout): open each via /proc and map
-    // MAP_SHARED at the advertised offset.
-    let mut files: std::collections::HashMap<u32, std::fs::File> = std::collections::HashMap::new();
-    let mut regions = Vec::with_capacity(count);
+    // Resolve each region to the VM process's OWN host address instead of
+    // mapping its memfd here. The connection is then served through
+    // /proc/<pid>/mem (the transport clones use), so the daemon never holds a
+    // writable shared mapping of the golden's guest RAM. Such a mapping makes
+    // the first fork fail: libkrun rebases the golden's RAM to private views
+    // and seals the memfd with F_SEAL_WRITE, which the kernel refuses (EBUSY)
+    // while any other process maps it shared-writable. /proc/<pid>/mem also
+    // keeps following the golden's live pages after that rebase, where a
+    // shared view of the now-sealed file would go stale.
+    let mut entries = Vec::with_capacity(count);
     for i in 0..count {
         let o = 20 + i * 28;
         let gpa = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
@@ -1892,38 +1891,63 @@ fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<GuestRamAdvert> 
         if len == 0 || off % 4096 != 0 {
             return None;
         }
-        use std::os::unix::io::AsRawFd as _;
-        let file = match files.entry(fd_no) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(v) => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(format!("/proc/{pid}/fd/{fd_no}"))
-                    .ok()?;
-                v.insert(f)
-            }
-        };
-        // SAFETY: MAP_SHARED of the VM's guest-RAM memfd at the advertised
-        // offset; failure aborts the whole advert. Mappings are leaked
-        // (VM-lifetime; bounded by connections that advertise).
-        let va = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                off as i64,
-            )
-        };
-        if va == libc::MAP_FAILED {
-            tracing::warn!(pid, fd_no, off, len, "guest-RAM mmap failed; sockets only");
+        entries.push((gpa, fd_no, off, len));
+    }
+    let regions = match resolve_guest_ram_hvas(pid, &entries) {
+        Ok(regions) => regions,
+        Err(error) => {
+            tracing::warn!(pid, %error, "guest-RAM advert unresolvable; sockets only");
             return None;
         }
-        regions.push((gpa, va as u64, len));
-    }
+    };
     Some((pid, regions))
+}
+
+/// Map each advertised `(gpa, memfd fd number, file offset, len)` region to
+/// `(gpa, host_va, len)` in the VM process `pid`, from the VMA of `/proc/<pid>/maps`
+/// that maps that memfd at that offset. libkrun maps each region with one
+/// linear mmap (DAX windows are later overlaid inside it), so any memfd VMA
+/// covering the region's start offset fixes the region's base address.
+#[cfg(unix)]
+fn resolve_guest_ram_hvas(
+    pid: u32,
+    entries: &[(u64, u32, u64, u64)],
+) -> io::Result<Vec<(u64, u64, u64)>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
+    let mut regions = Vec::with_capacity(entries.len());
+    for &(gpa, fd_no, off, len) in entries {
+        let inode = std::fs::metadata(format!("/proc/{pid}/fd/{fd_no}"))?.ino();
+        let hva = memfd_region_hva(&maps, inode, off).ok_or_else(|| {
+            io::Error::other(format!(
+                "no mapping of memfd fd {fd_no} (inode {inode}) at offset {off:#x}"
+            ))
+        })?;
+        regions.push((gpa, hva, len));
+    }
+    Ok(regions)
+}
+
+/// Host address at which the memfd with `inode` maps file offset `off`, from
+/// `/proc/<pid>/maps` text: `start + (off - vma_offset)` for the first VMA of
+/// that inode whose file range contains `off`.
+fn memfd_region_hva(maps: &str, inode: u64, off: u64) -> Option<u64> {
+    maps.lines().find_map(|line| {
+        if !line.contains("memfd:") {
+            return None;
+        }
+        let mut f = line.split_whitespace();
+        let (start, end) = f.next()?.split_once('-')?;
+        let _perms = f.next()?;
+        let vma_off = u64::from_str_radix(f.next()?, 16).ok()?;
+        let _dev = f.next()?;
+        if f.next()?.parse::<u64>().ok()? != inode {
+            return None;
+        }
+        let start = u64::from_str_radix(start, 16).ok()?;
+        let end = u64::from_str_radix(end, 16).ok()?;
+        (off >= vma_off && off - vma_off < end - start).then(|| start + (off - vma_off))
+    })
 }
 
 /// Keeps the daemon's open-connection count accurate: +1 on construction, -1 on
@@ -6104,22 +6128,45 @@ mod mps_tests {
         decode_clone_worker_status, disabled_worker_route, encode_attach_procmem,
         encode_clone_worker_capability, encode_clone_worker_status, fork_snapshot_enabled,
         golden_eviction_enabled, host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
-        live_host_snapshot_count, local_cuda_daemon_socket, map_module_blob_fd, mps_enabled,
-        next_clone_reservation_reexec, ordinary_regions_are_reserved, posix_spawn_clone_worker,
-        prepare_module_blob, prepare_streamed_module_blob, prune_dead_clone_worker_statuses_in,
-        publish_clone_worker_capability, range_is_reserved, read_host_snapshot,
-        reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
-        select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
-        spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
-        tensor_bundle_ttl_from, unique_live_clone_worker, validate_tensor_bundle_metadata,
-        write_module_handoff, CloneWorkerSpawnFds, CloneWorkerStatus, DEFAULT_TENSOR_BUNDLE_TTL,
-        MAX_CLONE_RESERVATION_GRANULARITY, TENSOR_CONSUME_MAGIC,
+        live_host_snapshot_count, local_cuda_daemon_socket, map_module_blob_fd, memfd_region_hva,
+        mps_enabled, next_clone_reservation_reexec, ordinary_regions_are_reserved,
+        posix_spawn_clone_worker, prepare_module_blob, prepare_streamed_module_blob,
+        prune_dead_clone_worker_statuses_in, publish_clone_worker_capability, range_is_reserved,
+        read_host_snapshot, reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream,
+        seal_host_snapshot, select_golden_owner, send_fd, send_tensor_bundle_to_parent,
+        serve_tensor_bundle_consumer, spawn_clone_attach_listener_with_timeout,
+        spawn_tensor_bundle_receiver, tensor_bundle_ttl_from, unique_live_clone_worker,
+        validate_tensor_bundle_metadata, write_module_handoff, CloneWorkerSpawnFds,
+        CloneWorkerStatus, DEFAULT_TENSOR_BUNDLE_TTL, MAX_CLONE_RESERVATION_GRANULARITY,
+        TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    // A guest-RAM region resolves to its base in the VM process even when a DAX
+    // window is overlaid inside it (splitting the memfd VMA), and a region of a
+    // different memfd with the same offsets is not confused for it.
+    #[test]
+    fn memfd_region_hva_finds_the_vm_mapping_of_an_advertised_offset() {
+        let maps = "\
+7f0000000000-7f0010000000 rw-s 00000000 00:01 4242 /memfd:guest-ram (deleted)
+7f0010000000-7f0010200000 rw-s 00000000 00:1c 9 /dax/window
+7f0010200000-7f0020000000 rw-s 10200000 00:01 4242 /memfd:guest-ram (deleted)
+7f0030000000-7f0040000000 rw-s 00000000 00:01 5151 /memfd:guest-ram-hi (deleted)
+55d000000000-55d000001000 r-xp 00000000 08:02 77 /usr/bin/smolvm
+";
+        assert_eq!(memfd_region_hva(maps, 4242, 0), Some(0x7f00_0000_0000));
+        assert_eq!(
+            memfd_region_hva(maps, 4242, 0x1030_0000),
+            Some(0x7f00_1030_0000)
+        );
+        assert_eq!(memfd_region_hva(maps, 5151, 0), Some(0x7f00_3000_0000));
+        assert_eq!(memfd_region_hva(maps, 4242, 0x2000_0000), None);
+        assert_eq!(memfd_region_hva(maps, 9999, 0), None);
+    }
 
     #[test]
     fn daemon_socket_is_private_or_limited_to_the_vmm_group() {
