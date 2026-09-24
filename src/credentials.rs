@@ -94,19 +94,25 @@ pub struct CredentialLaunch {
     /// environment variable of the same name (the `dotenvx run -- smolvm …`
     /// path).
     pub sources: BTreeMap<String, SecretRef>,
+    /// Values come only from [`supply_values`], never from this host's
+    /// environment (bindings that arrived over the HTTP API).
+    #[serde(default)]
+    pub supplied_only: bool,
 }
 
 impl CredentialLaunch {
     /// Describe the launch for a record. `None` when the machine has no
     /// credential policy. Pure: the CA is created by [`Self::ensure_ca`].
     pub fn for_record(machine: &str, record: &VmRecord) -> Option<Self> {
-        Self::from_parts(
+        let mut launch = Self::from_parts(
             machine,
             record.credential_policy.as_ref()?,
             &record.credential_placeholders,
             &record.secret_refs,
             record.golden.as_deref(),
-        )
+        )?;
+        launch.supplied_only = record.credentials_supplied_by_api;
+        Some(launch)
     }
 
     /// Describe a launch from its parts — the ephemeral `machine run` path has
@@ -145,6 +151,7 @@ impl CredentialLaunch {
             ca_owner: ca_owner.to_string(),
             ca_dir,
             sources,
+            supplied_only: false,
         })
     }
 
@@ -191,6 +198,63 @@ impl CredentialLaunch {
             Arc::new(SecretRefResolver(self.sources.clone())),
         )
         .map_err(|e| Error::config("credentials", format!("start interceptor: {e:#}")))
+    }
+}
+
+/// Values handed to this process for its machines' bindings, by machine name
+/// then binding name. Held in memory only: never written to a record, a boot
+/// config or a checkpoint, and gone when the process exits, so whoever supplied
+/// them supplies them again before the next boot.
+type SuppliedValues = BTreeMap<String, zeroize::Zeroizing<String>>;
+
+static SUPPLIED: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, SuppliedValues>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Hold `values` (binding name → value) for `machine`'s next boots, replacing
+/// any held before.
+pub fn supply_values(machine: &str, values: SuppliedValues) {
+    let mut held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
+    if values.is_empty() {
+        held.remove(machine);
+    } else {
+        held.insert(machine.to_string(), values);
+    }
+}
+
+/// Drop whatever was supplied for `machine`.
+pub fn forget_values(machine: &str) {
+    supply_values(machine, BTreeMap::new());
+}
+
+/// Name of the variable carrying a supplied value into the boot process.
+fn supplied_var(index: usize) -> String {
+    format!("SMOLVM_CREDENTIAL_{index}")
+}
+
+impl CredentialLaunch {
+    /// Point bindings at the values supplied for this machine, and return the
+    /// environment the boot process needs for it: `Some(value)` to set,
+    /// `None` to remove. A supplied value travels in a variable private to the
+    /// boot process, so it never lands in the boot config on disk. A
+    /// `supplied_only` binding with no value is pointed at a variable that is
+    /// removed, so it resolves to nothing rather than to a host variable.
+    pub fn child_env(&mut self) -> Vec<(String, Option<zeroize::Zeroizing<String>>)> {
+        let held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
+        let supplied = held.get(&self.machine);
+        let mut env = Vec::new();
+        for (index, binding) in self.policy.credentials.iter().enumerate() {
+            let value = supplied
+                .and_then(|values| values.get(&binding.name))
+                .cloned();
+            if value.is_none() && !self.supplied_only {
+                continue;
+            }
+            let var = supplied_var(index);
+            self.sources
+                .insert(binding.name.clone(), crate::secrets::env_ref(var.clone()));
+            env.push((var, value));
+        }
+        env
     }
 }
 
@@ -252,6 +316,75 @@ mod tests {
         assert_eq!(b.allowed_hosts, vec!["api.notion.com", "files.notion.com"]);
         assert!(parse_credential_flag("notion=NOTION_API_KEY").is_err());
         assert!(parse_credential_flag("=X@h").is_err());
+    }
+
+    fn launch(machine: &str, supplied_only: bool) -> CredentialLaunch {
+        let policy = CredentialPolicy {
+            credentials: vec![
+                parse_credential_flag("a=A_KEY@api.a.com").unwrap(),
+                parse_credential_flag("b=B_KEY@api.b.com").unwrap(),
+            ],
+        };
+        let mut launch = CredentialLaunch::from_parts(
+            machine,
+            &policy,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        launch.supplied_only = supplied_only;
+        launch
+    }
+
+    #[test]
+    fn supplied_values_reach_only_the_boot_process() {
+        let machine = "cred-test-supplied";
+        supply_values(
+            machine,
+            [(
+                "a".to_string(),
+                zeroize::Zeroizing::new("value-a".to_string()),
+            )]
+            .into(),
+        );
+        let mut l = launch(machine, false);
+        let env = l.child_env();
+        // The supplied binding moves to a private variable carrying its value.
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "SMOLVM_CREDENTIAL_0");
+        assert_eq!(env[0].1.as_deref().map(String::as_str), Some("value-a"));
+        assert_eq!(
+            l.sources["a"].from_env.as_deref(),
+            Some("SMOLVM_CREDENTIAL_0")
+        );
+        // An unsupplied binding of a local machine keeps its host variable.
+        assert_eq!(l.sources["b"].from_env.as_deref(), Some("B_KEY"));
+        // The launch, as written to the boot config, names but never holds it.
+        assert!(!serde_json::to_string(&l).unwrap().contains("value-a"));
+        forget_values(machine);
+        assert!(launch(machine, false).child_env().is_empty());
+    }
+
+    #[test]
+    fn api_bindings_never_fall_back_to_host_variables() {
+        let machine = "cred-test-api";
+        forget_values(machine);
+        let mut l = launch(machine, true);
+        let env = l.child_env();
+        // Nothing supplied: both bindings point at variables that are removed.
+        assert_eq!(env.len(), 2);
+        assert!(env
+            .iter()
+            .all(|(var, value)| var.starts_with("SMOLVM_CREDENTIAL_") && value.is_none()));
+        assert_eq!(
+            l.sources["a"].from_env.as_deref(),
+            Some("SMOLVM_CREDENTIAL_0")
+        );
+        assert_eq!(
+            l.sources["b"].from_env.as_deref(),
+            Some("SMOLVM_CREDENTIAL_1")
+        );
     }
 
     #[test]

@@ -42,10 +42,10 @@ use crate::api::state::{
     ReservationGuard,
 };
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, EgressEventsResponse,
-    ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse,
-    MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec,
-    StartMachineQuery,
+    ApiErrorResponse, CreateMachineRequest, CredentialValuesRequest, DeleteQuery, DeleteResponse,
+    EgressEventsResponse, ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest,
+    ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
+    ResourceSpec, StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -2377,7 +2377,12 @@ async fn create_machine_inner(
         block_io: req.block_io,
         allowed_cidrs: normalized_cidrs,
         allowed_hosts: restored_allowed_hosts,
-        credentials: req.credentials.clone(),
+        // A restored checkpoint keeps the bindings its workload was captured
+        // with unless the request names its own.
+        credentials: req
+            .credentials
+            .clone()
+            .or_else(|| checkpoint_network.and_then(|network| network.credential_policy.clone())),
         network_backend: restored_network_backend,
         // A restored guest already has its captured address in memory, so the
         // checkpoint's subnet wins over anything requested.
@@ -2480,6 +2485,10 @@ async fn create_machine_inner(
             let mut s = manifest_secret_refs;
             s.extend(req.secrets.clone());
             s
+        },
+        credential_placeholders: match (&req.credentials, checkpoint_network) {
+            (None, Some(network)) => network.credential_placeholders.clone(),
+            _ => Default::default(),
         },
     });
     if let Err(e) = complete_result {
@@ -4530,7 +4539,52 @@ async fn delete_one_transaction(
         }
     }
 
+    crate::credentials::forget_values(&name);
     Ok(DeleteResponse { deleted: name })
+}
+
+/// Supply the values for a machine's credential bindings.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/credential-values",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = CredentialValuesRequest,
+    responses(
+        (status = 204, description = "Values held for the machine's next boot"),
+        (status = 400, description = "A value names no binding of the machine", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+    )
+)]
+pub async fn put_credential_values(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CredentialValuesRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let bindings: Vec<&str> = record
+        .credential_policy
+        .iter()
+        .flat_map(|policy| policy.credentials.iter().map(|b| b.name.as_str()))
+        .collect();
+    if let Some(unknown) = req.values.keys().find(|k| !bindings.contains(&k.as_str())) {
+        return Err(ApiError::BadRequest(format!(
+            "machine '{name}' has no credential binding '{unknown}'"
+        )));
+    }
+    crate::credentials::supply_values(
+        &name,
+        req.values
+            .into_iter()
+            .map(|(k, v)| (k, zeroize::Zeroizing::new(v)))
+            .collect(),
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Resize a machine's disk resources.

@@ -2402,6 +2402,14 @@ impl AgentManager {
             None
         };
 
+        // Supplied credential values ride in the boot process's own
+        // environment, never in the boot config written below.
+        let credential_env = features
+            .credentials
+            .as_mut()
+            .map(|launch| launch.child_env())
+            .unwrap_or_default();
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -2539,6 +2547,12 @@ impl AgentManager {
                     cmd.env(var, joined);
                 }
             }
+        }
+        for (var, value) in &credential_env {
+            match value {
+                Some(value) => cmd.env(var, value.as_str()),
+                None => cmd.env_remove(var),
+            };
         }
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])
             .env(

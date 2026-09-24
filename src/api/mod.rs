@@ -103,6 +103,7 @@ use state::ApiState;
         handlers::machines::sync_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
+        handlers::machines::put_credential_values,
         handlers::machines::export_machine,
         // Pools
         handlers::pools::create_pool,
@@ -140,6 +141,7 @@ use state::ApiState;
         types::DeleteQuery,
         types::LogsQuery,
         types::ResizeMachineRequest,
+        types::CredentialValuesRequest,
         types::ForkRequest,
         types::ForkReleaseRequest,
         types::ExportRequest,
@@ -295,6 +297,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/resume", post(handlers::machines::resume_machine))
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
+        .route(
+            "/{id}/credential-values",
+            put(handlers::machines::put_credential_values),
+        )
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
         // File I/O routes. The upload handler buffers the whole body (`body:

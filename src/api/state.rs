@@ -216,6 +216,9 @@ pub struct MachineRegistration {
     /// Secret refs to attach to this machine (from a Smolfile or
     /// `CreateMachineRequest.secrets`).
     pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
+    /// Placeholders a restored checkpoint's workload already holds for its
+    /// credential bindings. Empty mints fresh ones.
+    pub credential_placeholders: std::collections::BTreeMap<String, String>,
 }
 
 /// RAII guard for machine name reservation.
@@ -1059,11 +1062,18 @@ impl ApiState {
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
         if let Some(policy) = reg.resources.credentials.clone().filter(|p| !p.is_empty()) {
-            record.credential_placeholders = crate::credentials::prepare_policy(
-                &policy,
-                reg.resources.allowed_hosts.as_deref(),
-            )?;
+            record.credential_placeholders = if reg.credential_placeholders.is_empty() {
+                crate::credentials::prepare_policy(&policy, reg.resources.allowed_hosts.as_deref())?
+            } else {
+                policy
+                    .validate(reg.resources.allowed_hosts.as_deref())
+                    .map_err(|e| ApiError::BadRequest(format!("credentials: {e}")))?;
+                reg.credential_placeholders.clone()
+            };
             record.credential_policy = Some(policy);
+            // Bindings from an API caller are never resolved from this host's
+            // environment; their values arrive over the API.
+            record.credentials_supplied_by_api = true;
         }
         record.network_backend = reg.resources.network_backend;
         record.guest_subnet = reg.resources.guest_subnet.clone();

@@ -992,6 +992,22 @@ pub struct StartMachineRequest {
     pub registry_auth: Option<RegistryAuthSpec>,
 }
 
+/// Values for a machine's credential bindings, by binding name.
+///
+/// Held in the server's memory only — never written to the machine record,
+/// a checkpoint or disk — and applied at the machine's next boot (start,
+/// resume or restore). A server restart forgets them, so supply them again
+/// before each start. A machine whose bindings came in over this API resolves
+/// them from here and nowhere else.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialValuesRequest {
+    /// Binding name → value. Replaces whatever was supplied before; empty
+    /// clears it.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
 /// Request to branch a running, branchable source machine into a new child.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

@@ -613,6 +613,13 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub credential_placeholders: std::collections::BTreeMap<String, String>,
 
+    /// The credential bindings came in over the HTTP API, so their values come
+    /// only from that API (`PUT /machines/{name}/credential-values`) and never
+    /// from this host's environment: an API caller must not be able to route a
+    /// host variable to a host of its choosing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credentials_supplied_by_api: bool,
+
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
     pub ephemeral: bool,
@@ -802,6 +809,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             credential_policy: None,
             credential_placeholders: std::collections::BTreeMap::new(),
+            credentials_supplied_by_api: false,
             ephemeral: false,
             source_smolmachine: None,
             source_registry_ref: None,
@@ -882,6 +890,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             credential_policy: None,
             credential_placeholders: std::collections::BTreeMap::new(),
+            credentials_supplied_by_api: false,
             ephemeral: false,
             source_smolmachine: None,
             source_registry_ref: None,
