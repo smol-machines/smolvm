@@ -332,9 +332,32 @@ impl SmolvmDb {
     /// or `~/.local/share/smolvm/server/smolvm.db` (Linux)
     ///
     /// If the database doesn't exist, it will be created and initialized.
+    ///
+    /// Every call in one process returns the same handle (writer connection and
+    /// reader pool). Each separate handle is another SQLite writer: in the
+    /// server, per-machine paths (state probes, launch preparation, runtime
+    /// cleanup) opened thousands per burst of pool activity, and their writes
+    /// raced the server's own, failing deferred read-then-write transactions
+    /// with SQLITE_BUSY. `open_at` still returns a fresh handle.
     pub fn open() -> Result<Self> {
-        let path = Self::default_path()?;
-        Self::open_at(&path)
+        Self::open_shared(&Self::default_path()?)
+    }
+
+    /// The process-wide handle for `path`, opened on first use. A forked child
+    /// never reuses its parent's connections: the entry records its owner pid.
+    fn open_shared(path: &Path) -> Result<Self> {
+        static SHARED: std::sync::OnceLock<Mutex<HashMap<PathBuf, (u32, SmolvmDb)>>> =
+            std::sync::OnceLock::new();
+        let pid = std::process::id();
+        let mut shared = SHARED.get_or_init(Default::default).lock();
+        if let Some((owner, db)) = shared.get(path) {
+            if *owner == pid {
+                return Ok(db.clone());
+            }
+        }
+        let db = Self::open_at(path)?;
+        shared.insert(path.to_path_buf(), (pid, db.clone()));
+        Ok(db)
     }
 
     /// Open the database at a specific path. Parent directories are created if
@@ -2708,6 +2731,21 @@ mod tests {
 
         let vms = db.list_vms().unwrap();
         assert_eq!(vms.len(), 2);
+    }
+
+    #[test]
+    fn open_shares_one_handle_per_path_within_a_process() {
+        let dir = TempDir::new().unwrap();
+        let first = SmolvmDb::open_shared(&dir.path().join("test.db")).unwrap();
+        let second = SmolvmDb::open_shared(&dir.path().join("test.db")).unwrap();
+        assert!(Arc::ptr_eq(&first.writer, &second.writer));
+        assert!(Arc::ptr_eq(&first.readers, &second.readers));
+
+        let other = SmolvmDb::open_shared(&dir.path().join("other.db")).unwrap();
+        assert!(!Arc::ptr_eq(&first.writer, &other.writer));
+        // open_at stays a separate handle (tests rely on real second connections).
+        let separate = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        assert!(!Arc::ptr_eq(&first.writer, &separate.writer));
     }
 
     #[test]
