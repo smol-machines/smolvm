@@ -2971,7 +2971,6 @@ impl ExecCmd {
 
         // Load machine record for workdir and image info
         let name = self.name.clone().unwrap_or_else(|| "default".to_string());
-        // Intent: plans/2026-09-19-machine-exec-record-errors.md.
         // A database failure is not an instruction to execute in the bare VM.
         let record = smolvm::db::SmolvmDb::open()?.get_vm(&name)?;
 
