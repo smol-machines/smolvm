@@ -607,6 +607,12 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_policy: Option<smolvm_protocol::CredentialPolicy>,
 
+    /// A host interceptor was bound to this machine. Future boots must supply
+    /// an interceptor again; the token and endpoint remain launch-scoped and
+    /// are never written to the machine record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external_interceptor_required: bool,
+
     /// Binding name → placeholder handed to the guest in the bound variable.
     /// Minted once at create and kept stable so processes captured in a
     /// checkpoint or fork keep working after restore.
@@ -801,6 +807,7 @@ impl VmRecord {
             docker_socket: false,
             dns_filter_hosts: None,
             credential_policy: None,
+            external_interceptor_required: false,
             credential_placeholders: std::collections::BTreeMap::new(),
             ephemeral: false,
             source_smolmachine: None,
@@ -881,6 +888,7 @@ impl VmRecord {
             docker_socket: false,
             dns_filter_hosts: None,
             credential_policy: None,
+            external_interceptor_required: false,
             credential_placeholders: std::collections::BTreeMap::new(),
             ephemeral: false,
             source_smolmachine: None,
@@ -1216,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_vm_record_serialization() {
-        let record = VmRecord::new(
+        let mut record = VmRecord::new(
             "test".to_string(),
             2,
             512,
@@ -1229,6 +1237,12 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, record.name);
         assert_eq!(deserialized.mounts, record.mounts);
+        assert!(!deserialized.external_interceptor_required);
+
+        record.external_interceptor_required = true;
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.external_interceptor_required);
     }
 
     #[test]

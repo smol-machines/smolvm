@@ -820,6 +820,37 @@ pub struct AgentManager {
     inner: Arc<Mutex<AgentInner>>,
 }
 
+/// Apply the persistent fail-closed policy before spawning a named VM. Every
+/// launch path funnels through `start_via_subprocess`, including API restarts.
+fn reject_missing_external_interceptor(
+    record: &crate::config::VmRecord,
+    endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
+) -> Result<()> {
+    if record.external_interceptor_required && endpoint.is_none() {
+        return Err(Error::config(
+            "egress interceptor",
+            "this machine requires an external interceptor on every start; pass --egress-interceptor and set SMOLVM_INTERCEPTOR_TOKEN",
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_external_interceptor_requirement(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
+) -> Result<()> {
+    if let Some(record) = db.get_vm(name)? {
+        reject_missing_external_interceptor(&record, endpoint)?;
+        if endpoint.is_some() && !record.external_interceptor_required {
+            // Persist before spawning the VMM. If the caller or boot fails,
+            // every later start still requires interception.
+            db.update_vm(name, |record| record.external_interceptor_required = true)?;
+        }
+    }
+    Ok(())
+}
+
 impl AgentManager {
     /// Create a new agent manager with explicit paths (low-level).
     ///
@@ -1659,6 +1690,14 @@ impl AgentManager {
         };
 
         if needs_restart {
+            if let Some(name) = self.name() {
+                if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                    reject_missing_external_interceptor(
+                        &record,
+                        features.external_interceptor.as_ref(),
+                    )?;
+                }
+            }
             tracing::info!("restarting agent VM due to configuration change");
             self.stop()?;
         } else {
@@ -2097,6 +2136,14 @@ impl AgentManager {
                     "external interception does not support checkpoint or branch launches",
                 ));
             }
+        }
+        if let Some(name) = self.name() {
+            let db = crate::db::SmolvmDb::open()?;
+            enforce_external_interceptor_requirement(
+                &db,
+                name,
+                features.external_interceptor.as_ref(),
+            )?;
         }
         if let Some(snapshot) = features.snapshot_dir.as_deref() {
             crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
@@ -2728,6 +2775,14 @@ impl AgentManager {
         };
 
         if needs_restart {
+            if let Some(name) = self.name() {
+                if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                    reject_missing_external_interceptor(
+                        &record,
+                        features.external_interceptor.as_ref(),
+                    )?;
+                }
+            }
             tracing::info!("restarting agent VM due to configuration change");
             self.stop()?;
         } else {
@@ -3558,6 +3613,34 @@ fn boot_failure_reason(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn intercepted_machine_cannot_relaunch_without_an_interceptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&temp.path().join("smolvm.db")).unwrap();
+        let record = crate::config::VmRecord::new("worker".into(), 1, 512, vec![], vec![], true);
+        db.insert_vm("worker", &record).unwrap();
+
+        // Existing records and ordinary machines remain bootable.
+        enforce_external_interceptor_requirement(&db, "worker", None).unwrap();
+        let endpoint = smolvm_protocol::InterceptEndpoint {
+            addr: "127.0.0.1:43123".parse().unwrap(),
+            token: [7; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        assert!(
+            db.get_vm("worker")
+                .unwrap()
+                .unwrap()
+                .external_interceptor_required
+        );
+
+        let error = enforce_external_interceptor_requirement(&db, "worker", None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires an external interceptor"));
+        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+    }
+
     /// A frozen fork base is snapshot-paused, so no shutdown acknowledgement is
     /// ever coming. Waiting for one and then refusing to stop is how such a
     /// machine became unstoppable: `exec` and `start` both told the caller to

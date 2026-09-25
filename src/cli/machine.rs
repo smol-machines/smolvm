@@ -2849,6 +2849,22 @@ mod tests {
             "[::1]:43123",
         ])
         .is_err());
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "monitor",
+            "--name",
+            "worker",
+            "--egress-interceptor",
+            "127.0.0.1:43123",
+        ]);
+        let MachineCmd::Monitor(cmd) = cli.command else {
+            panic!("expected machine monitor command");
+        };
+        assert_eq!(
+            cmd.egress_interceptor,
+            Some("127.0.0.1:43123".parse().unwrap())
+        );
     }
 
     #[test]
@@ -4419,7 +4435,6 @@ pub struct StartCmd {
         env = "SMOLVM_INTERCEPTOR_TOKEN",
         hide = true,
         hide_env_values = true,
-        requires = "egress_interceptor",
         value_parser = clap::builder::StringValueParser::new().map(smolvm::secrets::Secret::new)
     )]
     pub egress_interceptor_token: Option<smolvm::secrets::Secret>,
@@ -4430,25 +4445,10 @@ pub struct StartCmd {
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let external_interceptor = self
-            .egress_interceptor
-            .map(|addr| {
-                let encoded = self.egress_interceptor_token.as_ref().ok_or_else(|| {
-                    smolvm::Error::config(
-                        "egress interceptor",
-                        "set SMOLVM_INTERCEPTOR_TOKEN to 64 random hex digits",
-                    )
-                })?;
-                let mut token = [0; smolvm_protocol::intercept::TOKEN_LEN];
-                if hex::decode_to_slice(encoded.expose(), &mut token).is_err() || token == [0; 32] {
-                    return Err(smolvm::Error::config(
-                        "egress interceptor",
-                        "SMOLVM_INTERCEPTOR_TOKEN must contain 64 hex digits and must not be all zeros",
-                    ));
-                }
-                Ok(smolvm_protocol::InterceptEndpoint { addr, token })
-            })
-            .transpose()?;
+        let external_interceptor = parse_external_interceptor(
+            self.egress_interceptor,
+            self.egress_interceptor_token.as_ref(),
+        )?;
         let explicit_name = self.name.is_some();
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let proxy = self.proxy_opts.resolved_proxy()?;
@@ -4483,6 +4483,29 @@ impl StartCmd {
             Err(e) => Err(e),
         }
     }
+}
+
+fn parse_external_interceptor(
+    addr: Option<std::net::SocketAddr>,
+    token: Option<&smolvm::secrets::Secret>,
+) -> smolvm::Result<Option<smolvm_protocol::InterceptEndpoint>> {
+    addr.map(|addr| {
+        let encoded = token.ok_or_else(|| {
+            smolvm::Error::config(
+                "egress interceptor",
+                "set SMOLVM_INTERCEPTOR_TOKEN to 64 random hex digits",
+            )
+        })?;
+        let mut token = [0; smolvm_protocol::intercept::TOKEN_LEN];
+        if hex::decode_to_slice(encoded.expose(), &mut token).is_err() || token == [0; 32] {
+            return Err(smolvm::Error::config(
+                "egress interceptor",
+                "SMOLVM_INTERCEPTOR_TOKEN must contain 64 hex digits and must not be all zeros",
+            ));
+        }
+        Ok(smolvm_protocol::InterceptEndpoint { addr, token })
+    })
+    .transpose()
 }
 
 // ============================================================================
@@ -5205,6 +5228,10 @@ pub struct UpdateCmd {
     #[arg(long, conflicts_with = "net")]
     pub no_net: bool,
 
+    /// Remove the external egress interceptor requirement from a stopped machine.
+    #[arg(long)]
+    pub no_egress_interceptor: bool,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -5453,6 +5480,10 @@ impl UpdateCmd {
                     changes.push("  cleared dns_filter_hosts".to_string());
                     r.dns_filter_hosts = None;
                 }
+            }
+            if self.no_egress_interceptor && r.external_interceptor_required {
+                r.external_interceptor_required = false;
+                changes.push("  external egress interceptor requirement: removed".to_string());
             }
 
             // Env vars
@@ -6049,6 +6080,20 @@ pub struct MonitorCmd {
     /// Health check failures before triggering restart
     #[arg(long, default_value = "3", value_name = "N")]
     pub health_retries: u32,
+
+    /// Rebind the host egress interceptor on each automatic restart.
+    /// Requires SMOLVM_INTERCEPTOR_TOKEN (64 hex digits).
+    #[arg(long, value_name = "ADDR")]
+    pub egress_interceptor: Option<std::net::SocketAddr>,
+
+    #[arg(
+        long,
+        env = "SMOLVM_INTERCEPTOR_TOKEN",
+        hide = true,
+        hide_env_values = true,
+        value_parser = clap::builder::StringValueParser::new().map(smolvm::secrets::Secret::new)
+    )]
+    pub egress_interceptor_token: Option<smolvm::secrets::Secret>,
 }
 
 impl MonitorCmd {
@@ -6059,6 +6104,10 @@ impl MonitorCmd {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
+        let external_interceptor = parse_external_interceptor(
+            self.egress_interceptor,
+            self.egress_interceptor_token.as_ref(),
+        )?;
         let name = self.name.unwrap_or_else(|| "default".to_string());
 
         // Load machine config from DB
@@ -6066,6 +6115,26 @@ impl MonitorCmd {
         let record = db
             .get_vm(&name)?
             .ok_or_else(|| Error::vm_not_found(&name))?;
+        if let Some(endpoint) = external_interceptor.as_ref() {
+            smolvm::agent::validate_external_interceptor(
+                endpoint,
+                &record.vm_resources(),
+                record.credential_policy.is_some(),
+                false,
+            )?;
+            if record.forkable_on_start() {
+                return Err(Error::config(
+                    "egress interceptor",
+                    "external interception does not support branch launches",
+                ));
+            }
+        }
+        if record.external_interceptor_required && external_interceptor.is_none() {
+            return Err(Error::config(
+                "egress interceptor",
+                "this machine requires an external interceptor on every start; pass --egress-interceptor and set SMOLVM_INTERCEPTOR_TOKEN",
+            ));
+        }
 
         // Build restart config: CLI override > VmRecord config
         let mut restart = record.restart.clone();
@@ -6096,6 +6165,15 @@ impl MonitorCmd {
         let manager = AgentManager::for_vm(&name)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
+        if external_interceptor.is_some()
+            && !record.external_interceptor_required
+            && smolvm::agent::state_probe::resolve_state(&name, &record) == RecordState::Running
+        {
+            return Err(Error::config(
+                "egress interceptor",
+                "the running machine was not started with an external interceptor; stop and start it with --egress-interceptor before monitoring",
+            ));
+        }
         if !manager.is_process_alive() {
             println!("Machine '{}' is not running, starting...", name);
             vm_common::start_vm_named(
@@ -6104,7 +6182,10 @@ impl MonitorCmd {
                 None,
                 /* from_snapshot */ false,
                 vm_common::ForkLaunch::default(),
-                vm_common::StartOptions::default(),
+                vm_common::StartOptions {
+                    external_interceptor,
+                    ..Default::default()
+                },
             )?;
         }
 
@@ -6288,7 +6369,10 @@ impl MonitorCmd {
                         None,
                         /* from_snapshot */ false,
                         vm_common::ForkLaunch::default(),
-                        vm_common::StartOptions::default(),
+                        vm_common::StartOptions {
+                            external_interceptor,
+                            ..Default::default()
+                        },
                     ) {
                         Ok(()) => {
                             println!("  machine restarted");

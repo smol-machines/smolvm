@@ -1688,6 +1688,12 @@ fn start_vm_named_with_db(
         }
     }
 
+    if record.external_interceptor_required && external_interceptor.is_none() {
+        return Err(Error::config(
+            "egress interceptor",
+            "this machine requires an external interceptor on every start; pass --egress-interceptor and set SMOLVM_INTERCEPTOR_TOKEN",
+        ));
+    }
     if let Some(pool_size) = fork.pool_size {
         if !record.cuda {
             return Err(Error::config(
