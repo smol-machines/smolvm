@@ -12,6 +12,23 @@ A tool to build and run portable, self-contained virtual machines locally. <200m
 
 Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no branch/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
 
+## Documentation
+
+`docs/README.md` is the index. One folder per task: each `docs/<topic>/` holds a `README.md` with
+the facts and why they hold, and where a procedure exists a `SKILL.md` an agent follows, with its
+own `scripts/`, `references/` and `assets/`. Read the topic's `README.md` for what and why, run its
+`SKILL.md` for how; the facts live in the README and the SKILL.md cites them. Version stamps and
+per-platform results live in the `SKILL.md`.
+
+`docs/llms.txt` lists every `SKILL.md` path. A topic installs into an agent's own skills directory
+with:
+
+```bash
+npx skills add smol-machines/smolvm --skill <topic>
+```
+
+The Quick Reference blocks below stay as one-liners; each points at the topic that owns the detail.
+
 ## Quick Reference
 
 ```bash

@@ -190,17 +190,12 @@ Use This For
 **Sandbox untrusted code.** Run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
 
 ```bash
-# network is off by default, so untrusted code can't phone home
-smolvm machine run --image alpine -- nslookup example.com
-# fails: no network access
-
-# lock down egress: only allow specific hosts
+# egress is granted one host at a time, and the allow list is enforced
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://registry.npmjs.org
-# works: allowed host
-
-smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://google.com
-# fails: not in allow list
 ```
+
+Full documentation, including what the network does when you leave `--net` off, is
+[docs/sandbox](docs/sandbox/README.md).
 
 **Let untrusted code use a credential it can never read.** The guest gets a placeholder; the host swaps in the real key only on HTTPS requests to the hosts you name. See [docs/credential-substitution.md](docs/credential-substitution.md).
 
