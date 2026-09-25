@@ -16,7 +16,9 @@ use crate::util::{libkrun_filename, libkrunfw_filename};
 
 use crate::agent::vsock_service;
 use smolvm_network::PortMapping as VirtioPortMapping;
-use smolvm_network::{start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
+use smolvm_network::{
+    start_virtio_network, BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime,
+};
 use smolvm_protocol::{guest_env, ports};
 use socket2::Socket;
 #[cfg(windows)]
@@ -1398,13 +1400,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             // SAFETY: ownership of the host-side socketpair fd transfers
                             // here (already inside the function's outer `unsafe` block).
                             let host_stream = Socket::from_raw_fd(host_fd);
-                            let runtime = match start_virtio_network(
-                                host_stream,
-                                guest_network,
-                                &virtio_port_mappings,
-                                egress,
-                                fabric_lease,
-                            ) {
+                            let runtime = match BoundPublishedPorts::bind(&virtio_port_mappings)
+                                .and_then(|ports| {
+                                    start_virtio_network(
+                                        host_stream,
+                                        guest_network,
+                                        ports,
+                                        egress,
+                                        fabric_lease,
+                                    )
+                                }) {
                                 Ok(runtime) => runtime,
                                 Err(err) => {
                                     libc::close(guest_fd);
@@ -1446,6 +1451,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
                 #[cfg(windows)]
                 {
+                    // The runtime starts on the accept thread below, once the VM is
+                    // already booting, so bind published ports now: a port in use
+                    // must fail the launch, not leave the guest without a network.
+                    let published_ports = BoundPublishedPorts::bind(&virtio_port_mappings)
+                        .map_err(|e| {
+                            krun_free_ctx(ctx);
+                            Error::agent(
+                                "configure virtio-net",
+                                format!("failed to start virtio network runtime: {e}"),
+                            )
+                        })?;
                     // Per-VM AF_UNIX path for the net channel, a sibling of the
                     // agent-control vsock socket (already a working AF_UNIX path).
                     let net_sock_path = vsock_socket.with_extension("net");
@@ -1487,7 +1503,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             Ok((sock, _)) => match start_virtio_network(
                                 sock,
                                 guest_network,
-                                &virtio_port_mappings,
+                                published_ports,
                                 egress,
                                 fabric_lease,
                             ) {

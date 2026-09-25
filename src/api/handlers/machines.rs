@@ -2778,7 +2778,9 @@ pub async fn get_machine_egress_events(
 /// the virtio-net path so an unrelated AddrInUse can't be mistaken for it.
 fn classify_launch_error(e: String) -> ApiError {
     let lc = e.to_ascii_lowercase();
-    if lc.contains("address already in use") && lc.contains("virtio") {
+    // Windows words the same bind failure as WSAEADDRINUSE (os error 10048).
+    let in_use = lc.contains("address already in use") || lc.contains("os error 10048");
+    if in_use && lc.contains("virtio") {
         ApiError::PortConflict(e)
     } else {
         ApiError::Internal(e)
@@ -5550,6 +5552,12 @@ mod tests {
         // The real virtio-net host-port bind failure → retryable PortConflict.
         let e = "agent operation failed: configure virtio-net: failed to start virtio network \
                  runtime: Address already in use (os error 98)"
+            .to_string();
+        assert!(matches!(
+            classify_launch_error(e),
+            ApiError::PortConflict(_)
+        ));
+        let e = "configure virtio-net: failed to start virtio network runtime: cannot publish                  host TCP 127.0.0.1:9222 to guest TCP 9222: Only one usage of each socket                  address (protocol/network address/port) is normally permitted. (os error 10048)"
             .to_string();
         assert!(matches!(
             classify_launch_error(e),

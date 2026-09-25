@@ -91,6 +91,7 @@ use queues::NetworkFrameQueues;
 use queues::DEFAULT_FRAME_QUEUE_CAPACITY;
 use stack::{start_network_stack, VirtioPollConfig};
 use tcp_listeners::create_tcp_channel;
+pub use tcp_listeners::BoundPublishedPorts;
 use tcp_listeners::TcpPortListeners;
 
 /// Default upstream DNS resolver used by the gateway runtime.
@@ -422,8 +423,8 @@ pub struct VirtioNetworkRuntime {
 ///   `krun_add_net_unixstream()` setup path.
 /// - `guest_network`: the static guest/gateway addressing and MAC plan for this
 ///   NIC.
-/// - `published_ports`: host->guest TCP port mappings that should be serviced
-///   directly by the virtio runtime instead of TSI.
+/// - `published_ports`: host->guest TCP port mappings, bound by the caller with
+///   [`BoundPublishedPorts::bind`], that the virtio runtime services instead of TSI.
 ///
 /// High-level flow:
 ///
@@ -465,7 +466,7 @@ pub struct VirtioNetworkRuntime {
 pub fn start_virtio_network(
     host_stream: Socket,
     guest_network: GuestNetworkConfig,
-    published_ports: &[PortMapping],
+    published_ports: BoundPublishedPorts,
     egress: EgressPolicy,
     fabric_lease: Option<fabric::FabricLease>,
 ) -> io::Result<VirtioNetworkRuntime> {

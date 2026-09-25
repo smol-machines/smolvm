@@ -12,7 +12,9 @@ use crate::network::backend::TSI_FEATURE_HIJACK_INET;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 
 use smolvm_network::PortMapping as VirtioPortMapping;
-use smolvm_network::{start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
+use smolvm_network::{
+    start_virtio_network, BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime,
+};
 use smolvm_protocol::{guest_env, ports};
 #[cfg(unix)]
 use socket2::Socket;
@@ -523,13 +525,9 @@ pub fn launch_agent_vm_dynamic(
                     create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
                 // SAFETY: ownership of the host-side socketpair fd transfers here.
                 let host_stream = unsafe { Socket::from_raw_fd(host_fd) };
-                let runtime = match start_virtio_network(
-                    host_stream,
-                    guest_network,
-                    &port_mappings,
-                    egress,
-                    None,
-                ) {
+                let runtime = match BoundPublishedPorts::bind(&port_mappings).and_then(|ports| {
+                    start_virtio_network(host_stream, guest_network, ports, egress, None)
+                }) {
                     Ok(runtime) => runtime,
                     Err(err) => {
                         // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
@@ -558,6 +556,13 @@ pub fn launch_agent_vm_dynamic(
             }
             #[cfg(windows)]
             {
+                // Bind before boot; see the static launcher.
+                let published_ports = match BoundPublishedPorts::bind(&port_mappings) {
+                    Ok(ports) => ports,
+                    Err(e) => {
+                        free_ctx_on_err!(format!("failed to start virtio network runtime: {e}"))
+                    }
+                };
                 let net_sock_path = config.vsock_socket.with_extension("net");
                 let listener = match super::launcher::bind_unix_listener(&net_sock_path) {
                     Ok(listener) => listener,
@@ -588,7 +593,7 @@ pub fn launch_agent_vm_dynamic(
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(sock, guest_network, &port_mappings, egress, None) {
+                            match start_virtio_network(sock, guest_network, published_ports, egress, None) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {
                                     tracing::error!(error = %err, "virtio-net runtime failed to start")

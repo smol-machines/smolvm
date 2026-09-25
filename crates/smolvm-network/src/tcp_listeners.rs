@@ -94,20 +94,15 @@ impl Drop for ReadyListener {
     }
 }
 
-impl TcpPortListeners {
-    /// Start one non-blocking listener thread per published port.
-    ///
-    /// The CLI caps published mappings because every mapping creates this thread
-    /// and normally a second IPv6 thread. Raise that cap only after replacing
-    /// this per-listener model with multiplexed listeners or a bounded worker pool.
-    pub fn start(
-        port_mappings: &[PortMapping],
-        tcp_sender: SyncSender<AcceptedTcpConnection>,
-        publish_wake: WakePipe,
-    ) -> io::Result<Self> {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::with_capacity(port_mappings.len());
+/// Published host ports, bound before the listener threads start.
+///
+/// Binding is separate so a launcher that starts the runtime only after the VM
+/// is booting (Windows) can still fail the launch on a port already in use.
+pub struct BoundPublishedPorts(Vec<(PortMapping, TcpListener, Option<TcpListener>)>);
 
+impl BoundPublishedPorts {
+    /// Bind every published host port, releasing any already bound on failure.
+    pub fn bind(port_mappings: &[PortMapping]) -> io::Result<Self> {
         // Published ports bind loopback by default. `SMOLVM_PUBLISH_ADDR`
         // widens that for fleet nodes whose ingress proxy connects from
         // another host (the control plane): `0.0.0.0` (or any address) makes
@@ -123,22 +118,19 @@ impl TcpPortListeners {
             Ipv6Addr::LOCALHOST
         };
 
+        let mut bound = Vec::with_capacity(port_mappings.len());
         for mapping in port_mappings {
             // The IPv4 listener is required; the IPv6 one is best-effort so
             // hosts without IPv6 still publish normally.
-            let listener = match TcpListener::bind((publish_addr, mapping.host)) {
-                Ok(listener) => listener,
-                Err(err) => {
-                    shutdown_all(&shutdown, &mut handles);
-                    return Err(io::Error::new(
-                        err.kind(),
-                        format!(
-                            "cannot publish host TCP {publish_addr}:{} to guest TCP {}: {err}",
-                            mapping.host, mapping.guest,
-                        ),
-                    ));
-                }
-            };
+            let listener = TcpListener::bind((publish_addr, mapping.host)).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "cannot publish host TCP {publish_addr}:{} to guest TCP {}: {err}",
+                        mapping.host, mapping.guest,
+                    ),
+                )
+            })?;
             let listener_v6 = match TcpListener::bind((publish_v6, mapping.host)) {
                 Ok(listener) => Some(listener),
                 Err(err) => {
@@ -150,7 +142,32 @@ impl TcpPortListeners {
                     None
                 }
             };
+            bound.push((*mapping, listener, listener_v6));
+        }
+        Ok(Self(bound))
+    }
 
+    /// True when no host port is published.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl TcpPortListeners {
+    /// Start one non-blocking listener thread per bound published port.
+    ///
+    /// The CLI caps published mappings because every mapping creates this thread
+    /// and normally a second IPv6 thread. Raise that cap only after replacing
+    /// this per-listener model with multiplexed listeners or a bounded worker pool.
+    pub fn start(
+        ports: BoundPublishedPorts,
+        tcp_sender: SyncSender<AcceptedTcpConnection>,
+        publish_wake: WakePipe,
+    ) -> io::Result<Self> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::with_capacity(ports.0.len());
+
+        for (mapping, listener, listener_v6) in ports.0 {
             for listener in std::iter::once(listener).chain(listener_v6) {
                 let listener = ReadyListener::new(listener).inspect_err(|_| {
                     shutdown_all(&shutdown, &mut handles);
@@ -346,27 +363,22 @@ mod tests {
     }
 
     #[test]
-    fn partial_bind_failure_stops_prior_listeners_and_releases_their_ports() {
+    fn partial_bind_failure_releases_prior_ports() {
         let available = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let first = available.local_addr().unwrap().port();
         let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let second = occupied.local_addr().unwrap().port();
         drop(available);
-        let (sender, _receiver) = mpsc::sync_channel(4);
-        let result = TcpPortListeners::start(
-            &[
-                PortMapping {
-                    host: first,
-                    guest: 8080,
-                },
-                PortMapping {
-                    host: second,
-                    guest: 8081,
-                },
-            ],
-            sender,
-            WakePipe::new(),
-        );
+        let result = BoundPublishedPorts::bind(&[
+            PortMapping {
+                host: first,
+                guest: 8080,
+            },
+            PortMapping {
+                host: second,
+                guest: 8081,
+            },
+        ]);
         assert!(result.is_err());
         assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, first)).is_ok());
     }
