@@ -315,6 +315,7 @@ impl Supervisor {
         let cuda_fork_pool_size = record.cuda_fork_pool_size;
         let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
         let forkable = record.forkable_on_start();
+        let external_interceptor_required = record.external_interceptor_required;
         let name_for_features = name.to_string();
 
         let entry_clone = entry.clone();
@@ -330,6 +331,9 @@ impl Supervisor {
             features.cuda_fork_pool_size = cuda_fork_pool_size;
             features.cuda_vram_limit_mib = cuda_vram_limit_mib;
             features.forkable = forkable;
+            if external_interceptor_required {
+                features.external_interceptor = entry.external_interceptor;
+            }
             entry
                 .manager
                 .ensure_running_via_subprocess(mounts, ports, resources, features)

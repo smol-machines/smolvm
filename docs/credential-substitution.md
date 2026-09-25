@@ -202,11 +202,21 @@ SMOLVM_INTERCEPTOR_TOKEN="$TOKEN" smolvm machine monitor --name worker \
   --restart always --egress-interceptor 127.0.0.1:43123
 ```
 
-The API supervisor and other start paths also refuse to relaunch a machine
-that requires interception without a new endpoint and token. The API does not
-accept an external interceptor yet, so use the CLI or monitor for these
-machines. Keep the interceptor service available before starting or
-restarting the machine.
+The API can also bind the interceptor in the start request body:
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/v1/machines/worker/start \
+  -H 'Content-Type: application/json' --data-binary @- <<EOF
+{"egressInterceptor":{"address":"127.0.0.1:43123","token":"$TOKEN"}}
+EOF
+```
+
+The API server keeps the binding in memory for automatic and implicit restarts,
+but never writes the token to the machine record or returns it in responses.
+After the API server itself restarts, supply the binding again on the next
+stopped-machine start. A running machine must be stopped before rebinding.
+Every start path fails closed if the binding is unavailable. Keep the
+interceptor service available before starting or restarting the machine.
 
 This selects `virtio-net` and redirects every admitted outbound TCP connection,
 including non-HTTPS ports and IPv6, to the service. The machine's egress

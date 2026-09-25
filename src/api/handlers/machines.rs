@@ -1486,6 +1486,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         manager,
         image: record.image.clone(),
         credentials: crate::credentials::CredentialLaunch::for_record(&record.name, record),
+        external_interceptor: None,
         mounts,
         ports,
         resources: ResourceSpec {
@@ -2651,8 +2652,10 @@ fn validate_workload_image_source(
         ("forkPoolSize" = Option<u32>, Query, description = "Planned runnable CUDA clones; implies forkable and enables automatic VRAM budgeting"),
         ("cudaVramLimitMib" = Option<u64>, Query, description = "Optional logical VRAM limit per golden/clone session; requires forkPoolSize")
     ),
+    request_body = Option<crate::api::types::StartMachineRequest>,
     responses(
         (status = 200, description = "Machine started", body = MachineInfo),
+        (status = 400, description = "Invalid or missing interceptor binding", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
         (status = 409, description = "A published host port is already in use (PORT_IN_USE)", body = ApiErrorResponse),
         (status = 500, description = "Failed to start", body = ApiErrorResponse)
@@ -2666,8 +2669,16 @@ pub async fn start_machine(
     // caller that sends no body (or a non-JSON one) still starts normally.
     body: Option<Json<crate::api::types::StartMachineRequest>>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    let request = body.map(|Json(request)| request).unwrap_or_default();
     let registry_auth: Option<crate::registry::RegistryAuth> =
-        body.and_then(|Json(b)| b.registry_auth).map(Into::into);
+        request.registry_auth.map(Into::into);
+    let external_interceptor = request
+        .egress_interceptor
+        .map(|spec| {
+            spec.endpoint()
+                .map_err(|error| ApiError::BadRequest(error.into()))
+        })
+        .transpose()?;
     // Hold the per-machine lifecycle lock across the whole start so a concurrent
     // stop/delete cannot detach the macOS layers volume between our acquire+mount
     // and the launch, nor launch a guest into the launcher's missing-dir error
@@ -2694,6 +2705,25 @@ pub async fn start_machine(
         ));
     }
 
+    if let Some(endpoint) = external_interceptor.as_ref() {
+        crate::agent::validate_external_interceptor(
+            endpoint,
+            &record.vm_resources(),
+            record.credential_policy.is_some(),
+            false,
+        )
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        if query.forkable
+            || query.fork_pool_size.is_some()
+            || record.forkable_on_start()
+            || crate::portable_checkpoint::pending_dir(&vm_data_dir(&name)).is_some()
+        {
+            return Err(ApiError::BadRequest(
+                "external interception does not support checkpoint or branch launches".into(),
+            ));
+        }
+    }
+
     // Resolve via the shared probe (PID + vsock ping) so we don't
     // mistake a zombie VMM (live PID, dead agent) for Running — the
     // CLI's `start --name` handles this same case; the API must
@@ -2711,6 +2741,11 @@ pub async fn start_machine(
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
 
     if resolved == RecordState::Running {
+        if external_interceptor.is_some() {
+            return Err(ApiError::Conflict(
+                "stop the running machine before binding an external interceptor".into(),
+            ));
+        }
         if !state.machine_exists(&name) {
             // Running in DB but not in registry (startup recovery case).
             let name_for_repair = name.clone();
@@ -2753,6 +2788,12 @@ pub async fn start_machine(
         return Err(ApiError::Conflict(format!(
             "machine '{name}' is frozen because {reason}"
         )));
+    }
+
+    if record.external_interceptor_required && external_interceptor.is_none() {
+        return Err(ApiError::BadRequest(
+            "this machine requires egressInterceptor.address and egressInterceptor.token on every start".into(),
+        ));
     }
 
     let mut recovered_unreachable = false;
@@ -2897,6 +2938,7 @@ pub async fn start_machine(
         }
         features.cuda_fork_pool_size = cuda_fork_pool_size;
         features.cuda_vram_limit_mib = cuda_vram_limit_mib;
+        features.external_interceptor = external_interceptor;
         let _ = manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)
             .map_err(|e| format!("failed to start machine: {}", e))?;
@@ -2919,7 +2961,9 @@ pub async fn start_machine(
     .map_err(classify_launch_error)?;
 
     // Register in ApiState so exec/run/container endpoints can find it
-    state.insert_machine(&name, machine_entry_from_record(&record, manager));
+    let mut entry = machine_entry_from_record(&record, manager);
+    entry.external_interceptor = external_interceptor;
+    state.insert_machine(&name, entry);
 
     // Image machines: launch the image's workload (its ENTRYPOINT+CMD) as a
     // detached container now that the VM is up — mirroring the CLI start path

@@ -139,6 +139,9 @@ pub struct MachineEntry {
     pub image: Option<String>,
     /// Credential policy launch description, when the machine has one.
     pub credentials: Option<crate::credentials::CredentialLaunch>,
+    /// API-provided interceptor binding retained only in this server process
+    /// so automatic and implicit restarts can rebind without persisting a token.
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     /// The agent manager for this machine.
     pub manager: AgentManager,
     /// Host mounts configured for this machine.
@@ -550,6 +553,7 @@ impl ApiState {
                                 &record.name,
                                 &record,
                             ),
+                            external_interceptor: None,
                             manager,
                             mounts,
                             ports,
@@ -1120,6 +1124,7 @@ impl ApiState {
                             &record.name,
                             &record,
                         ),
+                        external_interceptor: None,
                         manager: reg.manager,
                         mounts: reg.mounts,
                         ports: reg.ports,
@@ -1443,6 +1448,7 @@ pub async fn ensure_machine_running(
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = entry.cuda_vram_limit_mib;
         features.forkable = entry.forkable;
+        features.external_interceptor = entry.external_interceptor;
         entry
             .manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)?;
@@ -1497,6 +1503,9 @@ pub async fn ensure_running_and_persist(
         e.forkable = record.forkable_on_start();
         e.cuda_fork_pool_size = record.cuda_fork_pool_size;
         e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+        if !record.external_interceptor_required {
+            e.external_interceptor = None;
+        }
     }
 
     let freshly_booted = ensure_machine_running(entry).await?;
@@ -1964,6 +1973,7 @@ mod tests {
             name,
             MachineEntry {
                 credentials: None,
+                external_interceptor: None,
                 manager: AgentManager::for_vm(name).unwrap(),
                 image: None,
                 mounts: vec![],
@@ -2025,6 +2035,7 @@ mod tests {
             "remove-test-m1",
             MachineEntry {
                 credentials: None,
+                external_interceptor: None,
                 manager,
                 image: None,
                 mounts: vec![],
@@ -2097,6 +2108,7 @@ mod tests {
             "busy-m1",
             MachineEntry {
                 credentials: None,
+                external_interceptor: None,
                 manager,
                 image: None,
                 mounts: vec![],

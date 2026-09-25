@@ -990,6 +990,47 @@ pub struct StartMachineRequest {
     /// fails with an opaque DENIED.
     #[serde(default)]
     pub registry_auth: Option<RegistryAuthSpec>,
+
+    /// External host egress interceptor for this start. The token remains on
+    /// the API server only and is never written to the machine record.
+    #[serde(default)]
+    pub egress_interceptor: Option<ExternalInterceptorSpec>,
+}
+
+/// Host interceptor binding supplied in a machine start request.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalInterceptorSpec {
+    /// Loopback listener address, for example `127.0.0.1:43123`.
+    #[schema(value_type = String)]
+    pub address: std::net::SocketAddr,
+    /// Authentication token shared with the interceptor, as 64 hex digits.
+    #[serde(deserialize_with = "deserialize_interceptor_token")]
+    #[schema(value_type = String)]
+    pub token: crate::secrets::Secret,
+}
+
+fn deserialize_interceptor_token<'de, D>(
+    deserializer: D,
+) -> Result<crate::secrets::Secret, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(crate::secrets::Secret::new)
+}
+
+impl ExternalInterceptorSpec {
+    /// Decode the token supplied by the caller into the launch protocol type.
+    pub fn endpoint(&self) -> Result<smolvm_protocol::InterceptEndpoint, &'static str> {
+        let mut token = [0; smolvm_protocol::intercept::TOKEN_LEN];
+        if hex::decode_to_slice(self.token.expose(), &mut token).is_err() || token == [0; 32] {
+            return Err("egressInterceptor.token must contain 64 nonzero hex digits");
+        }
+        Ok(smolvm_protocol::InterceptEndpoint {
+            addr: self.address,
+            token,
+        })
+    }
 }
 
 /// Request to branch a running, branchable source machine into a new child.
@@ -1439,6 +1480,7 @@ mod registry_auth_tests {
         // And it must stay redacted when nested in the request struct.
         let req = StartMachineRequest {
             registry_auth: Some(spec),
+            egress_interceptor: None,
         };
         assert!(!format!("{req:?}").contains("ghp_super_secret_value"));
     }
@@ -1450,6 +1492,7 @@ mod registry_auth_tests {
     fn body_is_optional_and_backwards_compatible() {
         let empty: StartMachineRequest = serde_json::from_str("{}").unwrap();
         assert!(empty.registry_auth.is_none());
+        assert!(empty.egress_interceptor.is_none());
 
         let unrelated: StartMachineRequest =
             serde_json::from_str(r#"{"somethingElse":1}"#).unwrap();
@@ -1461,6 +1504,24 @@ mod registry_auth_tests {
         let auth = with_auth.registry_auth.expect("registryAuth parsed");
         assert_eq!(auth.username, "token");
         assert_eq!(auth.password, "pat");
+    }
+
+    #[test]
+    fn api_interceptor_token_is_validated_and_redacted() {
+        let token = "0123456789abcdef".repeat(4);
+        let body =
+            format!(r#"{{"egressInterceptor":{{"address":"127.0.0.1:43123","token":"{token}"}}}}"#);
+        let request: StartMachineRequest = serde_json::from_str(&body).unwrap();
+        assert!(!format!("{request:?}").contains(&token));
+        let endpoint = request.egress_interceptor.unwrap().endpoint().unwrap();
+        assert_eq!(endpoint.addr, "127.0.0.1:43123".parse().unwrap());
+        assert_ne!(endpoint.token, [0; smolvm_protocol::intercept::TOKEN_LEN]);
+
+        let invalid: StartMachineRequest = serde_json::from_str(
+            r#"{"egressInterceptor":{"address":"127.0.0.1:43123","token":"short"}}"#,
+        )
+        .unwrap();
+        assert!(invalid.egress_interceptor.unwrap().endpoint().is_err());
     }
 
     /// Converting into the protocol type preserves both fields verbatim — a
