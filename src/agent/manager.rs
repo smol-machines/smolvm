@@ -2761,9 +2761,9 @@ impl AgentManager {
 
             // Process identity is not proof that guest writes reached disk. A slow
             // flush must not turn a graceful stop into an unannounced power cut.
-            // Spec: plans/2026-09-19-stop-ack-late-exit.md. EOF can precede
-            // process exit. Observe only: missing acknowledgment never permits
-            // a signal, and process death is not filesystem-sync confirmation.
+            // EOF can precede process exit. Observe only: missing acknowledgment
+            // never permits a signal, and process death is not filesystem-sync
+            // confirmation.
             if let Err(error) = shutdown {
                 let exited = !process::is_alive(pid)
                     || (process::is_our_process_strict(pid, start_time)
