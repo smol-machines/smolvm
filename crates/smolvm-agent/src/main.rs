@@ -1848,10 +1848,26 @@ fn mount_storage_disk() -> bool {
     false
 }
 
-/// Maximum number of vsock connections serviced concurrently.
-/// Bounds thread count and prevents vsock channel saturation.
-/// 8 (2^3) gives headroom for several parallel execs plus the state probe.
-const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+/// Most requests doing real work at once (exec, run, file transfer, pull…).
+/// Bounds the load on the vsock channel. Taken per request, not per
+/// connection, so a held-open exec stream occupies a slot only while it runs.
+const MAX_CONCURRENT_WORK: usize = 32;
+
+/// Most connection threads at once. Above [`MAX_CONCURRENT_WORK`], so the
+/// host's liveness pings are still accepted and answered when every work slot
+/// is taken: with the old per-connection limit, 8 open exec streams starved
+/// the ping and the machine read as not running.
+const MAX_CONNECTION_THREADS: usize = 64;
+
+/// Work slots shared by every connection.
+static WORK_SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
+    std::sync::LazyLock::new(|| ConnectionSemaphore::new(MAX_CONCURRENT_WORK));
+
+/// Whether a request waits for a work slot. Liveness pings and shutdown never
+/// queue behind real work.
+fn needs_work_slot(request: &AgentRequest) -> bool {
+    !matches!(request, AgentRequest::Ping | AgentRequest::Shutdown { .. })
+}
 
 /// A counting semaphore for bounding concurrent connection handlers.
 struct ConnectionSemaphore {
@@ -1899,7 +1915,7 @@ fn run_server_with_listener(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut first_connection = true;
     let listen_start = uptime_ms();
-    let semaphore = std::sync::Arc::new(ConnectionSemaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let semaphore = std::sync::Arc::new(ConnectionSemaphore::new(MAX_CONNECTION_THREADS));
 
     info!(uptime_ms = uptime_ms(), "entering vsock accept loop");
 
@@ -1919,9 +1935,9 @@ fn run_server_with_listener(
                 }
                 info!("accepted connection");
 
-                // Acquire a slot before spawning; blocks if MAX_CONCURRENT_CONNECTIONS
-                // threads are already running. This bounds thread count and prevents
-                // vsock channel saturation under heavy concurrency.
+                // Acquire a thread slot before spawning; blocks only if
+                // MAX_CONNECTION_THREADS threads are already running. Real work
+                // is bounded separately, per request (see WORK_SLOTS).
                 let permit = semaphore.acquire();
 
                 // Service the connection in its own thread so a long-running
@@ -2131,6 +2147,10 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             debug!("ignoring stray stdin/resize outside an interactive session");
             continue;
         }
+
+        // Held until this request is answered; released before the next one
+        // on the same connection is read.
+        let _work = needs_work_slot(&request).then(|| WORK_SLOTS.acquire());
 
         if let AgentRequest::Shutdown { progress } = request {
             shutdown::respond(stream, progress, || {
@@ -7348,6 +7368,43 @@ impl<T: Read + Write + AsRawFd> ReadWrite for T {}
 /// Linux-only because `waitpid` behavior + the agent crate as a whole
 /// is Linux-specific. `cargo test -p smolvm-agent --target
 /// aarch64-unknown-linux-musl` on a Linux runner.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod work_slot_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    #[test]
+    fn only_pings_and_shutdown_skip_the_work_slots() {
+        assert!(!needs_work_slot(&AgentRequest::Ping));
+        assert!(!needs_work_slot(&AgentRequest::Shutdown {
+            progress: false
+        }));
+        assert!(needs_work_slot(&AgentRequest::ListImages));
+    }
+
+    #[test]
+    fn a_ping_is_answered_while_every_work_slot_is_taken() {
+        let held: Vec<_> = (0..MAX_CONCURRENT_WORK)
+            .map(|_| WORK_SLOTS.acquire())
+            .collect();
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut guest = guest;
+            let _ = handle_connection(&mut guest);
+        });
+        let frame = serde_json::to_vec(&AgentRequest::Ping).unwrap();
+        host.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
+        host.write_all(&frame).unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut header = [0u8; 4];
+        host.read_exact(&mut header)
+            .expect("a ping must be answered even with every work slot taken");
+        drop(held);
+    }
+}
+
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod bg_reap_tests {
