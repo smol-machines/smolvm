@@ -357,6 +357,16 @@ impl EmbeddedRuntime {
 
     /// Start or reconnect to a persisted machine and cache its handle.
     pub fn start_machine(&self, name: &str) -> Result<()> {
+        self.start_machine_with_interceptor(name, None)
+    }
+
+    /// Start with a trusted local egress interceptor binding for this boot.
+    /// Callers must supply the binding again after a process restart.
+    pub fn start_machine_with_interceptor(
+        &self,
+        name: &str,
+        interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    ) -> Result<()> {
         self.with_name_lock(name, || {
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
@@ -375,7 +385,7 @@ impl EmbeddedRuntime {
                 self.remove_cached_handle(name)?;
             }
 
-            let started = control::start_vm(&self.db, name)?;
+            let started = control::start_vm_with_interceptor(&self.db, name, interceptor)?;
             let mut handle = started.handle;
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
@@ -395,6 +405,15 @@ impl EmbeddedRuntime {
     /// Treating that state as a stopped VM launches a second VMM over the same
     /// disks and replaces its control socket, destroying the fork source.
     pub fn connect_or_start_machine(&self, name: &str) -> Result<()> {
+        self.connect_or_start_machine_with_interceptor(name, None)
+    }
+
+    /// Attach to a live machine or start it with a fresh interceptor binding.
+    pub fn connect_or_start_machine_with_interceptor(
+        &self,
+        name: &str,
+        interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    ) -> Result<()> {
         self.with_name_lock(name, || {
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
@@ -428,7 +447,7 @@ impl EmbeddedRuntime {
                 return Ok(());
             }
 
-            let started = control::start_vm(&self.db, name)?;
+            let started = control::start_vm_with_interceptor(&self.db, name, interceptor)?;
             let mut handle = started.handle;
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {

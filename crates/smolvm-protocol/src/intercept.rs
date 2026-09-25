@@ -82,13 +82,38 @@ pub fn read_verdict<R: Read>(mut r: R) -> io::Result<()> {
 }
 
 /// Where a backend redirects intercepted flows, and the secret it must present.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterceptEndpoint {
     /// Loopback listener owned by the interceptor.
     pub addr: SocketAddr,
     /// Secret shared between the interceptor and the machine's backend only.
     pub token: [u8; TOKEN_LEN],
+}
+
+impl std::fmt::Debug for InterceptEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterceptEndpoint")
+            .field("addr", &self.addr)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::InterceptEndpoint;
+
+    #[test]
+    fn interceptor_token_is_redacted() {
+        let endpoint = InterceptEndpoint {
+            addr: "127.0.0.1:9000".parse().unwrap(),
+            token: [42; 32],
+        };
+        let rendered = format!("{endpoint:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("42"));
+    }
 }
 
 impl InterceptEndpoint {

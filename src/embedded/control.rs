@@ -144,14 +144,25 @@ pub fn get_record(db: &SmolvmDb, name: &str) -> Result<VmRecord> {
 /// booted/restarted it. Callers use the status to launch image workloads exactly
 /// once: a reused VM already has its workload, while a restarted VM does not.
 pub(crate) fn start_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
-    let record = get_record(db, name)?;
-    let started = start_vm_from_record(&record)?;
-    mark_running(db, name, started.handle.child_pid())?;
-    Ok(started)
+    start_vm_with_interceptor(db, name, None)
 }
 
-fn start_vm_from_record(record: &VmRecord) -> Result<StartedVm> {
-    launch_from_record(record, LaunchFeatures::default())
+/// Start with a per-launch interceptor binding. The token is never stored in the DB.
+pub(crate) fn start_vm_with_interceptor(
+    db: &SmolvmDb,
+    name: &str,
+    interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+) -> Result<StartedVm> {
+    let record = get_record(db, name)?;
+    let started = launch_from_record(
+        &record,
+        LaunchFeatures {
+            external_interceptor: interceptor,
+            ..Default::default()
+        },
+    )?;
+    mark_running(db, name, started.handle.child_pid())?;
+    Ok(started)
 }
 
 pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<StartedVm> {
