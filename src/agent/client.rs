@@ -1062,6 +1062,26 @@ fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, Vec<u8>, Vec<
     }
 }
 
+/// Whether a failed agent connect is worth retrying: the guest or its vsock
+/// muxer is briefly not ready, or turned the connection away.
+fn is_transient_connect_error(error_msg: &str) -> bool {
+    // Connection refused/reset are transient during VM startup.
+    // "No such file or directory" occurs when the vsock socket
+    // file hasn't been created yet by libkrun's muxer thread —
+    // transient under concurrent boot contention. A connect the
+    // guest hangs up mid-handshake (socket2 reports "no error set
+    // after POLLHUP") is a refusal too: a guest busy with many
+    // connections turns one away and accepts the next.
+    error_msg.contains("Connection refused")
+        || error_msg.contains("no error set after POLLHUP")
+        || error_msg.contains("connection refused")
+        || error_msg.contains("Connection reset")
+        || error_msg.contains("connection reset")
+        || error_msg.contains("Broken pipe")
+        || error_msg.contains("Resource temporarily unavailable")
+        || error_msg.contains("No such file or directory")
+}
+
 #[cfg(test)]
 impl AgentClient {
     /// Build an `AgentClient` from a pre-connected `UnixStream`.
@@ -1119,21 +1139,7 @@ impl AgentClient {
             RetryConfig::for_connection(),
             "agent connect",
             || Self::connect_once(path),
-            |e| {
-                // Check if this is a transient error worth retrying
-                let error_msg = e.to_string();
-                // Connection refused/reset are transient during VM startup.
-                // "No such file or directory" occurs when the vsock socket
-                // file hasn't been created yet by libkrun's muxer thread —
-                // transient under concurrent boot contention.
-                error_msg.contains("Connection refused")
-                    || error_msg.contains("connection refused")
-                    || error_msg.contains("Connection reset")
-                    || error_msg.contains("connection reset")
-                    || error_msg.contains("Broken pipe")
-                    || error_msg.contains("Resource temporarily unavailable")
-                    || error_msg.contains("No such file or directory")
-            },
+            |e| is_transient_connect_error(&e.to_string()),
         )
     }
 
@@ -4387,6 +4393,20 @@ mod term_default_tests {
 
 #[cfg(test)]
 mod flatten_timeout_tests {
+
+    #[test]
+    fn a_connect_the_guest_hangs_up_is_retried() {
+        assert!(super::is_transient_connect_error(
+            "connect to agent: no error set after POLLHUP"
+        ));
+        assert!(super::is_transient_connect_error(
+            "Connection refused (os error 111)"
+        ));
+        assert!(!super::is_transient_connect_error(
+            "Permission denied (os error 13)"
+        ));
+    }
+
     use super::*;
 
     // `set_var`/`remove_var` are process-global and the tests run in parallel
