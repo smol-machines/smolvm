@@ -1458,6 +1458,19 @@ pub async fn ensure_machine_running(
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
 }
 
+/// A paused machine must be resumed, never booted fresh: an implicit start
+/// (exec, files, images) would discard its saved execution and leave it unable
+/// to resume or pause again. Explicit start refuses the same way.
+fn refuse_implicit_start_of_paused(record: &crate::config::VmRecord) -> crate::Result<()> {
+    if record.paused_checkpoint.is_some() {
+        return Err(crate::Error::agent_conflict(
+            "start machine",
+            "machine has saved execution; use resume",
+        ));
+    }
+    Ok(())
+}
+
 /// Ensure a machine is running and persist the Running state to the database.
 ///
 /// Used by handlers that implicitly start VMs (containers, exec, images).
@@ -1487,6 +1500,7 @@ pub async fn ensure_running_and_persist(
     // running machines, so a running machine's entry can't be stale — and for
     // one, ensure_machine_running early-returns before the config matters.
     if let Ok(Some(record)) = state.lookup_vm(name).await {
+        refuse_implicit_start_of_paused(&record)?;
         let mut e = entry.lock();
         e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
         e.ports = record
@@ -1840,6 +1854,19 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_start_refuses_a_machine_with_saved_execution() {
+        let mut record =
+            crate::config::VmRecord::new("paused".into(), 1, 512, vec![], vec![], false);
+        assert!(refuse_implicit_start_of_paused(&record).is_ok());
+        record.paused_checkpoint = Some("/saved/execution".into());
+        let error = refuse_implicit_start_of_paused(&record).unwrap_err();
+        assert!(matches!(
+            crate::api::ApiError::from(error),
+            crate::api::ApiError::Conflict(_)
+        ));
+    }
     use futures_util::FutureExt as _;
     use tempfile::TempDir;
 
