@@ -4537,7 +4537,14 @@ pub async fn delete_machine(
                 .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
                 .map_err(ApiError::database)?;
         for clone in clones {
-            delete_one(state.clone(), clone).await?;
+            // A clone can vanish between the lineage read and its delete, e.g.
+            // when its fork pool is deleting its workers at the same time. That
+            // clone is gone, which is what the cascade wants; failing here would
+            // report the golden itself as not found and leave it half-deleted.
+            match delete_one(state.clone(), clone).await {
+                Ok(_) | Err(ApiError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     delete_one(state, name).await.map(Json)
