@@ -93,13 +93,18 @@ in
 
         mkdir -p $out/libexec/smolvm $out/bin
         cp -R . $out/libexec/smolvm/
-        chmod +x $out/libexec/smolvm/smolvm $out/libexec/smolvm/smolvm-bin
-        patchShebangs $out/libexec/smolvm/smolvm
+        # 1.15+ tarballs keep executables in bin/; older ones are flat.
+        bindir=$out/libexec/smolvm
+        if [ -d $out/libexec/smolvm/bin ]; then
+          bindir=$out/libexec/smolvm/bin
+        fi
+        chmod +x $bindir/smolvm $bindir/smolvm-bin
+        patchShebangs $bindir/smolvm
       ''
       + lib.optionalString stdenv.hostPlatform.isLinux ''
         patchelf --set-interpreter ${stdenv.cc.bintools.dynamicLinker} \
-          --set-rpath '$ORIGIN/lib:${linuxRpath}' \
-          $out/libexec/smolvm/smolvm-bin
+          --set-rpath '$ORIGIN/lib:$ORIGIN/../lib:${linuxRpath}' \
+          $bindir/smolvm-bin
 
         for library in $out/libexec/smolvm/lib/*.so*; do
           if patchelf --print-needed "$library" >/dev/null 2>&1; then
@@ -108,7 +113,7 @@ in
         done
       ''
       + ''
-        makeWrapper $out/libexec/smolvm/smolvm $out/bin/smolvm \
+        makeWrapper $bindir/smolvm $out/bin/smolvm \
           --set-default SMOLVM_AGENT_ROOTFS $out/libexec/smolvm/agent-rootfs \
           --prefix PATH : ${lib.makeBinPath runtimeDeps}
 
