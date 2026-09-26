@@ -2110,7 +2110,7 @@ impl AgentManager {
 
         let t_launch = Instant::now();
 
-        // A machine created from a `.smolcheckpoint` carries a private,
+        // A machine created from a checkpoint carries a private,
         // one-shot restore directory in its data dir. Discover it centrally so
         // CLI, API, SDK, implicit exec starts, and restart paths cannot drift.
         // An explicit live-fork snapshot always wins.

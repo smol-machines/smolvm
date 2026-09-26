@@ -29,15 +29,27 @@ owns hard links to all its objects: deleting the cache or an older checkpoint
 does not invalidate later checkpoints. `prune` removes unreferenced cache
 objects. Drop active writers before pruning.
 
-Reuse is based on content, not ancestry: sibling checkpoints can share chunks,
-but the crate does not record a parent/child VM lineage graph. Each index lists
-all objects needed for that checkpoint, rather than requiring an ordered chain
-of earlier checkpoints to restore. Machine lineage remains SmolVM's concern.
+Reuse is based on content: sibling checkpoints can share chunks. Each index
+lists all objects needed for that checkpoint, rather than requiring an ordered
+chain of earlier checkpoints to restore.
+
+## History
+
+A checkpoint can also retain its ancestors. `Writer::retain_generations` copies
+each earlier generation's index under `generations/<id>/` and hard-links every
+object it references, so any generation restores from the one directory
+(`materialize_at`, `resolve_generation`, `lineage_of`). `record_lineage`,
+`find_lineage` and `list_lineage` keep a per-store registry of published
+checkpoints and their parents, and `export_with_history` packs a checkpoint and
+its retained generations into one file.
 
 `materialize_with_base` can reuse a pristine materialization registered with
 `promote_base`; unsupported filesystem cloning falls back to full restoration.
 `export` produces a standalone portable artifact. Manifest types are available
 under `smolvm_checkpoint::format`.
+
+The on-disk layout is specified in
+[docs/checkpoint-format.md](../../docs/checkpoint-format.md).
 
 ## Boundary and safety
 

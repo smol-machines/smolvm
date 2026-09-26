@@ -775,7 +775,7 @@ fn checkpoint_capture_error(error: crate::Error) -> ApiError {
     }
 }
 
-/// Stream a running machine's complete live state as a `.smolcheckpoint`.
+/// Stream a running machine's complete live state as a `.checkpoint`.
 /// Options for a checkpoint capture.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct CaptureCheckpointQuery {
@@ -791,7 +791,7 @@ pub struct CaptureCheckpointQuery {
 }
 
 /// Capture a live checkpoint of a running machine and stream it back as a
-/// `.smolcheckpoint` artifact, keeping a node-local copy when the caller
+/// `.checkpoint` file, keeping a node-local copy when the caller
 /// supplies a cache key.
 pub async fn capture_portable_checkpoint(
     State(state): State<Arc<ApiState>>,
@@ -927,7 +927,7 @@ pub async fn capture_portable_checkpoint(
         .header(header::CONTENT_LENGTH, size)
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{name}.smolcheckpoint\""),
+            format!("attachment; filename=\"{name}.checkpoint\""),
         )
         .header(
             "x-smolvm-checkpoint-pause-ms",
@@ -1034,7 +1034,7 @@ async fn upload_checkpoint(
     Ok(size)
 }
 
-/// Create a machine by streaming a `.smolcheckpoint` into this node.
+/// Create a machine by streaming a `.checkpoint` into this node.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct RestoreCheckpointQuery {
     /// JSON port mappings for this host; guest ports must match the checkpoint.

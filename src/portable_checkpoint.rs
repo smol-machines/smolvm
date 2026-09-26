@@ -1,6 +1,6 @@
 //! Portable live-checkpoint compatibility and installation.
 //!
-//! A `.smolcheckpoint` uses the ordinary pack container for files and disks,
+//! A checkpoint file (`.checkpoint`) uses the ordinary pack container for files and disks,
 //! plus a durable libkrun memory/device snapshot. The container can be copied
 //! anywhere; live state is restored only under a versioned, fail-closed runtime
 //! compatibility contract.
@@ -381,6 +381,7 @@ pub fn unpack_verified_history_file(artifact: &Path) -> Result<Option<tempfile::
     let Some(checkpoint) = manifest.checkpoint.as_ref() else {
         return Ok(None);
     };
+    let footer = ensure_checkpoint_layout(artifact)?;
     if checkpoint.payload != smolvm_pack::format::CheckpointLayout::Chunked {
         return Ok(None);
     }
@@ -392,7 +393,7 @@ pub fn unpack_verified_history_file(artifact: &Path) -> Result<Option<tempfile::
         .prefix(".unpack-")
         .tempdir_in(&root)
         .map_err(|error| Error::agent("prepare checkpoint unpack", error.to_string()))?;
-    smolvm_pack::assets::decompress_assets_from_file(artifact, directory.path())
+    smolvm_pack::extract::unpack_checkpoint_history(artifact, &footer, directory.path())
         .map_err(|error| Error::agent("unpack checkpoint history", error.to_string()))?;
     if !directory.path().join("checkpoint.json").is_file() {
         return Err(Error::agent(
@@ -476,7 +477,7 @@ pub fn restore_from_path_at(
     let checkpoint = manifest.checkpoint.as_ref().ok_or_else(|| {
         Error::config(
             "restore checkpoint",
-            format!("{} is not a .smolcheckpoint artifact", artifact.display()),
+            format!("{} is not a checkpoint", artifact.display()),
         )
     })?;
     validate_compatibility(checkpoint)?;
@@ -559,6 +560,51 @@ pub fn restore_from_path_at(
             }
         }
         return Err(error);
+    }
+    Ok(())
+}
+
+/// The file extension a checkpoint is written with.
+pub const CHECKPOINT_EXTENSION: &str = "checkpoint";
+
+/// Whether `path` names a checkpoint output: `.checkpoint`, or the earlier
+/// `.smolcheckpoint`, which stays accepted. Readers never depend on the name.
+pub fn has_checkpoint_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case(CHECKPOINT_EXTENSION)
+            || extension.eq_ignore_ascii_case("smolcheckpoint")
+    })
+}
+
+/// Require the exact layout a checkpoint writer produces: the payload at
+/// offset 0, the manifest right after it, and the footer ending the file.
+/// Every byte of such a file except the footer is covered by the checksum.
+/// The general pack reader tolerates other layouts, which a checkpoint never
+/// has.
+pub fn ensure_checkpoint_layout(artifact: &Path) -> Result<smolvm_pack::format::PackFooter> {
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+    let len = std::fs::metadata(artifact)
+        .map_err(|error| Error::agent("inspect checkpoint artifact", error.to_string()))?
+        .len();
+    check_checkpoint_layout(&footer, len)?;
+    Ok(footer)
+}
+
+fn check_checkpoint_layout(footer: &smolvm_pack::format::PackFooter, len: u64) -> Result<()> {
+    let expected = footer
+        .assets_size
+        .checked_add(footer.manifest_size)
+        .and_then(|end| end.checked_add(smolvm_pack::format::FOOTER_SIZE as u64));
+    if footer.stub_size != 0
+        || footer.assets_offset != 0
+        || footer.manifest_offset != footer.assets_size
+        || expected != Some(len)
+    {
+        return Err(Error::agent(
+            "verify checkpoint layout",
+            "not a checkpoint layout: expected payload, manifest and footer with nothing between or after them",
+        ));
     }
     Ok(())
 }
@@ -1143,13 +1189,10 @@ fn capture_with_completion(
             "stored checkpoints stage inside the store; omit staging_dir",
         ));
     }
-    if output
-        .extension()
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
-    {
+    if !has_checkpoint_extension(output) {
         return Err(Error::config(
             "checkpoint machine",
-            "output must end in .smolcheckpoint",
+            "output must end in .checkpoint",
         ));
     }
     if output.exists() {
@@ -3578,6 +3621,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         ));
     }
     let footer = verified_sidecar_footer(artifact)?;
+    ensure_checkpoint_layout(artifact)?;
     let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
         .map_err(|e| Error::agent("read paused checkpoint", e.to_string()))?;
     let checkpoint = manifest
@@ -3687,6 +3731,54 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_are_written_as_dot_checkpoint_and_the_earlier_name_still_works() {
+        for name in [
+            "a.checkpoint",
+            "A.CHECKPOINT",
+            "dir/a.checkpoint",
+            "a.smolcheckpoint",
+        ] {
+            assert!(has_checkpoint_extension(Path::new(name)), "{name}");
+        }
+        for name in ["a.smolmachine", "a", "a.checkpoint.tmp", "checkpoint"] {
+            assert!(!has_checkpoint_extension(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_has_nothing_outside_its_checksummed_bytes() {
+        let footer = smolvm_pack::format::PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 1000,
+            manifest_offset: 1000,
+            manifest_size: 200,
+            checksum: 0,
+        };
+        let exact = 1000 + 200 + smolvm_pack::format::FOOTER_SIZE as u64;
+        assert!(check_checkpoint_layout(&footer, exact).is_ok());
+        assert!(
+            check_checkpoint_layout(&footer, exact + 1).is_err(),
+            "bytes between the manifest and the footer are not checksummed"
+        );
+        let shifted = smolvm_pack::format::PackFooter {
+            assets_offset: 8,
+            ..footer
+        };
+        assert!(check_checkpoint_layout(&shifted, exact).is_err());
+        let gap = smolvm_pack::format::PackFooter {
+            manifest_offset: 1008,
+            ..footer
+        };
+        assert!(check_checkpoint_layout(&gap, exact).is_err());
+        let stub = smolvm_pack::format::PackFooter {
+            stub_size: 4096,
+            ..footer
+        };
+        assert!(check_checkpoint_layout(&stub, exact).is_err());
+    }
 
     #[test]
     fn resuming_clears_the_memory_a_previous_restore_retained() {
@@ -4041,7 +4133,7 @@ mod tests {
     #[test]
     fn restore_checks_sidecar_checksum_before_manifest_or_machine_creation() {
         let temp = tempfile::tempdir().unwrap();
-        let artifact = temp.path().join("state.smolcheckpoint");
+        let artifact = temp.path().join("state.checkpoint");
         let manifest = PackManifest::new(
             "vm://checksum-test".into(),
             "none".into(),
@@ -4051,10 +4143,7 @@ mod tests {
         Packer::new(manifest).pack_artifact(&artifact).unwrap();
         let db = crate::db::SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
         let error = restore_from_path(&db, "checksum-test", &artifact).unwrap_err();
-        assert!(
-            error.to_string().contains("not a .smolcheckpoint"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("is not a checkpoint"), "{error}");
         let original = std::fs::read(&artifact).unwrap();
         let footer = smolvm_pack::packer::read_footer_from_sidecar(&artifact).unwrap();
         for offset in [0, footer.manifest_offset as usize] {

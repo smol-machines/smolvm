@@ -662,7 +662,7 @@ pub struct CreateMachineRequest {
     /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
-    /// Path to a `.smolmachine` or `.smolcheckpoint` artifact. Creates from
+    /// Path to a `.smolmachine` or `.checkpoint` artifact. Creates from
     /// pre-packed layers or restores the artifact's captured live state.
     /// Mutually exclusive with `image`.
     #[serde(default)]

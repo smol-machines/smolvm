@@ -69,8 +69,8 @@ Save a running machine mid-execution, rewind it, or branch it into copies that k
 smolvm machine create --net --name agent --image alpine
 smolvm machine start --name agent --branchable
 smolvm machine branch --from agent --name try-1                   # live copy-on-write child
-smolvm machine checkpoint --name agent -o agent.smolcheckpoint    # save it, processes and all
-smolvm machine create --name agent2 --from agent.smolcheckpoint   # resume later or elsewhere
+smolvm machine checkpoint --name agent -o agent.checkpoint        # save it, processes and all
+smolvm machine create --name agent2 --from agent.checkpoint       # resume later or elsewhere
 ```
 
 Rewind to an earlier generation with `--from <checkpoint> --at ~N` (see `machine checkpoint-log`), and stop without losing execution with [pause and resume](docs/pause-resume.md). More in [Branching](docs/branching.md) and [incremental checkpoints](docs/incremental-checkpoints.md).

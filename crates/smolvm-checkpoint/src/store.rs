@@ -551,10 +551,15 @@ impl Writer {
             let target = generations.join(&id);
             fs::create_dir_all(&target)?;
             fs::copy(&index_path, target.join(INDEX))?;
+            // A retained index is as durable as the checkpoint's own: flush
+            // the copy and the directory entry that names it.
+            File::open(target.join(INDEX))?.sync_all()?;
+            File::open(&target)?.sync_all()?;
             retained += 1;
         }
         if retained > 0 {
             File::open(&generations)?.sync_all()?;
+            File::open(&self.objects)?.sync_all()?;
         }
         Ok(retained)
     }
@@ -2739,7 +2744,7 @@ mod tests {
             Some(&first),
             "2026-01-02T00:00:00Z",
         );
-        let file = root.path().join("history.smolcheckpoint");
+        let file = root.path().join("history.checkpoint");
         let (bytes, carried) = export_with_history(&second, 32, &file, |manifest| {
             manifest.checkpoint.as_mut().unwrap().version = 99;
         })
@@ -2764,9 +2769,16 @@ mod tests {
             resolve_in(&generations_from_history(&checkpoint.history), "~1").unwrap(),
             Some(G1.to_string())
         );
+        // Exactly payload, manifest and footer: nothing outside the checksum.
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(&file).unwrap();
+        assert_eq!(
+            fs::metadata(&file).unwrap().len(),
+            footer.assets_size + footer.manifest_size + smolvm_pack::format::FOOTER_SIZE as u64
+        );
+        assert_eq!(footer.manifest_offset, footer.assets_size);
         // Unpacked, it is a directory checkpoint again — every generation restores.
         let unpacked = root.path().join("unpacked");
-        smolvm_pack::assets::decompress_assets_from_file(&file, &unpacked).unwrap();
+        smolvm_pack::extract::unpack_checkpoint_history(&file, &footer, &unpacked).unwrap();
         let ids: Vec<String> = lineage_of(&unpacked)
             .unwrap()
             .into_iter()
@@ -2780,7 +2792,7 @@ mod tests {
         materialize(&unpacked, &own).unwrap();
         assert_eq!(fs::read(own.join("checkpoint/memory.bin")).unwrap(), b);
         // With nothing retained the export is the classic single-generation file.
-        let single = root.path().join("single.smolcheckpoint");
+        let single = root.path().join("single.checkpoint");
         assert_eq!(
             export_with_history(&first, 32, &single, |_| {}).unwrap().1,
             0

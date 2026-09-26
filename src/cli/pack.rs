@@ -71,7 +71,7 @@ impl PackCmd {
 }
 
 /// Persist one running machine, including RAM and execution state, as a
-/// portable `.smolcheckpoint` artifact.
+/// portable `.checkpoint` file.
 #[derive(Args, Debug)]
 pub struct CheckpointCmd {
     /// Running machine to checkpoint.
@@ -105,7 +105,7 @@ pub struct CheckpointCmd {
     #[arg(long, value_name = "DIR")]
     pub store: Option<PathBuf>,
 
-    /// Destination `.smolcheckpoint` file (directory with --store).
+    /// Destination `.checkpoint` file (directory with --store).
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 

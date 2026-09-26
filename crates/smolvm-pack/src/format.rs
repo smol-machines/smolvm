@@ -696,7 +696,7 @@ pub struct PackManifest {
     /// Asset inventory - files included in the assets blob.
     pub assets: AssetInventory,
 
-    /// Live execution state when this artifact is a `.smolcheckpoint`.
+    /// Live execution state when this artifact is a checkpoint (`.checkpoint`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<PortableCheckpointManifest>,
 }
