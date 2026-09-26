@@ -280,6 +280,11 @@ pub struct PackRunCmd {
     #[arg(long, help_heading = "Security")]
     pub ssh_agent: bool,
 
+    /// Custom DNS resolver for the guest (implies --net). Defaults to the
+    /// host's own resolver; use this when that is not the resolver to use.
+    #[arg(long, value_name = "IP", help_heading = "Network")]
+    pub dns: Option<std::net::Ipv4Addr>,
+
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
@@ -569,7 +574,7 @@ impl PackRunCmd {
                 !ports.is_empty(),
             ),
             network_backend: self.net_backend,
-            dns: None,
+            dns: self.dns,
             network_name: None,
             guest_subnet: None,
             gpu: manifest.gpu,
@@ -1396,6 +1401,11 @@ struct PackedRunArgs {
     #[arg(long)]
     ssh_agent: bool,
 
+    /// Custom DNS resolver for the guest (implies --net). Defaults to the
+    /// host's own resolver; use this when that is not the resolver to use.
+    #[arg(long, value_name = "IP")]
+    dns: Option<std::net::Ipv4Addr>,
+
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
     cpus: Option<u8>,
@@ -1470,6 +1480,11 @@ struct PackedStartArgs {
     /// Forward the host SSH agent into the VM via a vsock bridge.
     #[arg(long)]
     ssh_agent: bool,
+
+    /// Custom DNS resolver for the guest (implies --net). Defaults to the
+    /// host's own resolver; use this when that is not the resolver to use.
+    #[arg(long, value_name = "IP")]
+    dns: Option<std::net::Ipv4Addr>,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1621,6 +1636,7 @@ fn run_ephemeral(
                 net: args.net,
                 net_backend: args.net_backend,
                 ssh_agent: args.ssh_agent,
+                dns: args.dns,
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1765,7 +1781,7 @@ fn run_from_cache(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
-        dns: None,
+        dns: args.dns,
         network_name: None,
         guest_subnet: None,
         gpu: manifest.gpu,
@@ -2202,7 +2218,7 @@ fn daemon_start(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
-        dns: None,
+        dns: args.dns,
         network_name: None,
         guest_subnet: None,
         gpu: manifest.gpu,

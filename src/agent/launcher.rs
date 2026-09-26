@@ -1274,12 +1274,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     guest_network.intercept =
                         Some(smolvm_network::StreamInterception::AllTcp(*endpoint));
                 }
-                // A custom resolver (--dns) becomes the gateway's upstream: the
+                // The effective resolver becomes the gateway's upstream: the
                 // guest still points at the gateway (100.96.0.1 by default), which forwards
                 // queries to this address instead of the default.
-                if let Some(dns) = resources.dns {
-                    guest_network.upstream_dns = dns;
-                }
+                guest_network.upstream_dns = crate::data::network::effective_dns(
+                    resources.dns,
+                    EffectiveNetworkBackend::VirtioNet,
+                )
+                .addr
+                .unwrap_or(guest_network.upstream_dns);
                 // A named network (--network) leases this VM a distinct /30 so
                 // members can address each other; the lease is handed to the
                 // virtio runtime below, which starts the fabric threads.
