@@ -73,7 +73,7 @@ Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
 `--forkable` remain compatibility aliases. A branch takes a checkpoint of the
 source in memory; `machine checkpoint` saves that same state as a durable
 `.checkpoint` file that can be restored later or elsewhere
-([format](checkpoint-format.md)).
+([format](../crates/smolvm-checkpoint/FORMAT.md)).
 
 Building checkpoint tooling in Rust? [`smolvm-checkpoint`](../crates/smolvm-checkpoint)
 provides incremental storage, verified file restoration, and portable export

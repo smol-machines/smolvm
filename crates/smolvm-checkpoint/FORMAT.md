@@ -13,7 +13,7 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | Store index version | `1` |
 | Container version | pack footer version `1` (readers accept `1`–`3`) |
 | File extension | `.checkpoint` (`.smolcheckpoint` is accepted as an earlier name) |
-| Reference implementation | `src/portable_checkpoint.rs`, `crates/smolvm-checkpoint`, `crates/smolvm-pack` (Apache-2.0) |
+| Reference implementation | [smolvm](https://github.com/smol-machines/smolvm): `src/portable_checkpoint.rs`, `crates/smolvm-checkpoint`, `crates/smolvm-pack` (Apache-2.0) |
 
 ## 1. Overview
 
@@ -51,7 +51,7 @@ The manifest decides (section 5).
 
 A checkpoint file or history file is laid out as:
 
-```
+```text
 offset 0            A                  A+M                A+M+64
        | payload    | manifest         | footer           |
        | A bytes    | M bytes, JSON    | 64 bytes         |
@@ -328,7 +328,7 @@ a library implementing that ABI.
 
 A stored checkpoint is a directory, conventionally named `<name>.checkpoint`:
 
-```
+```text
 <name>.checkpoint/
   checkpoint.json              index of this generation
   objects/<sha256>             every object any index here references
@@ -512,7 +512,7 @@ A writer that wants smolvm's durability guarantees:
 
 ## 13. Conformance
 
-The reference implementation's tests pin the rules above, including:
+The reference implementation's tests, run from a smolvm checkout, pin the rules above, including:
 exact-version refusal, checksum-before-parse, the exact container layout,
 history resolution (`~N`, id prefixes, ambiguity), unpack path safety, and
 restoring every generation from a single history file after the directories it

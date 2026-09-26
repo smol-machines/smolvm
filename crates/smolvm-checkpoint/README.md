@@ -4,11 +4,11 @@ Use SmolVM's incremental checkpoint storage from Rust without linking the VM
 runtime. The crate stores stable files or streams as verified, content-addressed
 chunks, restores independent writable files, and exports standalone artifacts.
 
-Until published to crates.io, use a path dependency on this checkout:
+The checkpoint format is specified in [FORMAT.md](FORMAT.md), so other tools can
+read and write checkpoints without this crate.
 
-```toml
-[dependencies]
-smolvm-checkpoint = { path = "../smolvm/crates/smolvm-checkpoint" }
+```sh
+cargo add smolvm-checkpoint
 ```
 
 Run the complete storage example with:
@@ -47,9 +47,6 @@ its retained generations into one file.
 `promote_base`; unsupported filesystem cloning falls back to full restoration.
 `export` produces a standalone portable artifact. Manifest types are available
 under `smolvm_checkpoint::format`.
-
-The on-disk layout is specified in
-[docs/checkpoint-format.md](../../docs/checkpoint-format.md).
 
 ## Boundary and safety
 

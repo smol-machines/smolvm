@@ -142,7 +142,7 @@ original store. Omitting `--store` when capturing a machine continues to produce
 a standalone file directly. Treat all checkpoint files as sensitive: they
 contain the machine's captured memory and disk data, and may contain its
 credential CA's private key. The file and directory layouts are specified in
-[Checkpoint format](checkpoint-format.md).
+[Checkpoint format](../crates/smolvm-checkpoint/FORMAT.md).
 
 ## Reclaim storage
 
