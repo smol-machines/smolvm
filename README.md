@@ -6,6 +6,9 @@
   <a href="https://discord.gg/E5r8rEWY9J"><img src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://github.com/smol-machines/smolvm/releases"><img src="https://img.shields.io/github/v/release/smol-machines/smolvm?label=Release" alt="Release"></a>
   <a href="https://github.com/smol-machines/smolvm/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+  <a href="https://www.npmjs.com/package/smolmachines"><img src="https://img.shields.io/npm/v/smolmachines?label=npm&logo=npm" alt="npm"></a>
+  <a href="https://pypi.org/project/smolmachines/"><img src="https://img.shields.io/pypi/v/smolmachines?label=PyPI&logo=pypi&logoColor=white" alt="PyPI"></a>
+  <a href="https://crates.io/crates/smolmachines"><img src="https://img.shields.io/crates/v/smolmachines?label=crates.io&logo=rust" alt="crates.io"></a>
 </p>
 
 smolvm
@@ -47,43 +50,13 @@ smolvm machine run --net -it --image alpine -- /bin/sh
 SDKs
 ----
 
-Drive machines from code with the same engine, locally or on [smol cloud](https://smolmachines.com), through one `Machine` API.
+Drive machines from code, locally or on smol cloud:
 
-| Language | Install | Package |
-|---|---|---|
-| Node / TypeScript | `npm install smolmachines` | [npm](https://www.npmjs.com/package/smolmachines) |
-| Python | `pip install smolmachines` | [PyPI](https://pypi.org/project/smolmachines/) |
-| Rust | `cargo add smolmachines` | [crates.io](https://crates.io/crates/smolmachines) |
+- **Node / TypeScript:** [`smolmachines` on npm](https://www.npmjs.com/package/smolmachines)
+- **Python:** [`smolmachines` on PyPI](https://pypi.org/project/smolmachines/)
+- **Rust:** [`smolmachines` on crates.io](https://crates.io/crates/smolmachines)
 
-SDK versions track smolvm releases. Source lives in [smol-machines/smol](https://github.com/smol-machines/smol); docs at [smolmachines.com/docs/sdk](https://smolmachines.com/docs/sdk).
-
-```ts
-import { Machine } from 'smolmachines';
-
-const m = await Machine.create({ resources: { cpus: 2, memoryMb: 1024, network: true } });
-try {
-  const r = await m.run('python:3.12', ['python', '-c', 'print(2 ** 10)']);
-  console.log(r.stdout); // 1024
-} finally {
-  await m.delete();
-}
-```
-
-```python
-from smol import Machine, MachineConfig, ResourceSpec
-
-with Machine.create(MachineConfig(resources=ResourceSpec(cpus=2, memory_mb=1024, network=True))) as m:
-    print(m.run("python:3.12", ["python", "-c", "print(2 ** 10)"]).stdout)  # 1024
-```
-
-```rust
-use smolmachines::Machine;
-
-let machine = Machine::builder("hello").image("alpine:latest").network(true).create()?;
-machine.start()?;
-println!("{}", machine.exec(["uname", "-a"])?.stdout_utf8());
-machine.delete()?;
-```
+Source and docs: [smol-machines/smol](https://github.com/smol-machines/smol) · [smolmachines.com/docs/sdk](https://smolmachines.com/docs/sdk)
 
 Smolfile
 --------
