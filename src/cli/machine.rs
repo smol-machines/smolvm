@@ -1862,11 +1862,11 @@ impl RunCmd {
             .clone()
             .or_else(|| rosetta_requested.then(|| "linux/amd64".to_string()));
 
-        // Pull only registry images; a local source's layers are already
-        // mounted via virtiofs and the guest assembles its rootfs from them.
-        let image_info = if uses_packed_layers {
-            None
-        } else if let Some(ref img) = image {
+        // A registry image is pulled. A local source's layers are already
+        // mounted via virtiofs, but its image config (WORKDIR, Env, USER) is
+        // only known once the guest materializes it; the agent's pull does that
+        // for mounted layers without touching the network.
+        let image_info = if let Some(ref img) = image {
             match crate::cli::pull_with_progress(
                 &mut client,
                 img,
@@ -1875,7 +1875,7 @@ impl RunCmd {
                 self.proxy_opts.no_proxy().as_deref(),
             ) {
                 Ok(info) => Some(info),
-                Err(e) if !params.net => {
+                Err(e) if !params.net && !uses_packed_layers => {
                     // Add a hint when pull fails and networking is disabled —
                     // this is the most common user error.
                     return Err(smolvm::Error::agent(
