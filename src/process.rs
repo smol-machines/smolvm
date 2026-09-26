@@ -3927,7 +3927,10 @@ mod tests {
                     0usize,
                     1u32, // LANDLOCK_CREATE_RULESET_VERSION
                 );
-                if abi < 2 || restrict_filesystem(&[ro.clone()], &[rw.clone()]).is_err() {
+                if abi < 2
+                    || restrict_filesystem(std::slice::from_ref(&ro), std::slice::from_ref(&rw))
+                        .is_err()
+                {
                     libc::_exit(3);
                 }
                 if libc::rename(moved_from.as_ptr(), moved_to.as_ptr()) != 0 {
