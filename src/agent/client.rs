@@ -959,6 +959,35 @@ fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> 
 // Response match helpers
 // ============================================================================
 
+/// Translate an agent error that is really a protocol-version skew.
+///
+/// An agent replying `invalid request: unknown variant `X` …` is older than
+/// this CLI: its deserializer has no such request tag, which is what a stock
+/// older agent-rootfs under a newer binary produces (a 1.7.7 agent receiving
+/// `flatten_layers` from a 1.8+ `pack create --from-vm`, say — see #951). Old
+/// agents in the field already emit exactly this text, so matching the string
+/// is the only translation possible for them; the prefix comes from the
+/// agent's own request loop (`invalid request: {serde error}` in
+/// smolvm-agent's `main.rs`), which must keep it stable. Anything else passes
+/// through untouched.
+///
+/// Applied once, in [`AgentClient::receive`], as the response enters — so the
+/// shared match helpers and every inline `AgentResponse::Error` match
+/// (`branchpoint_*`, `pod_*`, …) all see the rewritten message.
+fn describe_agent_error(message: String) -> String {
+    let Some(rest) = message.strip_prefix("invalid request: unknown variant `") else {
+        return message;
+    };
+    let Some((variant, _)) = rest.split_once('`') else {
+        return message;
+    };
+    format!(
+        "the machine's guest agent is older than this CLI and does not support the \
+         '{variant}' request. Update the agent rootfs to this release's (reinstall \
+         smolvm, or point SMOLVM_AGENT_ROOTFS at the new one), then restart the machine"
+    )
+}
+
 /// Extract typed data from an `Ok` response.
 fn expect_data<T: serde::de::DeserializeOwned>(resp: AgentResponse, op: &str) -> Result<T> {
     match resp {
@@ -3164,8 +3193,14 @@ impl AgentClient {
             return Err(e.into());
         }
 
-        let resp: AgentResponse = serde_json::from_slice(&buf)
+        let mut resp: AgentResponse = serde_json::from_slice(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
+        // Rewrite a version-skew error as it enters, so every decode site —
+        // the shared match helpers and the many inline `AgentResponse::Error`
+        // matches (branchpoint_*, pod_*, …) — reports the skew the same way.
+        if let AgentResponse::Error { message, .. } = &mut resp {
+            *message = describe_agent_error(std::mem::take(message));
+        }
         Ok(resp)
     }
 }
@@ -4388,6 +4423,69 @@ mod term_default_tests {
         let env = with_term_default(vec![("A".to_string(), "b".to_string())], false);
         assert_eq!(term_of(&env), None);
         assert_eq!(env.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod agent_error_skew_tests {
+    use super::describe_agent_error;
+
+    #[test]
+    fn unknown_variant_becomes_a_version_mismatch_message() {
+        // The verbatim reply a 1.7.7 agent sends for a newer CLI's
+        // flatten_layers request (#951). The raw serde text told the user
+        // nothing about the actual problem or the fix.
+        let raw = "invalid request: unknown variant `flatten_layers`, expected one of \
+                   `ping`, `fs_notify`, `pull` at line 1 column 26";
+        let described = describe_agent_error(raw.to_string());
+        assert!(described.contains("older than this CLI"), "{described}");
+        assert!(described.contains("flatten_layers"), "{described}");
+        assert!(described.contains("agent rootfs"), "{described}");
+        assert!(!described.contains("expected one of"), "{described}");
+    }
+
+    #[test]
+    fn ordinary_agent_errors_pass_through_unchanged() {
+        for msg in [
+            "flatten failed: no space left on device",
+            "invalid request: missing field `path` at line 1 column 40",
+            "invalid request: unknown variant with no backtick",
+        ] {
+            assert_eq!(describe_agent_error(msg.to_string()), msg);
+        }
+    }
+
+    #[test]
+    fn receive_rewrites_the_error_as_it_enters() {
+        // The rewrite lives in `receive`, not the match helpers, so the many
+        // call sites that match `AgentResponse::Error` themselves (the
+        // branchpoint and pod families included) get the translation too.
+        use super::{AgentClient, AgentResponse, UdsStream};
+        use std::io::Write;
+
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let resp = AgentResponse::error(
+                "invalid request: unknown variant `pod_create`, expected one of `ping` \
+                 at line 1 column 22",
+                "invalid_request",
+            );
+            let body = serde_json::to_vec(&resp).unwrap();
+            server_stream
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .unwrap();
+            server_stream.write_all(&body).unwrap();
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let resp = client.receive().expect("frame decodes");
+        server.join().unwrap();
+
+        let AgentResponse::Error { message, .. } = resp else {
+            panic!("expected an error response");
+        };
+        assert!(message.contains("older than this CLI"), "{message}");
+        assert!(message.contains("pod_create"), "{message}");
     }
 }
 
