@@ -79,9 +79,7 @@ pub fn ensure_running_and_connect(
         // so a typo in the name gives a clear error rather than the
         // generic "not running / use start" message.
         if let Some(ref n) = name {
-            let record = SmolvmDb::open()
-                .ok()
-                .and_then(|db| db.get_vm(n).ok().flatten());
+            let record = SmolvmDb::open()?.get_vm(n)?;
             let Some(record) = record else {
                 return Err(smolvm::Error::vm_not_found(n));
             };
@@ -107,14 +105,23 @@ pub fn ensure_running_and_connect(
         // Distinguish "machine does not exist" from "machine exists but is
         // stopped". Without this a typo in --name reports "is not running"
         // and points at `start`, which then fails differently (QA BUG-45).
-        let exists = SmolvmDb::open()
-            .ok()
-            .and_then(|db| db.get_vm(&label).ok().flatten())
-            .is_some();
-        if !exists {
+        let record = SmolvmDb::open()?.get_vm(&label)?;
+        let Some(record) = record else {
             return Err(smolvm::Error::agent(
                 "connect",
                 format!("machine '{}' not found", label),
+            ));
+        };
+
+        // Intent: plans/2026-09-19-live-unreachable-diagnostic.md.
+        // A failed agent probe does not establish that the VM process stopped.
+        if record.is_process_alive() {
+            return Err(smolvm::Error::agent(
+                "connect",
+                format!(
+                    "machine '{}' has a live VM process but its agent is unresponsive",
+                    label
+                ),
             ));
         }
 
@@ -163,13 +170,18 @@ fn cli_recover_if_unreachable(name: &str) -> smolvm::Result<()> {
 /// `Unreachable`. Caller invokes this on `ensure_running_and_connect`
 /// failure so the next `machine list` is honest.
 ///
-/// All errors are swallowed (logged at debug level) — this is a
-/// best-effort cleanup, not a critical path.
+/// Reconciliation failures warn with machine identity while preserving the
+/// caller’s connection error; successful updates alone log at debug level.
 fn mark_unreachable_if_zombie(name: &str) {
-    let Ok(mut config) = SmolvmConfig::load() else {
-        return;
+    let mut config = match SmolvmConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(machine = %name, error = %error, "cannot load config for unreachable reconciliation");
+            return;
+        }
     };
     let Some(record) = config.get_vm(name) else {
+        tracing::warn!(machine = %name, "missing record during unreachable reconciliation");
         return;
     };
     // Only transition Running → Unreachable. Stopped/Created/Failed
@@ -187,16 +199,22 @@ fn mark_unreachable_if_zombie(name: &str) {
     if smolvm::agent::state_probe::is_frozen_fork_base(name, record) {
         return;
     }
-    // PID alive + ensure_running_and_connect failed → zombie. Persist
-    // the new state. Update via the closure-based helper if available;
-    // fall back to nothing on failure (best-effort).
-    let _ = config.update_vm(name, |r| {
+    // Connection failure with a live process is not proof of agent death.
+    // Intent: plans/2026-09-19-live-unreachable-diagnostic.md.
+    match config.update_vm(name, |r| {
         r.state = RecordState::Unreachable;
-    });
-    tracing::debug!(
-        machine = %name,
-        "marked machine Unreachable: PID alive but agent not responding"
-    );
+    }) {
+        Some(Ok(())) => tracing::debug!(
+            machine = %name,
+            "marked machine Unreachable: PID alive but agent not responding"
+        ),
+        Some(Err(error)) => tracing::warn!(
+            machine = %name,
+            error = %error,
+            "cannot persist unreachable reconciliation"
+        ),
+        None => tracing::warn!(machine = %name, "missing record during unreachable update"),
+    }
 }
 
 /// Print command output and exit with the given code.
