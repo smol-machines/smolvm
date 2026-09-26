@@ -44,6 +44,47 @@ smolvm machine run --net -it --image alpine -- /bin/sh
 # inside the VM: apk add sl && sl && exit
 ```
 
+SDKs
+----
+
+Drive machines from code with the same engine, locally or on [smol cloud](https://smolmachines.com), through one `Machine` API.
+
+| Language | Install | Package |
+|---|---|---|
+| Node / TypeScript | `npm install smolmachines` | [npm](https://www.npmjs.com/package/smolmachines) |
+| Python | `pip install smolmachines` | [PyPI](https://pypi.org/project/smolmachines/) |
+| Rust | `cargo add smolmachines` | [crates.io](https://crates.io/crates/smolmachines) |
+
+SDK versions track smolvm releases. Source lives in [smol-machines/smol](https://github.com/smol-machines/smol); docs at [smolmachines.com/docs/sdk](https://smolmachines.com/docs/sdk).
+
+```ts
+import { Machine } from 'smolmachines';
+
+const m = await Machine.create({ resources: { cpus: 2, memoryMb: 1024, network: true } });
+try {
+  const r = await m.run('python:3.12', ['python', '-c', 'print(2 ** 10)']);
+  console.log(r.stdout); // 1024
+} finally {
+  await m.delete();
+}
+```
+
+```python
+from smol import Machine, MachineConfig, ResourceSpec
+
+with Machine.create(MachineConfig(resources=ResourceSpec(cpus=2, memory_mb=1024, network=True))) as m:
+    print(m.run("python:3.12", ["python", "-c", "print(2 ** 10)"]).stdout)  # 1024
+```
+
+```rust
+use smolmachines::Machine;
+
+let machine = Machine::builder("hello").image("alpine:latest").network(true).create()?;
+machine.start()?;
+println!("{}", machine.exec(["uname", "-a"])?.stdout_utf8());
+machine.delete()?;
+```
+
 Smolfile
 --------
 
