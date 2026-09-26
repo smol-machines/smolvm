@@ -958,9 +958,13 @@ pub fn restrict_filesystem(
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
     };
 
-    // ABI V1 is supported on every Landlock-capable kernel; it governs
-    // read/write/execute and directory mutation — enough to confine file access.
-    let abi = ABI::V1;
+    // ABI V2 adds `Refer`, the right to move or link a file into a different
+    // directory. Under V1 every such rename is refused with EXDEV, so a guest's
+    // `mv` between directories of a read-write mount failed. `Refer` is granted
+    // with the read-write rights only: nothing moves into or out of a read-only
+    // path, and Landlock refuses a move that would widen a file's access. On a
+    // V1-only kernel the crate's best-effort mode drops `Refer`, as before.
+    let abi = ABI::V2;
     let ro = AccessFs::from_read(abi);
     let rw = AccessFs::from_all(abi);
 
@@ -3887,6 +3891,63 @@ mod tests {
             assert!(
                 code == 0 || code == 3,
                 "expected EACCES denial (0) or no-landlock (3), got exit {code}"
+            );
+        }
+    }
+
+    /// A read-write path allows moving a file between its directories (a guest
+    /// `mv` over virtiofs), which Landlock ABI V1 refused with EXDEV, while a
+    /// file under a read-only path still cannot be moved out of it. Runs in a
+    /// forked child so the restriction doesn't affect the test runner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_allows_moves_within_read_write_paths_only() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let rw = dir.path().join("rw");
+        let ro = dir.path().join("ro");
+        std::fs::create_dir_all(rw.join("a")).unwrap();
+        std::fs::create_dir_all(rw.join("b")).unwrap();
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::write(rw.join("a/file"), b"x").unwrap();
+        std::fs::write(ro.join("file"), b"x").unwrap();
+        let path =
+            |p: std::path::PathBuf| std::ffi::CString::new(p.into_os_string().into_vec()).unwrap();
+        let (moved_from, moved_to) = (path(rw.join("a/file")), path(rw.join("b/file")));
+        let (ro_from, ro_to) = (path(ro.join("file")), path(rw.join("b/escaped")));
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                // `Refer` needs Landlock ABI 2 (Linux 5.19).
+                let abi = libc::syscall(
+                    libc::SYS_landlock_create_ruleset,
+                    std::ptr::null::<libc::c_void>(),
+                    0usize,
+                    1u32, // LANDLOCK_CREATE_RULESET_VERSION
+                );
+                if abi < 2
+                    || restrict_filesystem(std::slice::from_ref(&ro), std::slice::from_ref(&rw))
+                        .is_err()
+                {
+                    libc::_exit(3);
+                }
+                if libc::rename(moved_from.as_ptr(), moved_to.as_ptr()) != 0 {
+                    let err = *libc::__errno_location();
+                    libc::_exit(if err == libc::EXDEV { 6 } else { 7 });
+                }
+                if libc::rename(ro_from.as_ptr(), ro_to.as_ptr()) == 0 {
+                    libc::_exit(8); // moved out of a read-only path
+                }
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            let code = libc::WEXITSTATUS(status);
+            assert!(
+                code == 0 || code == 3,
+                "expected moves within read-write paths only (0) or no Landlock ABI 2 (3), got exit {code}"
             );
         }
     }
