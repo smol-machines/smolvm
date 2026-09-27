@@ -300,6 +300,37 @@ async fn terminate(
 }
 
 impl State {
+    /// Ask the resolver for `binding`'s value for this request. The inner
+    /// `Err` is the reply to send the guest when it has none.
+    async fn resolve(
+        &self,
+        binding: &str,
+        host: &str,
+        destination: SocketAddr,
+        method: &str,
+        path: &str,
+    ) -> Result<std::result::Result<zeroize::Zeroizing<String>, Reply>> {
+        let resolver = self.resolver.clone();
+        let request = CredentialRequest {
+            machine: self.machine.clone(),
+            binding: binding.to_string(),
+            host: host.to_string(),
+            port: destination.port(),
+            method: method.to_string(),
+            path: path.to_string(),
+        };
+        let resolved = tokio::task::spawn_blocking(move || resolver.resolve(&request))
+            .await
+            .context("resolver task")?;
+        Ok(resolved.map_err(|e| {
+            tracing::warn!(machine = %self.machine, binding, host, error = %e, "credential resolution failed");
+            text(
+                StatusCode::BAD_GATEWAY,
+                "smolvm credentials: credential unavailable",
+            )
+        }))
+    }
+
     fn leaf_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
         if let Some(config) = self.leaves.lock().expect("leaf cache").get(host) {
             return Ok(config.clone());
@@ -440,28 +471,18 @@ impl State {
                     "smolvm credentials: this credential is not allowed for this method",
                 ));
             }
-            let resolver = self.resolver.clone();
-            let request_for_resolver = CredentialRequest {
-                machine: self.machine.clone(),
-                binding: binding_name.clone(),
-                host: host.to_string(),
-                port: destination.port(),
-                method: parts.method.as_str().to_string(),
-                path: target.clone(),
-            };
-            let resolved =
-                tokio::task::spawn_blocking(move || resolver.resolve(&request_for_resolver))
-                    .await
-                    .context("resolver task")?;
-            let secret = match resolved {
+            let secret = match self
+                .resolve(
+                    binding_name,
+                    host,
+                    destination,
+                    parts.method.as_str(),
+                    &target,
+                )
+                .await?
+            {
                 Ok(secret) => secret,
-                Err(e) => {
-                    tracing::warn!(machine = %self.machine, binding = %binding_name, host, error = %e, "credential resolution failed");
-                    return Ok(text(
-                        StatusCode::BAD_GATEWAY,
-                        "smolvm credentials: credential unavailable",
-                    ));
-                }
+                Err(reply) => return Ok(reply),
             };
             let current = headers
                 .get(&header_name)
@@ -480,6 +501,40 @@ impl State {
             };
             value.set_sensitive(true);
             headers.insert(header_name, value);
+        }
+
+        // Header-setting bindings: the host supplies the whole value and it
+        // replaces whatever the guest sent, placeholder or not.
+        for binding in self.policy.header_bindings(host, parts.method.as_str()) {
+            let header_name = binding
+                .set_header
+                .as_deref()
+                .context("header binding without a header")?;
+            let secret = match self
+                .resolve(
+                    &binding.name,
+                    host,
+                    destination,
+                    parts.method.as_str(),
+                    &target,
+                )
+                .await?
+            {
+                Ok(secret) => secret,
+                Err(reply) => return Ok(reply),
+            };
+            let (Ok(name), Ok(mut value)) = (
+                header::HeaderName::from_bytes(header_name.as_bytes()),
+                header::HeaderValue::from_bytes(secret.as_bytes()),
+            ) else {
+                tracing::warn!(machine = %self.machine, binding = %binding.name, host, "credential value is not a valid header value");
+                return Ok(text(
+                    StatusCode::BAD_GATEWAY,
+                    "smolvm credentials: credential unavailable",
+                ));
+            };
+            value.set_sensitive(true);
+            headers.insert(name, value);
         }
 
         strip_hop_headers(&mut headers);
@@ -510,21 +565,7 @@ impl State {
     }
 }
 
-/// Headers a placeholder may never appear in: they steer routing or framing.
-const PROTECTED_HEADERS: &[&str] = &[
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "te",
-    "trailer",
-    "upgrade",
-    "proxy-authorization",
-    "proxy-authenticate",
-    "proxy-connection",
-    "cookie",
-];
+use smolvm_protocol::credentials::PROTECTED_HEADERS;
 
 /// Locate the single placeholder in the request headers.
 ///
@@ -790,7 +831,6 @@ mod tests {
     }
 
     async fn fixture_with_secret(secret: &str) -> Fixture {
-        let upstream = start_upstream().await;
         let policy = CredentialPolicy {
             credentials: vec![CredentialBinding {
                 name: "svc".into(),
@@ -798,11 +838,21 @@ mod tests {
                 allowed_hosts: vec![CRED_HOST.into()],
                 injection_location: InjectionLocation::default(),
                 methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+                set_header: None,
             }],
         };
+        fixture_with_policy(policy, CRED_HOST, StaticResolver::new().with("svc", secret)).await
+    }
+
+    async fn fixture_with_policy(
+        policy: CredentialPolicy,
+        ca_subtree: &str,
+        resolver: StaticResolver,
+    ) -> Fixture {
+        let upstream = start_upstream().await;
         let placeholders = crate::policy::generate_placeholders(&policy);
-        let placeholder = placeholders["svc"].clone();
-        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let placeholder = placeholders.values().next().cloned().unwrap_or_default();
+        let ca = MachineCa::generate("test-machine", &[ca_subtree.to_string()]).unwrap();
         let ca_pem = ca.certificate_pem().to_string();
         let interceptor = Interceptor::spawn(
             InterceptorConfig {
@@ -812,7 +862,7 @@ mod tests {
                 ca,
                 upstream_roots_pem: vec![upstream.cert_pem.clone()],
             },
-            Arc::new(StaticResolver::new().with("svc", secret)),
+            Arc::new(resolver),
         )
         .unwrap();
         Fixture {
@@ -876,6 +926,92 @@ mod tests {
         assert_eq!(
             seen,
             vec![("Bearer real-secret".to_string(), "/v1/me".to_string())]
+        );
+    }
+
+    /// A wildcard binding that sets `Authorization` on GETs only.
+    async fn header_fixture() -> Fixture {
+        let policy = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "git".into(),
+                environment_variable: String::new(),
+                allowed_hosts: vec!["*.credential.test".into()],
+                injection_location: InjectionLocation::default(),
+                methods: vec!["GET".into()],
+                set_header: Some("authorization".into()),
+            }],
+        };
+        fixture_with_policy(
+            policy,
+            "credential.test",
+            StaticResolver::new().with("git", "Basic aW5qZWN0ZWQ="),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sets_the_header_for_a_matching_host_replacing_the_guests() {
+        let f = header_fixture().await;
+        for guest_auth in ["Authorization: Bearer guest-chosen\r\n", ""] {
+            let request = format!(
+                "GET /repo.git/info/refs HTTP/1.1\r\nHost: {CRED_HOST}\r\n{guest_auth}Connection: close\r\n\r\n"
+            );
+            let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+                .await
+                .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "Basic aW5qZWN0ZWQ=".to_string(),
+                    "/repo.git/info/refs".to_string()
+                ),
+                (
+                    "Basic aW5qZWN0ZWQ=".to_string(),
+                    "/repo.git/info/refs".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sets_no_header_for_a_method_the_binding_does_not_allow() {
+        let f = header_fixture().await;
+        let request = format!(
+            "POST /repo.git/git-receive-pack HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer guest-chosen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(seen[0].0, "Bearer guest-chosen");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unresolvable_header_value_fails_closed() {
+        let policy = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "git".into(),
+                environment_variable: String::new(),
+                allowed_hosts: vec![CRED_HOST.into()],
+                injection_location: InjectionLocation::default(),
+                methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+                set_header: Some("authorization".into()),
+            }],
+        };
+        let f = fixture_with_policy(policy, CRED_HOST, StaticResolver::new()).await;
+        let request = format!("GET / HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(
+            f.upstream.seen.lock().unwrap().is_empty(),
+            "nothing reached upstream"
         );
     }
 

@@ -127,7 +127,7 @@ impl EmbeddedRuntime {
         user: Option<String>,
     ) -> Result<()> {
         self.with_name_lock(&spec.name, || {
-            control::create_vm_with_workload(&self.db, &spec, env, workdir, user)
+            control::create_vm_with_workload(&self.db, &spec, env, workdir, user, None)
         })
     }
 
@@ -140,6 +140,30 @@ impl EmbeddedRuntime {
         policy: &crate::data::network::EgressPolicy,
     ) -> Result<()> {
         self.with_name_lock(name, || control::set_egress_policy(&self.db, name, policy))
+    }
+
+    /// [`Self::create_machine_with_workload`], plus credential bindings: HTTPS
+    /// requests to each binding's hosts carry a value the host holds and the
+    /// guest never sees (see `docs/credential-substitution.md`). The policy
+    /// holds no values; supply them with [`Self::supply_credential_values`].
+    pub fn create_machine_with_credentials(
+        &self,
+        spec: MachineSpec,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        user: Option<String>,
+        credentials: crate::credentials::CredentialPolicy,
+    ) -> Result<()> {
+        self.with_name_lock(&spec.name, || {
+            control::create_vm_with_workload(
+                &self.db,
+                &spec,
+                env,
+                workdir,
+                user,
+                Some(&credentials),
+            )
+        })
     }
 
     /// Capture a running checkpointable machine into a portable artifact.
@@ -1222,8 +1246,10 @@ impl EmbeddedRuntime {
     /// Hold credential values for `name`'s next boots, by binding name, in
     /// this process's memory only: never on disk, in a boot config or in a
     /// checkpoint. A binding without one resolves from this process's own
-    /// variable of the binding's name. Supply them before the start that
-    /// should use them.
+    /// variable of the binding's name, except on a machine made with
+    /// [`Self::create_machine_with_credentials`], which uses only what is
+    /// supplied. A branch uses its golden's values until it is given its own.
+    /// Supply them before the start that should use them.
     pub fn supply_credential_values(
         &self,
         name: &str,

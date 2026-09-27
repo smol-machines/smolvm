@@ -43,6 +43,27 @@ pub fn prepare_policy(
     Ok(smolvm_credentials::generate_placeholders(policy))
 }
 
+/// Require every binding to name the variable its value is read from, for a
+/// machine whose values come from this host (the CLI) rather than being
+/// supplied by an embedder or API caller. A binding naming none could never be
+/// resolved and would fail every request to its hosts.
+pub fn require_host_sources(policy: &CredentialPolicy) -> Result<()> {
+    match policy
+        .credentials
+        .iter()
+        .find(|b| b.environment_variable.is_empty())
+    {
+        Some(binding) => Err(Error::config(
+            "credentials",
+            format!(
+                "credential {:?} names no environment_variable to read its value from",
+                binding.name
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Split a workload's secret references from its credential environment. A
 /// variable bound to a credential never carries plaintext into the guest: its
 /// reference feeds the interceptor, and the guest gets the placeholder plus
@@ -161,11 +182,16 @@ impl CredentialLaunch {
         if MachineCa::exists(&self.ca_dir) {
             return Ok(());
         }
+        // A wildcard's parent is the subtree the CA may sign in; the name
+        // constraint on it already covers every subdomain.
         let hosts: Vec<String> = self
             .policy
             .credentials
             .iter()
-            .flat_map(|binding| binding.allowed_hosts.iter().cloned())
+            .flat_map(|binding| binding.allowed_hosts.iter())
+            .map(|host| smolvm_protocol::credentials::host_subtree(host).to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         MachineCa::generate(&self.ca_owner, &hosts)
             .and_then(|ca| ca.save(&self.ca_dir))
@@ -240,7 +266,10 @@ impl CredentialLaunch {
     /// removed, so it resolves to nothing rather than to a host variable.
     pub fn child_env(&mut self) -> Vec<(String, Option<zeroize::Zeroizing<String>>)> {
         let held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
-        let supplied = held.get(&self.machine);
+        // A branch uses its golden's values unless some were supplied for the
+        // branch itself: it restores guest state that already relies on them,
+        // and its own name is new to whoever supplied the golden's.
+        let supplied = held.get(&self.machine).or_else(|| held.get(&self.ca_owner));
         let mut env = Vec::new();
         for (index, binding) in self.policy.credentials.iter().enumerate() {
             let value = supplied
@@ -300,6 +329,7 @@ pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBindin
             .iter()
             .map(|m| m.to_string())
             .collect(),
+        set_header: None,
     })
 }
 
@@ -364,6 +394,46 @@ mod tests {
         assert!(!serde_json::to_string(&l).unwrap().contains("value-a"));
         forget_values(machine);
         assert!(launch(machine, false).child_env().is_empty());
+    }
+
+    #[test]
+    fn a_branch_uses_its_goldens_values_until_given_its_own() {
+        let golden = "cred-test-golden";
+        let clone = "cred-test-golden-branch";
+        supply_values(
+            golden,
+            [(
+                "a".to_string(),
+                zeroize::Zeroizing::new("golden-a".to_string()),
+            )]
+            .into(),
+        );
+        let policy = CredentialPolicy {
+            credentials: vec![parse_credential_flag("a=A_KEY@api.a.com").unwrap()],
+        };
+        let mut l = CredentialLaunch::from_parts(
+            clone,
+            &policy,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(golden),
+        )
+        .unwrap();
+        l.supplied_only = true;
+        let env = l.child_env();
+        assert_eq!(env[0].1.as_deref().map(String::as_str), Some("golden-a"));
+        supply_values(
+            clone,
+            [(
+                "a".to_string(),
+                zeroize::Zeroizing::new("branch-a".to_string()),
+            )]
+            .into(),
+        );
+        let env = l.child_env();
+        assert_eq!(env[0].1.as_deref().map(String::as_str), Some("branch-a"));
+        forget_values(golden);
+        forget_values(clone);
     }
 
     #[test]

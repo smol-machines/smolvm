@@ -591,6 +591,7 @@ pub fn params_secret_env(params: &CreateVmParams) -> smolvm::Result<Vec<(String,
 /// ahead of boot. No-op without a policy.
 pub fn prepare_params_credentials(params: &mut CreateVmParams) -> smolvm::Result<()> {
     if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
+        smolvm::credentials::require_host_sources(policy)?;
         if params.credential_placeholders.is_empty() {
             params.credential_placeholders =
                 smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?;
@@ -819,6 +820,7 @@ pub(crate) fn build_vm_record_for(
     record.docker_socket = params.docker_socket;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
+        smolvm::credentials::require_host_sources(policy)?;
         record.credential_placeholders = if params.credential_placeholders.is_empty() {
             smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?
         } else {

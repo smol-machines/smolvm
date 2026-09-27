@@ -85,10 +85,13 @@ pub struct CredentialBinding {
     /// Binding name handed to the resolver. Scoped by the caller, never a
     /// storage identifier.
     pub name: String,
-    /// Guest environment variable that receives the placeholder.
+    /// Guest environment variable that receives the placeholder. May be empty
+    /// for a binding that only sets a header (see [`Self::set_header`]).
+    #[serde(default)]
     pub environment_variable: String,
-    /// Exact DNS hosts (lowercase, no wildcard, no scheme or port) the
-    /// credential may be sent to.
+    /// Hosts the credential may be sent to: exact lowercase DNS names, or a
+    /// whole-label wildcard (`*.example.com`) matching every subdomain but not
+    /// `example.com` itself. No scheme, port or IP.
     pub allowed_hosts: Vec<String>,
     /// Where substitution happens.
     #[serde(default)]
@@ -97,6 +100,13 @@ pub struct CredentialBinding {
     /// method; narrow it for read-only tokens.
     #[serde(default = "default_methods")]
     pub methods: Vec<String>,
+    /// Set this request header to the credential's value on every request to
+    /// an allowed host with an allowed method, replacing whatever the guest
+    /// sent. The value is the whole header value (`Bearer …`, `Basic …`). The
+    /// guest needs no placeholder and never learns the value — the shape of a
+    /// firewall that brokers credentials by domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_header: Option<String>,
 }
 
 fn default_methods() -> Vec<String> {
@@ -106,10 +116,9 @@ fn default_methods() -> Vec<String> {
 impl CredentialBinding {
     /// Whether this binding permits substitution toward `host`.
     pub fn allows_host(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.');
         self.allowed_hosts
             .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(host))
+            .any(|allowed| host_matches(allowed, host))
     }
 
     /// Whether this binding permits `method`.
@@ -163,7 +172,9 @@ impl CredentialPolicy {
                     "credential name {name:?} is not a valid binding name"
                 ));
             }
-            if !valid_env_name(env_var) {
+            // A header-setting binding needs no placeholder, so no variable.
+            let env_optional = binding.set_header.is_some() && env_var.is_empty();
+            if !env_optional && !valid_env_name(env_var) {
                 return refuse(format!(
                     "credential environment variable {env_var:?} is not a valid name"
                 ));
@@ -171,10 +182,22 @@ impl CredentialPolicy {
             if !names.insert(name.as_str()) {
                 return refuse(format!("credential {name:?} is declared twice"));
             }
-            if !env_vars.insert(env_var.as_str()) {
+            if !env_optional && !env_vars.insert(env_var.as_str()) {
                 return refuse(format!(
                     "environment variable {env_var:?} is bound to more than one credential"
                 ));
+            }
+            if let Some(header) = &binding.set_header {
+                if !valid_header_name(header) {
+                    return refuse(format!(
+                        "credential {name:?} set_header {header:?} must be a lowercase HTTP header name"
+                    ));
+                }
+                if PROTECTED_HEADERS.contains(&header.as_str()) {
+                    return refuse(format!(
+                        "credential {name:?} may not set {header:?}, a routing or framing header"
+                    ));
+                }
             }
             if binding.allowed_hosts.is_empty() {
                 return refuse(format!(
@@ -182,9 +205,10 @@ impl CredentialPolicy {
                 ));
             }
             for host in &binding.allowed_hosts {
-                if !valid_exact_host(host) {
+                if !valid_host_pattern(host) {
                     return refuse(format!(
-                        "credential {name:?} host {host:?} must be an exact lowercase DNS name (no wildcard, scheme, port or IP)"
+                        "credential {name:?} host {host:?} must be a lowercase DNS name, optionally \
+                         `*.` plus a name with at least two labels (no scheme, port or IP)"
                     ));
                 }
                 if network_allowed_hosts
@@ -211,7 +235,38 @@ impl CredentialPolicy {
                 return refuse(format!("credential {name:?} enables no injection location"));
             }
         }
+        // Two bindings setting the same header for the same host would leave
+        // which value is sent up to declaration order; refuse the ambiguity.
+        for (i, a) in self.credentials.iter().enumerate() {
+            for b in &self.credentials[i + 1..] {
+                let (Some(ha), Some(hb)) = (&a.set_header, &b.set_header) else {
+                    continue;
+                };
+                let overlap = ha == hb
+                    && a.allowed_hosts
+                        .iter()
+                        .any(|x| b.allowed_hosts.iter().any(|y| patterns_overlap(x, y)));
+                if overlap {
+                    return refuse(format!(
+                        "credentials {:?} and {:?} both set {ha:?} for the same host",
+                        a.name, b.name
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Bindings that set a header toward `host` for `method`, in declaration
+    /// order.
+    pub fn header_bindings<'a>(
+        &'a self,
+        host: &'a str,
+        method: &'a str,
+    ) -> impl Iterator<Item = &'a CredentialBinding> + 'a {
+        self.credentials.iter().filter(move |b| {
+            b.set_header.is_some() && b.allows_host(host) && b.allows_method(method)
+        })
     }
 
     /// Bindings permitted to substitute toward `host`, in declaration order.
@@ -234,19 +289,78 @@ impl CredentialPolicy {
         &'a self,
         placeholders: &'a BTreeMap<String, String>,
     ) -> impl Iterator<Item = (String, String)> + 'a {
-        self.credentials.iter().filter_map(move |b| {
-            placeholders
-                .get(&b.name)
-                .map(|p| (b.environment_variable.clone(), p.clone()))
-        })
+        self.credentials
+            .iter()
+            .filter(|b| !b.environment_variable.is_empty())
+            .filter_map(move |b| {
+                placeholders
+                    .get(&b.name)
+                    .map(|p| (b.environment_variable.clone(), p.clone()))
+            })
+    }
+}
+
+/// Whether a credential host pattern (an exact name, or `*.` plus a name for
+/// every subdomain of it) matches `host`.
+pub fn host_matches(pattern: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    match pattern.strip_prefix("*.") {
+        Some(parent) => host.len() > parent.len() + 1 && host.ends_with(&format!(".{parent}")),
+        None => pattern.eq_ignore_ascii_case(&host),
+    }
+}
+
+/// The DNS subtree a credential host pattern lives in: the name itself, or a
+/// wildcard's parent. Used to name-constrain the machine CA and to check the
+/// pattern against the network allow-list.
+pub fn host_subtree(pattern: &str) -> &str {
+    pattern.strip_prefix("*.").unwrap_or(pattern)
+}
+
+/// Headers a credential may never be placed in: they steer routing or framing,
+/// or (cookies) carry state the credential must not be mixed into.
+pub const PROTECTED_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "proxy-connection",
+    "cookie",
+];
+
+/// Whether two host patterns can match the same host.
+fn patterns_overlap(a: &str, b: &str) -> bool {
+    match (a.strip_prefix("*."), b.strip_prefix("*.")) {
+        (None, None) => a == b,
+        (Some(_), None) => host_matches(a, b),
+        (None, Some(_)) => host_matches(b, a),
+        (Some(pa), Some(pb)) => {
+            pa == pb || pa.ends_with(&format!(".{pb}")) || pb.ends_with(&format!(".{pa}"))
+        }
     }
 }
 
 /// Whether `host` is admitted by a legacy or opt-in network allow-list entry.
 pub fn covered_by_allow_list(host: &str, allowed: &[String]) -> bool {
-    allowed
-        .iter()
-        .any(|pattern| crate::host_pattern::matches(host, pattern))
+    match host.strip_prefix("*.") {
+        // A wildcard binding reaches every name under its parent, so only an
+        // entry admitting that whole subtree covers it; an exact entry never does.
+        Some(parent) => allowed.iter().any(|entry| {
+            let subtree = entry
+                .strip_prefix("*.")
+                .or_else(|| (!entry.starts_with('=')).then_some(entry.as_str()));
+            subtree.is_some_and(|subtree| crate::host_pattern::matches(parent, subtree))
+        }),
+        None => allowed
+            .iter()
+            .any(|pattern| crate::host_pattern::matches(host, pattern)),
+    }
 }
 
 fn valid_binding_name(name: &str) -> bool {
@@ -263,6 +377,39 @@ fn valid_env_name(name: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
         && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+fn valid_host_pattern(host: &str) -> bool {
+    match host.strip_prefix("*.") {
+        // `*.com` would cover a whole public suffix.
+        Some(parent) => valid_exact_host(parent) && parent.contains('.'),
+        None => valid_exact_host(host),
+    }
+}
+
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|c| {
+            c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || matches!(
+                    c,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn valid_exact_host(host: &str) -> bool {
@@ -292,6 +439,7 @@ mod tests {
             allowed_hosts: vec!["api.notion.com".into()],
             injection_location: InjectionLocation::default(),
             methods: default_methods(),
+            set_header: None,
         }
     }
 
@@ -326,10 +474,30 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_credential_host_needs_its_whole_subtree_allowed() {
+        let mut b = notion();
+        b.allowed_hosts = vec!["*.notion.com".to_string()];
+        let policy = CredentialPolicy {
+            credentials: vec![b],
+        };
+        for allowed in ["notion.com", "*.notion.com", "*.com"] {
+            policy.validate(Some(&[allowed.to_string()])).unwrap();
+        }
+        for allowed in ["=notion.com", "api.notion.com", "*.api.notion.com"] {
+            assert!(
+                policy.validate(Some(&[allowed.to_string()])).is_err(),
+                "{allowed:?} accepted"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_empty_wildcard_and_ip_hosts() {
         for host in [
             "",
-            "*.notion.com",
+            "*.com",
+            "*",
+            "api.*.com",
             "10.0.0.1",
             "API.notion.com",
             "notion.com:443",
@@ -423,5 +591,112 @@ mod tests {
         assert!(policy
             .bindings_for_host("api.github.com")
             .all(|b| b.name == "github"));
+    }
+
+    fn header_setter(name: &str, header: &str, hosts: &[&str]) -> CredentialBinding {
+        CredentialBinding {
+            name: name.into(),
+            environment_variable: String::new(),
+            allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            injection_location: InjectionLocation::default(),
+            methods: default_methods(),
+            set_header: Some(header.into()),
+        }
+    }
+
+    #[test]
+    fn wildcards_match_subdomains_only() {
+        assert!(host_matches("*.github.com", "codeload.github.com"));
+        assert!(host_matches("*.github.com", "a.b.github.com"));
+        assert!(host_matches("*.github.com", "API.GitHub.com."));
+        assert!(!host_matches("*.github.com", "github.com"));
+        assert!(!host_matches("*.github.com", "evilgithub.com"));
+        assert!(host_matches("github.com", "GitHub.com"));
+        assert!(!host_matches("github.com", "api.github.com"));
+        let mut b = notion();
+        b.allowed_hosts = vec!["*.notion.com".into()];
+        let policy = CredentialPolicy {
+            credentials: vec![b],
+        };
+        policy.validate(None).unwrap();
+        policy.validate(Some(&["notion.com".to_string()])).unwrap();
+        assert!(policy
+            .validate(Some(&["api.notion.com".to_string()]))
+            .is_err());
+    }
+
+    #[test]
+    fn a_header_setter_needs_no_variable_and_gets_no_placeholder_env() {
+        let policy = CredentialPolicy {
+            credentials: vec![
+                header_setter("git", "authorization", &["github.com", "*.github.com"]),
+                notion(),
+            ],
+        };
+        policy.validate(None).unwrap();
+        let placeholders: BTreeMap<String, String> = [
+            ("git".to_string(), "SMOL_PLACEHOLDER_GIT_1".to_string()),
+            (
+                "notion".to_string(),
+                "SMOL_PLACEHOLDER_NOTION_2".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let env: Vec<_> = policy.guest_env(&placeholders).collect();
+        assert_eq!(env.len(), 1, "{env:?}");
+        assert_eq!(env[0].0, "NOTION_API_KEY");
+        let setters: Vec<_> = policy
+            .header_bindings("codeload.github.com", "GET")
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(setters, ["git"]);
+        assert_eq!(policy.header_bindings("api.notion.com", "GET").count(), 0);
+    }
+
+    #[test]
+    fn header_setters_are_refused_for_protected_or_conflicting_headers() {
+        for header in [
+            "host",
+            "cookie",
+            "content-length",
+            "Authorization",
+            "x y",
+            "",
+        ] {
+            let policy = CredentialPolicy {
+                credentials: vec![header_setter("a", header, &["api.a.com"])],
+            };
+            assert!(policy.validate(None).is_err(), "{header:?} accepted");
+        }
+        let conflicting = CredentialPolicy {
+            credentials: vec![
+                header_setter("a", "authorization", &["*.github.com"]),
+                header_setter("b", "authorization", &["api.github.com"]),
+            ],
+        };
+        assert!(conflicting
+            .validate(None)
+            .unwrap_err()
+            .0
+            .contains("same host"));
+        let distinct = CredentialPolicy {
+            credentials: vec![
+                header_setter("a", "authorization", &["api.github.com"]),
+                header_setter("b", "authorization", &["api.notion.com"]),
+                header_setter("c", "x-api-key", &["api.github.com"]),
+            ],
+        };
+        distinct.validate(None).unwrap();
+    }
+
+    #[test]
+    fn a_placeholder_binding_still_needs_its_variable() {
+        let mut b = notion();
+        b.environment_variable.clear();
+        let policy = CredentialPolicy {
+            credentials: vec![b],
+        };
+        assert!(policy.validate(None).is_err());
     }
 }
