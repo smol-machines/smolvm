@@ -692,6 +692,7 @@ impl PackCreateCmd {
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,
+                egress_rules: Vec::new(),
             },
         )?;
         let mut guard = PackVmGuard {

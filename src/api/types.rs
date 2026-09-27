@@ -117,6 +117,10 @@ pub struct ResourceSpec {
     /// Omit for unrestricted egress. Empty list denies all egress.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Ordered transport, CIDR and port rules applied before legacy egress policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     /// Allowed egress hostnames. When set, DNS answers for these names (and their
     /// subdomains) are learned into the egress allow-list so the machine can reach
     /// them by name. Combine with `allowed_cidrs` to also permit fixed ranges.
@@ -628,6 +632,10 @@ pub struct CreateMachineRequest {
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Ordered host-enforced L4 egress rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     /// Allowed egress hostnames (and their subdomains); DNS answers for these
     /// names are learned into the egress allow-list.
     #[serde(default)]
@@ -748,6 +756,10 @@ pub struct MachineInfo {
     /// Allowed egress CIDRs. Omitted when unrestricted; an empty list denies all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Ordered host-enforced L4 egress rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     /// Allowed egress hostnames. Omitted when unset. Echoes back what `create` accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
@@ -868,6 +880,33 @@ impl From<crate::agent::EgressDenial> for EgressDenialInfo {
 pub struct EgressEventsResponse {
     /// Denials oldest-first, capped by the `limit` query parameter.
     pub events: Vec<EgressDenialInfo>,
+}
+
+/// One host-observed mediated egress decision.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MediationDecisionEvent {
+    /// Unix epoch milliseconds when the decision was recorded.
+    pub timestamp_ms: u64,
+    /// Host-minted identity for this VM launch.
+    pub machine_id: String,
+    /// Host-minted identity of the branch source, or all zeros.
+    pub parent_id: String,
+    /// TCP, UDP, ICMP, or DNS.
+    pub transport: String,
+    /// Allow, deny, or redirect.
+    pub action: String,
+    /// Guest-requested destination or DNS hostname.
+    pub destination: String,
+    /// Local policy, broker decision, or broker unavailability.
+    pub reason: String,
+}
+
+/// Bounded list of mediated egress decisions.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MediationEventsResponse {
+    /// Events oldest-first, capped by the `limit` query parameter.
+    pub events: Vec<MediationDecisionEvent>,
 }
 
 /// List machines response.
@@ -1008,6 +1047,9 @@ pub struct ExternalInterceptorSpec {
     #[serde(deserialize_with = "deserialize_interceptor_token")]
     #[schema(value_type = String)]
     pub token: crate::secrets::Secret,
+    /// Use the versioned mediated protocol with host-minted launch identity.
+    #[serde(default)]
+    pub mediated: bool,
 }
 
 fn deserialize_interceptor_token<'de, D>(

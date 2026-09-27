@@ -721,14 +721,13 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         published_sockets: &config.published_sockets,
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         extra_disks: &config.extra_disks,
-        dns_filter_enabled: config
-            .dns_filter_hosts
-            .as_ref()
-            .is_some_and(|hosts| !hosts.is_empty()),
+        dns_filter_enabled: config.dns_filter_hosts.as_ref().is_some(),
         egress_refresh_hosts: config.dns_filter_hosts.clone(),
         pod_net: pod_net_launch,
         credentials: config.credentials.as_ref(),
         external_interceptor: config.external_interceptor,
+        mediated_egress: config.mediated_egress,
+        mediated_parent_id: config.mediated_parent_id,
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

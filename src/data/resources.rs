@@ -95,6 +95,9 @@ pub struct VmResources {
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Ordered L4 flow rules, evaluated before the legacy CIDR/hostname policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     /// Custom DNS resolver for the guest. None = backend default.
     ///
     /// Under TSI this becomes the guest's `/etc/resolv.conf` nameserver (the
@@ -193,6 +196,7 @@ impl Default for VmResources {
             block_io: BlockIoEngine::Sync,
             disks: Vec::new(),
             allowed_cidrs: None,
+            egress_rules: Vec::new(),
             dns: None,
             network_name: None,
             guest_subnet: None,

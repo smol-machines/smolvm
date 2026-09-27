@@ -3304,6 +3304,7 @@ dependencies = [
  "humantime",
  "libc",
  "polling",
+ "serde_json",
  "smoltcp",
  "smolvm-protocol",
  "socket2",

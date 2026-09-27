@@ -585,6 +585,7 @@ impl PackRunCmd {
                 .egress
                 .as_ref()
                 .and_then(|policy| policy.allowed_cidrs.clone()),
+            egress_rules: Vec::new(),
         };
         validate_requested_network_backend(
             &resources,
@@ -723,6 +724,8 @@ impl PackRunCmd {
                 pod_netns: None,
                 credentials: None,
                 external_interceptor: None,
+                mediated_egress: false,
+                mediated_parent_id: [0; 16],
             };
 
             let config_path = runtime_dir.path().join("boot-config.json");
@@ -1778,6 +1781,7 @@ fn run_from_cache(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
+        egress_rules: Vec::new(),
     };
     validate_requested_network_backend(&resources, None, ports.len())?;
 
@@ -1872,6 +1876,8 @@ fn run_from_cache(
             pod_netns: None,
             credentials: None,
             external_interceptor: None,
+            mediated_egress: false,
+            mediated_parent_id: [0; 16],
         };
         let config_path = runtime_dir.path().join("boot-config.json");
         let config_json = serde_json::to_vec(&boot_config)
@@ -2215,6 +2221,7 @@ fn daemon_start(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
+        egress_rules: Vec::new(),
     };
     validate_requested_network_backend(&resources, None, ports.len())?;
 

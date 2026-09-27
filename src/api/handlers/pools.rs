@@ -561,6 +561,11 @@ pub async fn create_pool(
         .lookup_vm(&req.golden)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", req.golden)))?;
+    if golden.mediated_egress_required {
+        return Err(ApiError::BadRequest(
+            "a mediated source cannot supply pool workers because pools cannot bind a per-worker interceptor".into(),
+        ));
+    }
     if golden.golden.is_some() {
         return Err(ApiError::Conflict(
             "a fork clone cannot be used as a pool golden".into(),
