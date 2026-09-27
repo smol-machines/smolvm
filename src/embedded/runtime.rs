@@ -1,6 +1,6 @@
 //! Process-local runtime registry for embedded machines.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -52,8 +52,64 @@ impl EmbeddedRuntime {
         user: Option<String>,
     ) -> Result<()> {
         self.with_name_lock(&spec.name, || {
-            control::create_vm_with_workload(&self.db, &spec, env, workdir, user)
+            control::create_vm_with_workload(&self.db, &spec, env, workdir, user, None)
         })
+    }
+
+    /// [`Self::create_machine_with_workload`], plus credential bindings: HTTPS
+    /// requests to each binding's hosts carry a value the host holds and the
+    /// guest never sees (see `docs/credential-substitution.md`). The policy
+    /// holds no values; supply them with [`Self::supply_credential_values`].
+    pub fn create_machine_with_credentials(
+        &self,
+        spec: MachineSpec,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        user: Option<String>,
+        credentials: crate::credentials::CredentialPolicy,
+    ) -> Result<()> {
+        self.with_name_lock(&spec.name, || {
+            control::create_vm_with_workload(
+                &self.db,
+                &spec,
+                env,
+                workdir,
+                user,
+                Some(&credentials),
+            )
+        })
+    }
+
+    /// Hold the values of `name`'s credential bindings (binding name →
+    /// value) in this process, replacing any held before. They are never
+    /// written anywhere, and take effect when the machine next starts. A
+    /// branch of `name` uses them too unless values are supplied for the
+    /// branch itself. An empty map forgets them.
+    pub fn supply_credential_values(
+        &self,
+        name: &str,
+        values: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let record = control::get_record(&self.db, name)?;
+        let bindings: Vec<&str> = record
+            .credential_policy
+            .iter()
+            .flat_map(|policy| policy.credentials.iter().map(|b| b.name.as_str()))
+            .collect();
+        if let Some(unknown) = values.keys().find(|k| !bindings.contains(&k.as_str())) {
+            return Err(Error::config(
+                "credential values",
+                format!("machine '{name}' has no credential binding '{unknown}'"),
+            ));
+        }
+        crate::credentials::supply_values(
+            name,
+            values
+                .into_iter()
+                .map(|(k, v)| (k, zeroize::Zeroizing::new(v)))
+                .collect(),
+        );
+        Ok(())
     }
 
     /// Capture a running checkpointable machine into a portable artifact.
@@ -805,9 +861,10 @@ impl EmbeddedRuntime {
         &self,
         name: &str,
         command: Vec<String>,
-        options: ExecOptions,
+        mut options: ExecOptions,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+        self.add_credential_env(name, &mut options)?;
         let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
         let mut client = self.command_client(name)?;
         match config {
@@ -1015,6 +1072,19 @@ impl EmbeddedRuntime {
     /// The machine's image, if it is an image (container-workload) machine.
     /// Streamed execs on such a machine must run inside its persistent container
     /// overlay so their writes survive — matching non-streaming exec.
+    /// Give a command on a credentialed machine the placeholders and CA
+    /// variables its HTTP clients need, as every CLI and API command gets. The
+    /// caller's own variables come last, so they can override.
+    fn add_credential_env(&self, name: &str, options: &mut ExecOptions) -> Result<()> {
+        let record = control::get_record(&self.db, name)?;
+        let mut env = crate::credentials::record_guest_env(&record);
+        if !env.is_empty() {
+            env.append(&mut options.env);
+            options.env = env;
+        }
+        Ok(())
+    }
+
     fn image_and_overlay_owner(&self, name: &str) -> Result<(Option<String>, String)> {
         let record = control::get_record(&self.db, name)?;
         let overlay_owner = crate::workload::persistent_overlay_owner_with_lineage(
@@ -1071,11 +1141,12 @@ impl EmbeddedRuntime {
         &self,
         name: &str,
         command: Vec<String>,
-        options: ExecOptions,
+        mut options: ExecOptions,
         cancel: &ExecCancel,
         on_event: F,
     ) -> Result<()> {
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+        self.add_credential_env(name, &mut options)?;
         let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
         if cancel.is_cancelled() {
             return Ok(());

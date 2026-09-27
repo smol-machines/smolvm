@@ -21,6 +21,9 @@ smolvm machine exec --name notes -- sh -c \
 The same placeholder sent anywhere else — another host, a query string, a
 request body — is refused or travels as the literal placeholder string.
 
+A binding can instead set a header outright, so the guest needs no
+placeholder at all (see [Setting a header](#setting-a-header)).
+
 ## Declaring bindings
 
 A binding names a credential, the guest variable that receives its
@@ -55,13 +58,45 @@ API (`POST /v1/machines`): the same object under `credentials`, with
 
 Rules checked at create:
 
-- `allowed_hosts` are exact lowercase DNS names — no wildcards, IPs, schemes or
-  ports — and the list must be non-empty. A credential is never sent anywhere
-  by default.
+- `allowed_hosts` are lowercase DNS names, or a whole-label wildcard
+  `*.example.com` that matches every subdomain of `example.com` but not
+  `example.com` itself (list both to cover both). No IPs, schemes, ports or
+  `*.com`-style public-suffix wildcards, and the list must be non-empty. A
+  credential is never sent anywhere by default.
 - When the machine also has `allow_hosts`, every credential host must fall
   under it. Widening the machine's network never widens a credential, and a
   credential never grants reachability the network does not.
 - Binding names and environment variables are unique within a machine.
+
+## Setting a header
+
+A binding with `set_header` sets that request header to the credential's
+value on every request to its hosts with its methods, replacing whatever the
+guest sent. The value is the whole header value, `Bearer …` or `Basic …`
+included. The guest needs no placeholder and holds nothing: this is the shape
+of a firewall that brokers credentials by domain, for clients you cannot
+point at a placeholder (a `git clone` of a private repository, say).
+
+```toml
+[[network.credentials]]
+name = "github"
+environment_variable = "GITHUB_BASIC_AUTH"   # host variable holding "Basic …"
+allowed_hosts = ["github.com", "*.github.com"]
+set_header = "authorization"
+methods = ["GET", "POST"]
+```
+
+- `set_header` is a lowercase header name. Routing, framing and cookie
+  headers (`host`, `content-length`, `transfer-encoding`, `connection`,
+  `cookie`, …) are refused.
+- A request whose method the binding does not allow is forwarded without the
+  header, as the guest sent it.
+- Two bindings may not set the same header for hosts that overlap.
+- If the value cannot be resolved the request fails with a `502` rather than
+  going out without it.
+- `environment_variable` still names where the CLI reads the value from, and
+  still receives a (then unused) placeholder in the guest. A binding whose
+  values are supplied by an API caller or embedder may omit it.
 
 ## Where the value comes from
 
@@ -79,6 +114,13 @@ needs no restart, and nothing is cached across requests.
 [secrets]
 NOTION_API_KEY = { from_file = "/run/secrets/notion" }   # rotated in place, read per request
 ```
+
+Machines created over the HTTP API take their values only from
+`PUT /api/v1/machines/{name}/credential-values`. Machines created through the
+embedded runtime (`create_machine_with_credentials`) take them only from
+`supply_credential_values`. Neither ever falls back to this host's
+environment. Supplied values are held in the supplying process's memory,
+never written anywhere, and take effect when the machine next starts.
 
 Embedders resolve however they like: the engine asks a `CredentialResolver`
 with the machine name, binding name, destination host and port, method and
@@ -140,11 +182,12 @@ A request to an allowed host that carries no placeholder is forwarded as is.
 CA, so processes restored from the snapshot keep working without restarting.
 Each child resolves under its own machine name: a resolver can hand different
 values to different branches, or refuse one branch, without touching the rest.
+Values supplied for the golden (over the API or the embedded runtime) are used
+by its branches too, until values are supplied for a branch itself.
 
-Placeholders and the policy travel with portable checkpoints. Restoring on a
-different host regenerates the CA, so already-running processes captured in
-the checkpoint distrust the interceptor until they restart; new processes are
-fine.
+Placeholders, the policy and the CA travel with portable checkpoints, so
+processes captured in a checkpoint keep trusting the interceptor after a
+restore. Values never travel: supply them again for the restored machine.
 
 ## Backends and limits
 
