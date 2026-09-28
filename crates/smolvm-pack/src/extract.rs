@@ -1437,6 +1437,16 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the pack at `sidecar_path` carries image layers that its extracted
+/// entry at `cache_dir` no longer holds. A VM-mode pack carries none, so its
+/// empty `layers/` is never evicted. An unreadable manifest counts as not
+/// evicted: the marker then stands, as before.
+fn layers_evicted(sidecar_path: &Path, cache_dir: &Path) -> bool {
+    crate::packer::read_manifest_from_sidecar(sidecar_path)
+        .is_ok_and(|manifest| !manifest.assets.layers.is_empty())
+        && !cached_layers_usable(cache_dir)
+}
+
 /// Smallest cache the default sizing will ever choose, and the fallback when the
 /// filesystem's capacity can't be read. This was the whole cap before it scaled.
 const PACK_CACHE_MIN_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -1765,6 +1775,18 @@ fn extract_sidecar_capped(
         .open(&lock_path)?;
 
     lock_file_exclusive(&lock_file)?;
+
+    // An entry whose image layers were removed after it was marked extracted
+    // (a cache cleaner, or an older engine's size eviction) can't boot, and its
+    // marker would block the re-extract that repairs it. Drop the marker and
+    // extract over the entry in place: the directory stays, because guests may
+    // still hold its other files.
+    if !force && is_extracted(cache_dir) && layers_evicted(sidecar_path, cache_dir) {
+        if debug {
+            eprintln!("debug: extracted entry lost its image layers; re-extracting");
+        }
+        fs::remove_file(cache_dir.join(EXTRACTION_MARKER))?;
+    }
 
     // Double-check inside the lock: another process may have completed
     // extraction while we were waiting for the lock.
@@ -4870,6 +4892,62 @@ mod tests {
         fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
         assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+    }
+
+    /// An entry that lost its image layers after extraction is repaired by the
+    /// next extraction instead of being trusted because of its marker; one
+    /// that still has them, and a pack without layers, are left alone.
+    #[test]
+    fn a_marked_entry_that_lost_its_layers_is_re_extracted() {
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("stub");
+        fs::write(&stub, b"#!/bin/sh\necho stub").unwrap();
+        let mut collector =
+            crate::assets::AssetCollector::new(temp.path().join("staging")).unwrap();
+        // A real tar: other tests may switch on host-side layer unpacking.
+        collector
+            .add_layer("sha256:abc123def456", &make_tar("hello", b"world"))
+            .unwrap();
+        let manifest = crate::format::PackManifest::new(
+            "test:latest".into(),
+            "sha256:test".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let packed = temp.path().join("packed");
+        crate::packer::Packer::new(manifest)
+            .with_stub(&stub)
+            .with_assets(collector)
+            .pack(&packed)
+            .unwrap();
+        let sidecar = packed.with_extension("smolmachine");
+        let footer = crate::packer::read_footer_from_sidecar(&sidecar).unwrap();
+        let root = temp.path().join("shared");
+
+        let entry = extract_sidecar_shared(&sidecar, &root, &footer, false).unwrap();
+        assert!(is_extracted(&entry) && cached_layers_usable(&entry));
+        let untouched = entry.join("untouched");
+        fs::write(&untouched, b"kept").unwrap();
+
+        // A cleaner removes the layers but leaves the marker.
+        for layer in fs::read_dir(entry.join("layers")).unwrap() {
+            let path = layer.unwrap().path();
+            if path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        assert!(is_extracted(&entry) && !cached_layers_usable(&entry));
+
+        extract_sidecar_shared(&sidecar, &root, &footer, false).unwrap();
+        assert!(is_extracted(&entry) && cached_layers_usable(&entry));
+        assert!(untouched.exists(), "the entry is repaired in place");
+
+        // A healthy entry is a no-op, as before.
+        fs::write(&untouched, b"still kept").unwrap();
+        extract_sidecar_shared(&sidecar, &root, &footer, false).unwrap();
+        assert_eq!(fs::read(&untouched).unwrap(), b"still kept");
     }
 
     #[test]
