@@ -83,6 +83,127 @@ pub enum InteractiveOutput {
     Stderr(Vec<u8>),
 }
 
+/// The input side of a channel-driven interactive session has closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputClosed;
+
+/// Sending half of a channel-driven interactive session's input.
+///
+/// The session loop waits in `poll()` on the agent socket, which a channel
+/// cannot interrupt: input queued while it waited was only noticed when the
+/// poll timed out, up to [`POLL_TIMEOUT_MS`] later. Every send therefore also
+/// writes one byte to a socket pair whose other end the loop polls beside the
+/// agent socket, so input is forwarded as soon as it arrives.
+///
+/// The channel is bounded: [`send`](Self::send) waits while the session has
+/// not taken earlier input, which is what carries the session's backpressure
+/// to whoever produces the input.
+#[derive(Clone)]
+pub struct InteractiveInputSender {
+    tx: tokio::sync::mpsc::Sender<InteractiveInput>,
+    #[cfg(unix)]
+    wake: Arc<UdsStream>,
+}
+
+/// Receiving half of a channel-driven interactive session's input; see
+/// [`InteractiveInputSender`].
+pub struct InteractiveInputReceiver {
+    rx: tokio::sync::mpsc::Receiver<InteractiveInput>,
+    #[cfg(unix)]
+    wake: UdsStream,
+}
+
+/// Create the two halves of a session's input channel, holding at most
+/// `capacity` events.
+pub fn interactive_input(
+    capacity: usize,
+) -> std::io::Result<(InteractiveInputSender, InteractiveInputReceiver)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+    #[cfg(unix)]
+    {
+        // Neither end may block: the sender runs on an async worker, and the
+        // receiver only reads after poll() says there is something to read.
+        let (sender_end, receiver_end) = UdsStream::pair()?;
+        sender_end.as_socket().set_nonblocking(true)?;
+        receiver_end.as_socket().set_nonblocking(true)?;
+        Ok((
+            InteractiveInputSender {
+                tx,
+                wake: Arc::new(sender_end),
+            },
+            InteractiveInputReceiver {
+                rx,
+                wake: receiver_end,
+            },
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok((
+            InteractiveInputSender { tx },
+            InteractiveInputReceiver { rx },
+        ))
+    }
+}
+
+impl InteractiveInputSender {
+    /// Queue one input event, waiting while the channel is full.
+    pub async fn send(&self, input: InteractiveInput) -> std::result::Result<(), InputClosed> {
+        self.tx.send(input).await.map_err(|_| InputClosed)?;
+        // A full wake buffer already holds a pending wake-up, so a failed
+        // write loses nothing.
+        #[cfg(unix)]
+        let _ = (&*self.wake).write(&[0]);
+        Ok(())
+    }
+}
+
+impl InteractiveInputReceiver {
+    /// The descriptor that becomes readable when input may be waiting, or -1
+    /// where sessions are not wired up (non-Unix hosts).
+    fn wake_fd(&self) -> crate::agent::terminal::Fd {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.wake.as_raw_fd()
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
+    }
+
+    /// Consume pending wake-ups. Returns `false` once every sender is gone, when
+    /// the descriptor reads as closed forever and must not be polled again.
+    fn drain_wake(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            let mut scratch = [0u8; 64];
+            loop {
+                match self.wake.read(&mut scratch) {
+                    Ok(0) => return false,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    // Nothing more to read for now.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+                    // A broken descriptor would report ready forever.
+                    Err(_) => return false,
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    fn try_recv(
+        &mut self,
+    ) -> std::result::Result<InteractiveInput, tokio::sync::mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
 // ============================================================================
 // Socket Timeout Constants
 // ============================================================================
@@ -2512,16 +2633,22 @@ impl AgentClient {
     /// [`Self::interactive_session`] — used to bridge a VM PTY to a remote
     /// WebSocket terminal without touching the host's terminal.
     ///
-    /// The loop polls only the vsock socket (input comes from the channel, not an
-    /// fd) and drains pending input each iteration. When `input` disconnects
-    /// (the remote peer hung up) it sends EOF once and keeps running until the
-    /// command exits — a shell reading its PTY exits on EOF.
+    /// The loop polls the vsock socket together with the input channel's wake-up
+    /// descriptor, so it forwards input the moment it is sent rather than at the
+    /// next poll timeout (see [`InteractiveInputSender`]), and drains pending
+    /// input each iteration. When every sender is gone (the remote peer hung
+    /// up) it returns at once: this runs on a dedicated connection, and dropping
+    /// it makes the agent kill the command.
+    ///
+    /// `poll_timeout_ms` bounds how long the loop waits when nothing happens;
+    /// production callers pass [`POLL_TIMEOUT_MS`].
     fn interactive_session_io<F>(
         &mut self,
         request: AgentRequest,
-        input: std::sync::mpsc::Receiver<InteractiveInput>,
+        mut input: InteractiveInputReceiver,
         mut on_output: F,
         op: &str,
+        poll_timeout_ms: i32,
     ) -> Result<i32>
     where
         F: FnMut(InteractiveOutput),
@@ -2542,6 +2669,7 @@ impl AgentClient {
         }
 
         let socket_fd = self.stream_raw_fd();
+        let mut wake_fd = input.wake_fd();
         let mut input_eof_sent = false;
 
         // Route channel input through the same writer as `interactive_session`.
@@ -2554,14 +2682,20 @@ impl AgentClient {
             }
             pump_frames(&writer, &mut pending)?;
 
-            // stdin_fd = -1 → poll() ignores it; only the socket drives readiness.
+            // The wake-up descriptor stands where a terminal's stdin would: input
+            // arriving on the channel interrupts the wait. -1 is ignored by poll().
             let poll_timeout = if pending.is_empty() {
-                POLL_TIMEOUT_MS
+                poll_timeout_ms
             } else {
                 BACKPRESSURE_POLL_TIMEOUT_MS
             };
-            let poll_result = poll_io(-1, socket_fd, poll_timeout)
+            let poll_result = poll_io(wake_fd, socket_fd, poll_timeout)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
+            if poll_result.stdin_ready && !input.drain_wake() {
+                // Every sender is gone; a closed descriptor would report ready
+                // forever. The channel says so below once it has been emptied.
+                wake_fd = -1;
+            }
 
             // Drain agent output first (prevents deadlock when its send buffer fills).
             if poll_result.socket_ready {
@@ -2614,8 +2748,8 @@ impl AgentClient {
                             input_eof_sent = true;
                         }
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         // Remote peer (WebSocket client) gone. Return immediately
                         // instead of waiting for the command to exit on its own.
                         // This method runs on a DEDICATED, disposable connection,
@@ -2644,7 +2778,7 @@ impl AgentClient {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         tty: bool,
-        input: std::sync::mpsc::Receiver<InteractiveInput>,
+        input: InteractiveInputReceiver,
         on_output: F,
     ) -> Result<i32>
     where
@@ -2665,6 +2799,7 @@ impl AgentClient {
             input,
             on_output,
             "vm exec interactive (io)",
+            POLL_TIMEOUT_MS,
         )
     }
 
@@ -2673,7 +2808,7 @@ impl AgentClient {
     pub fn run_interactive_io<F>(
         &mut self,
         config: RunConfig,
-        input: std::sync::mpsc::Receiver<InteractiveInput>,
+        input: InteractiveInputReceiver,
         on_output: F,
     ) -> Result<i32>
     where
@@ -2703,6 +2838,7 @@ impl AgentClient {
             input,
             on_output,
             "run interactive (io)",
+            POLL_TIMEOUT_MS,
         )
     }
 
@@ -4598,5 +4734,144 @@ mod flatten_timeout_tests {
                 );
             });
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod interactive_input_tests {
+    //! The channel-driven interactive session must forward input as soon as it is
+    //! sent, not when the poll loop next times out, and must carry a stream of
+    //! input through to the command without losing a byte.
+    use super::*;
+    use crate::agent::test_guest::FakeGuest;
+    use std::sync::mpsc;
+
+    /// Longer than any test waits: a session that only noticed input when this
+    /// timeout expired would fail every deadline below.
+    const NEVER_MS: i32 = 60_000;
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    fn request(command: &[&str]) -> AgentRequest {
+        AgentRequest::VmExec {
+            command: command.iter().map(|s| s.to_string()).collect(),
+            env: Vec::new(),
+            workdir: None,
+            timeout_ms: None,
+            interactive: true,
+            tty: false,
+            background: false,
+            stdin_data: None,
+        }
+    }
+
+    /// A session running `command` in the fake guest. Output arrives on the
+    /// returned channel; the session's result on the returned handle.
+    fn session(
+        command: &[&str],
+        capacity: usize,
+    ) -> (
+        InteractiveInputSender,
+        mpsc::Receiver<InteractiveOutput>,
+        std::thread::JoinHandle<Result<i32>>,
+        FakeGuest,
+    ) {
+        let (client_stream, guest_stream) = UdsStream::pair().unwrap();
+        let guest = FakeGuest::spawn(guest_stream);
+        let (input_tx, input_rx) = interactive_input(capacity).unwrap();
+        let (output_tx, output_rx) = mpsc::channel();
+        let request = request(command);
+        let handle = std::thread::spawn(move || {
+            AgentClient::from_stream(client_stream).interactive_session_io(
+                request,
+                input_rx,
+                move |output| {
+                    let _ = output_tx.send(output);
+                },
+                "test",
+                NEVER_MS,
+            )
+        });
+        (input_tx, output_rx, handle, guest)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn input_reaches_the_command_without_waiting_for_the_poll_timeout() {
+        let (input, output, session, guest) = session(&["cat"], 8);
+        let runtime = runtime();
+        for round in 0..5u8 {
+            runtime
+                .block_on(input.send(InteractiveInput::Stdin(vec![round; 100])))
+                .unwrap();
+            let mut echoed = Vec::new();
+            while echoed.len() < 100 {
+                match output.recv_timeout(DEADLINE).expect("the echo arrives") {
+                    InteractiveOutput::Stdout(data) => echoed.extend(data),
+                    other => panic!("unexpected output {other:?}"),
+                }
+            }
+            assert_eq!(echoed, vec![round; 100]);
+        }
+        runtime.block_on(input.send(InteractiveInput::Eof)).unwrap();
+        assert_eq!(session.join().unwrap().unwrap(), 0);
+        guest.finish();
+    }
+
+    #[test]
+    fn a_vanished_peer_ends_the_session_without_waiting_for_the_poll_timeout() {
+        let (input, _output, session, guest) = session(&["cat"], 8);
+        drop(input);
+        assert_eq!(session.join().unwrap().unwrap(), DISCONNECT_EXIT_CODE);
+        // The guest sees its connection close and kills the command.
+        guest.finish();
+    }
+
+    #[test]
+    fn a_long_stream_of_input_arrives_intact_under_backpressure() {
+        // Far more than the input queue and the writer queue hold, so the sender
+        // has to wait for the session, and the session for the command.
+        let total = 3 * 1024 * 1024;
+        let (input, output, session, guest) = session(&["cat"], 4);
+        let sender = std::thread::spawn(move || {
+            let runtime = runtime();
+            let mut sent = 0usize;
+            while sent < total {
+                let chunk: Vec<u8> = (0..60 * 1024).map(|i| ((sent + i) % 251) as u8).collect();
+                sent += chunk.len();
+                runtime
+                    .block_on(input.send(InteractiveInput::Stdin(chunk)))
+                    .unwrap();
+            }
+            runtime.block_on(input.send(InteractiveInput::Eof)).unwrap();
+            // A peer that hangs up ends the session at once, so this one stays
+            // until the command has finished and said so.
+            (sent, input)
+        });
+        let mut received = Vec::new();
+        loop {
+            match output.recv_timeout(DEADLINE) {
+                Ok(InteractiveOutput::Stdout(data)) => received.extend(data),
+                Ok(other) => panic!("unexpected output {other:?}"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("the stream stalled"),
+            }
+        }
+        let (sent, input) = sender.join().unwrap();
+        assert_eq!(session.join().unwrap().unwrap(), 0);
+        drop(input);
+        guest.finish();
+        assert_eq!(received.len(), sent);
+        assert!(
+            received
+                .iter()
+                .enumerate()
+                .all(|(i, byte)| *byte == (i % 251) as u8),
+            "bytes arrived out of order or changed"
+        );
     }
 }

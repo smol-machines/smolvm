@@ -424,24 +424,69 @@ pub async fn run_command(
     }))
 }
 
-/// Query parameters for an interactive PTY session.
+/// Query parameters for an interactive session.
 #[derive(Debug, serde::Deserialize)]
 pub struct InteractiveQuery {
-    /// Program to run (single argv[0]); defaults to `/bin/sh`.
+    /// Program to run (argv[0]); defaults to `/bin/sh`. Its arguments follow as
+    /// repeated `arg` parameters, in order.
     pub cmd: Option<String>,
-    /// Initial terminal width in columns.
+    /// Initial terminal width in columns (`tty=true` only).
     pub cols: Option<u16>,
-    /// Initial terminal height in rows.
+    /// Initial terminal height in rows (`tty=true` only).
     pub rows: Option<u16>,
+    /// Run the command on a PTY (the default). `tty=false` runs it on pipes
+    /// instead: a byte stream in both directions with nothing between them and
+    /// the command, no terminal line discipline, and stderr kept apart.
+    pub tty: Option<bool>,
 }
 
-/// Interactive PTY session over a WebSocket.
+/// Largest piece of a WebSocket message forwarded to the command as one stdin
+/// frame. The agent protocol carries stdin as JSON and bounds a frame, so a
+/// large message is split rather than ending the session.
+const STDIN_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Stdin events that may wait for the session to take them. Beyond this the
+/// WebSocket is no longer read, which pushes back on the client.
+const INPUT_QUEUE_EVENTS: usize = 64;
+
+/// The command an interactive session runs: the program, then every `arg`
+/// query parameter in the order given (an empty argument is an argument).
+fn interactive_command(
+    program: Option<String>,
+    parameters: Vec<(String, String)>,
+) -> Result<Vec<String>, ApiError> {
+    let mut command = vec![program.unwrap_or_else(|| "/bin/sh".to_string())];
+    if command[0].is_empty() {
+        return Err(ApiError::BadRequest("command cannot be empty".into()));
+    }
+    command.extend(
+        parameters
+            .into_iter()
+            .filter(|(name, _)| name == "arg")
+            .map(|(_, value)| value),
+    );
+    validate_command(&command)?;
+    Ok(command)
+}
+
+/// Interactive session over a WebSocket.
 ///
 /// The client connects a WebSocket; binary frames are forwarded to the
-/// command's stdin and the PTY's output is sent back as binary frames. A JSON
-/// text frame `{"type":"resize","cols":N,"rows":N}` resizes the terminal. When
-/// the command exits, a final text frame `{"type":"exit","code":N}` is sent
-/// before the socket closes.
+/// command's stdin and its output is sent back as binary frames. A JSON text
+/// frame `{"type":"resize","cols":N,"rows":N}` resizes the terminal. When the
+/// command exits, a final text frame `{"type":"exit","code":N}` is sent before
+/// the socket closes. Closing the socket ends the session, and the command is
+/// killed.
+///
+/// Query parameters: `cmd` is the program and each `arg` one argument to it;
+/// `tty` chooses between a PTY (the default, which merges stderr into stdout)
+/// and pipes.
+///
+/// With `tty=false` stdin is written with backpressure and nothing is ever
+/// dropped: the WebSocket is read only as fast as the command takes its input.
+/// Standard output is the binary frames, byte for byte. Standard error is
+/// reported as text frames `{"type":"stderr","data":"..."}` (lossily decoded
+/// as UTF-8), so it never mixes into the stream.
 ///
 /// Image machines run the program in their persistent-overlay container (the
 /// same filesystem `exec` uses); plain machines run it directly in the VM.
@@ -449,9 +494,13 @@ pub async fn exec_interactive(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(q): Query<InteractiveQuery>,
+    Query(parameters): Query<Vec<(String, String)>>,
     _trace_id: Option<axum::Extension<TraceId>>,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, ApiError> {
+    let command = interactive_command(q.cmd.clone(), parameters)?;
+    let tty = q.tty.unwrap_or(true);
+
     let entry = state.get_machine(&id)?;
     ensure_running_and_persist(&state, &id, &entry)
         .await
@@ -463,7 +512,6 @@ pub async fn exec_interactive(
     // and the mount lives there.
     let machine_for_run = machine_record.clone();
 
-    let command = vec![q.cmd.clone().unwrap_or_else(|| "/bin/sh".to_string())];
     let init_size = (q.cols.unwrap_or(80), q.rows.unwrap_or(24));
 
     // Snapshot mounts now (used only for image runs) so the upgrade closure
@@ -477,147 +525,193 @@ pub async fn exec_interactive(
             .collect::<Vec<_>>()
     };
 
-    Ok(ws.on_upgrade(move |socket| async move {
-        let (mut ws_tx, mut ws_rx) = socket.split();
-
-        // Input channel: WS task → blocking session (sync mpsc; session try_recv's it).
-        let (in_tx, in_rx) = std::sync::mpsc::channel::<crate::agent::InteractiveInput>();
-        // Output channel: blocking session → WS task (tokio mpsc; blocking_send from session).
-        let (out_tx, mut out_rx) =
-            tokio::sync::mpsc::channel::<crate::agent::InteractiveOutput>(256);
-
-        // Seed the initial PTY size before any input.
-        let _ = in_tx.send(crate::agent::InteractiveInput::Resize {
-            cols: init_size.0,
-            rows: init_size.1,
-        });
-
-        // Run the interactive session on a DEDICATED agent connection — NOT the
-        // shared per-machine client. A PTY can outlive its usefulness (a client
-        // that disconnects while a `sleep` or daemon keeps running), and holding
-        // the shared client lock for the whole session would block every other
-        // operation on that machine until the command exits. A fresh connection
-        // also lets the agent kill the PTY child the moment we drop it on
-        // disconnect. We lock the entry only briefly, to dial.
-        let session_entry = entry.clone();
-        let session = tokio::spawn(async move {
-            let connect = { session_entry.lock().manager.connect() };
-            let mut client = match connect {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = ?e, "pty: failed to open dedicated agent connection");
-                    return -1;
-                }
-            };
-            tokio::task::spawn_blocking(move || {
-                let on_output = move |o| {
-                    // If the WS side is gone, the receiver is dropped; ignore.
-                    let _ = out_tx.blocking_send(o);
+    Ok(ws.on_upgrade(move |socket| {
+        bridge_interactive(socket, tty, init_size, move |input, out_tx| {
+            // Run the session on a DEDICATED agent connection — NOT the shared
+            // per-machine client. A PTY can outlive its usefulness (a client
+            // that disconnects while a `sleep` or daemon keeps running), and
+            // holding the shared client lock for the whole session would block
+            // every other operation on that machine until the command exits. A
+            // fresh connection also lets the agent kill the child the moment we
+            // drop it on disconnect. We lock the entry only briefly, to dial.
+            async move {
+                let connect = { entry.lock().manager.connect() };
+                let mut client = match connect {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "interactive: failed to open dedicated agent connection");
+                        return -1;
+                    }
                 };
-                if let Some(image) = machine_image {
-                    match client.query(&image) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            if let Err(e) = client.pull_with_registry_config(&image) {
-                                tracing::warn!(error = ?e, "pty: image pull failed");
+                tokio::task::spawn_blocking(move || {
+                    let on_output = move |o| {
+                        // If the WS side is gone, the receiver is dropped; ignore.
+                        let _ = out_tx.blocking_send(o);
+                    };
+                    if let Some(image) = machine_image {
+                        match client.query(&image) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                if let Err(e) = client.pull_with_registry_config(&image) {
+                                    tracing::warn!(error = ?e, "interactive: image pull failed");
+                                    return -1;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "interactive: image query failed");
                                 return -1;
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(error = ?e, "pty: image query failed");
-                            return -1;
+                        let config = crate::agent::RunConfig::new(image, command)
+                            .with_mounts(mounts_config)
+                            .with_tty(tty)
+                            .in_machine_opt(machine_for_run.as_ref(), &id, &[]);
+                        client
+                            .run_interactive_io(config, input, on_output)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(error = ?e, "interactive: run failed");
+                                -1
+                            })
+                    } else {
+                        client
+                            .vm_exec_interactive_io(command, Vec::new(), None, tty, input, on_output)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(error = ?e, "interactive: vm exec failed");
+                                -1
+                            })
+                    }
+                })
+                .await
+                .unwrap_or(-1)
+            }
+        })
+    }))
+}
+
+/// Carry one WebSocket to an interactive agent session and back.
+///
+/// `session` starts the session, given the receiving half of the input channel
+/// and the sending half of the output channel, and returns the command's exit
+/// code (or a sentinel: -1 on internal error, 130 on disconnect).
+pub(crate) async fn bridge_interactive<S, F>(
+    socket: axum::extract::ws::WebSocket,
+    tty: bool,
+    size: (u16, u16),
+    session: S,
+) where
+    S: FnOnce(
+        crate::agent::InteractiveInputReceiver,
+        tokio::sync::mpsc::Sender<crate::agent::InteractiveOutput>,
+    ) -> F,
+    F: std::future::Future<Output = i32> + Send + 'static,
+{
+    use crate::agent::{InteractiveInput, InteractiveOutput};
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let exit_frame =
+        |code: i32| Message::Text(format!("{{\"type\":\"exit\",\"code\":{code}}}").into());
+
+    let (in_tx, in_rx) = match crate::agent::interactive_input(INPUT_QUEUE_EVENTS) {
+        Ok(channel) => channel,
+        Err(e) => {
+            tracing::warn!(error = ?e, "interactive: could not create the input channel");
+            let _ = ws_tx.send(exit_frame(-1)).await;
+            let _ = ws_tx.send(Message::Close(None)).await;
+            return;
+        }
+    };
+    // Output channel: blocking session -> WS task (the session blocks in send).
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<InteractiveOutput>(256);
+
+    // Seed the initial PTY size before any input.
+    if tty {
+        let _ = in_tx
+            .send(InteractiveInput::Resize {
+                cols: size.0,
+                rows: size.1,
+            })
+            .await;
+    }
+
+    let session = tokio::spawn(session(in_rx, out_tx));
+
+    // Pump WS -> session input. Dropping `in_tx` (when this task ends) tells the
+    // session its peer is gone.
+    let input_pump = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let sent = match msg {
+                Message::Binary(b) => {
+                    let mut sent = Ok(());
+                    for chunk in b.chunks(STDIN_CHUNK_BYTES) {
+                        sent = in_tx.send(InteractiveInput::Stdin(chunk.to_vec())).await;
+                        if sent.is_err() {
+                            break;
                         }
                     }
-                    let config = crate::agent::RunConfig::new(image, command)
-                        .with_mounts(mounts_config)
-                        .with_tty(true)
-                        .in_machine_opt(machine_for_run.as_ref(), &id, &[]);
-                    client
-                        .run_interactive_io(config, in_rx, on_output)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error = ?e, "pty: interactive run failed");
-                            -1
-                        })
-                } else {
-                    client
-                        .vm_exec_interactive_io(command, Vec::new(), None, true, in_rx, on_output)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error = ?e, "pty: interactive vm_exec failed");
-                            -1
-                        })
+                    sent
                 }
-            })
-            .await
-            .unwrap_or(-1)
-        });
-
-        // Pump WS → session input. Dropping `in_tx` (when this task ends) signals
-        // EOF to the session via channel disconnect.
-        let input_pump = tokio::spawn(async move {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Binary(b)
-                        if in_tx
-                            .send(crate::agent::InteractiveInput::Stdin(b.to_vec()))
-                            .is_err() =>
-                    {
-                        break;
-                    }
-                    Message::Binary(_) => {}
-                    Message::Text(t) => {
-                        // Control frames are JSON; anything else is treated as raw stdin.
-                        match serde_json::from_str::<serde_json::Value>(t.as_str()) {
-                            Ok(v) if v["type"] == "resize" => {
+                Message::Text(t) => {
+                    // Control frames are JSON; anything else is treated as raw stdin.
+                    match serde_json::from_str::<serde_json::Value>(t.as_str()) {
+                        Ok(v) if v["type"] == "resize" => {
+                            if tty {
                                 let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                                 let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-                                let _ = in_tx
-                                    .send(crate::agent::InteractiveInput::Resize { cols, rows });
-                            }
-                            Ok(v) if v["type"] == "stdin" => {
-                                if let Some(d) = v["data"].as_str() {
-                                    let _ = in_tx.send(crate::agent::InteractiveInput::Stdin(
-                                        d.as_bytes().to_vec(),
-                                    ));
-                                }
-                            }
-                            _ => {
-                                let _ = in_tx.send(crate::agent::InteractiveInput::Stdin(
-                                    t.as_bytes().to_vec(),
-                                ));
+                                in_tx.send(InteractiveInput::Resize { cols, rows }).await
+                            } else {
+                                Ok(())
                             }
                         }
+                        Ok(v) if v["type"] == "stdin" => match v["data"].as_str() {
+                            Some(d) => {
+                                in_tx
+                                    .send(InteractiveInput::Stdin(d.as_bytes().to_vec()))
+                                    .await
+                            }
+                            None => Ok(()),
+                        },
+                        _ => {
+                            in_tx
+                                .send(InteractiveInput::Stdin(t.as_bytes().to_vec()))
+                                .await
+                        }
                     }
-                    Message::Close(_) => {
-                        let _ = in_tx.send(crate::agent::InteractiveInput::Eof);
-                        break;
-                    }
-                    _ => {}
                 }
-            }
-        });
-
-        // Pump session output → WS. Ends when the session drops `out_tx` (command exit).
-        while let Some(o) = out_rx.recv().await {
-            let bytes = match o {
-                crate::agent::InteractiveOutput::Stdout(d)
-                | crate::agent::InteractiveOutput::Stderr(d) => d,
+                Message::Close(_) => {
+                    let _ = in_tx.send(InteractiveInput::Eof).await;
+                    return;
+                }
+                _ => Ok(()),
             };
-            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
-                break;
+            if sent.is_err() {
+                return;
             }
         }
+    });
 
-        // Report the exit code and close. The session task returns the command's
-        // exit code (or a sentinel: -1 on internal error, 130 on disconnect).
-        let code = session.await.unwrap_or(-1);
-        let _ = ws_tx
-            .send(Message::Text(
-                format!("{{\"type\":\"exit\",\"code\":{code}}}").into(),
-            ))
-            .await;
-        let _ = ws_tx.send(Message::Close(None)).await;
-        input_pump.abort();
-    }))
+    // Pump session output -> WS. Ends when the session drops `out_tx` (command exit).
+    while let Some(o) = out_rx.recv().await {
+        let message = match o {
+            InteractiveOutput::Stdout(d) => Message::Binary(d.into()),
+            // A PTY has one output stream, which the agent reports as stdout. On
+            // pipes stderr is a stream of its own and must not join the bytes.
+            InteractiveOutput::Stderr(d) if tty => Message::Binary(d.into()),
+            InteractiveOutput::Stderr(d) => Message::Text(
+                serde_json::json!({"type": "stderr", "data": String::from_utf8_lossy(&d)})
+                    .to_string()
+                    .into(),
+            ),
+        };
+        if ws_tx.send(message).await.is_err() {
+            break;
+        }
+    }
+
+    // Report the exit code and close.
+    let code = session.await.unwrap_or(-1);
+    let _ = ws_tx.send(exit_frame(code)).await;
+    let _ = ws_tx.send(Message::Close(None)).await;
+    input_pump.abort();
 }
 
 /// Maximum number of concurrent log-follow SSE streams.
@@ -871,4 +965,294 @@ fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(Stri
 
     let text = String::from_utf8_lossy(&buf).into_owned();
     Ok((text, new_pos))
+}
+
+#[cfg(all(test, unix))]
+mod interactive_tests {
+    //! The interactive WebSocket, end to end but for the VM: a real server and
+    //! client, the handler's query parsing and bridge, the agent client's session
+    //! loop, and a stand-in guest that runs the command as a real process on pipes.
+    use super::*;
+    use crate::agent::{test_guest::FakeGuest, AgentClient};
+    use crate::platform::uds::UdsStream;
+    use axum::{routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_tungstenite::{connect_async, tungstenite::Message as Wire};
+
+    #[derive(Default)]
+    struct Guests {
+        resizes: std::sync::Mutex<Vec<Arc<AtomicUsize>>>,
+    }
+
+    /// Parses the same query as [`exec_interactive`] and bridges to a stand-in
+    /// guest instead of a machine.
+    async fn session(
+        State(guests): State<Arc<Guests>>,
+        Query(q): Query<InteractiveQuery>,
+        Query(parameters): Query<Vec<(String, String)>>,
+        ws: WebSocketUpgrade,
+    ) -> Result<axum::response::Response, ApiError> {
+        let command = interactive_command(q.cmd, parameters)?;
+        let tty = q.tty.unwrap_or(true);
+        let (client_stream, guest_stream) = UdsStream::pair().unwrap();
+        let guest = FakeGuest::spawn(guest_stream);
+        guests.resizes.lock().unwrap().push(guest.resizes.clone());
+        Ok(ws.on_upgrade(move |socket| {
+            bridge_interactive(socket, tty, (100, 40), move |input, out_tx| async move {
+                let code = tokio::task::spawn_blocking(move || {
+                    let on_output = move |o| {
+                        let _ = out_tx.blocking_send(o);
+                    };
+                    AgentClient::from_stream(client_stream)
+                        .vm_exec_interactive_io(command, Vec::new(), None, tty, input, on_output)
+                        .unwrap_or(-1)
+                })
+                .await
+                .unwrap_or(-1);
+                let _ = tokio::task::spawn_blocking(move || guest.finish()).await;
+                code
+            })
+        }))
+    }
+
+    async fn args(
+        Query(q): Query<InteractiveQuery>,
+        Query(parameters): Query<Vec<(String, String)>>,
+    ) -> Result<Json<Vec<String>>, ApiError> {
+        Ok(Json(interactive_command(q.cmd, parameters)?))
+    }
+
+    async fn server() -> (String, Arc<Guests>) {
+        let guests = Arc::new(Guests::default());
+        let app = Router::new()
+            .route("/session", get(session))
+            .route("/args", get(args))
+            .with_state(guests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address.to_string(), guests)
+    }
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn connect(address: &str, query: &str) -> Client {
+        connect_async(format!("ws://{address}/session?{query}"))
+            .await
+            .expect("upgrade")
+            .0
+    }
+
+    /// Everything the session sends until it says the command exited.
+    struct Transcript {
+        stdout: Vec<u8>,
+        stderr: String,
+        exit: Option<i64>,
+    }
+
+    async fn transcript(client: &mut Client) -> Transcript {
+        let mut all = Transcript {
+            stdout: Vec::new(),
+            stderr: String::new(),
+            exit: None,
+        };
+        while let Some(message) = tokio::time::timeout(Duration::from_secs(20), client.next())
+            .await
+            .expect("the session stalled")
+        {
+            match message.unwrap() {
+                Wire::Binary(data) => all.stdout.extend(data.iter()),
+                Wire::Text(text) => {
+                    let frame: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                    match frame["type"].as_str() {
+                        Some("stderr") => all.stderr.push_str(frame["data"].as_str().unwrap()),
+                        Some("exit") => all.exit = frame["code"].as_i64(),
+                        other => panic!("unexpected frame type {other:?}"),
+                    }
+                }
+                Wire::Close(_) => break,
+                _ => {}
+            }
+        }
+        all
+    }
+
+    /// Read binary frames until `count` bytes have arrived.
+    async fn receive(client: &mut Client, count: usize) -> Vec<u8> {
+        let mut received = Vec::new();
+        while received.len() < count {
+            match tokio::time::timeout(Duration::from_secs(20), client.next())
+                .await
+                .expect("the echo stalled")
+                .expect("the session ended early")
+                .unwrap()
+            {
+                Wire::Binary(data) => received.extend(data.iter()),
+                Wire::Text(text) => panic!("unexpected text frame {text}"),
+                _ => {}
+            }
+        }
+        received
+    }
+
+    fn pattern(length: usize, seed: usize) -> Vec<u8> {
+        (0..length).map(|i| ((seed + i) % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn arguments_arrive_in_order_and_empty_ones_count() {
+        let (address, _) = server().await;
+        let get = |query: &str| {
+            let url = format!("http://{address}/args?{query}");
+            async move { reqwest::get(url).await.unwrap() }
+        };
+        let answer = get("cmd=/bin/printf&arg=%25s-%25s&arg=a%20b&arg=&arg=c%26d")
+            .await
+            .json::<Vec<String>>()
+            .await
+            .unwrap();
+        assert_eq!(answer, ["/bin/printf", "%s-%s", "a b", "", "c&d"]);
+        // Without arguments the program is the whole command, and the default is a shell.
+        let answer = get("cmd=/bin/cat")
+            .await
+            .json::<Vec<String>>()
+            .await
+            .unwrap();
+        assert_eq!(answer, ["/bin/cat"]);
+        let answer = get("cols=80").await.json::<Vec<String>>().await.unwrap();
+        assert_eq!(answer, ["/bin/sh"]);
+        assert_eq!(get("cmd=").await.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn the_command_runs_with_the_given_argument_vector() {
+        let (address, _) = server().await;
+        let mut client = connect(
+            &address,
+            "tty=false&cmd=/bin/sh&arg=-c&arg=printf%20%25s%20%22%241%7C%242%22&arg=x&arg=one%20two&arg=",
+        )
+        .await;
+        let all = transcript(&mut client).await;
+        assert_eq!(all.exit, Some(0));
+        assert_eq!(String::from_utf8(all.stdout).unwrap(), "one two|");
+    }
+
+    #[tokio::test]
+    async fn stdin_on_pipes_arrives_intact_whatever_its_size_and_pacing() {
+        let (address, _) = server().await;
+        let mut client = connect(&address, "tty=false&cmd=/bin/cat").await;
+
+        // The message the terminal path delivered only 9,728 bytes of.
+        let large = pattern(256 * 1024, 7);
+        client
+            .send(Wire::Binary(large.clone().into()))
+            .await
+            .unwrap();
+        assert!(receive(&mut client, large.len()).await == large);
+
+        // A burst that delivered less than a third of it.
+        let mut burst = Vec::new();
+        for i in 0..50 {
+            let piece = pattern(1000, i);
+            client
+                .send(Wire::Binary(piece.clone().into()))
+                .await
+                .unwrap();
+            burst.extend(piece);
+        }
+        assert!(receive(&mut client, burst.len()).await == burst);
+
+        // Every byte value, including the ones a terminal treats specially.
+        let all: Vec<u8> = (0..=255).collect();
+        client.send(Wire::Binary(all.clone().into())).await.unwrap();
+        assert_eq!(receive(&mut client, all.len()).await, all);
+
+        client.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_message_bigger_than_a_frame_is_split_rather_than_refused() {
+        let (address, _) = server().await;
+        let mut client = connect(&address, "tty=false&cmd=/bin/cat").await;
+        let huge = pattern(3 * 1024 * 1024 + 5, 3);
+        client
+            .send(Wire::Binary(huge.clone().into()))
+            .await
+            .unwrap();
+        assert!(receive(&mut client, huge.len()).await == huge);
+        client.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_echo_needs_no_help_from_the_guest_to_be_prompt() {
+        // The session loop used to notice input only when its 100 ms poll timed
+        // out, so an idle round trip took anywhere from 0 to 100 ms. The gaps are
+        // jittered so no timer can phase-lock with the loop's.
+        let (address, _) = server().await;
+        let mut client = connect(&address, "tty=false&cmd=/bin/cat").await;
+        let mut trips = Vec::new();
+        for i in 0..30u64 {
+            tokio::time::sleep(Duration::from_millis(20 + (i * 37) % 61)).await;
+            let message = pattern(100, i as usize);
+            let began = std::time::Instant::now();
+            client
+                .send(Wire::Binary(message.clone().into()))
+                .await
+                .unwrap();
+            assert_eq!(receive(&mut client, message.len()).await, message);
+            trips.push(began.elapsed());
+        }
+        trips.sort();
+        eprintln!(
+            "idle echo round trip over 30 messages: min {:?}, median {:?}, max {:?}",
+            trips[0], trips[15], trips[29]
+        );
+        assert!(
+            trips[15] < Duration::from_millis(40),
+            "an idle round trip takes {:?} at the median; input waits for the poll timeout",
+            trips[15]
+        );
+        client.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_pipes_stderr_is_a_frame_of_its_own_and_the_exit_code_is_reported() {
+        let (address, _) = server().await;
+        let mut client = connect(
+            &address,
+            "tty=false&cmd=/bin/sh&arg=-c&arg=printf%20out%3B%20printf%20err%20%3E%262%3B%20exit%207",
+        )
+        .await;
+        let all = transcript(&mut client).await;
+        assert_eq!(all.stdout, b"out");
+        assert_eq!(all.stderr, "err");
+        assert_eq!(all.exit, Some(7));
+    }
+
+    #[tokio::test]
+    async fn on_a_terminal_output_stays_one_stream_and_the_size_is_sent() {
+        let (address, guests) = server().await;
+        let mut client = connect(
+            &address,
+            "cmd=/bin/sh&arg=-c&arg=printf%20out%3B%20printf%20err%20%3E%262",
+        )
+        .await;
+        let all = transcript(&mut client).await;
+        // A PTY has one output stream, so stderr is not reported apart.
+        assert_eq!(all.stderr, "");
+        assert_eq!(all.stdout.len(), 6);
+        assert_eq!(all.exit, Some(0));
+        let mut piped = connect(&address, "tty=false&cmd=/bin/true").await;
+        transcript(&mut piped).await;
+        let resizes: Vec<_> = guests
+            .resizes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(resizes, [1, 0], "only a terminal is told its size");
+    }
 }
