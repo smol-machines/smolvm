@@ -2618,9 +2618,11 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
     if !is_our_process_strict(pid, started) {
         return Err(Error::agent("RAM resize", "VMM process identity changed"));
     }
-    // macOS has no cgroup-equivalent VM budget. Admit against free and
-    // purgeable physical pages only, not swap or speculative compression.
-    // This is a conservative preflight, not a reservation against other apps.
+    // macOS has no cgroup-equivalent VM budget. Admit against pages the kernel
+    // can hand out without swapping or compressing: free, purgeable, and
+    // file-backed cache. macOS keeps little memory strictly free, so free pages
+    // alone refuse growth on almost any Mac in use. This is a conservative
+    // preflight, not a reservation against other apps.
     unsafe extern "C" {
         fn mach_port_deallocate(
             task: libc::mach_port_t,
@@ -2664,9 +2666,11 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
     }
     // SAFETY: host_statistics64 succeeded and returned the complete structure.
     let stats = unsafe { stats.assume_init() };
-    let available = (u64::from(stats.free_count) + u64::from(stats.purgeable_count))
-        .checked_mul(page_size as u64)
-        .ok_or_else(unavailable)?;
+    let available = (u64::from(stats.free_count)
+        + u64::from(stats.purgeable_count)
+        + u64::from(stats.external_page_count))
+    .checked_mul(page_size as u64)
+    .ok_or_else(unavailable)?;
     if !is_our_process_strict(pid, started) {
         return Err(Error::agent("RAM resize", "VMM process identity changed"));
     }
