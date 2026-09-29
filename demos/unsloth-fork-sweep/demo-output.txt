@@ -1,0 +1,22 @@
+──────────────────────────────────────────────────────────────
+  smolvm CUDA fork demo
+  model: unsloth/Qwen2.5-1.5B-Instruct-bnb-4bit     GPU baseline: 609 MiB
+──────────────────────────────────────────────────────────────
+[1/3] boot golden VM, load model
+      golden ready in 55s (2595 MiB); frozen as the fork base
+
+[2/3] fork three clones
+      uns-add forked in 0.4s
+      uns-mul forked in 0.4s
+      uns-sub forked in 0.3s
+      gate released; clones train concurrently (add / mul / sub)
+
+[3/3] results
+──────────────────────────────────────────────────────────────
+      task  GO→training  loss           ask it       verdict
+      add   5.7s           2.60 → 1.39  6+7 = 13     PASS (want 13)
+      mul   6.7s           2.68 → 1.40  6*7 = 42     PASS (want 42)
+      sub   7.6s           3.02 → 1.61  6-7 = -1     PASS (want -1)
+──────────────────────────────────────────────────────────────
+      peak VRAM: 3794 MiB (base weights shared across the clones)
+──────────────────────────────────────────────────────────────
