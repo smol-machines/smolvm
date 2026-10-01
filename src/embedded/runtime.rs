@@ -15,6 +15,16 @@ use smolvm_protocol::ImageInfo;
 
 type SharedHandle = Arc<Mutex<VmHandle>>;
 
+/// How a machine restored from a checkpoint starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RestoreOptions {
+    /// Restore the machine as itself going back in time rather than as a clone:
+    /// its first start keeps the saved hostname and machine ID, skipping about
+    /// a second of identity reset. Do not run two machines from one checkpoint
+    /// with this set.
+    pub keep_identity: bool,
+}
+
 /// Absolute resource targets for a running machine, never increments.
 /// CPU, RAM and disk growth currently require separate requests; both disks
 /// may grow in one request. Shrinking is rejected by the runtime.
@@ -388,8 +398,25 @@ impl EmbeddedRuntime {
     /// machine is also a fork/checkpoint source, which makes it suitable as a
     /// durable rollback root.
     pub fn restore_checkpoint_machine(&self, name: &str, artifact: &std::path::Path) -> Result<()> {
+        self.restore_checkpoint_machine_with(name, artifact, RestoreOptions::default())
+    }
+
+    /// [`Self::restore_checkpoint_machine`] with options for how the restored
+    /// machine starts.
+    pub fn restore_checkpoint_machine_with(
+        &self,
+        name: &str,
+        artifact: &std::path::Path,
+        options: RestoreOptions,
+    ) -> Result<()> {
         self.with_name_lock(name, || {
-            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)
+            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)?;
+            if options.keep_identity {
+                self.db
+                    .update_vm(name, |record| record.keep_identity = true)?
+                    .ok_or_else(|| Error::vm_not_found(name))?;
+            }
+            Ok(())
         })
     }
 

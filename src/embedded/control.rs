@@ -307,6 +307,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
 
     let restoring_checkpoint =
         crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(&record.name)).is_some();
+    if restoring_checkpoint {
+        // Read the restored RAM ahead while the VM boots, as the CLI does, so
+        // the first commands after the restore don't page it in from disk.
+        crate::portable_checkpoint::prefetch_restore_memory(&crate::agent::vm_data_dir(
+            &record.name,
+        ));
+    }
     let freshly_started = manager
         .ensure_running_with_full_config(
             record.host_mounts(),

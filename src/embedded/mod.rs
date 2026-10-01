@@ -7,7 +7,7 @@ mod runtime;
 
 pub use control::MachineSpec;
 pub use exec::{ExecCancel, ExecOptions};
-pub use runtime::{runtime, EmbeddedRuntime, ResizeSpec};
+pub use runtime::{runtime, EmbeddedRuntime, ResizeSpec, RestoreOptions};
 
 /// Parse the trusted loopback interceptor binding supplied by an SDK caller.
 /// The token is per launch and is never written to a machine record.
