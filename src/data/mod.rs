@@ -9,6 +9,8 @@ pub mod disk;
 pub mod error;
 /// Classifying `--image` into a registry ref, local archive, or rootfs dir.
 pub mod image_source;
+/// Pulling images from a registry on the host's loopback, on the host.
+pub mod local_registry;
 /// Canonical network-related data models.
 pub mod network;
 /// Detecting and host-pulling registry refs that name smolmachine packs.
