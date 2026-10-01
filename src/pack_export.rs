@@ -43,6 +43,11 @@ pub struct FromVmExportOptions {
     /// starts with those files. It lives on the storage disk, which container
     /// packs otherwise never carry, so without this a pack silently loses it.
     pub include_workspace: bool,
+    /// Also capture the machine's storage and rootfs overlay disks as templates.
+    /// For an image-based machine the storage disk already holds the image's
+    /// layers unpacked by the guest (as root, so ownership is exact), so a
+    /// machine seeded from these templates starts without unpacking anything.
+    pub include_disks: bool,
 }
 
 /// What the export decided about the machine, for the caller's manifest.
@@ -167,43 +172,28 @@ pub fn collect_from_vm_assets(
                 opts,
             )?;
         }
+        if opts.include_disks {
+            capture_disk_templates(
+                collector,
+                staging_dir,
+                &overlay_disk,
+                overlay_fmt,
+                &storage_disk,
+                storage_fmt,
+            )?;
+        }
     } else {
         // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
-        // from the template; a default-size overlay is a qcow2 CoW image and
-        // must be flattened to a raw before it can be a template.
-        let overlay_for_pack = match overlay_fmt {
-            DiskFormat::Raw => overlay_disk.clone(),
-            DiskFormat::Qcow2 => {
-                let flat = staging_dir.join("overlay-flat.raw");
-                flatten_qcow2_to_raw(&overlay_disk, &flat)?;
-                flat
-            }
-        };
-        println!("Copying overlay disk ({})...", overlay_for_pack.display());
-        collector
-            .add_overlay_template(&overlay_for_pack)
-            .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
-
-        if !storage_disk.exists() {
-            return Err(Error::agent(
-                "collect storage",
-                format!("storage disk not found at {}", storage_disk.display()),
-            ));
-        }
-        let storage_for_pack = match storage_fmt {
-            DiskFormat::Raw => storage_disk.clone(),
-            DiskFormat::Qcow2 => {
-                let flat = staging_dir.join("storage-flat.raw");
-                flatten_qcow2_to_raw(&storage_disk, &flat)?;
-                flat
-            }
-        };
-        println!("Copying storage disk ({})...", storage_for_pack.display());
-        collector
-            .add_vm_storage_template(&storage_for_pack)
-            .map_err(|e| Error::agent("collect storage", e.to_string()))?;
+        // from the template.
+        capture_disk_templates(
+            collector,
+            staging_dir,
+            &overlay_disk,
+            overlay_fmt,
+            &storage_disk,
+            storage_fmt,
+        )?;
     }
-
     Ok(FromVmAssets {
         mode: if is_image_based {
             PackMode::Container
@@ -215,6 +205,56 @@ pub fn collect_from_vm_assets(
         image_user,
         layer_bytes: collector.staged_layer_bytes(),
     })
+}
+
+/// Add the machine's rootfs overlay and storage disks to the pack as templates.
+/// A default-size overlay is a qcow2 CoW image and must be flattened to a raw
+/// before it can be a template.
+fn capture_disk_templates(
+    collector: &mut AssetCollector,
+    staging_dir: &Path,
+    overlay_disk: &Path,
+    overlay_fmt: DiskFormat,
+    storage_disk: &Path,
+    storage_fmt: DiskFormat,
+) -> crate::Result<()> {
+    if !overlay_disk.exists() {
+        return Err(Error::agent(
+            "collect overlay",
+            format!("overlay disk not found at {}", overlay_disk.display()),
+        ));
+    }
+    let overlay_for_pack = match overlay_fmt {
+        DiskFormat::Raw => overlay_disk.to_path_buf(),
+        DiskFormat::Qcow2 => {
+            let flat = staging_dir.join("overlay-flat.raw");
+            flatten_qcow2_to_raw(overlay_disk, &flat)?;
+            flat
+        }
+    };
+    println!("Copying overlay disk ({})...", overlay_for_pack.display());
+    collector
+        .add_overlay_template(&overlay_for_pack)
+        .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+    if !storage_disk.exists() {
+        return Err(Error::agent(
+            "collect storage",
+            format!("storage disk not found at {}", storage_disk.display()),
+        ));
+    }
+    let storage_for_pack = match storage_fmt {
+        DiskFormat::Raw => storage_disk.to_path_buf(),
+        DiskFormat::Qcow2 => {
+            let flat = staging_dir.join("storage-flat.raw");
+            flatten_qcow2_to_raw(storage_disk, &flat)?;
+            flat
+        }
+    };
+    println!("Copying storage disk ({})...", storage_for_pack.display());
+    collector
+        .add_vm_storage_template(&storage_for_pack)
+        .map_err(|e| Error::agent("collect storage", e.to_string()))?;
+    Ok(())
 }
 
 /// Seed a pack manifest with the source machine's runtime identity. CLI /
