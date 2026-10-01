@@ -97,6 +97,11 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
+# Reads the subject CN of a verified mTLS client certificate so serve can
+# restrict which client identity may use the full API.
+x509-parser = "0.18"
+# Wraps the per-connection service to carry the mTLS client identity.
+tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 tokio-stream = "0.1"
 # ReaderStream for streaming a cached blob from disk to a peer (GET /p2p/blob).
@@ -138,6 +143,7 @@ windows-sys = { version = "0.60", features = [
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.22.0" }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }

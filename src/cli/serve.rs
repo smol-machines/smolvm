@@ -89,6 +89,29 @@ pub struct ServeStartCmd {
     /// SMOLVM_LANDLOCK env var takes precedence.
     #[arg(long, value_name = "MODE", default_value = "enforce")]
     landlock: String,
+
+    /// Require the mTLS client certificate's subject CN to equal this value
+    /// for API access. Only applies when serve TLS is configured
+    /// (SMOLVM_SERVE_TLS_CERT/_KEY/_CLIENT_CA). Unset (the default), every
+    /// client certificate signed by the client CA is accepted for every route.
+    #[arg(
+        long = "mtls-client-cn",
+        value_name = "CN",
+        env = "SMOLVM_SERVE_TLS_CLIENT_CN"
+    )]
+    mtls_client_cn: Option<String>,
+
+    /// With --mtls-client-cn, also accept other client certificates signed by
+    /// the client CA, but only for the peer blob routes (/p2p/). Use this when
+    /// sibling hosts fetch cached layers from this one. Without it, such
+    /// certificates are refused at the TLS handshake.
+    #[arg(
+        long = "mtls-allow-peer-blobs",
+        env = "SMOLVM_SERVE_TLS_ALLOW_PEER_BLOBS",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::SetTrue
+    )]
+    mtls_allow_peer_blobs: bool,
 }
 
 impl ServeStartCmd {
@@ -381,7 +404,11 @@ impl ServeStartCmd {
         // Resolve the serve API's TLS posture before binding. In fleet mode this
         // is fail-closed: a missing/partial mTLS config aborts startup rather
         // than silently serving plain HTTP (control↔node mTLS, increment 3).
-        let tls = super::serve_tls::resolve_tls().map_err(|e| smolvm::error::Error::Config {
+        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
+            client_cn: self.mtls_client_cn.clone(),
+            allow_peer_blobs: self.mtls_allow_peer_blobs,
+        })
+        .map_err(|e| smolvm::error::Error::Config {
             operation: "serve tls".to_string(),
             reason: e.to_string(),
         })?;
@@ -468,11 +495,11 @@ impl ServeStartCmd {
         addr: SocketAddr,
         app: Router,
         local_app: Router,
-        tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+        tls: Option<super::serve_tls::ServeTls>,
         internal_shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        if let Some(tls_config) = tls {
-            return Self::serve_tcp_tls(addr, app, local_app, tls_config, internal_shutdown).await;
+        if let Some(tls) = tls {
+            return Self::serve_tcp_tls(addr, app, local_app, tls, internal_shutdown).await;
         }
 
         let listener = tokio::net::TcpListener::bind(addr)
@@ -501,7 +528,7 @@ impl ServeStartCmd {
         addr: SocketAddr,
         app: Router,
         local_app: Router,
-        tls_config: std::sync::Arc<rustls::ServerConfig>,
+        tls: super::serve_tls::ServeTls,
         internal_shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         // Loopback plain-HTTP door for the local node-agent.
@@ -564,7 +591,24 @@ impl ServeStartCmd {
                 .map_err(smolvm::error::Error::Io)?;
         }
 
-        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+        // The acceptor tags each connection with its client certificate's
+        // identity; the middleware limits clients without full access to the
+        // peer blob routes.
+        let acceptor = super::serve_tls::IdentityAcceptor::new(&tls);
+        let app = app.layer(axum::middleware::from_fn(
+            super::serve_tls::enforce_client_identity,
+        ));
+        match &tls.policy.client_cn {
+            Some(cn) => tracing::info!(
+                client_cn = %cn,
+                allow_peer_blobs = tls.policy.allow_peer_blobs,
+                "mTLS client identity restricted by subject CN"
+            ),
+            None => tracing::warn!(
+                "any client certificate signed by the client CA has full API access; \
+                 set --mtls-client-cn to restrict it"
+            ),
+        }
         let handle = axum_server::Handle::new();
 
         // Trip graceful shutdown on the same signal the plain path observes.
@@ -582,7 +626,8 @@ impl ServeStartCmd {
         tracing::info!(address = %addr, "starting HTTPS API server (mTLS, client cert required)");
         println!("smolvm API server listening on https://{} (mTLS)", addr);
 
-        axum_server::bind_rustls(addr, rustls_config)
+        axum_server::bind(addr)
+            .acceptor(acceptor)
             .handle(handle)
             .serve(app.into_make_service())
             .await
