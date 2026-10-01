@@ -603,6 +603,21 @@ fn pump_loop(
 
 // ============================== trait impl ==================================
 
+/// Remove a sandbox's host-side state root (`<POD_SHARE_HOST_ROOT>/<sandbox id>`).
+///
+/// Best-effort and idempotent: a sandbox that never got as far as creating its
+/// share has nothing here, and a delete must not fail because its leftovers were
+/// already gone. Only ever called with a sandbox id the shim itself created.
+pub(crate) fn reclaim_sandbox_share_root(sandbox_id: &str) {
+    let root = Path::new(POD_SHARE_HOST_ROOT).join(sandbox_id);
+    if !root.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(&root) {
+        warn!("rm sandbox state {}: {e}", root.display());
+    }
+}
+
 #[async_trait]
 impl PodBackend for EnginePodBackend {
     async fn create_sandbox(
@@ -970,8 +985,18 @@ impl PodBackend for EnginePodBackend {
                 if let Err(e) = rt.stop_machine(&sandbox.id) {
                     warn!("stop sandbox VM {}: {e}", sandbox.id);
                 }
-                rt.delete_machine(&sandbox.id)
-                    .map_err(|e| format!("delete sandbox VM: {e}"))
+                let result = rt
+                    .delete_machine(&sandbox.id)
+                    .map_err(|e| format!("delete sandbox VM: {e}"));
+                // The sandbox's host state root outlives the VM unless this path
+                // removes it: `delete_machine` drops the machine record, so the
+                // startup reconcile that reclaims machines by id has nothing left
+                // to key off afterwards, and no other caller looks here. Left
+                // alone it is one orphan tree per pod ever scheduled on the node,
+                // permanently. Container deletes already remove their own subtree
+                // under it; this is the same contract one level up.
+                reclaim_sandbox_share_root(&sandbox.id);
+                result
             })
             .await
             .map_err(|e| e.to_string())??;
