@@ -211,6 +211,115 @@ mod imp {
         Some(image.to_string())
     }
 
+    /// Opt-in reuse window for resolved digests, from `SMOLVM_SEED_DIGEST_TTL`
+    /// (seconds). Off by default: every first start resolves the digest at the
+    /// registry, which doubles as the per-start authorization check. Within
+    /// the window a moved tag or a revoked credential is not observed, so this
+    /// is for tight loops starting many machines of one image, not a general
+    /// default.
+    fn digest_ttl() -> Option<u64> {
+        let secs: u64 = std::env::var("SMOLVM_SEED_DIGEST_TTL")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (secs > 0).then_some(secs)
+    }
+
+    /// One remembered resolution: the digest `image` pointed to for one
+    /// credential fingerprint, and when it was resolved.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct CachedDigest {
+        image: String,
+        digest: String,
+        resolved_at_unix: u64,
+    }
+
+    /// Cache file for `image` as resolved by `auth`. The credential
+    /// fingerprint is part of the name, so a caller only ever reuses a
+    /// resolution its own credentials performed. `FromConfig` is one
+    /// fingerprint, so a `docker login` change inside the window is not
+    /// noticed, same as any other credential change while the TTL runs.
+    fn digest_cache_path(image: &str, auth: &PullAuth) -> PathBuf {
+        let mut hash = Sha256::new();
+        hash.update(image.as_bytes());
+        hash.update([0]);
+        match auth {
+            PullAuth::FromConfig => hash.update(b"from-config"),
+            PullAuth::Anonymous => hash.update(b"anonymous"),
+            PullAuth::Basic { username, password } => {
+                hash.update(b"basic:");
+                hash.update(username.as_bytes());
+                hash.update([0]);
+                hash.update(password.as_bytes());
+            }
+            PullAuth::Bearer(token) => {
+                hash.update(b"bearer:");
+                hash.update(token.as_bytes());
+            }
+            PullAuth::Identity(token) => {
+                hash.update(b"identity:");
+                hash.update(token.as_bytes());
+            }
+        }
+        seed_root()
+            .join("digests")
+            .join(format!("{}.json", hex::encode(hash.finalize())))
+    }
+
+    /// The digest in `body` when it is for `image` and younger than the TTL.
+    pub(super) fn fresh_cached_digest(
+        body: &[u8],
+        image: &str,
+        ttl_secs: u64,
+        now_unix: u64,
+    ) -> Option<String> {
+        let entry: CachedDigest = serde_json::from_slice(body).ok()?;
+        if entry.image != image || now_unix.saturating_sub(entry.resolved_at_unix) > ttl_secs {
+            return None;
+        }
+        Some(entry.digest)
+    }
+
+    /// The digest `image` points to, through the opt-in TTL cache. With the
+    /// TTL unset (the default) this is exactly `resolve()`.
+    fn resolved_digest(
+        image: &str,
+        auth: &PullAuth,
+        resolve: impl Fn() -> Result<String>,
+    ) -> Result<String> {
+        let Some(ttl_secs) = digest_ttl() else {
+            return resolve();
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let path = digest_cache_path(image, auth);
+        if let Ok(body) = std::fs::read(&path) {
+            if let Some(digest) = fresh_cached_digest(&body, image, ttl_secs, now_unix) {
+                return Ok(digest);
+            }
+        }
+        let digest = resolve()?;
+        // Best effort: a failed write only means the next start resolves again.
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            if let Ok(body) = serde_json::to_vec(&CachedDigest {
+                image: image.to_string(),
+                digest: digest.clone(),
+                resolved_at_unix: now_unix,
+            }) {
+                let tmp = path.with_extension("tmp");
+                if std::fs::write(&tmp, body).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                }
+            }
+        }
+        Ok(digest)
+    }
+
     /// Give machine `name` a storage disk over the seed for `image`, building the
     /// seed first (with `exe`, this smolvm binary) if its digest has none yet.
     /// Returns `Ok(false)` when the storage template cannot back a seed.
@@ -228,7 +337,7 @@ mod imp {
             .build()
             .map_err(|e| Error::config("image seed", e.to_string()))?;
         let resolve = || rt.block_on(crate::image_store::authorized_reference_digest(image, auth));
-        let digest = resolve()?;
+        let digest = resolved_digest(image, auth, resolve)?;
         let key = seed_key(image, &digest, template.as_deref())?;
         let root = seed_root();
         std::fs::create_dir_all(&root).map_err(|e| Error::config("image seed", e.to_string()))?;
@@ -890,5 +999,27 @@ mod tests {
             Some(PathBuf::from("/seeds/k/storage.qcow2"))
         );
         assert_eq!(qcow2_backing(&dir.path().join("b.raw")), None);
+    }
+
+    #[test]
+    fn cached_digest_honors_image_and_ttl() {
+        let body = serde_json::json!({
+            "image": "alpine",
+            "digest": "sha256:aa",
+            "resolved_at_unix": 1000
+        })
+        .to_string();
+        let body = body.as_bytes();
+        // Fresh: 60 s old inside a 300 s window.
+        assert_eq!(
+            fresh_cached_digest(body, "alpine", 300, 1060),
+            Some("sha256:aa".into())
+        );
+        // Stale: 400 s old.
+        assert_eq!(fresh_cached_digest(body, "alpine", 300, 1400), None);
+        // A different image never reuses the entry.
+        assert_eq!(fresh_cached_digest(body, "busybox", 300, 1060), None);
+        // Garbage reads as a miss, not an error.
+        assert_eq!(fresh_cached_digest(b"not json", "alpine", 300, 1060), None);
     }
 }
