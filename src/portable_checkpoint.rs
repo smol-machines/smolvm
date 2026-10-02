@@ -1604,20 +1604,37 @@ fn capture_with_completion(
     } else {
         "PREPARE_SAVE"
     };
-    let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
-        &control,
-        &format!("{command} {}", runtime_snapshot.display()),
-        std::time::Duration::from_secs(30 * 60),
-    )?;
+    let send = |command: &str| {
+        crate::agent::fork::control_socket_cmd_with_timeout(
+            &control,
+            &format!("{command} {}", runtime_snapshot.display()),
+            std::time::Duration::from_secs(30 * 60),
+        )
+    };
+    // A live checkpoint resumes the source and packs SAVE's files into its own
+    // durable artifact, so syncing them first would only hold the source paused
+    // at the host disk's flush rate. A pause stops the source on those files,
+    // so it keeps the durable SAVE. An older VMM without SAVE_UNSYNCED gets SAVE.
+    let synchronous_save = || -> Result<String> {
+        if stop_after_capture {
+            return send("SAVE");
+        }
+        let reply = send("SAVE_UNSYNCED")?;
+        if reply.trim() == "ERR EINVAL unknown command" {
+            return send("SAVE");
+        }
+        Ok(reply)
+    };
+    let mut reply = if command == "SAVE" {
+        synchronous_save()?
+    } else {
+        send(command)?
+    };
     if command == "PREPARE_SAVE_HELD"
         && !held_in_place
         && reply.trim() == "ERR EINVAL unknown command"
     {
-        reply = crate::agent::fork::control_socket_cmd_with_timeout(
-            &control,
-            &format!("PREPARE_SAVE {}", runtime_snapshot.display()),
-            std::time::Duration::from_secs(30 * 60),
-        )?;
+        reply = send("PREPARE_SAVE")?;
     }
     let prepared = (use_deferred_save || held_in_place) && reply.starts_with("OK");
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
@@ -1629,11 +1646,7 @@ fn capture_with_completion(
                 && (reply.starts_with("ERR ENOTSUP")
                     || reply.trim() == "ERR EINVAL unknown command")))
     {
-        reply = crate::agent::fork::control_socket_cmd_with_timeout(
-            &control,
-            &format!("SAVE {}", runtime_snapshot.display()),
-            std::time::Duration::from_secs(30 * 60),
-        )?;
+        reply = synchronous_save()?;
         tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
     if !reply.starts_with("OK") {
