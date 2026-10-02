@@ -8,6 +8,7 @@ pub mod client;
 pub mod peer;
 pub mod pull;
 pub mod push;
+mod token_store;
 
 pub use cache::BlobCache;
 pub use client::{validate_digest, RegistryClient};

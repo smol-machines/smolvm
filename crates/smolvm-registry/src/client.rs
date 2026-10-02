@@ -14,7 +14,9 @@ use reqwest::header::{
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::token_store;
 
 /// Maximum bytes buffered in memory for a manifest / image-index document.
 /// A hostile or MITM'd registry could otherwise stream a multi-GB (or endless)
@@ -1389,6 +1391,36 @@ impl RegistryClient {
             *lc = Some(challenge.clone());
         }
 
+        // Persist pull tokens so the NEXT process can also attach a preemptive
+        // bearer. The in-memory cache above only helps within one process, and
+        // the CLI is a fresh process per command, so without this every
+        // `machine run` pays the full challenge exchange again. Push scopes and
+        // tokens without a server-reported expiry are deliberately not written.
+        if token_store::enabled()
+            && self.base_url.starts_with("https://")
+            && challenge
+                .scope
+                .as_deref()
+                .is_some_and(|s| !s.contains("push"))
+        {
+            if let (Some(secs), Ok(now)) = (
+                token_response.expires_in,
+                SystemTime::now().duration_since(UNIX_EPOCH),
+            ) {
+                token_store::save(
+                    &self.base_url,
+                    &self.identity_fingerprint(),
+                    &token_store::PersistedToken {
+                        realm: challenge.realm.clone(),
+                        service: challenge.service.clone(),
+                        scope: challenge.scope.clone(),
+                        token: token.clone(),
+                        expires_at_unix: now.as_secs().saturating_add(secs),
+                    },
+                );
+            }
+        }
+
         Ok(token)
     }
 
@@ -1404,6 +1436,12 @@ impl RegistryClient {
         if self.auth_token.is_some() {
             return None;
         }
+        // A fresh process has no challenge yet. If an earlier process
+        // persisted a still-valid pull token for this registry and identity,
+        // replay it into the in-memory cache first.
+        if self.last_challenge.lock().ok()?.is_none() {
+            self.restore_persisted_token();
+        }
         let challenge = self.last_challenge.lock().ok()?.as_ref()?.clone();
         let cache = self.token_cache.lock().ok()?;
         let key = TokenCacheKey {
@@ -1417,6 +1455,57 @@ impl RegistryClient {
         } else {
             None
         }
+    }
+
+    /// Load the newest still-valid persisted pull token for this registry and
+    /// identity into `token_cache` and `last_challenge`, as if this process had
+    /// already done the challenge exchange. Best-effort: on any miss the normal
+    /// 401 flow runs. A token persisted for a different repository scope is
+    /// harmless, the registry answers 401 and the normal exchange follows,
+    /// which is exactly what would have happened with no preemptive bearer.
+    fn restore_persisted_token(&self) {
+        if !token_store::enabled() {
+            return;
+        }
+        let Some(entry) = token_store::load_any(&self.base_url, &self.identity_fingerprint())
+        else {
+            return;
+        };
+        let Some(expires_at) = entry.expires_at_instant() else {
+            return;
+        };
+        if let Ok(mut cache) = self.token_cache.lock() {
+            cache.insert(
+                TokenCacheKey {
+                    realm: entry.realm.clone(),
+                    service: entry.service.clone(),
+                    scope: entry.scope.clone(),
+                },
+                CachedToken {
+                    token: entry.token,
+                    expires_at: Some(expires_at),
+                },
+            );
+        }
+        if let Ok(mut lc) = self.last_challenge.lock() {
+            if lc.is_none() {
+                *lc = Some(BearerChallenge {
+                    realm: entry.realm,
+                    service: entry.service,
+                    scope: entry.scope,
+                });
+            }
+        }
+    }
+
+    /// Fingerprint of this client's credentials for the persisted token store,
+    /// so entries are keyed per identity.
+    fn identity_fingerprint(&self) -> String {
+        token_store::identity_fingerprint(
+            self.auth_token.as_deref(),
+            self.identity_token.as_deref(),
+            self.basic_credentials.as_ref(),
+        )
     }
 }
 
