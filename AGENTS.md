@@ -266,7 +266,7 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `--allow-cidr 10.0.0.0/8` enables egress only to specified IP ranges (implies `--net`)
 - `--allow-host` and `--allow-cidr` can be combined and used multiple times
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
-- `-p HOST:GUEST` forwards a host port to the VM (TCP)
+- `-p HOST:GUEST` forwards a host port to the VM (TCP). The server inside the machine must listen on `0.0.0.0` (not `127.0.0.1`): a server bound only to the guest's loopback is unreachable from the host, and connections are reset. `machine status` shows each published port's listening state.
 - `--guest-subnet 10.200.0.0/30` moves the guest link off the default `100.96.0.0/30` (gateway and resolver `.1`, guest `.2`; implies `--net`, virtio-net). Use it when the guest runs Tailscale, another VPN or carrier NAT that claims `100.64.0.0/10`, which otherwise routes the gateway away and breaks DNS. API: `guestSubnet` on create. Not combinable with `--network`
 - Smolfile: use `[network] allow_host_patterns` for exact/wildcard matching; `allow_hosts` retains legacy matching.
 

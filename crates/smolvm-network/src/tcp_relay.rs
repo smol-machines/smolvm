@@ -75,6 +75,10 @@ pub struct TcpRelayTable {
     /// Redirect selected streams after egress admits their real destination.
     /// `None` relays every flow directly.
     intercept: Option<crate::StreamInterception>,
+    /// Guest ports already reported as refusing published connections, so a
+    /// client retrying in a loop produces one warning rather than one per
+    /// attempt.
+    unaccepted_guest_ports: HashSet<u16>,
 }
 
 /// Destination port whose guest flows go through the credential interceptor.
@@ -224,6 +228,7 @@ impl TcpRelayTable {
             gateway_ips,
             host_service,
             intercept: None,
+            unaccepted_guest_ports: HashSet::new(),
         }
     }
 
@@ -622,12 +627,26 @@ impl TcpRelayTable {
     pub fn cleanup_closed(&mut self, sockets: &mut SocketSet<'_>) {
         let keys = &mut self.connection_keys;
         let published_ports = &mut self.used_published_ports;
+        let unaccepted = &mut self.unaccepted_guest_ports;
         self.connections.retain(|&handle, connection| {
             let socket = sockets.get::<tcp::Socket>(handle);
             if socket.state() == tcp::State::Closed && socket.remote_endpoint().is_none() {
                 keys.remove(&(connection.source, connection.destination));
                 if let Some(port) = connection.reserved_published_port {
                     published_ports.remove(&port);
+                    // A published connection that closed before the guest
+                    // handshake completed was refused (or reset) by the guest:
+                    // nothing accepts connections on guest_ip:guest_port.
+                    if !connection.relay_spawned
+                        && first_refusal_of_guest_port(unaccepted, connection.destination.port())
+                    {
+                        tracing::warn!(
+                            "nothing inside the machine accepted a published-port connection on {}; \
+                             a server listening only on 127.0.0.1 inside the machine is not \
+                             reachable through a published port, so listen on 0.0.0.0",
+                            connection.destination
+                        );
+                    }
                 }
                 sockets.remove(handle);
                 false
@@ -657,6 +676,13 @@ impl TcpRelayTable {
             }
         }
     }
+}
+
+/// Record that a published connection to `guest_port` was refused by the
+/// guest. Returns `true` only the first time for each port, so the caller
+/// warns once per port rather than once per connection attempt.
+fn first_refusal_of_guest_port(reported: &mut HashSet<u16>, guest_port: u16) -> bool {
+    reported.insert(guest_port)
 }
 
 /// Spawn one host TCP relay thread for an established guest connection.
@@ -1440,5 +1466,72 @@ mod tests {
         // With the RST on the wire the connection is finally reaped.
         table.cleanup_closed(&mut sockets);
         assert!(!table.has_socket_for(&source, &destination));
+    }
+
+    #[test]
+    fn refused_guest_port_is_reported_once_per_port() {
+        let mut reported = HashSet::new();
+        assert!(first_refusal_of_guest_port(&mut reported, 8888));
+        assert!(!first_refusal_of_guest_port(&mut reported, 8888));
+        assert!(!first_refusal_of_guest_port(&mut reported, 8888));
+        assert!(first_refusal_of_guest_port(&mut reported, 9000));
+    }
+
+    #[test]
+    fn published_connection_refused_by_the_guest_is_noted_for_its_port() {
+        use smoltcp::iface::{Config, Interface};
+        use smoltcp::phy::{Loopback, Medium};
+        use smoltcp::time::Instant;
+        use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+
+        let mut device = Loopback::new(Medium::Ethernet);
+        let mut interface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress([
+                0x02, 0, 0, 0, 0, 1,
+            ]))),
+            &mut device,
+            Instant::ZERO,
+        );
+        let gateway = Ipv4Addr::new(100, 96, 0, 1);
+        interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::from(gateway), 30))
+                .unwrap();
+        });
+
+        // Host side of the published connection: any connected stream will do.
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let host_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_host_server, _) = listener.accept().unwrap();
+
+        // Nothing listens on the "guest" port, so the SYN is answered with RST,
+        // exactly as a guest kernel answers when the server is bound to
+        // 127.0.0.1 only.
+        let mut sockets = SocketSet::new(vec![]);
+        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+        let guest = SocketAddr::new(IpAddr::V4(gateway), 8888);
+        assert!(table.create_published_socket(
+            &mut interface,
+            gateway,
+            guest,
+            host_client,
+            &mut sockets
+        ));
+
+        for now_ms in 1..=20 {
+            interface.poll(Instant::from_millis(now_ms * 10), &mut device, &mut sockets);
+            assert!(table.take_new_connections(&mut sockets).is_empty());
+            table.cleanup_closed(&mut sockets);
+            if table.active_connections() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            table.active_connections(),
+            0,
+            "refused connection was not reaped"
+        );
+        assert!(table.unaccepted_guest_ports.contains(&8888));
+        assert!(table.used_published_ports.is_empty());
     }
 }

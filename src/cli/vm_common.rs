@@ -2970,6 +2970,9 @@ pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
         if let Some(memory_line) = memory_usage_line(&manager) {
             output.push_str(&memory_line);
         }
+        for (host, guest, state) in published_port_states(&label, &manager) {
+            output.push_str(&state.describe(host, guest));
+        }
         output
     } else if let Some(ref n) = name {
         // Agent not reachable. Report the precise state from the registry
@@ -3075,6 +3078,28 @@ fn memory_usage_line(manager: &AgentManager) -> Option<String> {
     ))
 }
 
+/// Guest-side listening state of each published port of a running machine.
+///
+/// Empty when the machine publishes no ports or the guest read fails: status
+/// reports what it can and never fails or changes the machine over this.
+fn published_port_states(
+    name: &str,
+    manager: &AgentManager,
+) -> Vec<(u16, u16, crate::cli::port_listen::GuestPortState)> {
+    let ports = SmolvmDb::open()
+        .ok()
+        .and_then(|db| db.get_vm(name).ok().flatten())
+        .map(|record| record.ports)
+        .unwrap_or_default();
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    match crate::cli::port_listen::probe_guest_listeners(manager.vsock_socket()) {
+        Some(listeners) => crate::cli::port_listen::port_states(&ports, &listeners),
+        None => Vec::new(),
+    }
+}
+
 /// Build the per-machine JSON object shared by `machine list --json` and
 /// `machine status --json` so the two outputs never drift apart.
 fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
@@ -3144,7 +3169,7 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
     let config = SmolvmConfig::load()?;
     // Build the owned JSON value inside the match so the borrow of `config`
     // ends before `config` is dropped.
-    let obj = match config.list_vms().find(|(n, _)| *n == &label) {
+    let mut obj = match config.list_vms().find(|(n, _)| *n == &label) {
         Some((_, record)) => machine_status_json(&label, record),
         None => {
             return Err(smolvm::Error::config(
@@ -3153,6 +3178,31 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
             ))
         }
     };
+    // Per-port guest listening state, only for a machine that is already
+    // running (status never starts one). Kept out of the shared object so
+    // `machine list --json` does not exec into every running machine.
+    if obj["state"] == RecordState::Running.to_string() {
+        let manager = get_vm_manager(name).ok();
+        if let Some(manager) = manager.filter(|m| {
+            m.detach();
+            m.try_connect_existing().is_some()
+        }) {
+            let states = published_port_states(&label, &manager);
+            if !states.is_empty() {
+                let entries: Vec<_> = states
+                    .iter()
+                    .map(|(host, guest, state)| {
+                        serde_json::json!({
+                            "host": host,
+                            "guest": guest,
+                            "guest_listening": state.as_str(),
+                        })
+                    })
+                    .collect();
+                obj["published_ports"] = serde_json::Value::Array(entries);
+            }
+        }
+    }
     let json = serde_json::to_string_pretty(&obj)
         .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
     write_status_output(&format!("{json}\n"))
