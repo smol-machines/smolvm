@@ -522,6 +522,8 @@ pub struct MachineCountsResponse {
 /// totals/reserved; this endpoint reports only what the runtime itself knows.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CapacityResponse {
+    /// API-supplied credential values can be rotated for a running VM.
+    pub credential_live_rotation: bool,
     /// CPUs allocated to running machines (sum of per-machine cpu requests).
     pub allocated_cpus: u32,
     /// Memory (MB) allocated to running machines.

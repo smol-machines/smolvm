@@ -71,6 +71,7 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
     });
 
     Json(CapacityResponse {
+        credential_live_rotation: cfg!(unix),
         allocated_cpus,
         allocated_memory_mb,
         used_cpus: utilization.used_cpus,

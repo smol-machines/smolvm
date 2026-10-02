@@ -5122,7 +5122,7 @@ pub async fn put_credential_values(
             .into_iter()
             .map(|(k, v)| (k, zeroize::Zeroizing::new(v)))
             .collect(),
-    );
+    )?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

@@ -72,6 +72,34 @@ pub fn workload_env(
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string())),
     );
+    // Git's credential helper returns the opaque placeholder as the HTTP
+    // password. The interceptor recognizes its Basic header and inserts the
+    // real value after the request leaves the guest. Reset any inherited
+    // helper for this host so an unrelated helper cannot supply a PAT first.
+    if policy.credentials.iter().any(|binding| {
+        binding.environment_variable == "GITHUB_TOKEN"
+            && binding
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "github.com")
+    }) {
+        env.extend([
+            ("GIT_CONFIG_COUNT".into(), "2".into()),
+            (
+                "GIT_CONFIG_KEY_0".into(),
+                "credential.https://github.com.helper".into(),
+            ),
+            ("GIT_CONFIG_VALUE_0".into(), String::new()),
+            (
+                "GIT_CONFIG_KEY_1".into(),
+                "credential.https://github.com.helper".into(),
+            ),
+            (
+                "GIT_CONFIG_VALUE_1".into(),
+                "!f() { [ \"$1\" = get ] || exit 0; host=; protocol=; while IFS= read -r line; do case \"$line\" in host=*) host=${line#host=} ;; protocol=*) protocol=${line#protocol=} ;; esac; done; [ \"$host\" = github.com ] && [ \"$protocol\" = https ] && [ -n \"$GITHUB_TOKEN\" ] || exit 0; printf \"username=x-access-token\\npassword=%s\\n\" \"$GITHUB_TOKEN\"; }; f".into(),
+            ),
+        ]);
+    }
     (refs, env)
 }
 
@@ -187,6 +215,18 @@ impl CredentialLaunch {
     pub fn start_interceptor(&self) -> Result<Interceptor> {
         let ca = MachineCa::load(&self.ca_dir, &self.ca_owner)
             .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?;
+        let resolver: Arc<dyn CredentialResolver> = if self.supplied_only {
+            #[cfg(unix)]
+            {
+                Arc::new(SuppliedResolver)
+            }
+            #[cfg(not(unix))]
+            {
+                Arc::new(SecretRefResolver(self.sources.clone()))
+            }
+        } else {
+            Arc::new(SecretRefResolver(self.sources.clone()))
+        };
         Interceptor::spawn(
             InterceptorConfig {
                 machine: self.machine.clone(),
@@ -195,16 +235,14 @@ impl CredentialLaunch {
                 ca,
                 upstream_roots_pem: Vec::new(),
             },
-            Arc::new(SecretRefResolver(self.sources.clone())),
+            resolver,
         )
         .map_err(|e| Error::config("credentials", format!("start interceptor: {e:#}")))
     }
 }
 
-/// Values handed to this process for its machines' bindings, by machine name
-/// then binding name. Held in memory only: never written to a record, a boot
-/// config or a checkpoint, and gone when the process exits, so whoever supplied
-/// them supplies them again before the next boot.
+/// Values handed to the API process for its machines' bindings, by machine name
+/// then binding name. Held in memory only, outside the guest and checkpoint.
 type SuppliedValues = BTreeMap<String, zeroize::Zeroizing<String>>;
 
 static SUPPLIED: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, SuppliedValues>>> =
@@ -212,18 +250,205 @@ static SUPPLIED: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, SuppliedV
 
 /// Hold `values` (binding name → value) for `machine`'s next boots, replacing
 /// any held before.
-pub fn supply_values(machine: &str, values: SuppliedValues) {
+pub fn supply_values(machine: &str, values: SuppliedValues) -> Result<()> {
+    #[cfg(unix)]
+    if !values.is_empty() {
+        ensure_resolver_server(machine)?;
+    }
     let mut held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
     if values.is_empty() {
         held.remove(machine);
     } else {
         held.insert(machine.to_string(), values);
     }
+    Ok(())
 }
 
 /// Drop whatever was supplied for `machine`.
 pub fn forget_values(machine: &str) {
-    supply_values(machine, BTreeMap::new());
+    let _ = supply_values(machine, BTreeMap::new());
+    #[cfg(unix)]
+    {
+        if let Some(handle) = RESOLVERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(machine)
+        {
+            handle.abort();
+        }
+        let _ = std::fs::remove_file(resolver_socket_path(machine));
+    }
+}
+
+/// One host-only resolver socket per machine, inside that machine's data dir.
+/// This matters under Landlock: a confined VM host process can reach its own
+/// socket, but not another VM's socket and therefore not its credentials.
+#[cfg(unix)]
+fn resolver_socket_path(machine: &str) -> PathBuf {
+    crate::agent::vm_data_dir(machine).join("credential-resolver.sock")
+}
+
+#[cfg(unix)]
+static RESOLVERS: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(unix)]
+fn ensure_resolver_server(machine: &str) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+    let mut resolvers = RESOLVERS.lock().unwrap_or_else(|e| e.into_inner());
+    if resolvers.contains_key(machine) {
+        return Ok(());
+    }
+    let path = resolver_socket_path(machine);
+    std::fs::create_dir_all(path.parent().expect("socket has a parent"))
+        .map_err(|e| Error::config("credentials", format!("create resolver directory: {e}")))?;
+    if UnixStream::connect(&path).is_ok() {
+        return Err(Error::config(
+            "credentials",
+            "another resolver owns this machine socket",
+        ));
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::config(
+                "credentials",
+                format!("remove stale resolver socket: {error}"),
+            ))
+        }
+    }
+    let listener = tokio::net::UnixListener::bind(&path)
+        .map_err(|e| Error::config("credentials", format!("bind resolver socket: {e}")))?;
+    // The per-VM data directory is chowned to a dedicated UID when a root
+    // node starts the VM. On an API restart the new socket is created by root
+    // again, so give it back to that VM's UID before serving requests.
+    if unsafe { libc::geteuid() } == 0 {
+        let owner = std::fs::metadata(path.parent().expect("socket has a parent"))
+            .map_err(|e| Error::config("credentials", format!("stat resolver directory: {e}")))?;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| Error::config("credentials", format!("invalid resolver path: {e}")))?;
+        if unsafe { libc::lchown(cpath.as_ptr(), owner.uid(), owner.gid()) } != 0 {
+            return Err(Error::config(
+                "credentials",
+                format!("chown resolver socket: {}", std::io::Error::last_os_error()),
+            ));
+        }
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::config("credentials", format!("protect resolver socket: {e}")))?;
+    let machine_name = machine.to_string();
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|e| Error::config("credentials", format!("resolver runtime unavailable: {e}")))?
+        .spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let machine = machine_name.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        serve_resolver_request(&machine, &mut stream),
+                    )
+                    .await
+                    {
+                        tracing::debug!(%error, "credential resolver request timed out");
+                    }
+                });
+            }
+        });
+    resolvers.insert(machine.to_string(), handle);
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn serve_resolver_request(
+    machine: &str,
+    stream: &mut tokio::net::UnixStream,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut size = [0u8; 4];
+    stream.read_exact(&mut size).await?;
+    let size = u32::from_be_bytes(size) as usize;
+    if size == 0 || size > 4096 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid request size",
+        ));
+    }
+    let mut bytes = vec![0u8; size];
+    stream.read_exact(&mut bytes).await?;
+    let binding: String = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let value = SUPPLIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(machine)
+        .and_then(|bindings| bindings.get(&binding))
+        .cloned();
+    let Some(value) = value else {
+        stream.write_all(&0u32.to_be_bytes()).await?;
+        return Ok(());
+    };
+    let bytes = zeroize::Zeroizing::new(value.as_bytes().to_vec());
+    let size = u32::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "credential too large")
+    })?;
+    stream.write_all(&size.to_be_bytes()).await?;
+    stream.write_all(&bytes).await
+}
+
+#[cfg(unix)]
+struct SuppliedResolver;
+
+#[cfg(unix)]
+impl CredentialResolver for SuppliedResolver {
+    fn resolve(
+        &self,
+        request: &CredentialRequest,
+    ) -> std::result::Result<zeroize::Zeroizing<String>, ResolveError> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let mut stream =
+            UnixStream::connect(resolver_socket_path(&request.machine)).map_err(|_| {
+                ResolveError::Unavailable("node credential resolver unavailable".into())
+            })?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .ok();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+            .ok();
+        let request = serde_json::to_vec(&request.binding)
+            .map_err(|_| ResolveError::Unavailable("invalid credential request".into()))?;
+        let size = u32::try_from(request.len())
+            .map_err(|_| ResolveError::Unavailable("credential request too large".into()))?;
+        stream
+            .write_all(&size.to_be_bytes())
+            .and_then(|_| stream.write_all(&request))
+            .map_err(|_| {
+                ResolveError::Unavailable("node credential resolver unavailable".into())
+            })?;
+        let mut size = [0u8; 4];
+        stream.read_exact(&mut size).map_err(|_| {
+            ResolveError::Unavailable("node credential resolver unavailable".into())
+        })?;
+        let size = u32::from_be_bytes(size) as usize;
+        if size == 0 || size > 64 * 1024 {
+            return Err(ResolveError::Unavailable("credential unavailable".into()));
+        }
+        let mut bytes = zeroize::Zeroizing::new(vec![0u8; size]);
+        stream.read_exact(&mut bytes).map_err(|_| {
+            ResolveError::Unavailable("node credential resolver unavailable".into())
+        })?;
+        String::from_utf8(std::mem::take(&mut *bytes))
+            .map(zeroize::Zeroizing::new)
+            .map_err(|_| ResolveError::Unavailable("invalid credential value".into()))
+    }
 }
 
 /// Name of the variable carrying a supplied value into the boot process.
@@ -239,6 +464,13 @@ impl CredentialLaunch {
     /// `supplied_only` binding with no value is pointed at a variable that is
     /// removed, so it resolves to nothing rather than to a host variable.
     pub fn child_env(&mut self) -> Vec<(String, Option<zeroize::Zeroizing<String>>)> {
+        // On Unix the boot process asks the API process's node-local socket on
+        // every request. No supplied value needs to enter its environment, and
+        // PUT /credential-values changes a running VM immediately.
+        #[cfg(unix)]
+        if self.supplied_only {
+            return Vec::new();
+        }
         let held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
         let supplied = held.get(&self.machine);
         let mut env = Vec::new();
@@ -337,8 +569,8 @@ mod tests {
         launch
     }
 
-    #[test]
-    fn supplied_values_reach_only_the_boot_process() {
+    #[tokio::test]
+    async fn supplied_values_reach_only_the_boot_process() {
         let machine = "cred-test-supplied";
         supply_values(
             machine,
@@ -347,7 +579,8 @@ mod tests {
                 zeroize::Zeroizing::new("value-a".to_string()),
             )]
             .into(),
-        );
+        )
+        .unwrap();
         let mut l = launch(machine, false);
         let env = l.child_env();
         // The supplied binding moves to a private variable carrying its value.
@@ -372,19 +605,71 @@ mod tests {
         forget_values(machine);
         let mut l = launch(machine, true);
         let env = l.child_env();
-        // Nothing supplied: both bindings point at variables that are removed.
-        assert_eq!(env.len(), 2);
-        assert!(env
-            .iter()
-            .all(|(var, value)| var.starts_with("SMOLVM_CREDENTIAL_") && value.is_none()));
-        assert_eq!(
-            l.sources["a"].from_env.as_deref(),
-            Some("SMOLVM_CREDENTIAL_0")
-        );
-        assert_eq!(
-            l.sources["b"].from_env.as_deref(),
-            Some("SMOLVM_CREDENTIAL_1")
-        );
+        #[cfg(unix)]
+        {
+            assert!(env.is_empty());
+            assert_eq!(l.sources["a"].from_env.as_deref(), Some("A_KEY"));
+            assert_eq!(l.sources["b"].from_env.as_deref(), Some("B_KEY"));
+            return;
+        }
+        #[cfg(not(unix))]
+        {
+            // Nothing supplied: both bindings point at variables that are removed.
+            assert_eq!(env.len(), 2);
+            assert!(env
+                .iter()
+                .all(|(var, value)| var.starts_with("SMOLVM_CREDENTIAL_") && value.is_none()));
+            assert_eq!(
+                l.sources["a"].from_env.as_deref(),
+                Some("SMOLVM_CREDENTIAL_0")
+            );
+            assert_eq!(
+                l.sources["b"].from_env.as_deref(),
+                Some("SMOLVM_CREDENTIAL_1")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_supplied_value_rotates_and_revokes_while_resolver_is_running() {
+        let machine = "cred-test-live-rotation";
+        let request = CredentialRequest {
+            machine: machine.into(),
+            binding: "github".into(),
+            host: "github.com".into(),
+            port: 443,
+            method: "GET".into(),
+            path: "/org/repo.git/info/refs".into(),
+        };
+        supply_values(
+            machine,
+            [("github".into(), zeroize::Zeroizing::new("old".into()))].into(),
+        )
+        .unwrap();
+        let resolver = SuppliedResolver;
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "old");
+        supply_values(
+            machine,
+            [("github".into(), zeroize::Zeroizing::new("new".into()))].into(),
+        )
+        .unwrap();
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "new");
+        forget_values(machine);
+        assert!(resolver.resolve(&request).is_err());
+        supply_values(
+            machine,
+            [("github".into(), zeroize::Zeroizing::new("rebound".into()))].into(),
+        )
+        .unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let socket = resolver_socket_path(machine);
+        let metadata = std::fs::metadata(&socket).unwrap();
+        let parent = std::fs::metadata(socket.parent().unwrap()).unwrap();
+        assert_eq!(metadata.uid(), parent.uid());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "rebound");
+        forget_values(machine);
     }
 
     #[test]
@@ -407,5 +692,38 @@ mod tests {
             .any(|(k, v)| k == "SSL_CERT_FILE" && v == "/run/smolvm/ca-bundle.pem"));
         assert!(env.iter().all(|(_, v)| !v.contains("secret")));
         assert!(prepare_policy(&policy, Some(&["github.com".to_string()])).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_binding_installs_git_helper_that_returns_only_the_placeholder() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let policy = CredentialPolicy {
+            credentials: vec![parse_credential_flag(
+                "github=GITHUB_TOKEN@github.com,api.github.com",
+            )
+            .unwrap()],
+        };
+        let placeholders = prepare_policy(&policy, None).unwrap();
+        let (_, env) = workload_env(Some(&policy), &placeholders, &BTreeMap::new());
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("git is required for the credential helper test");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(output.contains("username=x-access-token"));
+        assert!(output.contains(&format!("password={}", placeholders["github"])));
     }
 }
