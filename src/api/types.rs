@@ -103,6 +103,12 @@ pub struct ResourceSpec {
     /// bundled shims). Required on a golden that fork clones will train on.
     #[serde(default)]
     pub cuda: Option<bool>,
+    /// Expose the host's virtualization extensions so the guest can run its own
+    /// VMs (nested KVM). Refused unless the server runs with
+    /// `--allow-nested-virt`; it hands the guest the host kernel's nested-KVM
+    /// code, so enable it only for trusted workloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_virt: Option<bool>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     #[schema(example = 20)]
@@ -642,6 +648,12 @@ pub struct CreateMachineRequest {
     /// Enable CUDA remoting (host NVIDIA GPU via the bundled shims).
     #[serde(default)]
     pub cuda: bool,
+    /// Expose the host's virtualization extensions so the guest can run its own
+    /// VMs (nested KVM). Refused with 403 unless the server runs with
+    /// `--allow-nested-virt`; it hands the guest the host kernel's nested-KVM
+    /// code, so enable it only for trusted workloads.
+    #[serde(default)]
+    pub nested_virt: bool,
     /// Ask compatible CUDA frameworks to graph safe compiled regions.
     /// Implies CUDA; arbitrary eager CUDA calls are not captured.
     #[serde(default)]

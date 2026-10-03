@@ -90,6 +90,13 @@ pub struct ServeStartCmd {
     #[arg(long, value_name = "MODE", default_value = "enforce")]
     landlock: String,
 
+    /// Let machines run with nested virtualization (`nestedVirt` on create).
+    /// Off by default: it exposes the host kernel's nested-KVM code to the
+    /// guest, so enable it only on a server that runs trusted workloads. Turning
+    /// it off again also stops existing nested machines from starting.
+    #[arg(long = "allow-nested-virt")]
+    allow_nested_virt: bool,
+
     /// Require the mTLS client certificate's subject CN to equal this value
     /// for API access. Only applies when serve TLS is configured
     /// (SMOLVM_SERVE_TLS_CERT/_KEY/_CLIENT_CA). Unset (the default), every
@@ -316,6 +323,12 @@ impl ServeStartCmd {
         let state = Arc::new(ApiState::new().map_err(|e| {
             smolvm::error::Error::config("initialize api state", format!("{:?}", e))
         })?);
+        state.set_allow_nested_virt(self.allow_nested_virt);
+        if self.allow_nested_virt {
+            println!(
+                "Nested virtualization is enabled: guests can reach this host's nested-KVM code"
+            );
+        }
         let loaded = state.load_persisted_machines();
         if !loaded.is_empty() {
             println!(

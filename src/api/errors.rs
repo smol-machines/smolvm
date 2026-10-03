@@ -125,6 +125,7 @@ impl From<crate::error::Error> for ApiError {
             crate::error::Error::Agent { reason, kind, .. } => match kind {
                 crate::error::AgentErrorKind::NotFound => ApiError::NotFound(reason.clone()),
                 crate::error::AgentErrorKind::Conflict => ApiError::Conflict(reason.clone()),
+                crate::error::AgentErrorKind::Forbidden => ApiError::Forbidden(reason.clone()),
                 crate::error::AgentErrorKind::Other => ApiError::Internal(reason.clone()),
             },
             _ => ApiError::Internal(err.to_string()),

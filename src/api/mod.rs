@@ -719,3 +719,108 @@ mod tests {
         assert!(validate_command(&["echo".to_string(), "hello".to_string()]).is_ok());
     }
 }
+
+#[cfg(test)]
+mod nested_virt_gate_test {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn send(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    // Nesting hands the guest the host's nested-KVM code, so a server refuses it
+    // until started with --allow-nested-virt, and turning the flag off again
+    // keeps machines created with it from starting.
+    #[tokio::test]
+    async fn nested_virt_needs_the_server_opt_in_to_create_and_to_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("t.db")).unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        let router = || create_router(state.clone(), vec![]);
+
+        let (status, body) = send(
+            router(),
+            "POST",
+            "/api/v1/machines",
+            r#"{"name":"nest","nestedVirt":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("--allow-nested-virt"), "{body}");
+        assert!(
+            state.db().get_vm("nest").unwrap().is_none(),
+            "refused before anything is written"
+        );
+
+        state.set_allow_nested_virt(true);
+        let (status, body) = send(
+            router(),
+            "POST",
+            "/api/v1/machines",
+            r#"{"name":"nest","nestedVirt":true}"#,
+        )
+        .await;
+        assert!(status.is_success(), "{status}: {body}");
+        let record = state.db().get_vm("nest").unwrap().expect("created");
+        assert_eq!(record.nested_virt, Some(true));
+        assert!(record.vm_resources().nested_virt);
+
+        state.set_allow_nested_virt(false);
+        let (status, body) = send(router(), "POST", "/api/v1/machines/nest/start", "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("--allow-nested-virt"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_machine_without_the_field_is_not_nested() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("t.db")).unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        let (status, body) = send(
+            create_router(state.clone(), vec![]),
+            "POST",
+            "/api/v1/machines",
+            r#"{"name":"flat"}"#,
+        )
+        .await;
+        assert!(status.is_success(), "{status}: {body}");
+        let record = state.db().get_vm("flat").unwrap().expect("created");
+        assert_eq!(record.nested_virt, None);
+        assert!(!record.vm_resources().nested_virt);
+    }
+
+    #[test]
+    fn the_resource_spec_round_trips_nesting() {
+        let mut res = crate::data::resources::VmResources::default();
+        assert!(!crate::api::state::vm_resources_to_spec(res.clone())
+            .nested_virt
+            .unwrap_or(false));
+        res.nested_virt = true;
+        let spec = crate::api::state::vm_resources_to_spec(res);
+        assert_eq!(spec.nested_virt, Some(true));
+        assert!(crate::api::state::resource_spec_to_vm_resources(&spec, false).nested_virt);
+    }
+}

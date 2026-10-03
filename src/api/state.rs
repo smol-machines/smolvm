@@ -117,6 +117,11 @@ pub struct ApiState {
     /// node as unschedulable (HTTP 503) the moment the main runtime stops
     /// making progress, turning a silent wedge into a fast, honest drain signal.
     runtime_heartbeat_ms: std::sync::atomic::AtomicU64,
+    /// Whether this server lets machines run with nested virtualization. Off
+    /// unless `smolvm serve --allow-nested-virt`: nesting hands the guest the host
+    /// kernel's nested-KVM code, so a server opts in for its whole fleet, and
+    /// turning it back off also stops existing nested machines from starting.
+    allow_nested_virt: std::sync::atomic::AtomicBool,
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
@@ -325,6 +330,7 @@ impl ApiState {
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -345,11 +351,36 @@ impl ApiState {
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         }
+    }
+
+    /// Let (or stop letting) machines on this server run with nested
+    /// virtualization. Set once from `smolvm serve --allow-nested-virt`.
+    pub fn set_allow_nested_virt(&self, allow: bool) {
+        self.allow_nested_virt
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this server lets machines run with nested virtualization.
+    pub fn nested_virt_allowed(&self) -> bool {
+        self.allow_nested_virt
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Refuse a machine that would run with nested virtualization on a server
+    /// that has not opted in. Every path that creates, starts, restarts, forks or
+    /// branches a machine asks this first, so the flag closes the surface for
+    /// machines created before it was turned off, not just new ones.
+    pub fn ensure_nested_virt_allowed(&self, nested_virt: bool) -> Result<(), ApiError> {
+        if nested_virt && !self.nested_virt_allowed() {
+            return Err(ApiError::Forbidden(NESTED_VIRT_DISABLED.to_string()));
+        }
+        Ok(())
     }
 
     /// Shared lease-aware admission registry used by the pool controller and
@@ -522,6 +553,7 @@ impl ApiState {
                 network: Some(record.network),
                 gpu: record.gpu,
                 cuda: Some(record.cuda),
+                nested_virt: record.nested_virt,
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
                 block_io: Some(record.block_io),
@@ -1124,6 +1156,7 @@ impl ApiState {
         // silently lost CUDA/GPU on restart).
         record.gpu = reg.resources.gpu;
         record.cuda = reg.resources.cuda.unwrap_or(false);
+        record.nested_virt = reg.resources.nested_virt.filter(|on| *on);
         record.forkable = reg.forkable;
         record.init_completed = reg.init_completed;
         record.docker_socket = reg.docker_socket;
@@ -1547,6 +1580,16 @@ pub async fn ensure_running_and_persist(
     let lifecycle = state.lifecycle_lock(name);
     let _guard = lifecycle.lock().await;
 
+    // A nested machine waking on a server that has since turned nesting off
+    // stays down, the same as an explicit start.
+    let nested = entry.lock().resources.nested_virt.unwrap_or(false);
+    if nested && !state.nested_virt_allowed() {
+        return Err(crate::Error::agent_forbidden(
+            "start machine",
+            NESTED_VIRT_DISABLED,
+        ));
+    }
+
     // Refresh the entry's launch config from the persisted record before an
     // implicit start. The record is the source of truth and can change while
     // the machine is stopped (`machine update` from the CLI edits the DB but
@@ -1755,6 +1798,11 @@ pub fn mounts_to_host_mounts(specs: &[MountSpec]) -> Result<Vec<HostMount>, ApiE
         .collect()
 }
 
+/// The refusal for a machine that asks for nested virtualization on a server
+/// that has not opted in.
+pub const NESTED_VIRT_DISABLED: &str = "nested virtualization is disabled on this server; \
+start `smolvm serve` with --allow-nested-virt to enable it";
+
 /// Convert ResourceSpec to VmResources.
 pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmResources {
     VmResources {
@@ -1768,7 +1816,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // needs to expose it.
         gpu_vram_mib: None,
         cuda: spec.cuda.unwrap_or(false),
-        nested_virt: false,
+        nested_virt: spec.nested_virt.unwrap_or(false),
         rosetta: false,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
@@ -1791,6 +1839,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         network: Some(res.network),
         gpu: Some(res.gpu),
         cuda: Some(res.cuda),
+        nested_virt: res.nested_virt.then_some(true),
         storage_gb: res.storage_gib,
         overlay_gb: res.overlay_gib,
         block_io: Some(res.block_io),
@@ -2035,6 +2084,7 @@ mod tests {
             network: None,
             gpu: None,
             cuda: None,
+            nested_virt: None,
             storage_gb: None,
             overlay_gb: None,
             block_io: None,
@@ -2101,6 +2151,7 @@ mod tests {
                     network: None,
                     gpu: None,
                     cuda: None,
+                    nested_virt: None,
                     storage_gb: None,
                     overlay_gb: None,
                     block_io: None,
@@ -2163,6 +2214,7 @@ mod tests {
                     network: None,
                     gpu: None,
                     cuda: None,
+                    nested_virt: None,
                     storage_gb: None,
                     overlay_gb: None,
                     block_io: None,
@@ -2236,6 +2288,7 @@ mod tests {
                     network: None,
                     gpu: None,
                     cuda: None,
+                    nested_virt: None,
                     storage_gb: None,
                     overlay_gb: None,
                     block_io: None,

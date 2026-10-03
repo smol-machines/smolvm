@@ -307,6 +307,14 @@ impl Supervisor {
             }
         }
 
+        if record.nested_virt.unwrap_or(false) && !self.state.nested_virt_allowed() {
+            tracing::warn!(
+                machine = %name,
+                "not auto-restarting: nested virtualization is disabled on this server"
+            );
+            return Ok(());
+        }
+
         let mounts = record.host_mounts();
         let ports = record.port_mappings();
         let resources = record.vm_resources();

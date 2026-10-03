@@ -48,6 +48,8 @@ pub enum AgentErrorKind {
     NotFound,
     /// Conflict / resource already exists (maps to 409).
     Conflict,
+    /// Refused by this server's policy (maps to 403).
+    Forbidden,
     /// General error (maps to 500).
     #[default]
     Other,
@@ -344,6 +346,16 @@ impl Error {
             operation: operation.into(),
             reason: reason.into(),
             kind: AgentErrorKind::Conflict,
+        }
+    }
+
+    /// Create an agent "forbidden" error (maps to 403): this server's policy
+    /// refuses the operation.
+    pub fn agent_forbidden(operation: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Agent {
+            operation: operation.into(),
+            reason: reason.into(),
+            kind: AgentErrorKind::Forbidden,
         }
     }
 

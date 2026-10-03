@@ -1874,6 +1874,9 @@ async fn create_machine_inner(
     verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
     cached_checkpoint: bool,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Refused before any image pull or disk work, so a server that has not opted
+    // in never builds a nested machine.
+    state.ensure_nested_virt_allowed(req.nested_virt)?;
     #[cfg(target_os = "linux")]
     let mut req = req;
     #[cfg(target_os = "linux")]
@@ -2296,6 +2299,7 @@ async fn create_machine_inner(
             || req.gpu
             || req.cuda
             || req.auto_graph
+            || req.nested_virt
             || req.storage_gb.is_some()
             || req.overlay_gb.is_some()
             || req.network_backend.is_some()
@@ -2570,6 +2574,7 @@ async fn create_machine_inner(
         network: Some(network),
         gpu: Some(req.gpu),
         cuda: Some(req.cuda || req.auto_graph),
+        nested_virt: req.nested_virt.then_some(true),
         storage_gb: restored_storage_gb,
         overlay_gb: restored_overlay_gb,
         block_io: req.block_io,
@@ -2933,6 +2938,8 @@ pub async fn start_machine(
             "machine has saved execution; use resume".into(),
         ));
     }
+    // A machine created with nesting stays down once the server turns it off.
+    state.ensure_nested_virt_allowed(record.nested_virt.unwrap_or(false))?;
 
     if let Some(endpoint) = external_interceptor.as_ref() {
         crate::agent::validate_external_interceptor(
@@ -3480,6 +3487,11 @@ pub(crate) async fn fork_machine_inner(
     golden: String,
     req: ForkRequest,
 ) -> Result<MachineInfo, ApiError> {
+    // A branch of a nested machine is nested too (its saved guest expects VMX),
+    // so it needs the same opt-in as creating one.
+    if let Some(source) = state.lookup_vm(&golden).await? {
+        state.ensure_nested_virt_allowed(source.nested_virt.unwrap_or(false))?;
+    }
     if coalescable_branch(&req) {
         return with_owned_operation(move |reply| async move {
             state.queue_branch(&golden, crate::api::state::QueuedBranch { req, reply });
@@ -3889,6 +3901,9 @@ pub(crate) async fn fork_held_machines_inner(
     batch: ForkHeldBatch,
     result_tx: UnboundedSender<(String, Result<MachineInfo, ApiError>)>,
 ) -> Result<ForkBatchOutcome, ApiError> {
+    if let Some(source) = state.lookup_vm(&batch.golden).await? {
+        state.ensure_nested_virt_allowed(source.nested_virt.unwrap_or(false))?;
+    }
     let ForkHeldBatch {
         golden,
         clones,
@@ -4080,6 +4095,8 @@ async fn boot_prepared_fork_inner(
         cuda_worker_ready_timeout,
         mut boot_permit,
     } = boot;
+    // Backstop for every fork path: a clone inherits its golden's nesting.
+    state.ensure_nested_virt_allowed(prep.clone_record.nested_virt.unwrap_or(false))?;
     // Phase 2: boot the clone from the golden's in-memory snapshot (warm — its
     // processes are already running in the restored RAM, so unlike a cold start
     // there is no image workload to launch), then rejuvenate its identity.
@@ -6303,6 +6320,7 @@ mod tests {
             network: false,
             gpu: false,
             cuda: false,
+            nested_virt: false,
             auto_graph: false,
             entrypoint: vec![],
             cmd: vec![],
