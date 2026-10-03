@@ -22,6 +22,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod compact;
+
 /// Bound qcow2 ancestry and recursive lifecycle work. Longer chains should be
 /// compacted into a new root rather than accumulating unbounded lookup cost.
 const MAX_FORK_LINEAGE_DEPTH: usize = 32;
@@ -901,6 +904,7 @@ fn prepare_running_disk_generation(
     let mut pivot_lines = Vec::new();
     let mut generation_lines = Vec::new();
     let mut rotations = Vec::new();
+    let mut compacted = Vec::new();
     for (id, raw) in [
         ("storage", crate::data::storage::STORAGE_DISK_FILENAME),
         ("overlay", crate::data::storage::OVERLAY_DISK_FILENAME),
@@ -939,6 +943,22 @@ fn prepare_running_disk_generation(
                 return Err(Error::agent("fork-continue disk base", error.to_string()));
             }
         };
+        // A finished background merge shortens the chain this branch stacks on.
+        let base = if format == DiskFormat::Qcow2 {
+            match compact::adopt_compacted_base(gdir, id, &base, &generation_disk_dir) {
+                Ok(Some(merged)) => merged,
+                Ok(None) => base,
+                Err(error) => {
+                    tracing::warn!(%error, "could not adopt a merged disk chain; branching on the full chain");
+                    base
+                }
+            }
+        } else {
+            base
+        };
+        if format == DiskFormat::Qcow2 {
+            compacted.push((id, base.clone()));
+        }
         overlays.push((active.clone(), base.clone(), format));
         pivot_lines.push((id, active));
         generation_lines.push((raw, base, format));
@@ -1011,6 +1031,11 @@ fn prepare_running_disk_generation(
     if let Err(error) = write_result {
         rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
         return Err(error);
+    }
+    for (id, base) in &compacted {
+        if let Err(error) = compact::maybe_start_compaction(gdir, id, base, vm_ids) {
+            tracing::warn!(%error, "could not start merging a branch source's disk chain");
+        }
     }
     Ok(())
 }
@@ -2401,6 +2426,13 @@ pub(crate) fn prepare_forks_reusing(
                 .map_err(|e| Error::agent("fork: prepare snapshot permissions", e.to_string()))?;
             crate::process::chown_tree(&snapshot_dir, uid, gid)
                 .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if fork_continue {
+            if let Err(error) = compact::compact_if_near_limit(&gdir, vm_ids) {
+                tracing::warn!(%golden, %error, "could not merge a deep branch source disk chain");
+            }
         }
 
         if let Err(error) = sync_fork_source(golden) {
