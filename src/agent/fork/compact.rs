@@ -37,6 +37,22 @@ const COPY_CHUNK: u64 = 4 << 20;
 /// Disks with a merge running, so one source never runs two at once.
 static IN_FLIGHT: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
+/// A file that marks a merge as running to every process until dropped.
+struct Busy(PathBuf);
+
+impl Busy {
+    fn announce(path: PathBuf) -> Result<Self> {
+        std::fs::write(&path, b"").map_err(|e| compact_err("announce merge", e))?;
+        Ok(Busy(path))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Holds a disk's place in [`IN_FLIGHT`] until dropped.
 struct Claim(PathBuf);
 
@@ -402,6 +418,9 @@ fn compact(
         .unwrap_or_default();
     let partial = dir.join(format!("{id}.{stamp}.qcow2.partial"));
     let finished = dir.join(format!("{id}.{stamp}.qcow2"));
+    // Announce the merge before reading any layer, so a collection in another
+    // process keeps every layer from the first read on.
+    let _busy = Busy::announce(dir.join(format!("{id}.{stamp}.busy")))?;
     merge_onto(top, root, root, &partial)?;
     std::fs::rename(&partial, &finished).map_err(|e| compact_err("publish merge", e))?;
     if let Some((uid, gid)) = vm_ids {
@@ -506,7 +525,8 @@ fn merge_in_progress(gdir_d: &Path) -> bool {
     let mut running = false;
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.to_string_lossy().ends_with(".partial") {
+        let name = path.to_string_lossy();
+        if !name.ends_with(".partial") && !name.ends_with(".busy") {
             continue;
         }
         let age = entry
@@ -760,6 +780,14 @@ mod tests {
         .unwrap();
         assert_eq!(collect_unreachable_layers(&source, &both).unwrap(), 0);
         assert!(pinned.exists());
+
+        // An announced merge keeps everything too, before it has written a byte.
+        std::fs::write(source.join("d/c/storage.3.busy"), b"").unwrap();
+        assert_eq!(
+            collect_unreachable_layers(&source, std::slice::from_ref(&source)).unwrap(),
+            0
+        );
+        std::fs::remove_file(source.join("d/c/storage.3.busy")).unwrap();
 
         // A merge in progress keeps everything, whatever looks unreachable.
         std::fs::remove_dir_all(source.join("s")).unwrap();
