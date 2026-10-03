@@ -721,6 +721,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         docker_socket: docker_socket.as_deref(),
         published_sockets: &config.published_sockets,
         packed_layers_dir: config.packed_layers_dir.as_deref(),
+        packed_layers_dax_window: config.packed_layers_dax_window,
         extra_disks: &config.extra_disks,
         dns_filter_enabled: config
             .dns_filter_hosts

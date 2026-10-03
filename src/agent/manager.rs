@@ -2471,6 +2471,12 @@ impl AgentManager {
             .map(|launch| launch.child_env())
             .unwrap_or_default();
 
+        // A fresh boot gets the small packed-layer window; a restore keeps the
+        // window its guest booted with (recorded with the snapshot).
+        let packed_layers_dax_window =
+            super::virtiofs::packed_layers_window_for_launch(features.snapshot_dir.as_deref());
+        let records_window = features.packed_layers_dir.is_some();
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -2494,6 +2500,7 @@ impl AgentManager {
             credentials: features.credentials,
             external_interceptor: features.external_interceptor,
             packed_layers_dir: features.packed_layers_dir,
+            packed_layers_dax_window,
             pack_idmap_source,
             extra_disks: {
                 let mut __d = features.extra_disks;
@@ -2706,6 +2713,17 @@ impl AgentManager {
         // the sweep is only driven from serve.) The `child` handle drops without
         // waiting (Rust `Child::drop` is a no-op), leaving the PID for the sweep.
         crate::process::register_vm_child(child_pid);
+        // Captures of this machine record the window its guest booted with.
+        if let (Some(name), true) = (self.name(), records_window) {
+            if let Some(start) = crate::process::process_start_time(child_pid) {
+                super::virtiofs::record_launch_window(
+                    &vm_data_dir(name),
+                    packed_layers_dax_window,
+                    child_pid as u32,
+                    start,
+                );
+            }
+        }
         tracing::info!(
             pid = child_pid,
             spawn_ms = spawn_start.elapsed().as_millis(),

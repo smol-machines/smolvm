@@ -2575,6 +2575,24 @@ pub(crate) fn prepare_forks_reusing(
             response = %reply,
             "fork: golden RAM checkpoint written"
         );
+        // Clones restore the golden's guest, so they need the packed-layer DAX
+        // window it booted with. Without a record they use the legacy window.
+        if let Some(window) =
+            golden_rec
+                .pid
+                .zip(golden_rec.pid_start_time)
+                .and_then(|(pid, start)| {
+                    super::virtiofs::running_window(
+                        &crate::agent::vm_data_dir(golden),
+                        pid as u32,
+                        start,
+                    )
+                })
+        {
+            if let Err(error) = super::virtiofs::record_snapshot_window(&snapshot_dir, window) {
+                tracing::warn!(%golden, %error, "could not record the snapshot DAX window; clones use the legacy window");
+            }
+        }
         (snapshot_dir, false)
     };
 

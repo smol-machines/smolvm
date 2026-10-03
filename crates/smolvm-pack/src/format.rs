@@ -604,6 +604,11 @@ pub struct CheckpointPackedLayers {
     /// on a host that does not already have it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_ref: Option<String>,
+    /// DAX window (bytes) the captured guest booted its packed layers with. A
+    /// restore must map at least this much; absent on checkpoints taken before
+    /// it was recorded, which restore with the legacy 2 GiB window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dax_window_bytes: Option<u64>,
 }
 
 /// Manifest describing the packed image and configuration.
