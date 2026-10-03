@@ -2345,6 +2345,189 @@ fn fetch_and_extract_layer(
     Ok(extract_result.unwrap_or(0))
 }
 
+/// One `crane pull` into an OCI layout at `dest`: manifest, config and every
+/// layer blob through a single crane process, so a cold pull pays one process
+/// start and one registry token exchange instead of one per request.
+///
+/// Retries like every other crane call. Each attempt starts from an empty
+/// `dest` so a partial layout from a failed attempt never leaks into the next.
+fn crane_pull_layout(
+    image: &str,
+    oci_platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    dest: &Path,
+) -> Result<()> {
+    use crate::retry::{
+        is_permanent_error, is_transient_network_error, retry_with_backoff, RetryConfig,
+    };
+
+    retry_with_backoff(
+        RetryConfig::for_network(),
+        "crane pull",
+        || {
+            let _ = std::fs::remove_dir_all(dest);
+            let mut cmd = Command::new("crane");
+            cmd.arg("pull").arg("--format=oci").arg(image).arg(dest);
+            if let Some(p) = oci_platform {
+                cmd.arg("--platform").arg(p);
+            }
+            // Set up auth if provided (temp_dir must stay alive until command completes)
+            let _temp_dir = setup_docker_auth(image, auth)?;
+            cmd.env("DOCKER_CONFIG", _temp_dir.path());
+            apply_proxy_env(&mut cmd, proxy, no_proxy);
+            let output = cmd.output()?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(StorageError::new(format!("crane pull failed: {}", stderr)));
+            }
+            Ok(())
+        },
+        |e| {
+            let error_msg = e.to_string();
+            if is_permanent_error(&error_msg) {
+                return false;
+            }
+            is_transient_network_error(&error_msg)
+        },
+    )
+}
+
+/// Remove pull layouts left behind by a crashed agent (their [`LayoutGuard`]
+/// never ran). An hour is far beyond any live pull, so a layout older than
+/// that is garbage holding storage space.
+fn sweep_stale_pull_layouts(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".pull-layout-")
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(60 * 60));
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Removes a transient pull layout on every exit path.
+struct LayoutGuard(PathBuf);
+impl Drop for LayoutGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Path of a blob inside an OCI layout.
+fn oci_layout_blob(layout: &Path, digest: &str) -> PathBuf {
+    layout
+        .join("blobs")
+        .join("sha256")
+        .join(digest.strip_prefix("sha256:").unwrap_or(digest))
+}
+
+/// The platform image manifest inside an OCI layout, as raw bytes.
+///
+/// `crane pull --platform` normally writes a single-entry index, but a nested
+/// index is followed one level, preferring the entry whose architecture
+/// matches `oci_platform`.
+fn oci_layout_manifest(layout: &Path, oci_platform: Option<&str>) -> Result<String> {
+    let index = std::fs::read_to_string(layout.join("index.json"))?;
+    let index: serde_json::Value =
+        serde_json::from_str(&index).map_err(|e| StorageError::parse_error("oci index", e))?;
+    let mut digest = index["manifests"][0]["digest"]
+        .as_str()
+        .ok_or_else(|| StorageError::MissingField {
+            context: "oci index".into(),
+            field: "manifests[0].digest".into(),
+        })?
+        .to_string();
+    for _ in 0..2 {
+        let body = std::fs::read_to_string(oci_layout_blob(layout, &digest))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| StorageError::parse_error("manifest", e))?;
+        if json.get("config").is_some() {
+            return Ok(body);
+        }
+        let Some(entries) = json["manifests"].as_array() else {
+            break;
+        };
+        let want_arch = oci_platform.map(oci_platform_to_arch);
+        let chosen = entries
+            .iter()
+            .find(|m| {
+                want_arch
+                    .as_deref()
+                    .is_some_and(|arch| m["platform"]["architecture"].as_str() == Some(arch))
+            })
+            .or_else(|| entries.first());
+        match chosen.and_then(|m| m["digest"].as_str()) {
+            Some(next) => digest = next.to_string(),
+            None => break,
+        }
+    }
+    Err(StorageError::new(
+        "oci layout holds no platform image manifest".to_string(),
+    ))
+}
+
+/// [`fetch_and_extract_layer`] for a blob that is already on disk in an OCI
+/// layout. Identical cleanup and marker handling, no crane process. The blob
+/// file is removed after a successful extraction so the layout's transient
+/// disk overhead stays at one compressed blob beyond the layer being written.
+fn extract_layer_from_file(
+    layer_digest: &str,
+    layer_id: &str,
+    layer_dir: &Path,
+    blob: &Path,
+    index: usize,
+    total_layers: usize,
+) -> Result<u64> {
+    if layer_dir.exists() {
+        warn!(layer = %layer_id, "removing incomplete or unverified layer directory");
+        if let Err(e) = std::fs::remove_dir_all(layer_dir) {
+            warn!(layer = %layer_id, error = %e, "failed to remove incomplete layer directory");
+        }
+    }
+    let _ = std::fs::remove_file(layer_ok_marker(layer_dir));
+    let _ = std::fs::remove_file(layer_size_marker(layer_dir));
+
+    info!(
+        layer = %layer_id,
+        progress = format!("{}/{}", index + 1, total_layers),
+        "extracting layer"
+    );
+
+    std::fs::create_dir_all(layer_dir)?;
+    let reader = std::fs::File::open(blob)?;
+    match extract_oci_layer_with_size(reader, layer_dir) {
+        Ok(size) => {
+            let _ = std::fs::remove_file(blob);
+            Ok(size)
+        }
+        Err(e) => {
+            if let Err(cleanup) = std::fs::remove_dir_all(layer_dir) {
+                warn!(layer = %layer_id, error = %cleanup, "failed to clean up layer directory after extraction failure");
+            }
+            Err(StorageError::new(format!(
+                "layer extraction failed for layer {}: {}",
+                layer_digest, e
+            )))
+        }
+    }
+}
+
 pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
     oci_platform: Option<&str>,
@@ -2434,20 +2617,21 @@ where
     // Get manifest with OCI platform specified
     progress(0, 0, "fetching manifest");
     info!(image = %image, oci_platform = ?oci_platform, "fetching manifest");
-    let manifest = crane_manifest(image, oci_platform, auth, proxy, no_proxy)?;
+    let mut manifest = crane_manifest(image, oci_platform, auth, proxy, no_proxy)?;
 
     // Parse manifest to get config and layers
-    let manifest_json: serde_json::Value =
+    let mut manifest_json: serde_json::Value =
         serde_json::from_str(&manifest).map_err(|e| StorageError::parse_error("manifest", e))?;
 
     // Handle manifest list (multi-arch)
-    let config_digest = if manifest_json.get("config").is_some() {
+    let mut config_digest: String = if manifest_json.get("config").is_some() {
         manifest_json["config"]["digest"]
             .as_str()
             .ok_or_else(|| StorageError::MissingField {
                 context: "manifest".into(),
                 field: "config digest".into(),
             })?
+            .to_string()
     } else if manifest_json.get("manifests").is_some() {
         return Err(StorageError::new(format!(
             "got manifest list instead of image manifest - platform may not be available. \
@@ -2463,7 +2647,7 @@ where
         });
     };
 
-    let layers: Vec<String> = manifest_json["layers"]
+    let mut layers: Vec<String> = manifest_json["layers"]
         .as_array()
         .ok_or_else(|| StorageError::MissingField {
             context: "manifest".into(),
@@ -2473,25 +2657,13 @@ where
         .filter_map(|l| l["digest"].as_str().map(String::from))
         .collect();
 
-    let total_layers = layers.len();
+    let mut total_layers = layers.len();
 
     // Save manifest
     let manifest_path = root
         .join(MANIFESTS_DIR)
         .join(sanitize_image_name(image) + ".json");
     std::fs::write(&manifest_path, &manifest)?;
-
-    // Fetch and save config
-    let config = crane_config(image, oci_platform, auth, proxy, no_proxy)?;
-    let config_id = config_digest
-        .strip_prefix("sha256:")
-        .unwrap_or(config_digest);
-    let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
-    std::fs::write(&config_path, &config)?;
-
-    // Parse config for metadata
-    let config_json: serde_json::Value =
-        serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
     // Extract layers with progress updates.
     //
@@ -2510,8 +2682,9 @@ where
     // Decide what actually needs fetching before spawning anything: duplicate
     // digests within one manifest, and layers a previous pull already
     // completed, are reported as progress and skipped.
-    let mut pending: Vec<(usize, &String, String, PathBuf)> = Vec::new();
+    let mut pending: Vec<(usize, String, String, PathBuf)> = Vec::new();
     let mut seen_dirs: Vec<PathBuf> = Vec::new();
+    let mut any_cached = false;
     for (i, layer_digest) in layers.iter().enumerate() {
         let layer_id = layer_digest
             .strip_prefix("sha256:")
@@ -2524,12 +2697,101 @@ where
         }
         if is_layer_cached(&layer_dir) {
             info!(layer = %layer_id, "layer already cached");
+            any_cached = true;
             progress(i + 1, total_layers, &layer_id);
             continue;
         }
         seen_dirs.push(layer_dir.clone());
-        pending.push((i, layer_digest, layer_id, layer_dir));
+        pending.push((i, layer_digest.clone(), layer_id, layer_dir));
     }
+
+    // A fully cold pull takes everything through ONE crane process: manifest,
+    // config and every layer blob land in an OCI layout in a single
+    // invocation with a single registry token exchange, instead of one
+    // process and one anonymous auth round trip per request. A pull that can
+    // reuse cached layers keeps the per-blob path, which never downloads what
+    // is already on disk.
+    let layout_guard: Option<LayoutGuard> = if !pending.is_empty() && !any_cached {
+        sweep_stale_pull_layouts(root);
+        // Unique per pull: two concurrent pulls of the same image must not
+        // share a directory, and a crashed pull's leftover (its guard never
+        // ran) must not collide with the next one.
+        let layout_dir = root.join(format!(
+            ".pull-layout-{}-{}-{}",
+            sanitize_image_name(image),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        progress(0, 0, "downloading image");
+        crane_pull_layout(image, oci_platform, auth, proxy, no_proxy, &layout_dir)?;
+        Some(LayoutGuard(layout_dir))
+    } else {
+        None
+    };
+    if let Some(layout) = &layout_guard {
+        let pulled_manifest = oci_layout_manifest(&layout.0, oci_platform)?;
+        if pulled_manifest != manifest {
+            // The tag moved between the manifest call and the pull. The
+            // layout is what was actually pulled, so it is the truth from
+            // here on: stored manifest, config digest, layer list and the
+            // extraction work list all follow it.
+            info!(image = %image, "image moved between manifest and pull; following the pulled manifest");
+            manifest = pulled_manifest;
+            manifest_json = serde_json::from_str(&manifest)
+                .map_err(|e| StorageError::parse_error("manifest", e))?;
+            config_digest = manifest_json["config"]["digest"]
+                .as_str()
+                .ok_or_else(|| StorageError::MissingField {
+                    context: "manifest".into(),
+                    field: "config digest".into(),
+                })?
+                .to_string();
+            layers = manifest_json["layers"]
+                .as_array()
+                .ok_or_else(|| StorageError::MissingField {
+                    context: "manifest".into(),
+                    field: "layers".into(),
+                })?
+                .iter()
+                .filter_map(|l| l["digest"].as_str().map(String::from))
+                .collect();
+            total_layers = layers.len();
+            std::fs::write(&manifest_path, &manifest)?;
+            pending.clear();
+            seen_dirs.clear();
+            for (i, layer_digest) in layers.iter().enumerate() {
+                let layer_id = layer_digest
+                    .strip_prefix("sha256:")
+                    .unwrap_or(layer_digest)
+                    .to_string();
+                let layer_dir = root.join(LAYERS_DIR).join(&layer_id);
+                if seen_dirs.contains(&layer_dir) || is_layer_cached(&layer_dir) {
+                    continue;
+                }
+                seen_dirs.push(layer_dir.clone());
+                pending.push((i, layer_digest.clone(), layer_id, layer_dir));
+            }
+        }
+    }
+
+    // Save config: from the layout when one was pulled, else its own crane
+    // call (the only remaining per-request fetch on the warm path).
+    let config = match &layout_guard {
+        Some(layout) => std::fs::read_to_string(oci_layout_blob(&layout.0, &config_digest))?,
+        None => crane_config(image, oci_platform, auth, proxy, no_proxy)?,
+    };
+    let config_id = config_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&config_digest);
+    let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
+    std::fs::write(&config_path, &config)?;
+
+    // Parse config for metadata
+    let config_json: serde_json::Value =
+        serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
     if !pending.is_empty() {
         // One crane fetch + decompress per worker; more than a handful of
@@ -2542,6 +2804,9 @@ where
         );
         let (tx, rx) = std::sync::mpsc::channel::<Result<(usize, String, PathBuf, u64)>>();
 
+        // Shared by every worker; `Option<&LayoutGuard>` is Copy, so the move
+        // closures below capture the reference, not the guard.
+        let layout_ref = layout_guard.as_ref();
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 let tx = tx.clone();
@@ -2552,18 +2817,28 @@ where
                     else {
                         break;
                     };
-                    let outcome = fetch_and_extract_layer(
-                        image,
-                        layer_digest,
-                        &layer_id,
-                        &layer_dir,
-                        oci_platform,
-                        auth,
-                        proxy,
-                        no_proxy,
-                        i,
-                        total_layers,
-                    )
+                    let outcome = match layout_ref {
+                        Some(layout) => extract_layer_from_file(
+                            &layer_digest,
+                            &layer_id,
+                            &layer_dir,
+                            &oci_layout_blob(&layout.0, &layer_digest),
+                            i,
+                            total_layers,
+                        ),
+                        None => fetch_and_extract_layer(
+                            image,
+                            &layer_digest,
+                            &layer_id,
+                            &layer_dir,
+                            oci_platform,
+                            auth,
+                            proxy,
+                            no_proxy,
+                            i,
+                            total_layers,
+                        ),
+                    }
                     .map(|size| (i, layer_id, layer_dir, size));
                     let failed = outcome.is_err();
                     if tx.send(outcome).is_err() || failed {
