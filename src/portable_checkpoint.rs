@@ -1038,6 +1038,7 @@ fn restored_record(
     record.storage_gb = checkpoint.storage_gib;
     record.overlay_gb = checkpoint.overlay_gib;
     record.allowed_cidrs = network.and_then(|network| network.allowed_cidrs.clone());
+    record.denied_cidrs = network.and_then(|network| network.denied_cidrs.clone());
     record.dns_filter_hosts = network.and_then(|network| network.dns_filter_hosts.clone());
     if let Some(policy) = network.and_then(|network| network.credential_policy.clone()) {
         // The artifact is untrusted: hold its policy to the same rules create
@@ -2755,6 +2756,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         network_name: vm.network_name.clone(),
         guest_subnet: vm.guest_subnet.clone(),
         allowed_cidrs: vm.allowed_cidrs.clone(),
+        denied_cidrs: vm.denied_cidrs.clone(),
         dns_filter_hosts: vm.dns_filter_hosts.clone(),
         // The captured workload holds its placeholders (in its environment and
         // possibly its RAM), so the policy and the exact placeholders must

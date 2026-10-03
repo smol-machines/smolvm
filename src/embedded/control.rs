@@ -83,6 +83,7 @@ impl MachineSpec {
         record.overlay_gb = self.resources.overlay_gib;
         record.block_io = self.resources.block_io;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();
+        record.denied_cidrs = self.resources.denied_cidrs.clone();
         record.dns_filter_hosts = if self.allowed_hosts.is_empty() {
             None
         } else {
@@ -127,6 +128,15 @@ pub(crate) fn create_vm_with_workload(
                 .map(|cidr| crate::smolfile::parse_cidr(cidr))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|reason| Error::config("validate allowed CIDR", reason))?,
+        );
+    }
+    if let Some(cidrs) = &spec.resources.denied_cidrs {
+        record.denied_cidrs = Some(
+            cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| Error::config("validate denied CIDR", reason))?,
         );
     }
     record.cmd = spec.command.clone();

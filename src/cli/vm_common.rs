@@ -484,6 +484,7 @@ pub struct CreateVmParams {
     /// Host disks attached beyond storage and overlay (`--disk`).
     pub disks: Vec<smolvm::data::disk::AttachedDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
+    pub denied_cidrs: Option<Vec<String>>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
     pub restart_max_backoff_secs: Option<u64>,
@@ -781,6 +782,7 @@ pub(crate) fn build_vm_record_for(
     record.block_io = params.block_io;
     record.disks = params.disks.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
+    record.denied_cidrs = params.denied_cidrs.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.network_name = params.network_name.clone();
@@ -2101,6 +2103,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.block_io = o.block_io;
     r.disks = o.disks.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
+    r.denied_cidrs = o.denied_cidrs.clone();
     r.init = o.init.clone();
     r.init_completed = false;
     r.env = o.env.clone();
@@ -2176,6 +2179,7 @@ pub struct DefaultVmOverrides {
     /// Host disks attached beyond storage and overlay (`--disk`).
     pub disks: Vec<smolvm::data::disk::AttachedDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
+    pub denied_cidrs: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub secret_refs: BTreeMap<String, SecretRef>,
@@ -2226,6 +2230,7 @@ impl DefaultVmOverrides {
             block_io: params.block_io,
             disks: params.disks.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
+            denied_cidrs: params.denied_cidrs.clone(),
             init: params.init.clone(),
             env: smolvm::util::parse_env_list(&params.env),
             workdir: params.workdir.clone(),

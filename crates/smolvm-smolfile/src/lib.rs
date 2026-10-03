@@ -69,6 +69,7 @@
 //! | `allow_hosts` | string[] | Legacy hostname and subdomain entries |
 //! | `allow_host_patterns` | string[] | Exact hostnames or `*.` subdomain patterns |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
+//! | `deny_cidrs` | string[] | Denied CIDR ranges, checked before the allow rules |
 //! | `credentials` | table[] | Credential bindings (see below) |
 //!
 //! #### `[[network.credentials]]` — Credential substitution
@@ -188,6 +189,7 @@
 //! [network]
 //! allow_hosts = ["pypi.org"]
 //! allow_cidrs = ["10.0.0.0/8"]
+//! deny_cidrs = ["192.168.0.0/16"]
 //!
 //! [branch]
 //! enabled = true
@@ -372,6 +374,11 @@ pub struct NetworkConfig {
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
+    /// Denied egress CIDR ranges, evaluated before the allow rules: a
+    /// destination inside one is unreachable even when `allow_cidrs` or a
+    /// resolved `allow_hosts` answer covers it.
+    #[serde(default)]
+    pub deny_cidrs: Vec<String>,
     /// Credential bindings (`[[network.credentials]]`). The guest receives a
     /// placeholder in each `environment_variable`; the host substitutes the
     /// real value on HTTPS requests to the binding's `allowed_hosts` only.

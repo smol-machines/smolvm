@@ -178,6 +178,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-cidr` | | run, create | CIDR egress filter (implies --net) |
 | `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
+| `--deny-cidr` | | run, create | CIDR egress deny list, checked before the allow rules (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
 | `--stop-on-exit` | | create | Stop the machine when its workload exits, whatever the exit status |
 
@@ -208,6 +209,7 @@ overlay = 4                           # overlay disk GiB (default: 2)
 allow_hosts = ["api.stripe.com"]      # resolved at VM start (implies net)
 allow_host_patterns = ["api.example.com", "*.files.example.com"] # exact / subdomains
 allow_cidrs = ["10.0.0.0/8"]         # IP/CIDR ranges (implies net)
+deny_cidrs = ["192.168.0.0/16"]      # denied before the allow rules (implies net)
 
 # Dev profile (used by `machine run` and `machine create`)
 [dev]
@@ -265,10 +267,11 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `--allow-host-pattern api.stripe.com` permits the exact hostname. `--allow-host-pattern '*.stripe.com'` permits subdomains but not the apex. Both enable DNS filtering and imply `--net`.
 - `--allow-cidr 10.0.0.0/8` enables egress only to specified IP ranges (implies `--net`)
 - `--allow-host` and `--allow-cidr` can be combined and used multiple times
+- `--deny-cidr 192.168.0.0/16` blocks egress to the given range (implies `--net`). Deny rules are evaluated first: a destination inside a denied range is unreachable even when an allow rule covers it. A deny list can be used alone (everything else stays reachable) or with allow rules to carve holes out of them.
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP). The server inside the machine must listen on `0.0.0.0` (not `127.0.0.1`): a server bound only to the guest's loopback is unreachable from the host, and connections are reset. `machine status` shows each published port's listening state.
 - `--guest-subnet 10.200.0.0/30` moves the guest link off the default `100.96.0.0/30` (gateway and resolver `.1`, guest `.2`; implies `--net`, virtio-net). Use it when the guest runs Tailscale, another VPN or carrier NAT that claims `100.64.0.0/10`, which otherwise routes the gateway away and breaks DNS. API: `guestSubnet` on create. Not combinable with `--network`
-- Smolfile: use `[network] allow_host_patterns` for exact/wildcard matching; `allow_hosts` retains legacy matching.
+- Smolfile: use `[network] allow_host_patterns` for exact/wildcard matching; `allow_hosts` retains legacy matching. `[network] allow_cidrs` and `[network] deny_cidrs` take CIDR ranges, deny checked first.
 
 ### Proxy Support
 

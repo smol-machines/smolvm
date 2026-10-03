@@ -527,6 +527,7 @@ impl ApiState {
                 block_io: Some(record.block_io),
                 allowed_cidrs: record.allowed_cidrs.clone(),
                 allowed_hosts: record.dns_filter_hosts.clone(),
+                denied_cidrs: record.denied_cidrs.clone(),
                 credentials: record.credential_policy.clone(),
                 network_backend: record.network_backend,
                 guest_subnet: record.guest_subnet.clone(),
@@ -1103,6 +1104,7 @@ impl ApiState {
         // Persist egress policy + backend selection from the request (previously
         // dropped here, so API-created machines silently lost both).
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
+        record.denied_cidrs = reg.resources.denied_cidrs.clone();
         record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
         if let Some(policy) = reg.resources.credentials.clone().filter(|p| !p.is_empty()) {
             record.credential_placeholders = if reg.credential_placeholders.is_empty() {
@@ -1775,6 +1777,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         block_io: spec.block_io.unwrap_or_default(),
         disks: Vec::new(),
         allowed_cidrs: spec.allowed_cidrs.clone(),
+        denied_cidrs: spec.denied_cidrs.clone(),
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
         dns: None,
@@ -1795,6 +1798,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         overlay_gb: res.overlay_gib,
         block_io: Some(res.block_io),
         allowed_cidrs: res.allowed_cidrs,
+        denied_cidrs: res.denied_cidrs,
         // VmResources has no hostname allow-list; callers that need it graft it
         // back from the source record (see the MachineEntry reload path).
         allowed_hosts: None,
@@ -1879,6 +1883,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         network_backend: entry.resources.network_backend,
         allowed_cidrs: entry.resources.allowed_cidrs.clone(),
         allowed_hosts: entry.resources.allowed_hosts.clone(),
+        denied_cidrs: entry.resources.denied_cidrs.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
         block_io: entry.resources.block_io.unwrap_or_default(),
@@ -2040,6 +2045,7 @@ mod tests {
             block_io: None,
             allowed_cidrs: None,
             allowed_hosts: None,
+            denied_cidrs: None,
             credentials: None,
             network_backend: None,
             guest_subnet: None,
@@ -2106,6 +2112,7 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    denied_cidrs: None,
                     credentials: None,
                     network_backend: None,
                     guest_subnet: None,
@@ -2168,6 +2175,7 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    denied_cidrs: None,
                     credentials: None,
                     network_backend: None,
                     guest_subnet: None,
@@ -2241,6 +2249,7 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    denied_cidrs: None,
                     credentials: None,
                     network_backend: None,
                     guest_subnet: None,

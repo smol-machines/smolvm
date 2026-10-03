@@ -755,6 +755,7 @@ impl PackCreateCmd {
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,
+                denied_cidrs: None,
             },
         )?;
         let mut guard = PackVmGuard {

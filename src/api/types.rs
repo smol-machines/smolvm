@@ -124,6 +124,11 @@ pub struct ResourceSpec {
     /// them by name. Combine with `allowed_cidrs` to also permit fixed ranges.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+    /// Denied egress CIDR ranges, evaluated before the allow rules: a
+    /// destination inside one is unreachable even when `allowed_cidrs` or a
+    /// learned `allowed_hosts` answer covers it.
+    #[serde(default)]
+    pub denied_cidrs: Option<Vec<String>>,
     /// Credential bindings substituted by the host: the workload receives a
     /// placeholder in each `environment_variable` and the real value is
     /// injected only on HTTPS requests to that binding's `allowed_hosts`.
@@ -675,6 +680,9 @@ pub struct CreateMachineRequest {
     /// names are learned into the egress allow-list.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+    /// Denied egress CIDR ranges, evaluated before the allow rules.
+    #[serde(default)]
+    pub denied_cidrs: Option<Vec<String>>,
     /// Credential bindings substituted by the host on the way out (see
     /// `ResourceSpec::credentials`). Placeholders replace the values in the
     /// workload environment; the request never carries a credential value.
@@ -797,6 +805,9 @@ pub struct MachineInfo {
     /// Allowed egress hostnames. Omitted when unset. Echoes back what `create` accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
+    /// Denied egress CIDRs, evaluated before the allow rules. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied_cidrs: Option<Vec<String>>,
     /// Storage disk size in GiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 20)]
