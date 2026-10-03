@@ -430,6 +430,170 @@ fn compact(
     Ok(())
 }
 
+/// How long a merge may be in progress before its partial file is taken as left
+/// behind by a process that died.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Every disk layer some machine can still read: the chains under every machine's
+/// active disks, every retained branch snapshot's recorded bases, and any merge
+/// not yet adopted. `None` when a chain cannot be read, which keeps everything.
+fn reachable_layers(
+    machine_dirs: &[PathBuf],
+    compact_dirs: &[PathBuf],
+) -> Option<HashSet<PathBuf>> {
+    let mut reachable = HashSet::new();
+    let mut walk = |top: &Path| -> Option<()> {
+        reachable.extend(chain(top).ok()?);
+        Some(())
+    };
+    for dir in machine_dirs {
+        for raw in [
+            crate::data::storage::STORAGE_DISK_FILENAME,
+            crate::data::storage::OVERLAY_DISK_FILENAME,
+        ] {
+            let (active, _) = crate::agent::resolve_disk_image(dir, raw);
+            if active.exists() {
+                walk(&active)?;
+            }
+        }
+        let Ok(snapshots) = std::fs::read_dir(dir.join("s")) else {
+            continue;
+        };
+        for snapshot in snapshots.flatten() {
+            let Ok(listing) = std::fs::read_to_string(snapshot.path().join("generation-disks.tsv"))
+            else {
+                continue;
+            };
+            for line in listing.lines() {
+                if let Some(base) = line.split('\t').nth(1) {
+                    walk(Path::new(base))?;
+                }
+            }
+        }
+    }
+    for dir in compact_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ready") {
+                continue;
+            }
+            for layer in std::fs::read_to_string(&path).ok()?.lines() {
+                walk(Path::new(layer))?;
+            }
+        }
+    }
+    Some(reachable)
+}
+
+/// Whether a merge for this source is running here or, judging by a fresh partial
+/// file, in another process. A partial older than [`STALE_PARTIAL`] is removed.
+fn merge_in_progress(gdir_d: &Path) -> bool {
+    {
+        let guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .as_ref()
+            .is_some_and(|set| set.iter().any(|key| key.starts_with(gdir_d)))
+        {
+            return true;
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(gdir_d.join("c")) else {
+        return false;
+    };
+    let mut running = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.to_string_lossy().ends_with(".partial") {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok());
+        match age {
+            Some(age) if age > STALE_PARTIAL => {
+                let _ = std::fs::remove_file(&path);
+            }
+            _ => running = true,
+        }
+    }
+    running
+}
+
+/// Delete the disk layers under `gdir/d` that no machine can read any more, given
+/// the data directories of every machine on this host. Returns how many files went.
+pub(super) fn collect_unreachable_layers(gdir: &Path, machine_dirs: &[PathBuf]) -> Result<usize> {
+    let Ok(gdir_d) = gdir.join("d").canonicalize() else {
+        return Ok(0);
+    };
+    if merge_in_progress(&gdir_d) {
+        return Ok(0);
+    }
+    let compact_dirs: Vec<PathBuf> = machine_dirs.iter().map(|dir| compact_dir(dir)).collect();
+    let Some(reachable) = reachable_layers(machine_dirs, &compact_dirs) else {
+        tracing::debug!(gdir = %gdir.display(), "kept every disk layer: a chain could not be read");
+        return Ok(0);
+    };
+    let mut removed = 0;
+    let entries = std::fs::read_dir(&gdir_d).map_err(|e| compact_err("list layers", e))?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let is_compact = dir.file_name().is_some_and(|n| n == "c");
+        let is_generation = super::snapshot_generation_id(&dir).is_some();
+        if !is_compact && !is_generation {
+            continue;
+        }
+        removed += remove_unreachable_files(&dir, &reachable, is_compact)?;
+        if is_generation {
+            // Only succeeds once nothing in it is reachable.
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
+    if removed > 0 {
+        tracing::info!(gdir = %gdir.display(), removed, "removed disk layers no machine reads");
+    }
+    Ok(removed)
+}
+
+fn remove_unreachable_files(
+    dir: &Path,
+    reachable: &HashSet<PathBuf>,
+    layers_only: bool,
+) -> Result<usize> {
+    let mut removed = 0;
+    let entries = std::fs::read_dir(dir).map_err(|e| compact_err("list layer dir", e))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            removed += remove_unreachable_files(&path, reachable, layers_only)?;
+            let _ = std::fs::remove_dir(&path);
+            continue;
+        }
+        // In the merge directory only finished layers go; markers and partials stay.
+        if layers_only && path.extension().and_then(|e| e.to_str()) != Some("qcow2") {
+            continue;
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| compact_err("resolve layer", e))?;
+        if !reachable.contains(&canonical) {
+            std::fs::remove_file(&path).map_err(|e| compact_err("remove layer", e))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +714,69 @@ mod tests {
             "overlay",
             Path::new("/vms/m/d/c/storage.17.qcow2")
         ));
+    }
+
+    /// A layer goes once no machine's chain, retained snapshot or pending merge
+    /// reaches it; everything something can still read stays.
+    #[test]
+    fn only_layers_nothing_reads_are_collected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let branch = tmp.path().join("branch");
+        for dir in [&source, &branch] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root = source.join("storage.raw");
+        std::fs::write(&root, vec![0_u8; SIZE as usize]).unwrap();
+        let layer = |path: PathBuf, below: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            create_overlay(&path, SIZE, below).unwrap();
+            path.canonicalize().unwrap()
+        };
+        let a = layer(source.join("d/aaaaaaaa/storage.base.qcow2"), &root);
+        let b = layer(source.join("d/bbbbbbbb/storage.base.qcow2"), &a);
+        let compacted = layer(source.join("d/c/storage.1.qcow2"), &root);
+        let merged = layer(source.join("d/cccccccc/storage.merged.qcow2"), &compacted);
+        layer(source.join("storage.qcow2"), &merged);
+        layer(branch.join("storage.qcow2"), &a);
+
+        let both = [source.clone(), branch.clone()];
+        assert_eq!(collect_unreachable_layers(&source, &both).unwrap(), 1);
+        assert!(
+            !b.exists() && !source.join("d/bbbbbbbb").exists(),
+            "the orphaned generation goes"
+        );
+        for kept in [&a, &compacted, &merged, &root] {
+            assert!(kept.exists(), "{} is still read", kept.display());
+        }
+
+        // A retained snapshot pins its recorded base even with no machine on it.
+        let pinned = layer(source.join("d/dddddddd/storage.base.qcow2"), &a);
+        std::fs::create_dir_all(source.join("s/dddddddd")).unwrap();
+        std::fs::write(
+            source.join("s/dddddddd/generation-disks.tsv"),
+            format!("storage.raw\t{}\tqcow2\n", pinned.display()),
+        )
+        .unwrap();
+        assert_eq!(collect_unreachable_layers(&source, &both).unwrap(), 0);
+        assert!(pinned.exists());
+
+        // A merge in progress keeps everything, whatever looks unreachable.
+        std::fs::remove_dir_all(source.join("s")).unwrap();
+        std::fs::write(source.join("d/c/storage.2.qcow2.partial"), b"").unwrap();
+        assert_eq!(
+            collect_unreachable_layers(&source, std::slice::from_ref(&source)).unwrap(),
+            0
+        );
+        std::fs::remove_file(source.join("d/c/storage.2.qcow2.partial")).unwrap();
+
+        // With the branch gone, the generation only it read goes as well.
+        assert_eq!(
+            collect_unreachable_layers(&source, std::slice::from_ref(&source)).unwrap(),
+            2
+        );
+        assert!(!a.exists() && !pinned.exists());
+        assert!(merged.exists() && compacted.exists());
     }
 
     #[test]

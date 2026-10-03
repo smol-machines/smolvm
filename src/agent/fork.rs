@@ -1822,6 +1822,16 @@ pub fn collect_parent_generations_after_child_delete(db: &SmolvmDb, parent: &str
     let retained = db.retained_fork_snapshot(parent)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     gc_unreferenced_fork_generations(db, parent, &snapshot_root, retained.as_ref())?;
+    // The child's disk chain is gone too, so the parent's disk layers only it
+    // read can go, now that the snapshots it pinned have been collected above.
+    let machine_dirs: Vec<PathBuf> = db
+        .list_vms()?
+        .into_iter()
+        .map(|(name, _)| vm_data_dir(&name))
+        .collect();
+    if let Err(error) = compact::collect_unreachable_layers(&vm_data_dir(parent), &machine_dirs) {
+        tracing::warn!(%parent, %error, "could not collect unreachable branch disk layers");
+    }
     #[cfg(target_os = "linux")]
     reconcile_fork_lineage_memory_limit(
         db,
