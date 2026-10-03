@@ -66,6 +66,7 @@ pub mod fabric;
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.
 pub mod frame_stream;
 pub mod icmp_relay;
+pub mod mining;
 // CNI netns ↔ virtio-net L2 bridge for the Kubernetes runtime (Linux only:
 // needs /dev/net/tun + setns).
 #[cfg(target_os = "linux")]
@@ -310,6 +311,11 @@ impl StreamInterception {
 /// Filename of the per-VM egress denial audit log, created beside the vsock
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
+
+/// Filename of the per-VM egress signal log: traffic that is allowed but worth
+/// knowing about, such as a lookup of a mining pool's hostname. Created beside
+/// the vsock socket by the launcher and read back by the host.
+pub const EGRESS_SIGNALS_LOG: &str = "egress-signals.log";
 
 /// Whether the host can actually reach the IPv6 internet.
 ///

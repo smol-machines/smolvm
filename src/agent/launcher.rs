@@ -1356,6 +1356,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 if let Some(path) = denial_log {
                     egress = egress.with_denial_log(path);
                 }
+                if let Some(dir) = vsock_socket.parent() {
+                    egress = egress.with_signal_log(dir.join(smolvm_network::EGRESS_SIGNALS_LOG));
+                }
                 let egress_path = egress_telemetry.map(|p| p.to_path_buf());
 
                 // The host and guest ends of the virtio-net channel are an AF_UNIX

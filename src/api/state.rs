@@ -1831,6 +1831,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         "stopped"
     };
     let egress_bytes = crate::agent::read_egress_telemetry(&name);
+    let mining_pool = crate::agent::read_mining_pool_signal(&name);
     // Live consumed CPU-seconds for the VMM child (host-sampled, resets on
     // restart); the control plane accumulates the durable total. None when there
     // is no live process to sample.
@@ -1893,6 +1894,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         branchpoint_held: entry.forkpoint_held,
         forkpoint_held: entry.forkpoint_held,
         egress_bytes,
+        mining_pool,
         cpu_seconds,
         cpu_millis,
         rss_mb,

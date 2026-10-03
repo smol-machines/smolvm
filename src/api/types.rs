@@ -835,6 +835,12 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 1048576)]
     pub egress_bytes: Option<u64>,
+    /// Lookups of mining-pool hostnames this machine made, the definitive
+    /// evidence that heavy CPU use is cryptocurrency mining. Omitted when it
+    /// made none. Recorded by the host-side network stack, which the guest
+    /// cannot reach, for virtio-net machines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mining_pool: Option<crate::agent::MiningPoolSignal>,
     /// Consumed CPU-seconds (user+system) of the machine's CURRENT VMM process,
     /// sampled live from the host. Resets to 0 on a VM restart — it's a stateless
     /// snapshot; the control plane accumulates a durable total from it. Omitted

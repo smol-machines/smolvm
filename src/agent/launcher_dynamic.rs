@@ -517,6 +517,7 @@ pub fn launch_agent_vm_dynamic(
             );
             if let Some(dir) = config.vsock_socket.parent() {
                 egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
+                egress = egress.with_signal_log(dir.join(smolvm_network::EGRESS_SIGNALS_LOG));
             }
 
             // The host/guest ends of the virtio-net channel are an AF_UNIX

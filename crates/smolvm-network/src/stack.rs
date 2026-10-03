@@ -875,6 +875,13 @@ enum DnsDecision {
 /// gateway-internal plumbing, not egress, so it must resolve even under a
 /// strict allow-host policy.
 fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Addr) -> DnsDecision {
+    // Observed, not blocked: a lookup of a mining pool is the evidence an abuse
+    // review needs, whatever the egress policy then decides about the query.
+    if let Some(name) = dns::question_name(query) {
+        if crate::mining::mining_pool_domain(&name).is_some() {
+            egress.record_signal("mining-pool", &name);
+        }
+    }
     if dns::question_name(query)
         .and_then(|n| dns::normalize_hostname(&n))
         .is_some_and(|n| n == dns::GATEWAY_HOSTNAME)

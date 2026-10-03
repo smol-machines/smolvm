@@ -245,6 +245,31 @@ pub struct EgressPolicy {
     /// appended here in addition to the runtime's stderr line, so the record
     /// can't be evicted by ordinary connection chatter in the boot log.
     denial_log: Option<Arc<std::path::PathBuf>>,
+    /// Audit sink for signals: allowed traffic that is evidence of abuse, such
+    /// as resolving a mining pool. Separate from denials so neither evicts the other.
+    signal_log: Option<Arc<std::path::PathBuf>>,
+}
+
+/// Append one timestamped line to an audit file, rotating it once past 8 MiB
+/// (`.1` suffix) so a workload repeating an event at packet rate can't fill the
+/// host disk.
+fn append_audit_line(path: &std::path::Path, message: &str) {
+    const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{}",
+            crate::format_network_log_line(std::time::SystemTime::now(), message)
+        );
+    }
 }
 
 impl EgressPolicy {
@@ -254,6 +279,7 @@ impl EgressPolicy {
             inner: None,
             floor: floor_mode(),
             denial_log: None,
+            signal_log: None,
         }
     }
 
@@ -290,6 +316,7 @@ impl EgressPolicy {
             })),
             floor: floor_mode(),
             denial_log: None,
+            signal_log: None,
         }
     }
 
@@ -310,27 +337,23 @@ impl EgressPolicy {
     /// denied destination at packet rate can't fill the host disk.
     pub fn record_denial(&self, operation: &str, dest: &dyn std::fmt::Display) {
         crate::virtio_net_log!("egress policy denied {} {}", operation, dest);
-        let Some(path) = self.denial_log.as_deref() else {
-            return;
-        };
-        const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
-        if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
-            let _ = std::fs::rename(path, path.with_extension("log.1"));
+        if let Some(path) = self.denial_log.as_deref() {
+            append_audit_line(path, &format!("egress policy denied {operation} {dest}"));
         }
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(
-                file,
-                "{}",
-                crate::format_network_log_line(
-                    std::time::SystemTime::now(),
-                    &format!("egress policy denied {operation} {dest}"),
-                )
-            );
+    }
+
+    /// Attach the audit sink signals are appended to, beside the denial log.
+    pub fn with_signal_log(mut self, path: std::path::PathBuf) -> Self {
+        self.signal_log = Some(Arc::new(path));
+        self
+    }
+
+    /// Record one signal. Keep the marker text stable: the host's
+    /// `read_mining_pool_signal` parses `egress signal <kind> <dest>`.
+    pub fn record_signal(&self, kind: &str, dest: &dyn std::fmt::Display) {
+        crate::virtio_net_log!("egress signal {} {}", kind, dest);
+        if let Some(path) = self.signal_log.as_deref() {
+            append_audit_line(path, &format!("egress signal {kind} {dest}"));
         }
     }
 

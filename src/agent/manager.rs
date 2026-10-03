@@ -539,6 +539,68 @@ fn parse_egress_denial_line(line: &str) -> Option<EgressDenial> {
     })
 }
 
+/// Per-VM egress signal log: `<vm_data_dir>/egress-signals.log`, where the
+/// virtio-net runtime records allowed traffic that is evidence of abuse.
+pub fn egress_signals_log_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(smolvm_network::EGRESS_SIGNALS_LOG)
+}
+
+/// Lookups of mining-pool hostnames a machine made, from its signal log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MiningPoolSignal {
+    /// How many pool lookups the recent log holds.
+    pub lookups: u64,
+    /// The last pool hostname looked up, e.g. `rx.unmineable.com`.
+    pub last_host: String,
+    /// When that lookup happened (RFC 3339), or empty when unparseable.
+    pub last_seen: String,
+}
+
+/// Summarize the mining-pool lookups recorded for `name`, or `None` when it
+/// made none. Only the log's recent tail is read, bounding the work per call.
+pub fn read_mining_pool_signal(name: &str) -> Option<MiningPoolSignal> {
+    read_mining_pool_signal_at(&egress_signals_log_file(name))
+}
+
+fn read_mining_pool_signal_at(path: &std::path::Path) -> Option<MiningPoolSignal> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > EGRESS_DENIAL_SCAN_BYTES {
+        let _ = file.seek(SeekFrom::End(-(EGRESS_DENIAL_SCAN_BYTES as i64)));
+    }
+    let mut tail = String::new();
+    file.read_to_string(&mut tail).ok()?;
+    const MARKER: &str = "egress signal mining-pool ";
+    let mut signal: Option<MiningPoolSignal> = None;
+    for line in tail.lines() {
+        let Some(at) = line.find(MARKER) else {
+            continue;
+        };
+        let host = line[at + MARKER.len()..].trim();
+        if host.is_empty() {
+            continue;
+        }
+        let seen = line
+            .strip_prefix('[')
+            .and_then(|r| r.split_whitespace().next())
+            .unwrap_or("")
+            .trim_end_matches(':')
+            .trim_end_matches(']')
+            .to_string();
+        let entry = signal.get_or_insert_with(|| MiningPoolSignal {
+            lookups: 0,
+            last_host: String::new(),
+            last_seen: String::new(),
+        });
+        entry.lookups += 1;
+        entry.last_host = host.to_string();
+        entry.last_seen = seen;
+    }
+    signal
+}
+
 /// How often the VM subprocess flushes its egress counter to disk. The control
 /// plane's egress rollup runs on a multi-minute cadence, so a value this small
 /// keeps the file comfortably fresh while writing only a few bytes.
@@ -4355,5 +4417,40 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(features.packed_layers_dir.is_none());
+    }
+}
+
+#[cfg(test)]
+mod mining_pool_signal_tests {
+    use super::read_mining_pool_signal_at;
+
+    #[test]
+    fn pool_lookups_are_counted_and_the_latest_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("egress-signals.log");
+        std::fs::write(
+            &log,
+            "[2026-10-03T21:01:00.000000Z]: egress signal mining-pool rx.unmineable.com\n\
+             [2026-10-03T21:02:00.000000Z]: something else entirely\n\
+             [2026-10-03T21:03:00.000000Z]: egress signal mining-pool pool.supportxmr.com\n",
+        )
+        .unwrap();
+        let signal = read_mining_pool_signal_at(&log).unwrap();
+        assert_eq!(signal.lookups, 2);
+        assert_eq!(signal.last_host, "pool.supportxmr.com");
+        assert_eq!(signal.last_seen, "2026-10-03T21:03:00.000000Z");
+    }
+
+    #[test]
+    fn no_log_or_no_pool_lookups_is_no_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("egress-signals.log");
+        assert!(read_mining_pool_signal_at(&log).is_none());
+        std::fs::write(
+            &log,
+            "[2026-10-03T21:02:00Z]: egress signal other example.com\n",
+        )
+        .unwrap();
+        assert!(read_mining_pool_signal_at(&log).is_none());
     }
 }

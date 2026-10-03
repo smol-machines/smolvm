@@ -132,6 +132,9 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // flushes. Surfaced here so the control plane reads it from the machine
         // list exactly like disk size — no bespoke endpoint.
         egress_bytes: crate::agent::read_egress_telemetry(name),
+        // Read from the signal log the network stack writes, so the control
+        // plane sees pool lookups in the machine list it already polls.
+        mining_pool: crate::agent::read_mining_pool_signal(name),
         // Live consumed CPU-seconds for the VMM child, sampled from the host
         // (user+system CPU time). Resets on restart — the control plane treats it
         // as a monotonic-with-resets counter and accumulates the durable total.

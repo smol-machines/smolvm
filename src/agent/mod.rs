@@ -98,9 +98,10 @@ pub(crate) use manager::cleanup_dead_vm_runtime_in_db;
 pub use manager::{
     disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
     prune_orphaned_ready_markers, read_egress_denials, read_egress_telemetry,
-    read_shared_pack_pointer, resolve_disk_image, restore_base_dir, shared_pack_cache_root,
-    shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir,
-    AgentManager, AgentState, EgressDenial, SHARED_PACK_POINTER,
+    read_mining_pool_signal, read_shared_pack_pointer, resolve_disk_image, restore_base_dir,
+    shared_pack_cache_root, shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash,
+    vm_uid_registry_dir, AgentManager, AgentState, EgressDenial, MiningPoolSignal,
+    SHARED_PACK_POINTER,
 };
 
 /// Agent VM name.
