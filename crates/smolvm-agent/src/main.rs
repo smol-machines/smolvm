@@ -4259,15 +4259,19 @@ fn handle_run_detached(
 /// a `machine stop` before the power-off, so nothing the workload wrote is lost.
 ///
 /// The workload's process is re-parented to the agent, which does not reap
-/// unknown children, so it may linger as a zombie; `is_container_running`
-/// already treats a zombie as exited.
+/// unknown children, so it may linger as a zombie; both the pidfd wait and
+/// `crun_container_pid` treat a zombie as exited.
 #[cfg(target_os = "linux")]
 fn stop_machine_when_workload_exits(container_id: String) {
     let spawned = std::thread::Builder::new()
         .name("stop-on-exit".into())
         .spawn(move || {
-            while is_container_running(&container_id) {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+            while let Some(pid) = crun_container_pid(&container_id) {
+                if !wait_for_pid_exit(pid) {
+                    // No pidfd for that pid (it already exited, or poll
+                    // failed): the old poll interval is the fallback.
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
             }
             info!(container_id = %container_id, "workload exited; stopping the machine (stop_on_exit)");
             if let Err(e) = shutdown_freeze::freeze_internal_filesystems() {
@@ -4282,6 +4286,80 @@ fn stop_machine_when_workload_exits(container_id: String) {
         });
     if let Err(e) = spawned {
         warn!(error = %e, "stop_on_exit: could not start the workload watcher");
+    }
+}
+
+/// Block until `pid` terminates, observed through a pidfd the moment it
+/// happens instead of on the next 500ms poll tick. A zombie counts: the pidfd
+/// becomes readable on termination whether or not anything reaps the process,
+/// which matters here because the workload re-parents to the agent and the
+/// agent does not reap unknown children.
+///
+/// Returns `true` only on an observed exit. `false` means no pidfd could be
+/// opened (the process is already gone, or the pid was reused and raced the
+/// open), poll failed, or the periodic wakeup fired, and the caller falls
+/// back to its sleep poll plus a fresh container-state check.
+#[cfg(target_os = "linux")]
+fn wait_for_pid_exit(pid: u32) -> bool {
+    // SAFETY: pidfd_open takes a pid and a flags word and returns a new fd.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if fd < 0 {
+        return false;
+    }
+    let fd = fd as libc::c_int;
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let exited = loop {
+        // SAFETY: pollfd refers to the pidfd opened above. The timeout hands
+        // control back to the caller so its container-state check reruns:
+        // if this fd ever belongs to a pid-reuse stranger, the wait is
+        // bounded instead of lasting the stranger's lifetime.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, 10_000) };
+        if rc > 0 {
+            break true;
+        }
+        if rc == 0 {
+            break false;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            break false;
+        }
+    };
+    // SAFETY: fd came from pidfd_open above and is closed exactly once.
+    unsafe { libc::close(fd) };
+    exited
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stop_on_exit_tests {
+    use super::wait_for_pid_exit;
+
+    #[test]
+    fn observes_a_child_exit() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        let waiter = std::thread::spawn(move || wait_for_pid_exit(pid));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(waiter.join().unwrap());
+        // The old watcher would have slept out its 500ms tick.
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+    }
+
+    #[test]
+    fn gone_pid_reports_no_pidfd() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!wait_for_pid_exit(pid));
     }
 }
 
