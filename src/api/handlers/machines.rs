@@ -980,11 +980,69 @@ async fn upload_checkpoint(
     artifact: &std::path::Path,
     urls: Vec<reqwest::Url>,
 ) -> Result<u64, ApiError> {
-    use tokio::io::AsyncSeekExt;
-    let size = tokio::fs::metadata(artifact)
+    let file = std::fs::File::open(artifact)
+        .map_err(|error| ApiError::internal(format!("open checkpoint artifact: {error}")))?;
+    upload_checkpoint_file(file, urls).await
+}
+
+/// Read `length` bytes at `offset` of `file` as a body stream, positionally, so
+/// parts uploading at once never share a cursor and the descriptor's file may
+/// already be unlinked.
+fn checkpoint_part_stream(
+    file: Arc<std::fs::File>,
+    offset: u64,
+    length: u64,
+) -> impl futures_util::Stream<Item = std::io::Result<axum::body::Bytes>> {
+    const CHUNK: u64 = 1024 * 1024;
+    futures_util::stream::try_unfold((file, offset, length), |(file, offset, left)| async move {
+        if left == 0 {
+            return Ok(None);
+        }
+        let want = left.min(CHUNK) as usize;
+        let reader = file.clone();
+        let chunk = tokio::task::spawn_blocking(move || {
+            let mut buffer = vec![0_u8; want];
+            let mut filled = 0;
+            while filled < want {
+                #[cfg(unix)]
+                let read = std::os::unix::fs::FileExt::read_at(
+                    &*reader,
+                    &mut buffer[filled..],
+                    offset + filled as u64,
+                )?;
+                #[cfg(windows)]
+                let read = std::os::windows::fs::FileExt::seek_read(
+                    &*reader,
+                    &mut buffer[filled..],
+                    offset + filled as u64,
+                )?;
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "checkpoint artifact shrank during upload",
+                    ));
+                }
+                filled += read;
+            }
+            Ok(axum::body::Bytes::from(buffer))
+        })
         .await
+        .map_err(std::io::Error::other)??;
+        let read = chunk.len() as u64;
+        Ok(Some((chunk, (file, offset + read, left - read))))
+    })
+}
+
+/// Upload an open checkpoint artifact to `urls` in contiguous parts at once.
+async fn upload_checkpoint_file(
+    file: std::fs::File,
+    urls: Vec<reqwest::Url>,
+) -> Result<u64, ApiError> {
+    let size = file
+        .metadata()
         .map_err(|error| ApiError::internal(format!("stat checkpoint artifact: {error}")))?
         .len();
+    let file = Arc::new(file);
     // Same policy as the restore fetch: no redirects, so the host allow-list
     // cannot be escaped by a 302.
     let client = reqwest::Client::builder()
@@ -1000,18 +1058,10 @@ async fn upload_checkpoint(
             .enumerate()
             .map(|(index, (url, (start, length)))| {
                 let client = client.clone();
+                let file = file.clone();
                 async move {
-                    let mut file = tokio::fs::File::open(artifact).await.map_err(|error| {
-                        ApiError::internal(format!("open checkpoint artifact: {error}"))
-                    })?;
-                    file.seek(std::io::SeekFrom::Start(start))
-                        .await
-                        .map_err(|error| {
-                            ApiError::internal(format!("seek checkpoint artifact: {error}"))
-                        })?;
-                    let body = reqwest::Body::wrap_stream(
-                        tokio_util::io::ReaderStream::with_capacity(file.take(length), 1024 * 1024),
-                    );
+                    let body =
+                        reqwest::Body::wrap_stream(checkpoint_part_stream(file, start, length));
                     let response = client
                         .put(url)
                         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1114,7 +1164,33 @@ fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
 
 #[cfg(test)]
 mod checkpoint_upload_tests {
-    use super::{checked_upload_urls, upload_part_ranges};
+    use super::{checked_upload_urls, checkpoint_part_stream, upload_part_ranges};
+
+    /// Parts read at once from one descriptor reassemble the file exactly, even
+    /// after its name is gone, as when a resume consumes a paused checkpoint.
+    #[tokio::test]
+    async fn concurrent_parts_reassemble_an_unlinked_artifact() {
+        use futures_util::TryStreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        let content: Vec<u8> = (0..5_000_003_u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &content).unwrap();
+        let file = std::sync::Arc::new(std::fs::File::open(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        let ranges = upload_part_ranges(content.len() as u64, 4);
+        let parts = futures_util::future::try_join_all(ranges.iter().map(|&(start, length)| {
+            checkpoint_part_stream(file.clone(), start, length).try_fold(
+                Vec::new(),
+                |mut acc, chunk| async move {
+                    acc.extend_from_slice(&chunk);
+                    Ok(acc)
+                },
+            )
+        }))
+        .await
+        .unwrap();
+        assert_eq!(parts.concat(), content);
+    }
 
     #[test]
     fn part_ranges_cover_the_artifact_exactly_once() {
@@ -4339,6 +4415,9 @@ pub async fn release_held_fork(
 pub struct PauseOperationQuery {
     /// The same identifier must be reused for all attempts of one pause.
     pub operation_id: Option<String>,
+    /// JSON array of pre-signed object-store URLs to upload the saved execution
+    /// to in parallel parts, as a capture does, instead of streaming it back.
+    pub upload_urls: Option<String>,
 }
 
 /// Save execution durably before stopping the machine.
@@ -4421,6 +4500,11 @@ pub async fn paused_checkpoint(
     Path(name): Path<String>,
     Query(query): Query<PauseOperationQuery>,
 ) -> Result<Response<Body>, ApiError> {
+    let upload_urls = query
+        .upload_urls
+        .as_deref()
+        .map(checked_upload_urls)
+        .transpose()?;
     let guard = state.lifecycle_lock(&name).lock_owned().await;
     let file = tokio::task::spawn_blocking(move || {
         let _guard = guard;
@@ -4455,9 +4539,17 @@ pub async fn paused_checkpoint(
     })
     .await?
     .map_err(ApiError::from)?;
-    let size = file.metadata().map_err(ApiError::internal)?.len();
     // The open descriptor survives deletion of the machine or a concurrent
     // resume; downloading never takes ownership of its recovery artifact.
+    if let Some(urls) = upload_urls {
+        // Straight to the store, so the artifact never crosses the control
+        // plane: relaying it there cost a full copy, an fsync and one stream.
+        let size = upload_checkpoint_file(file, urls).await?;
+        return Ok(axum::response::IntoResponse::into_response(Json(
+            serde_json::json!({ "uploaded": true, "sizeBytes": size }),
+        )));
+    }
+    let size = file.metadata().map_err(ApiError::internal)?.len();
     Response::builder()
         .header(
             header::CONTENT_TYPE,
