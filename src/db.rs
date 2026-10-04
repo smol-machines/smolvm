@@ -34,6 +34,25 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 /// crashed creator does not reserve a name forever.
 const CREATE_RESERVATION_TTL_SECS: u64 = 60 * 60;
 
+/// One transactional view of registered and partially created machines.
+pub struct MachineInventory {
+    /// Registered machine definitions.
+    pub machines: Vec<(String, VmRecord)>,
+    /// Pending name, opaque owner token, and creator process ID.
+    pub pending_creates: Vec<(String, String, i64)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+/// Outcome of a fenced partial-create cleanup.
+pub enum PendingCreateReclaim {
+    /// No registered machine or reservation exists.
+    Absent,
+    /// A machine was published or another process still owns its creation.
+    Active,
+    /// Partial files and the matching reservation were removed.
+    Reclaimed,
+}
+
 /// Inputs committed together when one ready fork-pool worker is claimed.
 pub struct ForkPoolSlotClaim<'a> {
     /// Pool that owns the ready worker.
@@ -211,6 +230,45 @@ impl std::fmt::Debug for SmolvmDb {
             .field("reader_conns", &self.readers.inner.lock().open)
             .finish()
     }
+}
+
+fn read_machine_inventory(conn: &Connection, between: impl FnOnce()) -> Result<MachineInventory> {
+    let machines = {
+        let mut statement = conn
+            .prepare("SELECT name, data FROM vms ORDER BY name")
+            .db_err("prepare inventory machines")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .db_err("query inventory machines")?;
+        let mut machines = Vec::new();
+        for row in rows {
+            let (name, data) = row.db_err("read inventory machine")?;
+            machines.push((
+                name,
+                serde_json::from_slice(&data).db_err("decode inventory machine")?,
+            ));
+        }
+        machines
+    };
+    between();
+    let pending_creates = {
+        let mut statement = conn
+            .prepare(
+                "SELECT name, owner_token, owner_pid FROM vm_create_reservations ORDER BY name",
+            )
+            .db_err("prepare inventory pending creates")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .db_err("query inventory pending creates")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .db_err("read inventory pending creates")?
+    };
+    Ok(MachineInventory {
+        machines,
+        pending_creates,
+    })
 }
 
 impl SmolvmDb {
@@ -606,6 +664,104 @@ impl SmolvmDb {
             )
             .db_err(format!("release create reservation '{}'", name))?;
             Ok(())
+        })
+    }
+
+    /// Durable pending creates, including a creator interrupted before registration.
+    pub fn pending_vm_creates(&self) -> Result<Vec<(String, String, i64)>> {
+        self.with_read_conn(|conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT name, owner_token, owner_pid FROM vm_create_reservations ORDER BY name",
+                )
+                .db_err("prepare pending creates")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .db_err("query pending creates")?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .db_err("read pending creates")
+        })
+    }
+
+    /// Both collections share one SQLite read snapshot. A reservation becoming
+    /// a VM between the reads cannot disappear from control-plane inventory.
+    pub fn machine_inventory(&self) -> Result<MachineInventory> {
+        self.machine_inventory_with(|| {})
+    }
+
+    fn machine_inventory_with(&self, between: impl FnOnce()) -> Result<MachineInventory> {
+        self.with_read_conn(|conn| {
+            let tx = conn.transaction().db_err("begin inventory snapshot")?;
+            let inventory = read_machine_inventory(&tx, between)?;
+            tx.commit().db_err("commit inventory snapshot")?;
+            Ok(inventory)
+        })
+    }
+
+    /// Hold the cross-process writer fence through filesystem reconciliation.
+    /// All API/CLI creators reserve in this database before allocating storage,
+    /// so none can start or publish outside this inventory during the callback.
+    pub fn with_machine_inventory<T>(
+        &self,
+        work: impl FnOnce(MachineInventory) -> Result<T>,
+    ) -> Result<T> {
+        self.with_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin inventory fence")?;
+            let result = work(read_machine_inventory(&tx, || {})?)?;
+            tx.commit().db_err("commit inventory fence")?;
+            Ok(result)
+        })
+    }
+
+    /// Atomically fence replacement of a pending reservation from the ownership
+    /// check through deletion of its files and release of its token. Filesystem
+    /// failure rolls back and keeps ownership discoverable for another attempt.
+    pub fn reclaim_pending_vm_create(
+        &self,
+        name: &str,
+        remove_files: impl FnOnce() -> Result<()>,
+    ) -> Result<PendingCreateReclaim> {
+        self.with_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin pending reclaim")?;
+            let committed: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM vms WHERE name=?1)",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .db_err("check published machine")?;
+            if committed {
+                return Ok(PendingCreateReclaim::Active);
+            }
+            let reservation: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT owner_token, owner_pid FROM vm_create_reservations WHERE name=?1",
+                    params![name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .db_err("read pending owner")?;
+            let Some((token, pid)) = reservation else {
+                return Ok(PendingCreateReclaim::Absent);
+            };
+            if pid != i64::from(std::process::id())
+                && pid > 0
+                && crate::process::is_alive(pid as crate::process::Pid)
+            {
+                return Ok(PendingCreateReclaim::Active);
+            }
+            remove_files()?;
+            tx.execute(
+                "DELETE FROM vm_create_reservations WHERE name=?1 AND owner_token=?2",
+                params![name, token],
+            )
+            .db_err("release reclaimed owner")?;
+            tx.commit().db_err("commit pending reclaim")?;
+            Ok(PendingCreateReclaim::Reclaimed)
         })
     }
 
@@ -3692,5 +3848,75 @@ mod tests {
             db.get_fork_pool_slot("slot-1").unwrap().unwrap().state,
             ForkPoolSlotState::Retiring
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_inventory_tests {
+    use super::*;
+    #[test]
+    fn pending_publication_between_inventory_reads_cannot_disappear() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let reader = SmolvmDb::open_at(&path).unwrap();
+        let writer = SmolvmDb::open_at(&path).unwrap();
+        assert!(writer.reserve_vm_create("publishing", "token").unwrap());
+        let record = VmRecord::new("publishing".into(), 1, 512, vec![], vec![], false);
+        let snapshot = reader
+            .machine_inventory_with(|| {
+                assert!(writer
+                    .commit_reserved_vm("publishing", "token", &record)
+                    .unwrap());
+            })
+            .unwrap();
+        assert!(snapshot.machines.is_empty());
+        assert_eq!(snapshot.pending_creates[0].0, "publishing");
+        let next = reader.machine_inventory().unwrap();
+        assert_eq!(next.machines[0].0, "publishing");
+        assert!(next.pending_creates.is_empty());
+    }
+
+    #[test]
+    fn pending_reclaim_fences_replacement_through_file_deletion_and_release() {
+        use std::sync::mpsc;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let reaper = SmolvmDb::open_at(&path).unwrap();
+        let creator = SmolvmDb::open_at(&path).unwrap();
+        assert!(reaper.reserve_vm_create("reused", "old").unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE vm_create_reservations SET owner_pid=0", [])
+            .unwrap();
+        let disk = root.path().join("disk");
+        std::fs::create_dir(&disk).unwrap();
+        std::fs::write(disk.join("old"), b"old").unwrap();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let new_disk = disk.clone();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            attempt_tx.send(()).unwrap();
+            assert!(creator.reserve_vm_create("reused", "new").unwrap());
+            std::fs::create_dir_all(&new_disk).unwrap();
+            std::fs::write(new_disk.join("new"), b"new").unwrap();
+            done_tx.send(()).unwrap();
+        });
+        assert_eq!(
+            reaper
+                .reclaim_pending_vm_create("reused", || {
+                    start_tx.send(()).unwrap();
+                    attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+                    std::fs::remove_dir_all(&disk).unwrap();
+                    Ok(())
+                })
+                .unwrap(),
+            PendingCreateReclaim::Reclaimed
+        );
+        writer.join().unwrap();
+        assert!(disk.join("new").exists());
+        assert_eq!(reaper.pending_vm_creates().unwrap()[0].1, "new");
     }
 }

@@ -937,6 +937,9 @@ pub struct EgressEventsResponse {
 /// List machines response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ListMachinesResponse {
+    /// Names reserved by incomplete creates. Included until committed or deleted.
+    #[serde(rename = "pendingCreates")]
+    pub pending_creates: Vec<String>,
     /// List of machines.
     pub machines: Vec<MachineInfo>,
 }

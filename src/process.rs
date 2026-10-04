@@ -2139,7 +2139,11 @@ extern "C" fn sigchld_handler(_sig: libc::c_int) {
 /// Returns true if the process exists and is running.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub fn is_alive(pid: Pid) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    if pid <= 0 {
+        return false;
+    }
+    (unsafe { libc::kill(pid, 0) == 0 })
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Check whether a Linux process may still be running.

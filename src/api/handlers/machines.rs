@@ -710,11 +710,65 @@ async fn with_owned_transfer<T: Send + 'static>(
     .map_err(|error| ApiError::internal(format!("checkpoint transfer task failed: {error}")))
 }
 
+/// Retain uploaded input and all prepared-input leases captured by `work`
+/// through a disconnected restore, including its final cache publication.
+async fn with_owned_restore_inputs<T: Send + 'static>(
+    inputs: impl Send + 'static,
+    work: impl Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    with_owned_operation(move |reply| async move {
+        let _inputs = inputs;
+        let result = work.await;
+        let _ = reply.send(result);
+    })
+    .await
+}
+
 #[cfg(test)]
 mod capture_transfer_tests {
     use super::{with_owned_operation, with_owned_transfer};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn disconnected_restore_keeps_uploaded_and_prepared_inputs_until_finished() {
+        let upload = tempfile::tempdir().unwrap();
+        let upload_path = upload.path().to_path_buf();
+        let artifact = upload.path().join("upload.smolcheckpoint");
+        std::fs::write(&artifact, b"upload").unwrap();
+        let prepared = tempfile::tempdir().unwrap();
+        let prepared_path = prepared.path().to_path_buf();
+        std::fs::write(prepared.path().join("prepared"), b"prepared").unwrap();
+        let transfer = super::CheckpointTransfer {
+            _directory: Some(upload),
+            artifact,
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(super::with_owned_restore_inputs(transfer, async move {
+            let _prepared = prepared;
+            entered_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            assert!(_prepared.path().join("prepared").exists());
+            done_tx.send(()).unwrap();
+            Ok(())
+        }));
+        entered_rx.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(upload_path.join("upload.smolcheckpoint").exists());
+        assert!(prepared_path.exists());
+        finish_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while upload_path.exists() || prepared_path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("restore input cleanup did not finish");
+    }
 
     const WAIT: Duration = Duration::from_secs(10);
 
@@ -1853,21 +1907,26 @@ pub async fn restore_portable_checkpoint(
     // The cache take verified this request's pinned artifact; hand that
     // verification over so creation does not read the payload a second time.
     // It only applies if the path creation uses still names that exact inode.
-    let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
-    #[cfg(target_os = "linux")]
-    drop(prepared);
-    // A hit is already cached; re-linking it would only change the inode's
-    // ctime under the restores still sharing it.
-    if result.is_ok() && !cache_hit {
-        if let Some(key) = options.cache_key {
-            if let Err(error) =
-                tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact)).await
-            {
-                tracing::warn!(%error, "checkpoint cache task failed");
+    // Creation now survives a disconnected caller. Keep uploaded/prepared
+    // inputs alive through that owned operation and its cache publication too.
+    with_owned_restore_inputs((_transfer, shared_take), async move {
+        let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
+        #[cfg(target_os = "linux")]
+        drop(prepared);
+        // A hit is already cached; re-linking it would only change the inode's
+        // ctime under the restores still sharing it.
+        if result.is_ok() && !cache_hit {
+            if let Some(key) = options.cache_key {
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact)).await
+                {
+                    tracing::warn!(%error, "checkpoint cache task failed");
+                }
             }
         }
-    }
-    result
+        result
+    })
+    .await
 }
 
 /// Build a MachineEntry from a VmRecord and AgentManager.
@@ -2110,6 +2169,41 @@ async fn create_machine_inner(
     // Refused before any image pull or disk work, so a server that has not opted
     // in never builds a nested machine.
     state.ensure_nested_virt_allowed(req.nested_virt)?;
+    let name = req.name.clone().unwrap_or_else(generate_machine_name);
+    validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
+    let mut req = req;
+    req.name = Some(name.clone());
+    let guard = state.lifecycle_lock(&name).lock_owned().await;
+    with_owned_operation(move |reply| async move {
+        // Keep the guard and all preparation alive through client disconnect.
+        // DELETE cannot report absence while this create can still register.
+        let _guard = guard;
+        // Reserve before any image/network/disk preparation can be interrupted.
+        let result = match ReservationGuard::new(&state, name) {
+            Ok(reservation) => {
+                create_machine_transaction(
+                    State(state.clone()),
+                    Json(req),
+                    verified,
+                    cached_checkpoint,
+                    reservation,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let _ = reply.send(result);
+    })
+    .await
+}
+
+async fn create_machine_transaction(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateMachineRequest>,
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+    cached_checkpoint: bool,
+    guard: ReservationGuard<'_>,
+) -> Result<Json<MachineInfo>, ApiError> {
     #[cfg(target_os = "linux")]
     let mut req = req;
     #[cfg(target_os = "linux")]
@@ -2564,8 +2658,7 @@ async fn create_machine_inner(
     if manifest_checkpoint.is_some() {
         crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);
     }
-    // Reserve the name atomically (prevents concurrent creation)
-    let guard = ReservationGuard::new(&state, name.clone())?;
+    // The caller reserved this name before any asynchronous preparation.
 
     // A registry-image machine gets its storage disk on a shared seed of its
     // image (see `image_seed`), so its first start skips the pull. The manager
@@ -2970,13 +3063,25 @@ pub async fn list_machines(
     // Read off the reactor: an inline synchronous `list_vms()` here let a stalled
     // write park the worker pool and wedge the liveness probes (this is the path
     // the control plane polls every reconcile). See tests/reactor_wedge.rs.
-    let vms = state.list_vm_records().await?;
-    let machines: Vec<MachineInfo> = vms
+    let db = state.db().clone();
+    let inventory = tokio::task::spawn_blocking(move || db.machine_inventory())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(ApiError::database)?;
+    let machines = inventory
+        .machines
         .iter()
         .map(|(name, record)| record_to_info(name, record))
         .collect();
-
-    Ok(Json(ListMachinesResponse { machines }))
+    let pending_creates = inventory
+        .pending_creates
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+    Ok(Json(ListMachinesResponse {
+        machines,
+        pending_creates,
+    }))
 }
 
 /// Get machine status.
@@ -5217,10 +5322,81 @@ async fn delete_one_transaction(
     let _source_lock = acquire_fork_source_lock(name.clone()).await?;
 
     // Check if VM exists and get its state (off the reactor)
-    let record = state
-        .lookup_vm(&name)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let record = match state.lookup_vm(&name).await? {
+        Some(record) => record,
+        None => {
+            let db = state.db().clone();
+            let pending_name = name.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+                let outcome = db
+                    .reclaim_pending_vm_create(&pending_name, || {
+                        let dir = vm_data_dir(&pending_name);
+                        if dir.exists() {
+                            let actual = match std::fs::read_to_string(dir.join("name")) {
+                                Ok(actual) => actual,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    // Preparation can stop between mkdir and the name binding.
+                                    // The DB reservation is fenced here. Remove ONLY an empty
+                                    // directory: unknown contents or a concurrent binding must
+                                    // preserve ownership for inspection/retry, not be erased.
+                                    std::fs::remove_dir(&dir).map_err(|error| {
+                                        crate::error::Error::Storage {
+                                            operation: "remove unbound pending directory".into(),
+                                            reason: error.to_string(),
+                                        }
+                                    })?;
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    return Err(crate::error::Error::Storage {
+                                        operation: "verify pending owner".into(),
+                                        reason: error.to_string(),
+                                    })
+                                }
+                            };
+                            if actual.trim() != pending_name {
+                                return Err(crate::error::Error::Storage {
+                                    operation: "verify pending owner".into(),
+                                    reason: "directory ownership mismatch".into(),
+                                });
+                            }
+                            smolvm_pack::extract::force_detach_layers_volume(
+                                &crate::agent::machine_layers_cache_dir(&pending_name),
+                            );
+                            std::fs::remove_dir_all(dir).map_err(|e| {
+                                crate::error::Error::Storage {
+                                    operation: "remove pending storage".into(),
+                                    reason: e.to_string(),
+                                }
+                            })?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(ApiError::database)?;
+                match outcome {
+                    crate::db::PendingCreateReclaim::Absent => {
+                        return Err(ApiError::NotFound(format!(
+                            "machine '{}' not found",
+                            pending_name
+                        )))
+                    }
+                    crate::db::PendingCreateReclaim::Active => {
+                        return Err(ApiError::Conflict(
+                            "machine was published or creation is active in another process; retry"
+                                .into(),
+                        ))
+                    }
+                    crate::db::PendingCreateReclaim::Reclaimed => {}
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))??;
+            // Clears an in-process failed preparation's reservation as well.
+            state.release_machine_reservation(&name, "already-cleared");
+            return Ok(DeleteResponse { deleted: name });
+        }
+    };
 
     // A forked clone's block disks are copy-on-write overlays backed by this
     // machine's disks, so deleting a golden with live clones would destroy
