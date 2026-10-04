@@ -101,6 +101,18 @@ impl IntoResponse for ApiError {
             ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg),
         };
+        // The access log records only the status of a failed response; the
+        // reason exists nowhere on the server unless it is logged here, inside
+        // the request span that names the machine.
+        match failure_log_level(status) {
+            Some(tracing::Level::WARN) => {
+                tracing::warn!(status = status.as_u16(), code, error = %message, "request unavailable")
+            }
+            Some(_) => {
+                tracing::error!(status = status.as_u16(), code, error = %message, "request failed")
+            }
+            None => {}
+        }
 
         let body = Json(ErrorResponse {
             error: message,
@@ -108,6 +120,19 @@ impl IntoResponse for ApiError {
         });
 
         (status, body).into_response()
+    }
+}
+
+/// Level at which a failed response's reason is logged: a server failure is
+/// an error, a temporarily unavailable server a warning, and a client error is
+/// the caller's to report.
+fn failure_log_level(status: StatusCode) -> Option<tracing::Level> {
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        Some(tracing::Level::WARN)
+    } else if status.is_server_error() {
+        Some(tracing::Level::ERROR)
+    } else {
+        None
     }
 }
 
@@ -183,6 +208,28 @@ mod tests {
         ];
         for (error, expected) in cases {
             assert_eq!(error.into_response().status(), expected);
+        }
+    }
+
+    #[test]
+    fn server_errors_log_their_reason() {
+        use tracing::Level;
+        let cases = [
+            (ApiError::Internal("x".into()), Some(Level::ERROR)),
+            (
+                ApiError::CloneIdentityRejuvenationFailed("x".into()),
+                Some(Level::ERROR),
+            ),
+            (ApiError::Unavailable("x".into()), Some(Level::WARN)),
+            (ApiError::NotFound("x".into()), None),
+            (ApiError::Conflict("x".into()), None),
+            (ApiError::BadRequest("x".into()), None),
+            (ApiError::Timeout, None),
+        ];
+        for (error, expected) in cases {
+            let label = format!("{error:?}");
+            let status = error.into_response().status();
+            assert_eq!(failure_log_level(status), expected, "{label}");
         }
     }
 
