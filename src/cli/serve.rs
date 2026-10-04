@@ -97,11 +97,12 @@ pub struct ServeStartCmd {
     #[arg(long = "allow-nested-virt")]
     allow_nested_virt: bool,
 
-    /// Flag guest traffic to destinations on this watchlist. Each line is
-    /// `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
+    /// Flag, or block, guest traffic to destinations on this watchlist. Each line
+    /// is `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
     /// lowercased DNS name (its subdomains match too) or of an IP address's text.
     /// Matches are recorded per machine and reported as `egressSignals` in the
-    /// machine API; traffic is never blocked by this. The file is re-read when it
+    /// machine API. A line ending in `block` also answers a matching lookup as
+    /// nonexistent and drops matching connections. The file is re-read when it
     /// changes. Applies to virtio-net machines. Off by default.
     #[arg(long = "egress-watchlist", value_name = "PATH")]
     egress_watchlist: Option<std::path::PathBuf>,
