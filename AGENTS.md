@@ -2,6 +2,9 @@
 
 A tool to build and run portable, self-contained virtual machines locally. <200ms boot time. No daemon, no Docker.
 
+> [!TIP]
+> **Coding Agent Skill**: If you are using Claude Code, OpenCode, Antigravity, or other AI coding assistants, see [skills/smolvm-sandbox/SKILL.md](skills/smolvm-sandbox/SKILL.md) for isolated sandbox execution recipes and security guardrails.
+
 ## Platform Support
 
 | Host | Guest | Hypervisor | Requirements |
