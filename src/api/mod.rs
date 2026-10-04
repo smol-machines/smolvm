@@ -25,6 +25,7 @@ pub(crate) mod device_handoff;
 pub mod error;
 pub mod guest_rollout;
 pub mod handlers;
+pub mod inflight;
 pub mod pool_controller;
 pub mod resize_controller;
 pub mod rollout;
@@ -428,6 +429,11 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
         }))
         .layer(cors)
+        // Outermost, so a request counts from arrival until its body is sent.
+        .layer(middleware::from_fn_with_state(
+            inflight::global(),
+            inflight::track,
+        ))
         .with_state(state)
 }
 
@@ -491,7 +497,8 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
 /// into unauthenticated reads/writes against `download_file` / `upload_file`.
 ///
 /// The door's only legitimate job is liveness — a fleet node-agent polling
-/// `/capacity` (plus `/health`/`/readyz`, and read-only `/metrics`). Restricting
+/// `/capacity` (plus `/health`/`/readyz`, read-only `/metrics`, and `/inflight`,
+/// the request counts a roll waits on before restarting serve). Restricting
 /// it to exactly those routes closes the SSRF pivot without touching the mTLS
 /// control path, which keeps the full API. Everything else 404s on loopback.
 pub fn create_local_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
@@ -501,6 +508,7 @@ pub fn create_local_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> R
         .route("/readyz", get(handlers::health::readyz))
         .route("/capacity", get(handlers::node::capacity))
         .route("/metrics", get(serve_metrics))
+        .route("/inflight", get(inflight::inflight_status))
         .layer(middleware::from_fn(trace_id_middleware))
         .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
             tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
@@ -563,6 +571,11 @@ mod loopback_router_test {
             status(local.clone(), "GET", "/health").await,
             StatusCode::NOT_FOUND,
             "loopback /health must remain served"
+        );
+        assert_eq!(
+            status(local.clone(), "GET", "/inflight").await,
+            StatusCode::OK,
+            "loopback /inflight must be served so a roll can wait for idle"
         );
 
         // Sanity: the FULL router (mTLS port) still DOES expose the API.

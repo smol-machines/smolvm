@@ -128,6 +128,16 @@ pub struct ServeStartCmd {
         action = clap::ArgAction::SetTrue
     )]
     mtls_allow_peer_blobs: bool,
+
+    /// Seconds a stopping server gives in-flight requests to finish once it has
+    /// stopped accepting connections. Whatever still runs after that is dropped
+    /// and the process exits. Without the flag, SMOLVM_SERVE_SHUTDOWN_GRACE_SECS
+    /// is read, then the default of 5. Capped at 3600. Connections are refused
+    /// for as long as the grace lasts, so to restart without cutting off a long
+    /// exec, wait for `GET /inflight` on the loopback door to report nothing in
+    /// flight before stopping serve rather than raising this.
+    #[arg(long = "shutdown-grace", value_name = "SECS")]
+    shutdown_grace: Option<u64>,
 }
 
 impl ServeStartCmd {
@@ -300,7 +310,15 @@ impl ServeStartCmd {
             .build()
             .map_err(smolvm::error::Error::Io)?;
 
-        runtime.block_on(async move { self.run_server(listen_target).await })
+        let result = runtime.block_on(async move { self.run_server(listen_target).await });
+        // A request dropped at the end of the grace can leave its agent call
+        // running on a blocking thread: a buffered exec waits there for its
+        // command to finish. Dropping the runtime waits for every such thread
+        // without limit, which kept a stopped server's process alive, and its
+        // replacement from starting, until the abandoned command ended. Give
+        // blocking work a brief moment, then exit regardless.
+        runtime.shutdown_timeout(BLOCKING_WORK_EXIT_WAIT);
+        result
     }
 
     async fn run_server(self, listen_target: ListenTarget) -> Result<()> {
@@ -444,13 +462,21 @@ impl ServeStartCmd {
         })?;
 
         // Listen server on TCP or Unix socket
+        let grace = resolve_shutdown_grace(
+            self.shutdown_grace,
+            std::env::var("SMOLVM_SERVE_SHUTDOWN_GRACE_SECS")
+                .ok()
+                .as_deref(),
+        );
         let server_result = match listen_target {
             ListenTarget::Tcp(addr) => {
-                self.serve_tcp(addr, app, local_app, tls, shutdown_rx.clone())
+                self.serve_tcp(addr, app, local_app, tls, shutdown_rx.clone(), grace)
                     .await
             }
             #[cfg(unix)]
-            ListenTarget::Unix(path) => self.serve_unix(path, app, shutdown_rx.clone()).await,
+            ListenTarget::Unix(path) => {
+                self.serve_unix(path, app, shutdown_rx.clone(), grace).await
+            }
         };
 
         // The HTTP server has stopped accepting (graceful shutdown on SIGTERM).
@@ -527,9 +553,10 @@ impl ServeStartCmd {
         local_app: Router,
         tls: Option<super::serve_tls::ServeTls>,
         internal_shutdown: tokio::sync::watch::Receiver<bool>,
+        grace: std::time::Duration,
     ) -> Result<()> {
         if let Some(tls) = tls {
-            return Self::serve_tcp_tls(addr, app, local_app, tls, internal_shutdown).await;
+            return Self::serve_tcp_tls(addr, app, local_app, tls, internal_shutdown, grace).await;
         }
 
         let listener = tokio::net::TcpListener::bind(addr)
@@ -539,8 +566,9 @@ impl ServeStartCmd {
         tracing::info!(address = %addr, "starting HTTP API server");
         println!("smolvm API server listening on http://{}", addr);
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal_or_internal(internal_shutdown))
+        let (signal, started) = signal_and_notice(shutdown_signal_or_internal(internal_shutdown));
+        let serve = axum::serve(listener, app).with_graceful_shutdown(signal);
+        finish_within_grace(async move { serve.await }, started, grace)
             .await
             .map_err(smolvm::error::Error::Io)
     }
@@ -560,6 +588,7 @@ impl ServeStartCmd {
         local_app: Router,
         tls: super::serve_tls::ServeTls,
         internal_shutdown: tokio::sync::watch::Receiver<bool>,
+        grace: std::time::Duration,
     ) -> Result<()> {
         // Loopback plain-HTTP door for the local node-agent.
         if let Some(local_addr) = super::serve_tls::local_plain_addr(addr) {
@@ -642,26 +671,22 @@ impl ServeStartCmd {
         let handle = axum_server::Handle::new();
 
         // Trip graceful shutdown on the same signal the plain path observes.
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            shutdown_signal_or_internal(internal_shutdown).await;
-            let grace = shutdown_grace();
-            tracing::info!(
-                grace_secs = grace.as_secs(),
-                "finishing in-flight requests before exit"
-            );
-            shutdown_handle.graceful_shutdown(Some(grace));
-        });
+        arm_graceful_shutdown(
+            handle.clone(),
+            shutdown_signal_or_internal(internal_shutdown),
+            grace,
+        );
 
         tracing::info!(address = %addr, "starting HTTPS API server (mTLS, client cert required)");
         println!("smolvm API server listening on https://{} (mTLS)", addr);
 
-        axum_server::bind(addr)
+        let result = axum_server::bind(addr)
             .acceptor(acceptor)
             .handle(handle)
             .serve(app.into_make_service())
-            .await
-            .map_err(smolvm::error::Error::Io)
+            .await;
+        log_requests_cut_off();
+        result.map_err(smolvm::error::Error::Io)
     }
 
     #[cfg(unix)]
@@ -670,6 +695,7 @@ impl ServeStartCmd {
         path: PathBuf,
         app: Router,
         internal_shutdown: tokio::sync::watch::Receiver<bool>,
+        grace: std::time::Duration,
     ) -> Result<()> {
         let socket_guard = UnixSocketGuard::bind(&path)?;
         let listener =
@@ -681,8 +707,9 @@ impl ServeStartCmd {
             socket_guard.path.display()
         );
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal_or_internal(internal_shutdown))
+        let (signal, started) = signal_and_notice(shutdown_signal_or_internal(internal_shutdown));
+        let serve = axum::serve(listener, app).with_graceful_shutdown(signal);
+        finish_within_grace(async move { serve.await }, started, grace)
             .await
             .map_err(smolvm::error::Error::Io)
     }
@@ -819,22 +846,24 @@ async fn shutdown_signal() {
     eprintln!("\nShutting down server (VMs continue running)...");
 }
 
-/// Default time a stopping HTTPS server gives in-flight requests to finish.
+/// Default time a stopping server gives in-flight requests to finish.
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 5;
 /// Upper bound on a configured grace, so a typo cannot make a stop hang for days.
 const MAX_SHUTDOWN_GRACE_SECS: u64 = 3600;
+/// How long a stopped server waits for blocking work its dropped requests left
+/// behind before the process exits anyway.
+const BLOCKING_WORK_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long a stopping HTTPS server lets in-flight requests finish before it
-/// drops them: `SMOLVM_SERVE_SHUTDOWN_GRACE_SECS`, default 5 s. A worker being
-/// upgraded sets it high so a long `exec` in progress completes instead of being
-/// cut off; the server stops accepting new connections as soon as it is asked to
-/// stop, so the grace only ever extends work that had already started.
-fn shutdown_grace() -> std::time::Duration {
-    parse_shutdown_grace(
-        std::env::var("SMOLVM_SERVE_SHUTDOWN_GRACE_SECS")
-            .ok()
-            .as_deref(),
-    )
+/// How long a stopping server lets in-flight requests finish before it drops
+/// them: `--shutdown-grace`, else `SMOLVM_SERVE_SHUTDOWN_GRACE_SECS`, else 5 s.
+/// The server stops accepting connections as soon as it is asked to stop, so a
+/// longer grace finishes more of the work already started at the cost of
+/// refusing new work for longer.
+fn resolve_shutdown_grace(flag: Option<u64>, env: Option<&str>) -> std::time::Duration {
+    match flag {
+        Some(secs) => std::time::Duration::from_secs(secs.min(MAX_SHUTDOWN_GRACE_SECS)),
+        None => parse_shutdown_grace(env),
+    }
 }
 
 fn parse_shutdown_grace(value: Option<&str>) -> std::time::Duration {
@@ -843,6 +872,94 @@ fn parse_shutdown_grace(value: Option<&str>) -> std::time::Duration {
         .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS)
         .min(MAX_SHUTDOWN_GRACE_SECS);
     std::time::Duration::from_secs(secs)
+}
+
+/// Log what the shutdown is about to cut off (or has cut off): the requests the
+/// main API router still counts as in flight.
+fn log_inflight(message: &'static str) {
+    let s = smolvm::api::inflight::global().snapshot();
+    if s.in_flight > 0 || s.open_streams > 0 {
+        tracing::warn!(
+            in_flight = s.in_flight,
+            execs = s.execs,
+            open_streams = s.open_streams,
+            oldest_ms = s.oldest_ms,
+            "{message}"
+        );
+    }
+}
+
+fn log_requests_cut_off() {
+    log_inflight("requests still running at the end of the shutdown grace were cut off");
+}
+
+/// Start the HTTPS server's graceful shutdown when `signal` resolves: stop
+/// accepting, then give in-flight requests `grace` before dropping them.
+fn arm_graceful_shutdown<S>(handle: axum_server::Handle, signal: S, grace: std::time::Duration)
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        signal.await;
+        tracing::info!(
+            grace_secs = grace.as_secs(),
+            "finishing in-flight requests before exit"
+        );
+        log_inflight("stopping with requests in flight");
+        handle.graceful_shutdown(Some(grace));
+    });
+}
+
+/// Wrap a shutdown signal so the caller also learns when it fired.
+fn signal_and_notice<S>(
+    signal: S,
+) -> (
+    impl std::future::Future<Output = ()> + Send + 'static,
+    tokio::sync::oneshot::Receiver<()>,
+)
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (fired_tx, fired_rx) = tokio::sync::oneshot::channel();
+    let signal = async move {
+        signal.await;
+        let _ = fired_tx.send(());
+    };
+    (signal, fired_rx)
+}
+
+/// Drive a gracefully-shutting-down plain server, but give up on it `grace`
+/// after its shutdown signal fired. axum's own graceful shutdown waits for every
+/// open connection without limit, so one long exec would hold the stop open.
+async fn finish_within_grace<F>(
+    serve: F,
+    signal_fired: tokio::sync::oneshot::Receiver<()>,
+    grace: std::time::Duration,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    let deadline = async move {
+        match signal_fired.await {
+            Ok(()) => {
+                tracing::info!(
+                    grace_secs = grace.as_secs(),
+                    "finishing in-flight requests before exit"
+                );
+                log_inflight("stopping with requests in flight");
+                tokio::time::sleep(grace).await
+            }
+            // The server ended without being asked to stop; let it report why.
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        result = serve => result,
+        () = deadline => {
+            log_requests_cut_off();
+            Ok(())
+        }
+    }
 }
 
 async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -863,6 +980,7 @@ async fn shutdown_signal_or_internal(shutdown: tokio::sync::watch::Receiver<bool
 #[cfg(test)]
 mod tests {
     use super::ListenTarget;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn shutdown_grace_defaults_and_is_bounded() {
@@ -873,6 +991,196 @@ mod tests {
         assert_eq!(grace(Some(" 300 ")).as_secs(), 300);
         assert_eq!(grace(Some("0")).as_secs(), 0);
         assert_eq!(grace(Some("999999")).as_secs(), 3600);
+    }
+
+    #[test]
+    fn shutdown_grace_flag_wins_over_env() {
+        use super::resolve_shutdown_grace as grace;
+        assert_eq!(grace(Some(12), Some("300")).as_secs(), 12);
+        assert_eq!(grace(Some(0), Some("300")).as_secs(), 0);
+        assert_eq!(grace(None, Some("300")).as_secs(), 300);
+        assert_eq!(grace(None, None).as_secs(), 5);
+        assert_eq!(grace(Some(999_999), None).as_secs(), 3600);
+    }
+
+    fn slow_app(delay: Duration) -> axum::Router {
+        axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || async move {
+                tokio::time::sleep(delay).await;
+                "done"
+            }),
+        )
+    }
+
+    /// The mTLS server's shutdown path (`arm_graceful_shutdown` driving an
+    /// axum-server `Handle`), served over plain TCP so no certificates are
+    /// needed. Returns the server task, the address, and the trigger.
+    async fn https_style_server(
+        handler_delay: Duration,
+        grace: Duration,
+    ) -> (
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        super::arm_graceful_shutdown(
+            handle.clone(),
+            async move {
+                let _ = stop_rx.await;
+            },
+            grace,
+        );
+        let server = tokio::spawn(
+            axum_server::from_tcp(listener)
+                .handle(handle.clone())
+                .serve(slow_app(handler_delay).into_make_service()),
+        );
+        handle.listening().await.expect("server listening");
+        (server, addr, stop_tx)
+    }
+
+    /// The Unix-socket/plain-TCP shutdown path (`finish_within_grace` around
+    /// axum's own graceful shutdown).
+    async fn plain_server(
+        handler_delay: Duration,
+        grace: Duration,
+    ) -> (
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (signal, fired) = super::signal_and_notice(async move {
+            let _ = stop_rx.await;
+        });
+        let serve = axum::serve(listener, slow_app(handler_delay)).with_graceful_shutdown(signal);
+        let server = tokio::spawn(super::finish_within_grace(
+            async move { serve.await },
+            fired,
+            grace,
+        ));
+        (server, addr, stop_tx)
+    }
+
+    type Reply = tokio::task::JoinHandle<Result<String, String>>;
+
+    /// Send `GET /slow`, ask the server to stop while it runs, and return the
+    /// pending reply plus how long the server took to return after being asked
+    /// to stop.
+    async fn stop_during_request(
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+        addr: std::net::SocketAddr,
+        stop: tokio::sync::oneshot::Sender<()>,
+    ) -> (Reply, Duration) {
+        let request = tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .get(format!("http://{addr}/slow"))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            response.text().await.map_err(|e| e.to_string())
+        });
+        // Let the request reach the handler before the stop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop.send(()).unwrap();
+        let asked = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(20), server)
+            .await
+            .expect("server returned")
+            .expect("server task");
+        let took = asked.elapsed();
+        result.expect("server result");
+        // A stopped server refuses new connections.
+        assert!(
+            reqwest::Client::new()
+                .get(format!("http://{addr}/slow"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .is_err(),
+            "a stopped server must not accept new requests"
+        );
+        (request, took)
+    }
+
+    async fn reply(request: Reply) -> Result<String, String> {
+        tokio::time::timeout(Duration::from_secs(20), request)
+            .await
+            .expect("request finished")
+            .expect("request task")
+    }
+
+    // A request already running when the stop arrives finishes and its response
+    // is delivered, and the server returns as soon as it has, not at the end of
+    // the grace.
+    #[tokio::test]
+    async fn https_shutdown_delivers_an_inflight_response_then_returns() {
+        let (server, addr, stop) =
+            https_style_server(Duration::from_millis(800), Duration::from_secs(10)).await;
+        let (request, took) = stop_during_request(server, addr, stop).await;
+        assert_eq!(reply(request).await.as_deref(), Ok("done"));
+        assert!(took < Duration::from_secs(3), "returned after {took:?}");
+    }
+
+    #[tokio::test]
+    async fn plain_shutdown_delivers_an_inflight_response_then_returns() {
+        let (server, addr, stop) =
+            plain_server(Duration::from_millis(800), Duration::from_secs(10)).await;
+        let (request, took) = stop_during_request(server, addr, stop).await;
+        assert_eq!(reply(request).await.as_deref(), Ok("done"));
+        assert!(took < Duration::from_secs(3), "returned after {took:?}");
+    }
+
+    // A request that outlives the grace is dropped and the server returns right
+    // after the grace instead of waiting for it.
+    #[tokio::test]
+    async fn https_shutdown_drops_a_request_that_outlives_the_grace() {
+        let (server, addr, stop) =
+            https_style_server(Duration::from_secs(60), Duration::from_millis(300)).await;
+        let (request, took) = stop_during_request(server, addr, stop).await;
+        let response = reply(request).await;
+        assert!(response.is_err(), "{response:?}");
+        assert!(took < Duration::from_secs(3), "returned after {took:?}");
+    }
+
+    #[tokio::test]
+    async fn plain_shutdown_drops_a_request_that_outlives_the_grace() {
+        let (server, addr, stop) =
+            plain_server(Duration::from_secs(60), Duration::from_millis(300)).await;
+        let (request, took) = stop_during_request(server, addr, stop).await;
+        assert!(took < Duration::from_secs(3), "returned after {took:?}");
+        // axum's serve spawns each connection, so the abandoned one ends when the
+        // runtime shuts down; the server itself must not have waited for it.
+        request.abort();
+    }
+
+    // Blocking work left behind by a dropped request (an exec waiting for its
+    // command) must not keep the process from exiting.
+    #[test]
+    fn runtime_exit_does_not_wait_for_abandoned_blocking_work() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(60)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        let started = Instant::now();
+        runtime.shutdown_timeout(super::BLOCKING_WORK_EXIT_WAIT);
+        assert!(
+            started.elapsed() < super::BLOCKING_WORK_EXIT_WAIT + Duration::from_secs(1),
+            "exit waited {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
