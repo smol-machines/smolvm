@@ -573,6 +573,12 @@ pub struct PortableCheckpointManifest {
     /// pack again to reproduce the captured device topology.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packed_layers: Option<CheckpointPackedLayers>,
+    /// The registry image the host fetched for a machine with no network and
+    /// served to it as a saved-image archive over the same virtio-fs device a
+    /// pack's layers use. The archive is not in the artifact, so a restore
+    /// fetches this image again to reproduce the captured device topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_image: Option<CheckpointHostImage>,
     /// Position in the source machine's checkpoint history. Absent on
     /// checkpoints written before lineage was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -627,6 +633,24 @@ pub struct CheckpointPackedLayers {
     /// on a host that does not already have it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_ref: Option<String>,
+}
+
+/// Identity of the registry image a checkpointed machine booted from a
+/// host-fetched archive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointHostImage {
+    /// Registry reference to fetch, pinned to the manifest digest the source
+    /// host fetched when it recorded one.
+    pub reference: String,
+    /// Digest of the image config the archive carries. A restore refuses an
+    /// archive with any other config, so a moved tag cannot swap the image.
+    pub config_digest: String,
+    /// Size in bytes of the archive the guest read.
+    pub archive_size: u64,
+    /// Modification time (seconds since the epoch) of the archive the guest
+    /// read. The guest keys its flattened copy of the image on size and
+    /// modification time, so a restore must serve an archive with both.
+    pub archive_mtime: u64,
 }
 
 /// Manifest describing the packed image and configuration.

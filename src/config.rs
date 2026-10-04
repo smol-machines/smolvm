@@ -704,6 +704,12 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_origin: Option<String>,
 
+    /// Manifest digest of the image the host fetched for `image_origin`, so a
+    /// checkpoint can name exactly the image this machine's disks were built
+    /// from rather than a tag that may have moved since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_origin_digest: Option<String>,
+
     /// Name of the golden VM this machine was forked from, if any. A clone's
     /// block disks are copy-on-write overlays backed by the golden's disks, so
     /// the golden must outlive its clones. The disk *format* is not recorded
@@ -887,6 +893,7 @@ impl VmRecord {
             source_smolmachine: None,
             source_registry_ref: None,
             image_origin: None,
+            image_origin_digest: None,
             golden: None,
             checkpoint_head: None,
             fork_generation: None,
@@ -973,6 +980,7 @@ impl VmRecord {
             source_smolmachine: None,
             source_registry_ref: None,
             image_origin: None,
+            image_origin_digest: None,
             golden: None,
             checkpoint_head: None,
             fork_generation: None,
@@ -1106,12 +1114,35 @@ impl VmRecord {
     }
 
     /// Boot from `local_ref`, a host-fetched copy of this machine's registry
-    /// image, keeping the reference it came from as `image_origin`.
-    pub fn pin_host_fetched_image(&mut self, local_ref: String) {
+    /// image whose manifest digest is `digest`, keeping the reference it came
+    /// from as `image_origin`.
+    pub fn pin_host_fetched_image(&mut self, local_ref: String, digest: String) {
         if self.image_origin.is_none() {
             self.image_origin = self.image.take();
         }
         self.image = Some(local_ref);
+        self.image_origin_digest = Some(digest);
+    }
+
+    /// The registry reference this machine's host-fetched image came from,
+    /// pinned to the fetched manifest digest when one was recorded, or `None`
+    /// when the machine does not boot a host-fetched registry image. A user's
+    /// own archive or rootfs directory has no registry origin.
+    pub fn host_fetched_origin(&self) -> Option<String> {
+        crate::data::image_source::local_archive_hash(self.image.as_deref()?)?;
+        let origin = self.image_origin.as_deref()?;
+        if crate::data::image_source::is_local_ref(origin)
+            || !matches!(
+                crate::data::image_source::classify(origin),
+                crate::data::image_source::ImageSource::Registry(_)
+            )
+        {
+            return None;
+        }
+        Some(match self.image_origin_digest.as_deref() {
+            Some(digest) if !origin.contains('@') => format!("{origin}@{digest}"),
+            _ => origin.to_string(),
+        })
     }
 
     /// The image to show for this machine: what the user asked for, even when
@@ -1498,7 +1529,7 @@ mod tests {
     #[test]
     fn a_pinned_copy_boots_while_the_origin_is_what_shows() {
         let mut r = rec_with_image("alpine:3.20", false, vec![]);
-        r.pin_host_fetched_image("local:abc".to_string());
+        r.pin_host_fetched_image("local:abc".to_string(), "sha256:aa".to_string());
         assert_eq!(r.image.as_deref(), Some("local:abc"));
         assert_eq!(r.display_image(), Some("alpine:3.20"));
         assert!(
@@ -1506,8 +1537,44 @@ mod tests {
             "a pinned copy is never fetched again"
         );
         // Re-pinning keeps the first origin, not the previous local copy.
-        r.pin_host_fetched_image("local:def".to_string());
+        r.pin_host_fetched_image("local:def".to_string(), "sha256:bb".to_string());
         assert_eq!(r.image_origin.as_deref(), Some("alpine:3.20"));
+        assert_eq!(r.image_origin_digest.as_deref(), Some("sha256:bb"));
+    }
+
+    #[test]
+    fn a_host_fetched_image_names_its_origin_pinned_to_the_fetched_digest() {
+        let mut r = rec_with_image("python:3.12-slim", false, vec![]);
+        r.pin_host_fetched_image("local:abc".to_string(), "sha256:aa".to_string());
+        assert_eq!(
+            r.host_fetched_origin().as_deref(),
+            Some("python:3.12-slim@sha256:aa")
+        );
+        // An origin that already names a digest is kept as given.
+        r.image_origin = Some("python@sha256:cc".to_string());
+        assert_eq!(r.host_fetched_origin().as_deref(), Some("python@sha256:cc"));
+        // A copy pinned before digests were recorded names the origin as given.
+        r.image_origin = Some("python:3.12-slim".to_string());
+        r.image_origin_digest = None;
+        assert_eq!(r.host_fetched_origin().as_deref(), Some("python:3.12-slim"));
+    }
+
+    #[test]
+    fn a_users_own_image_has_no_registry_origin() {
+        // A `docker save` archive or rootfs directory given directly.
+        for local in ["local:abc", "local-dir:/srv/rootfs"] {
+            let r = rec_with_image(local, false, vec![]);
+            assert_eq!(r.host_fetched_origin(), None, "{local}");
+        }
+        // A registry image the guest pulls itself is not host-fetched.
+        assert_eq!(
+            rec_with_image("alpine", true, vec![]).host_fetched_origin(),
+            None
+        );
+        // A rootfs directory never boots a fetched archive, whatever its origin.
+        let mut r = rec_with_image("local-dir:/srv/rootfs", false, vec![]);
+        r.image_origin = Some("alpine".to_string());
+        assert_eq!(r.host_fetched_origin(), None);
     }
 
     #[test]

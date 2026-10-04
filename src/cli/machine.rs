@@ -4781,6 +4781,11 @@ impl CreateCmd {
                     record.source_smolmachine = Some(sidecar);
                     record.source_registry_ref = reference;
                 }
+                if let Some(image) =
+                    smolvm::portable_checkpoint::fetch_checkpoint_host_image_blocking(checkpoint)?
+                {
+                    image.apply(&mut record);
+                }
             }
 
             reservation.commit(&record)?;

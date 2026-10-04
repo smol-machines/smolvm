@@ -211,6 +211,10 @@ pub struct MachineRegistration {
     pub source_smolmachine: Option<String>,
     /// Registry reference that sidecar was pulled from, if any.
     pub source_registry_ref: Option<String>,
+    /// Registry reference a host-fetched `image` came from, if any.
+    pub image_origin: Option<String>,
+    /// Manifest digest of that host-fetched image.
+    pub image_origin_digest: Option<String>,
     /// Container entrypoint (from manifest).
     pub entrypoint: Vec<String>,
     /// Container cmd (from manifest).
@@ -1163,6 +1167,8 @@ impl ApiState {
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
         record.source_registry_ref = reg.source_registry_ref.clone();
+        record.image_origin = reg.image_origin;
+        record.image_origin_digest = reg.image_origin_digest;
         record.entrypoint = reg.entrypoint;
         record.cmd = reg.cmd;
         record.env = reg.env;

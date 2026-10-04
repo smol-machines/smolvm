@@ -2967,6 +2967,7 @@ mod tests {
             workload: None,
             network: None,
             packed_layers: None,
+            host_image: None,
             lineage: Some(CheckpointLineage {
                 id: id.into(),
                 parent: parent.map(str::to_string),

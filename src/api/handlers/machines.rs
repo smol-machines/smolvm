@@ -2786,6 +2786,25 @@ async fn create_machine_inner(
         }
     }
 
+    // A checkpoint of a machine that booted a host-fetched registry image needs
+    // that image fetched here and served the way the captured guest read it,
+    // whatever the restored machine's network: the guest holds its device.
+    let mut restored_host_image = None;
+    if let Some(checkpoint) = manifest_checkpoint.as_ref() {
+        match crate::portable_checkpoint::fetch_checkpoint_host_image(
+            checkpoint,
+            &crate::registry::PullAuth::FromConfig,
+        )
+        .await
+        {
+            Ok(image) => restored_host_image = image,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(vm_data_dir(&name));
+                return Err(ApiError::from(error));
+            }
+        }
+    }
+
     if manifest_checkpoint.is_some() {
         // Install may publish a disk under a different name than the one the
         // manager opened (a copy-on-write top is `.qcow2`, not `.raw`), so
@@ -2882,7 +2901,14 @@ async fn create_machine_inner(
         forkable: manifest_checkpoint.is_some(),
         init_completed: manifest_checkpoint.is_some(),
         docker_socket: req.docker_socket,
-        image,
+        image: match &restored_host_image {
+            Some(restored) => Some(restored.local.clone()),
+            None => image,
+        },
+        image_origin: restored_host_image
+            .as_ref()
+            .map(|restored| restored.origin.clone()),
+        image_origin_digest: restored_host_image.map(|restored| restored.digest),
         source_registry_ref: if manifest_checkpoint.is_some() {
             restored_pack
                 .as_ref()
@@ -3369,10 +3395,12 @@ pub async fn start_machine(
             None => crate::registry::PullAuth::FromConfig,
         };
         let image = record.image.clone().unwrap_or_default();
-        let local = crate::image_store::fetch_image_archive(&image, &auth).await?;
-        record.pin_host_fetched_image(local.clone());
+        let fetched = crate::image_store::fetch_image_archive(&image, &auth).await?;
+        record.pin_host_fetched_image(fetched.local.clone(), fetched.digest.clone());
         state
-            .update_vm(&name, move |r| r.pin_host_fetched_image(local))
+            .update_vm(&name, move |r| {
+                r.pin_host_fetched_image(fetched.local, fetched.digest)
+            })
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
     }

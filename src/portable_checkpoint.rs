@@ -13,9 +13,9 @@ use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate};
 use sha2::{Digest, Sha256};
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{
-    CheckpointAsset, CheckpointCpuContract, CheckpointDisk, CheckpointDiskFile, CheckpointNetwork,
-    CheckpointPackedLayers, CheckpointPort, CheckpointWorkload, PackManifest, PackMode,
-    PortableCheckpointManifest,
+    CheckpointAsset, CheckpointCpuContract, CheckpointDisk, CheckpointDiskFile,
+    CheckpointHostImage, CheckpointNetwork, CheckpointPackedLayers, CheckpointPort,
+    CheckpointWorkload, PackManifest, PackMode, PortableCheckpointManifest,
 };
 use smolvm_pack::packer::Packer;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -710,6 +710,9 @@ pub fn restore_from_path_at(
         if let Some((sidecar, reference)) = attach_cached_checkpoint_pack(name, checkpoint)? {
             record.source_smolmachine = Some(sidecar);
             record.source_registry_ref = reference;
+        }
+        if let Some(image) = fetch_checkpoint_host_image_blocking(checkpoint)? {
+            image.apply(&mut record);
         }
         if !reservation
             .db
@@ -1580,7 +1583,7 @@ fn capture_with_completion(
             all(target_os = "macos", target_arch = "aarch64")
         )) && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
-    let max_memory_image = max_checkpoint_memory_image(vm.mem, vm.source_smolmachine.is_some())?;
+    let max_memory_image = max_checkpoint_memory_image(vm.mem, mounts_image_layers(vm))?;
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
     if stop_after_capture {
@@ -1595,8 +1598,7 @@ fn capture_with_completion(
     // WHP only implements the eager, frozen save. Send SAVE directly rather
     // than probing deferred commands that the Windows VMM cannot handle.
     let use_deferred_save = !cfg!(target_os = "windows")
-        && (!cfg!(all(target_os = "linux", target_arch = "x86_64"))
-            || vm.source_smolmachine.is_none());
+        && (!cfg!(all(target_os = "linux", target_arch = "x86_64")) || !mounts_image_layers(vm));
     // A capture that stops the VM keeps it paused until the RAM is written, so
     // libkrun can read RAM it cannot retain as a generation (a fork clone's)
     // in place instead of falling back to a synchronous save.
@@ -1875,6 +1877,7 @@ fn capture_with_completion(
     manifest.cpus = vm.cpus;
     manifest.mem = vm.mem;
     let packed_layers = checkpoint_packed_layers(name, vm)?;
+    let host_image = checkpoint_host_image(vm)?;
     let credential_ca = checkpoint_credential_ca(name, vm, &snapshot_dir)?;
     manifest.checkpoint = Some(PortableCheckpointManifest {
         version: FORMAT_VERSION,
@@ -1894,7 +1897,7 @@ fn capture_with_completion(
             vm.overlay_gb
                 .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
         ),
-        device_profile: if packed_layers.is_some() {
+        device_profile: if packed_layers.is_some() || host_image.is_some() {
             DEVICE_PROFILE_PACKED_LAYERS
         } else {
             DEVICE_PROFILE
@@ -1934,6 +1937,7 @@ fn capture_with_completion(
         workload: checkpoint_workload(name, vm),
         network: Some(checkpoint_network(vm)),
         packed_layers,
+        host_image,
         lineage: Some(smolvm_pack::format::CheckpointLineage {
             id: checkpoint_id.clone(),
             parent: vm.checkpoint_head.clone(),
@@ -2143,8 +2147,11 @@ fn capture_with_completion(
 }
 
 fn checkpoint_workload(name: &str, vm: &VmRecord) -> Option<CheckpointWorkload> {
-    vm.image.as_ref().map(|image| CheckpointWorkload {
-        image: image.clone(),
+    // A host-fetched image is named by the registry reference it came from:
+    // its local archive exists only on this host.
+    let image = vm.host_fetched_origin().or_else(|| vm.image.clone())?;
+    Some(CheckpointWorkload {
+        image,
         user: vm.user.clone(),
         overlay_owner: crate::workload::persistent_overlay_owner_with_lineage(
             name,
@@ -2609,6 +2616,145 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     Ok(())
 }
 
+/// Whether a machine mounts image layers from the host over the packed-layers
+/// virtio-fs device: a `.smolmachine`'s layers, or a local image archive or
+/// directory (including a registry image the host fetched for it).
+fn mounts_image_layers(vm: &VmRecord) -> bool {
+    vm.source_smolmachine.is_some()
+        || vm
+            .image
+            .as_deref()
+            .and_then(crate::data::image_source::packed_layers_dir_for_ref)
+            .is_some()
+}
+
+/// Identify the registry image a machine boots from a host-fetched archive, if
+/// any, so a restore can fetch it again and serve the guest the archive it
+/// read.
+fn checkpoint_host_image(vm: &VmRecord) -> Result<Option<CheckpointHostImage>> {
+    if vm.source_smolmachine.is_some() {
+        return Ok(None);
+    }
+    let Some(reference) = vm.host_fetched_origin() else {
+        return Ok(None);
+    };
+    let archive = vm
+        .image
+        .as_deref()
+        .and_then(crate::data::image_source::archive_file_for_ref)
+        .ok_or_else(|| Error::agent("checkpoint machine", "image archive has no cache entry"))?;
+    let (archive_size, archive_mtime) = crate::data::image_source::archive_signature(&archive)
+        .map_err(|error| {
+            Error::agent(
+                "checkpoint machine",
+                format!(
+                    "the archive of {reference} is missing from this host's image cache ({}): {error}",
+                    archive.display()
+                ),
+            )
+        })?;
+    Ok(Some(CheckpointHostImage {
+        config_digest: crate::image_store::archive_config_digest(&archive)?,
+        reference,
+        archive_size,
+        archive_mtime,
+    }))
+}
+
+/// The machine image to boot after restoring a checkpoint whose machine booted
+/// a host-fetched registry image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredHostImage {
+    /// The `local:` reference serving the archive the captured guest read.
+    pub local: String,
+    /// The registry reference it came from, as the checkpoint names it.
+    pub origin: String,
+    /// The manifest digest this host fetched.
+    pub digest: String,
+}
+
+impl RestoredHostImage {
+    /// Point a restored machine's record at this image.
+    pub fn apply(self, record: &mut VmRecord) {
+        record.image = Some(self.local);
+        record.image_origin = Some(self.origin);
+        record.image_origin_digest = Some(self.digest);
+    }
+}
+
+/// Fetch the registry image a checkpoint's machine booted from a host-fetched
+/// archive, whatever the restored machine's network, and serve it the way the
+/// captured guest read it. The guest's state holds that archive's virtio-fs
+/// device and keys its flattened image on the archive's size and time, so the
+/// restore needs the same image at the same size and time. Returns `None` when
+/// the checkpoint has no host-fetched image.
+pub async fn fetch_checkpoint_host_image(
+    checkpoint: &PortableCheckpointManifest,
+    auth: &crate::registry::PullAuth,
+) -> Result<Option<RestoredHostImage>> {
+    let Some(host) = &checkpoint.host_image else {
+        return Ok(None);
+    };
+    let fetched = crate::image_store::fetch_checkpoint_image(&host.reference, auth)
+        .await
+        .map_err(|error| {
+            Error::agent(
+                "restore checkpoint",
+                format!(
+                    "fetch {} for the restored machine's image: {error}",
+                    host.reference
+                ),
+            )
+        })?;
+    let host = host.clone();
+    tokio::task::spawn_blocking(move || serve_checkpoint_host_image(&host, fetched))
+        .await
+        .map_err(|error| Error::agent("restore checkpoint", error.to_string()))?
+        .map(Some)
+}
+
+/// [`fetch_checkpoint_host_image`] for a synchronous caller.
+pub fn fetch_checkpoint_host_image_blocking(
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<Option<RestoredHostImage>> {
+    if checkpoint.host_image.is_none() {
+        return Ok(None);
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::agent("restore checkpoint", error.to_string()))?
+        .block_on(fetch_checkpoint_host_image(
+            checkpoint,
+            &crate::registry::PullAuth::FromConfig,
+        ))
+}
+
+fn serve_checkpoint_host_image(
+    host: &CheckpointHostImage,
+    fetched: crate::image_store::FetchedImage,
+) -> Result<RestoredHostImage> {
+    let archive = crate::data::image_source::archive_file_for_ref(&fetched.local)
+        .ok_or_else(|| Error::agent("restore checkpoint", "fetched image has no cache entry"))?;
+    let config = crate::image_store::archive_config_digest(&archive)?;
+    let (size, _) = crate::data::image_source::archive_signature(&archive)?;
+    if config != host.config_digest || size != host.archive_size {
+        return Err(Error::agent(
+            "restore checkpoint",
+            format!(
+                "{} is no longer the image this checkpoint was captured with \
+                 (config {config}, {size} bytes; expected {}, {} bytes)",
+                host.reference, host.config_digest, host.archive_size
+            ),
+        ));
+    }
+    Ok(RestoredHostImage {
+        local: crate::data::image_source::archive_with_mtime(&fetched.local, host.archive_mtime)?,
+        origin: host.reference.clone(),
+        digest: fetched.digest,
+    })
+}
+
 /// Identify the pack a machine mounts its image layers from, if any, so a
 /// restore can attach the same layers again.
 fn checkpoint_packed_layers(name: &str, vm: &VmRecord) -> Result<Option<CheckpointPackedLayers>> {
@@ -2758,9 +2904,11 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
         unsupported.push("host secret references");
     }
     // A `.smolmachine` source is recorded in the checkpoint and attached again
-    // on restore. Layers found only under a host path named by the image are
-    // not, so they stay unsupported.
+    // on restore, and so is a registry image the host fetched for a machine
+    // with no network. Layers found only under a host path named by the image
+    // are not, so they stay unsupported.
     if vm.source_smolmachine.is_none()
+        && vm.host_fetched_origin().is_none()
         && vm
             .image
             .as_deref()
@@ -3640,6 +3788,11 @@ fn max_checkpoint_memory_image(memory_mib: u32, packed_layers: bool) -> Result<u
         .ok_or_else(|| Error::agent("checkpoint memory", "memory size overflow"))
 }
 
+/// Whether a checkpoint's machine had the packed-layers virtio-fs device.
+fn mounts_checkpoint_image_layers(checkpoint: &PortableCheckpointManifest) -> bool {
+    checkpoint.packed_layers.is_some() || checkpoint.host_image.is_some()
+}
+
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
     let required = match checkpoint.payload {
@@ -3677,7 +3830,13 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
         ));
     }
     validate_clock(checkpoint)?;
-    let expected_profile = if checkpoint.packed_layers.is_some() {
+    if checkpoint.packed_layers.is_some() && checkpoint.host_image.is_some() {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "checkpoint names both a pack and a fetched image as its image layers",
+        ));
+    }
+    let expected_profile = if mounts_checkpoint_image_layers(checkpoint) {
         DEVICE_PROFILE_PACKED_LAYERS
     } else {
         DEVICE_PROFILE
@@ -3757,8 +3916,10 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     // for those non-configured mappings.
     const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
-    let max_memory_image =
-        max_checkpoint_memory_image(checkpoint.memory_mib, checkpoint.packed_layers.is_some())?;
+    let max_memory_image = max_checkpoint_memory_image(
+        checkpoint.memory_mib,
+        mounts_checkpoint_image_layers(checkpoint),
+    )?;
     if checkpoint.state.size == 0
         || checkpoint.state.size > MAX_STATE_BYTES
         || checkpoint.layout.size == 0
@@ -5334,6 +5495,7 @@ mod tests {
             workload: None,
             network: Some(CheckpointNetwork::default()),
             packed_layers: None,
+            host_image: None,
             lineage: None,
             payload: Default::default(),
             history: Vec::new(),
@@ -6089,6 +6251,129 @@ mod tests {
         validate_capture_profile(&record).unwrap();
     }
 
+    fn no_network_machine(image: &str) -> VmRecord {
+        let mut record = VmRecord::new(
+            "fetched".to_string(),
+            2,
+            1024,
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        record.image = Some(image.to_string());
+        record
+    }
+
+    #[test]
+    fn a_host_fetched_registry_image_can_be_captured() {
+        let mut record = no_network_machine("python:3.12-slim-bookworm");
+        record.pin_host_fetched_image("local:abc".to_string(), "sha256:feedface".to_string());
+        validate_capture_profile(&record).expect("a host-fetched registry image is portable");
+        assert!(mounts_image_layers(&record));
+        // The checkpoint names the registry image at the fetched digest, never
+        // this host's archive.
+        let workload = checkpoint_workload(&record.name, &record).unwrap();
+        assert_eq!(workload.image, "python:3.12-slim-bookworm@sha256:feedface");
+    }
+
+    #[test]
+    fn a_users_own_local_image_still_cannot_be_captured() {
+        for image in ["local:abc", "local-dir:/srv/rootfs"] {
+            let record = no_network_machine(image);
+            let error = validate_capture_profile(&record).unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "the initial portable checkpoint profile does not support host-backed image layers"
+                ),
+                "{image}: {error}"
+            );
+        }
+        // An origin that is itself a local source is not a registry origin.
+        let mut record = no_network_machine("./saved.tar");
+        record.pin_host_fetched_image("local:abc".to_string(), "sha256:aa".to_string());
+        let error = validate_capture_profile(&record).unwrap_err().to_string();
+        assert!(error.contains("host-backed image layers"), "{error}");
+    }
+
+    #[test]
+    fn a_registry_image_the_guest_pulled_keeps_its_reference() {
+        let record = no_network_machine("alpine:3.20");
+        assert!(!mounts_image_layers(&record));
+        let workload = checkpoint_workload(&record.name, &record).unwrap();
+        assert_eq!(workload.image, "alpine:3.20");
+    }
+
+    #[test]
+    fn a_host_image_checkpoint_needs_the_packed_layers_device_profile() {
+        let host_image = CheckpointHostImage {
+            reference: "python:3.12-slim-bookworm@sha256:feedface".to_string(),
+            config_digest: "sha256:c0ffee".to_string(),
+            archive_size: 42,
+            archive_mtime: 7,
+        };
+        let mut metadata = minimal_checkpoint_manifest();
+        metadata.host_image = Some(host_image.clone());
+        // Without the profile, a runtime would resume without the device.
+        let error = validate_compatibility(&metadata).unwrap_err().to_string();
+        assert!(error.contains("device profile"), "{error}");
+
+        metadata.device_profile = DEVICE_PROFILE_PACKED_LAYERS.to_string();
+        validate_compatibility(&metadata).unwrap();
+        metadata.memory.size = max_checkpoint_memory_image(metadata.memory_mib, true).unwrap();
+        validate_compatibility(&metadata).unwrap();
+        metadata.memory.size = 1;
+
+        // A runtime that predates host images expects a pack with this
+        // profile, so it refuses the checkpoint rather than resume without
+        // the image's device.
+        let mut older = metadata.clone();
+        older.host_image = None;
+        let error = validate_compatibility(&older).unwrap_err().to_string();
+        assert!(error.contains("device profile"), "{error}");
+
+        // Never both a pack and a fetched image.
+        metadata.packed_layers = Some(CheckpointPackedLayers {
+            artifact_sha256: "ab".repeat(32),
+            footer_checksum: 7,
+            registry_ref: None,
+        });
+        assert!(validate_compatibility(&metadata).is_err());
+
+        // The manifest round-trips the image, and omits it when absent.
+        metadata.packed_layers = None;
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(
+            json["host_image"]["reference"],
+            "python:3.12-slim-bookworm@sha256:feedface"
+        );
+        let back: PortableCheckpointManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.host_image, Some(host_image));
+        let json = serde_json::to_value(minimal_checkpoint_manifest()).unwrap();
+        assert!(json.get("host_image").is_none());
+    }
+
+    #[test]
+    fn a_restored_host_image_points_the_record_at_its_archive() {
+        let mut record = no_network_machine("python:3.12-slim-bookworm@sha256:feedface");
+        RestoredHostImage {
+            local: "local:abc".to_string(),
+            origin: "python:3.12-slim-bookworm@sha256:feedface".to_string(),
+            digest: "sha256:feedface".to_string(),
+        }
+        .apply(&mut record);
+        assert_eq!(record.image.as_deref(), Some("local:abc"));
+        assert_eq!(
+            record.display_image(),
+            Some("python:3.12-slim-bookworm@sha256:feedface")
+        );
+        // A restored machine can be captured again under the same reference.
+        validate_capture_profile(&record).unwrap();
+        assert_eq!(
+            checkpoint_workload(&record.name, &record).unwrap().image,
+            "python:3.12-slim-bookworm@sha256:feedface"
+        );
+    }
+
     #[test]
     fn a_packed_layers_checkpoint_needs_its_own_device_profile() {
         let packed = CheckpointPackedLayers {
@@ -6160,6 +6445,7 @@ mod tests {
             workload: None,
             network: Some(CheckpointNetwork::default()),
             packed_layers: None,
+            host_image: None,
             lineage: None,
             payload: Default::default(),
             history: Vec::new(),

@@ -198,8 +198,19 @@ async fn resolve_manifest(
     Ok((client, repo, manifest_bytes))
 }
 
+/// A registry image the host fetched: the `local:` reference it boots from and
+/// the manifest digest that was fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedImage {
+    /// The `local:<hash>` reference the machine boots from.
+    pub local: String,
+    /// The manifest digest of the image that was fetched.
+    pub digest: String,
+}
+
 /// Fetch `reference` on the HOST into a `docker save` archive and stage it in
-/// the local image cache, returning the `local:<hash>` reference to boot from.
+/// the local image cache, returning the `local:<hash>` reference to boot from
+/// and the manifest digest that was fetched.
 ///
 /// This is how a machine with no network gets a registry image: the guest
 /// would pull it itself, but it has no network to pull with. The archive is
@@ -210,7 +221,7 @@ async fn resolve_manifest(
 /// guest's own pull. Every blob is checked against its manifest digest and
 /// size before anything is staged. A repeat fetch of the same image from the
 /// same registry and repository reuses the staged archive.
-pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<String> {
+pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<FetchedImage> {
     let (client, repo, manifest_bytes) =
         resolve_manifest(reference, auth, None)
             .await
@@ -230,13 +241,14 @@ pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<Str
                 }
                 _ => error,
             })?;
-    let host = crate::registry::extract_registry(reference);
-    let key = hex::encode(Sha256::digest(format!(
-        "{host}/{repo}@{}",
-        manifest_digest(&manifest_bytes)
-    )));
-    if let Some(staged) = crate::data::image_source::fetched_archive(&key) {
-        return Ok(staged);
+    let digest = manifest_digest(&manifest_bytes);
+    let key = fetched_key(
+        &crate::registry::extract_registry(reference),
+        &repo,
+        &digest,
+    );
+    if let Some(local) = crate::data::image_source::fetched_archive(&key) {
+        return Ok(FetchedImage { local, digest });
     }
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| Error::agent("fetch image", format!("parse manifest: {e}")))?;
@@ -258,13 +270,22 @@ pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<Str
 
     let dir = staging.path().to_path_buf();
     let OciManifest { config, layers, .. } = manifest;
+    let mtime = archive_mtime_for(&digest);
     let local = tokio::task::spawn_blocking(move || -> Result<String> {
         let archive = dir.join("image.tar");
         write_save_archive(&dir, &archive, &config, &layers)?;
         match crate::data::image_source::resolve(crate::data::image_source::ImageSource::Archive(
             crate::data::image_source::ArchiveInput::File(archive),
         ))? {
-            crate::data::image_source::ResolvedImage::Local { reference, .. } => Ok(reference),
+            crate::data::image_source::ResolvedImage::Local { reference, .. } => {
+                // The guest keys its flattened copy on the archive's size and
+                // time, so the same image gets the same time on every host: a
+                // checkpoint then restores onto a fresh fetch without a copy.
+                if let Some(staged) = crate::data::image_source::archive_file_for_ref(&reference) {
+                    crate::data::image_source::set_archive_mtime(&staged, mtime)?;
+                }
+                Ok(reference)
+            }
             crate::data::image_source::ResolvedImage::Registry(_) => {
                 unreachable!("an archive resolves to a local reference")
             }
@@ -274,7 +295,75 @@ pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<Str
     .map_err(|e| Error::agent("fetch image", e.to_string()))??;
     crate::data::image_source::record_fetched_archive(&key, &local)?;
     drop(staging);
-    Ok(local)
+    Ok(FetchedImage { local, digest })
+}
+
+/// The index key of a fetched image: the registry and repository that
+/// authorized it, and its manifest digest.
+fn fetched_key(host: &str, repo: &str, digest: &str) -> String {
+    hex::encode(Sha256::digest(format!("{host}/{repo}@{digest}")))
+}
+
+/// The modification time a fetched archive is given: derived from its manifest
+/// digest, so the same image gets the same time on every host and another
+/// image almost never shares it.
+fn archive_mtime_for(digest: &str) -> u64 {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    // 31 bits keeps the time well inside every platform's file-time range.
+    u64::from_str_radix(hex.get(..8).unwrap_or("0"), 16).unwrap_or(0) & 0x7fff_ffff
+}
+
+/// Fetch the image a checkpoint's machine booted from a host-fetched archive,
+/// for a restore. Unlike [`fetch_image_archive`], a digest-pinned reference
+/// this host already fetched is reused after a manifest HEAD (which the
+/// registry authorizes for `auth` like a pull, without counting it as one),
+/// so restoring many copies does not download the manifest again for each.
+pub async fn fetch_checkpoint_image(reference: &str, auth: &PullAuth) -> Result<FetchedImage> {
+    let unpinned = without_pinned_tag(reference);
+    if let Ok(parsed) = Reference::parse(&unpinned) {
+        if let Some(digest) = parsed.digest.clone() {
+            let host = crate::registry::extract_registry(&unpinned);
+            let key = fetched_key(&host, &repo_for(&host, &parsed), &digest);
+            if let Some(local) = crate::data::image_source::fetched_archive(&key) {
+                let authorized = authorized_reference_digest(reference, auth).await?;
+                if authorized == digest {
+                    return Ok(FetchedImage { local, digest });
+                }
+            }
+        }
+    }
+    fetch_image_archive(reference, auth).await
+}
+
+/// The config digest a `docker save` archive's `manifest.json` names.
+pub fn archive_config_digest(archive: &std::path::Path) -> Result<String> {
+    let fail = |message: String| {
+        Error::agent(
+            "read image archive",
+            format!("{}: {message}", archive.display()),
+        )
+    };
+    let mut tar = tar::Archive::new(std::fs::File::open(archive)?);
+    for entry in tar.entries().map_err(|e| fail(e.to_string()))? {
+        let mut entry = entry.map_err(|e| fail(e.to_string()))?;
+        if entry.path().map_err(|e| fail(e.to_string()))?.as_os_str() != "manifest.json" {
+            continue;
+        }
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut body)?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| fail(e.to_string()))?;
+        let config = manifest[0]["Config"]
+            .as_str()
+            .ok_or_else(|| fail("manifest.json names no config".to_string()))?;
+        // `sha256-<hex>` as written by this host's fetch, or a `docker save`
+        // path such as `blobs/sha256/<hex>` / `<hex>.json`.
+        let name = config.rsplit('/').next().unwrap_or(config);
+        let name = name.strip_suffix(".json").unwrap_or(name);
+        let hex = name.strip_prefix("sha256-").unwrap_or(name);
+        return Ok(format!("sha256:{hex}"));
+    }
+    Err(fail("no manifest.json".to_string()))
 }
 
 /// The local reference `record` should boot from when its registry image must
@@ -282,7 +371,10 @@ pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<Str
 /// or `None` when the guest pulls it as usual. For the synchronous start
 /// paths; the caller persists the pin with
 /// [`crate::config::VmRecord::pin_host_fetched_image`].
-pub fn host_fetch_for(record: &crate::config::VmRecord, auth: &PullAuth) -> Result<Option<String>> {
+pub fn host_fetch_for(
+    record: &crate::config::VmRecord,
+    auth: &PullAuth,
+) -> Result<Option<FetchedImage>> {
     if !record.image_needs_host_fetch() {
         return Ok(None);
     }
@@ -304,11 +396,13 @@ pub fn pin_for_start(
     record: crate::config::VmRecord,
     auth: &PullAuth,
 ) -> Result<crate::config::VmRecord> {
-    let Some(local) = host_fetch_for(&record, auth)? else {
+    let Some(fetched) = host_fetch_for(&record, auth)? else {
         return Ok(record);
     };
-    db.update_vm_durable(name, |r| r.pin_host_fetched_image(local.clone()))?
-        .ok_or_else(|| Error::vm_not_found(name))
+    db.update_vm_durable(name, |r| {
+        r.pin_host_fetched_image(fetched.local.clone(), fetched.digest.clone())
+    })?
+    .ok_or_else(|| Error::vm_not_found(name))
 }
 
 /// The file a blob is written to in a staged archive: its digest, which the
@@ -383,7 +477,14 @@ fn write_save_archive(
     tar.append_data(&mut header, "manifest.json", manifest.as_slice())?;
     for blob in std::iter::once(config).chain(layers) {
         let name = blob_file(blob);
-        tar.append_path_with_name(dir.join(&name), &name)?;
+        // Fixed metadata, so the same image makes the same archive bytes on
+        // every host rather than carrying this download's time and owner.
+        let file = std::fs::File::open(dir.join(&name))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(file.metadata()?.len());
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, &name, file)?;
         // The archive now holds the blob; drop the loose copy as we go so
         // staging peaks near one image's size, not two.
         std::fs::remove_file(dir.join(&name))?;
@@ -511,6 +612,60 @@ mod tests {
             !dir.path().join(blob_file(&layer)).exists(),
             "loose blobs are dropped once archived"
         );
+    }
+
+    #[test]
+    fn a_fetched_archive_is_the_same_bytes_on_every_host() {
+        let config = descriptor(br#"{"architecture":"amd64"}"#);
+        let layer = descriptor(b"layer bytes");
+        let build = || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(blob_file(&config)),
+                br#"{"architecture":"amd64"}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.path().join(blob_file(&layer)), b"layer bytes").unwrap();
+            let archive = dir.path().join("image.tar");
+            write_save_archive(dir.path(), &archive, &config, std::slice::from_ref(&layer))
+                .unwrap();
+            (dir, archive)
+        };
+        let (_first_dir, first) = build();
+        // Another download lands with another time.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let (_second_dir, second) = build();
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap()
+        );
+        assert_eq!(archive_config_digest(&first).unwrap(), config.digest);
+    }
+
+    #[test]
+    fn a_fetched_archives_time_follows_its_digest() {
+        let a = archive_mtime_for(
+            "sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507",
+        );
+        assert_eq!(a, 0xce64758a & 0x7fff_ffff);
+        assert_eq!(a, archive_mtime_for("sha256:ce64758aff"));
+        assert_ne!(a, archive_mtime_for("sha256:0164758aff"));
+    }
+
+    #[test]
+    fn a_save_archives_config_digest_is_read_from_its_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("save.tar");
+        let mut tar = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        let manifest = br#"[{"Config":"blobs/sha256/abcd","Layers":[]}]"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "manifest.json", &manifest[..])
+            .unwrap();
+        tar.into_inner().unwrap();
+        assert_eq!(archive_config_digest(&archive).unwrap(), "sha256:abcd");
     }
 
     #[test]
