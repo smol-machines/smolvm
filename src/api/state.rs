@@ -2106,6 +2106,18 @@ mod tests {
     }
 
     #[test]
+    fn build_launch_features_mounts_a_local_image() {
+        let features = build_launch_features(None, None, Some("local:abc"), None, None).unwrap();
+        assert_eq!(
+            features.packed_layers_dir,
+            crate::data::image_source::packed_layers_dir_for_ref("local:abc")
+        );
+        // A registry image is pulled by the guest; nothing to mount.
+        let features = build_launch_features(None, None, Some("alpine"), None, None).unwrap();
+        assert!(features.packed_layers_dir.is_none());
+    }
+
+    #[test]
     fn build_launch_features_carries_allowed_hosts() {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
