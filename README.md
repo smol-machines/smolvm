@@ -21,6 +21,7 @@ Install
 -------
 
 ```bash
+brew install smol-machines/tap/smolvm                  # macOS (Homebrew)
 curl -sSL https://smolmachines.com/install.sh | bash   # macOS + Linux
 ```
 
@@ -158,5 +159,7 @@ More
 * [GPU and CUDA](docs/gpu.md): Vulkan via virtio-gpu / Venus, and CUDA API remoting.
 * [Examples](examples/): python, node, docker-in-vm, local-llm, headless-browser, doom.
 * [Development](docs/DEVELOPMENT.md) · User docs at [smolmachines.com/docs](https://smolmachines.com/docs/), written in [smol-machines/docs](https://github.com/smol-machines/docs) (corrections welcome there; runtime bugs stay here).
+
+smolvm is the open-source runtime behind [smol machines](https://smolmachines.com), and is not affiliated with other projects named SmolVM.
 
 [Apache-2.0](LICENSE) · made by [@binsquare](https://github.com/BinSquare) · [twitter](https://x.com/binsquares) · [github](https://github.com/smol-machines/smolvm)
