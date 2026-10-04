@@ -245,6 +245,34 @@ pub struct EgressPolicy {
     /// appended here in addition to the runtime's stderr line, so the record
     /// can't be evicted by ordinary connection chatter in the boot log.
     denial_log: Option<Arc<std::path::PathBuf>>,
+    /// The operator's egress watchlist for this VM, when one was provisioned:
+    /// destinations to flag in `signal_log`, never to block.
+    watchlist: Option<Arc<crate::watchlist::WatchlistSource>>,
+    /// Audit sink for watchlist matches, kept apart from denials so neither
+    /// evicts the other. Created on the first match only.
+    signal_log: Option<Arc<std::path::PathBuf>>,
+}
+
+/// Append one timestamped line to an audit file, rotating it once past 8 MiB
+/// (`.1` suffix) so a workload repeating an event at packet rate can't fill the
+/// host disk.
+fn append_audit_line(path: &std::path::Path, message: &str) {
+    const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{}",
+            crate::format_network_log_line(std::time::SystemTime::now(), message)
+        );
+    }
 }
 
 impl EgressPolicy {
@@ -254,6 +282,8 @@ impl EgressPolicy {
             inner: None,
             floor: floor_mode(),
             denial_log: None,
+            watchlist: None,
+            signal_log: None,
         }
     }
 
@@ -290,6 +320,8 @@ impl EgressPolicy {
             })),
             floor: floor_mode(),
             denial_log: None,
+            watchlist: None,
+            signal_log: None,
         }
     }
 
@@ -310,27 +342,57 @@ impl EgressPolicy {
     /// denied destination at packet rate can't fill the host disk.
     pub fn record_denial(&self, operation: &str, dest: &dyn std::fmt::Display) {
         crate::virtio_net_log!("egress policy denied {} {}", operation, dest);
-        let Some(path) = self.denial_log.as_deref() else {
-            return;
-        };
-        const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
-        if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
-            let _ = std::fs::rename(path, path.with_extension("log.1"));
+        if let Some(path) = self.denial_log.as_deref() {
+            append_audit_line(path, &format!("egress policy denied {operation} {dest}"));
         }
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+    }
+
+    /// Attach the operator's watchlist and the file its matches are appended to.
+    /// `watchlist` is the VM's copy (`EGRESS_WATCHLIST_FILE`); when there is no
+    /// copy the policy observes nothing and never creates the signal log.
+    pub fn with_watchlist(
+        mut self,
+        watchlist: std::path::PathBuf,
+        signal_log: std::path::PathBuf,
+    ) -> Self {
+        if let Some(source) = crate::watchlist::WatchlistSource::open(watchlist) {
+            self.watchlist = Some(source);
+            self.signal_log = Some(Arc::new(signal_log));
+        }
+        self
+    }
+
+    /// Whether a watchlist is attached, so callers can skip work when not.
+    pub fn watching(&self) -> bool {
+        self.watchlist.is_some()
+    }
+
+    /// Note a guest DNS question for `name` against the watchlist. Observed,
+    /// never decided here: the policy still answers or blocks the query.
+    pub fn observe_dns(&self, name: &str) {
+        if let Some(label) = self.watchlist.as_deref().and_then(|w| w.observe_dns(name)) {
+            self.record_signal(&label, &name);
+        }
+    }
+
+    /// Note an outbound destination against the watchlist, like `observe_dns`.
+    pub fn observe_destination(&self, destination: std::net::SocketAddr) {
+        let dest = destination.to_string();
+        if let Some(label) = self
+            .watchlist
+            .as_deref()
+            .and_then(|w| w.observe_ip(destination.ip(), &dest))
         {
-            let _ = writeln!(
-                file,
-                "{}",
-                crate::format_network_log_line(
-                    std::time::SystemTime::now(),
-                    &format!("egress policy denied {operation} {dest}"),
-                )
-            );
+            self.record_signal(&label, &dest);
+        }
+    }
+
+    /// Record one match. Keep the marker text stable: the host's
+    /// `read_egress_signals` parses `egress watch <label> <dest>`.
+    fn record_signal(&self, label: &str, dest: &dyn std::fmt::Display) {
+        crate::virtio_net_log!("egress watch {} {}", label, dest);
+        if let Some(path) = self.signal_log.as_deref() {
+            append_audit_line(path, &format!("egress watch {label} {dest}"));
         }
     }
 

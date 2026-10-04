@@ -363,6 +363,7 @@ impl TcpRelayTable {
                 .record_denial("connect", &format_args!("to {destination}"));
             return false;
         }
+        self.egress.observe_destination(destination);
 
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);

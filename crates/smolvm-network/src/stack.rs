@@ -370,6 +370,9 @@ fn run_network_stack(
                     if !relay_allowed && destination.port() != 53 {
                         egress.record_denial("sendto", &destination);
                     }
+                    if relay_allowed && egress.watching() && !udp_sockets.has_socket(destination) {
+                        egress.observe_destination(destination);
+                    }
                     if relay_allowed && udp_sockets.ensure_socket(destination, &mut sockets) {
                         if matches!(
                             interface.poll_ingress_single(now, &mut device, &mut sockets),
@@ -875,6 +878,13 @@ enum DnsDecision {
 /// gateway-internal plumbing, not egress, so it must resolve even under a
 /// strict allow-host policy.
 fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Addr) -> DnsDecision {
+    // Watchlist matches are observed, never decided here: the policy below
+    // still answers or blocks the query exactly as it would without one.
+    if egress.watching() {
+        if let Some(name) = dns::question_name(query) {
+            egress.observe_dns(&name);
+        }
+    }
     if dns::question_name(query)
         .and_then(|n| dns::normalize_hostname(&n))
         .is_some_and(|n| n == dns::GATEWAY_HOSTNAME)

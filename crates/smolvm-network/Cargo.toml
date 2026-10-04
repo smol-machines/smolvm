@@ -29,6 +29,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     # IPv6 link-local (default cap is 2).
     "iface-max-addr-count-3",
 ] }
+sha2 = "0.10"
 socket2 = "0.6"
 tracing = { workspace = true }
 

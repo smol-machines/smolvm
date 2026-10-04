@@ -75,6 +75,7 @@ pub mod stack;
 pub mod tcp_listeners;
 pub mod tcp_relay;
 pub mod udp_relay;
+pub mod watchlist;
 
 pub use egress::EgressPolicy;
 
@@ -310,6 +311,11 @@ impl StreamInterception {
 /// Filename of the per-VM egress denial audit log, created beside the vsock
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
+
+/// Filename of the per-VM egress signal log: watchlist matches, recorded beside
+/// the denial log by the launcher and read back by the host's
+/// `read_egress_signals`. Created on the first match only.
+pub const EGRESS_SIGNALS_LOG: &str = "egress-signals.log";
 
 /// Whether the host can actually reach the IPv6 internet.
 ///

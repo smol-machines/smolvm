@@ -1356,6 +1356,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 if let Some(path) = denial_log {
                     egress = egress.with_denial_log(path);
                 }
+                // The operator's watchlist copy, written by `serve
+                // --egress-watchlist` before boot; absent means none for this VM.
+                if let Some(dir) = vsock_socket.parent() {
+                    egress = egress.with_watchlist(
+                        dir.join(smolvm_network::watchlist::EGRESS_WATCHLIST_FILE),
+                        dir.join(smolvm_network::EGRESS_SIGNALS_LOG),
+                    );
+                }
                 let egress_path = egress_telemetry.map(|p| p.to_path_buf());
 
                 // The host and guest ends of the virtio-net channel are an AF_UNIX

@@ -170,6 +170,7 @@ use state::ApiState;
         types::CudaDeviceCapacity,
         types::MachineInfo,
         types::EgressDenialInfo,
+        crate::agent::EgressSignal,
         types::EgressEventsResponse,
         types::MountInfo,
         types::ListMachinesResponse,

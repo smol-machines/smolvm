@@ -97,6 +97,15 @@ pub struct ServeStartCmd {
     #[arg(long = "allow-nested-virt")]
     allow_nested_virt: bool,
 
+    /// Flag guest traffic to destinations on this watchlist. Each line is
+    /// `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
+    /// lowercased DNS name (its subdomains match too) or of an IP address's text.
+    /// Matches are recorded per machine and reported as `egressSignals` in the
+    /// machine API; traffic is never blocked by this. The file is re-read when it
+    /// changes. Applies to virtio-net machines. Off by default.
+    #[arg(long = "egress-watchlist", value_name = "PATH")]
+    egress_watchlist: Option<std::path::PathBuf>,
+
     /// Require the mTLS client certificate's subject CN to equal this value
     /// for API access. Only applies when serve TLS is configured
     /// (SMOLVM_SERVE_TLS_CERT/_KEY/_CLIENT_CA). Unset (the default), every
@@ -324,6 +333,11 @@ impl ServeStartCmd {
             smolvm::error::Error::config("initialize api state", format!("{:?}", e))
         })?);
         state.set_allow_nested_virt(self.allow_nested_virt);
+        if let Some(path) = &self.egress_watchlist {
+            smolvm::agent::egress_watchlist::enable(path.clone())
+                .map_err(|e| smolvm::error::Error::config("load egress watchlist", e))?;
+            println!("Egress watchlist enabled from {}", path.display());
+        }
         if self.allow_nested_virt {
             println!(
                 "Nested virtualization is enabled: guests can reach this host's nested-KVM code"

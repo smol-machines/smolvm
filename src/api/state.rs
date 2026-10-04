@@ -1880,6 +1880,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         "stopped"
     };
     let egress_bytes = crate::agent::read_egress_telemetry(&name);
+    let egress_signals = crate::agent::read_egress_signals(&name);
     // Live consumed CPU-seconds for the VMM child (host-sampled, resets on
     // restart); the control plane accumulates the durable total. None when there
     // is no live process to sample.
@@ -1942,6 +1943,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         branchpoint_held: entry.forkpoint_held,
         forkpoint_held: entry.forkpoint_held,
         egress_bytes,
+        egress_signals,
         cpu_seconds,
         cpu_millis,
         rss_mb,

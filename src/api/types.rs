@@ -847,6 +847,12 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 1048576)]
     pub egress_bytes: Option<u64>,
+    /// Matches against the operator's egress watchlist (`smolvm serve
+    /// --egress-watchlist`), grouped by label and destination, latest first.
+    /// Omitted when there are none. Recorded by the host-side network stack the
+    /// guest cannot reach, for virtio-net machines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_signals: Option<Vec<crate::agent::EgressSignal>>,
     /// Consumed CPU-seconds (user+system) of the machine's CURRENT VMM process,
     /// sampled live from the host. Resets to 0 on a VM restart — it's a stateless
     /// snapshot; the control plane accumulates a durable total from it. Omitted

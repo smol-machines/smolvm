@@ -295,6 +295,12 @@ impl UdpSocketTable {
     /// Ensure a smoltcp UDP socket exists for `destination` so the staged guest
     /// datagram has somewhere to land. Returns false when the table is full or
     /// the bind fails (the caller drops the frame — UDP semantics).
+    /// Whether a socket for `destination` already exists, so a caller can tell
+    /// a new flow from the next datagram of an existing one.
+    pub fn has_socket(&self, destination: SocketAddr) -> bool {
+        self.sockets.contains_key(&destination)
+    }
+
     pub fn ensure_socket(&mut self, destination: SocketAddr, sockets: &mut SocketSet<'_>) -> bool {
         if self.sockets.contains_key(&destination) {
             self.last_active.insert(destination, Instant::now());
