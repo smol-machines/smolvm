@@ -946,6 +946,17 @@ fn classify_sidecar_verification_after_read(
 }
 
 impl VerifiedSidecar {
+    /// The same proof over a duplicate of the pinned descriptor, for another
+    /// request using the very same inode. Reuse still requires [`Self::covers`].
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            footer: self.footer,
+            #[cfg(unix)]
+            identity: self.identity,
+        })
+    }
+
     /// The verified footer.
     pub fn footer(&self) -> &smolvm_pack::format::PackFooter {
         &self.footer
