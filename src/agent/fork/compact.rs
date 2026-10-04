@@ -21,6 +21,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Whether a running branch source's disk chain is merged and the merge adopted.
+/// Adoption copies the source's newest layer while its VMM can still write to it,
+/// so writes that land between the copy and the block pivot would be lost. Off
+/// until adoption happens with the source's disks quiesced; chains then grow to
+/// `MAX_FORK_DISK_CHAIN_DEPTH` as they did before merging existed.
+pub(super) const LIVE_DISK_MERGE: bool = false;
+
 /// Chain depth at which a background merge starts. The hard refusal sits at
 /// `MAX_FORK_DISK_CHAIN_DEPTH`; the gap is how many branches can land while the
 /// merge runs.
@@ -59,10 +66,14 @@ struct Claim(PathBuf);
 impl Claim {
     fn take(key: PathBuf) -> Option<Self> {
         let mut guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .get_or_insert_with(HashSet::new)
-            .insert(key.clone())
-            .then_some(Claim(key))
+        // Build the claim only once the key is ours: a `Claim` dropped here,
+        // while `guard` still holds `IN_FLIGHT`, would relock it from its own
+        // `Drop` and deadlock this thread and every later merge or layer GC.
+        if guard.get_or_insert_with(HashSet::new).insert(key.clone()) {
+            Some(Claim(key))
+        } else {
+            None
+        }
     }
 }
 
@@ -295,6 +306,9 @@ pub(super) fn adopt_compacted_base(
     base: &Path,
     generation_dir: &Path,
 ) -> Result<Option<PathBuf>> {
+    if !LIVE_DISK_MERGE {
+        return Ok(None);
+    }
     let marker = marker_path(gdir, id);
     let contents = match std::fs::read_to_string(&marker) {
         Ok(contents) => contents,
@@ -326,7 +340,7 @@ pub(super) fn maybe_start_compaction(
     base: &Path,
     vm_ids: Option<(u32, u32)>,
 ) -> Result<()> {
-    if !is_qcow2(base)? {
+    if !LIVE_DISK_MERGE || !is_qcow2(base)? {
         return Ok(());
     }
     let layers = chain(base)?;
@@ -368,6 +382,9 @@ pub(super) fn maybe_start_compaction(
 /// merge is ready or running, so the branch about to happen adopts it. The source
 /// keeps running meanwhile: every layer below its active disk is immutable.
 pub(super) fn compact_if_near_limit(gdir: &Path, vm_ids: Option<(u32, u32)>) -> Result<()> {
+    if !LIVE_DISK_MERGE {
+        return Ok(());
+    }
     for (id, raw) in [
         ("storage", crate::data::storage::STORAGE_DISK_FILENAME),
         ("overlay", crate::data::storage::OVERLAY_DISK_FILENAME),
@@ -672,6 +689,45 @@ mod tests {
         (root, layers)
     }
 
+    /// With live merging off, a waiting merge is never adopted or consumed, and no
+    /// new merge starts, however deep the chain.
+    #[test]
+    fn live_merging_off_leaves_the_chain_and_any_waiting_merge_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let gdir = dir.path().join("vm");
+        std::fs::create_dir_all(gdir.join("d")).unwrap();
+        let layer_dir = gdir.join("d").join("layers");
+        std::fs::create_dir_all(&layer_dir).unwrap();
+        let (root, layers) = layered(&layer_dir, 30);
+        let top = layers.last().unwrap();
+        std::fs::create_dir_all(compact_dir(&gdir)).unwrap();
+        let finished = compact_dir(&gdir).join("storage.1.qcow2");
+        merge_onto(top, &root, &root, &finished).unwrap();
+        let marker = marker_path(&gdir, "storage");
+        let recorded = format!(
+            "{}\n{}\n",
+            finished.canonicalize().unwrap().display(),
+            top.display()
+        );
+        std::fs::write(&marker, &recorded).unwrap();
+
+        let generation = gdir.join("d").join("gen");
+        std::fs::create_dir_all(&generation).unwrap();
+        assert_eq!(
+            adopt_compacted_base(&gdir, "storage", top, &generation).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), recorded);
+        assert!(!generation.join("storage.merged.qcow2").exists());
+
+        std::fs::remove_file(&marker).unwrap();
+        maybe_start_compaction(&gdir, "storage", top, None).unwrap();
+        compact_if_near_limit(&gdir, None).unwrap();
+        assert!(!marker.exists(), "no merge was started");
+        assert!(!merge_in_progress(&gdir.join("d")));
+        assert_eq!(chain(top).unwrap().len(), 31);
+    }
+
     #[test]
     fn a_merge_onto_the_root_reads_exactly_like_the_chain_it_replaces() {
         let dir = tempfile::tempdir().unwrap();
@@ -805,6 +861,29 @@ mod tests {
         );
         assert!(!a.exists() && !pinned.exists());
         assert!(merged.exists() && compacted.exists());
+    }
+
+    /// A second claim on a disk whose merge is running is refused, and the
+    /// refusal neither blocks the caller nor releases the first claim.
+    #[test]
+    fn a_second_claim_on_a_busy_disk_is_refused_without_blocking() {
+        let key = PathBuf::from("/claim-test/d/storage");
+        let first = Claim::take(key.clone()).expect("first claim");
+        let (done, outcome) = std::sync::mpsc::channel();
+        let contender = key.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(Claim::take(contender).is_none());
+        });
+        let refused = outcome
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a contended claim returns instead of deadlocking");
+        assert!(refused, "the running merge keeps the disk");
+        assert!(merge_in_progress(Path::new("/claim-test/d")));
+        drop(first);
+        assert!(
+            Claim::take(key).is_some(),
+            "the disk is free once the merge ends"
+        );
     }
 
     #[test]
