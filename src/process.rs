@@ -854,8 +854,8 @@ pub fn cuda_fork_pool_vcpus(configured: u8, pool_size: u32, host_cpus: usize) ->
 //
 // The allowlist was derived empirically by stracing a full VM lifecycle
 // (boot + exec + stop) on a Linux/KVM host; see docs/runtime-isolation-hardening.md.
-// x86_64-Linux only for now (the production target); a no-op stub elsewhere.
-// Gated by SMOLVM_SECCOMP=audit|enforce so rollout is opt-in.
+// x86_64 and arm64 Linux; a no-op stub elsewhere. Gated by
+// SMOLVM_SECCOMP=audit|enforce, which `smolvm serve` sets to enforce by default.
 // ============================================================================
 
 /// Install the seccomp allowlist on every current thread with TSYNC.  Device
@@ -1039,7 +1039,7 @@ fn build_seccomp_program(
     // Legacy syscalls present only on x86_64; aarch64 exposes only the *at/p
     // variants (already in the common list above) plus a few of its own. These
     // libc::SYS_* constants don't exist on the other arch, so they must be
-    // arch-gated. The arm64 set is a starting point — refine from an audit run.
+    // arch-gated.
     #[cfg(target_arch = "x86_64")]
     allowed.extend_from_slice(&[
         // A live fork generation creates a syscall-only RAM guardian after all

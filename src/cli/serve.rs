@@ -78,8 +78,8 @@ pub struct ServeStartCmd {
 
     /// Seccomp syscall-allowlist mode for VM boot subprocesses (untrusted-guest
     /// hardening): `enforce` kills the VMM on a disallowed syscall, `audit` logs
-    /// only, `off` disables. x86_64-Linux only; ignored elsewhere. A pre-set
-    /// SMOLVM_SECCOMP env var takes precedence.
+    /// only, `off` disables. Linux (x86_64 and arm64) only; ignored elsewhere. A
+    /// pre-set SMOLVM_SECCOMP env var takes precedence.
     #[arg(long, value_name = "MODE", default_value = "enforce")]
     seccomp: String,
 
@@ -205,7 +205,10 @@ impl ServeStartCmd {
         // subprocess. `--seccomp` selects enforce|audit|off (default enforce); a
         // pre-set SMOLVM_SECCOMP env wins for ad-hoc overrides. Inherited by the
         // spawned `_boot-vm`. See docs/runtime-isolation-hardening.md.
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         if std::env::var_os("SMOLVM_SECCOMP").is_none() {
             std::env::set_var("SMOLVM_SECCOMP", &self.seccomp);
             if self.seccomp != "off" {
