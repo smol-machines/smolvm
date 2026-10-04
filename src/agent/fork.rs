@@ -943,19 +943,6 @@ fn prepare_running_disk_generation(
                 return Err(Error::agent("fork-continue disk base", error.to_string()));
             }
         };
-        // A finished background merge shortens the chain this branch stacks on.
-        let base = if format == DiskFormat::Qcow2 {
-            match compact::adopt_compacted_base(gdir, id, &base, &generation_disk_dir) {
-                Ok(Some(merged)) => merged,
-                Ok(None) => base,
-                Err(error) => {
-                    tracing::warn!(%error, "could not adopt a merged disk chain; branching on the full chain");
-                    base
-                }
-            }
-        } else {
-            base
-        };
         if format == DiskFormat::Qcow2 {
             compacted.push((id, base.clone()));
         }

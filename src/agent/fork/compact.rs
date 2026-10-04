@@ -2,14 +2,17 @@
 //!
 //! Every live branch freezes the source's active qcow2 into a generation layer and
 //! stacks a fresh overlay on it, so a source branched many times would grow its
-//! chain without bound. Once the chain reaches [`COMPACT_AT_DEPTH`], a background
-//! job merges the source's generation layers into one base backed by the disk the
-//! machine started from. The next branch then copies only what was written since
-//! that job began onto the merged base, and the source and its new branch stack on
-//! that short chain instead. Nothing is deleted: branches made earlier keep reading
-//! the layers they were created on.
+//! chain without bound. The newest generation stays writable until its branch
+//! pivots the VMM onto the new overlay; every generation below it is immutable.
+//! Once the chain reaches [`COMPACT_AT_DEPTH`], the newest immutable generation is
+//! flattened: its content, and everything beneath it, is written into one new file
+//! backed by the disk the machine started from, which then replaces it at the same
+//! path by an atomic rename. Every chain that names that path reads the same bytes
+//! through a short chain from then on, and nothing ever copies a layer a VMM can
+//! still write. A process that already opened the old file keeps reading it, and
+//! nothing a branch made earlier is deleted while a chain still reaches it.
 
-use super::{atomic_write_snapshot_file, qcow2_backing_name};
+use super::qcow2_backing_name;
 use crate::{Error, Result};
 use imago::file::File as ImagoFile;
 use imago::qcow2::Qcow2;
@@ -20,13 +23,6 @@ use imago::{
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-
-/// Whether a running branch source's disk chain is merged and the merge adopted.
-/// Adoption copies the source's newest layer while its VMM can still write to it,
-/// so writes that land between the copy and the block pivot would be lost. Off
-/// until adoption happens with the source's disks quiesced; chains then grow to
-/// `MAX_FORK_DISK_CHAIN_DEPTH` as they did before merging existed.
-pub(super) const LIVE_DISK_MERGE: bool = false;
 
 /// Chain depth at which a background merge starts. The hard refusal sits at
 /// `MAX_FORK_DISK_CHAIN_DEPTH`; the gap is how many branches can land while the
@@ -92,10 +88,6 @@ fn compact_err(context: &str, error: impl std::fmt::Display) -> Error {
 
 fn compact_dir(gdir: &Path) -> PathBuf {
     gdir.join("d").join("c")
-}
-
-fn marker_path(gdir: &Path, id: &str) -> PathBuf {
-    compact_dir(gdir).join(format!("{id}.ready"))
 }
 
 fn is_qcow2(path: &Path) -> Result<bool> {
@@ -297,132 +289,114 @@ pub(super) fn merge_onto(top: &Path, stop: &Path, new_backing: &Path, out: &Path
     result
 }
 
-/// If a finished merge still covers part of `base`'s chain, write
-/// `generation_dir/<id>.merged.qcow2` on it holding what was written since, and
-/// return that path for the new overlays to stack on. Consumes the merge either way.
-pub(super) fn adopt_compacted_base(
+/// The immutable layer to flatten in `live`'s chain and the layer it is flattened
+/// onto, or `None` while the chain is no deeper than `threshold`.
+///
+/// `live` is the one layer a VMM may still write (the active disk, or the
+/// generation a branch has just renamed it into), so the target is the layer
+/// right beneath it: the newest generation whose branch has committed. It is
+/// flattened onto the first layer of the chain that is not a generation.
+fn flatten_target(
     gdir: &Path,
     id: &str,
-    base: &Path,
-    generation_dir: &Path,
-) -> Result<Option<PathBuf>> {
-    if !LIVE_DISK_MERGE {
+    live: &Path,
+    threshold: usize,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    if !is_qcow2(live)? {
         return Ok(None);
     }
-    let marker = marker_path(gdir, id);
-    let contents = match std::fs::read_to_string(&marker) {
-        Ok(contents) => contents,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(compact_err("read merge marker", e)),
-    };
-    let _ = std::fs::remove_file(&marker);
-    let mut lines = contents.lines();
-    let (Some(compacted), Some(covers)) = (lines.next(), lines.next()) else {
+    let layers = chain(live)?;
+    if layers.len() <= threshold || layers.len() < 3 {
         return Ok(None);
-    };
-    let (compacted, covers) = (Path::new(compacted), Path::new(covers));
-    if !compacted.is_file() || !chain(base)?.iter().any(|layer| layer == covers) {
-        return Ok(None);
-    }
-    let merged = generation_dir.join(format!("{id}.merged.qcow2"));
-    merge_onto(base, covers, compacted, &merged)?;
-    merged
-        .canonicalize()
-        .map(Some)
-        .map_err(|e| compact_err("resolve merged layer", e))
-}
-
-/// Start a background merge of `base`'s generation layers when its chain is deep
-/// and no merge for this disk is running or waiting to be adopted.
-pub(super) fn maybe_start_compaction(
-    gdir: &Path,
-    id: &str,
-    base: &Path,
-    vm_ids: Option<(u32, u32)>,
-) -> Result<()> {
-    if !LIVE_DISK_MERGE || !is_qcow2(base)? {
-        return Ok(());
-    }
-    let layers = chain(base)?;
-    if layers.len() <= COMPACT_AT_DEPTH || marker_path(gdir, id).is_file() {
-        return Ok(());
     }
     let gdir_d = gdir
         .join("d")
         .canonicalize()
         .map_err(|e| compact_err("resolve d", e))?;
-    let Some(root) = layers
+    let target = &layers[1];
+    if !is_generation_layer(&gdir_d, id, target) {
+        return Ok(None);
+    }
+    let Some(root) = layers[2..]
         .iter()
         .find(|layer| !is_generation_layer(&gdir_d, id, layer))
     else {
+        return Ok(None);
+    };
+    // Already flat: the target sits directly on the root.
+    if layers.get(2) == Some(root) {
+        return Ok(None);
+    }
+    Ok(Some((target.clone(), root.clone())))
+}
+
+/// Flatten the newest immutable generation in the background when `live`'s
+/// chain is deep and no flatten for this disk is running. Called once a branch
+/// has renamed the active disk into `live`, which stays writable until the pivot.
+pub(super) fn maybe_start_compaction(
+    gdir: &Path,
+    id: &str,
+    live: &Path,
+    vm_ids: Option<(u32, u32)>,
+) -> Result<()> {
+    let Some((target, root)) = flatten_target(gdir, id, live, COMPACT_AT_DEPTH)? else {
         return Ok(());
     };
+    let gdir_d = gdir
+        .join("d")
+        .canonicalize()
+        .map_err(|e| compact_err("resolve d", e))?;
     let Some(claim) = Claim::take(gdir_d.join(id)) else {
         return Ok(());
     };
-    let (gdir, id, top, root) = (
-        gdir.to_path_buf(),
-        id.to_string(),
-        base.to_path_buf(),
-        root.clone(),
-    );
+    let (gdir, id) = (gdir.to_path_buf(), id.to_string());
     std::thread::Builder::new()
         .name("fork-disk-compact".into())
         .spawn(move || {
             let _claim = claim;
-            if let Err(error) = compact(&gdir, &id, &top, &root, vm_ids) {
-                tracing::warn!(disk = %top.display(), %error, "could not compact a branch source's disk chain");
+            if let Err(error) = flatten_in_place(&gdir, &id, &target, &root, vm_ids) {
+                tracing::warn!(disk = %target.display(), %error, "could not flatten a branch source's disk chain");
             }
         })
-        .map_err(|e| compact_err("start merge", e))?;
+        .map_err(|e| compact_err("start flatten", e))?;
     Ok(())
 }
 
-/// Merge before the source freezes when its chain is near the hard limit and no
-/// merge is ready or running, so the branch about to happen adopts it. The source
-/// keeps running meanwhile: every layer below its active disk is immutable.
+/// Flatten before the source freezes when its chain is near the hard limit and
+/// no flatten is running, so a process that exits right after branching (the
+/// CLI) still keeps the chain short. The source keeps running meanwhile: only
+/// layers beneath its active disk are read.
 pub(super) fn compact_if_near_limit(gdir: &Path, vm_ids: Option<(u32, u32)>) -> Result<()> {
-    if !LIVE_DISK_MERGE {
-        return Ok(());
-    }
     for (id, raw) in [
         ("storage", crate::data::storage::STORAGE_DISK_FILENAME),
         ("overlay", crate::data::storage::OVERLAY_DISK_FILENAME),
     ] {
         let (active, _) = crate::agent::resolve_disk_image(gdir, raw);
-        if !active.is_file() || !is_qcow2(&active)? || marker_path(gdir, id).is_file() {
+        if !active.is_file() {
             continue;
         }
-        let layers = chain(&active)?;
-        if layers.len() <= SYNC_COMPACT_AT_DEPTH {
+        let Some((target, root)) = flatten_target(gdir, id, &active, SYNC_COMPACT_AT_DEPTH)? else {
             continue;
-        }
+        };
         let gdir_d = gdir
             .join("d")
             .canonicalize()
             .map_err(|e| compact_err("resolve d", e))?;
-        let top = &layers[1];
-        let Some(root) = layers[1..]
-            .iter()
-            .find(|layer| !is_generation_layer(&gdir_d, id, layer))
-        else {
-            continue;
-        };
-        if root == top {
-            continue;
-        }
         let Some(_claim) = Claim::take(gdir_d.join(id)) else {
             continue;
         };
-        compact(gdir, id, top, root, vm_ids)?;
+        flatten_in_place(gdir, id, &target, &root, vm_ids)?;
     }
     Ok(())
 }
 
-fn compact(
+/// Replace the immutable `target` with one file holding the same bytes, backed
+/// directly by `root`: written beside it, given its owner and mode, synced, then
+/// renamed over it. Readers that already opened `target` keep the old file.
+fn flatten_in_place(
     gdir: &Path,
     id: &str,
-    top: &Path,
+    target: &Path,
     root: &Path,
     vm_ids: Option<(u32, u32)>,
 ) -> Result<()> {
@@ -433,35 +407,51 @@ fn compact(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let partial = dir.join(format!("{id}.{stamp}.qcow2.partial"));
-    let finished = dir.join(format!("{id}.{stamp}.qcow2"));
-    // Announce the merge before reading any layer, so a collection in another
+    // Announce the flatten before reading any layer, so a collection in another
     // process keeps every layer from the first read on.
     let _busy = Busy::announce(dir.join(format!("{id}.{stamp}.busy")))?;
-    merge_onto(top, root, root, &partial)?;
-    std::fs::rename(&partial, &finished).map_err(|e| compact_err("publish merge", e))?;
-    if let Some((uid, gid)) = vm_ids {
-        #[cfg(target_os = "linux")]
-        super::prepare_isolated_snapshot_permissions(&gdir.join("d"), &dir)
-            .and_then(|()| crate::process::chown_tree(&dir, uid, gid))
-            .map_err(|e| compact_err("hand merge to source VMM", e))?;
-        #[cfg(not(target_os = "linux"))]
-        let _ = (uid, gid);
+    let partial = target.with_file_name(format!(
+        "{}.{stamp}.flatten.partial",
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("layer")
+    ));
+    let result = (|| -> Result<()> {
+        merge_onto(target, root, root, &partial)?;
+        let meta = std::fs::metadata(target).map_err(|e| compact_err("stat target", e))?;
+        std::fs::set_permissions(&partial, meta.permissions())
+            .map_err(|e| compact_err("copy mode", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Some((uid, gid)) = vm_ids.or(Some((meta.uid(), meta.gid()))) {
+                let current =
+                    std::fs::metadata(&partial).map_err(|e| compact_err("stat flat", e))?;
+                if (current.uid(), current.gid()) != (uid, gid) {
+                    std::os::unix::fs::chown(&partial, Some(uid), Some(gid))
+                        .map_err(|e| compact_err("hand flat layer to its owner", e))?;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = vm_ids;
+        std::fs::rename(&partial, target).map_err(|e| compact_err("publish flat layer", e))?;
+        if let Some(parent) = target.parent() {
+            std::fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| compact_err("sync layer dir", e))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
     }
-    let finished = finished
-        .canonicalize()
-        .map_err(|e| compact_err("resolve merge", e))?;
-    let covers = top
-        .canonicalize()
-        .map_err(|e| compact_err("resolve merged top", e))?;
-    atomic_write_snapshot_file(
-        &marker_path(gdir, id),
-        format!("{}\n{}\n", finished.display(), covers.display()).as_bytes(),
-    )?;
+    result?;
     tracing::info!(
-        disk = %covers.display(),
+        disk = %target.display(),
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "compacted a branch source's disk chain"
+        "flattened a branch source's disk chain"
     );
     Ok(())
 }
@@ -471,12 +461,9 @@ fn compact(
 const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Every disk layer some machine can still read: the chains under every machine's
-/// active disks, every retained branch snapshot's recorded bases, and any merge
-/// not yet adopted. `None` when a chain cannot be read, which keeps everything.
-fn reachable_layers(
-    machine_dirs: &[PathBuf],
-    compact_dirs: &[PathBuf],
-) -> Option<HashSet<PathBuf>> {
+/// active disks and every retained branch snapshot's recorded bases. `None` when
+/// a chain cannot be read, which keeps everything.
+fn reachable_layers(machine_dirs: &[PathBuf]) -> Option<HashSet<PathBuf>> {
     let mut reachable = HashSet::new();
     let mut walk = |top: &Path| -> Option<()> {
         reachable.extend(chain(top).ok()?);
@@ -504,20 +491,6 @@ fn reachable_layers(
                 if let Some(base) = line.split('\t').nth(1) {
                     walk(Path::new(base))?;
                 }
-            }
-        }
-    }
-    for dir in compact_dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("ready") {
-                continue;
-            }
-            for layer in std::fs::read_to_string(&path).ok()?.lines() {
-                walk(Path::new(layer))?;
             }
         }
     }
@@ -570,8 +543,16 @@ pub(super) fn collect_unreachable_layers(gdir: &Path, machine_dirs: &[PathBuf]) 
     if merge_in_progress(&gdir_d) {
         return Ok(0);
     }
-    let compact_dirs: Vec<PathBuf> = machine_dirs.iter().map(|dir| compact_dir(dir)).collect();
-    let Some(reachable) = reachable_layers(machine_dirs, &compact_dirs) else {
+    // A merge marker left by an earlier release names a merge nothing adopts
+    // any more; drop it so the merged file goes once no chain reaches it.
+    if let Ok(entries) = std::fs::read_dir(gdir_d.join("c")) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("ready") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let Some(reachable) = reachable_layers(machine_dirs) else {
         tracing::debug!(gdir = %gdir.display(), "kept every disk layer: a chain could not be read");
         return Ok(0);
     };
@@ -689,43 +670,129 @@ mod tests {
         (root, layers)
     }
 
-    /// With live merging off, a waiting merge is never adopted or consumed, and no
-    /// new merge starts, however deep the chain.
-    #[test]
-    fn live_merging_off_leaves_the_chain_and_any_waiting_merge_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let gdir = dir.path().join("vm");
+    /// A machine dir laid out as live branching leaves it: a raw root, then one
+    /// generation layer per branch under `d/<8 hex>/storage.base.qcow2`, each
+    /// backed by the one before and each writing a cluster, then the live top.
+    fn branched_machine(dir: &Path, generations: usize) -> (PathBuf, PathBuf, Vec<PathBuf>) {
+        let gdir = dir.join("vm");
         std::fs::create_dir_all(gdir.join("d")).unwrap();
-        let layer_dir = gdir.join("d").join("layers");
-        std::fs::create_dir_all(&layer_dir).unwrap();
-        let (root, layers) = layered(&layer_dir, 30);
-        let top = layers.last().unwrap();
-        std::fs::create_dir_all(compact_dir(&gdir)).unwrap();
-        let finished = compact_dir(&gdir).join("storage.1.qcow2");
-        merge_onto(top, &root, &root, &finished).unwrap();
-        let marker = marker_path(&gdir, "storage");
-        let recorded = format!(
-            "{}\n{}\n",
-            finished.canonicalize().unwrap().display(),
-            top.display()
-        );
-        std::fs::write(&marker, &recorded).unwrap();
+        let root = gdir.join("storage.raw");
+        let mut bytes = vec![0_u8; SIZE as usize];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = (i / CLUSTER as usize) as u8 | 1;
+        }
+        std::fs::write(&root, bytes).unwrap();
+        let mut below = root.canonicalize().unwrap();
+        let mut gens = Vec::new();
+        for n in 0..generations {
+            let path = gdir
+                .join("d")
+                .join(format!("{n:08x}"))
+                .join("storage.base.qcow2");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            create_overlay(&path, SIZE, &below).unwrap();
+            let access = writable(&path);
+            let at = (n as u64 * 3 % (SIZE / CLUSTER)) * CLUSTER;
+            access
+                .write(&vec![0x40 + n as u8; 4096][..], at + 512)
+                .unwrap();
+            access.flush().unwrap();
+            drop(access);
+            below = path.canonicalize().unwrap();
+            gens.push(below.clone());
+        }
+        let live = gdir.join("storage.qcow2");
+        create_overlay(&live, SIZE, &below).unwrap();
+        (gdir, live.canonicalize().unwrap(), gens)
+    }
 
-        let generation = gdir.join("d").join("gen");
-        std::fs::create_dir_all(&generation).unwrap();
+    /// The layer flattened is the one right beneath the writable top, onto the
+    /// first layer that is not a generation; a shallow chain is left alone.
+    #[test]
+    fn the_newest_immutable_generation_is_the_flatten_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gdir, live, gens) = branched_machine(dir.path(), 20);
+        let (target, root) = flatten_target(&gdir, "storage", &live, COMPACT_AT_DEPTH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&target, gens.last().unwrap(), "never the live layer itself");
+        assert_eq!(root, gdir.join("storage.raw").canonicalize().unwrap());
+        assert!(flatten_target(&gdir, "storage", &live, 64)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Writes keep landing on the live layer while the layer beneath it is
+    /// flattened, and none is lost: the chain afterwards is three files deep and
+    /// reads the same as before, plus every write made meanwhile.
+    #[test]
+    fn writes_to_the_live_layer_during_a_flatten_are_never_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gdir, live, gens) = branched_machine(dir.path(), 20);
+        let before = read_all(&live);
+        let (target, root) = flatten_target(&gdir, "storage", &live, COMPACT_AT_DEPTH)
+            .unwrap()
+            .unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (live, stop) = (live.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let access = writable(&live);
+                let mut written = Vec::new();
+                let mut n = 0_u64;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) || n < 64 {
+                    let at = (n % (SIZE / CLUSTER)) * CLUSTER + 1024;
+                    let stamp = (n as u32).to_le_bytes();
+                    access.write(&stamp[..], at).unwrap();
+                    access.flush().unwrap();
+                    written.push((at, stamp));
+                    n += 1;
+                }
+                written
+            })
+        };
+        flatten_in_place(&gdir, "storage", &target, &root, None).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let written = writer.join().unwrap();
+
         assert_eq!(
-            adopt_compacted_base(&gdir, "storage", top, &generation).unwrap(),
-            None
+            chain(&live).unwrap().len(),
+            3,
+            "live, flattened layer, root"
         );
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), recorded);
-        assert!(!generation.join("storage.merged.qcow2").exists());
+        let after = read_all(&live);
+        let mut expected = before;
+        for (at, stamp) in &written {
+            expected[*at as usize..*at as usize + 4].copy_from_slice(stamp);
+        }
+        assert_eq!(
+            after, expected,
+            "every write made during the flatten survives"
+        );
+        assert_eq!(
+            gens.last().unwrap(),
+            &target,
+            "the flattened file kept its path"
+        );
+    }
 
-        std::fs::remove_file(&marker).unwrap();
-        maybe_start_compaction(&gdir, "storage", top, None).unwrap();
-        compact_if_near_limit(&gdir, None).unwrap();
-        assert!(!marker.exists(), "no merge was started");
-        assert!(!merge_in_progress(&gdir.join("d")));
-        assert_eq!(chain(top).unwrap().len(), 31);
+    /// A reader that opened the target before the flatten keeps the old file and
+    /// reads the same bytes it always did.
+    #[test]
+    fn an_open_reader_keeps_the_file_it_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gdir, live, _) = branched_machine(dir.path(), 20);
+        let (target, root) = flatten_target(&gdir, "storage", &live, COMPACT_AT_DEPTH)
+            .unwrap()
+            .unwrap();
+        let opened = open_readonly(&target, true).unwrap();
+        let mut old = vec![0_u8; opened.size() as usize];
+        opened.read(&mut old[..], 0).unwrap();
+        flatten_in_place(&gdir, "storage", &target, &root, None).unwrap();
+        let mut again = vec![0_u8; opened.size() as usize];
+        opened.read(&mut again[..], 0).unwrap();
+        assert_eq!(again, old);
+        assert_eq!(read_all(&target), old, "the new file reads the same");
     }
 
     #[test]
