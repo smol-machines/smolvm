@@ -1446,6 +1446,7 @@ where
 pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
+    image: Option<&str>,
     dns_filter_hosts: Option<Vec<String>>,
     credentials: Option<crate::credentials::CredentialLaunch>,
 ) -> crate::Result<crate::agent::LaunchFeatures> {
@@ -1457,6 +1458,12 @@ pub fn build_launch_features(
         )?,
         None => features,
     };
+    // A `local:` image (a registry image the host fetched for a machine with
+    // no network) is mounted the same way, so the guest boots it offline.
+    if features.packed_layers_dir.is_none() {
+        features.packed_layers_dir =
+            image.and_then(crate::data::image_source::packed_layers_dir_for_ref);
+    }
     // Carry the egress hostname allow-list into the boot config; `internal_boot`
     // starts the DNS filter for these names and learns their answers into the
     // egress allow-list (parity with the CLI `--allow-host` path).
@@ -1520,6 +1527,7 @@ pub async fn ensure_machine_running(
             build_launch_features(
                 entry.manager.name(),
                 entry.source_smolmachine.as_deref(),
+                entry.image.as_deref(),
                 entry.resources.allowed_hosts.clone(),
                 entry.credentials.clone(),
             )?
@@ -2102,11 +2110,11 @@ mod tests {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
         let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
-        let features = build_launch_features(None, None, Some(hosts.clone()), None).unwrap();
+        let features = build_launch_features(None, None, None, Some(hosts.clone()), None).unwrap();
         assert_eq!(features.dns_filter_hosts, Some(hosts));
 
         // No hostname policy stays None (unrestricted egress, unchanged behavior).
-        let features = build_launch_features(None, None, None, None).unwrap();
+        let features = build_launch_features(None, None, None, None, None).unwrap();
         assert_eq!(features.dns_filter_hosts, None);
     }
 

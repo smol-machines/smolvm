@@ -333,6 +333,7 @@ impl Supervisor {
             let mut features = crate::api::state::build_launch_features(
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
+                entry.image.as_deref(),
                 dns_filter_hosts,
                 entry.credentials.clone(),
             )?;

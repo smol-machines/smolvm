@@ -3162,6 +3162,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let launch_image = record.image.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let credential_launch = crate::credentials::CredentialLaunch::for_record(&name, &record);
     let record_golden = record.golden.clone();
@@ -3225,6 +3226,7 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            launch_image.as_deref(),
             dns_filter_hosts,
             credential_launch,
         )
@@ -4141,6 +4143,7 @@ async fn boot_prepared_fork_inner(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
+            record.image.as_deref(),
             record.dns_filter_hosts.clone(),
             crate::credentials::CredentialLaunch::for_record(&clone_b, &record),
         )
