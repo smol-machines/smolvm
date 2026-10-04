@@ -697,6 +697,13 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_registry_ref: Option<String>,
 
+    /// The registry reference a machine with no network was created from, when
+    /// the host fetched that image for it (see
+    /// [`VmRecord::image_needs_host_fetch`]). `image` then names the pinned
+    /// local copy every start boots from; this keeps what the user asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_origin: Option<String>,
+
     /// Name of the golden VM this machine was forked from, if any. A clone's
     /// block disks are copy-on-write overlays backed by the golden's disks, so
     /// the golden must outlive its clones. The disk *format* is not recorded
@@ -879,6 +886,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             source_registry_ref: None,
+            image_origin: None,
             golden: None,
             checkpoint_head: None,
             fork_generation: None,
@@ -964,6 +972,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             source_registry_ref: None,
+            image_origin: None,
             golden: None,
             checkpoint_head: None,
             fork_generation: None,
@@ -1049,73 +1058,58 @@ impl VmRecord {
             .collect()
     }
 
-    /// Reject a machine whose image can never be fetched: a REGISTRY reference
-    /// with no network.
+    /// Whether this machine's registry image must be fetched on the HOST before
+    /// it boots: a REGISTRY reference, on a first boot, with no network.
     ///
-    /// The pull runs inside the guest (the agent shells out to `crane`), so a VM
-    /// with no network device cannot fetch its own image and every `start` dies
-    /// with a raw Go DNS error naming the fallback resolver — a failure deferred
-    /// from `create`, where the config is already known to be unbootable. This is
-    /// the same up-front rejection `create` already applies to resources, ports,
-    /// CIDRs and mounts.
+    /// The pull normally runs inside the guest (the agent shells out to
+    /// `crane`), so a machine with no network device cannot fetch its own image.
+    /// Rather than refuse such a machine, the start path fetches the image on the
+    /// host, which has network, and pins it as a local archive the guest
+    /// flattens offline (see [`crate::image_store::fetch_image_archive`]). The
+    /// machine itself never gets network.
     ///
-    /// Deliberately narrow: only a registry reference needs the network. A local
-    /// archive (`--image ./img.tar`, `--image -`) or an already-unpacked
-    /// directory is resolved from bytes the host already has, and a
-    /// `.smolmachine` artifact has its layers extracted at create — all three are
-    /// legitimately network-free and must keep working.
-    ///
-    /// A `.smolmachine` is checked by SOURCE, not by `image`: the create path
-    /// sets both fields, so the artifact's provenance ref is present and looks
-    /// exactly like a pull that will never happen.
-    pub fn validate_image_fetchable(&self) -> crate::Result<()> {
-        // A `.smolmachine` source carries the ORIGINAL registry reference in
-        // `image` as provenance, while the bytes come from the artifact's layers,
-        // extracted at create. Judging it by `image` alone reads that provenance
-        // as a pull that has to happen and rejects a machine that needs no
-        // network at all — which took the warm pool offline in prod, because
-        // pooled VMs are deliberately created network-less from a pack.
-        if self.source_smolmachine.is_some() {
-            return Ok(());
-        }
-        // A live-checkpoint restore resumes a guest whose image was pulled long
-        // ago: its RAM and disks come from the artifact and nothing is fetched.
-        // `image` is provenance here too. Without this, an offline machine could
-        // be checkpointed but never restored, which forced sandboxes that pause
-        // to keep a network device they otherwise have no use for.
-        if self.host_uid_owner.is_some() {
-            return Ok(());
+    /// Deliberately narrow: only a registry reference needs fetching. A local
+    /// archive or directory is already on the host, a `.smolmachine` has its
+    /// layers extracted at create, and a checkpoint restore or branch resumes a
+    /// guest whose image is already on its disks. A machine that has booted
+    /// before keeps the image it pulled then.
+    pub fn image_needs_host_fetch(&self) -> bool {
+        if self.init_completed
+            || self.source_smolmachine.is_some()
+            || self.host_uid_owner.is_some()
+            || self.vm_uid_owner().is_some()
+            || self.golden.is_some()
+        {
+            return false;
         }
         let Some(image) = self.image.as_deref() else {
-            return Ok(());
+            return false;
         };
         // An ALREADY-RESOLVED local source persists as `local:<hash>` /
         // `local-dir:<path>`, and `classify` would read those as registry refs
-        // (no `/`, `./` or archive suffix). Check the resolved form first, or
-        // this rejects the very offline workflow the error below recommends.
+        // (no `/`, `./` or archive suffix). Check the resolved form first.
         if crate::data::image_source::is_local_ref(image) {
-            return Ok(());
+            return false;
         }
-        if !matches!(
+        matches!(
             crate::data::image_source::classify(image),
             crate::data::image_source::ImageSource::Registry(_)
-        ) {
-            return Ok(());
+        ) && !self.launch_network_plan().has_network()
+    }
+
+    /// Boot from `local_ref`, a host-fetched copy of this machine's registry
+    /// image, keeping the reference it came from as `image_origin`.
+    pub fn pin_host_fetched_image(&mut self, local_ref: String) {
+        if self.image_origin.is_none() {
+            self.image_origin = self.image.take();
         }
-        let plan = self.launch_network_plan();
-        if plan.has_network() {
-            return Ok(());
-        }
-        Err(crate::Error::config(
-            "create machine",
-            format!(
-                "image '{image}' must be pulled from a registry, but this machine has no \
-                 network, so the pull can never succeed. Add --net (or publish a port with \
-                 -p, or set an egress policy with --allow-cidr/--allow-host). To keep the \
-                 machine network-isolated, supply the image locally instead: \
-                 `docker save {image} | smolvm machine create --image - ...`"
-            ),
-        ))
+        self.image = Some(local_ref);
+    }
+
+    /// The image to show for this machine: what the user asked for, even when
+    /// it boots from a host-fetched copy.
+    pub fn display_image(&self) -> Option<&str> {
+        self.image_origin.as_deref().or(self.image.as_deref())
     }
 
     /// Remote volumes are mounted into the workload container's mount
@@ -1411,106 +1405,101 @@ mod tests {
         assert!(opened.network);
     }
 
-    // The bug: `create` accepted this and every `start` died with a raw Go DNS
-    // error, because the pull runs inside a guest that has no network.
+    // `create` used to accept this and every `start` died with a raw Go DNS
+    // error, because the pull runs inside a guest that has no network. Later it
+    // was refused outright, which left no way to isolate a registry image. Now
+    // the host fetches it.
     #[test]
-    fn a_registry_image_with_no_network_is_rejected_at_create() {
-        let err = rec_with_image("alpine", false, vec![])
-            .validate_image_fetchable()
-            .expect_err("must reject");
-        let msg = err.to_string();
-        assert!(msg.contains("alpine"), "names the image: {msg}");
-        assert!(msg.contains("--net"), "says how to fix it: {msg}");
+    fn a_registry_image_with_no_network_is_fetched_on_the_host() {
+        assert!(rec_with_image("alpine", false, vec![]).image_needs_host_fetch());
+        assert!(rec_with_image(
+            "alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507",
+            false,
+            vec![]
+        )
+        .image_needs_host_fetch());
     }
 
     #[test]
-    fn granting_network_any_way_makes_it_fetchable() {
+    fn granting_network_any_way_leaves_the_pull_to_the_guest() {
         // Explicit --net.
-        assert!(rec_with_image("alpine", true, vec![])
-            .validate_image_fetchable()
-            .is_ok());
-        // A published port implicitly enables networking, which is why an
-        // otherwise-identical `-p` machine already started fine.
-        assert!(rec_with_image("alpine", false, vec![(8080, 80)])
-            .validate_image_fetchable()
-            .is_ok());
+        assert!(!rec_with_image("alpine", true, vec![]).image_needs_host_fetch());
+        // A published port implicitly enables networking.
+        assert!(!rec_with_image("alpine", false, vec![(8080, 80)]).image_needs_host_fetch());
         // An egress policy also forces a network backend.
         let mut cidr = rec_with_image("alpine", false, vec![]);
         cidr.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
-        assert!(cidr.validate_image_fetchable().is_ok());
+        assert!(!cidr.image_needs_host_fetch());
         let mut dns = rec_with_image("alpine", false, vec![]);
         dns.dns_filter_hosts = Some(vec!["example.com".to_string()]);
-        assert!(dns.validate_image_fetchable().is_ok());
+        assert!(!dns.image_needs_host_fetch());
     }
 
-    // These resolve from bytes the host already has, so they are legitimately
-    // network-free and must NOT be caught by the new check.
+    // These resolve from bytes the host already has.
     #[test]
-    fn locally_sourced_images_stay_allowed_without_network() {
+    fn locally_sourced_images_need_no_fetch() {
         for local in [
-            // As the user typed them.
             "-",
             "./img.tar",
             "/tmp/img.tar.gz",
             "img.tgz",
             // As they are PERSISTED after `resolve` rewrites them. These carry no
             // path prefix or archive suffix, so `classify` calls them registry
-            // refs; missing this rejects offline local-image machines outright —
-            // the exact workflow the rejection message recommends.
+            // refs.
             "local:9f2b1c",
             "local-dir:/srv/rootfs",
         ] {
             assert!(
-                rec_with_image(local, false, vec![])
-                    .validate_image_fetchable()
-                    .is_ok(),
-                "{local} needs no registry and must be allowed with no network"
+                !rec_with_image(local, false, vec![]).image_needs_host_fetch(),
+                "{local} is already on the host"
             );
         }
     }
 
     #[test]
-    fn a_machine_with_no_image_is_unaffected() {
-        // A bare VM carries no pullable image reference.
+    fn a_machine_with_no_image_needs_no_fetch() {
         assert!(
-            VmRecord::new("m".to_string(), 1, 512, vec![], vec![], false)
-                .validate_image_fetchable()
-                .is_ok()
+            !VmRecord::new("m".to_string(), 1, 512, vec![], vec![], false).image_needs_host_fetch()
         );
     }
 
     #[test]
-    fn a_smolmachine_source_needs_no_network_even_though_it_names_a_registry_image() {
+    fn a_smolmachine_source_needs_no_fetch_even_though_it_names_a_registry_image() {
         // The create path sets BOTH fields for an artifact-sourced machine: the
-        // layers come from the `.smolmachine`, and `image` is retained only as
-        // provenance. Reading `image` alone made this look like an impossible
-        // pull, which is how warm-pool fill (network-less, artifact-sourced)
-        // started failing every create in production.
+        // layers come from the `.smolmachine`, and `image` is provenance.
         let mut r = rec_with_image("alpine:3.20", false, vec![]);
         r.source_smolmachine = Some("library/alpine:latest".to_string());
-        assert!(
-            r.validate_image_fetchable().is_ok(),
-            "an artifact-sourced machine extracts its layers locally and must not \
-             require network"
-        );
+        assert!(!r.image_needs_host_fetch());
     }
 
     #[test]
-    fn a_checkpoint_restore_needs_no_network_even_though_it_names_a_registry_image() {
-        // A restored guest's RAM and disks come from the checkpoint; `image` is
-        // provenance. Rejecting it made offline machines impossible to restore.
+    fn a_checkpoint_restore_needs_no_fetch_even_though_it_names_a_registry_image() {
+        // A restored guest's RAM and disks come from the checkpoint.
         let mut r = rec_with_image("alpine:3.20", false, vec![]);
         r.host_uid_owner = Some("restored".to_string());
-        assert!(r.validate_image_fetchable().is_ok());
+        assert!(!r.image_needs_host_fetch());
     }
 
     #[test]
-    fn a_registry_image_with_no_network_is_still_rejected_without_an_artifact() {
-        // The guard #807 added must survive the fix above: no artifact source,
-        // no network, registry ref → still a create-time rejection.
+    fn a_machine_that_has_booted_keeps_the_image_it_has() {
         let mut r = rec_with_image("alpine:3.20", false, vec![]);
-        r.source_smolmachine = None;
-        assert!(r.validate_image_fetchable().is_err());
+        r.init_completed = true;
+        assert!(!r.image_needs_host_fetch());
+    }
+
+    #[test]
+    fn a_pinned_copy_boots_while_the_origin_is_what_shows() {
+        let mut r = rec_with_image("alpine:3.20", false, vec![]);
+        r.pin_host_fetched_image("local:abc".to_string());
+        assert_eq!(r.image.as_deref(), Some("local:abc"));
+        assert_eq!(r.display_image(), Some("alpine:3.20"));
+        assert!(
+            !r.image_needs_host_fetch(),
+            "a pinned copy is never fetched again"
+        );
+        // Re-pinning keeps the first origin, not the previous local copy.
+        r.pin_host_fetched_image("local:def".to_string());
+        assert_eq!(r.image_origin.as_deref(), Some("alpine:3.20"));
     }
 
     #[test]

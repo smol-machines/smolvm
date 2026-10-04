@@ -40,6 +40,7 @@ pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<Strin
 /// GET, so this is the same gate as [`authorized_digest`] at a fraction of the
 /// cost. A caller keying cached content on it must add the platform.
 pub async fn authorized_reference_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+    let reference = &without_pinned_tag(reference);
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
     let want = parsed
@@ -158,6 +159,7 @@ async fn resolve_manifest(
     auth: &PullAuth,
     oci_platform: Option<&str>,
 ) -> Result<(RegistryClient, String, Vec<u8>)> {
+    let reference = &without_pinned_tag(reference);
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
     let want = parsed
@@ -194,6 +196,216 @@ async fn resolve_manifest(
         ));
     }
     Ok((client, repo, manifest_bytes))
+}
+
+/// Fetch `reference` on the HOST into a `docker save` archive and stage it in
+/// the local image cache, returning the `local:<hash>` reference to boot from.
+///
+/// This is how a machine with no network gets a registry image: the guest
+/// would pull it itself, but it has no network to pull with. The archive is
+/// what `--image ./saved.tar` would have produced, so the guest flattens it
+/// offline exactly as it does a user's own `docker save`.
+///
+/// Authorization is the registry's, with `auth`, on every call, as for the
+/// guest's own pull. Every blob is checked against its manifest digest and
+/// size before anything is staged. A repeat fetch of the same image from the
+/// same registry and repository reuses the staged archive.
+pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<String> {
+    let (client, repo, manifest_bytes) =
+        resolve_manifest(reference, auth, None)
+            .await
+            .map_err(|error| match &error {
+                // Say what the guest's own pull says for a reference that does not
+                // exist, so callers tell a typo (never retryable) from a fault.
+                Error::Agent { reason, .. }
+                    if reason.contains("registry returned 404")
+                        || reason.contains("blob not found")
+                        || reason.contains("MANIFEST_UNKNOWN")
+                        || reason.contains("NAME_UNKNOWN") =>
+                {
+                    Error::agent_not_found(
+                        "fetch image",
+                        format!("image not found in the registry: {reference}"),
+                    )
+                }
+                _ => error,
+            })?;
+    let host = crate::registry::extract_registry(reference);
+    let key = hex::encode(Sha256::digest(format!(
+        "{host}/{repo}@{}",
+        manifest_digest(&manifest_bytes)
+    )));
+    if let Some(staged) = crate::data::image_source::fetched_archive(&key) {
+        return Ok(staged);
+    }
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("fetch image", format!("parse manifest: {e}")))?;
+    let total = manifest.config.size + manifest.layers.iter().map(|l| l.size).sum::<u64>();
+    let limit = crate::data::image_source::max_archive_bytes();
+    if total > limit {
+        return Err(Error::config(
+            "fetch image",
+            format!("{reference} is {total} bytes, over the {limit}-byte image limit"),
+        ));
+    }
+
+    let staging = crate::data::image_source::archive_staging_dir()?;
+    let blobs = std::iter::once(&manifest.config).chain(manifest.layers.iter());
+    futures_util::future::try_join_all(
+        blobs.map(|blob| download_blob(&client, &repo, blob, staging.path().join(blob_file(blob)))),
+    )
+    .await?;
+
+    let dir = staging.path().to_path_buf();
+    let OciManifest { config, layers, .. } = manifest;
+    let local = tokio::task::spawn_blocking(move || -> Result<String> {
+        let archive = dir.join("image.tar");
+        write_save_archive(&dir, &archive, &config, &layers)?;
+        match crate::data::image_source::resolve(crate::data::image_source::ImageSource::Archive(
+            crate::data::image_source::ArchiveInput::File(archive),
+        ))? {
+            crate::data::image_source::ResolvedImage::Local { reference, .. } => Ok(reference),
+            crate::data::image_source::ResolvedImage::Registry(_) => {
+                unreachable!("an archive resolves to a local reference")
+            }
+        }
+    })
+    .await
+    .map_err(|e| Error::agent("fetch image", e.to_string()))??;
+    crate::data::image_source::record_fetched_archive(&key, &local)?;
+    drop(staging);
+    Ok(local)
+}
+
+/// The local reference `record` should boot from when its registry image must
+/// be fetched on the host (see [`crate::config::VmRecord::image_needs_host_fetch`]),
+/// or `None` when the guest pulls it as usual. For the synchronous start
+/// paths; the caller persists the pin with
+/// [`crate::config::VmRecord::pin_host_fetched_image`].
+pub fn host_fetch_for(record: &crate::config::VmRecord, auth: &PullAuth) -> Result<Option<String>> {
+    if !record.image_needs_host_fetch() {
+        return Ok(None);
+    }
+    let Some(image) = record.image.as_deref() else {
+        return Ok(None);
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::agent("fetch image", e.to_string()))?;
+    rt.block_on(fetch_image_archive(image, auth)).map(Some)
+}
+
+/// [`host_fetch_for`], then persist the pin on `name`'s record so this and every
+/// later start boot the same bytes. Returns the record to launch.
+pub fn pin_for_start(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    record: crate::config::VmRecord,
+    auth: &PullAuth,
+) -> Result<crate::config::VmRecord> {
+    let Some(local) = host_fetch_for(&record, auth)? else {
+        return Ok(record);
+    };
+    db.update_vm_durable(name, |r| r.pin_host_fetched_image(local.clone()))?
+        .ok_or_else(|| Error::vm_not_found(name))
+}
+
+/// The file a blob is written to in a staged archive: its digest, which the
+/// archive's `manifest.json` names.
+fn blob_file(blob: &smolvm_registry::OciDescriptor) -> String {
+    blob.digest.replace(':', "-")
+}
+
+/// Stream one blob to `dest`, refusing it unless it is exactly the bytes the
+/// manifest names.
+async fn download_blob(
+    client: &RegistryClient,
+    repo: &str,
+    blob: &smolvm_registry::OciDescriptor,
+    dest: std::path::PathBuf,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let fail = |message: String| Error::agent("fetch image", message);
+    let mut stream = client
+        .pull_blob_stream(repo, &blob.digest)
+        .await
+        .map_err(|e| fail(format!("{}: {e}", blob.digest)))?;
+    let mut file = tokio::fs::File::create(&dest).await?;
+    let mut hasher = Sha256::new();
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| fail(format!("{}: {e}", blob.digest)))?;
+        written += chunk.len() as u64;
+        if written > blob.size {
+            return Err(fail(format!(
+                "{} is larger than the {} bytes its manifest declares",
+                blob.digest, blob.size
+            )));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    let got = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if got != blob.digest || written != blob.size {
+        return Err(fail(format!(
+            "{} arrived as {got} ({written} bytes); refusing it",
+            blob.digest
+        )));
+    }
+    Ok(())
+}
+
+/// Write the blobs downloaded into `dir` as a `docker save` archive at
+/// `archive`: a `manifest.json` naming the config and the layers in order,
+/// beside the blobs themselves. This is the format the guest's `crane export`
+/// flattens and its config recovery reads.
+fn write_save_archive(
+    dir: &std::path::Path,
+    archive: &std::path::Path,
+    config: &smolvm_registry::OciDescriptor,
+    layers: &[smolvm_registry::OciDescriptor],
+) -> Result<()> {
+    let manifest = serde_json::json!([{
+        "Config": blob_file(config),
+        "RepoTags": [],
+        "Layers": layers.iter().map(blob_file).collect::<Vec<_>>(),
+    }]);
+    let manifest =
+        serde_json::to_vec(&manifest).map_err(|e| Error::agent("fetch image", e.to_string()))?;
+    let mut tar = tar::Builder::new(std::fs::File::create(archive)?);
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "manifest.json", manifest.as_slice())?;
+    for blob in std::iter::once(config).chain(layers) {
+        let name = blob_file(blob);
+        tar.append_path_with_name(dir.join(&name), &name)?;
+        // The archive now holds the blob; drop the loose copy as we go so
+        // staging peaks near one image's size, not two.
+        std::fs::remove_file(dir.join(&name))?;
+    }
+    tar.into_inner()?.sync_all()?;
+    Ok(())
+}
+
+/// `reference` without its tag when a digest also pins it (`alpine:3.21@sha256:…`
+/// → `alpine@sha256:…`). The digest decides the content, as it does for Docker
+/// and `crane`; the tag is only a label, and the parser takes one or the other.
+fn without_pinned_tag(reference: &str) -> String {
+    let Some((name, digest)) = reference.split_once('@') else {
+        return reference.to_string();
+    };
+    let tag_at = name
+        .rfind(':')
+        .filter(|at| name.rfind('/').is_none_or(|slash| *at > slash));
+    match tag_at {
+        Some(at) => format!("{}@{digest}", &name[..at]),
+        None => reference.to_string(),
+    }
 }
 
 /// The slice of an OCI image config blob the run path needs: its default
@@ -233,6 +445,115 @@ fn repo_for(host: &str, r: &Reference) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn descriptor(bytes: &[u8]) -> smolvm_registry::OciDescriptor {
+        smolvm_registry::OciDescriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            digest: format!("sha256:{}", hex::encode(Sha256::digest(bytes))),
+            size: bytes.len() as u64,
+        }
+    }
+
+    #[test]
+    fn a_digest_pinned_reference_drops_its_tag() {
+        assert_eq!(
+            without_pinned_tag("alpine:3.21@sha256:ab"),
+            "alpine@sha256:ab"
+        );
+        assert_eq!(
+            without_pinned_tag("reg.io:5000/org/app:v1@sha256:ab"),
+            "reg.io:5000/org/app@sha256:ab"
+        );
+        // A registry port is not a tag.
+        assert_eq!(
+            without_pinned_tag("reg.io:5000/app@sha256:ab"),
+            "reg.io:5000/app@sha256:ab"
+        );
+        assert_eq!(without_pinned_tag("alpine:3.21"), "alpine:3.21");
+        assert!(Reference::parse(&without_pinned_tag(
+            "alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn a_fetched_image_is_written_as_a_docker_save_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = descriptor(br#"{"architecture":"arm64"}"#);
+        let layer = descriptor(b"layer bytes");
+        std::fs::write(
+            dir.path().join(blob_file(&config)),
+            br#"{"architecture":"arm64"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(blob_file(&layer)), b"layer bytes").unwrap();
+        let archive = dir.path().join("image.tar");
+        write_save_archive(dir.path(), &archive, &config, std::slice::from_ref(&layer)).unwrap();
+
+        let mut entries = std::collections::HashMap::new();
+        for entry in tar::Archive::new(std::fs::File::open(&archive).unwrap())
+            .entries()
+            .unwrap()
+        {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
+            entries.insert(name, body);
+        }
+        // What the guest's config recovery and `crane export` read.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&entries["manifest.json"]).unwrap();
+        assert_eq!(manifest[0]["Config"], blob_file(&config));
+        assert_eq!(manifest[0]["Layers"][0], blob_file(&layer));
+        assert_eq!(entries[&blob_file(&layer)], b"layer bytes");
+        assert!(
+            !dir.path().join(blob_file(&layer)).exists(),
+            "loose blobs are dropped once archived"
+        );
+    }
+
+    #[test]
+    fn a_blob_that_is_not_what_the_manifest_names_is_refused() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            let wanted = descriptor(b"the real layer");
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/library/x/blobs/{}", wanted.digest)))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(b"a substituted layer".to_vec()),
+                )
+                .mount(&server)
+                .await;
+            let client = RegistryClient::new(server.uri());
+            let dir = tempfile::tempdir().unwrap();
+            let error = download_blob(&client, "library/x", &wanted, dir.path().join("blob"))
+                .await
+                .expect_err("substituted bytes must be refused");
+            assert!(error.to_string().contains(&wanted.digest), "{error}");
+
+            Mock::given(method("GET"))
+                .and(path(
+                    "/v2/library/x/blobs/sha256:".to_string() + &hex::encode(Sha256::digest(b"ok")),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+                .mount(&server)
+                .await;
+            download_blob(
+                &client,
+                "library/x",
+                &descriptor(b"ok"),
+                dir.path().join("ok"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(dir.path().join("ok")).unwrap(), b"ok");
+        });
+    }
 
     #[test]
     fn repo_for_maps_docker_hub_and_namespaced_refs() {

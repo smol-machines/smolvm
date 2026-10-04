@@ -80,7 +80,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     MachineInfo {
         runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name: name.to_string(),
-        image: record.image.clone(),
+        image: record.display_image().map(str::to_string),
         state: actual_state.to_string(),
         cpus: record.cpus,
         mem: record.mem,
@@ -3120,6 +3120,29 @@ pub async fn start_machine(
         record.forkable = true;
         state
             .update_vm(&name, |r| r.forkable = true)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    }
+
+    // A machine with no network cannot pull its registry image in-guest; the
+    // host fetches it instead, authorized with the credentials this start
+    // carries, as the guest's pull would be. A restore resumes a guest that
+    // already has its image.
+    if record.image_needs_host_fetch()
+        && crate::portable_checkpoint::pending_dir(&vm_data_dir(&name)).is_none()
+    {
+        let auth = match &registry_auth {
+            Some(auth) => crate::registry::PullAuth::Basic {
+                username: auth.username.clone(),
+                password: auth.password.clone(),
+            },
+            None => crate::registry::PullAuth::FromConfig,
+        };
+        let image = record.image.clone().unwrap_or_default();
+        let local = crate::image_store::fetch_image_archive(&image, &auth).await?;
+        record.pin_host_fetched_image(local.clone());
+        state
+            .update_vm(&name, move |r| r.pin_host_fetched_image(local))
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
     }

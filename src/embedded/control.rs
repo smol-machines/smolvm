@@ -189,7 +189,14 @@ pub(crate) fn start_vm_with_interceptor(
     name: &str,
     interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 ) -> Result<StartedVm> {
-    let record = get_record(db, name)?;
+    // A machine with no network cannot pull its registry image in-guest; the
+    // host fetches it instead.
+    let record = crate::image_store::pin_for_start(
+        db,
+        name,
+        get_record(db, name)?,
+        &crate::registry::PullAuth::FromConfig,
+    )?;
     // A fresh registry-image machine starts on a shared seed of its image, as
     // the CLI and API do, so an SDK create skips the in-guest pull.
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);
@@ -351,7 +358,12 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
 pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
     db.update_vm(name, |record| record.forkable = true)?
         .ok_or_else(|| Error::vm_not_found(name))?;
-    let record = get_record(db, name)?;
+    let record = crate::image_store::pin_for_start(
+        db,
+        name,
+        get_record(db, name)?,
+        &crate::registry::PullAuth::FromConfig,
+    )?;
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);
     let features = LaunchFeatures {
         forkable: true,

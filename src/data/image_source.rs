@@ -374,6 +374,40 @@ pub fn packed_layers_dir_for_ref(reference: &str) -> Option<PathBuf> {
     reference.strip_prefix(LOCAL_DIR_PREFIX).map(PathBuf::from)
 }
 
+/// A scratch directory inside the archive cache, so an archive built there is
+/// staged by hardlink rather than copied.
+pub fn archive_staging_dir() -> Result<tempfile::TempDir> {
+    let base = archive_cache_base()?;
+    std::fs::create_dir_all(&base)?;
+    Ok(tempfile::TempDir::new_in(base)?)
+}
+
+/// The `local:` reference a host fetch keyed by `key` staged earlier, if its
+/// archive is still in the cache.
+pub fn fetched_archive(key: &str) -> Option<String> {
+    let reference = std::fs::read_to_string(archive_cache_base().ok()?.join(FETCHED_DIR).join(key))
+        .ok()?
+        .trim()
+        .to_string();
+    let dir = packed_layers_dir_for_ref(&reference)?;
+    dir.join(ARCHIVE_FILE).is_file().then_some(reference)
+}
+
+/// Remember that a host fetch keyed by `key` staged `reference`.
+pub fn record_fetched_archive(key: &str, reference: &str) -> Result<()> {
+    let dir = archive_cache_base()?.join(FETCHED_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
+    staged.write_all(reference.as_bytes())?;
+    staged
+        .persist(dir.join(key))
+        .map_err(|e| Error::storage("image archive cache", e.to_string()))?;
+    Ok(())
+}
+
+/// Where [`record_fetched_archive`] keeps its index, beside the archives.
+const FETCHED_DIR: &str = "fetched";
+
 fn archive_cache_base() -> Result<PathBuf> {
     let base = dirs::cache_dir()
         .ok_or_else(|| Error::storage("image archive cache", "no cache directory available"))?;

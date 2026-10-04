@@ -827,10 +827,6 @@ pub(crate) fn build_vm_record_for(
         record.host_uid_owner = Some(record.name.clone());
     }
 
-    // A registry image with no network can never be pulled (the guest runs the
-    // pull), so refuse here rather than deferring to a `start` that must fail.
-    record.validate_image_fetchable()?;
-
     // Remote volumes mount into the workload container's namespace, so an
     // imageless machine has nowhere to put them, and they need network to
     // reach the bucket. Refuse at create instead of failing every start.
@@ -1714,6 +1710,17 @@ fn start_vm_named_with_db(
     if let Some(limit_mib) = fork.vram_limit_mib {
         record.cuda_vram_limit_mib = Some(limit_mib);
         db.update_vm(name, |r| r.cuda_vram_limit_mib = Some(limit_mib))?;
+    }
+
+    // A machine with no network cannot pull its registry image in-guest; the
+    // host fetches it instead. A restore resumes a guest that already has it.
+    if !from_snapshot {
+        record = smolvm::image_store::pin_for_start(
+            db,
+            name,
+            record,
+            &smolvm::registry::PullAuth::FromConfig,
+        )?;
     }
 
     let mounts = record.host_mounts();
@@ -3141,7 +3148,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "overlay_gb": record.overlay_gb,
         "block_io": record.block_io,
         "disks": record.disks,
-        "image": record.image,
+        "image": record.display_image(),
         "entrypoint": record.entrypoint,
         "cmd": record.cmd,
         "ephemeral": record.ephemeral,

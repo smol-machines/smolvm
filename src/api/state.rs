@@ -1176,15 +1176,6 @@ impl ApiState {
             .validate_remote_volumes()
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-        // A registry image with no network can never be pulled (the guest runs
-        // the pull), so reject with a 400 here instead of persisting a machine
-        // whose every `start` must fail with a raw Go DNS error. Checked on the
-        // assembled record so it sees exactly the network inputs the launch will:
-        // `network`, published ports, CIDR policy and DNS-filter hosts.
-        record
-            .validate_image_fetchable()
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-
         // Complete the cross-process create reservation and insert the VM row
         // atomically. Only after that succeeds do we publish the in-memory entry.
         match self.db.commit_reserved_vm(&name, token, &record) {
