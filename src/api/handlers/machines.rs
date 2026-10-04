@@ -515,6 +515,77 @@ static SHARED_CHECKPOINT_TAKES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, SharedTakeSlot>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// How long a checkpoint's take outlives its last restore. A restore that links
+/// a new alias changes the inode's ctime and so re-hashes the whole artifact;
+/// restores minutes apart reuse the same take instead and skip that work.
+const SHARED_TAKE_LINGER: Duration = Duration::from_secs(300);
+
+/// At most this many takes linger, bounding the disk their pinned links hold.
+const SHARED_TAKE_LINGER_MAX: usize = 8;
+
+type LingeringTakes =
+    std::collections::HashMap<String, (std::sync::Arc<SharedCheckpointTake>, std::time::Instant)>;
+
+/// Takes kept alive past their last restore, with when they were last used.
+static LINGERING_CHECKPOINT_TAKES: std::sync::LazyLock<std::sync::Mutex<LingeringTakes>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Keep `take` alive for [`SHARED_TAKE_LINGER`], dropping expired takes and,
+/// past [`SHARED_TAKE_LINGER_MAX`], the least recently used one.
+fn linger_checkpoint_take(key: &str, take: &std::sync::Arc<SharedCheckpointTake>) {
+    let mut lingering = LINGERING_CHECKPOINT_TAKES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    lingering.retain(|_, (_, used)| now.duration_since(*used) < SHARED_TAKE_LINGER);
+    lingering.insert(key.to_string(), (take.clone(), now));
+    while lingering.len() > SHARED_TAKE_LINGER_MAX {
+        let Some(oldest) = lingering
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        lingering.remove(&oldest);
+    }
+}
+
+/// Release lingering takes once idle, so their links free disk without
+/// waiting for the next restore to prune them.
+fn spawn_checkpoint_take_reaper() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async {
+                loop {
+                    tokio::time::sleep(SHARED_TAKE_LINGER / 4).await;
+                    let expired: Vec<_> = {
+                        let mut lingering = LINGERING_CHECKPOINT_TAKES
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let now = std::time::Instant::now();
+                        let keys: Vec<String> = lingering
+                            .iter()
+                            .filter(|(_, (_, used))| {
+                                now.duration_since(*used) >= SHARED_TAKE_LINGER
+                            })
+                            .map(|(key, _)| key.clone())
+                            .collect();
+                        keys.into_iter()
+                            .filter_map(|key| lingering.remove(&key))
+                            .collect()
+                    };
+                    // The take's cleanup locks and unlinks, so it runs off the runtime.
+                    if !expired.is_empty() {
+                        let _ = tokio::task::spawn_blocking(move || drop(expired)).await;
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// The live take of `key`, or a new one from the node-local cache; `None` on a miss.
 async fn shared_checkpoint_take(
     key: &str,
@@ -533,7 +604,9 @@ async fn shared_checkpoint_take(
     // Held across the take so overlapping restores of `key` wait for it
     // rather than each linking an alias of their own.
     let mut live = slot.lock().await;
+    spawn_checkpoint_take_reaper();
     if let Some(take) = live.upgrade() {
+        linger_checkpoint_take(key, &take);
         return Ok(Some(take));
     }
     let transfer = tempfile::Builder::new()
@@ -560,6 +633,7 @@ async fn shared_checkpoint_take(
         verified: cached.verified,
     });
     *live = std::sync::Arc::downgrade(&take);
+    linger_checkpoint_take(key, &take);
     Ok(Some(take))
 }
 
