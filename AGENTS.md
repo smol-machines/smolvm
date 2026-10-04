@@ -77,6 +77,7 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Change mounts/ports/resources on existing VM | `machine update --name NAME -v ./src:/app -p 8080:8080` |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
+| Move a running machine from an arm64 Mac to arm64 Linux | `machine checkpoint --name NAME -o FILE.checkpoint` on the Mac, then `machine create --name NAME --from FILE.checkpoint` + `machine start` on Linux ([details](docs/mac-to-linux.md)) |
 
 ### Persistence Model
 

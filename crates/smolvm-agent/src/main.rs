@@ -2363,7 +2363,7 @@ fn handle_request(
 
     match request {
         AgentRequest::Ping => {
-            let capabilities = vec![
+            let mut capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
@@ -2371,6 +2371,13 @@ fn handle_request(
                 smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_string(),
             ];
+            // The guest kernel publishes this parameter when its timer driver
+            // follows a change of counter rate after a restore.
+            if std::path::Path::new("/sys/module/arm_arch_timer/parameters/follows_counter_rate")
+                .exists()
+            {
+                capabilities.push(smolvm_protocol::COUNTER_RATE_FOLLOW_CAPABILITY.to_string());
+            }
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,
                 capabilities,

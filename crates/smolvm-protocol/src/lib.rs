@@ -365,6 +365,10 @@ pub const OFFLINE_CPU_SHRINK_CAPABILITY: &str = "offline-cpu-shrink-v1";
 
 /// Agent can online and verify a RAM range already added by the VMM.
 pub const ONLINE_MEMORY_GROWTH_CAPABILITY: &str = "online-memory-growth-v1";
+/// The guest kernel keeps time when its machine resumes on a host whose arm64
+/// system counter runs at another rate, so a checkpoint may move between
+/// such hosts.
+pub const COUNTER_RATE_FOLLOW_CAPABILITY: &str = "counter-rate-follow-v1";
 
 /// Managed writable disk, never an arbitrary guest path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

@@ -2976,6 +2976,8 @@ mod tests {
             payload: Default::default(),
             history: Vec::new(),
             credential_ca: None,
+            clock: None,
+            guest_cpu_features: None,
         });
         manifest
     }

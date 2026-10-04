@@ -1540,6 +1540,8 @@ fn capture_with_completion(
     let checkpoint_id = new_checkpoint_id();
     let checkpoint_created_at =
         humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+    // Ask while the guest still runs: its agent answers for the kernel it is on.
+    let (clock, guest_cpu_features) = checkpoint_guest_view(name);
     if stop_after_capture {
         let db = crate::db::SmolvmDb::open()?;
         if !db.dependent_clones(name)?.is_empty() {
@@ -1930,6 +1932,8 @@ fn capture_with_completion(
         payload: Default::default(),
         history: Vec::new(),
         credential_ca,
+        clock,
+        guest_cpu_features,
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
@@ -2320,8 +2324,6 @@ fn collect_aarch64_host_features() -> Result<Vec<String>> {
 /// ARM's `FEAT_*` spelling, so they are normalised to a common form. Only the
 /// first processor block is read: every core in a machine smolvm will run on
 /// presents the same features.
-#[cfg(any(target_arch = "aarch64", test))]
-#[allow(dead_code)]
 fn parse_linux_features(cpuinfo: &str) -> Vec<String> {
     for line in cpuinfo.lines().take_while(|line| !line.trim().is_empty()) {
         let Some((key, value)) = line.split_once(':') else {
@@ -2336,6 +2338,139 @@ fn parse_linux_features(cpuinfo: &str) -> Vec<String> {
             .collect();
     }
     Vec::new()
+}
+
+/// What the running guest tells about itself that a restore on another
+/// platform needs: whether its kernel follows a change of counter rate, and
+/// the CPU features it was given. Both `None` on x86_64, where the TSC and
+/// CPUID contracts cover them.
+fn checkpoint_guest_view(
+    name: &str,
+) -> (
+    Option<smolvm_pack::format::CheckpointClock>,
+    Option<Vec<String>>,
+) {
+    let Some(counter_hz) = host_counter_hz() else {
+        return (None, None);
+    };
+    let client = crate::agent::AgentManager::for_vm(name)
+        .and_then(|manager| crate::agent::AgentClient::connect(manager.vsock_socket()));
+    let Ok(mut client) = client else {
+        let clock = smolvm_pack::format::CheckpointClock {
+            counter_hz,
+            follows_counter_rate: false,
+        };
+        return (Some(clock), None);
+    };
+    let follows_counter_rate = client
+        .supports_capability(smolvm_protocol::COUNTER_RATE_FOLLOW_CAPABILITY)
+        .unwrap_or(false);
+    let features = client
+        .vm_exec(
+            vec!["cat".into(), "/proc/cpuinfo".into()],
+            Vec::new(),
+            None,
+            Some(std::time::Duration::from_secs(10)),
+            None,
+        )
+        .ok()
+        .filter(|(code, _, _)| *code == 0)
+        .map(|(_, stdout, _)| {
+            let mut features = parse_linux_features(&String::from_utf8_lossy(&stdout));
+            features.sort();
+            features
+        })
+        .filter(|features| !features.is_empty());
+    (
+        Some(smolvm_pack::format::CheckpointClock {
+            counter_hz,
+            follows_counter_rate,
+        }),
+        features,
+    )
+}
+
+/// The host's system counter frequency (`CNTFRQ_EL0`), readable from user
+/// space on Linux and macOS.
+#[cfg(target_arch = "aarch64")]
+fn host_counter_hz() -> Option<u64> {
+    let hz: u64;
+    // SAFETY: reads a system register EL0 is allowed to read; no memory access.
+    unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) hz) };
+    (hz != 0).then_some(hz)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn host_counter_hz() -> Option<u64> {
+    None
+}
+
+/// libkrun's tag on VM state written by its macOS backend, which other
+/// backends translate rather than parse (see libkrun's `VmCheckpoint`).
+const HVF_STATE_TAG: &[u8; 8] = b"SMVCHVF1";
+
+/// Refuse VM state from another platform that its runtime did not tag for
+/// translation. A Mac machine started by an older libkrun writes untagged
+/// state, which this host's runtime would misread as its own format.
+fn validate_state_origin(checkpoint: &PortableCheckpointManifest, state: &Path) -> Result<()> {
+    let host_platform = crate::platform::Platform::current()
+        .host_oci_platform()
+        .to_string();
+    if checkpoint.host_platform == host_platform {
+        return Ok(());
+    }
+    let mut tag = [0u8; 8];
+    let tagged = std::fs::File::open(state)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut tag))
+        .is_ok()
+        && &tag == HVF_STATE_TAG;
+    if tagged {
+        return Ok(());
+    }
+    Err(Error::agent(
+        "restore checkpoint",
+        "the checkpoint's VM state was written by a runtime that cannot be restored on this platform; restart the machine with a newer smolvm and checkpoint it again",
+    ))
+}
+
+/// Whether a checkpoint captured on `source` may be restored on `host`. An
+/// arm64 Mac checkpoint restores on arm64 Linux: libkrun recreates the Mac's
+/// virtual board under KVM and the CPU and clock checks below cover the rest.
+fn host_platform_compatible(source: &str, host: &str) -> bool {
+    source == host || (source == "darwin/arm64" && host == "linux/arm64")
+}
+
+/// Refuse a restore whose guest would keep time at the wrong rate.
+fn validate_clock(checkpoint: &PortableCheckpointManifest) -> Result<()> {
+    let Some(host_hz) = host_counter_hz() else {
+        return Ok(());
+    };
+    let Some(clock) = checkpoint.clock else {
+        // Captured before the clock was recorded: the counter rate is unknown,
+        // which only a same-platform restore has always assumed away.
+        let host_platform = crate::platform::Platform::current()
+            .host_oci_platform()
+            .to_string();
+        if checkpoint.host_platform != host_platform {
+            return Err(Error::agent(
+                "restore checkpoint",
+                "the checkpoint does not record its guest clock; capture it again with a newer smolvm",
+            ));
+        }
+        return Ok(());
+    };
+    if clock.counter_hz != host_hz && !clock.follows_counter_rate {
+        return Err(Error::agent(
+            "restore checkpoint",
+            format!(
+                "this host's clock runs at {host_hz} Hz but the checkpoint's guest kernel \
+                 only keeps time at {} Hz; restart the machine with a newer smolvm and \
+                 checkpoint it again",
+                clock.counter_hz
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn checkpoint_cpu_contract() -> Result<CheckpointCpuContract> {
@@ -2425,6 +2560,19 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             ));
         }
         CheckpointCpuContract::Aarch64FeaturesV1 { features } => {
+            // A Mac contract names the Mac's own features, spelled the macOS
+            // way and including ones its hypervisor hides from guests. On
+            // Linux, check the features the guest itself reported instead.
+            #[cfg(target_os = "linux")]
+            if checkpoint.host_platform.starts_with("darwin/") {
+                let guest = checkpoint.guest_cpu_features.as_ref().ok_or_else(|| {
+                    Error::agent(
+                        "restore checkpoint",
+                        "the checkpoint does not record its guest's CPU features; capture it again with a newer smolvm",
+                    )
+                })?;
+                return validate_aarch64_features(guest);
+            }
             return validate_aarch64_features(features);
         }
         CheckpointCpuContract::LinuxKvmIntelPortableV1 => {
@@ -3508,7 +3656,7 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     let host_platform = crate::platform::Platform::current()
         .host_oci_platform()
         .to_string();
-    if checkpoint.host_platform != host_platform {
+    if !host_platform_compatible(&checkpoint.host_platform, &host_platform) {
         return Err(Error::agent(
             "restore checkpoint",
             format!(
@@ -3517,6 +3665,7 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             ),
         ));
     }
+    validate_clock(checkpoint)?;
     let expected_profile = if checkpoint.packed_layers.is_some() {
         DEVICE_PROFILE_PACKED_LAYERS
     } else {
@@ -4135,6 +4284,7 @@ fn install_with(
         if let Some(asset) = &checkpoint.credential_ca {
             install_credential_ca(extracted, vm_data_dir, &partial, asset)?;
         }
+        validate_state_origin(checkpoint, &partial.join("checkpoint.bin"))?;
 
         // Names to move into the machine directory, and the copy-on-write tops
         // to create over a captured writable disk once its base is in place.
@@ -4524,6 +4674,64 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/proc/cpuinfo` of an M4 Max guest booted with pointer authentication off.
+    const M4_MAX_GUEST_CPUINFO: &str = "processor\t: 0\nFeatures\t: fp asimd evtstrm aes \
+        pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 \
+        asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb dcpodp flagm2 frint bf16 afp\n\n";
+
+    /// `/proc/cpuinfo` Features of a Google Axion (c4a) host.
+    const AXION_CPUINFO: &str = "processor\t: 0\nFeatures\t: fp asimd evtstrm aes pmull sha1 \
+        sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 \
+        asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes \
+        svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh rng bti \
+        ecv afp wfxt\n\n";
+
+    #[test]
+    fn an_m4_max_guest_fits_an_axion_host() {
+        let guest = parse_linux_features(M4_MAX_GUEST_CPUINFO);
+        assert!(guest.contains(&"FEAT_ATOMICS".to_string()));
+        let host = parse_linux_features(AXION_CPUINFO);
+        assert_eq!(missing_features(&guest, &host), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_m4_max_guest_names_what_a_cortex_a72_lacks() {
+        let guest = parse_linux_features(M4_MAX_GUEST_CPUINFO);
+        let pi = parse_linux_features("Features\t: fp asimd evtstrm crc32 cpuid\n");
+        let missing = missing_features(&guest, &pi);
+        assert!(missing.contains(&"FEAT_ATOMICS".to_string()), "{missing:?}");
+        assert!(missing.contains(&"FEAT_USCAT".to_string()), "{missing:?}");
+    }
+
+    #[test]
+    fn foreign_state_must_carry_the_translation_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("checkpoint.bin");
+        let mut checkpoint = minimal_checkpoint_manifest();
+
+        // This host's own state is never inspected.
+        std::fs::write(&state, b"untagged").unwrap();
+        validate_state_origin(&checkpoint, &state).unwrap();
+
+        checkpoint.host_platform = "other/arch".into();
+        let err = validate_state_origin(&checkpoint, &state).unwrap_err();
+        assert!(err.to_string().contains("newer smolvm"), "{err}");
+
+        let mut tagged = HVF_STATE_TAG.to_vec();
+        tagged.extend_from_slice(b"rest of the state");
+        std::fs::write(&state, tagged).unwrap();
+        validate_state_origin(&checkpoint, &state).unwrap();
+    }
+
+    #[test]
+    fn only_mac_to_linux_crosses_platforms() {
+        assert!(host_platform_compatible("darwin/arm64", "darwin/arm64"));
+        assert!(host_platform_compatible("darwin/arm64", "linux/arm64"));
+        assert!(!host_platform_compatible("linux/arm64", "darwin/arm64"));
+        assert!(!host_platform_compatible("darwin/arm64", "linux/amd64"));
+        assert!(!host_platform_compatible("linux/amd64", "linux/arm64"));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -5119,6 +5327,8 @@ mod tests {
             payload: Default::default(),
             history: Vec::new(),
             credential_ca: None,
+            clock: None,
+            guest_cpu_features: None,
         };
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
@@ -5943,6 +6153,8 @@ mod tests {
             payload: Default::default(),
             history: Vec::new(),
             credential_ca: None,
+            clock: None,
+            guest_cpu_features: None,
         }
     }
 

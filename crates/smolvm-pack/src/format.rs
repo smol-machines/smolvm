@@ -590,6 +590,29 @@ pub struct PortableCheckpointManifest {
     /// one the guest would reject. Absent for machines without credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ca: Option<CheckpointAsset>,
+    /// The source host's guest clock source. Absent on checkpoints written
+    /// before it was recorded and on x86_64, where the TSC contract covers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<CheckpointClock>,
+    /// The CPU features the arm64 guest kernel reported (`/proc/cpuinfo`
+    /// names in `FEAT_` form). A restore on another OS checks these, since the
+    /// contract names the source host's features in that host's own terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_cpu_features: Option<Vec<String>>,
+}
+
+/// The arm64 system counter a checkpoint's guest was reading.
+///
+/// A guest kernel fixes the counter rate at boot, so resuming it on a host
+/// whose counter runs at another rate (24 MHz on Apple silicon, 1 GHz on
+/// Armv8.6+ servers) skews every clock unless the kernel notices the change.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointClock {
+    /// The source host's counter frequency (`CNTFRQ_EL0`) in Hz.
+    pub counter_hz: u64,
+    /// The guest kernel keeps time correctly when the counter rate changes.
+    #[serde(default)]
+    pub follows_counter_rate: bool,
 }
 
 /// Identity of the pack a checkpointed machine mounted its image layers from.

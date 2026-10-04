@@ -22,8 +22,9 @@ still accepted.
 Start the source with `machine start --branchable` before capturing it. Capture
 checks the runtime and guest-agent capabilities before pausing the source.
 Normal portable-checkpoint restrictions still apply, including host-platform,
-CPU and device compatibility. This does not make live state cross-architecture
-or cross-OS portable.
+CPU and device compatibility. A checkpoint can move from an arm64 Mac to arm64
+Linux (see [Moving a running machine from a Mac to Linux](mac-to-linux.md)); it
+cannot change CPU architecture.
 
 ## What is retained
 
