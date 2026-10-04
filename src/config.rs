@@ -1097,6 +1097,14 @@ impl VmRecord {
         ) && !self.launch_network_plan().has_network()
     }
 
+    /// Whether this machine's image can be fetched. Always: a machine with no
+    /// network has its registry image fetched on the host (see
+    /// [`Self::image_needs_host_fetch`]). Kept so existing callers that check
+    /// at create keep compiling.
+    pub fn validate_image_fetchable(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     /// Boot from `local_ref`, a host-fetched copy of this machine's registry
     /// image, keeping the reference it came from as `image_origin`.
     pub fn pin_host_fetched_image(&mut self, local_ref: String) {
