@@ -475,8 +475,21 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
         tracing::debug!(
             src = %src.display(),
             errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            "clonefile failed, falling back to fs::copy"
+            "clonefile failed, falling back to sparse copy"
         );
+        // clonefile cannot cross volumes. APFS supports SEEK_DATA, so copy only
+        // the data extents; std::fs::copy would write every hole of a 20 GiB
+        // disk image as real zeros.
+        match sparse_copy(src, dst) {
+            Ok(bytes) => {
+                tracing::debug!(src = %src.display(), dst = %dst.display(), bytes_copied = bytes, "sparse copy succeeded");
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(dst);
+                tracing::debug!(src = %src.display(), error = %e, "sparse copy failed, falling back to fs::copy");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -662,8 +675,19 @@ fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// [`sparse_copy`] for callers that must never fall back to a full copy:
+/// writing every hole of a large disk image would cost more than the work the
+/// copy was meant to save.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn sparse_copy_file(src: &Path, dst: &Path) -> Result<u64> {
+    sparse_copy(src, dst).map_err(|e| {
+        let _ = std::fs::remove_file(dst);
+        Error::storage("sparse copy", e.to_string())
+    })
+}
+
 /// Copy only data regions of a sparse file via SEEK_HOLE/SEEK_DATA.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     use std::io::{Seek, SeekFrom};
     use std::os::unix::io::AsRawFd;
@@ -721,7 +745,7 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// the result is identical, but written zeros in the source (a template that
 /// was copied with a tool that fills holes) stay holes in the copy instead of
 /// becoming gigabytes of dirty page cache the guest's first flush must sync.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn copy_extent_exact(
     source: &mut impl std::io::Read,
     destination: &mut (impl std::io::Write + std::io::Seek),
@@ -739,6 +763,33 @@ fn copy_extent_exact(
         remaining -= count as u64;
     }
     Ok(())
+}
+
+/// Move a file, falling back to copy then delete when `src` and `dst` are on
+/// different filesystems. Machine directories live under the data dir and
+/// seeds and staging under the cache dir, which need not share a volume.
+/// The copy goes through [`clone_or_copy_file`], so sparse disks stay sparse.
+pub fn rename_or_move(src: &Path, dst: &Path) -> Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(error) if is_cross_device(&error) => {
+            clone_or_copy_file(src, dst)?;
+            std::fs::remove_file(src).map_err(|e| Error::storage("move file", e.to_string()))
+        }
+        Err(error) => Err(Error::storage("move file", error.to_string())),
+    }
+}
+
+fn is_cross_device(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE
+        error.raw_os_error() == Some(17)
+    }
 }
 
 /// The backing file a qcow2 image names in its header, with the offset and
@@ -888,7 +939,7 @@ mod tests {
     /// A template whose free space is written zeros rather than holes (what
     /// `scp` or a plain `cp` leaves) must still copy as a sparse file, or every
     /// machine created from it starts with its whole disk dirty in page cache.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sparse_copy_leaves_written_zeros_as_holes() {
         use std::os::unix::fs::MetadataExt;
