@@ -1695,11 +1695,8 @@ fn capture_with_completion(
         .transpose()?;
     #[cfg(not(unix))]
     let captured_disks: Option<String> = None;
-    let checkpoint_disks = stage_disk_chains_with(
-        &crate::agent::vm_data_dir(name),
-        &snapshot_dir,
-        discard_staging,
-    )?;
+    let (checkpoint_disks, deferred_backings) =
+        stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     if !stop_after_capture {
         pause.resume()?;
     }
@@ -1713,6 +1710,15 @@ fn capture_with_completion(
         &mut phase,
     );
     let source_pause = pause_started.elapsed();
+    // The store ingests the staging tree, so it needs every layer as a file.
+    // A packed artifact takes backing layers straight from the source.
+    let deferred_backings = if stored.is_some() {
+        deferred_backings.stage_copies()?;
+        log_phase(name, "capture_backings", &mut phase);
+        None
+    } else {
+        Some(deferred_backings)
+    };
 
     let mut sparse_socket = if prepared && sparse_capable {
         let mut stream = crate::platform::uds::UdsStream::connect(&pause.control)
@@ -1840,6 +1846,14 @@ fn capture_with_completion(
         if file == "memory.bin"
             && prepared
             && link_completed_memory(&runtime_snapshot.join(file), &snapshot_dir.join(file))?
+        {
+            continue;
+        }
+        // A tree that is only packed reads the saved RAM where it is, rather
+        // than copying gigabytes the packer reads once anyway.
+        if file == "memory.bin"
+            && discard_staging
+            && std::fs::hard_link(runtime_snapshot.join(file), snapshot_dir.join(file)).is_ok()
         {
             continue;
         }
@@ -2058,8 +2072,20 @@ fn capture_with_completion(
         });
     }
 
-    let collector = AssetCollector::new(staging_dir.clone())
+    let mut collector = AssetCollector::new(staging_dir.clone())
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
+    // Retention keeps the staging tree as this artifact's extraction, so it
+    // gets the layers as files too, but only after the artifact is published.
+    let retained_backings = match deferred_backings {
+        Some(deferred) => {
+            let copies = retain.then(|| deferred.try_clone()).transpose()?;
+            deferred.pack_from_source(&mut collector)?;
+            copies
+        }
+        None => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = retained_backings;
     let packer = Packer::new(manifest)
         .with_asset_collector(collector)
         .with_direct_artifact_io();
@@ -2097,6 +2123,10 @@ fn capture_with_completion(
     if retain {
         let budget = options.prepared_cache_budget_bytes.unwrap_or(0);
         let job = DeferredRetain(Box::new(move |artifact: &Path| {
+            if let Some(Err(error)) = retained_backings.map(DeferredBackings::stage_copies) {
+                tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
+                return;
+            }
             if streamed {
                 if let Err(error) =
                     std::fs::rename(&prepared_memory, snapshot_dir.join("memory.bin"))
@@ -3175,6 +3205,25 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
         .write(true)
         .open(path)
         .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
+    for (offset, bytes) in qcow2_backing_patches(&mut file, path, backing)? {
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(&bytes))
+            .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
+    }
+    file.sync_all()
+        .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))
+}
+
+/// The `(offset, bytes)` writes that make the qcow2 image in `file` name
+/// `backing` as its backing file. Only the header's backing name, its
+/// zero padding and its length field change.
+fn qcow2_backing_patches(
+    file: &mut std::fs::File,
+    path: &Path,
+    backing: &str,
+) -> Result<Vec<(u64, Vec<u8>)>> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| Error::agent("read qcow2 header", error.to_string()))?;
     let mut header = [0_u8; 104];
     file.read_exact(&mut header)
         .map_err(|error| Error::agent("read qcow2 header", error.to_string()))?;
@@ -3265,15 +3314,12 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
             ));
         }
     }
-    file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.write_all(backing.as_bytes()))
-        .and_then(|_| file.write_all(&vec![0_u8; old_len.saturating_sub(backing.len())]))
-        .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
-    file.seek(SeekFrom::Start(16))
-        .and_then(|_| file.write_all(&(backing.len() as u32).to_be_bytes()))
-        .and_then(|_| file.sync_all())
-        .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
-    Ok(())
+    let mut name = backing.as_bytes().to_vec();
+    name.resize(old_len.max(backing.len()), 0);
+    Ok(vec![
+        (offset, name),
+        (16, (backing.len() as u32).to_be_bytes().to_vec()),
+    ])
 }
 
 /// Identity of every file in a machine's storage and overlay disk chains, top
@@ -3461,31 +3507,28 @@ fn paused_disks_intact(_vm_data: &Path, _artifact: &Path, _disks: &[CheckpointDi
 
 /// Stage exact, self-contained disk chains without flattening them.
 ///
-/// Each qcow2 layer is copied as-is and rebased to a reserved relative
-/// filename. This preserves the block backend's allocation/topology state,
-/// avoids multi-gigabyte logical scans, and prevents restored images from
-/// retaining absolute references to the capture host.
-pub fn stage_disk_chains(
-    snapshot_dir: &Path,
+/// Each layer is rebased to a reserved relative filename. This preserves the
+/// block backend's allocation/topology state, avoids multi-gigabyte logical
+/// scans, and prevents restored images from retaining absolute references to
+/// the capture host.
+///
+/// Only each chain's writable top is copied here, while the source is paused:
+/// it is the one layer that changes once the source resumes. Backing layers
+/// are immutable. Raw ones are hard-linked; on Linux qcow2 ones are held open
+/// and staged by [`DeferredBackings`] after the source resumes, so the pause
+/// does not grow with the data a restored machine inherited from its
+/// checkpoint.
+fn stage_disk_chains(
+    vm_data: &Path,
     checkpoint_dir: &Path,
-) -> Result<Vec<CheckpointDisk>> {
-    stage_disk_chains_with(snapshot_dir, checkpoint_dir, false)
-}
-
-/// [`stage_disk_chains`]; with `share_backings`, qcow2 backing layers are
-/// linked from [`stage_shared_backing`]'s copies. Only for a staging tree that
-/// is packed and then discarded: nothing may modify a staged file in place.
-fn stage_disk_chains_with(
-    snapshot_dir: &Path,
-    checkpoint_dir: &Path,
-    share_backings: bool,
-) -> Result<Vec<CheckpointDisk>> {
+) -> Result<(Vec<CheckpointDisk>, DeferredBackings)> {
     let mut disks = Vec::new();
+    let mut deferred = DeferredBackings::default();
     for (role, raw_name) in [
         ("storage", crate::storage::STORAGE_DISK_FILENAME),
         ("overlay", crate::storage::OVERLAY_DISK_FILENAME),
     ] {
-        let (mut source, initial_format) = crate::agent::resolve_disk_image(snapshot_dir, raw_name);
+        let (mut source, initial_format) = crate::agent::resolve_disk_image(vm_data, raw_name);
         if !source.is_file() {
             continue;
         }
@@ -3498,6 +3541,7 @@ fn stage_disk_chains_with(
             .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
         let mut files = Vec::new();
         for index in 0..64 {
+            let started = std::time::Instant::now();
             let target = disk_target(role, index, format)?;
             let artifact_path = format!("checkpoint/disks/{role}/{index}");
             let staged = disk_staging.join(index.to_string());
@@ -3523,20 +3567,37 @@ fn stage_disk_chains_with(
             } else {
                 None
             };
-            let next_target = next.as_ref().map(|(_, _, target)| target.as_str());
-            if !(share_backings
-                && index > 0
-                && format == "qcow2"
-                && stage_shared_backing(&source, &staged, next_target)?)
-            {
-                stage_checkpoint_disk_layer(&source, &staged, index, format)?;
-                if let Some(next_target) = next_target {
+            let next_target = next.as_ref().map(|(_, _, target)| target.clone());
+            let method = if cfg!(target_os = "linux") && index > 0 && format == "qcow2" {
+                let file = std::fs::File::open(&source)
+                    .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
+                deferred.0.push(DeferredBacking {
+                    file,
+                    source: source.clone(),
+                    staged: staged.clone(),
+                    archive_path: artifact_path.clone(),
+                    next_target,
+                });
+                "deferred"
+            } else {
+                let method = stage_checkpoint_disk_layer(&source, &staged, index, format)?;
+                if let Some(next_target) = &next_target {
                     rewrite_qcow2_backing(&staged, next_target)?;
                 }
-            }
+                method
+            };
 
-            let metadata = std::fs::metadata(&staged)
+            let metadata = std::fs::metadata(&source)
                 .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
+            tracing::info!(
+                role,
+                index,
+                format,
+                method,
+                bytes = allocated_bytes(&metadata),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "checkpoint disk layer staged"
+            );
             // The pack footer authenticates the entire compressed asset blob.
             // Avoid hashing a 20 GiB logical raw backing full of sparse holes.
             let asset = CheckpointAsset {
@@ -3574,132 +3635,116 @@ fn stage_disk_chains_with(
             "portable checkpoints require storage and overlay disks",
         ));
     }
-    Ok(disks)
+    Ok((disks, deferred))
 }
 
-/// Stage the qcow2 backing layer `source` with its backing name rewritten to
-/// `next_target`, sharing one copy between checkpoints. Backing layers are
-/// immutable, and every fork clone of a source shares them: without this,
-/// each clone's pause copies them anew.
-///
-/// The first pause stages a private copy as before and keeps it by a second
-/// hard link; later ones link that. A copy is named by a digest of the boot,
-/// of the layer's device, inode, size and change times, and of `next_target`:
-/// a layer that changes gets a new copy, and a copy is never used after a
-/// crash may have lost it, so none is synced. Idle copies beyond the newest
-/// few are removed. `Ok(false)` means there is no cache here; the caller
-/// stages a private copy as before.
-#[cfg(unix)]
-fn stage_shared_backing(source: &Path, staged: &Path, next_target: Option<&str>) -> Result<bool> {
-    let Some(cache) = dirs::cache_dir() else {
-        return Ok(false);
-    };
-    stage_shared_backing_in(
-        &cache.join("smolvm").join("checkpoint-backings"),
-        source,
-        staged,
-        next_target,
+/// Bytes a file occupies on disk, which for a sparse image is its data.
+fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
+/// A qcow2 backing layer held open while the source was paused. Backing
+/// layers are never written, so the open file keeps exactly the captured
+/// bytes even if the source's chain is later rotated or merged.
+struct DeferredBacking {
+    file: std::fs::File,
+    source: PathBuf,
+    staged: PathBuf,
+    archive_path: String,
+    next_target: Option<String>,
+}
+
+/// The qcow2 backing layers [`stage_disk_chains`] left to stage after the
+/// source resumes.
+#[derive(Default)]
+#[must_use]
+struct DeferredBackings(Vec<DeferredBacking>);
+
+impl DeferredBackings {
+    /// Pack each layer straight from its open file with its backing name
+    /// patched in the archive. Nothing is copied and the layer itself is
+    /// never modified. For a staging tree that is packed and then discarded.
+    fn pack_from_source(self, collector: &mut AssetCollector) -> Result<()> {
+        for mut layer in self.0 {
+            let patches = match &layer.next_target {
+                Some(target) => qcow2_backing_patches(&mut layer.file, &layer.source, target)?,
+                None => Vec::new(),
+            };
+            collector
+                .add_patched_file(smolvm_pack::assets::PatchedFile {
+                    archive_path: layer.archive_path,
+                    source: layer.file,
+                    mode: 0o600,
+                    patches,
+                })
+                .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// The same layers through new handles to the same open files.
+    fn try_clone(&self) -> Result<Self> {
+        self.0
+            .iter()
+            .map(|layer| {
+                Ok(DeferredBacking {
+                    file: layer.file.try_clone().map_err(|error| {
+                        Error::agent("stage checkpoint disk", error.to_string())
+                    })?,
+                    source: layer.source.clone(),
+                    staged: layer.staged.clone(),
+                    archive_path: layer.archive_path.clone(),
+                    next_target: layer.next_target.clone(),
+                })
+            })
+            .collect::<Result<_>>()
+            .map(Self)
+    }
+
+    /// Stage a private, rebased copy of each layer in the staging tree, for
+    /// a staging tree that outlives packing.
+    fn stage_copies(self) -> Result<()> {
+        for layer in self.0 {
+            let started = std::time::Instant::now();
+            copy_open_file(&layer.file, &layer.staged)?;
+            if let Some(target) = &layer.next_target {
+                rewrite_qcow2_backing(&layer.staged, target)?;
+            }
+            tracing::info!(
+                path = %layer.archive_path,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "checkpoint disk layer copied after resume"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Copy the file behind `file` to `destination`, keeping its holes.
+#[cfg(target_os = "linux")]
+fn copy_open_file(file: &std::fs::File, destination: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    crate::disk_utils::clone_or_copy_file(
+        Path::new(&format!("/proc/self/fd/{}", file.as_raw_fd())),
+        destination,
     )
 }
 
-#[cfg(unix)]
-fn stage_shared_backing_in(
-    cache: &Path,
-    source: &Path,
-    staged: &Path,
-    next_target: Option<&str>,
-) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    const KEEP: usize = 4;
-    static LINKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let identity = |metadata: &std::fs::Metadata| {
-        [
-            metadata.dev(),
-            metadata.ino(),
-            metadata.size(),
-            metadata.mtime() as u64,
-            metadata.mtime_nsec() as u64,
-            metadata.ctime() as u64,
-            metadata.ctime_nsec() as u64,
-        ]
-    };
-    let Ok(boot) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
-        return Ok(false);
-    };
-    if std::fs::create_dir_all(cache).is_err() {
-        return Ok(false);
-    }
-    let before = std::fs::metadata(source)
-        .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
-    let mut hash = Sha256::new();
-    hash.update(b"checkpoint-backing-v1\0");
-    hash.update(boot.trim().as_bytes());
-    for value in identity(&before) {
-        hash.update(value.to_le_bytes());
-    }
-    hash.update(next_target.unwrap_or_default().as_bytes());
-    let key = hex::encode(hash.finalize());
-    let cached = cache.join(format!("{key}.qcow2"));
-    if std::fs::hard_link(&cached, staged).is_ok() {
-        return Ok(true);
-    }
-    // Clones pausing together all miss at once: one stages, the rest link.
-    let lock_path = cache.join(format!("{key}.lock"));
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .and_then(|lock| crate::agent::fork::lock_file_exclusive(&lock).map(|()| lock));
-    if lock.is_ok() && std::fs::hard_link(&cached, staged).is_ok() {
-        return Ok(true);
-    }
-    crate::disk_utils::clone_or_copy_file(source, staged)?;
-    if let Some(next_target) = next_target {
-        rewrite_qcow2_backing(staged, next_target)?;
-    }
-    let unchanged =
-        std::fs::metadata(source).is_ok_and(|after| identity(&after) == identity(&before));
-    if lock.is_ok() && unchanged {
-        let temporary = cache.join(format!(
-            ".{key}.{}.{}",
-            std::process::id(),
-            LINKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        if std::fs::hard_link(staged, &temporary).is_err()
-            || std::fs::rename(&temporary, &cached).is_err()
-        {
-            let _ = std::fs::remove_file(&temporary);
-        }
-    }
-    let _ = std::fs::remove_file(&lock_path);
-    drop(lock);
-    // Keep copies still linked into some staging tree, and the newest idle ones.
-    if let Ok(entries) = std::fs::read_dir(cache) {
-        let mut idle: Vec<(std::time::SystemTime, PathBuf)> = entries
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".qcow2"))
-            .filter_map(|entry| {
-                let metadata = entry.metadata().ok()?;
-                (metadata.nlink() == 1).then_some((metadata.modified().ok()?, entry.path()))
-            })
-            .collect();
-        idle.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        for (_, path) in idle.into_iter().skip(KEEP) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-    Ok(true)
-}
-
-/// Without a boot identity for the cache, every checkpoint stages its own copy.
-#[cfg(not(unix))]
-fn stage_shared_backing(
-    _source: &Path,
-    _staged: &Path,
-    _next_target: Option<&str>,
-) -> Result<bool> {
-    Ok(false)
+/// Only Linux defers backing layers.
+#[cfg(not(target_os = "linux"))]
+fn copy_open_file(_file: &std::fs::File, _destination: &Path) -> Result<()> {
+    Err(Error::agent(
+        "stage checkpoint disk",
+        "deferred backing layers are Linux-only",
+    ))
 }
 
 fn stage_checkpoint_disk_layer(
@@ -3707,21 +3752,23 @@ fn stage_checkpoint_disk_layer(
     staged: &Path,
     index: usize,
     format: &str,
-) -> Result<()> {
+) -> Result<&'static str> {
     if index == 0 || format == "qcow2" {
         // The active top is writable, and every qcow2 layer below it has a
         // backing filename that is rewritten for the self-contained artifact.
         // Both therefore need a private inode. Hard-linking a qcow2 backing and
         // editing its header corrupts the live source's disk chain.
-        return crate::disk_utils::clone_or_copy_file(source, staged);
+        crate::disk_utils::clone_or_copy_file(source, staged)?;
+        return Ok("copy");
     }
 
     // Terminal raw backings are immutable and carry no header to rewrite. An
     // owned hard link is an exact O(1) snapshot and survives source deletion.
     match std::fs::hard_link(source, staged) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok("link"),
         Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-            crate::disk_utils::clone_or_copy_file(source, staged)
+            crate::disk_utils::clone_or_copy_file(source, staged)?;
+            Ok("copy")
         }
         Err(error) => Err(Error::agent("stage checkpoint disk", error.to_string())),
     }
@@ -5959,41 +6006,123 @@ mod tests {
         );
     }
 
+    /// A storage chain like a restored machine's: a writable qcow2 top over
+    /// the checkpoint's former top over its raw base, and a raw overlay.
+    #[cfg(target_os = "linux")]
+    fn restored_disk_chain(vm: &Path) -> Vec<u8> {
+        use imago::FormatCreateBuilder;
+        let create = |path: &Path, backing: &str, format: &str| {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            let file = ImagoFile::try_from(file).unwrap();
+            let builder = Qcow2::<ImagoFile>::create_builder(file)
+                .size(64 * 1024 * 1024)
+                .backing(backing.to_string(), format.to_string());
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(builder.create())
+                .unwrap();
+        };
+        std::fs::create_dir_all(vm).unwrap();
+        let base = vm.join(".smolcheckpoint-storage-1.raw");
+        let file = std::fs::File::create(&base).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        std::fs::write(vm.join(crate::storage::OVERLAY_DISK_FILENAME), b"overlay").unwrap();
+        let layer = vm.join(".smolcheckpoint-storage-layer2.qcow2");
+        create(&layer, ".smolcheckpoint-storage-1.raw", "raw");
+        // Data past the header the archive must carry unchanged.
+        let mut bytes = std::fs::read(&layer).unwrap();
+        bytes.extend((0..200_000_u32).map(|i| (i % 251) as u8));
+        std::fs::write(&layer, &bytes).unwrap();
+        create(
+            &vm.join("storage.qcow2"),
+            ".smolcheckpoint-storage-layer2.qcow2",
+            "qcow2",
+        );
+        bytes
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn shared_backing_is_copied_once_per_layer_version() {
-        use std::os::unix::fs::MetadataExt;
-
+    fn backing_layers_are_packed_from_the_source_with_their_names_patched() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join("cache");
-        let source = dir.path().join("layer.qcow2");
-        let live = qcow2_header_fixture();
-        std::fs::write(&source, &live).unwrap();
-        let next = disk_target("storage", 10, "qcow2").unwrap();
-        let [first, second, third] = ["a", "b", "c"].map(|name| dir.path().join(name));
-
-        assert!(stage_shared_backing_in(&cache, &source, &first, Some(&next)).unwrap());
-        assert!(stage_shared_backing_in(&cache, &source, &second, Some(&next)).unwrap());
-        let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
-        assert_eq!(inode(&first), inode(&second), "the copy was not shared");
-        assert_ne!(inode(&first), inode(&source));
+        let vm = dir.path().join("vm");
+        let live = restored_disk_chain(&vm);
+        let layer = vm.join(".smolcheckpoint-storage-layer2.qcow2");
+        let staging = dir.path().join("staging");
+        let (disks, deferred) = stage_disk_chains(&vm, &staging.join("checkpoint")).unwrap();
+        let storage = &disks[0].files;
         assert_eq!(
-            std::fs::read(&source).unwrap(),
+            storage
+                .iter()
+                .map(|f| f.format.as_str())
+                .collect::<Vec<_>>(),
+            ["qcow2", "qcow2", "raw"]
+        );
+        assert_eq!(deferred.0.len(), 1, "the qcow2 backing was not deferred");
+        // Only the writable top is copied while the source is paused.
+        let staged = staging.join("checkpoint/disks/storage");
+        assert!(!staged.join("1").exists());
+        assert_eq!(
+            inspect_qcow2(&staged.join("0")).unwrap().0.as_deref(),
+            Some(storage[1].target.as_str())
+        );
+
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        deferred.pack_from_source(&mut collector).unwrap();
+        let archive = dir.path().join("assets.tar.zst");
+        collector.compress(&archive, false).unwrap();
+        assert_eq!(
+            std::fs::read(&layer).unwrap(),
             live,
             "the live layer changed"
         );
-        let staged = std::fs::read(&first).unwrap();
-        let len = u32::from_be_bytes(staged[16..20].try_into().unwrap()) as usize;
-        assert_eq!(&staged[128..128 + len], next.as_bytes());
 
-        // A changed layer, or another backing name, needs its own copy.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&source, &live).unwrap();
-        assert!(stage_shared_backing_in(&cache, &source, &third, Some(&next)).unwrap());
-        assert_ne!(inode(&third), inode(&first));
-        let other = dir.path().join("d");
-        assert!(stage_shared_backing_in(&cache, &source, &other, Some("x")).unwrap());
-        assert_ne!(inode(&other), inode(&third));
+        let out = dir.path().join("out");
+        smolvm_pack::assets::decompress_assets_from_file(&archive, &out).unwrap();
+        let packed = out.join("checkpoint/disks/storage/1");
+        assert_eq!(
+            inspect_qcow2(&packed).unwrap(),
+            (Some(storage[2].target.clone()), Some("raw".to_string()))
+        );
+        // Exactly what the earlier copy-then-rewrite staging produced.
+        let expected = dir.path().join("expected");
+        std::fs::write(&expected, &live).unwrap();
+        rewrite_qcow2_backing(&expected, &storage[2].target).unwrap();
+        assert_eq!(
+            std::fs::read(&packed).unwrap(),
+            std::fs::read(&expected).unwrap()
+        );
+        assert_eq!(storage[1].asset.size, live.len() as u64);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kept_staging_gets_private_rebased_copies_of_backing_layers() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let vm = dir.path().join("vm");
+        let live = restored_disk_chain(&vm);
+        let layer = vm.join(".smolcheckpoint-storage-layer2.qcow2");
+        let checkpoint = dir.path().join("staging/checkpoint");
+        let (disks, deferred) = stage_disk_chains(&vm, &checkpoint).unwrap();
+        // The source may be replaced after it resumes; the held file is not.
+        std::fs::rename(&layer, vm.join("rotated")).unwrap();
+        deferred.stage_copies().unwrap();
+        let staged = checkpoint.join("disks/storage/1");
+        assert_ne!(
+            std::fs::metadata(&staged).unwrap().ino(),
+            std::fs::metadata(vm.join("rotated")).unwrap().ino()
+        );
+        assert_eq!(
+            inspect_qcow2(&staged).unwrap().0.as_deref(),
+            Some(disks[0].files[2].target.as_str())
+        );
+        assert_eq!(std::fs::read(vm.join("rotated")).unwrap(), live);
     }
 
     #[cfg(unix)]

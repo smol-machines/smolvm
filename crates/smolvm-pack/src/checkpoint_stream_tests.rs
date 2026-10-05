@@ -307,3 +307,56 @@ fn memory_copy_matches_the_unpacked_entry_without_changing_the_archive() {
     expected[1024..1027].copy_from_slice(b"RAM");
     assert_eq!(std::fs::read(&path).unwrap(), expected);
 }
+
+#[test]
+fn fragmented_ram_is_archived_as_whole_aligned_blocks() {
+    let logical = 1024 * 1024_u64;
+    let ranges = [
+        (0_u64, 512_u64),
+        (4096, 512),
+        (204_800, 512),
+        (921_600, 1024),
+    ];
+    let mut wire = b"SMOLCKS1".to_vec();
+    wire.extend_from_slice(&3_u32.to_le_bytes());
+    wire.extend_from_slice(&3_u32.to_le_bytes());
+    wire.extend_from_slice(b"cpumapSMOLRSP1");
+    wire.extend_from_slice(&logical.to_le_bytes());
+    wire.extend_from_slice(&(ranges.len() as u32 + 1).to_le_bytes());
+    for (offset, len) in ranges.iter().copied().chain([(logical, 0)]) {
+        wire.extend_from_slice(&offset.to_le_bytes());
+        wire.extend_from_slice(&len.to_le_bytes());
+    }
+    let mut expected = vec![0_u8; logical as usize];
+    for (index, (offset, len)) in ranges.iter().enumerate() {
+        let bytes = vec![index as u8 + 1; *len as usize];
+        expected[*offset as usize..(*offset + *len) as usize].copy_from_slice(&bytes);
+        wire.extend_from_slice(&bytes);
+    }
+    wire.extend_from_slice(b"OK saved (1048576 bytes, 1 regions)\n");
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("memory.bin");
+    let mut source = wire.as_slice();
+    let mut stream = CheckpointStream::read(&mut source, logical).unwrap();
+    stream.copy_memory_to(std::fs::File::create(&copy).unwrap());
+    let mut builder = tar::Builder::new(Vec::new());
+    stream.append(&mut builder).unwrap();
+    assert!(stream.memory_copied());
+    let bytes = builder.into_inner().unwrap();
+    let mut archive = tar::Archive::new(bytes.as_slice());
+    let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+    let gnu = entry.header().as_gnu().unwrap();
+    let map: Vec<_> = gnu
+        .sparse
+        .iter()
+        .map(|s| (s.offset().unwrap(), s.length().unwrap()))
+        .collect();
+    assert_eq!(
+        map,
+        [(0, 65536), (196_608, 65536), (917_504, 65536), (logical, 0)]
+    );
+    let mut restored = Vec::new();
+    entry.read_to_end(&mut restored).unwrap();
+    assert_eq!(restored, expected);
+    assert_eq!(std::fs::read(&copy).unwrap(), expected);
+}
