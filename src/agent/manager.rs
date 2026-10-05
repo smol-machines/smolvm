@@ -941,6 +941,26 @@ fn enforce_external_interceptor_requirement(
     Ok(())
 }
 
+/// Which of a VM's launch settings differ from the requested ones.
+fn config_differences(
+    inner: &AgentInner,
+    mounts: &[HostMount],
+    ports: &[PortMapping],
+    resources: &VmResources,
+) -> Vec<&'static str> {
+    let mut differences = Vec::new();
+    if inner.mounts != mounts {
+        differences.push("mounts");
+    }
+    if inner.ports != ports {
+        differences.push("ports");
+    }
+    if inner.resources != *resources {
+        differences.push("resources");
+    }
+    differences
+}
+
 impl AgentManager {
     /// Create a new agent manager with explicit paths (low-level).
     ///
@@ -1285,6 +1305,22 @@ impl AgentManager {
     /// Get the current state of the agent.
     pub fn state(&self) -> AgentState {
         self.inner.lock().state
+    }
+
+    /// The launch settings a running VM differs in from `mounts`, `ports` and
+    /// `resources`, or `None` when it matches or its settings are not known.
+    pub fn running_config_differences(
+        &self,
+        mounts: &[HostMount],
+        ports: &[PortMapping],
+        resources: &VmResources,
+    ) -> Option<Vec<&'static str>> {
+        let inner = self.inner.lock();
+        if !matches!(inner.config_state, ConfigState::Known) {
+            return None;
+        }
+        let differences = config_differences(&inner, mounts, ports, resources);
+        (!differences.is_empty()).then_some(differences)
     }
 
     /// Check if the agent is running.
@@ -1745,7 +1781,8 @@ impl AgentManager {
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
         // so the comparison below is accurate even for detached VMs.
-        if self.try_connect_existing().is_some() {
+        let reachable = self.try_connect_existing().is_some();
+        if reachable {
             let inner = self.inner.lock();
             match &inner.config_state {
                 ConfigState::Known => {
@@ -1788,7 +1825,18 @@ impl AgentManager {
                     )?;
                 }
             }
-            tracing::info!("restarting agent VM due to configuration change");
+            let reason = {
+                let inner = self.inner.lock();
+                match (reachable, &inner.config_state) {
+                    (false, _) => "agent unreachable".to_string(),
+                    (true, ConfigState::Known) => format!(
+                        "{} changed",
+                        config_differences(&inner, &mounts, &ports, &resources).join(", ")
+                    ),
+                    (true, _) => "running config unknown".to_string(),
+                }
+            };
+            tracing::warn!(%reason, "restarting agent VM");
             self.stop()?;
         } else {
             // try_connect_existing failed but state may still be Running (crashed VM).
@@ -2863,7 +2911,8 @@ impl AgentManager {
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running (same logic as ensure_running_with_full_config)
-        if self.try_connect_existing().is_some() {
+        let reachable = self.try_connect_existing().is_some();
+        if reachable {
             let inner = self.inner.lock();
             match &inner.config_state {
                 ConfigState::Known => {
@@ -2900,7 +2949,18 @@ impl AgentManager {
                     )?;
                 }
             }
-            tracing::info!("restarting agent VM due to configuration change");
+            let reason = {
+                let inner = self.inner.lock();
+                match (reachable, &inner.config_state) {
+                    (false, _) => "agent unreachable".to_string(),
+                    (true, ConfigState::Known) => format!(
+                        "{} changed",
+                        config_differences(&inner, &mounts, &ports, &resources).join(", ")
+                    ),
+                    (true, _) => "running config unknown".to_string(),
+                }
+            };
+            tracing::warn!(%reason, "restarting agent VM");
             self.stop()?;
         } else {
             self.reset_stale_running_state();

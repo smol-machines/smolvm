@@ -1527,41 +1527,48 @@ pub async fn ensure_machine_running(
         let ports: Vec<_> = entry.ports.iter().map(PortMapping::from).collect();
         let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
+        // An implicit start (exec/run/files/images) never restarts a machine
+        // that is up. `update` refuses running machines, so its recorded
+        // settings should match what it runs with; if they do not, restarting
+        // would throw away its execution (for a machine restored from a
+        // checkpoint, the restored state) to fix nothing the caller asked for.
+        // Returning here also keeps the packed-layers lease off this hot path.
+        if entry.manager.try_connect_existing().is_some() {
+            if let Some(differences) = entry
+                .manager
+                .running_config_differences(&mounts, &ports, &resources)
+            {
+                tracing::warn!(
+                    machine = %entry.manager.name().unwrap_or_default(),
+                    differs = %differences.join(", "),
+                    "running machine's recorded settings differ from its launch; leaving it running"
+                );
+            }
+            return Ok(false);
+        }
+        // Up but not answering (busy, or still restoring): fail this request
+        // rather than stop the VM and boot it fresh.
+        if entry.manager.is_process_alive() {
+            return Err(crate::Error::agent_conflict(
+                "start machine",
+                "machine is running but its agent is not answering yet; retry",
+            ));
+        }
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
-        //
-        // Build the packed-layers features only when the VM is not already up.
-        // This preflight runs on every implicit-start request (exec/run/files/
-        // images); when the VM is already running `ensure_running_via_subprocess`
-        // returns early (discarding `features`) as long as the mount/port/resource
-        // config is unchanged. Acquiring the layers lease on that hot path is
-        // wasted work — on macOS it re-mounts the case-sensitive volume via
-        // hdiutil — so gate it on the same already-running check.
-        //
-        // The gated `default()` is safe across the relaunch branch too: if the
-        // preflight detects a mount/port/resource change and restarts the VM,
-        // `ensure_running_via_subprocess` re-attaches this machine's pre-extracted
-        // packed layers itself (see `rewire_packed_layers_if_extracted`), so the
-        // restart keeps using them instead of falling back to a registry pull.
-        let already_up = entry.manager.try_connect_existing().is_some();
-        let mut features = if already_up {
-            crate::agent::LaunchFeatures::default()
-        } else {
-            build_launch_features(
-                entry.manager.name(),
-                entry.source_smolmachine.as_deref(),
-                entry.image.as_deref(),
-                entry.resources.allowed_hosts.clone(),
-                entry.credentials.clone(),
-            )?
-        };
+        let mut features = build_launch_features(
+            entry.manager.name(),
+            entry.source_smolmachine.as_deref(),
+            entry.image.as_deref(),
+            entry.resources.allowed_hosts.clone(),
+            entry.credentials.clone(),
+        )?;
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = entry.cuda_vram_limit_mib;
         features.forkable = entry.forkable;
         features.external_interceptor = entry.external_interceptor;
         entry
             .manager
-            .ensure_running_via_subprocess(mounts, ports, resources, features)?;
-        Ok(!already_up)
+            .ensure_running_via_subprocess(mounts, ports, resources, features)
     })
     .await
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
