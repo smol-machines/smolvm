@@ -378,6 +378,9 @@ impl ServeStartCmd {
         if reclaimed > 0 {
             println!("Reclaimed {reclaimed} dangling VM data dir(es)");
         }
+        // A previous run may have stopped while restored checkpoint RAM was
+        // still being written back; finish that in the background.
+        smolvm::portable_checkpoint::resume_deferred_restore_syncs();
 
         // Create shutdown channel for supervisor
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

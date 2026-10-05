@@ -310,6 +310,44 @@ impl DeferredRestoreSync {
     }
 }
 
+/// Finish the write-backs an earlier run of this server deferred but did not
+/// complete because it stopped first. Only markers written in this boot are
+/// taken up: an earlier boot's mark RAM the restart may have lost, which must
+/// keep refusing rather than be declared durable now.
+pub fn resume_deferred_restore_syncs() {
+    #[cfg(target_os = "linux")]
+    {
+        let current = |marker: &Path| {
+            marker.exists() && !smolvm_pack::extract::unsynced_before_this_boot(marker)
+        };
+        let shared_root = crate::agent::shared_pack_cache_root();
+        if let Ok(entries) = std::fs::read_dir(&shared_root) {
+            for entry in entries.flatten() {
+                let marker = entry.path();
+                if marker.extension().is_some_and(|ext| ext == "unsynced") && current(&marker) {
+                    DeferredRestoreSync::for_extraction(&marker.with_extension("")).start();
+                }
+            }
+        }
+        let mut inputs = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(crate::agent::vm_cache_root()) {
+            for entry in entries.flatten() {
+                let input_dir = entry.path().join(READONLY_INPUT_DIR);
+                if current(&input_dir.join(UNSYNCED_INPUT_MARKER)) {
+                    if let Ok(memory) = std::fs::File::open(input_dir.join("memory.bin")) {
+                        inputs.push((memory, input_dir));
+                    }
+                }
+            }
+        }
+        DeferredRestoreSync {
+            shared: None,
+            inputs,
+        }
+        .start();
+    }
+}
+
 /// How long a deferred write-back waits for concurrent restores to install.
 #[cfg(target_os = "linux")]
 const DEFERRED_SYNC_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
