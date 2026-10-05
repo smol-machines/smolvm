@@ -125,6 +125,7 @@ pub fn seedable_image(_: &str, _: Option<&str>, _: Option<u64>) -> Option<String
 
 /// Seeds need a Unix host; elsewhere nothing seeds.
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
 pub fn seed_storage(
     _: &std::path::Path,
     _: &str,
