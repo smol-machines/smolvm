@@ -63,6 +63,7 @@ pub fn seed_first_start(
                 name,
                 &image,
                 &crate::registry::PullAuth::FromConfig,
+                record.storage_gb,
                 digest_ttl,
                 proxy,
                 no_proxy,
@@ -99,6 +100,7 @@ pub fn seed_ephemeral_run(
                 name,
                 &image,
                 &crate::registry::PullAuth::FromConfig,
+                storage_gb,
                 digest_ttl,
                 proxy,
                 no_proxy,
@@ -128,6 +130,7 @@ pub fn seed_storage(
     _: &str,
     _: &str,
     _: &crate::registry::PullAuth,
+    _: Option<u64>,
     _: Option<u64>,
     _: Option<&str>,
     _: Option<&str>,
@@ -184,8 +187,9 @@ mod imp {
     }
 
     /// `image` when a machine called `name` with that image and storage size can
-    /// start on a seed: a registry image, the default storage size, no storage
-    /// disk yet, and seeding on.
+    /// start on a seed: a registry image, at least the default storage size (a
+    /// larger disk is the seed grown, see [`grow`]), no storage disk yet, and
+    /// seeding on.
     pub fn seedable_image(
         name: &str,
         image: Option<&str>,
@@ -194,7 +198,7 @@ mod imp {
         // The builder's own machine pulls the normal way.
         if name.starts_with(SEED_MACHINE_PREFIX)
             || std::env::var("SMOLVM_IMAGE_SEEDS").is_ok_and(|v| v.trim() == "0")
-            || storage_gb.is_some_and(|gb| gb != crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+            || storage_gb.is_some_and(|gb| gb < crate::storage::DEFAULT_STORAGE_SIZE_GIB)
         {
             return None;
         }
@@ -321,13 +325,16 @@ mod imp {
     }
 
     /// Give machine `name` a storage disk over the seed for `image`, building the
-    /// seed first (with `exe`, this smolvm binary) if its digest has none yet.
+    /// seed first (with `exe`, this smolvm binary) if its digest has none yet,
+    /// and grown to `storage_gb` when that is larger than the seed.
     /// Returns `Ok(false)` when the storage template cannot back a seed.
+    #[allow(clippy::too_many_arguments)]
     pub fn seed_storage(
         exe: &Path,
         name: &str,
         image: &str,
         auth: &PullAuth,
+        storage_gb: Option<u64>,
         digest_ttl: Option<u64>,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
@@ -398,7 +405,11 @@ mod imp {
             std::process::id(),
             format.extension()
         ));
+        let size_bytes = storage_gb
+            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+            .saturating_mul(crate::data::consts::BYTES_PER_GIB);
         let created = attach(&staging, &seed, format).and_then(|()| {
+            grow(&staging, format, size_bytes)?;
             // A clone keeps no link to its seed; record it for revalidation.
             if matches!(format, DiskFormat::Raw) {
                 std::fs::write(source_marker(&storage), seed.as_os_str().as_encoded_bytes())
@@ -693,6 +704,39 @@ mod imp {
             .map_err(|e| Error::config("image seed", e.to_string()))
     }
 
+    /// Grow a freshly attached disk to `size_bytes` (sparse; never shrinks). The
+    /// guest grows the seed's ext4 into the new space at boot, as it does for a
+    /// template disk, so a larger machine starts from the same seed.
+    pub(super) fn grow(disk: &Path, format: DiskFormat, size_bytes: u64) -> Result<()> {
+        let fail = |e: std::io::Error| Error::config("grow seeded disk", e.to_string());
+        match format {
+            DiskFormat::Raw => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(disk)
+                    .map_err(fail)?;
+                if file.metadata().map_err(fail)?.len() < size_bytes {
+                    file.set_len(size_bytes).map_err(fail)?;
+                }
+                Ok(())
+            }
+            DiskFormat::Qcow2 => {
+                use imago::FormatDriverBuilder;
+                let qcow = imago::qcow2::Qcow2::<imago::file::File>::builder_path(disk)
+                    .write(true)
+                    .open_sync(imago::PermissiveImplicitOpenGate::default())
+                    .map_err(fail)?;
+                let access = imago::SyncFormatAccess::new(qcow).map_err(fail)?;
+                if access.size() < size_bytes {
+                    access
+                        .resize_grow(size_bytes, imago::format::PreallocateMode::None)
+                        .map_err(fail)?;
+                }
+                access.flush().map_err(fail)
+            }
+        }
+    }
+
     /// An APFS clone. Never a full copy: that would write the whole 20 GiB disk,
     /// far slower than the pull it replaces.
     #[cfg(target_os = "macos")]
@@ -956,6 +1000,71 @@ mod imp {
 mod tests {
     use super::imp::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_larger_disk_seeds_and_a_smaller_one_pulls() {
+        let default = crate::storage::DEFAULT_STORAGE_SIZE_GIB;
+        let name = "seed-size-gate-test";
+        assert!(seedable_image(name, Some("alpine"), None).is_some());
+        assert!(seedable_image(name, Some("alpine"), Some(default)).is_some());
+        assert!(seedable_image(name, Some("alpine"), Some(default * 5)).is_some());
+        assert!(seedable_image(name, Some("alpine"), Some(default - 1)).is_none());
+    }
+
+    #[test]
+    fn a_seeded_disk_grows_to_the_requested_size_and_keeps_the_seed() {
+        use crate::storage::DiskFormat;
+        use imago::{FormatCreateBuilder, FormatDriverBuilder};
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A raw clone grows sparsely and keeps its bytes.
+        let raw = dir.path().join("storage.raw");
+        std::fs::write(&raw, b"seeded").unwrap();
+        grow(&raw, DiskFormat::Raw, 64 * MIB).unwrap();
+        assert_eq!(std::fs::metadata(&raw).unwrap().len(), 64 * MIB);
+        assert_eq!(&std::fs::read(&raw).unwrap()[..6], b"seeded");
+        // Never shrinks.
+        grow(&raw, DiskFormat::Raw, MIB).unwrap();
+        assert_eq!(std::fs::metadata(&raw).unwrap().len(), 64 * MIB);
+
+        // A qcow2 overlay over a seed grows its virtual size and still reads
+        // the seed through its backing.
+        let base = dir.path().join("seed.raw");
+        let mut seed = vec![0_u8; (16 * MIB) as usize];
+        seed[..6].copy_from_slice(b"seeded");
+        std::fs::write(&base, &seed).unwrap();
+        let overlay = dir.path().join("storage.qcow2");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&overlay)
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(
+                imago::qcow2::Qcow2::<imago::file::File>::create_builder(
+                    imago::file::File::try_from(file).unwrap(),
+                )
+                .size(16 * MIB)
+                .backing("seed.raw".to_string(), "raw".to_string())
+                .create(),
+            )
+            .unwrap();
+        grow(&overlay, DiskFormat::Qcow2, 64 * MIB).unwrap();
+        let qcow = imago::qcow2::Qcow2::<imago::file::File>::builder_path(&overlay)
+            .open_sync(imago::PermissiveImplicitOpenGate::default())
+            .unwrap();
+        let access = imago::SyncFormatAccess::new(qcow).unwrap();
+        assert_eq!(access.size(), 64 * MIB);
+        let mut head = [0_u8; 6];
+        access.read(&mut head[..], 0).unwrap();
+        assert_eq!(&head, b"seeded");
+        let mut tail = [0xff_u8; 4];
+        access.read(&mut tail[..], 64 * MIB - 4).unwrap();
+        assert_eq!(tail, [0; 4]);
+    }
 
     #[test]
     fn a_started_machine_does_not_seed_again() {
