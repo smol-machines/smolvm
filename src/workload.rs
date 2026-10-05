@@ -6,7 +6,7 @@
 //! it boots a bare agent VM whose published ports forward to nothing. Keeping
 //! the launch here, in the lib, is what stops front-ends from drifting apart.
 
-use crate::agent::{AgentClient, RunConfig};
+use crate::agent::{AgentClient, RunConfig, WorkloadTarget};
 use crate::config::VmRecord;
 
 /// Convert a record's live and staged host mounts to the agent's binding form.
@@ -49,6 +49,61 @@ pub fn persistent_overlay_owner_with_lineage(
     fork_overlay_owner: Option<&str>,
 ) -> String {
     fork_overlay_owner.or(golden).unwrap_or(name).to_string()
+}
+
+/// The persistent overlay owner for a machine record (see
+/// [`persistent_overlay_owner_with_lineage`]).
+pub fn record_overlay_owner(record: &VmRecord) -> String {
+    persistent_overlay_owner_with_lineage(
+        &record.name,
+        record.golden.as_deref(),
+        record.fork_overlay_owner.as_deref(),
+    )
+}
+
+/// The filesystem a machine's commands run in, and so the one its file
+/// operations act on: the VM's own root for a bare machine, or its image
+/// container's persistent overlay. Every exec and file path asks this, so a
+/// file written one way is the file every other way reads.
+pub fn machine_target(record: &VmRecord) -> WorkloadTarget {
+    match &record.image {
+        None => WorkloadTarget::Vm,
+        Some(image) => WorkloadTarget::Container {
+            image: image.clone(),
+            overlay_id: record_overlay_owner(record),
+        },
+    }
+}
+
+/// The container `run(image, ...)` uses on a machine. Running the machine's
+/// own image is its workload container; any other image gets an overlay of its
+/// own for this machine, so its changes persist across runs of that image
+/// without ever mixing two images' filesystems.
+pub fn run_target(record: &VmRecord, image: &str) -> WorkloadTarget {
+    let owner = record_overlay_owner(record);
+    let canonical = smolvm_protocol::normalize_image_ref(image);
+    let own_image = record
+        .image
+        .as_deref()
+        .is_some_and(|own| smolvm_protocol::normalize_image_ref(own) == canonical);
+    WorkloadTarget::Container {
+        image: image.to_string(),
+        overlay_id: if own_image {
+            owner
+        } else {
+            run_overlay_id(&owner, &canonical)
+        },
+    }
+}
+
+/// The overlay id for running `canonical_image` on a machine whose overlay
+/// owner is `owner`. Machine names cannot contain `.`, so this id never
+/// collides with a machine's own overlay.
+fn run_overlay_id(owner: &str, canonical_image: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(canonical_image.as_bytes());
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{owner}.{hex}")
 }
 
 /// Launch an image machine's workload container in the background.
@@ -262,6 +317,72 @@ mod tests {
         assert!(!is_missing_launch_metadata(
             "run container detached: image not found: docker.io/library/ubuntu:latest"
         ));
+    }
+
+    fn record(name: &str, image: Option<&str>, golden: Option<&str>) -> VmRecord {
+        let mut record = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        record.image = image.map(str::to_string);
+        record.golden = golden.map(str::to_string);
+        record
+    }
+
+    // A bare machine's commands and files are the VM's own; an image machine's
+    // are its workload container's, keyed like every other overlay lookup.
+    #[test]
+    fn a_machine_targets_the_filesystem_its_commands_run_in() {
+        assert_eq!(
+            machine_target(&record("bare", None, None)),
+            WorkloadTarget::Vm
+        );
+        assert_eq!(
+            machine_target(&record("web", Some("alpine:3.20"), None)),
+            WorkloadTarget::Container {
+                image: "alpine:3.20".into(),
+                overlay_id: "web".into()
+            }
+        );
+        assert_eq!(
+            machine_target(&record("clone", Some("alpine:3.20"), Some("web"))),
+            WorkloadTarget::Container {
+                image: "alpine:3.20".into(),
+                overlay_id: "web".into()
+            }
+        );
+    }
+
+    // Running a machine's own image is its workload container. Any other image
+    // gets an overlay per machine and image: stable across runs, distinct
+    // between images, and never a machine's own overlay id.
+    #[test]
+    fn run_keys_its_overlay_by_machine_and_image() {
+        let web = record("web", Some("alpine:3.20"), None);
+        let own = |t: WorkloadTarget| match t {
+            WorkloadTarget::Container { overlay_id, .. } => overlay_id,
+            WorkloadTarget::Vm => panic!("run is always a container"),
+        };
+        assert_eq!(
+            own(run_target(&web, "docker.io/library/alpine:3.20")),
+            "web"
+        );
+
+        let bare = record("bare", None, None);
+        let alpine = own(run_target(&bare, "alpine:3.20"));
+        let python = own(run_target(&bare, "python:3.12-alpine"));
+        assert_ne!(alpine, python);
+        assert_eq!(
+            alpine,
+            own(run_target(&bare, "docker.io/library/alpine:3.20"))
+        );
+        assert!(
+            alpine.starts_with("bare.") && alpine.len() == "bare.".len() + 16,
+            "{alpine}"
+        );
+        assert!(crate::data::validate_vm_name(&alpine, "name").is_err());
+        assert!(smolvm_protocol::workload_target::validate_overlay_id(&alpine).is_ok());
+
+        // A clone runs other images in its golden's overlays, as it execs there.
+        let clone = record("clone", None, Some("bare"));
+        assert_eq!(own(run_target(&clone, "alpine:3.20")), alpine);
     }
 
     // A plain machine's overlay is keyed by its own name; a fork clone's by

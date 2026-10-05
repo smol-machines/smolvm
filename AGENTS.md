@@ -491,11 +491,14 @@ smolvm machine cp ./script.py myvm:/workspace/script.py
 smolvm machine cp myvm:/workspace/output.json ./output.json
 ```
 
-**Image-based VMs (--image):** Files copied with `cp` are visible to
-`exec` at the same path, and vice versa. This works for any path —
-`/tmp`, `/home`, `/workspace`, etc. Under the hood, `cp` routes
-through the container's overlay filesystem so both commands see the
-same files.
+**Files and `exec` see the same filesystem.** Files copied with `cp`
+(or written through the HTTP API or an SDK) are visible to `exec` at the
+same path, and vice versa, for any path: `/tmp`, `/home`, `/workspace`,
+etc. On an image-based VM (`--image`) that is the container's overlay
+filesystem; on a bare VM it is the VM's own root, also after an SDK
+`run(image, ...)` has used a container on the machine. Each image an SDK
+`run`s on a machine keeps its own persistent container filesystem, so
+running a second image never sees the first one's files.
 
 **`/workspace` shared directory:** Every machine has a `/workspace`
 directory — bare VMs, image-based VMs, and machines created from

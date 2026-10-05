@@ -1872,6 +1872,14 @@ pub enum StorageError {
     // ========================================================================
     /// Image not found locally.
     ImageNotFound { image: String },
+    /// A persistent overlay built from one image was asked to run another.
+    /// Mounting the new image's layers under the old upper layer would mix the
+    /// two filesystems, so it is refused.
+    OverlayImageConflict {
+        overlay: String,
+        recorded: String,
+        requested: String,
+    },
     /// Failed to pull image from registry.
     ImagePullFailed { image: String, cause: String },
     /// Invalid image reference format.
@@ -2033,6 +2041,14 @@ impl std::fmt::Display for StorageError {
             StorageError::ImageNotFound { image } => {
                 write!(f, "image not found: {}", image)
             }
+            StorageError::OverlayImageConflict {
+                overlay,
+                recorded,
+                requested,
+            } => write!(
+                f,
+                "overlay {overlay} was built from {recorded} and cannot run {requested}"
+            ),
             StorageError::ImagePullFailed { image, cause } => {
                 write!(f, "failed to pull image '{}': {}", image, cause)
             }
@@ -3992,7 +4008,53 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
         })
         .collect();
 
-    OverlaySetup::new(workload_id)?.execute_or_remount(lowerdirs)
+    let setup = OverlaySetup::new(workload_id)?;
+    if !workload_id.starts_with("persistent-") {
+        return setup.execute_or_remount(lowerdirs);
+    }
+    let overlay_root = setup.overlay_root.clone();
+    check_overlay_image(&overlay_root, workload_id, image)?;
+    let overlay = setup.execute_or_remount(lowerdirs)?;
+    record_overlay_image(&overlay_root, image)?;
+    Ok(overlay)
+}
+
+/// File in a persistent overlay's directory naming the image it was built from.
+const OVERLAY_IMAGE_FILE: &str = "image_ref";
+
+/// Refuse to mount a persistent overlay for `image` when it was built from a
+/// different image: the new image's layers under the old upper layer would be
+/// a mix of both filesystems. An overlay with no record (one made before images
+/// were recorded) is accepted, and gets one once it mounts.
+fn check_overlay_image(overlay_root: &Path, workload_id: &str, image: &str) -> Result<()> {
+    let Ok(recorded) = std::fs::read_to_string(overlay_root.join(OVERLAY_IMAGE_FILE)) else {
+        return Ok(());
+    };
+    let recorded = recorded.trim();
+    let requested = smolvm_protocol::normalize_image_ref(image);
+    if recorded.is_empty() || recorded == requested {
+        return Ok(());
+    }
+    Err(StorageError::OverlayImageConflict {
+        overlay: workload_id.to_string(),
+        recorded: recorded.to_string(),
+        requested,
+    })
+}
+
+/// Record the image a persistent overlay was built from, once.
+fn record_overlay_image(overlay_root: &Path, image: &str) -> Result<()> {
+    let path = overlay_root.join(OVERLAY_IMAGE_FILE);
+    if path.exists() {
+        return Ok(());
+    }
+    let tmp = overlay_root.join(format!(".{OVERLAY_IMAGE_FILE}.tmp"));
+    std::fs::write(&tmp, smolvm_protocol::normalize_image_ref(image))
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| StorageError::WriteFile {
+            path: path.display().to_string(),
+            cause: e.to_string(),
+        })
 }
 
 /// Prepare an overlay filesystem using pre-packed layers.
@@ -4462,17 +4524,25 @@ where
 
     // Resolve image layers (same logic as prepare_overlay). A local image
     // archive is flattened into a rootfs first; a packed-layers dir is used
-    // as-is.
-    let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
+    // as-is. A packed machine has exactly one image, so only an image-store
+    // overlay records and checks which image it was built from.
+    let (lowerdirs, image_store) = if let Some(packed_dir) = get_packed_layers_dir() {
         let effective = effective_packed_dir_with_progress(packed_dir, &mut progress)?;
-        get_packed_lowerdirs(&effective)?
+        (get_packed_lowerdirs(&effective)?, false)
     } else {
-        get_image_lowerdirs(image)?
+        (get_image_lowerdirs(image)?, true)
     };
 
     progress("preparing persistent overlay", 0);
     let setup = OverlaySetup::new(&workload_id)?;
+    let overlay_root = setup.overlay_root.clone();
+    if image_store {
+        check_overlay_image(&overlay_root, &workload_id, image)?;
+    }
     let overlay = setup.execute_or_remount(lowerdirs)?;
+    if image_store {
+        record_overlay_image(&overlay_root, image)?;
+    }
 
     debug!(
         workload_id = %workload_id,
@@ -5966,6 +6036,45 @@ mod tests {
         std::fs::write(&short, vec![0u8; 100]).unwrap();
         assert!(super::has_ext_superblock(&short).is_err());
     }
+    #[test]
+    fn an_overlay_runs_only_the_image_it_was_built_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // An overlay made before images were recorded is accepted, then recorded.
+        check_overlay_image(root, "persistent-web", "python:3.12-alpine").unwrap();
+        record_overlay_image(root, "alpine:3.20").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("image_ref")).unwrap(),
+            "docker.io/library/alpine:3.20"
+        );
+
+        // Any spelling of the same image matches.
+        check_overlay_image(root, "persistent-web", "alpine:3.20").unwrap();
+        check_overlay_image(root, "persistent-web", "docker.io/library/alpine:3.20").unwrap();
+
+        // Another image is refused instead of being mixed into this overlay.
+        match check_overlay_image(root, "persistent-web", "python:3.12-alpine") {
+            Err(StorageError::OverlayImageConflict {
+                overlay,
+                recorded,
+                requested,
+            }) => {
+                assert_eq!(overlay, "persistent-web");
+                assert_eq!(recorded, "docker.io/library/alpine:3.20");
+                assert_eq!(requested, "docker.io/library/python:3.12-alpine");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+
+        // The first record stands.
+        record_overlay_image(root, "python:3.12-alpine").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("image_ref")).unwrap(),
+            "docker.io/library/alpine:3.20"
+        );
+    }
+
     use super::*;
 
     #[test]

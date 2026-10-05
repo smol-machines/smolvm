@@ -90,7 +90,7 @@ pub use crate::data::storage::HostMount;
 pub use client::{
     file_transfer_max_total, interactive_input, pack_export_max_total, AgentClient, ExecEvent,
     FileWriteMeta, InputClosed, InteractiveInput, InteractiveInputReceiver, InteractiveInputSender,
-    InteractiveOutput, PullOptions, RunConfig,
+    InteractiveOutput, PullOptions, RunConfig, WorkloadTarget,
 };
 pub use fsnotify_watch::FsNotifyWatcher;
 pub use krun::{host_layers_supported, KrunFunctions};
