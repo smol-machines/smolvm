@@ -1602,8 +1602,9 @@ pub async fn ensure_running_and_persist(
     // launches with pre-update mounts/ports/resources. `update` refuses
     // running machines, so a running machine's entry can't be stale — and for
     // one, ensure_machine_running early-returns before the config matters.
-    if let Ok(Some(record)) = state.lookup_vm(name).await {
-        refuse_implicit_start_of_paused(&record)?;
+    let record = state.lookup_vm(name).await.ok().flatten();
+    if let Some(record) = &record {
+        refuse_implicit_start_of_paused(record)?;
         let mut e = entry.lock();
         e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
         e.ports = record
@@ -1625,7 +1626,34 @@ pub async fn ensure_running_and_persist(
         }
     }
 
+    // A restored machine boots from its checkpoint with the workload already
+    // running in the restored RAM. Remember that before the boot, finalize the
+    // restore after it exactly like the explicit start handler, and never launch
+    // the workload a second time.
+    let restoring_checkpoint =
+        crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(name)).is_some();
+
     let freshly_booted = ensure_machine_running(entry).await?;
+
+    if freshly_booted && restoring_checkpoint {
+        if let Some(record) = record.clone() {
+            let machine = name.to_string();
+            let finalized = tokio::task::spawn_blocking(move || {
+                crate::portable_checkpoint::finalize_live_restore(&machine, &record).and_then(
+                    |()| crate::portable_checkpoint::consume(&crate::agent::vm_data_dir(&machine)),
+                )
+            })
+            .await
+            .map_err(|e| crate::Error::agent("finalize checkpoint restore", e.to_string()))?;
+            if let Err(error) = finalized {
+                let _ = entry.lock().manager.stop();
+                return Err(crate::Error::agent(
+                    "finalize checkpoint restore",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
 
     let pid = {
         let entry = entry.lock();
@@ -1648,7 +1676,7 @@ pub async fn ensure_running_and_persist(
     // `freshly_booted` so an already-running machine's workload is never
     // double-launched. Best-effort like the handler's launch step: the caller's
     // exec must not fail because the workload didn't come up.
-    if freshly_booted {
+    if freshly_booted && !restoring_checkpoint {
         if let Err(e) = relaunch_image_workload(state, name, entry).await {
             tracing::warn!(
                 machine = %name,
