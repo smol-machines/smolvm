@@ -287,11 +287,34 @@ pub fn materialize_shared_pack_lease(
     machine_layers_dir: &Path,
     debug: bool,
 ) -> io::Result<SharedPackLease> {
+    materialize_shared_pack_lease_with_options(
+        sidecar_path,
+        footer,
+        machine_layers_dir,
+        debug,
+        smolvm_pack::extract::SharedExtractOptions::default(),
+    )
+}
+
+/// [`materialize_shared_pack_lease`] with the shortcuts a restore can take
+/// (see [`smolvm_pack::extract::SharedExtractOptions`]).
+pub fn materialize_shared_pack_lease_with_options(
+    sidecar_path: &Path,
+    footer: &smolvm_pack::PackFooter,
+    machine_layers_dir: &Path,
+    debug: bool,
+    options: smolvm_pack::extract::SharedExtractOptions,
+) -> io::Result<SharedPackLease> {
     let vm_root = vm_cache_root();
     let shared_root = shared_pack_cache_root();
     let _lock = lock_artifact_cache(&vm_root, false)?;
-    let shared_dir =
-        smolvm_pack::extract::extract_sidecar_shared(sidecar_path, &shared_root, footer, debug)?;
+    let shared_dir = smolvm_pack::extract::extract_sidecar_shared_with_options(
+        sidecar_path,
+        &shared_root,
+        footer,
+        debug,
+        options,
+    )?;
     let shared_dir = canonical_shared_dir(&shared_dir, &shared_root)?;
     let artifact_sha256 = read_artifact_digest(&shared_dir)?;
     fs::create_dir_all(machine_layers_dir)?;

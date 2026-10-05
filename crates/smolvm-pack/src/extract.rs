@@ -1403,8 +1403,135 @@ pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
 }
 
 /// Check if assets have already been extracted.
+///
+/// An extraction whose checkpoint RAM was still only in the page cache when
+/// the host last restarted is not: the restart may have lost it.
 pub fn is_extracted(cache_dir: &Path) -> bool {
     cache_dir.join(EXTRACTION_MARKER).exists()
+        && !unsynced_before_this_boot(&unsynced_marker_path(cache_dir))
+}
+
+/// Marker beside a shared extraction whose checkpoint RAM is not yet known to
+/// be on disk. It sits beside the tree, like the SHA-256 marker, so the tree
+/// itself stays identical to a private extraction.
+pub fn unsynced_marker_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.with_extension("unsynced")
+}
+
+/// This boot of the host, as the kernel names it; `None` where unknown.
+fn host_boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Record at `marker` that data written in this boot is not yet durable.
+/// The marker itself is durable before this returns, so a crash can never
+/// leave the data without it.
+pub fn mark_unsynced(marker: &Path) -> std::io::Result<()> {
+    let boot = host_boot_id().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "host boot id unavailable")
+    })?;
+    write_atomic_marker(marker, format!("{boot}\n").as_bytes())?;
+    if let Some(parent) = marker.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Whether `marker` says its data was left unsynced by an earlier boot, so a
+/// host restart may have lost it. A marker that cannot be read counts as that.
+pub fn unsynced_before_this_boot(marker: &Path) -> bool {
+    match fs::read_to_string(marker) {
+        Ok(recorded) => host_boot_id().is_none_or(|boot| recorded.trim() != boot),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Clear `marker` once its data is durable, and make the removal durable.
+pub fn clear_unsynced(marker: &Path) -> std::io::Result<()> {
+    match fs::remove_file(marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    if let Some(parent) = marker.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Write a file's dirty pages back a bounded window at a time.
+///
+/// One fsync of gigabytes queues all of it at once, and every journal commit
+/// on the filesystem (the fsyncs of restores installing meanwhile) then waits
+/// behind it. Window by window, those commits wait for one window at most;
+/// the final fsync only flushes what is left.
+pub fn write_back_paced(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        const WINDOW: u64 = 64 << 20;
+        let len = file.metadata()?.len();
+        let mut offset = 0;
+        while offset < len {
+            let count = WINDOW.min(len - offset);
+            // SAFETY: a valid open descriptor and an in-bounds byte range.
+            let result = unsafe {
+                libc::sync_file_range(
+                    file.as_raw_fd(),
+                    offset as libc::off64_t,
+                    count as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            offset += count;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+    Ok(())
+}
+
+/// Whether a shared extraction's checkpoint RAM is still being made durable.
+pub fn memory_sync_pending(cache_dir: &Path) -> bool {
+    unsynced_marker_path(cache_dir).exists()
+}
+
+/// Make a shared extraction's checkpoint RAM durable, then clear its marker.
+/// If the write-back fails the extraction is withdrawn instead, so the next
+/// restore extracts it again rather than trusting what is on disk.
+pub fn sync_extracted_memory(cache_dir: &Path) -> std::io::Result<()> {
+    let synced = File::open(cache_dir.join("checkpoint/memory.bin")).and_then(|file| {
+        write_back_paced(&file)?;
+        file.sync_all()
+    });
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(cache_dir.with_extension("lock"))?;
+    lock_file_exclusive(&lock_file)?;
+    match synced {
+        Ok(()) => clear_unsynced(&unsynced_marker_path(cache_dir)),
+        Err(error) => {
+            let _ = fs::remove_file(cache_dir.join(EXTRACTION_MARKER));
+            Err(error)
+        }
+    }
 }
 
 /// Whether an extraction's `layers/` cache is structurally usable: every id in
@@ -1730,13 +1857,17 @@ pub fn extract_sidecar_for_agent(
         ExtractContext {
             agent_version,
             digest_out: None,
+            defer_memory_sync: None,
         },
     )
 }
 
 struct ExtractContext<'a> {
     agent_version: Option<&'a str>,
-    digest_out: Option<&'a mut Option<ExtractedArtifactDigest>>,
+    digest_out: Option<&'a mut Option<ArtifactDigestProof>>,
+    /// Set when a new extraction leaves its checkpoint RAM for a later
+    /// write-back instead of syncing it; the marker is written first.
+    defer_memory_sync: Option<&'a mut bool>,
 }
 
 /// Core of [`extract_sidecar`]. `cap_cache` runs the LRU size-cap on
@@ -1762,6 +1893,7 @@ fn extract_sidecar_capped(
     let ExtractContext {
         agent_version,
         digest_out,
+        defer_memory_sync,
     } = context;
     if !sidecar_path.exists() {
         return Err(std::io::Error::new(
@@ -1800,6 +1932,17 @@ fn extract_sidecar_capped(
         fs::remove_file(cache_dir.join(EXTRACTION_MARKER))?;
     }
 
+    // RAM left unsynced by an earlier boot may not have survived the restart.
+    // Extract over the entry in place, as for evicted layers above.
+    let unsynced = unsynced_marker_path(cache_dir);
+    if !force && cache_dir.join(EXTRACTION_MARKER).exists() && unsynced_before_this_boot(&unsynced)
+    {
+        if debug {
+            eprintln!("debug: extracted entry was not synced before a host restart; re-extracting");
+        }
+        fs::remove_file(cache_dir.join(EXTRACTION_MARKER))?;
+    }
+
     // Double-check inside the lock: another process may have completed
     // extraction while we were waiting for the lock.
     if !force && is_extracted(cache_dir) {
@@ -1827,6 +1970,20 @@ fn extract_sidecar_capped(
         let _ = fs::remove_dir_all(cache_dir);
     }
 
+    // The unsynced marker is durable before any RAM is written, so a crash
+    // can never leave an extraction marker without it. Without deferral, a
+    // stale marker from an earlier attempt must not outlive this extraction.
+    match defer_memory_sync {
+        Some(deferred) => {
+            mark_unsynced(&unsynced)?;
+            *deferred = true;
+        }
+        None => match fs::remove_file(&unsynced) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        },
+    }
     let result = extract_sidecar_inner(
         sidecar_path,
         cache_dir,
@@ -2009,9 +2166,48 @@ pub fn extract_sidecar_shared(
     footer: &PackFooter,
     debug: bool,
 ) -> std::io::Result<PathBuf> {
+    extract_sidecar_shared_with_options(
+        sidecar_path,
+        shared_root,
+        footer,
+        debug,
+        SharedExtractOptions::default(),
+    )
+}
+
+/// How [`extract_sidecar_shared_with_options`] may shorten a restore.
+#[derive(Default)]
+pub struct SharedExtractOptions {
+    /// SHA-256 already known for the artifact's exact inode, so neither a
+    /// cold extraction nor a warm hit hashes it again.
+    pub digest: Option<ArtifactDigestProof>,
+    /// Return once a checkpoint's RAM is extracted instead of once it is on
+    /// disk. Until the caller completes the write-back with
+    /// [`sync_extracted_memory`], the entry carries a marker naming this boot,
+    /// and after a host restart it is extracted again rather than trusted
+    /// (see [`is_extracted`]). Only for a long-lived process, which is there
+    /// to finish the write-back.
+    pub defer_memory_sync: bool,
+}
+
+/// [`extract_sidecar_shared`] with [`SharedExtractOptions`].
+pub fn extract_sidecar_shared_with_options(
+    sidecar_path: &Path,
+    shared_root: &Path,
+    footer: &PackFooter,
+    debug: bool,
+    options: SharedExtractOptions,
+) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
     let was_extracted = is_extracted(&shared_dir);
-    let mut observed_digest = None;
+    let checkpoint = cfg!(target_os = "linux")
+        && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
+        && crate::packer::read_manifest_from_sidecar(sidecar_path)
+            .is_ok_and(|m| m.checkpoint.is_some());
+    let defer = checkpoint && options.defer_memory_sync && host_boot_id().is_some();
+    let mut deferred = false;
+    let capture_digest = cfg!(unix) && options.digest.is_none();
+    let mut observed_digest = options.digest;
     // cap_cache=false: never perform blind automatic LRU eviction here. Shared
     // entries are maintained explicitly by `smolvm pack prune`, which treats
     // each machine's `.pack-shared` pointer as a durable lease and therefore
@@ -2025,15 +2221,20 @@ pub fn extract_sidecar_shared(
         false,
         ExtractContext {
             agent_version: None,
-            digest_out: cfg!(unix).then_some(&mut observed_digest),
+            digest_out: capture_digest.then_some(&mut observed_digest),
+            defer_memory_sync: defer.then_some(&mut deferred),
         },
     )?;
-    let overlap = cfg!(target_os = "linux")
-        && !was_extracted
-        && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
-        && crate::packer::read_manifest_from_sidecar(sidecar_path)
-            .is_ok_and(|m| m.checkpoint.is_some());
-    if overlap {
+    // With deferral requested, whoever extracted the entry owns its
+    // write-back: this call when it extracted, otherwise the other extractor.
+    let overlap = checkpoint && !was_extracted && !defer;
+    if deferred {
+        ensure_shared_artifact_sha256_with_observed(
+            sidecar_path,
+            &shared_dir,
+            observed_digest.as_mut(),
+        )?;
+    } else if overlap {
         let memory = shared_dir.join("checkpoint/memory.bin");
         overlap_checkpoint_writeback(
             || File::open(&memory)?.sync_all(),
@@ -2397,6 +2598,110 @@ fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
     Ok(digest)
 }
 
+/// Checksums of an artifact taken over its bytes as they were received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedArtifactHashes {
+    /// Bytes seen.
+    pub len: u64,
+    /// Lowercase hex SHA-256 of every byte.
+    pub sha256: String,
+    /// CRC32 of every byte except the trailing pack footer: the range a
+    /// single-file artifact's footer checksum covers. `None` when fewer bytes
+    /// than a footer were seen.
+    pub crc32_before_footer: Option<u32>,
+}
+
+/// Incremental hashing of an artifact while it streams in, so verifying the
+/// footer checksum and naming the artifact by SHA-256 need no second read.
+///
+/// The footer is the last [`crate::format::FOOTER_SIZE`] bytes, which are not
+/// known to be the end until the stream ends, so that many bytes are held back
+/// from the CRC until more arrive.
+pub struct ArtifactStreamHasher {
+    sha256: Context,
+    crc32: crc32fast::Hasher,
+    held: Vec<u8>,
+    len: u64,
+}
+
+impl Default for ArtifactStreamHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArtifactStreamHasher {
+    /// Start an empty stream.
+    pub fn new() -> Self {
+        Self {
+            sha256: Context::new(&SHA256),
+            crc32: crc32fast::Hasher::new(),
+            held: Vec::with_capacity(2 * crate::format::FOOTER_SIZE),
+            len: 0,
+        }
+    }
+
+    /// Add the next bytes of the stream.
+    pub fn update(&mut self, bytes: &[u8]) {
+        const HOLD: usize = crate::format::FOOTER_SIZE;
+        self.sha256.update(bytes);
+        self.len += bytes.len() as u64;
+        if self.held.len() + bytes.len() <= HOLD {
+            self.held.extend_from_slice(bytes);
+            return;
+        }
+        // Everything except the last HOLD bytes seen so far is now known not
+        // to be part of the footer.
+        let release = self.held.len() + bytes.len() - HOLD;
+        let from_held = release.min(self.held.len());
+        self.crc32.update(&self.held[..from_held]);
+        let from_bytes = release - from_held;
+        self.crc32.update(&bytes[..from_bytes]);
+        self.held.drain(..from_held);
+        self.held.extend_from_slice(&bytes[from_bytes..]);
+    }
+
+    /// Finish the stream.
+    pub fn finish(self) -> ReceivedArtifactHashes {
+        let mut sha256 = String::with_capacity(64);
+        for byte in self.sha256.finish().as_ref() {
+            write!(&mut sha256, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        ReceivedArtifactHashes {
+            len: self.len,
+            sha256,
+            crc32_before_footer: (self.held.len() == crate::format::FOOTER_SIZE)
+                .then(|| self.crc32.finalize()),
+        }
+    }
+}
+
+#[test]
+fn stream_hashes_match_whole_file_hashes_for_any_chunking() {
+    use sha2::{Digest, Sha256};
+    let footer = crate::format::FOOTER_SIZE;
+    let bytes: Vec<u8> = (0..10_000_u32)
+        .map(|index| (index * 7 % 251) as u8)
+        .collect();
+    for size in [0, 1, footer - 1, footer, footer + 1, 4096, bytes.len()] {
+        let data = &bytes[..size];
+        let expected_crc = (size >= footer).then(|| crc32fast::hash(&data[..size - footer]));
+        for chunk in [1, 3, footer - 1, footer, footer + 1, 1000, 1 << 20] {
+            let mut hasher = ArtifactStreamHasher::new();
+            for piece in data.chunks(chunk) {
+                hasher.update(piece);
+            }
+            let hashes = hasher.finish();
+            assert_eq!(hashes.len, size as u64);
+            assert_eq!(hashes.sha256, format!("{:x}", Sha256::digest(data)));
+            assert_eq!(
+                hashes.crc32_before_footer, expected_crc,
+                "size {size} chunk {chunk}"
+            );
+        }
+    }
+}
+
 /// Hash the exact compressed bytes consumed by extraction on a bounded worker.
 /// The reader also consumes the trailing manifest and footer before the proof
 /// can be used, so the digest names the entire artifact rather than only the
@@ -2477,7 +2782,7 @@ impl ExtractDigestReader {
         })
     }
 
-    fn finish(mut self) -> std::io::Result<Option<ExtractedArtifactDigest>> {
+    fn finish(mut self) -> std::io::Result<Option<ArtifactDigestProof>> {
         if self.worker.is_none() {
             return Ok(None);
         }
@@ -2488,11 +2793,12 @@ impl ExtractDigestReader {
         if self.bytes != before.len() {
             return Ok(None);
         }
-        Ok(self.worker.take().map(|worker| ExtractedArtifactDigest {
+        Ok(self.worker.take().map(|worker| ArtifactDigestProof {
             file: self.file,
             before,
             service_only_before: self.service_only_before,
             worker: Some(worker),
+            known: None,
         }))
     }
 }
@@ -2513,14 +2819,45 @@ impl Read for ExtractDigestReader {
     }
 }
 
-struct ExtractedArtifactDigest {
+/// The SHA-256 of an artifact's exact bytes, bound to the inode they are in.
+///
+/// It comes either from extraction reading the file, or from the service
+/// hashing the bytes as it wrote them ([`ArtifactDigestProof::received`]).
+/// Either way it is only ever used while the pinned descriptor and the path
+/// still name that same, unchanged inode, so it stands in for a full read.
+pub struct ArtifactDigestProof {
     file: File,
     before: fs::Metadata,
     service_only_before: bool,
     worker: Option<ExtractDigestWorker>,
+    known: Option<String>,
 }
 
-impl ExtractedArtifactDigest {
+impl ArtifactDigestProof {
+    /// A digest the service computed over the bytes it wrote into `file`.
+    /// `service_only` must say whether nobody but the service could write the
+    /// file from its creation until now.
+    pub fn received(file: File, digest: String, service_only: bool) -> std::io::Result<Self> {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact digest must be lowercase hex SHA-256",
+            ));
+        }
+        let before = file.metadata()?;
+        Ok(Self {
+            file,
+            before,
+            service_only_before: service_only,
+            worker: None,
+            known: Some(digest),
+        })
+    }
+
     fn digest_for(&mut self, path: &Path) -> Option<String> {
         // An open descriptor pins the inode through extraction and hashing.
         // A changed descriptor or path cannot provide a cache identity.
@@ -2531,7 +2868,10 @@ impl ExtractedArtifactDigest {
         {
             return None;
         }
-        let digest = self.worker.take()?.finish()?;
+        let digest = match self.known.take() {
+            Some(digest) => digest,
+            None => self.worker.take()?.finish()?,
+        };
         let after = self.file.metadata().ok()?;
         let path_after = fs::metadata(path).ok()?;
         (same_checkpoint_identity(&self.before, &after)
@@ -2595,7 +2935,7 @@ fn ensure_shared_artifact_sha256(
 fn ensure_shared_artifact_sha256_with_observed(
     sidecar_path: &Path,
     shared_dir: &Path,
-    observed: Option<&mut ExtractedArtifactDigest>,
+    observed: Option<&mut ArtifactDigestProof>,
 ) -> std::io::Result<String> {
     if cfg!(unix) {
         ensure_shared_artifact_sha256_with_proofs(sidecar_path, shared_dir, None, observed)
@@ -2616,7 +2956,7 @@ fn ensure_shared_artifact_sha256_with_proofs(
     sidecar_path: &Path,
     shared_dir: &Path,
     identity: Option<&crate::packer::PackedArtifactIdentity>,
-    observed: Option<&mut ExtractedArtifactDigest>,
+    mut observed: Option<&mut ArtifactDigestProof>,
 ) -> std::io::Result<String> {
     let digest_path = shared_artifact_sha256_path(shared_dir);
     let lock_path = digest_path.with_extension("artifact-sha256.lock");
@@ -2657,8 +2997,17 @@ fn ensure_shared_artifact_sha256_with_proofs(
         // CRC32 footer. If a different artifact ever collides with that key,
         // fail instead of associating its SHA-256 with the already-extracted
         // bytes. A second path to identical content is safe and refreshes the
-        // cheap source fingerprint for later warm creates.
-        let actual_digest = hash_artifact_sha256(sidecar_path)?;
+        // cheap source fingerprint for later warm creates. A digest already
+        // taken over this exact inode's bytes answers that without a re-read.
+        let observed_digest = observed.as_deref_mut().and_then(|observed| {
+            observed
+                .digest_for(sidecar_path)
+                .map(|digest| (digest, observed.service_only_before))
+        });
+        let (actual_digest, full_read_trusted) = match observed_digest {
+            Some((digest, trusted)) => (digest, trusted),
+            None => (hash_artifact_sha256(sidecar_path)?, true),
+        };
         if actual_digest != cached_digest {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2675,8 +3024,8 @@ fn ensure_shared_artifact_sha256_with_proofs(
             && cached_source.as_ref().is_some_and(|cached| {
                 cached.locally_produced && cached.same_inode(&source_identity)
             });
-        source_identity.hashed_while_service_only =
-            hashed_while_service_only(sidecar_path, &source_identity, trusted_before)?;
+        source_identity.hashed_while_service_only = full_read_trusted
+            && hashed_while_service_only(sidecar_path, &source_identity, trusted_before)?;
         write_atomic_marker(
             &source_path,
             &serde_json::to_vec(&source_identity)
@@ -3166,7 +3515,7 @@ fn extract_sidecar_inner(
     footer: &PackFooter,
     debug: bool,
     agent_version: Option<&str>,
-    digest_out: Option<&mut Option<ExtractedArtifactDigest>>,
+    digest_out: Option<&mut Option<ArtifactDigestProof>>,
 ) -> std::io::Result<()> {
     fs::create_dir_all(cache_dir)?;
 
@@ -5056,6 +5405,135 @@ mod tests {
         assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), first_digest);
     }
 
+    fn digest_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_received_digest_answers_a_warm_hit_without_reading_the_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let first = temp.path().join("first");
+        fs::write(&first, b"artifact bytes").unwrap();
+        let digest = ensure_shared_artifact_sha256(&first, &shared).unwrap();
+
+        let second = temp.path().join("second");
+        fs::write(&second, b"artifact bytes").unwrap();
+        let mut proof =
+            ArtifactDigestProof::received(File::open(&second).unwrap(), digest.clone(), true)
+                .unwrap();
+        assert_eq!(
+            ensure_shared_artifact_sha256_with_observed(&second, &shared, Some(&mut proof))
+                .unwrap(),
+            digest
+        );
+
+        // A proof is taken at its word for its inode: a wrong digest for the
+        // very same bytes is reported as a collision, so nothing re-read them.
+        let third = temp.path().join("third");
+        fs::write(&third, b"artifact bytes").unwrap();
+        let mut wrong =
+            ArtifactDigestProof::received(File::open(&third).unwrap(), digest_of(b"other"), true)
+                .unwrap();
+        let error = ensure_shared_artifact_sha256_with_observed(&third, &shared, Some(&mut wrong))
+            .unwrap_err();
+        assert!(error.to_string().contains("checksum collision"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_received_digest_is_ignored_once_its_inode_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let first = temp.path().join("first");
+        fs::write(&first, b"artifact bytes").unwrap();
+        let digest = ensure_shared_artifact_sha256(&first, &shared).unwrap();
+
+        let second = temp.path().join("second");
+        fs::write(&second, b"artifact bytes").unwrap();
+        let mut stale =
+            ArtifactDigestProof::received(File::open(&second).unwrap(), digest_of(b"other"), true)
+                .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&second, b"artifact bytes").unwrap();
+        // The proof no longer names these bytes, so they are hashed instead.
+        assert_eq!(
+            ensure_shared_artifact_sha256_with_observed(&second, &shared, Some(&mut stale))
+                .unwrap(),
+            digest
+        );
+    }
+
+    #[test]
+    fn a_received_digest_must_be_a_sha256() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("artifact");
+        fs::write(&path, b"x").unwrap();
+        for digest in ["", "abc", &"A".repeat(64), &"g".repeat(64)] {
+            assert!(
+                ArtifactDigestProof::received(File::open(&path).unwrap(), digest.to_string(), true)
+                    .is_err(),
+                "{digest}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_or_foreign_unsynced_marker_means_the_data_may_be_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("entry.unsynced");
+        assert!(!unsynced_before_this_boot(&marker));
+        fs::write(&marker, "another-boot\n").unwrap();
+        assert!(unsynced_before_this_boot(&marker));
+        fs::create_dir(temp.path().join("dir.unsynced")).unwrap();
+        assert!(unsynced_before_this_boot(&temp.path().join("dir.unsynced")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_extraction_left_unsynced_by_an_earlier_boot_is_not_extracted() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("0000abcd");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join(EXTRACTION_MARKER), "").unwrap();
+        let marker = unsynced_marker_path(&cache);
+
+        mark_unsynced(&marker).unwrap();
+        assert!(is_extracted(&cache), "this boot still holds the data");
+        assert!(memory_sync_pending(&cache));
+
+        fs::write(&marker, "another-boot\n").unwrap();
+        assert!(!is_extracted(&cache));
+
+        clear_unsynced(&marker).unwrap();
+        assert!(is_extracted(&cache));
+        assert!(!memory_sync_pending(&cache));
+        clear_unsynced(&marker).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn written_back_memory_clears_its_marker_and_a_failed_write_back_withdraws_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("0000abcd");
+        fs::create_dir_all(cache.join("checkpoint")).unwrap();
+        fs::write(cache.join("checkpoint/memory.bin"), b"ram").unwrap();
+        fs::write(cache.join(EXTRACTION_MARKER), "").unwrap();
+        mark_unsynced(&unsynced_marker_path(&cache)).unwrap();
+        sync_extracted_memory(&cache).unwrap();
+        assert!(!memory_sync_pending(&cache));
+        assert!(is_extracted(&cache));
+
+        fs::remove_file(cache.join("checkpoint/memory.bin")).unwrap();
+        mark_unsynced(&unsynced_marker_path(&cache)).unwrap();
+        assert!(sync_extracted_memory(&cache).is_err());
+        assert!(!is_extracted(&cache));
+    }
+
     #[cfg(unix)]
     #[test]
     fn shared_digest_rejects_same_length_edit_with_restored_mtime() {
@@ -5307,6 +5785,94 @@ mod tests {
     }
 
     /// Build a single-file tar archive in memory with the given name and data.
+    /// Write an old-GNU sparse tar entry for `name` whose data runs are the
+    /// given `(offset, len)` extents, each filled with a byte derived from its
+    /// index, into `out`; returns the logical size.
+    fn write_sparse_tar<W: Write>(
+        out: &mut W,
+        name: &str,
+        extents: &[(u64, u64)],
+        logical: u64,
+    ) -> std::io::Result<()> {
+        let stored: u64 = extents.iter().map(|(_, len)| len).sum();
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name)?;
+        header.set_mode(0o600);
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(stored);
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(logical);
+        let slots = gnu.sparse.len();
+        for (&(offset, len), slot) in extents.iter().zip(gnu.sparse.iter_mut()) {
+            slot.set_offset(offset);
+            slot.set_length(len);
+        }
+        gnu.set_is_extended(extents.len() > slots);
+        header.set_cksum();
+        out.write_all(header.as_bytes())?;
+        let rest = &extents[slots.min(extents.len())..];
+        for (index, chunk) in rest.chunks(21).enumerate() {
+            let mut ext = tar::GnuExtSparseHeader::new();
+            for (&(offset, len), slot) in chunk.iter().zip(ext.sparse_mut().iter_mut()) {
+                slot.set_offset(offset);
+                slot.set_length(len);
+            }
+            ext.set_is_extended((index + 1) * 21 < rest.len());
+            out.write_all(ext.as_bytes())?;
+        }
+        for (index, &(_, len)) in extents.iter().enumerate() {
+            out.write_all(&vec![(index % 251) as u8 + 1; len as usize])?;
+        }
+        out.write_all(&vec![0; ((512 - stored % 512) % 512) as usize])?;
+        out.write_all(&[0; 1024])
+    }
+
+    /// Unpack time for a RAM image fragmented into many small data runs.
+    /// `SPARSE_RUNS` sets the number of 4 KiB runs (default 300000).
+    #[test]
+    #[ignore = "benchmark; run explicitly"]
+    fn bench_unpack_fragmented_sparse_memory() {
+        let runs: u64 = std::env::var("SPARSE_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000);
+        let dir = tempfile::tempdir_in(std::env::var("BENCH_DIR").unwrap_or(".".into())).unwrap();
+        let logical = runs * 12288 + 4096;
+        // Data runs separated by holes, then a terminal empty run marking the
+        // logical end, as the packer writes them.
+        let extents: Vec<(u64, u64)> = (0..runs)
+            .map(|i| (i * 12288, 4096))
+            .chain([(logical, 0)])
+            .collect();
+        let tar_path = dir.path().join("archive.tar");
+        let mut out = std::io::BufWriter::new(File::create(&tar_path).unwrap());
+        write_sparse_tar(&mut out, "checkpoint/memory.bin", &extents, logical).unwrap();
+        drop(out);
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        let started = std::time::Instant::now();
+        let mut archive =
+            tar::Archive::new(std::io::BufReader::new(File::open(&tar_path).unwrap()));
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            true,
+            false,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        let memory = dest.join("checkpoint/memory.bin");
+        assert_eq!(fs::metadata(&memory).unwrap().len(), logical);
+        let synced = std::time::Instant::now();
+        File::open(&memory).unwrap().sync_all().unwrap();
+        eprintln!(
+            "BENCH runs={runs} unpack_ms={} fsync_ms={}",
+            elapsed.as_millis(),
+            synced.elapsed().as_millis()
+        );
+    }
+
     fn make_tar(name: &str, data: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();

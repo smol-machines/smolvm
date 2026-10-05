@@ -46,6 +46,10 @@ const PENDING_MARKER: &str = "pending";
 const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 pub(crate) const READONLY_INPUT_DIR: &str = ".restore-input";
 const READONLY_INPUT_MARKER: &str = "readonly-memory";
+/// Marker in a read-only RAM input whose bytes were still being written back
+/// when it was installed; it names the boot that installed it.
+#[cfg(target_os = "linux")]
+const UNSYNCED_INPUT_MARKER: &str = "unsynced";
 /// Suffix of the file beside a paused machine's data directory that records
 /// its disk chains' identity once it has stopped.
 const PAUSED_DISKS_SUFFIX: &str = ".paused-disks";
@@ -156,8 +160,22 @@ fn readonly_restore_supported() -> bool {
         .is_some_and(|krun| krun.set_snapshot_memory_fd.is_some())
 }
 
+/// Link the extracted RAM image in as this machine's read-only restore input.
+///
+/// `sync_pending` says the extraction is still writing that image back in the
+/// background. The input is then published with a marker naming this boot
+/// instead of waiting for the write-back, and `deferred` (or, without one, a
+/// write-back started here) clears the marker once the RAM is durable. Until
+/// then a start after a host restart refuses the input rather than resuming
+/// from RAM the restart may have lost.
 #[cfg(target_os = "linux")]
-fn stage_readonly_memory(source: &Path, vm_dir: &Path, asset: &CheckpointAsset) -> Result<bool> {
+fn stage_readonly_memory(
+    source: &Path,
+    vm_dir: &Path,
+    asset: &CheckpointAsset,
+    sync_pending: bool,
+    deferred: Option<&mut DeferredRestoreSync>,
+) -> Result<bool> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if !asset.sha256.is_empty() || !readonly_restore_supported() {
         return Ok(false);
@@ -195,7 +213,13 @@ fn stage_readonly_memory(source: &Path, vm_dir: &Path, asset: &CheckpointAsset) 
     }
     // Durability still matters: the retained image must survive a service/host
     // restart between import and start. Subsequent cache hits sync clean pages.
-    std::fs::File::open(&input)?.sync_all()?;
+    // While the extraction is still writing it back, the marker stands in.
+    let memory = std::fs::File::open(&input)?;
+    if sync_pending {
+        smolvm_pack::extract::mark_unsynced(&staging.path().join(UNSYNCED_INPUT_MARKER))?;
+    } else {
+        memory.sync_all()?;
+    }
     std::fs::File::open(staging.path())?.sync_all()?;
     if readonly_input_dirs(vm_dir)
         .iter()
@@ -205,12 +229,116 @@ fn stage_readonly_memory(source: &Path, vm_dir: &Path, asset: &CheckpointAsset) 
     }
     std::fs::rename(staging.path(), &destination)?;
     std::fs::File::open(parent)?.sync_all()?;
+    if sync_pending {
+        match deferred {
+            Some(deferred) => deferred.inputs.push((memory, destination)),
+            None => DeferredRestoreSync {
+                shared: None,
+                inputs: vec![(memory, destination)],
+            }
+            .start(),
+        }
+    }
     Ok(true)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn stage_readonly_memory(_: &Path, _: &Path, _: &CheckpointAsset) -> Result<bool> {
+fn stage_readonly_memory(
+    _: &Path,
+    _: &Path,
+    _: &CheckpointAsset,
+    _: bool,
+    _: Option<&mut DeferredRestoreSync>,
+) -> Result<bool> {
     Ok(false)
+}
+
+/// Checkpoint RAM a restore installed before it reached the disk, still to be
+/// written back: the shared extraction it came from and the machine inputs
+/// linked to it. [`Self::start`] runs the write-back in the background and
+/// clears each marker once its data is durable.
+#[derive(Default)]
+pub struct DeferredRestoreSync {
+    shared: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    inputs: Vec<(std::fs::File, PathBuf)>,
+}
+
+impl DeferredRestoreSync {
+    /// Write-back owed for `extracted`, if the extraction deferred it.
+    pub fn for_extraction(extracted: &Path) -> Self {
+        Self {
+            shared: smolvm_pack::extract::memory_sync_pending(extracted)
+                .then(|| extracted.to_path_buf()),
+            #[cfg(target_os = "linux")]
+            inputs: Vec::new(),
+        }
+    }
+
+    /// Start the write-back on a background thread.
+    ///
+    /// Writing gigabytes back stalls every other fsync on the filesystem while
+    /// it runs (an ext4 journal commit waits for it), including the installs of
+    /// restores that arrived together with this one. So it waits a moment for
+    /// those to finish first; the kernel's own write-back would start no sooner.
+    pub fn start(self) {
+        #[cfg(target_os = "linux")]
+        {
+            if self.shared.is_none() && self.inputs.is_empty() {
+                return;
+            }
+            let run = move || {
+                std::thread::sleep(DEFERRED_SYNC_GRACE);
+                if let Some(shared) = &self.shared {
+                    if let Err(error) = smolvm_pack::extract::sync_extracted_memory(shared) {
+                        tracing::warn!(extraction = %shared.display(), %error, "checkpoint RAM could not be written to disk; it will be extracted again on next use");
+                    }
+                }
+                for (memory, input_dir) in self.inputs {
+                    clear_synced_input(&memory, &input_dir);
+                }
+            };
+            if let Err(error) = std::thread::Builder::new()
+                .name("restore-ram-sync".into())
+                .spawn(run)
+            {
+                tracing::warn!(%error, "could not start checkpoint RAM write-back");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = self.shared;
+    }
+}
+
+/// How long a deferred write-back waits for concurrent restores to install.
+#[cfg(target_os = "linux")]
+const DEFERRED_SYNC_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Clear a machine input's marker once its RAM is durable, unless the input
+/// has since been replaced by another restore's.
+#[cfg(target_os = "linux")]
+fn clear_synced_input(memory: &std::fs::File, input_dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    if let Err(error) =
+        smolvm_pack::extract::write_back_paced(memory).and_then(|()| memory.sync_all())
+    {
+        tracing::warn!(input = %input_dir.display(), %error, "restore RAM could not be written to disk; a start after a host restart will refuse it");
+        return;
+    }
+    let same_input = match (
+        memory.metadata(),
+        std::fs::symlink_metadata(input_dir.join("memory.bin")),
+    ) {
+        (Ok(ours), Ok(current)) => (ours.dev(), ours.ino()) == (current.dev(), current.ino()),
+        _ => false,
+    };
+    if same_input {
+        if let Err(error) =
+            smolvm_pack::extract::clear_unsynced(&input_dir.join(UNSYNCED_INPUT_MARKER))
+        {
+            tracing::warn!(input = %input_dir.display(), %error, "could not clear restore RAM sync marker");
+        }
+    }
 }
 
 /// Open a retained RAM image while the boot process still has service privileges.
@@ -239,12 +367,19 @@ pub(crate) fn open_readonly_memory(vm_dir: &Path) -> Result<std::fs::File> {
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(input_dir)?;
+        .open(&input_dir)?;
     let metadata = directory.metadata()?;
     if metadata.uid() != 0 || metadata.mode() & 0o777 != 0o700 {
         return Err(Error::agent(
             "open restore RAM",
             "input directory must be service-owned mode 0700",
+        ));
+    }
+    if smolvm_pack::extract::unsynced_before_this_boot(&input_dir.join(UNSYNCED_INPUT_MARKER)) {
+        return Err(Error::agent(
+            "open restore RAM",
+            "this machine's checkpoint RAM had not reached the disk when the host restarted; \
+             restore the checkpoint again",
         ));
     }
     // Anchor the lookup to the validated directory and never follow a symlink.
@@ -888,6 +1023,8 @@ pub struct VerifiedSidecar {
     footer: smolvm_pack::format::PackFooter,
     #[cfg(unix)]
     identity: SidecarIdentity,
+    /// SHA-256 of the same bytes, when it was taken while they were received.
+    sha256: Option<String>,
 }
 
 pub(crate) enum SidecarVerification {
@@ -945,7 +1082,57 @@ fn classify_sidecar_verification_after_read(
         footer,
         #[cfg(unix)]
         identity,
+        sha256: None,
     }))
+}
+
+/// Verification of a checkpoint the service has just written itself, from
+/// checksums taken over the bytes as they were written, so it is not read
+/// back. `None` whenever those checksums cannot stand in for a read of the
+/// file: another layout than a checkpoint's, a checksum mismatch, or a file
+/// someone other than the service could have written. The caller then
+/// verifies it the ordinary way, which also reports any mismatch.
+#[cfg(unix)]
+pub fn verified_from_received(
+    artifact: &Path,
+    hashes: &smolvm_pack::extract::ReceivedArtifactHashes,
+    service_only_since_creation: bool,
+) -> Option<VerifiedSidecar> {
+    if !service_only_since_creation || !smolvm_pack::extract::only_service_can_write(artifact) {
+        return None;
+    }
+    let mut file = std::fs::File::open(artifact).ok()?;
+    let before = SidecarIdentity::of(&file).ok()?;
+    if before.len != hashes.len {
+        return None;
+    }
+    let footer = smolvm_pack::packer::read_footer_from_file(&mut file).ok()?;
+    // In a checkpoint's layout the footer checksum covers every byte before
+    // the footer, which is exactly what the stream's CRC covered.
+    check_checkpoint_layout(&footer, before.len).ok()?;
+    if hashes.crc32_before_footer != Some(footer.checksum) {
+        return None;
+    }
+    if SidecarIdentity::of(&file).ok()? != before
+        || !smolvm_pack::extract::only_service_can_write(artifact)
+    {
+        return None;
+    }
+    Some(VerifiedSidecar {
+        file,
+        footer,
+        identity: before,
+        sha256: Some(hashes.sha256.clone()),
+    })
+}
+
+#[cfg(not(unix))]
+pub fn verified_from_received(
+    _: &Path,
+    _: &smolvm_pack::extract::ReceivedArtifactHashes,
+    _: bool,
+) -> Option<VerifiedSidecar> {
+    None
 }
 
 impl VerifiedSidecar {
@@ -957,7 +1144,28 @@ impl VerifiedSidecar {
             footer: self.footer,
             #[cfg(unix)]
             identity: self.identity,
+            sha256: self.sha256.clone(),
         })
+    }
+
+    /// The SHA-256 taken while this artifact was received, bound to the
+    /// pinned inode, for the shared extraction to use instead of hashing the
+    /// file again. Only meaningful after [`Self::covers`] held for the path.
+    pub(crate) fn digest_proof(&self) -> Option<smolvm_pack::extract::ArtifactDigestProof> {
+        #[cfg(unix)]
+        {
+            let digest = self.sha256.clone()?;
+            let file = self.file.try_clone().ok()?;
+            let proof =
+                smolvm_pack::extract::ArtifactDigestProof::received(file, digest, true).ok()?;
+            // The proof records the inode as it is now; it must still be the
+            // one whose bytes were hashed.
+            (SidecarIdentity::of(&self.file).ok()? == self.identity).then_some(proof)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     /// The verified footer.
@@ -2830,14 +3038,30 @@ pub fn verify_checkpoint_pack(sidecar: &Path, packed: &CheckpointPackedLayers) -
 /// directory. Used both when a machine is created from a pack and when a
 /// checkpoint of one is restored.
 pub fn materialize_pack_layers(name: &str, sidecar: &Path) -> Result<()> {
+    materialize_pack_layers_with_options(
+        name,
+        sidecar,
+        smolvm_pack::extract::SharedExtractOptions::default(),
+    )
+}
+
+/// [`materialize_pack_layers`] with the shortcuts a restore can take: a
+/// SHA-256 already known for the artifact's inode (see
+/// [`VerifiedSidecar::digest_proof`]), and, for a long-lived server, leaving
+/// checkpoint RAM to reach the disk in the background.
+pub fn materialize_pack_layers_with_options(
+    name: &str,
+    sidecar: &Path,
+    options: smolvm_pack::extract::SharedExtractOptions,
+) -> Result<()> {
     let cache_dir = crate::agent::machine_layers_cache_dir(name);
     let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
         .map_err(|error| Error::agent("read sidecar footer", error.to_string()))?;
     if smolvm_pack::extract::shared_extract_enabled() {
         #[cfg(target_os = "linux")]
         {
-            crate::artifact_cache::materialize_shared_pack_lease(
-                sidecar, &footer, &cache_dir, false,
+            crate::artifact_cache::materialize_shared_pack_lease_with_options(
+                sidecar, &footer, &cache_dir, false, options,
             )
             .map_err(|error| Error::agent("extract sidecar (shared)", error.to_string()))?;
             return Ok(());
@@ -2845,6 +3069,8 @@ pub fn materialize_pack_layers(name: &str, sidecar: &Path) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         unreachable!("shared pack extraction is Linux-only")
     }
+    // A private extraction neither hashes the artifact nor defers its sync.
+    drop(options);
     smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
     match std::fs::remove_dir_all(&cache_dir) {
         Ok(()) => {}
@@ -4389,7 +4615,18 @@ pub fn install(
     vm_data_dir: &Path,
     checkpoint: &PortableCheckpointManifest,
 ) -> Result<()> {
-    install_with(extracted, vm_data_dir, checkpoint, false)
+    install_with(extracted, vm_data_dir, checkpoint, false, None)
+}
+
+/// [`install`], leaving any write-back of RAM the extraction deferred to
+/// `deferred`, for the caller to start once the install is done.
+pub fn install_deferring_sync(
+    extracted: &Path,
+    vm_data_dir: &Path,
+    checkpoint: &PortableCheckpointManifest,
+    deferred: &mut DeferredRestoreSync,
+) -> Result<()> {
+    install_with(extracted, vm_data_dir, checkpoint, false, Some(deferred))
 }
 
 /// [`install`]; with `keep_disks`, the machine keeps the disk chains it has,
@@ -4399,6 +4636,7 @@ fn install_with(
     vm_data_dir: &Path,
     checkpoint: &PortableCheckpointManifest,
     keep_disks: bool,
+    mut deferred: Option<&mut DeferredRestoreSync>,
 ) -> Result<()> {
     validate_compatibility(checkpoint)?;
     validate_disk_manifest(&checkpoint.disks)?;
@@ -4429,7 +4667,13 @@ fn install_with(
                 .file_name()
                 .expect("fixed checkpoint asset path");
             if expected == "checkpoint/memory.bin"
-                && stage_readonly_memory(&extracted.join(expected), vm_data_dir, asset)?
+                && stage_readonly_memory(
+                    &extracted.join(expected),
+                    vm_data_dir,
+                    asset,
+                    smolvm_pack::extract::memory_sync_pending(extracted),
+                    deferred.as_deref_mut(),
+                )?
             {
                 std::fs::write(partial.join(READONLY_INPUT_MARKER), b"1\n")?;
                 tracing::info!(
@@ -4732,7 +4976,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
         tracing::info!(machine = %record.name, phase = "extract", elapsed_ms = extract_started.elapsed().as_millis(), "paused resume phase completed");
         clear_stale_restore_state(&vm_data)?;
-        install_with(staged.path(), &vm_data, checkpoint, keep_disks)
+        install_with(staged.path(), &vm_data, checkpoint, keep_disks, None)
     };
     // Stage on tmpfs when there is room, so the RAM image handed to the VMM
     // is never written to disk. Its RAM is freed once the VMM has read it.
@@ -4967,6 +5211,89 @@ mod tests {
             ..footer
         };
         assert!(check_checkpoint_layout(&stub, exact).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_received_checkpoint_is_verified_from_its_stream_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let assets: Vec<u8> = (0..1000_u32).map(|i| (i * 13 % 251) as u8).collect();
+        let manifest = vec![b'm'; 200];
+        let mut prefix = assets.clone();
+        prefix.extend_from_slice(&manifest);
+        // The CRC the stream reports for these bytes followed by any footer.
+        let mut probe = smolvm_pack::extract::ArtifactStreamHasher::new();
+        probe.update(&prefix);
+        probe.update(&[0; smolvm_pack::format::FOOTER_SIZE]);
+        let checksum = probe.finish().crc32_before_footer.unwrap();
+        let footer = smolvm_pack::format::PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: assets.len() as u64,
+            manifest_offset: assets.len() as u64,
+            manifest_size: manifest.len() as u64,
+            checksum,
+        };
+        let mut bytes = prefix.clone();
+        bytes.extend_from_slice(&footer.to_bytes());
+        let artifact = dir.path().join("upload.smolcheckpoint");
+        std::fs::write(&artifact, &bytes).unwrap();
+        let streamed = |data: &[u8]| {
+            let mut hasher = smolvm_pack::extract::ArtifactStreamHasher::new();
+            for chunk in data.chunks(97) {
+                hasher.update(chunk);
+            }
+            hasher.finish()
+        };
+        let hashes = streamed(&bytes);
+
+        let verified = verified_from_received(&artifact, &hashes, true).expect("verified");
+        assert_eq!(verified.footer().checksum, checksum);
+        assert!(verified.covers(&artifact));
+        assert!(verified.digest_proof().is_some());
+        // The full-read verification agrees with the streamed one.
+        assert!(verify_sidecar_pinned(&artifact).is_ok());
+
+        // Anything that breaks the correspondence falls back to a real read.
+        assert!(verified_from_received(&artifact, &hashes, false).is_none());
+        let mut wrong = hashes.clone();
+        wrong.crc32_before_footer = Some(checksum ^ 1);
+        assert!(verified_from_received(&artifact, &wrong, true).is_none());
+        let mut short = hashes.clone();
+        short.len -= 1;
+        assert!(verified_from_received(&artifact, &short, true).is_none());
+        let mut padded = bytes.clone();
+        padded.insert(prefix.len(), 0);
+        std::fs::write(&artifact, &padded).unwrap();
+        assert!(verified_from_received(&artifact, &streamed(&padded), true).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_received_verification_stops_covering_a_rewritten_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe = smolvm_pack::extract::ArtifactStreamHasher::new();
+        probe.update(b"payload");
+        probe.update(&[0; smolvm_pack::format::FOOTER_SIZE]);
+        let footer = smolvm_pack::format::PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 7,
+            manifest_offset: 7,
+            manifest_size: 0,
+            checksum: probe.finish().crc32_before_footer.unwrap(),
+        };
+        let mut bytes = b"payload".to_vec();
+        bytes.extend_from_slice(&footer.to_bytes());
+        let artifact = dir.path().join("upload.smolcheckpoint");
+        std::fs::write(&artifact, &bytes).unwrap();
+        let mut hasher = smolvm_pack::extract::ArtifactStreamHasher::new();
+        hasher.update(&bytes);
+        let verified = verified_from_received(&artifact, &hasher.finish(), true).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&artifact, &bytes).unwrap();
+        assert!(!verified.covers(&artifact));
+        assert!(verified.digest_proof().is_none());
     }
 
     #[test]

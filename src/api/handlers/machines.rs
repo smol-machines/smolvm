@@ -637,6 +637,48 @@ async fn shared_checkpoint_take(
     Ok(Some(take))
 }
 
+/// Hashes a checkpoint on a blocking thread as it is received, so verifying
+/// it and naming it by SHA-256 need no further read of the written file.
+/// Best-effort: if hashing stops, the artifact is simply verified by reading it.
+struct ReceiveHasher {
+    sender: Option<tokio::sync::mpsc::Sender<axum::body::Bytes>>,
+    task: tokio::task::JoinHandle<smolvm_pack::extract::ReceivedArtifactHashes>,
+}
+
+impl ReceiveHasher {
+    fn spawn() -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<axum::body::Bytes>(64);
+        let task = tokio::task::spawn_blocking(move || {
+            let mut hasher = smolvm_pack::extract::ArtifactStreamHasher::new();
+            while let Some(chunk) = receiver.blocking_recv() {
+                hasher.update(&chunk);
+            }
+            hasher.finish()
+        });
+        Self {
+            sender: Some(sender),
+            task,
+        }
+    }
+
+    /// Queue the next received bytes; waits while the hasher is behind, so
+    /// memory stays bounded.
+    async fn update(&mut self, chunk: axum::body::Bytes) {
+        if let Some(sender) = &self.sender {
+            if sender.send(chunk).await.is_err() {
+                self.sender = None;
+            }
+        }
+    }
+
+    /// Hashes of everything queued, or `None` if hashing stopped early.
+    async fn finish(mut self) -> Option<smolvm_pack::extract::ReceivedArtifactHashes> {
+        let complete = self.sender.take().is_some();
+        let hashes = (&mut self.task).await.ok()?;
+        complete.then_some(hashes)
+    }
+}
+
 fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
     let root = std::env::var_os("SMOLVM_PACK_STAGING")
         .map(std::path::PathBuf::from)
@@ -1726,6 +1768,7 @@ pub async fn restore_portable_checkpoint(
         }
     };
     let limit = max_checkpoint_upload_bytes();
+    let mut received_hashes = None;
     let received: u64 = if cache_hit {
         std::fs::metadata(&artifact).map(|m| m.len()).unwrap_or(0)
     } else {
@@ -1735,6 +1778,11 @@ pub async fn restore_portable_checkpoint(
             .open(&artifact)
             .await
             .map_err(|error| ApiError::internal(format!("create checkpoint upload: {error}")))?;
+        // Checked once the file exists and again once it is complete: only a
+        // file nobody else could write between the two is verified from the
+        // bytes as they were received instead of being read back.
+        let service_only = smolvm_pack::extract::only_service_can_write(&artifact);
+        let mut hasher = ReceiveHasher::spawn();
         let mut received = 0_u64;
         if let Some(raw) = options.source_url.as_deref() {
             // Pull the checkpoint ourselves. `none()` redirects: a signed URL needs
@@ -1781,6 +1829,7 @@ pub async fn restore_portable_checkpoint(
                 file.write_all(&chunk)
                     .await
                     .map_err(|error| ApiError::internal(format!("write checkpoint: {error}")))?;
+                hasher.update(chunk).await;
             }
         } else {
             let mut body = request.into_body().into_data_stream();
@@ -1799,15 +1848,19 @@ pub async fn restore_portable_checkpoint(
                 file.write_all(&chunk).await.map_err(|error| {
                     ApiError::internal(format!("write checkpoint upload: {error}"))
                 })?;
+                hasher.update(chunk).await;
             }
         }
         file.flush()
             .await
             .map_err(|error| ApiError::internal(format!("flush checkpoint upload: {error}")))?;
-        file.sync_all()
-            .await
-            .map_err(|error| ApiError::internal(format!("sync checkpoint upload: {error}")))?;
+        // No fsync: this file only carries the checkpoint into extraction and
+        // is removed afterwards. Everything installed from it is made durable
+        // where it is installed, and a node cache entry made from it is
+        // verified on every later use, so forcing it to disk first only made
+        // the restore wait for a write nothing depends on.
         drop(file);
+        received_hashes = hasher.finish().await.map(|hashes| (hashes, service_only));
         received
     };
     if received > limit {
@@ -1820,6 +1873,19 @@ pub async fn restore_portable_checkpoint(
             "checkpoint upload is empty".to_string(),
         ));
     }
+    // A miss was hashed while it arrived; when that covers what the footer
+    // checksum covers, creation uses it instead of reading the file again.
+    let verified = match received_hashes {
+        Some((hashes, service_only)) => {
+            let artifact = artifact.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::portable_checkpoint::verified_from_received(&artifact, &hashes, service_only)
+            })
+            .await
+            .map_err(|error| ApiError::internal(format!("checkpoint verification task: {error}")))?
+        }
+        None => verified,
+    };
 
     // Prepared state is an optional optimization: eviction or missing metadata
     // falls back to the durable artifact before machine creation starts.
@@ -2311,6 +2377,9 @@ async fn create_machine_inner(
         None => None,
     };
 
+    // SHA-256 taken while a restored checkpoint was received, handed to the
+    // shared extraction so it does not hash the artifact again.
+    let mut received_digest: Option<smolvm_pack::extract::ArtifactDigestProof> = None;
     // If --from is set, read manifest and extract sidecar
     let (
         image,
@@ -2337,23 +2406,25 @@ async fn create_machine_inner(
         // have changed link metadata in between; reverify under the same lease
         // used by lookup, publication, eviction and transfer cleanup.
         let verification_path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        received_digest = tokio::task::spawn_blocking(move || {
             let _lock = if cached_checkpoint {
                 Some(lock_checkpoint_cache_verification(&checkpoint_cache_dir()?)
                     .map_err(|e| ApiError::internal(format!("lock checkpoint verification: {e}")))?)
             } else {
                 None
             };
-            if verified.as_ref().is_some_and(|input| input.covers(&verification_path)) {
+            let mut digest = None;
+            if let Some(input) = verified.as_ref().filter(|input| input.covers(&verification_path)) {
                 tracing::info!(
                     artifact = %verification_path.display(),
                     "reusing this request's pinned checkpoint verification; skipping a second checksum pass"
                 );
+                digest = input.digest_proof();
             } else {
                 crate::portable_checkpoint::verified_sidecar_footer(&verification_path)
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             }
-            Ok::<_, ApiError>(())
+            Ok::<_, ApiError>(digest)
         }).await.map_err(|e| ApiError::internal(format!("checkpoint verification task: {e}")))??;
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
@@ -2621,11 +2692,20 @@ async fn create_machine_inner(
     if let Some(ref sidecar_path) = source_smolmachine {
         let name = name.clone();
         let sidecar_path = sidecar_path.clone();
+        let digest = received_digest.take();
         tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
             let path = std::path::Path::new(&sidecar_path);
             let cache_dir = crate::agent::machine_layers_cache_dir(&name);
-            let result = crate::portable_checkpoint::materialize_pack_layers(&name, path)
-                .map_err(|e| ApiError::internal(e.to_string()));
+            // The server outlives the restore, so checkpoint RAM can finish
+            // reaching the disk after the machine is created.
+            let options = smolvm_pack::extract::SharedExtractOptions {
+                digest,
+                defer_memory_sync: true,
+            };
+            let result = crate::portable_checkpoint::materialize_pack_layers_with_options(
+                &name, path, options,
+            )
+            .map_err(|e| ApiError::internal(e.to_string()));
             // Detach the case-sensitive volume mounted during extraction so a
             // created-but-unstarted machine leaves nothing mounted, and so the
             // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
@@ -2722,17 +2802,24 @@ async fn create_machine_inner(
             let cache_dir = crate::agent::machine_layers_cache_dir(&name_for_checkpoint);
             let content_dir = crate::agent::read_shared_pack_pointer(&cache_dir)
                 .unwrap_or_else(|| cache_dir.clone());
-            crate::portable_checkpoint::install(
+            // RAM the extraction left for later reaches the disk after this
+            // install, whether or not it succeeds, so it does not slow it down.
+            let mut deferred =
+                crate::portable_checkpoint::DeferredRestoreSync::for_extraction(&content_dir);
+            let installed = crate::portable_checkpoint::install_deferring_sync(
                 &content_dir,
                 &vm_data_dir(&name_for_checkpoint),
                 &checkpoint,
+                &mut deferred,
             )
             .and_then(|()| {
                 crate::portable_checkpoint::discard_transport_pack(&vm_data_dir(
                     &name_for_checkpoint,
                 ))
             })
-            .map_err(|error| ApiError::BadRequest(error.to_string()))
+            .map_err(|error| ApiError::BadRequest(error.to_string()));
+            deferred.start();
+            installed
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))?;
