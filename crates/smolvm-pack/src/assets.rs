@@ -1550,9 +1550,12 @@ fn append_checkpoint_tree<W: Write>(
     name: &Path,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
+    // Tar paths use `/` on every host; a Windows `Path` joins with `\`.
     let archive_path = name
         .to_str()
-        .ok_or_else(|| PackError::Tar(format!("{} is not UTF-8", name.display())))?;
+        .ok_or_else(|| PackError::Tar(format!("{} is not UTF-8", name.display())))?
+        .replace('\\', "/");
+    let archive_path = archive_path.as_str();
     if metadata.is_dir() {
         builder
             .append_dir(name, path)
@@ -2055,6 +2058,8 @@ mod tests {
         }
     }
 
+    // macOS packs checkpoints through `append_macos_sparse_file` instead.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn checkpoint_ram_is_packed_as_aligned_nonzero_blocks() {
         let temp_dir = tempfile::tempdir().unwrap();
