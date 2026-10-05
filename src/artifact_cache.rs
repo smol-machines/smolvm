@@ -256,6 +256,18 @@ fn read_lease_from_machine_dir(
     machine_dir: &Path,
     shared_root: &Path,
 ) -> io::Result<Option<SharedPackLease>> {
+    let Some(shared_dir) = read_leased_shared_dir(machine_dir, shared_root)? else {
+        return Ok(None);
+    };
+    let artifact_sha256 = read_artifact_digest(&shared_dir)?;
+    Ok(Some(SharedPackLease {
+        shared_dir,
+        artifact_sha256,
+    }))
+}
+
+/// The shared extraction a machine directory's pointer names, if it has one.
+fn read_leased_shared_dir(machine_dir: &Path, shared_root: &Path) -> io::Result<Option<PathBuf>> {
     let pointer = machine_dir.join(SHARED_PACK_POINTER);
     let metadata = match fs::symlink_metadata(&pointer) {
         Ok(metadata) => metadata,
@@ -279,12 +291,7 @@ fn read_lease_from_machine_dir(
             format!("empty shared pack pointer: {}", pointer.display()),
         ));
     }
-    let shared_dir = canonical_shared_dir(Path::new(target), shared_root)?;
-    let artifact_sha256 = read_artifact_digest(&shared_dir)?;
-    Ok(Some(SharedPackLease {
-        shared_dir,
-        artifact_sha256,
-    }))
+    canonical_shared_dir(Path::new(target), shared_root).map(Some)
 }
 
 fn touch_lease(lease: &SharedPackLease) {
@@ -621,10 +628,24 @@ fn collect_machine_leases(
                 ),
             ));
         }
-        if let Some(lease) = read_lease_from_machine_dir(&entry.path(), shared_root)? {
-            digests.insert(lease.artifact_sha256);
-            shared_dirs.insert(lease.shared_dir);
+        // A pointer to an extraction that is already gone protects nothing, and
+        // one extracted before artifact digests were recorded is protected by
+        // its path alone. Neither may abort the scan: every caller is a cleanup
+        // that would otherwise never run again on this host.
+        let shared_dir = match read_leased_shared_dir(&entry.path(), shared_root) {
+            Ok(Some(shared_dir)) => shared_dir,
+            Ok(None) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        match read_artifact_digest(&shared_dir) {
+            Ok(digest) => {
+                digests.insert(digest);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
+        shared_dirs.insert(shared_dir);
     }
     Ok((digests, shared_dirs))
 }
@@ -716,6 +737,11 @@ fn inventory_candidates(
                         error = %error,
                         "unreferenced legacy shared cache has no valid artifact SHA"
                     );
+                    (format!("shared:{name}"), None)
+                }
+                // A machine still uses this pre-digest extraction; the lease
+                // keeps it, so it needs no digest to be left alone.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     (format!("shared:{name}"), None)
                 }
                 Err(error) => return Err(error),
@@ -1281,6 +1307,38 @@ mod tests {
         assert!(!smolvm_pack::extract::shared_artifact_sha256_path(&oldest).exists());
         assert!(middle.exists() && newest.exists());
         assert!(leased.exists() && leased_cow.exists());
+    }
+
+    #[test]
+    fn trim_survives_leases_on_pre_digest_and_vanished_extractions() {
+        const DIGEST_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (legacy, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        let (gone, _) = install_artifact(&root, "bbbbbbbb", DIGEST_B);
+        let (stale, stale_cow) = install_artifact(&root, "cccccccc", DIGEST_C);
+        age_artifact(&stale, DIGEST_C, 300);
+        publish_test_lease(&machine_dir(&root, "01"), &legacy);
+        publish_test_lease(&machine_dir(&root, "02"), &gone);
+        // Extracted before digests were recorded, and removed out from under
+        // its machine: neither may stop the trim.
+        fs::remove_file(smolvm_pack::extract::shared_artifact_sha256_path(&legacy)).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        fs::remove_file(smolvm_pack::extract::shared_artifact_sha256_path(&gone)).unwrap();
+
+        let report = trim_unleased_shared_packs_in(&root, 0, u64::MAX)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            legacy.exists(),
+            "a leased extraction is kept without a digest"
+        );
+        assert!(!stale.exists() && !stale_cow.exists());
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.artifact == DIGEST_C));
     }
 
     #[test]
