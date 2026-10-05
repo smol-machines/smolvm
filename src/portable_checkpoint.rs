@@ -560,6 +560,42 @@ impl Default for RestoreCache {
     }
 }
 
+static PROCESS_RESTORE_CACHE: std::sync::OnceLock<RestoreCache> = std::sync::OnceLock::new();
+
+impl RestoreCache {
+    /// The policy this process set at startup with [`RestoreCache::set_process`],
+    /// or the default. A server sizes it for the host's disk; a CLI command
+    /// keeps the small default, or passes its own policy explicitly.
+    pub fn process() -> Self {
+        PROCESS_RESTORE_CACHE.get().copied().unwrap_or_default()
+    }
+
+    /// Set the policy [`RestoreCache::process`] returns. The first call wins.
+    pub fn set_process(cache: Self) {
+        let _ = PROCESS_RESTORE_CACHE.set(cache);
+    }
+}
+
+/// Default space for captured checkpoints kept beside their extraction so a
+/// restore on the same host skips the download.
+pub const DEFAULT_PREPARED_CHECKPOINT_BUDGET: u64 = 8 * 1024 * 1024 * 1024;
+
+static PROCESS_PREPARED_CHECKPOINT_BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Space this process keeps for prepared captures: what it set at startup with
+/// [`set_prepared_checkpoint_budget`], or [`DEFAULT_PREPARED_CHECKPOINT_BUDGET`].
+pub fn prepared_checkpoint_budget() -> u64 {
+    PROCESS_PREPARED_CHECKPOINT_BUDGET
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_PREPARED_CHECKPOINT_BUDGET)
+}
+
+/// Set the budget [`prepared_checkpoint_budget`] returns. The first call wins.
+pub fn set_prepared_checkpoint_budget(bytes: u64) {
+    let _ = PROCESS_PREPARED_CHECKPOINT_BUDGET.set(bytes);
+}
+
 /// Materialize a stored checkpoint for restore, diffing against the node's
 /// bounded cache of pristine checkpoint materializations. Exact revisits clone
 /// without rewriting RAM; misses diff against a recent checkpoint. Both the CLI
@@ -873,7 +909,7 @@ pub fn restore_from_path_at(
                 artifact,
                 &cache_dir,
                 generation.as_deref(),
-                RestoreCache::default(),
+                RestoreCache::process(),
             )?;
         }
         log_phase(name, "restore_extract", &mut phase);

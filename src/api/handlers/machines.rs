@@ -1021,7 +1021,7 @@ pub async fn capture_portable_checkpoint(
         std::env::var("SMOLVM_PREPARED_CHECKPOINT_CACHE_MAX_BYTES")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(8 * 1024 * 1024 * 1024)
+            .unwrap_or_else(crate::portable_checkpoint::prepared_checkpoint_budget)
     });
     // Keep staging alive until the background capture finishes, even on disconnect.
     let (transfer, result) = with_owned_transfer(transfer, move |_dir| {

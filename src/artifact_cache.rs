@@ -832,6 +832,7 @@ fn remove_candidate(candidate: &CacheCandidate) -> io::Result<()> {
     for path in &candidate.shared_dirs {
         smolvm_pack::extract::force_detach_layers_volume(path);
         make_tree_owner_writable(path)?;
+        smolvm_pack::extract::invalidate_extraction(path)?;
         fs::remove_dir_all(path)?;
     }
     for path in &candidate.metadata_files {
@@ -920,7 +921,7 @@ pub fn prune_artifact_caches(keep: usize, dry_run: bool) -> io::Result<ArtifactC
 /// Never waits: when another process holds the cache lock (an extraction in
 /// progress), it returns `None` and a later call trims instead.
 pub fn trim_unleased_shared_packs() -> io::Result<Option<ArtifactCachePruneReport>> {
-    let policy = crate::portable_checkpoint::RestoreCache::default();
+    let policy = crate::portable_checkpoint::RestoreCache::process();
     trim_unleased_shared_packs_in(&vm_cache_root(), policy.entries, policy.max_bytes)
 }
 

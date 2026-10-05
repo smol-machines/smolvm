@@ -1402,6 +1402,20 @@ pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
     Ok(base.join("smolvm-pack").join(format!("{:08x}", checksum)))
 }
 
+/// Mark an extraction incomplete before removing it, so a removal interrupted
+/// part-way (a crash, a restart) leaves a tree that is extracted again on its
+/// next use instead of one that still claims to be whole. The marker lives
+/// inside the tree, and `remove_dir_all` may reach it after the files a
+/// restore needs.
+pub fn invalidate_extraction(cache_dir: &Path) -> std::io::Result<()> {
+    match fs::remove_file(cache_dir.join(EXTRACTION_MARKER)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    fs::File::open(cache_dir)?.sync_all()
+}
+
 /// Check if assets have already been extracted.
 ///
 /// An extraction whose checkpoint RAM was still only in the page cache when
@@ -6609,6 +6623,22 @@ mod tests {
 
         fs::write(temp_dir.path().join(EXTRACTION_MARKER), "").unwrap();
         assert!(is_extracted(temp_dir.path()));
+    }
+
+    #[test]
+    fn an_invalidated_extraction_is_extracted_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("abcd1234");
+        std::fs::create_dir_all(dir.join("checkpoint/disks")).unwrap();
+        std::fs::write(dir.join(EXTRACTION_MARKER), "").unwrap();
+        assert!(is_extracted(&dir));
+
+        // A removal stopped right after this must not leave a tree that still
+        // claims to be whole.
+        invalidate_extraction(&dir).unwrap();
+        assert!(!is_extracted(&dir));
+        assert!(dir.join("checkpoint/disks").is_dir());
+        invalidate_extraction(&dir).unwrap();
     }
 
     #[test]
