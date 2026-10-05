@@ -1164,6 +1164,8 @@ pub fn verified_from_received(
     })
 }
 
+/// Hashes taken while receiving are not trusted on this platform, so the
+/// artifact is always read again to verify it.
 #[cfg(not(unix))]
 pub fn verified_from_received(
     _: &Path,
