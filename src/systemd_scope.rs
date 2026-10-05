@@ -367,6 +367,56 @@ pub fn set_scope_cpu_count(machine_id: &str, cpus: u8) -> Result<()> {
     Ok(())
 }
 
+/// Stop the scope a failed launch created once its VM process is gone.
+///
+/// A VM process that exits before systemd moves it into the new scope never
+/// populates the scope's cgroup, so systemd never sees that cgroup become
+/// empty and the scope stays active with no processes in it. Only the launch
+/// that created the scope may call this, after confirming its process is dead.
+/// A scope that is already gone counts as stopped.
+pub fn stop_scope(machine_id: &str) -> Result<()> {
+    let busctl = busctl_path()
+        .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot stop scope"))?;
+    let name = scope_name(machine_id);
+    let mut cmd = Command::new(&busctl);
+    cmd.args(scope_stop_args(&name));
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if out.status.success() || scope_already_gone(&out.stderr) {
+        tracing::info!(scope = %name, "stopped VM scope left by a failed launch");
+        return Ok(());
+    }
+    Err(Error::agent(
+        "vm scope",
+        format!(
+            "StopUnit {name} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    ))
+}
+
+fn scope_stop_args(name: &str) -> Vec<String> {
+    // StopUnit(name: s, mode: s).
+    [
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "StopUnit",
+        "ss",
+        name,
+        "replace",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// Whether a unit call failed only because the unit no longer exists.
+fn scope_already_gone(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("not loaded") || stderr.contains("NoSuchUnit") || stderr.contains("not found")
+}
+
 /// Force-kill a VM's transient scope: SIGKILL every process in its cgroup.
 ///
 /// This is the AUTHORITATIVE teardown when the pid-based delete can't confirm
@@ -410,17 +460,16 @@ pub fn kill_scope(machine_id: &str) -> Result<bool> {
             return Ok(true);
         }
         // A scope that already exited is not loaded — teardown is effectively done.
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("not loaded")
-            || stderr.contains("NoSuchUnit")
-            || stderr.contains("not found")
-        {
+        if scope_already_gone(&out.stderr) {
             tracing::debug!(scope = %name, "scope already gone on kill");
             return Ok(true);
         }
         Err(Error::agent(
             "vm scope",
-            format!("KillUnit {name} failed: {}", stderr.trim()),
+            format!(
+                "KillUnit {name} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
         ))
     }
 }
@@ -498,6 +547,43 @@ mod tests {
             b"Call failed: Unit smolvm-vm-x.scope was already loaded or has a fragment file."
         ));
         assert!(!scope_start_collided(b"Call failed: Access denied"));
+    }
+
+    #[test]
+    fn scope_stop_targets_only_the_named_unit() {
+        assert_eq!(
+            scope_stop_args("smolvm-vm-m.scope")[4..],
+            ["StopUnit", "ss", "smolvm-vm-m.scope", "replace"]
+        );
+        assert!(scope_already_gone(
+            b"Call failed: Unit smolvm-vm-m.scope not loaded."
+        ));
+        assert!(!scope_already_gone(b"Call failed: Access denied"));
+    }
+
+    /// A process that exits before systemd moves it leaves an empty scope
+    /// that stays active; stopping it is what removes it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root on a systemd host"]
+    fn stop_scope_removes_a_scope_whose_process_exited_before_adoption() {
+        let active = |id: &str| {
+            Command::new("systemctl")
+                .args(["is-active", "--quiet", &scope_name(id)])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let id = format!("scope-test-{}", std::process::id());
+        let mut child = Command::new("true").spawn().unwrap();
+        // Exited but not yet reaped, like a VM process refused at boot.
+        std::thread::sleep(Duration::from_millis(200));
+        adopt_into_scope(&id, child.id() as i32, &ScopeCaps::default()).unwrap();
+        child.wait().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(active(&id), "the empty scope should still be active");
+        stop_scope(&id).unwrap();
+        assert!(!active(&id));
+        stop_scope(&id).unwrap();
     }
 
     #[test]

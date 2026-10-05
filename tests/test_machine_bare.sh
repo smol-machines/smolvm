@@ -538,6 +538,11 @@ test_docker_in_vm() {
 
     # ── Create ────────────────────────────────────────────────────────────────
     echo "phase: create"
+    # Count the example's init commands rather than hard-coding them, so the
+    # test follows the example when it gains a step.
+    local init_count
+    init_count=$(awk '/^init = \[/{f=1; next} f && /^\]/{exit} f && /^[[:space:]]*"/{n++} END{print n+0}' "$smolfile")
+    [[ "$init_count" -gt 0 ]] || { echo "FAIL: no init commands found in $smolfile"; return 1; }
     local output
     output=$($SMOLVM machine create --name "$vm_name" \
         -s "$smolfile" --net-backend virtio-net 2>&1) || {
@@ -545,8 +550,8 @@ test_docker_in_vm() {
         echo "$output"
         return 1
     }
-    [[ "$output" == *"Init commands: 4"* ]] || {
-        echo "FAIL: expected 4 init commands, got: $output"
+    [[ "$output" == *"Init commands: $init_count"* ]] || {
+        echo "FAIL: expected $init_count init commands, got: $output"
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
@@ -559,8 +564,8 @@ test_docker_in_vm() {
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
-    [[ "$output" == *"Running 4 init command"* ]] || {
-        echo "FAIL: expected 4 init commands to run on first start"
+    [[ "$output" == *"Running $init_count init command"* ]] || {
+        echo "FAIL: expected $init_count init commands to run on first start"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true

@@ -958,6 +958,21 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn a_started_machine_does_not_seed_again() {
+        let mut record = crate::config::VmRecord::new(
+            "seed-test-started-machine".to_string(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+        );
+        record.image = Some("alpine:3.20".to_string());
+        record.mark_image_on_storage();
+        assert_eq!(wants_seed(&record.name, &record, false), None);
+    }
+
+    #[test]
     fn key_changes_with_digest_and_image() {
         let template = std::env::temp_dir().join("seed-key-template");
         std::fs::write(&template, b"t").unwrap();

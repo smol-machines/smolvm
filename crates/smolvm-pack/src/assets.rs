@@ -517,6 +517,25 @@ pub const WORKSPACE_SEED_DIR: &str = "workspace-seed";
 /// Name of the workspace seed tar inside [`WORKSPACE_SEED_DIR`].
 pub const WORKSPACE_SEED_FILE: &str = "workspace.tar";
 
+/// A file packed with a few byte ranges replaced, while the file itself is
+/// only read.
+///
+/// This packs an immutable file the caller must not modify, such as a qcow2
+/// layer still backing a running machine, with a rewritten header and without
+/// copying it first.
+#[derive(Debug)]
+pub struct PatchedFile {
+    /// Relative path of the entry in the archive.
+    pub archive_path: String,
+    /// The open file whose bytes are packed. Holding it open keeps exactly
+    /// these bytes even if the file's path is replaced or removed meanwhile.
+    pub source: File,
+    /// Permission bits of the archive entry.
+    pub mode: u32,
+    /// `(offset, bytes)` written over the source's bytes in the archive.
+    pub patches: Vec<(u64, Vec<u8>)>,
+}
+
 /// Asset collector for gathering runtime components.
 pub struct AssetCollector {
     staging_dir: PathBuf,
@@ -524,6 +543,8 @@ pub struct AssetCollector {
     /// Link host assets into staging instead of copying them. Only for a
     /// staging tree that is packed and then discarded unchanged.
     link_host_assets: bool,
+    /// Files packed under `checkpoint/` from outside the staging tree.
+    patched_files: Vec<PatchedFile>,
 }
 
 impl AssetCollector {
@@ -548,7 +569,31 @@ impl AssetCollector {
                 workspace_seed: None,
             },
             link_host_assets: false,
+            patched_files: Vec::new(),
         })
+    }
+
+    /// Pack `file` under `checkpoint/`, after the staged checkpoint files.
+    /// Its archive path must not also exist in the staging tree.
+    pub fn add_patched_file(&mut self, file: PatchedFile) -> Result<()> {
+        let path = Path::new(&file.archive_path);
+        let mut components = path.components();
+        if components.next() != Some(std::path::Component::Normal("checkpoint".as_ref()))
+            || !components.all(|c| matches!(c, std::path::Component::Normal(_)))
+            || file.archive_path.len() > 100
+            || fs::symlink_metadata(self.staging_dir.join(path)).is_ok()
+            || self
+                .patched_files
+                .iter()
+                .any(|other| other.archive_path == file.archive_path)
+        {
+            return Err(PackError::Tar(format!(
+                "invalid patched archive path {}",
+                file.archive_path
+            )));
+        }
+        self.patched_files.push(file);
+        Ok(())
     }
 
     /// Hard-link the libraries and storage template into staging, and reuse
@@ -1169,15 +1214,12 @@ impl AssetCollector {
                     #[cfg(target_os = "macos")]
                     append_macos_tree(&mut tar_builder, &child_path, &child_name)?;
                     #[cfg(not(target_os = "macos"))]
-                    if child_path.is_dir() {
-                        tar_builder
-                            .append_dir_all(&child_name, &child_path)
-                            .map_err(|error| PackError::Tar(error.to_string()))?;
-                    } else {
-                        tar_builder
-                            .append_path_with_name(&child_path, &child_name)
-                            .map_err(|error| PackError::Tar(error.to_string()))?;
-                    }
+                    append_checkpoint_tree(&mut tar_builder, &child_path, &child_name)?;
+                }
+                let mut patched: Vec<_> = self.patched_files.iter().collect();
+                patched.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
+                for file in patched {
+                    append_patched_file(tar_builder.get_mut(), file)?;
                 }
                 continue;
             }
@@ -1204,6 +1246,347 @@ impl AssetCollector {
             .finish()
             .map_err(|e| PackError::Compression(e.to_string()))
     }
+}
+
+/// The data ranges of `file`, `len` bytes long, as `(offset, length)`.
+/// A filesystem without hole reporting gives one range for the whole file.
+#[cfg(unix)]
+fn data_ranges(file: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    use std::os::unix::io::AsRawFd;
+    let seek = |offset: u64, whence| -> std::io::Result<Option<u64>> {
+        let offset = i64::try_from(offset)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset"))?;
+        // Safety: the descriptor is a live regular file borrowed for the call.
+        match unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) } {
+            -1 => match std::io::Error::last_os_error() {
+                error if error.raw_os_error() == Some(libc::ENXIO) => Ok(None),
+                error => Err(error),
+            },
+            found => Ok(Some(found as u64)),
+        }
+    };
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while offset < len {
+        let start = match seek(offset, libc::SEEK_DATA) {
+            Ok(Some(start)) if start >= offset => start.min(len),
+            Ok(Some(_)) => {
+                return Err(std::io::Error::other("SEEK_DATA went backwards"));
+            }
+            Ok(None) => break,
+            // No hole reporting: treat the rest of the file as data.
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) && ranges.is_empty() => {
+                return Ok(vec![(0, len)]);
+            }
+            Err(error) => return Err(error),
+        };
+        if start >= len {
+            break;
+        }
+        let end = seek(start, libc::SEEK_HOLE)?.unwrap_or(len).min(len);
+        if end <= start {
+            return Err(std::io::Error::other("SEEK_HOLE did not advance"));
+        }
+        ranges.push((start, end - start));
+        offset = end;
+    }
+    Ok(ranges)
+}
+
+#[cfg(not(unix))]
+fn data_ranges(_file: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    Ok(if len == 0 { Vec::new() } else { vec![(0, len)] })
+}
+
+/// Sorted, disjoint ranges covering `ranges` and every patch, 512-aligned
+/// around patches so they stay sector-aligned.
+fn ranges_with_patches(
+    mut ranges: Vec<(u64, u64)>,
+    patches: &[(u64, Vec<u8>)],
+    len: u64,
+) -> std::io::Result<Vec<(u64, u64)>> {
+    for (offset, bytes) in patches {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .filter(|end| *end <= len && !bytes.is_empty())
+            .ok_or_else(|| std::io::Error::other("patch lies outside the file"))?;
+        let start = offset - offset % 512;
+        let end = end.div_ceil(512).saturating_mul(512).min(len);
+        ranges.push((start, end - start));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (offset, length) in ranges {
+        match merged.last_mut() {
+            Some((last, last_len)) if offset <= *last + *last_len => {
+                *last_len = (*last_len).max(offset + length - *last);
+            }
+            _ => merged.push((offset, length)),
+        }
+    }
+    Ok(merged)
+}
+
+/// Write a tar header for `path`: a regular entry when `ranges` is the whole
+/// file, else an old-GNU sparse entry listing `ranges`, whose bytes follow
+/// back to back.
+pub(crate) fn write_sparse_header<W: Write>(
+    archive: &mut W,
+    mut header: tar::Header,
+    logical: u64,
+    ranges: &[(u64, u64)],
+) -> std::io::Result<u64> {
+    let stored: u64 = ranges.iter().map(|(_, len)| *len).sum();
+    header.set_size(stored);
+    if ranges == [(0, logical)] || logical == 0 {
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        archive.write_all(header.as_bytes())?;
+        return Ok(stored);
+    }
+    let mut map = ranges.to_vec();
+    // The terminal entry gives the logical size even when it ends in a hole.
+    map.push((logical, 0));
+    header.set_entry_type(tar::EntryType::GNUSparse);
+    let gnu = header
+        .as_gnu_mut()
+        .ok_or_else(|| std::io::Error::other("sparse entries need a GNU header"))?;
+    gnu.set_real_size(logical);
+    for ((offset, len), slot) in map.iter().zip(gnu.sparse.iter_mut()) {
+        slot.set_offset(*offset);
+        slot.set_length(*len);
+    }
+    let slots = gnu.sparse.len();
+    gnu.set_is_extended(map.len() > slots);
+    header.set_cksum();
+    archive.write_all(header.as_bytes())?;
+    let rest = &map[map.len().min(slots)..];
+    for (index, chunk) in rest.chunks(21).enumerate() {
+        let mut extra = tar::GnuExtSparseHeader::new();
+        for ((offset, len), slot) in chunk.iter().zip(extra.sparse_mut().iter_mut()) {
+            slot.set_offset(*offset);
+            slot.set_length(*len);
+        }
+        extra.set_is_extended((index + 1) * 21 < rest.len());
+        archive.write_all(extra.as_bytes())?;
+    }
+    Ok(stored)
+}
+
+/// Append `file` with its patches applied, keeping its holes.
+fn append_patched_file<W: Write>(archive: &mut W, file: &PatchedFile) -> Result<()> {
+    append_file_entry(
+        archive,
+        &file.archive_path,
+        &file.source,
+        file.mode,
+        &file.patches,
+        false,
+    )
+}
+
+/// Granularity of a checkpoint archive's RAM map. RAM is serialized as
+/// whole aligned blocks of the logical image, each either data or a hole, so
+/// however fragmented the source's extents are, the archive lists a few large
+/// runs and a restore writes them with a few large writes.
+pub(crate) const RAM_BLOCK: u64 = 64 * 1024;
+
+/// `ranges` widened to whole `block`-aligned blocks within `logical` bytes,
+/// with overlapping and adjacent blocks merged.
+pub(crate) fn align_ranges(ranges: &[(u64, u64)], block: u64, logical: u64) -> Vec<(u64, u64)> {
+    let mut aligned: Vec<(u64, u64)> = Vec::new();
+    for &(offset, len) in ranges.iter().filter(|(_, len)| *len > 0) {
+        let start = offset - offset % block;
+        let end = (offset + len)
+            .div_ceil(block)
+            .saturating_mul(block)
+            .min(logical);
+        match aligned.last_mut() {
+            Some((last, last_len)) if start <= *last + *last_len => {
+                *last_len = end.max(*last + *last_len) - *last;
+            }
+            _ => aligned.push((start, end - start)),
+        }
+    }
+    aligned
+}
+
+/// The [`RAM_BLOCK`]-aligned blocks of `file` covering `ranges` that are not
+/// entirely zero, with adjacent blocks merged.
+fn nonzero_ranges(
+    file: &File,
+    ranges: &[(u64, u64)],
+    logical: u64,
+) -> std::io::Result<Vec<(u64, u64)>> {
+    let mut found: Vec<(u64, u64)> = Vec::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for (start, len) in align_ranges(ranges, RAM_BLOCK, logical) {
+        let end = start + len;
+        let mut position = start;
+        while position < end {
+            let count = (end - position).min(buffer.len() as u64) as usize;
+            read_exact_at(file, &mut buffer[..count], position)?;
+            for (index, bytes) in buffer[..count].chunks(RAM_BLOCK as usize).enumerate() {
+                if crate::is_zero_filled(bytes) {
+                    continue;
+                }
+                let block = position + index as u64 * RAM_BLOCK;
+                let block_end = block + bytes.len() as u64;
+                match found.last_mut() {
+                    Some((last, last_len)) if *last + *last_len == block => {
+                        *last_len = block_end - *last;
+                    }
+                    _ => found.push((block, block_end - block)),
+                }
+            }
+            position += count as u64;
+        }
+    }
+    Ok(found)
+}
+
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buffer, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buffer)
+    }
+}
+
+/// Append the regular file `source` as `archive_path`: a sparse entry of its
+/// data extents, or with `ram_blocks` of its [`RAM_BLOCK`]-aligned blocks that
+/// are not entirely zero, with `patches` written over its bytes. Reads are large and sequential so a cold
+/// file streams at the device's rate. `source` itself is only read.
+fn append_file_entry<W: Write>(
+    archive: &mut W,
+    archive_path: &str,
+    source: &File,
+    mode: u32,
+    patches: &[(u64, Vec<u8>)],
+    ram_blocks: bool,
+) -> Result<()> {
+    let before = source.metadata()?;
+    if !before.is_file() {
+        return Err(PackError::Tar(format!(
+            "{archive_path} is not a regular file"
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // Safety: advisory only, on a live descriptor.
+        unsafe { libc::posix_fadvise(source.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+    }
+    let logical = before.len();
+    let mut ranges = data_ranges(source, logical)?;
+    if ram_blocks {
+        ranges = nonzero_ranges(source, &ranges, logical)?;
+    }
+    let ranges = ranges_with_patches(ranges, patches, logical)?;
+    let mut header = tar::Header::new_gnu();
+    header
+        .set_path(archive_path)
+        .map_err(|error| PackError::Tar(error.to_string()))?;
+    header.set_mode(mode);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        header.set_uid(u64::from(before.uid()));
+        header.set_gid(u64::from(before.gid()));
+    }
+    header.set_mtime(
+        before
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |time| time.as_secs()),
+    );
+    let stored = write_sparse_header(archive, header, logical, &ranges)?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for &(offset, len) in &ranges {
+        let mut position = offset;
+        let end = offset + len;
+        while position < end {
+            let chunk = (end - position).min(buffer.len() as u64) as usize;
+            let bytes = &mut buffer[..chunk];
+            read_exact_at(source, bytes, position)?;
+            for (patch_offset, patch) in patches {
+                let from = (*patch_offset).max(position);
+                let to = (patch_offset + patch.len() as u64).min(position + chunk as u64);
+                if from < to {
+                    bytes[(from - position) as usize..(to - position) as usize].copy_from_slice(
+                        &patch[(from - patch_offset) as usize..(to - patch_offset) as usize],
+                    );
+                }
+            }
+            archive.write_all(bytes)?;
+            position += chunk as u64;
+        }
+    }
+    let padding = (512 - stored % 512) % 512;
+    archive.write_all(&[0; 512][..padding as usize])?;
+    let after = source.metadata()?;
+    if after.len() != logical || after.modified().ok() != before.modified().ok() {
+        return Err(PackError::Tar(format!(
+            "{archive_path} changed while it was packed"
+        )));
+    }
+    Ok(())
+}
+
+/// Append the staged checkpoint tree at `path` as `name`: directories in
+/// sorted order, files through [`append_file_entry`], with all-zero RAM left
+/// out as holes.
+#[cfg(not(target_os = "macos"))]
+fn append_checkpoint_tree<W: Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+    name: &Path,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    // Tar paths use `/` on every host; a Windows `Path` joins with `\`.
+    let archive_path = name
+        .to_str()
+        .ok_or_else(|| PackError::Tar(format!("{} is not UTF-8", name.display())))?
+        .replace('\\', "/");
+    let archive_path = archive_path.as_str();
+    if metadata.is_dir() {
+        builder
+            .append_dir(name, path)
+            .map_err(|error| PackError::Tar(error.to_string()))?;
+        let mut children = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+        children.sort_by_key(|child| child.file_name());
+        for child in children {
+            append_checkpoint_tree(builder, &child.path(), &name.join(child.file_name()))?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() || archive_path.len() > 100 {
+        return builder
+            .append_path_with_name(path, name)
+            .map_err(|error| PackError::Tar(error.to_string()));
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644;
+    append_file_entry(
+        builder.get_mut(),
+        archive_path,
+        &File::open(path)?,
+        mode,
+        &[],
+        archive_path == "checkpoint/memory.bin",
+    )
 }
 
 // =============================================================================
@@ -1615,6 +1998,154 @@ mod tests {
         let restored = output.join("test.txt");
         assert!(restored.exists());
         assert_eq!(fs::read_to_string(&restored).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn patched_files_pack_patched_bytes_and_keep_holes_and_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        fs::create_dir_all(staging.join("checkpoint/disks/storage")).unwrap();
+        fs::write(staging.join("checkpoint/disks/storage/0"), b"top").unwrap();
+        // Data, a 4 MiB hole, data, and a trailing hole.
+        let source = temp_dir.path().join("layer");
+        let mut file = File::create(&source).unwrap();
+        file.write_all(&vec![7_u8; 65536]).unwrap();
+        file.seek(SeekFrom::Start(4 << 20)).unwrap();
+        file.write_all(&vec![9_u8; 65536]).unwrap();
+        file.set_len(8 << 20).unwrap();
+        drop(file);
+        let original = fs::read(&source).unwrap();
+        let mut expected = original.clone();
+        expected[100..104].copy_from_slice(b"name");
+        expected[(4 << 20) + 10] = 1;
+
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        let patched = |path: &str| PatchedFile {
+            archive_path: path.to_string(),
+            source: File::open(&source).unwrap(),
+            mode: 0o600,
+            patches: vec![(100, b"name".to_vec()), ((4 << 20) + 10, vec![1])],
+        };
+        collector
+            .add_patched_file(patched("checkpoint/disks/storage/1"))
+            .unwrap();
+        // Paths outside `checkpoint/`, already staged, or repeated are refused.
+        for path in [
+            "other/1",
+            "checkpoint/../x",
+            "checkpoint/disks/storage/0",
+            "checkpoint/disks/storage/1",
+        ] {
+            assert!(collector.add_patched_file(patched(path)).is_err(), "{path}");
+        }
+        let compressed = temp_dir.path().join("assets.tar.zst");
+        collector.compress(&compressed, false).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        let output = temp_dir.path().join("output");
+        decompress_assets_from_file(&compressed, &output).unwrap();
+        let restored = output.join("checkpoint/disks/storage/1");
+        assert_eq!(fs::read(&restored).unwrap(), expected);
+        assert_eq!(
+            fs::read(output.join("checkpoint/disks/storage/0")).unwrap(),
+            b"top"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let allocated = fs::metadata(&restored).unwrap().blocks() * 512;
+            assert!(allocated < 1 << 20, "holes were filled: {allocated} bytes");
+        }
+    }
+
+    // macOS packs checkpoints through `append_macos_sparse_file` instead.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn checkpoint_ram_is_packed_as_aligned_nonzero_blocks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        fs::create_dir_all(staging.join("checkpoint")).unwrap();
+        // Scattered small pages, and a megabyte of zeros written as data.
+        let logical = 8_u64 << 20;
+        let mut memory = File::create(staging.join("checkpoint/memory.bin")).unwrap();
+        memory.set_len(logical).unwrap();
+        let mut expected = vec![0_u8; logical as usize];
+        for (index, offset) in [4096_u64, 12288, 70_000, 3 << 20, (5 << 20) + 100]
+            .into_iter()
+            .enumerate()
+        {
+            memory.seek(SeekFrom::Start(offset)).unwrap();
+            memory.write_all(&[index as u8 + 1; 4096]).unwrap();
+            expected[offset as usize..offset as usize + 4096].fill(index as u8 + 1);
+        }
+        memory.seek(SeekFrom::Start(6 << 20)).unwrap();
+        memory.write_all(&vec![0_u8; 1 << 20]).unwrap();
+        drop(memory);
+
+        let collector = AssetCollector::new(staging).unwrap();
+        let compressed = temp_dir.path().join("assets.tar.zst");
+        collector.compress(&compressed, false).unwrap();
+        let decoder = zstd::stream::read::Decoder::new(File::open(&compressed).unwrap()).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let mut entries = archive.entries().unwrap();
+        let mut entry = loop {
+            let entry = entries.next().unwrap().unwrap();
+            if entry.path().unwrap() == Path::new("checkpoint/memory.bin") {
+                break entry;
+            }
+        };
+        let gnu = entry.header().as_gnu().unwrap();
+        let map: Vec<_> = gnu
+            .sparse
+            .iter()
+            .map(|s| (s.offset().unwrap(), s.length().unwrap()))
+            .collect();
+        // Blocks [0, 128 KiB), [3 MiB, +64 KiB), [5 MiB, +64 KiB): the zeros
+        // written as data are a hole.
+        assert_eq!(
+            map,
+            [
+                (0, 131_072),
+                (3 << 20, 65536),
+                (5 << 20, 65536),
+                (logical, 0)
+            ]
+        );
+        let mut restored = Vec::new();
+        entry.read_to_end(&mut restored).unwrap();
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn aligned_ranges_cover_and_merge() {
+        assert_eq!(
+            align_ranges(&[(100, 10), (65_000, 1000), (200_000, 5)], 65536, 1 << 20),
+            [(0, 131_072), (196_608, 65536)]
+        );
+        assert_eq!(
+            align_ranges(&[(70_000, 10)], 65536, 70_010),
+            [(65536, 4474)]
+        );
+        assert!(align_ranges(&[(0, 0)], 65536, 10).is_empty());
+    }
+
+    #[test]
+    fn patches_outside_the_file_are_refused_and_merge_with_data() {
+        assert!(ranges_with_patches(Vec::new(), &[(10, vec![1; 4])], 12).is_err());
+        assert!(ranges_with_patches(Vec::new(), &[(0, Vec::new())], 12).is_err());
+        assert_eq!(
+            ranges_with_patches(
+                vec![(0, 4096), (8192, 4096)],
+                &[(4000, vec![1; 200])],
+                1 << 20
+            )
+            .unwrap(),
+            [(0, 4608), (8192, 4096)]
+        );
+        assert_eq!(
+            ranges_with_patches(vec![(4096, 4096)], &[(9000, vec![1; 4])], 9100).unwrap(),
+            [(4096, 4096), (8704, 396)]
+        );
     }
 
     #[test]

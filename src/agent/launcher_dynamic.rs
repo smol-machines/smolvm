@@ -909,7 +909,7 @@ pub fn launch_agent_vm_dynamic(
                     ctx,
                     layers_tag.as_ptr(),
                     layers_path.as_ptr(),
-                    super::virtiofs::packed_layers_dax_window(),
+                    super::virtiofs::legacy_packed_layers_dax_window(),
                     false,
                     super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
                 )
@@ -920,7 +920,7 @@ pub fn launch_agent_vm_dynamic(
                     ctx,
                     layers_tag.as_ptr(),
                     layers_path.as_ptr(),
-                    super::virtiofs::packed_layers_dax_window(),
+                    super::virtiofs::legacy_packed_layers_dax_window(),
                     false,
                 )
             }

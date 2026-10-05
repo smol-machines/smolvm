@@ -408,6 +408,93 @@ pub fn record_fetched_archive(key: &str, reference: &str) -> Result<()> {
 /// Where [`record_fetched_archive`] keeps its index, beside the archives.
 const FETCHED_DIR: &str = "fetched";
 
+/// The cache key of a `local:` archive reference, or `None` for anything else
+/// (a `local-dir:` rootfs directory or a registry reference).
+pub fn local_archive_hash(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix(LOCAL_ARCHIVE_PREFIX)
+        .filter(|key| !key.is_empty() && !key.contains('/') && *key != "." && *key != "..")
+}
+
+/// The staged archive file a `local:` reference boots from.
+pub fn archive_file_for_ref(reference: &str) -> Option<PathBuf> {
+    local_archive_hash(reference)?;
+    packed_layers_dir_for_ref(reference).map(|dir| dir.join(ARCHIVE_FILE))
+}
+
+/// Size in bytes and modification time (whole seconds since the epoch) of a
+/// staged archive: what the guest keys its flattened copy of the image on.
+pub fn archive_signature(archive: &Path) -> Result<(u64, u64)> {
+    let meta = std::fs::metadata(archive)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok((meta.len(), mtime))
+}
+
+/// Set a staged archive's modification time to `mtime` seconds since the epoch.
+pub fn set_archive_mtime(archive: &Path, mtime: u64) -> Result<()> {
+    std::fs::File::options()
+        .write(true)
+        .open(archive)?
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime))?;
+    Ok(())
+}
+
+/// A `local:` reference serving the same bytes as `reference` with
+/// modification time `mtime`.
+///
+/// The guest keys its flattened copy of an archive on size and modification
+/// time, so a restored guest must be served an archive with the times it read
+/// at capture or it flattens the image again under its running workload. When
+/// this host's copy has another time, a copy with the captured time is staged
+/// beside it (cache entries are shared, so the original is never touched).
+pub fn archive_with_mtime(reference: &str, mtime: u64) -> Result<String> {
+    archive_with_mtime_in(&archive_cache_base()?, reference, mtime)
+}
+
+fn archive_with_mtime_in(base: &Path, reference: &str, mtime: u64) -> Result<String> {
+    let key = local_archive_hash(reference).ok_or_else(|| {
+        Error::config(
+            "image archive cache",
+            format!("{reference} is not a staged image archive"),
+        )
+    })?;
+    let source = base.join(key).join(ARCHIVE_FILE);
+    let (size, current) = archive_signature(&source)?;
+    if current == mtime {
+        return Ok(reference.to_string());
+    }
+    let variant = format!("{key}-m{mtime}");
+    let dir = base.join(&variant);
+    let target = dir.join(ARCHIVE_FILE);
+    if archive_signature(&target).ok() == Some((size, mtime)) {
+        return Ok(format!("{LOCAL_ARCHIVE_PREFIX}{variant}"));
+    }
+    std::fs::create_dir_all(&dir)?;
+    let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
+    std::io::copy(&mut std::fs::File::open(&source)?, staged.as_file_mut())?;
+    staged.as_file().sync_all()?;
+    staged
+        .as_file()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime))?;
+    // Readable by the per-machine uid that serves it, like any staged archive.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    }
+    staged
+        .persist(&target)
+        .map_err(|e| Error::storage("image archive cache", e.to_string()))?;
+    Ok(format!("{LOCAL_ARCHIVE_PREFIX}{variant}"))
+}
+
 fn archive_cache_base() -> Result<PathBuf> {
     let base = dirs::cache_dir()
         .ok_or_else(|| Error::storage("image archive cache", "no cache directory available"))?;
@@ -429,6 +516,44 @@ fn too_large(bytes: u64) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_staged_archive_reference_has_an_archive_key() {
+        assert_eq!(local_archive_hash("local:abc"), Some("abc"));
+        assert_eq!(local_archive_hash("local-dir:/srv/rootfs"), None);
+        assert_eq!(local_archive_hash("alpine:3.20"), None);
+        assert_eq!(local_archive_hash("local:"), None);
+        assert_eq!(local_archive_hash("local:../escape"), None);
+    }
+
+    #[test]
+    fn an_archive_is_served_with_the_time_the_guest_read() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path().join("abc");
+        std::fs::create_dir_all(&dir).expect("archive dir");
+        let archive = dir.join(ARCHIVE_FILE);
+        std::fs::write(&archive, b"image bytes").expect("write archive");
+        set_archive_mtime(&archive, 1_000).expect("set mtime");
+
+        // The same time: the shared entry itself.
+        assert_eq!(
+            archive_with_mtime_in(base.path(), "local:abc", 1_000).unwrap(),
+            "local:abc"
+        );
+        // Another time: a copy beside it with that time, the original untouched.
+        let variant = archive_with_mtime_in(base.path(), "local:abc", 2_000).unwrap();
+        assert_eq!(variant, "local:abc-m2000");
+        let copy = base.path().join("abc-m2000").join(ARCHIVE_FILE);
+        assert_eq!(archive_signature(&copy).unwrap(), (11, 2_000));
+        assert_eq!(std::fs::read(&copy).unwrap(), b"image bytes");
+        assert_eq!(archive_signature(&archive).unwrap(), (11, 1_000));
+        // A second restore reuses the copy.
+        assert_eq!(
+            archive_with_mtime_in(base.path(), "local:abc", 2_000).unwrap(),
+            variant
+        );
+        assert!(archive_with_mtime_in(base.path(), "local-dir:/x", 1).is_err());
+    }
 
     /// The staged copy is hardlinked to the caller's archive when the cache is
     /// on the same filesystem, so truncating that file through its own path —

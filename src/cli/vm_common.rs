@@ -2292,9 +2292,11 @@ fn check_port_conflicts(
     Ok(())
 }
 
-/// Start the default machine.
+/// Start the default machine when it has no record yet, creating its disks
+/// at the default sizes. A recorded default machine starts through
+/// [`start_vm_named`] with its own sizes.
 pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
-    let manager = AgentManager::new_default()?;
+    let manager = AgentManager::new_default_with_sizes(None, None)?;
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = format_pid_suffix(manager.child_pid());
@@ -2912,6 +2914,9 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // Keep the record until process death and storage removal are both confirmed,
     // so a failed delete remains visible and can be retried safely.
     remove_vm_data_and_record(&SmolvmDb::open()?, name, &data_dir)?;
+    // The machine may have held the last lease on a shared extraction.
+    #[cfg(target_os = "linux")]
+    smolvm::artifact_cache::log_trim(smolvm::artifact_cache::trim_unleased_shared_packs());
 
     // Once a child record and its VMM are both gone, its parent may have an old
     // RAM generation that no remaining clone references. Reap that generation

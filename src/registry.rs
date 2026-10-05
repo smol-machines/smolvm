@@ -463,9 +463,16 @@ impl Reference {
         // Digest takes precedence: `image@sha256:...` is a digest ref even if
         // there's a `:` in the name part.
         let (path, tag, digest) = if let Some(at_pos) = input.find('@') {
-            let path = &input[..at_pos];
+            let mut path = &input[..at_pos];
             let digest_str = &input[at_pos + 1..];
             validate_digest(raw_input, digest_str)?;
+            // `name:tag@sha256:...` pins by digest and keeps the tag only as a
+            // label; the digest decides the content, as for Docker. A `:`
+            // before the last `/` is a registry port, not a tag.
+            let last_segment = path.rfind('/').map(|p| p + 1).unwrap_or(0);
+            if let Some(colon) = path[last_segment..].find(':') {
+                path = &path[..last_segment + colon];
+            }
             (path, None, Some(digest_str.to_string()))
         } else {
             // No digest — check for tag after the last colon.
@@ -1018,6 +1025,40 @@ mirror = "ghcr-mirror.example.com"
         assert_eq!(r.name, "python-dev");
         assert_eq!(r.tag, None);
         assert_eq!(r.digest, Some(digest.to_string()));
+    }
+
+    #[test]
+    fn a_tag_beside_a_digest_is_a_label_and_the_digest_wins() {
+        let digest = "sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507";
+        // The reference a tenant used for its own copy of an image.
+        let input = format!(
+            "registry.smolmachines.com/tenants/tenant-9d74f78801124de795246870fb57388c/alpine:3.21@{digest}"
+        );
+        let r = Reference::parse(&input).unwrap();
+        assert_eq!(r.registry, "registry.smolmachines.com");
+        assert_eq!(
+            r.namespace.as_deref(),
+            Some("tenants/tenant-9d74f78801124de795246870fb57388c")
+        );
+        assert_eq!(r.name, "alpine");
+        assert_eq!(r.tag, None);
+        assert_eq!(r.digest.as_deref(), Some(digest));
+
+        let r = Reference::parse(&format!("alpine:3.21@{digest}")).unwrap();
+        assert_eq!(
+            (r.name.as_str(), r.digest.as_deref()),
+            ("alpine", Some(digest))
+        );
+
+        // A registry port is not a tag.
+        let r = Reference::parse(&format!("localhost:5000/img:v1@{digest}")).unwrap();
+        assert_eq!(r.registry, "localhost:5000");
+        assert_eq!(r.name, "img");
+        let r = Reference::parse(&format!("localhost:5000/img@{digest}")).unwrap();
+        assert_eq!(r.name, "img");
+
+        // Dropping the tag must not open the traversal guard.
+        assert!(Reference::parse(&format!("ghcr.io/../img:v1@{digest}")).is_err());
     }
 
     #[test]

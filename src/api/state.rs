@@ -211,6 +211,10 @@ pub struct MachineRegistration {
     pub source_smolmachine: Option<String>,
     /// Registry reference that sidecar was pulled from, if any.
     pub source_registry_ref: Option<String>,
+    /// Registry reference a host-fetched `image` came from, if any.
+    pub image_origin: Option<String>,
+    /// Manifest digest of that host-fetched image.
+    pub image_origin_digest: Option<String>,
     /// Container entrypoint (from manifest).
     pub entrypoint: Vec<String>,
     /// Container cmd (from manifest).
@@ -1163,6 +1167,8 @@ impl ApiState {
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
         record.source_registry_ref = reg.source_registry_ref.clone();
+        record.image_origin = reg.image_origin;
+        record.image_origin_digest = reg.image_origin_digest;
         record.entrypoint = reg.entrypoint;
         record.cmd = reg.cmd;
         record.env = reg.env;
@@ -1281,7 +1287,23 @@ impl ApiState {
     ///
     /// Used by start_machine to register a booted VM so that exec/run/container
     /// endpoints can find it without server restart.
+    ///
+    /// An existing entry is replaced in place rather than swapped for a new
+    /// one. A request that looked the machine up before a start finished (an
+    /// exec queued behind the start's lifecycle lock) still holds the old
+    /// entry; with a separate entry it would reconnect a stale manager to the
+    /// new VM, adopt its process, and stop that VM when the request dropped
+    /// the last reference to it. In place, every holder sees the new manager,
+    /// and the replaced one is detached because the VM it may have reconnected
+    /// to now belongs to the new manager.
     pub fn insert_machine(&self, name: &str, entry: MachineEntry) {
+        let existing = self.machines.read().get(name).cloned();
+        if let Some(slot) = existing {
+            let replaced = std::mem::replace(&mut *slot.lock(), entry);
+            replaced.manager.detach();
+            self.machines.write().insert(name.to_string(), slot);
+            return;
+        }
         let mut machines = self.machines.write();
         machines.insert(name.to_string(), Arc::new(parking_lot::Mutex::new(entry)));
     }
@@ -1505,41 +1527,48 @@ pub async fn ensure_machine_running(
         let ports: Vec<_> = entry.ports.iter().map(PortMapping::from).collect();
         let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
+        // An implicit start (exec/run/files/images) never restarts a machine
+        // that is up. `update` refuses running machines, so its recorded
+        // settings should match what it runs with; if they do not, restarting
+        // would throw away its execution (for a machine restored from a
+        // checkpoint, the restored state) to fix nothing the caller asked for.
+        // Returning here also keeps the packed-layers lease off this hot path.
+        if entry.manager.try_connect_existing().is_some() {
+            if let Some(differences) = entry
+                .manager
+                .running_config_differences(&mounts, &ports, &resources)
+            {
+                tracing::warn!(
+                    machine = %entry.manager.name().unwrap_or_default(),
+                    differs = %differences.join(", "),
+                    "running machine's recorded settings differ from its launch; leaving it running"
+                );
+            }
+            return Ok(false);
+        }
+        // Up but not answering (busy, or still restoring): fail this request
+        // rather than stop the VM and boot it fresh.
+        if entry.manager.is_process_alive() {
+            return Err(crate::Error::agent_conflict(
+                "start machine",
+                "machine is running but its agent is not answering yet; retry",
+            ));
+        }
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
-        //
-        // Build the packed-layers features only when the VM is not already up.
-        // This preflight runs on every implicit-start request (exec/run/files/
-        // images); when the VM is already running `ensure_running_via_subprocess`
-        // returns early (discarding `features`) as long as the mount/port/resource
-        // config is unchanged. Acquiring the layers lease on that hot path is
-        // wasted work — on macOS it re-mounts the case-sensitive volume via
-        // hdiutil — so gate it on the same already-running check.
-        //
-        // The gated `default()` is safe across the relaunch branch too: if the
-        // preflight detects a mount/port/resource change and restarts the VM,
-        // `ensure_running_via_subprocess` re-attaches this machine's pre-extracted
-        // packed layers itself (see `rewire_packed_layers_if_extracted`), so the
-        // restart keeps using them instead of falling back to a registry pull.
-        let already_up = entry.manager.try_connect_existing().is_some();
-        let mut features = if already_up {
-            crate::agent::LaunchFeatures::default()
-        } else {
-            build_launch_features(
-                entry.manager.name(),
-                entry.source_smolmachine.as_deref(),
-                entry.image.as_deref(),
-                entry.resources.allowed_hosts.clone(),
-                entry.credentials.clone(),
-            )?
-        };
+        let mut features = build_launch_features(
+            entry.manager.name(),
+            entry.source_smolmachine.as_deref(),
+            entry.image.as_deref(),
+            entry.resources.allowed_hosts.clone(),
+            entry.credentials.clone(),
+        )?;
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = entry.cuda_vram_limit_mib;
         features.forkable = entry.forkable;
         features.external_interceptor = entry.external_interceptor;
         entry
             .manager
-            .ensure_running_via_subprocess(mounts, ports, resources, features)?;
-        Ok(!already_up)
+            .ensure_running_via_subprocess(mounts, ports, resources, features)
     })
     .await
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
@@ -1596,8 +1625,9 @@ pub async fn ensure_running_and_persist(
     // launches with pre-update mounts/ports/resources. `update` refuses
     // running machines, so a running machine's entry can't be stale — and for
     // one, ensure_machine_running early-returns before the config matters.
-    if let Ok(Some(record)) = state.lookup_vm(name).await {
-        refuse_implicit_start_of_paused(&record)?;
+    let record = state.lookup_vm(name).await.ok().flatten();
+    if let Some(record) = &record {
+        refuse_implicit_start_of_paused(record)?;
         let mut e = entry.lock();
         e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
         e.ports = record
@@ -1619,7 +1649,34 @@ pub async fn ensure_running_and_persist(
         }
     }
 
+    // A restored machine boots from its checkpoint with the workload already
+    // running in the restored RAM. Remember that before the boot, finalize the
+    // restore after it exactly like the explicit start handler, and never launch
+    // the workload a second time.
+    let restoring_checkpoint =
+        crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(name)).is_some();
+
     let freshly_booted = ensure_machine_running(entry).await?;
+
+    if freshly_booted && restoring_checkpoint {
+        if let Some(record) = record.clone() {
+            let machine = name.to_string();
+            let finalized = tokio::task::spawn_blocking(move || {
+                crate::portable_checkpoint::finalize_live_restore(&machine, &record).and_then(
+                    |()| crate::portable_checkpoint::consume(&crate::agent::vm_data_dir(&machine)),
+                )
+            })
+            .await
+            .map_err(|e| crate::Error::agent("finalize checkpoint restore", e.to_string()))?;
+            if let Err(error) = finalized {
+                let _ = entry.lock().manager.stop();
+                return Err(crate::Error::agent(
+                    "finalize checkpoint restore",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
 
     let pid = {
         let entry = entry.lock();
@@ -1642,7 +1699,7 @@ pub async fn ensure_running_and_persist(
     // `freshly_booted` so an already-running machine's workload is never
     // double-launched. Best-effort like the handler's launch step: the caller's
     // exec must not fail because the workload didn't come up.
-    if freshly_booted {
+    if freshly_booted && !restoring_checkpoint {
         if let Err(e) = relaunch_image_workload(state, name, entry).await {
             tracing::warn!(
                 machine = %name,
@@ -2199,6 +2256,60 @@ mod tests {
         assert!(state.get_machine(name).is_err());
         assert!(entry.lock().manager.is_detached());
         assert!(state.forget_deleted_machine(name).unwrap());
+    }
+
+    /// A request that looked a machine up before a start replaced its entry
+    /// must see the started VM's manager, not keep a stale one whose drop
+    /// would stop that VM.
+    #[test]
+    fn replacing_an_entry_updates_requests_already_holding_it() {
+        let (_dir, state) = temp_api_state();
+        let name = "replace-entry-qa";
+        let entry = |image: &str| MachineEntry {
+            credentials: None,
+            external_interceptor: None,
+            manager: AgentManager::for_vm(name).unwrap(),
+            image: Some(image.to_string()),
+            mounts: vec![],
+            ports: vec![],
+            resources: ResourceSpec {
+                cpus: None,
+                memory_mb: None,
+                network: None,
+                gpu: None,
+                cuda: None,
+                nested_virt: None,
+                storage_gb: None,
+                overlay_gb: None,
+                block_io: None,
+                allowed_cidrs: None,
+                allowed_hosts: None,
+                credentials: None,
+                network_backend: None,
+                guest_subnet: None,
+            },
+            restart: RestartConfig::default(),
+            network: false,
+            secret_refs: Default::default(),
+            source_smolmachine: None,
+            forkable: false,
+            cuda_fork_pool_size: None,
+            cuda_vram_limit_mib: None,
+            forkpoint_held: false,
+        };
+        state.insert_machine(name, entry("before-start"));
+        let queued = state.get_machine(name).unwrap();
+
+        state.insert_machine(name, entry("started"));
+
+        let current = state.get_machine(name).unwrap();
+        assert!(Arc::ptr_eq(&queued, &current));
+        let seen = queued.lock();
+        assert_eq!(seen.image.as_deref(), Some("started"));
+        assert!(!seen.manager.is_detached());
+        drop(seen);
+        state.forget_deleted_machine(name).unwrap();
+        std::fs::remove_dir_all(crate::agent::vm_data_dir(name)).ok();
     }
 
     // remove_machine must clear BOTH the DB row and the in-memory registry entry

@@ -208,62 +208,63 @@ impl<'a> CheckpointStream<'a> {
             return Err(invalid());
         }
         self.consumed = true;
-        // Sorted, disjoint ranges were checked against logical length above.
-        let stored: u64 = self.ranges.iter().map(|(_, len)| *len).sum();
+        // Sorted, disjoint ranges were checked against logical length above;
+        // the last is the terminal `(logical, 0)` entry. The archive lists
+        // them widened to whole aligned blocks, the widening written as the
+        // zeros the runtime left out, so a fragmented map stays a few runs.
         let mut header = tar::Header::new_gnu();
         header.set_path("checkpoint/memory.bin")?;
         header.set_mode(0o600);
-        header.set_entry_type(tar::EntryType::GNUSparse);
-        header.set_size(stored);
-        let gnu = header.as_gnu_mut().unwrap();
-        gnu.set_real_size(self.logical);
-        for ((offset, len), slot) in self.ranges.iter().zip(gnu.sparse.iter_mut()) {
-            slot.set_offset(*offset);
-            slot.set_length(*len);
-        }
-        gnu.set_is_extended(self.ranges.len() > 4);
-        header.set_cksum();
-        archive.get_mut().write_all(header.as_bytes())?;
-        let rest = &self.ranges[self.ranges.len().min(4)..];
-        for (index, chunk) in rest.chunks(21).enumerate() {
-            let mut extra = tar::GnuExtSparseHeader::new();
-            for ((offset, len), slot) in chunk.iter().zip(extra.sparse_mut().iter_mut()) {
-                slot.set_offset(*offset);
-                slot.set_length(*len);
-            }
-            extra.set_is_extended((index + 1) * 21 < rest.len());
-            archive.get_mut().write_all(extra.as_bytes())?;
-        }
-        match self.copy.take() {
-            None => {
-                let copied = io::copy(&mut (&mut *self.source).take(stored), archive.get_mut())?;
-                if copied != stored {
-                    return Err(io::ErrorKind::UnexpectedEof.into());
+        let data = &self.ranges[..self.ranges.len() - 1];
+        let blocks = crate::assets::align_ranges(data, crate::assets::RAM_BLOCK, self.logical);
+        let stored =
+            crate::assets::write_sparse_header(archive.get_mut(), header, self.logical, &blocks)?;
+        let mut copy = self.copy.take();
+        let mut buffer = vec![0; 1024 * 1024];
+        let zeros = vec![0; 1024 * 1024];
+        let mut data = data.iter().peekable();
+        for &(block, block_len) in &blocks {
+            let mut position = block;
+            let end = block + block_len;
+            while position < end {
+                // The runtime's next range, if it starts inside this block run.
+                let (offset, len) = match data.peek() {
+                    Some(&&(offset, len)) if offset < end => (offset, len),
+                    _ => (end, 0),
+                };
+                if position < offset {
+                    let gap = (offset - position).min(zeros.len() as u64) as usize;
+                    archive.get_mut().write_all(&zeros[..gap])?;
+                    position += gap as u64;
+                    continue;
                 }
-            }
-            Some(mut copy) => {
-                // The payload is the ranges' bytes back to back, in order.
-                let mut buffer = vec![0; 1024 * 1024];
-                for &(offset, len) in &self.ranges {
-                    if len > 0 && !self.copy_failed {
+                if len > 0 && !self.copy_failed {
+                    if let Some(copy) = copy.as_mut() {
                         self.copy_failed = copy.seek(SeekFrom::Start(offset)).is_err();
                     }
-                    let mut left = len;
-                    while left > 0 {
-                        let chunk = left.min(buffer.len() as u64) as usize;
-                        self.source.read_exact(&mut buffer[..chunk])?;
-                        archive.get_mut().write_all(&buffer[..chunk])?;
-                        if !self.copy_failed {
-                            self.copy_failed = copy.write_all(&buffer[..chunk]).is_err();
-                        }
-                        left -= chunk as u64;
+                }
+                let mut left = len;
+                while left > 0 {
+                    let chunk = left.min(buffer.len() as u64) as usize;
+                    self.source.read_exact(&mut buffer[..chunk])?;
+                    archive.get_mut().write_all(&buffer[..chunk])?;
+                    if let Some(copy) = copy.as_mut().filter(|_| !self.copy_failed) {
+                        self.copy_failed = copy.write_all(&buffer[..chunk]).is_err();
                     }
+                    left -= chunk as u64;
                 }
-                if !self.copy_failed {
-                    self.copy_failed = copy.set_len(self.logical).is_err();
-                }
-                self.copy = Some(copy);
+                position = offset + len;
+                data.next();
             }
+        }
+        if data.next().is_some() {
+            return Err(invalid());
+        }
+        if let Some(copy) = copy {
+            if !self.copy_failed {
+                self.copy_failed = copy.set_len(self.logical).is_err();
+            }
+            self.copy = Some(copy);
         }
         let padding = (512 - stored % 512) % 512;
         archive.get_mut().write_all(&[0; 512][..padding as usize])?;

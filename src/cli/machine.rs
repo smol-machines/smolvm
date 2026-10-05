@@ -4781,6 +4781,11 @@ impl CreateCmd {
                     record.source_smolmachine = Some(sidecar);
                     record.source_registry_ref = reference;
                 }
+                if let Some(image) =
+                    smolvm::portable_checkpoint::fetch_checkpoint_host_image_blocking(checkpoint)?
+                {
+                    image.apply(&mut record);
+                }
             }
 
             reservation.commit(&record)?;
@@ -6114,30 +6119,19 @@ pub struct NetworkTestCmd {
 
 impl NetworkTestCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = vm_common::get_vm_manager(&self.name)?;
-        let label = vm_common::vm_label(&self.name);
-
-        // Ensure machine is running
-        let already_running = manager.try_connect_existing().is_some();
-        if !already_running {
-            eprintln!("Starting machine '{}'...", label);
-            manager.ensure_running()?;
-        }
-
-        // Connect and test
+        // Test a running machine as it is. Booting one here would launch it
+        // without its recorded mounts, ports and resources, or fail outright
+        // for a machine that was never started.
+        let (manager, mut client) = vm_common::ensure_running_and_connect(&self.name)?;
         println!("Testing network from machine: {}", self.url);
-        let mut client = manager.connect()?;
-        let result = client.network_test(&self.url)?;
+        let result = client.network_test(&self.url);
+        manager.detach();
+        let result = result?;
 
         println!(
             "Result: {}",
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
-
-        // VM was already running — don't stop it when we're done
-        if already_running {
-            manager.detach();
-        }
         Ok(())
     }
 }

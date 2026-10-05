@@ -578,6 +578,8 @@ pub struct LaunchConfig<'a> {
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
+    /// DAX window for `packed_layers_dir` (see [`super::virtiofs`]).
+    pub packed_layers_dax_window: u64,
     /// Additional disk images (path, read_only, format). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool, DiskFormat)],
     /// Whether DNS filtering was configured for this launch, even if the
@@ -642,6 +644,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         docker_socket,
         published_sockets,
         packed_layers_dir,
+        packed_layers_dax_window,
         extra_disks,
         dns_filter_enabled,
         egress_refresh_hosts,
@@ -2047,7 +2050,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         ctx,
                         tag.as_ptr(),
                         host_path.as_ptr(),
-                        super::virtiofs::packed_layers_dax_window(),
+                        *packed_layers_dax_window,
                         false,
                         super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
                     )
@@ -2063,7 +2066,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         ctx,
                         tag.as_ptr(),
                         host_path.as_ptr(),
-                        super::virtiofs::packed_layers_dax_window(),
+                        *packed_layers_dax_window,
                         false,
                     )
                 };
