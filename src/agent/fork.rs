@@ -3023,6 +3023,25 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
 /// `vm_exec` errors or exits non-zero transiently.
 const REJUVENATE_ATTEMPTS: usize = 3;
 
+/// How long one re-mint may run. The agent enforces it: a VM exec runs in its
+/// own session and the whole group is killed at the deadline.
+const REJUVENATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The re-mint runs as a plain shell, with nothing that outlives it.
+///
+/// It must never leave an orphan behind. An orphan is reparented to the
+/// guest's PID 1, libkrun's `init.krun`, and reaping it wakes init for the
+/// first time since boot. init's code is mapped from a one-shot virtio-fs
+/// entry that is gone once it has been exec'd (and, after a restore, is served
+/// by a different libkrun build), so in a guest whose memory pressure evicted
+/// those pages the wake-up faults with SIGBUS, init dies and the guest
+/// reboots. Wrapping the script in busybox `timeout` did exactly that: its
+/// watcher is a daemonized grandchild that outlives the script, so every
+/// branch and restore of such a guest rebooted a second after it resumed.
+fn rejuvenation_command(script: String) -> Vec<String> {
+    vec!["/bin/sh".into(), "-c".into(), script]
+}
+
 /// Build the shell script that re-mints a clone's on-disk identity. Kept as a
 /// pure function of `(clone, seed, host_epoch)` so the security-critical
 /// contents (fresh machine-id, regenerated SSH host keys, wall-clock re-stamp)
@@ -3323,18 +3342,10 @@ fn rejuvenate_once(
     // their libkrun time-sync pusher already owns CLOCK_REALTIME correction.
     let script = build_rejuvenation_script(clone, seed, rejuvenation_host_epoch(), record);
     match client.vm_exec(
-        vec![
-            "/usr/bin/timeout".into(),
-            "-k".into(),
-            "1".into(),
-            "7".into(),
-            "/bin/sh".into(),
-            "-c".into(),
-            script,
-        ],
+        rejuvenation_command(script),
         vec![],
         None,
-        Some(std::time::Duration::from_secs(10)),
+        Some(REJUVENATE_TIMEOUT),
         None,
     ) {
         Ok((0, _, stderr)) => {
@@ -4875,6 +4886,22 @@ mod tests {
         let mut record = bare_vm_record();
         record.image = Some("alpine:latest".to_string());
         record
+    }
+
+    #[test]
+    fn rejuvenation_runs_a_plain_shell_that_leaves_no_orphan() {
+        let script =
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record());
+        let command = rejuvenation_command(script.clone());
+
+        // Anything that outlives the script is reparented to init.krun, and
+        // reaping it can reboot the guest; the agent enforces the deadline.
+        assert_eq!(command[..2], ["/bin/sh".to_string(), "-c".to_string()]);
+        assert_eq!(command[2], script);
+        assert_eq!(command.len(), 3);
+        assert!(!script.contains("timeout"), "{script}");
+        assert!(!script.contains("nohup"), "{script}");
+        assert!(!script.contains(" & "), "{script}");
     }
 
     #[test]
