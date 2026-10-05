@@ -28,6 +28,9 @@ pub const FORMAT_VERSION: u32 = 4;
 /// [`FORMAT_VERSION`] so runtimes that predate history refuse such files with
 /// a version message instead of failing on missing assets.
 pub const HISTORY_FORMAT_VERSION: u32 = 5;
+/// Format version of a `Chunked` file that holds only the objects its base
+/// lacks. Runtimes that cannot complete one from its base refuse it by version.
+pub const DELTA_FORMAT_VERSION: u32 = 6;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
@@ -1441,6 +1444,99 @@ fn runtime_capture_dir(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
     runtime_capture_dir_at(&data, ids)
 }
 
+/// Service-owned tmpfs directory for transient runtime captures. Searchable
+/// (0711) so a VMM running as its own uid can reach the private directory
+/// made for it inside.
+#[cfg(target_os = "linux")]
+const CAPTURE_TMPFS_ROOT: &str = "/dev/shm/smolvm-capture";
+
+/// The tmpfs capture root, created if needed, when it is usable: the caller
+/// runs as root, `/dev/shm` is tmpfs, and the directory is root-owned 0711.
+#[cfg(target_os = "linux")]
+pub fn capture_tmpfs_root() -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let root = PathBuf::from(CAPTURE_TMPFS_ROOT);
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    let usable = unsafe { libc::geteuid() } == 0
+        && unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut stat) } == 0
+        && stat.f_type == libc::TMPFS_MAGIC
+        && match std::fs::DirBuilder::new().mode(0o711).create(&root) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::AlreadyExists,
+        }
+        && std::fs::symlink_metadata(&root).is_ok_and(|metadata| {
+            metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o777 == 0o711
+        });
+    usable.then_some(root)
+}
+
+/// The tmpfs capture root for a VMM's filesystem confinement: created when
+/// still privileged, granted whenever it exists as a directory.
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_tmpfs_grant() -> Option<PathBuf> {
+    capture_tmpfs_root().or_else(|| {
+        let root = PathBuf::from(CAPTURE_TMPFS_ROOT);
+        std::fs::symlink_metadata(&root)
+            .is_ok_and(|metadata| metadata.is_dir())
+            .then_some(root)
+    })
+}
+
+/// No tmpfs capture grant off Linux.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn capture_tmpfs_grant() -> Option<PathBuf> {
+    None
+}
+
+/// No tmpfs capture root off Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn capture_tmpfs_root() -> Option<PathBuf> {
+    None
+}
+
+/// [`runtime_capture_dir`] on tmpfs when the service runs as root and tmpfs
+/// has room for the whole RAM image with margin; otherwise in the VM's data
+/// directory as usual.
+fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
+    #[cfg(target_os = "linux")]
+    {
+        let needed = u64::from(vm.mem) * 1024 * 1024 * 5 / 4 + (1 << 30);
+        let root = capture_tmpfs_root();
+        let usable = root.is_some()
+            && free_bytes(Path::new("/dev/shm")).is_some_and(|free| free > needed)
+            // tmpfs pages are RAM: never push the host into swap for this.
+            && std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|meminfo| {
+                    meminfo
+                        .lines()
+                        .find_map(|line| line.strip_prefix("MemAvailable:"))
+                        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                })
+                .is_some_and(|available_kib| available_kib * 1024 > needed * 2);
+        if let Some(root) = root.filter(|_| usable) {
+            let data = crate::agent::vm_data_dir(name);
+            let owner = vm.vm_uid_owner().unwrap_or(name);
+            let owner_data = crate::agent::vm_data_dir(owner);
+            let ids = crate::process::vm_drop_ids(
+                &crate::agent::vm_uid_registry_dir(),
+                &data,
+                None,
+                Some(&owner_data),
+            )
+            .transpose()
+            .map_err(|error| Error::agent("resolve checkpoint uid", error.to_string()))?;
+            match runtime_capture_dir_at(&root, ids) {
+                Ok(directory) => return Ok(directory),
+                Err(error) => {
+                    tracing::warn!(%error, "tmpfs runtime capture unavailable; using the data directory")
+                }
+            }
+        }
+    }
+    runtime_capture_dir(name, vm)
+}
+
 fn runtime_capture_dir_at(data: &Path, ids: Option<(u32, u32)>) -> Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("checkpoint-capture-");
@@ -1631,6 +1727,30 @@ pub(crate) fn capture_to_path_deferring_retention(
     Ok((result, deferred))
 }
 
+/// Capture a live checkpoint into the content-addressed `store`, publishing
+/// the stored checkpoint directory at `output`. Only chunks the store lacks
+/// are compressed and written; no ancestor generations are retained in it.
+pub(crate) fn capture_to_store(
+    name: &str,
+    output: &Path,
+    store: &Path,
+    release_source: impl FnOnce(),
+) -> Result<CaptureResult> {
+    capture_with_completion(
+        name,
+        output,
+        &CaptureOptions {
+            store_dir: Some(store.to_path_buf()),
+            ..Default::default()
+        },
+        0,
+        release_source,
+        false,
+        |_| Ok(()),
+        None,
+    )
+}
+
 /// Durable lifecycle boundaries for an owner coordinating a pause.
 pub enum PauseCaptureStage {
     /// Persist intent before freezing the guest.
@@ -1771,7 +1891,10 @@ fn capture_with_completion(
         && !options
             .prepared_cache_budget_bytes
             .is_some_and(|bytes| bytes > 0);
-    if discard_staging {
+    // A store only reads its staging tree before removing it, so it may link
+    // host assets and shared backing copies exactly like a discarded staging.
+    let read_only_staging = discard_staging || stored.is_some();
+    if read_only_staging {
         collector = collector.with_linked_host_assets();
     }
     collector
@@ -1814,7 +1937,13 @@ fn capture_with_completion(
         }
     }
     let control = crate::agent::fork::control_socket_path(name);
-    let runtime_capture = runtime_capture_dir(name, vm)?;
+    // A store capture consumes the runtime's RAM image and deletes it: on
+    // tmpfs it never reaches (or queues behind) the disk.
+    let runtime_capture = if options.store_dir.is_some() {
+        runtime_capture_dir_preferring_tmpfs(name, vm)?
+    } else {
+        runtime_capture_dir(name, vm)?
+    };
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
     #[cfg(target_os = "linux")]
     let mut memory_reservation = Some(
@@ -1943,10 +2072,12 @@ fn capture_with_completion(
         .transpose()?;
     #[cfg(not(unix))]
     let captured_disks: Option<String> = None;
+    let mut linked_heads = std::collections::HashMap::new();
     let checkpoint_disks = stage_disk_chains_with(
         &crate::agent::vm_data_dir(name),
         &snapshot_dir,
-        discard_staging,
+        read_only_staging,
+        stored.is_some().then_some(&mut linked_heads),
     )?;
     if !stop_after_capture {
         pause.resume()?;
@@ -2038,7 +2169,7 @@ fn capture_with_completion(
             }
             Some(
                 writer
-                    .ingest("checkpoint/memory.bin", size, 0o600, &mut file)
+                    .ingest_sparse_file("checkpoint/memory.bin", 0o600, &mut file)
                     .map_err(|e| Error::agent("store checkpoint memory", e.to_string()))?,
             )
         }
@@ -2194,6 +2325,7 @@ fn capture_with_completion(
         }),
         payload: Default::default(),
         history: Vec::new(),
+        base: None,
         credential_ca,
         clock,
         guest_cpu_features,
@@ -2217,10 +2349,17 @@ fn capture_with_completion(
     }
 
     if let Some((directory, mut writer)) = stored {
+        // A restored machine's read-only disk bases are inodes of the tree
+        // it was restored from; their chunks are already known.
+        let known = match (options.store_dir.as_ref(), vm.checkpoint_head.as_deref()) {
+            (Some(store), Some(parent)) => crate::checkpoint_delta::known_files_for(store, parent),
+            _ => Default::default(),
+        };
         let mut files = writer
-            .ingest_tree(&staging_dir)
+            .ingest_tree_known(&staging_dir, &known, &linked_heads)
             .map_err(|e| Error::agent("store checkpoint assets", e.to_string()))?;
         files.push(stored_memory.expect("stored capture has a RAM index"));
+        log_phase(name, "capture_store_assets", &mut phase);
         // Only compressed objects and the index are published. Keeping these
         // assets inside owned staging also makes interrupted captures reclaimable.
         temp_dir
@@ -2267,6 +2406,7 @@ fn capture_with_completion(
         );
         crate::checkpoint_store::publish(directory.path(), output)
             .map_err(|e| Error::agent("publish stored checkpoint", e.to_string()))?;
+        log_phase(name, "capture_store_publish", &mut phase);
         if let Some(store) = store.as_ref() {
             let published = output
                 .canonicalize()
@@ -3435,6 +3575,38 @@ fn resolve_backing_path(image: &Path, backing: &str) -> PathBuf {
     }
 }
 
+/// The first MiB of qcow2 image `path` with its backing name replaced by
+/// `backing`, as [`rewrite_qcow2_backing`] would leave it, without touching
+/// the file. `None` when the image is shorter than a qcow2 header or its
+/// header cluster extends past the first MiB.
+fn qcow2_head_with_backing(path: &Path, backing: &str) -> Result<Option<Vec<u8>>> {
+    const HEAD: u64 = 1024 * 1024;
+    let size = std::fs::metadata(path)
+        .map_err(|error| Error::agent("inspect qcow2", error.to_string()))?
+        .len();
+    let mut head = vec![0_u8; size.min(HEAD) as usize];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .map_err(|error| Error::agent("read qcow2 header", error.to_string()))?;
+    if head.len() < 104 {
+        return Ok(None);
+    }
+    let cluster_bits = u32::from_be_bytes(head[20..24].try_into().unwrap());
+    if !(9..=20).contains(&cluster_bits) || (1_u64 << cluster_bits) > head.len() as u64 {
+        return Ok(None);
+    }
+    // Apply the exact file rewrite to a scratch copy of the header cluster.
+    let scratch = tempfile::NamedTempFile::new()
+        .map_err(|error| Error::agent("stage qcow2 header", error.to_string()))?;
+    std::fs::write(scratch.path(), &head[..1 << cluster_bits])
+        .map_err(|error| Error::agent("stage qcow2 header", error.to_string()))?;
+    rewrite_qcow2_backing(scratch.path(), backing)?;
+    let cluster = std::fs::read(scratch.path())
+        .map_err(|error| Error::agent("stage qcow2 header", error.to_string()))?;
+    head[..cluster.len()].copy_from_slice(&cluster);
+    Ok(Some(head))
+}
+
 fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -3735,16 +3907,22 @@ pub fn stage_disk_chains(
     snapshot_dir: &Path,
     checkpoint_dir: &Path,
 ) -> Result<Vec<CheckpointDisk>> {
-    stage_disk_chains_with(snapshot_dir, checkpoint_dir, false)
+    stage_disk_chains_with(snapshot_dir, checkpoint_dir, false, None)
 }
 
 /// [`stage_disk_chains`]; with `share_backings`, qcow2 backing layers are
 /// linked from [`stage_shared_backing`]'s copies. Only for a staging tree that
 /// is packed and then discarded: nothing may modify a staged file in place.
+/// With `linked_heads`, immutable qcow2 backing layers are hard-linked rather
+/// than copied, and the header each needs in the checkpoint (its backing name
+/// rewritten) is recorded there by artifact path for the store to substitute
+/// while ingesting: nothing is copied while the source is paused but the
+/// writable top. Only for a store capture, which reads staging and discards it.
 fn stage_disk_chains_with(
     snapshot_dir: &Path,
     checkpoint_dir: &Path,
     share_backings: bool,
+    mut linked_heads: Option<&mut std::collections::HashMap<String, Vec<u8>>>,
 ) -> Result<Vec<CheckpointDisk>> {
     let mut disks = Vec::new();
     for (role, raw_name) in [
@@ -3790,10 +3968,23 @@ fn stage_disk_chains_with(
                 None
             };
             let next_target = next.as_ref().map(|(_, _, target)| target.as_str());
-            if !(share_backings
-                && index > 0
-                && format == "qcow2"
-                && stage_shared_backing(&source, &staged, next_target)?)
+            let linked = match (linked_heads.as_deref_mut(), next_target) {
+                (Some(heads), Some(next_target)) if index > 0 && format == "qcow2" => {
+                    match qcow2_head_with_backing(&source, next_target)? {
+                        Some(head) if std::fs::hard_link(&source, &staged).is_ok() => {
+                            heads.insert(artifact_path.clone(), head);
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if !linked
+                && !(share_backings
+                    && index > 0
+                    && format == "qcow2"
+                    && stage_shared_backing(&source, &staged, next_target)?)
             {
                 stage_checkpoint_disk_layer(&source, &staged, index, format)?;
                 if let Some(next_target) = next_target {
@@ -4063,6 +4254,9 @@ fn mounts_checkpoint_image_layers(checkpoint: &PortableCheckpointManifest) -> bo
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
     let required = match checkpoint.payload {
         smolvm_pack::format::CheckpointLayout::Assets => FORMAT_VERSION,
+        smolvm_pack::format::CheckpointLayout::Chunked if checkpoint.base.is_some() => {
+            DELTA_FORMAT_VERSION
+        }
         smolvm_pack::format::CheckpointLayout::Chunked => HISTORY_FORMAT_VERSION,
     };
     if checkpoint.version != required {
@@ -5866,6 +6060,7 @@ mod tests {
             lineage: None,
             payload: Default::default(),
             history: Vec::new(),
+            base: None,
             credential_ca: None,
             clock: None,
             guest_cpu_features: None,
@@ -6816,6 +7011,7 @@ mod tests {
             lineage: None,
             payload: Default::default(),
             history: Vec::new(),
+            base: None,
             credential_ca: None,
             clock: None,
             guest_cpu_features: None,

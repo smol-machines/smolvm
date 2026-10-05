@@ -226,6 +226,10 @@ impl ServeStartCmd {
             }
         }
 
+        // The tmpfs capture root exists before any VMM is confined, so each
+        // can be granted it.
+        let _ = smolvm::portable_checkpoint::capture_tmpfs_root();
+
         // Default-on: confine each VM boot subprocess's filesystem view via
         // Landlock. `--landlock` selects enforce|off (default enforce); a pre-set
         // SMOLVM_LANDLOCK env wins. Inherited by the spawned `_boot-vm`.

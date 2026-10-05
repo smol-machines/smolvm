@@ -350,6 +350,16 @@ pub struct CheckpointLineage {
     pub created_at: String,
 }
 
+/// The parent a delta checkpoint file depends on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointBase {
+    /// Lineage id of the parent checkpoint.
+    pub id: String,
+    /// SHA-256 of the parent's stored index (`checkpoint.json`), which names
+    /// every object the parent holds.
+    pub index_sha256: String,
+}
+
 /// How a portable checkpoint file lays out its payload.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -591,6 +601,11 @@ pub struct PortableCheckpointManifest {
     /// single-generation file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<CheckpointGeneration>,
+    /// The checkpoint this file's objects are relative to. A `Chunked` file
+    /// with a base carries only the objects its base lacks, so it restores
+    /// only where that exact base (same id and index digest) is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<CheckpointBase>,
     /// The machine's credential CA (certificate and signing key). The captured
     /// guest trusts this CA, so a restore keeps it instead of minting a new
     /// one the guest would reject. Absent for machines without credentials.

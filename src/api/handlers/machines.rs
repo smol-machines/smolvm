@@ -977,6 +977,10 @@ pub struct CaptureCheckpointQuery {
     /// caller to join; the reply is then a small JSON summary and the artifact
     /// never crosses the control plane.
     pub upload_urls: Option<String>,
+    /// Capture through the node's checkpoint store. The artifact is then a
+    /// chunked file, and a delta of the checkpoint the machine continues from
+    /// when this node holds it.
+    pub incremental: Option<bool>,
 }
 
 /// Capture a live checkpoint of a running machine and stream it back as a
@@ -1023,8 +1027,15 @@ pub async fn capture_portable_checkpoint(
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(8 * 1024 * 1024 * 1024)
     });
+    let incremental = capture_options.incremental.unwrap_or(false);
     // Keep staging alive until the background capture finishes, even on disconnect.
     let (transfer, result) = with_owned_transfer(transfer, move |_dir| {
+        if incremental {
+            return crate::checkpoint_delta::capture(&capture_name, &capture_path, move || {
+                drop(guard)
+            })
+            .map(|capture| (capture.result.clone(), None, Some(capture)));
+        }
         crate::portable_checkpoint::capture_to_path_deferring_retention(
             &capture_name,
             &capture_path,
@@ -1035,9 +1046,45 @@ pub async fn capture_portable_checkpoint(
             crate::portable_checkpoint::DEFAULT_HISTORY,
             move || drop(guard),
         )
+        .map(|(result, retention)| (result, retention, None))
     })
     .await?;
-    let (result, retention) = result.map_err(checkpoint_capture_error)?;
+    let (result, retention, incremental) = result.map_err(checkpoint_capture_error)?;
+    let incremental_headers: Vec<(&'static str, String)> = match &incremental {
+        Some(capture) => vec![
+            (
+                "x-smolvm-checkpoint-kind",
+                if capture.base.is_some() {
+                    "delta"
+                } else {
+                    "full"
+                }
+                .to_string(),
+            ),
+            ("x-smolvm-checkpoint-id", capture.id.clone()),
+            (
+                "x-smolvm-checkpoint-parent",
+                capture.base.clone().unwrap_or_default(),
+            ),
+            (
+                "x-smolvm-checkpoint-store-ms",
+                capture.store_elapsed.as_millis().to_string(),
+            ),
+            (
+                "x-smolvm-checkpoint-export-ms",
+                capture.export_elapsed.as_millis().to_string(),
+            ),
+            (
+                "x-smolvm-checkpoint-new-bytes",
+                capture.result.size_bytes.to_string(),
+            ),
+            (
+                "x-smolvm-checkpoint-reused-bytes",
+                capture.result.reused_bytes.to_string(),
+            ),
+        ],
+        None => Vec::new(),
+    };
     let transfer = CheckpointTransfer {
         _directory: Some(transfer),
         artifact: artifact.clone(),
@@ -1078,7 +1125,10 @@ pub async fn capture_portable_checkpoint(
     let mut file = tokio::fs::File::open(&artifact)
         .await
         .map_err(|error| ApiError::internal(format!("open checkpoint artifact: {error}")))?;
-    let size = result.size_bytes;
+    let size = match &incremental {
+        Some(capture) => capture.export.bytes,
+        None => result.size_bytes,
+    };
     let stream = async_stream::stream! {
         // Keeping the TempDir in the stream owns the artifact until the client
         // finishes or disconnects; dropping the body cleans it up either way.
@@ -1100,7 +1150,10 @@ pub async fn capture_portable_checkpoint(
             }
         }
     };
-    let response = Response::builder();
+    let mut response = Response::builder();
+    for (name, value) in incremental_headers {
+        response = response.header(name, value);
+    }
     #[cfg(target_os = "linux")]
     let response = if let Some(reference) = prepared_reference {
         response.header("x-smolvm-checkpoint-prepared", reference)
@@ -1292,6 +1345,9 @@ pub struct RestoreCheckpointQuery {
     /// before) the artifact is served from the node-local cache and
     /// `source_url` is never fetched.
     pub cache_key: Option<String>,
+    /// Only import a chunked checkpoint into this node's store (so deltas of
+    /// it can restore here); create no machine.
+    pub import_only: Option<bool>,
 }
 
 fn checkpoint_host_ports(
@@ -1719,7 +1775,7 @@ pub async fn restore_portable_checkpoint(
     Path(name): Path<String>,
     Query(options): Query<RestoreCheckpointQuery>,
     request: axum::extract::Request,
-) -> Result<Json<MachineInfo>, ApiError> {
+) -> Result<Response<Body>, ApiError> {
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
     // Pull credential for the pack a checkpoint's layers come from, sent as a
     // header so it stays out of URLs and request logs.
@@ -1887,6 +1943,60 @@ pub async fn restore_portable_checkpoint(
         None => verified,
     };
 
+    // A chunked checkpoint, complete or a delta, is imported into the node's
+    // store and materialized once into the shared extraction its footer
+    // names; creation then reuses that tree like any extracted checkpoint.
+    {
+        let import_only = options.import_only.unwrap_or(false);
+        let input = artifact.clone();
+        let needs_verification = verified.is_none();
+        let started = std::time::Instant::now();
+        let prepared = tokio::task::spawn_blocking(move || -> crate::Result<Option<String>> {
+            // Classic artifacts take the ordinary path, which verifies them.
+            let chunked = smolvm_pack::packer::read_manifest_from_sidecar(&input)
+                .ok()
+                .and_then(|manifest| manifest.checkpoint)
+                .is_some_and(|checkpoint| {
+                    checkpoint.payload == smolvm_pack::format::CheckpointLayout::Chunked
+                });
+            if !chunked && !import_only {
+                return Ok(None);
+            }
+            if needs_verification {
+                crate::portable_checkpoint::verified_sidecar_footer(&input)?;
+            }
+            if import_only {
+                return crate::checkpoint_delta::import(&input)
+                    .map(|imported| imported.map(|imported| imported.id));
+            }
+            crate::checkpoint_delta::prepare_restore(&input)
+                .map(|tree| tree.map(|tree| tree.display().to_string()))
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("chunked checkpoint task: {error}")))?
+        .map_err(ApiError::from)?;
+        if prepared.is_some() {
+            crate::portable_checkpoint::log_phase(&name, "api_restore_chunked_prepare", &mut {
+                started
+            });
+        }
+        if import_only {
+            let Some(id) = prepared else {
+                return Err(ApiError::BadRequest(
+                    "only chunked checkpoints can be imported".to_string(),
+                ));
+            };
+            if let Some(key) = options.cache_key {
+                let artifact = artifact.clone();
+                let _ = tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact))
+                    .await;
+            }
+            return Ok(axum::response::IntoResponse::into_response(Json(
+                serde_json::json!({ "imported": id, "elapsedMs": started.elapsed().as_millis() as u64 }),
+            )));
+        }
+    }
+
     // Prepared state is an optional optimization: eviction or missing metadata
     // falls back to the durable artifact before machine creation starts.
     #[cfg(target_os = "linux")]
@@ -1933,7 +2043,7 @@ pub async fn restore_portable_checkpoint(
             }
         }
     }
-    result
+    result.map(axum::response::IntoResponse::into_response)
 }
 
 /// Build a MachineEntry from a VmRecord and AgentManager.
@@ -3040,6 +3150,22 @@ async fn create_machine_inner(
             _ => Default::default(),
         },
     });
+    if complete_result.is_ok() {
+        if let Some(id) = manifest_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.lineage.as_ref())
+            .map(|lineage| lineage.id.clone())
+        {
+            // The next capture records this as its parent, which is what lets
+            // it be a delta of the checkpoint this machine was restored from.
+            if let Err(error) = state
+                .update_vm(&name, move |record| record.checkpoint_head = Some(id))
+                .await
+            {
+                tracing::warn!(machine = %name, ?error, "checkpoint head not recorded");
+            }
+        }
+    }
     if let Err(e) = complete_result {
         let data_dir = vm_data_dir(&name);
         smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(

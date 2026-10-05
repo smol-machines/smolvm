@@ -175,6 +175,8 @@ pub struct Writer {
     pool: Pool,
     /// Running byte accounting for this writer.
     pub stats: WriteStats,
+    /// New objects written but not yet durable, published by [`Self::finish`].
+    pending: Vec<(std::path::PathBuf, String)>,
 }
 
 impl Writer {
@@ -213,6 +215,7 @@ impl Writer {
             objects,
             pool,
             stats: WriteStats::default(),
+            pending: Vec::new(),
         })
     }
 
@@ -303,8 +306,11 @@ impl Writer {
             in_flight -= 1;
             free.push(bytes);
             match result {
-                Ok((hash, stats)) => {
+                Ok((hash, stats, unsynced)) => {
                     self.stats.add(&stats);
+                    if let (Some(path), Some(hash)) = (unsynced, hash.as_ref()) {
+                        self.pending.push((path, hash.clone()));
+                    }
                     pending[seq] = Some(hash);
                 }
                 Err(error) => {
@@ -382,18 +388,34 @@ impl Writer {
 
     /// Ingest a stable directory tree. Symlinks and special files are rejected.
     pub fn ingest_tree(&mut self, root: &Path) -> io::Result<Vec<StoredFile>> {
+        self.ingest_tree_known(root, &KnownFiles::default(), &HashMap::new())
+    }
+
+    /// [`Self::ingest_tree`], reusing the recorded chunks of any file that is
+    /// one of the `known` read-only inodes instead of reading it. A file named
+    /// in `heads` (by relative path) is stored with its first chunk replaced
+    /// by those bytes: a linked qcow2 layer whose header names a different
+    /// backing file in the checkpoint than on the host.
+    pub fn ingest_tree_known(
+        &mut self,
+        root: &Path,
+        known: &KnownFiles,
+        heads: &HashMap<String, Vec<u8>>,
+    ) -> io::Result<Vec<StoredFile>> {
         fn visit(
             writer: &mut Writer,
             root: &Path,
             dir: &Path,
             result: &mut Vec<StoredFile>,
+            known: &KnownFiles,
+            heads: &HashMap<String, Vec<u8>>,
         ) -> io::Result<()> {
             let mut entries = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
             entries.sort_by_key(|e| e.file_name());
             for entry in entries {
                 let kind = entry.file_type()?;
                 if kind.is_dir() {
-                    visit(writer, root, &entry.path(), result)?;
+                    visit(writer, root, &entry.path(), result, known, heads)?;
                 } else if kind.is_file() {
                     #[cfg(unix)]
                     let mode = {
@@ -409,7 +431,20 @@ impl Writer {
                     let relative = relative
                         .to_str()
                         .ok_or_else(|| invalid("non-UTF8 checkpoint asset"))?;
-                    result.push(writer.ingest_file(relative, mode, &mut File::open(&path)?)?);
+                    let head = heads.get(relative).map(Vec::as_slice);
+                    #[cfg(unix)]
+                    if head.is_none() {
+                        if let Some(file) = writer.reuse_known(relative, &path, known)? {
+                            result.push(file);
+                            continue;
+                        }
+                    }
+                    result.push(writer.ingest_file_with_head(
+                        relative,
+                        mode,
+                        &mut File::open(&path)?,
+                        head,
+                    )?);
                 } else {
                     return Err(invalid("checkpoint staging contains a non-regular asset"));
                 }
@@ -417,16 +452,90 @@ impl Writer {
             Ok(())
         }
         let mut files = Vec::new();
-        visit(self, root, root, &mut files)?;
+        visit(self, root, root, &mut files, known, heads)?;
         Ok(files)
+    }
+
+    /// Link the objects of a known, unmodifiable inode instead of reading it.
+    #[cfg(unix)]
+    fn reuse_known(
+        &mut self,
+        relative: &str,
+        path: &Path,
+        known: &KnownFiles,
+    ) -> io::Result<Option<StoredFile>> {
+        use std::os::unix::fs::MetadataExt;
+        if known.is_empty() {
+            return Ok(None);
+        }
+        let metadata = fs::metadata(path)?;
+        if metadata.mode() & 0o222 != 0 {
+            return Ok(None);
+        }
+        let Some((mode, chunks)) =
+            known
+                .files
+                .get(&(metadata.dev(), metadata.ino(), metadata.len()))
+        else {
+            return Ok(None);
+        };
+        for hash in chunks.iter().flatten() {
+            let cached = self.cache.join(hash);
+            if !cached.is_file() {
+                return Ok(None);
+            }
+        }
+        for (index, hash) in chunks.iter().enumerate() {
+            let count = (metadata.len() - index as u64 * CHUNK_SIZE as u64).min(CHUNK_SIZE as u64);
+            let Some(hash) = hash else {
+                self.stats.zero_bytes += count;
+                continue;
+            };
+            match fs::hard_link(self.cache.join(hash), self.objects.join(hash)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            self.stats.reused_bytes += count;
+        }
+        Ok(Some(StoredFile {
+            path: relative.into(),
+            size: metadata.len(),
+            mode: *mode,
+            chunks: chunks.clone(),
+        }))
+    }
+
+    /// Ingest a stable file under a safe relative path, skipping its holes
+    /// without reading them (a sparse RAM image or disk).
+    pub fn ingest_sparse_file(
+        &mut self,
+        path: &str,
+        mode: u32,
+        source: &mut File,
+    ) -> io::Result<StoredFile> {
+        self.ingest_file(path, mode, source)
     }
 
     // Disk images and templates may be tens of GiB logically but mostly holes.
     // Preserve those holes without reading and scanning their logical zeros.
     fn ingest_file(&mut self, path: &str, mode: u32, source: &mut File) -> io::Result<StoredFile> {
+        self.ingest_file_with_head(path, mode, source, None)
+    }
+
+    fn ingest_file_with_head(
+        &mut self,
+        path: &str,
+        mode: u32,
+        source: &mut File,
+        head: Option<&[u8]>,
+    ) -> io::Result<StoredFile> {
         let size = source.metadata()?.len();
         if !safe_relative(path) || size > MAX_BYTES {
             return Err(invalid("invalid checkpoint asset"));
+        }
+        if head.is_some_and(|head| head.len() as u64 != size.min(CHUNK_SIZE as u64)) {
+            return Err(invalid("replacement head does not cover the first chunk"));
         }
         let mut offset = 0;
         #[cfg(unix)]
@@ -460,7 +569,11 @@ impl Writer {
             };
             #[cfg(not(unix))]
             let hole = false;
-            let job = if hole {
+            let job = if let Some(head) = head.filter(|_| offset == 0) {
+                buffer.clear();
+                buffer.extend_from_slice(head);
+                Job::Data
+            } else if hole {
                 Job::Hole(count as usize)
             } else {
                 buffer.resize(count as usize, 0);
@@ -497,6 +610,7 @@ impl Writer {
             files,
         };
         validate_index(&index)?;
+        self.publish_pending()?;
         let mut file = File::options()
             .write(true)
             .create_new(true)
@@ -511,6 +625,28 @@ impl Writer {
 }
 
 impl Writer {
+    /// Make every object this capture wrote with deferred durability durable
+    /// (all at once, so their journal commits are shared), then publish each
+    /// into the store's cache under its digest. An object is reachable by
+    /// name only once its bytes are on disk.
+    fn publish_pending(&mut self) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let cache = self.cache.clone();
+        for_each_parallel(worker_threads(), pending.into_iter(), |(path, hash)| {
+            File::open(&path)?.sync_all()?;
+            match fs::hard_link(&path, cache.join(&hash)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            fs::remove_file(&path)
+        })?;
+        File::open(&self.cache)?.sync_all()
+    }
+
     /// Retain `parent`'s generation, and every generation `parent` retains, in
     /// the checkpoint being written at `directory`: their indexes are copied
     /// under [`GENERATIONS`] and every object they reference is hard-linked
@@ -960,10 +1096,14 @@ struct Done {
     /// allocating a fresh megabyte per chunk.
     bytes: Vec<u8>,
     /// `None` when the chunk was all zero bytes.
-    result: io::Result<(Option<String>, WriteStats)>,
+    result: io::Result<ChunkResult>,
 }
 
 type Submission = (usize, Vec<u8>, mpsc::Sender<Done>);
+
+/// A stored chunk's object hash (`None` for zeros), its accounting, and, when
+/// object durability is deferred, the not yet published object file.
+type ChunkResult = (Option<String>, WriteStats, Option<std::path::PathBuf>);
 
 /// Worker threads that turn chunk bytes into store objects. Hashing and
 /// compressing are most of a capture's cost and every chunk is independent of
@@ -1226,20 +1366,45 @@ impl Drop for Pool {
 /// publish it, then hard-link it into this checkpoint. Two workers (or two
 /// concurrent captures) storing the same content race on `persist_noclobber`;
 /// the loser verifies and keeps the winner's object.
-fn store_chunk(
-    cache: &Path,
-    objects: &Path,
-    bytes: &[u8],
-) -> io::Result<(Option<String>, WriteStats)> {
+static TRUST_EXISTING_OBJECTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+static DEFER_OBJECT_SYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Write new objects without syncing each one; [`Writer::finish`] syncs them
+/// together and only then publishes them under their digests. Per-object
+/// syncs serialize on the filesystem journal when the disk is busy.
+pub fn defer_object_sync(defer: bool) {
+    DEFER_OBJECT_SYNC.store(defer, Ordering::Relaxed);
+}
+
+/// Let captures reuse an object already in the store by its content digest
+/// alone, without decoding it to compare bytes. A damaged object is then
+/// caught when a restore reads it (every read verifies its digest) rather
+/// than when a capture reuses it.
+pub fn trust_existing_objects(trust: bool) {
+    TRUST_EXISTING_OBJECTS.store(trust, Ordering::Relaxed);
+}
+
+fn store_chunk(cache: &Path, objects: &Path, bytes: &[u8]) -> io::Result<ChunkResult> {
     let mut stats = WriteStats::default();
     let count = bytes.len() as u64;
     if smolvm_pack::is_zero_filled(bytes) {
         stats.zero_bytes += count;
-        return Ok((None, stats));
+        return Ok((None, stats, None));
     }
     let hash = digest(bytes);
     let cached = cache.join(&hash);
-    match verify_object_matches(&cached, bytes) {
+    let existing = if TRUST_EXISTING_OBJECTS.load(Ordering::Relaxed) {
+        match fs::symlink_metadata(&cached) {
+            Ok(metadata) if metadata.is_file() && metadata.len() > 0 => Ok(()),
+            Ok(_) => Err(invalid("checkpoint object type or length mismatch")),
+            Err(error) => Err(error),
+        }
+    } else {
+        verify_object_matches(&cached, bytes)
+    };
+    match existing {
         Ok(_) => stats.reused_bytes += count,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut temp = tempfile::Builder::new()
@@ -1247,6 +1412,27 @@ fn store_chunk(
                 .tempfile_in(cache)?;
             let compressed = zstd::bulk::compress(bytes, 3)?;
             temp.write_all(&compressed)?;
+            if DEFER_OBJECT_SYNC.load(Ordering::Relaxed) {
+                let (_, path) = temp.keep().map_err(|error| error.error)?;
+                let linked = objects.join(&hash);
+                match fs::hard_link(&path, &linked) {
+                    Ok(()) => {
+                        stats.new_bytes += compressed.len() as u64;
+                        stats.new_logical_bytes += count;
+                        return Ok((Some(hash), stats, Some(path)));
+                    }
+                    // Another chunk of this capture had the same bytes.
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        fs::remove_file(&path)?;
+                        stats.reused_bytes += count;
+                        return Ok((Some(hash), stats, None));
+                    }
+                    Err(error) => {
+                        let _ = fs::remove_file(&path);
+                        return Err(error);
+                    }
+                }
+            }
             sync_object(temp.as_file())?;
             match temp.persist_noclobber(&cached) {
                 Ok(_) => {
@@ -1266,13 +1452,15 @@ fn store_chunk(
     match fs::hard_link(&cached, &linked) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            verify_object_matches(&linked, bytes)?;
+            if !TRUST_EXISTING_OBJECTS.load(Ordering::Relaxed) {
+                verify_object_matches(&linked, bytes)?;
+            }
         }
         // Cross-device copies would silently remove the storage benefit, so
         // require the store and output on one volume.
         Err(error) => return Err(error),
     }
-    Ok((Some(hash), stats))
+    Ok((Some(hash), stats, None))
 }
 
 fn cache_lock(cache: &Path, exclusive: bool) -> io::Result<File> {
@@ -2267,6 +2455,430 @@ pub fn export_at(directory: &Path, generation: Option<&str>, output: &Path) -> i
     Ok(info.total_size)
 }
 
+/// SHA-256 of a stored checkpoint's own index. The index names every object
+/// the checkpoint holds, so this digest identifies a delta's base exactly.
+pub fn index_digest(directory: &Path) -> io::Result<String> {
+    let path = directory.join(INDEX);
+    if fs::symlink_metadata(&path)?.len() > 256 * 1024 * 1024 {
+        return Err(invalid("checkpoint index too large"));
+    }
+    Ok(digest(&fs::read(path)?))
+}
+
+fn own_objects(index: &Index) -> HashSet<&str> {
+    index
+        .files
+        .iter()
+        .flat_map(|file| file.chunks.iter().flatten())
+        .map(String::as_str)
+        .collect()
+}
+
+/// Immutable files a stored checkpoint already describes, keyed by inode.
+/// A capture that stages one of these exact inodes (a restored machine's
+/// read-only disk base, linked from the tree it was restored from) reuses
+/// its chunk list instead of reading and hashing it again.
+#[derive(Debug, Default)]
+pub struct KnownFiles {
+    files: HashMap<(u64, u64, u64), (u32, Vec<Option<String>>)>,
+}
+
+impl KnownFiles {
+    /// Number of known files.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether no file is known.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
+/// Index the read-only files of `tree`, an untouched materialization of the
+/// stored checkpoint at `stored`, by inode. Writable files are skipped: only
+/// an inode nobody can modify may stand for the chunks recorded for it.
+#[cfg(unix)]
+pub fn known_files(stored: &Path, tree: &Path) -> io::Result<KnownFiles> {
+    use std::os::unix::fs::MetadataExt;
+    let index = read_index(stored)?;
+    let mut known = KnownFiles::default();
+    for file in index.files {
+        let Ok(metadata) = fs::symlink_metadata(tree.join(&file.path)) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() != file.size || metadata.mode() & 0o222 != 0 {
+            continue;
+        }
+        known.files.insert(
+            (metadata.dev(), metadata.ino(), file.size),
+            (file.mode, file.chunks),
+        );
+    }
+    Ok(known)
+}
+
+/// What [`export_chunked`] wrote.
+#[derive(Debug, Default, Clone)]
+pub struct ExportStats {
+    /// Size of the exported file.
+    pub bytes: u64,
+    /// Objects carried by the file.
+    pub objects: usize,
+    /// Compressed bytes of the objects carried.
+    pub object_bytes: u64,
+    /// Objects left out because the base holds them.
+    pub base_objects: usize,
+}
+
+/// Export the stored checkpoint at `directory` as one `Chunked` file holding
+/// its index and objects. With `base` (another stored checkpoint), every
+/// object the base's own index references is left out and the manifest names
+/// the base by lineage id and index digest: the file is then a delta that
+/// restores only where that base is present. `decorate` stamps the manifest
+/// (format version).
+pub fn export_chunked(
+    directory: &Path,
+    base: Option<&Path>,
+    output: &Path,
+    decorate: impl FnOnce(&mut PackManifest),
+) -> io::Result<ExportStats> {
+    if output.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "checkpoint output exists",
+        ));
+    }
+    let own = read_index(directory)?;
+    let base_index = base.map(read_index).transpose()?;
+    let skip: HashSet<&str> = base_index.as_ref().map(own_objects).unwrap_or_default();
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .prefix(".checkpoint-export-")
+        .tempdir_in(parent)?;
+    let staging = temporary.path().join("staging");
+    fs::create_dir_all(staging.join("objects"))?;
+    fs::copy(directory.join(INDEX), staging.join(INDEX))?;
+    let mut stats = ExportStats::default();
+    let objects = directory.join("objects");
+    for hash in own_objects(&own) {
+        if skip.contains(hash) {
+            stats.base_objects += 1;
+            continue;
+        }
+        let source = objects.join(hash);
+        let target = staging.join("objects").join(hash);
+        if fs::hard_link(&source, &target).is_err() {
+            fs::copy(&source, &target)?;
+        }
+        stats.objects += 1;
+        stats.object_bytes += fs::metadata(&target)?.len();
+    }
+    let mut manifest = own.manifest;
+    {
+        let checkpoint = manifest
+            .checkpoint
+            .as_mut()
+            .ok_or_else(|| invalid("stored checkpoint has no live-state manifest"))?;
+        checkpoint.payload = smolvm_pack::format::CheckpointLayout::Chunked;
+        if let Some(generation) = generation_of(&read_index(directory)?, false) {
+            checkpoint.history = vec![smolvm_pack::format::CheckpointGeneration {
+                lineage: smolvm_pack::format::CheckpointLineage {
+                    id: generation.id,
+                    parent: generation.parent,
+                    machine: generation.machine,
+                    created_at: generation.created_at,
+                },
+                data_bytes: generation.data_bytes,
+            }];
+        }
+        checkpoint.base = match (base, base_index.as_ref()) {
+            (Some(base), Some(index)) => {
+                let id = index
+                    .manifest
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.lineage.as_ref())
+                    .map(|lineage| lineage.id.clone())
+                    .ok_or_else(|| invalid("a delta's base must record its lineage id"))?;
+                Some(smolvm_pack::format::CheckpointBase {
+                    id,
+                    index_sha256: index_digest(base)?,
+                })
+            }
+            _ => None,
+        };
+    }
+    decorate(&mut manifest);
+    let collector =
+        smolvm_pack::assets::AssetCollector::new(staging).map_err(|e| invalid(e.to_string()))?;
+    let artifact = temporary.path().join("export.smolcheckpoint");
+    let info = smolvm_pack::packer::Packer::new(manifest)
+        .with_asset_collector(collector)
+        .pack_artifact(&artifact)
+        .map_err(|e| invalid(e.to_string()))?;
+    File::open(&artifact)?.sync_all()?;
+    publish(&artifact, output)?;
+    stats.bytes = info.total_size;
+    Ok(stats)
+}
+
+/// Objects the stored checkpoint at `directory` references but does not hold.
+pub fn missing_objects(directory: &Path) -> io::Result<Vec<String>> {
+    let index = read_index(directory)?;
+    let objects = directory.join("objects");
+    let mut missing: Vec<String> = own_objects(&index)
+        .into_iter()
+        .filter(|hash| !objects.join(hash).is_file())
+        .map(str::to_string)
+        .collect();
+    missing.sort();
+    Ok(missing)
+}
+
+/// Complete an unpacked delta from its base: hard-link every object the
+/// delta's index needs and does not carry from `base`'s objects. The caller
+/// has checked that `base` is the exact checkpoint the delta names. Returns
+/// how many objects were linked; objects stay verified on every read.
+pub fn complete_from_base(directory: &Path, base: &Path) -> io::Result<usize> {
+    let objects = directory.join("objects");
+    fs::create_dir_all(&objects)?;
+    let base_objects = base.join("objects");
+    let mut linked = 0;
+    for hash in missing_objects(directory)? {
+        let source = base_objects.join(&hash);
+        if !source.is_file() {
+            return Err(invalid(format!(
+                "delta checkpoint needs object {hash} that its base does not hold"
+            )));
+        }
+        match fs::hard_link(&source, objects.join(&hash)) {
+            Ok(()) => linked += 1,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(linked)
+}
+
+/// Make a stored checkpoint's objects available to later captures through the
+/// store's object cache, so a machine restored from it captures only what it
+/// changes. Existing cache objects are kept.
+pub fn adopt_objects(store: &Path, directory: &Path) -> io::Result<usize> {
+    fs::create_dir_all(store)?;
+    let _lock = cache_lock(store, false)?;
+    let cache = store.join("objects");
+    fs::create_dir_all(&cache)?;
+    let mut adopted = 0;
+    for entry in fs::read_dir(directory.join("objects"))? {
+        let entry = entry?;
+        match fs::hard_link(entry.path(), cache.join(entry.file_name())) {
+            Ok(()) => adopted += 1,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    File::open(&cache)?.sync_all()?;
+    Ok(adopted)
+}
+
+/// What [`materialize_over`] did.
+#[derive(Debug, Default, Clone)]
+pub struct MaterializeStats {
+    /// Files hard-linked unchanged from the base tree.
+    pub linked_files: usize,
+    /// Logical bytes of those files.
+    pub linked_bytes: u64,
+    /// Chunks copied from the base tree's files.
+    pub copied_chunks: u64,
+    /// Chunks decoded from objects.
+    pub written_chunks: u64,
+}
+
+/// Materialize the stored checkpoint at `directory` into the fresh directory
+/// `output`, reusing `base`: a stored checkpoint and an untouched
+/// materialization of it. A file whose chunks all match one of the base's
+/// files (at any path: a disk layer moves down the chain as generations are
+/// added) is hard-linked; any other file takes each chunk the base holds
+/// from wherever the base holds it (a reflink where the filesystem can) and
+/// decodes only chunks the base lacks. Without a base this is a full
+/// materialization.
+///
+/// The base tree is trusted as written by this host; both trees must be
+/// immutable once materialized, since they may share inodes.
+pub fn materialize_over(
+    directory: &Path,
+    output: &Path,
+    base: Option<(&Path, &Path)>,
+) -> io::Result<MaterializeStats> {
+    let index = read_index(directory)?;
+    let base = base
+        .map(|(stored, tree)| read_index(stored).map(|index| (index, tree.to_path_buf())))
+        .transpose()?;
+    // Base files present in the tree with their expected size, by index.
+    let mut base_files: Vec<(std::path::PathBuf, &StoredFile)> = Vec::new();
+    if let Some((index, tree)) = base.as_ref() {
+        for file in &index.files {
+            let path = tree.join(&file.path);
+            if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == file.size) {
+                base_files.push((path, file));
+            }
+        }
+    }
+    let mut whole: HashMap<(&[Option<String>], u64, u32), usize> = HashMap::new();
+    let mut located: HashMap<&str, (usize, u64)> = HashMap::new();
+    for (position, (_, file)) in base_files.iter().enumerate() {
+        whole
+            .entry((file.chunks.as_slice(), file.size, file.mode))
+            .or_insert(position);
+        for (chunk, hash) in file.chunks.iter().enumerate() {
+            if let Some(hash) = hash {
+                let offset = chunk as u64 * CHUNK_SIZE as u64;
+                // Only whole chunks: a file's short tail cannot stand in for
+                // a full chunk elsewhere.
+                if file.size - offset >= CHUNK_SIZE as u64 {
+                    located.entry(hash.as_str()).or_insert((position, offset));
+                }
+            }
+        }
+    }
+    let handles: Vec<Option<File>> = base_files
+        .iter()
+        .map(|(path, _)| File::open(path).ok())
+        .collect();
+    fs::create_dir(output)?;
+    let objects = directory.join("objects");
+    let threads = worker_threads();
+    let mut stats = MaterializeStats::default();
+    for entry in &index.files {
+        let destination = output.join(&entry.path);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .ok_or_else(|| invalid("missing asset parent"))?,
+        )?;
+        if let Some(&position) = whole.get(&(entry.chunks.as_slice(), entry.size, entry.mode)) {
+            fs::hard_link(&base_files[position].0, &destination)?;
+            stats.linked_files += 1;
+            stats.linked_bytes += entry.size;
+            continue;
+        }
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&destination)?;
+        file.set_len(entry.size)?;
+        let copied = AtomicU64::new(0);
+        let written = AtomicU64::new(0);
+        let jobs = entry.chunks.iter().enumerate().filter_map(|(index, hash)| {
+            let hash = hash.as_ref()?;
+            let offset = index as u64 * CHUNK_SIZE as u64;
+            let count = (entry.size - offset).min(CHUNK_SIZE as u64) as usize;
+            let from = located
+                .get(hash.as_str())
+                .filter(|_| count == CHUNK_SIZE)
+                .and_then(|&(position, at)| handles[position].as_ref().map(|handle| (handle, at)));
+            Some((offset, count, hash, from))
+        });
+        for_each_parallel(threads, jobs, |(offset, count, hash, from)| {
+            match from {
+                Some((source, at)) => {
+                    copy_range(source, &file, at, offset, count)?;
+                    copied.fetch_add(1, Ordering::Relaxed);
+                }
+                None => {
+                    let bytes = read_object(&objects.join(hash), hash, count)?;
+                    write_at(&file, offset, &bytes)?;
+                    written.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        })?;
+        stats.copied_chunks += copied.load(Ordering::Relaxed);
+        stats.written_chunks += written.load(Ordering::Relaxed);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+        }
+    }
+    tracing::info!(
+        base = base.is_some(),
+        linked_files = stats.linked_files,
+        linked_bytes = stats.linked_bytes,
+        copied_chunks = stats.copied_chunks,
+        written_chunks = stats.written_chunks,
+        "checkpoint materialized over base"
+    );
+    Ok(stats)
+}
+
+/// Copy `count` bytes from `source` at `from` to `destination` at `offset`,
+/// in the kernel where possible (which also shares blocks on filesystems
+/// that can).
+fn copy_range(
+    source: &File,
+    destination: &File,
+    from: u64,
+    offset: u64,
+    count: usize,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut done = 0usize;
+        while done < count {
+            let mut read_at = (from + done as u64) as libc::loff_t;
+            let mut to = (offset + done as u64) as libc::loff_t;
+            let copied = unsafe {
+                libc::copy_file_range(
+                    source.as_raw_fd(),
+                    &mut read_at,
+                    destination.as_raw_fd(),
+                    &mut to,
+                    count - done,
+                    0,
+                )
+            };
+            if copied < 0 {
+                let error = io::Error::last_os_error();
+                if done == 0
+                    && matches!(
+                        error.raw_os_error(),
+                        Some(libc::EXDEV) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+                    )
+                {
+                    break;
+                }
+                return Err(error);
+            }
+            if copied == 0 {
+                return Err(invalid("checkpoint base file shrank"));
+            }
+            done += copied as usize;
+        }
+        if done == count {
+            return Ok(());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut bytes = vec![0; count];
+        source.read_exact_at(&mut bytes, from)?;
+        write_at(destination, offset, &bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, destination, from, offset, count);
+        Err(io::Error::other("unsupported"))
+    }
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     #[test]
@@ -2976,11 +3588,101 @@ mod tests {
             }),
             payload: Default::default(),
             history: Vec::new(),
+            base: None,
             credential_ca: None,
             clock: None,
             guest_cpu_features: None,
         });
         manifest
+    }
+
+    /// A delta carries only the objects its base lacks, completes from that
+    /// base, and materializes to the exact bytes, linking unchanged files and
+    /// reusing unchanged chunks from the base's tree wherever they sit.
+    #[test]
+    fn delta_export_completes_from_base_and_materializes_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let parent_id = "a".repeat(32);
+        let child_id = "b".repeat(32);
+        let pattern = |seed: u8, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|i| ((i as u64 * 2654435761 + seed as u64 * 97) >> 7) as u8)
+                .collect()
+        };
+        let disk = pattern(1, 3 * CHUNK_SIZE + 5);
+        let parent_memory = pattern(2, 4 * CHUNK_SIZE);
+        let mut child_memory = parent_memory.clone();
+        child_memory[2 * CHUNK_SIZE + 9] ^= 0xff;
+        let store = |directory: &Path, id: &str, parent: Option<&str>, files: &[(&str, &[u8])]| {
+            fs::create_dir(directory).unwrap();
+            let mut writer = Writer::new(&cache, directory).unwrap();
+            let stored = files
+                .iter()
+                .map(|(path, bytes)| {
+                    writer
+                        .ingest(path, bytes.len() as u64, 0o444, &mut &**bytes)
+                        .unwrap()
+                })
+                .collect();
+            writer
+                .finish(directory, lineage_manifest(id, parent, "t"), stored)
+                .unwrap();
+        };
+        let parent = root.path().join("parent");
+        store(
+            &parent,
+            &parent_id,
+            None,
+            &[
+                ("disks/0", &disk),
+                ("checkpoint/memory.bin", &parent_memory),
+            ],
+        );
+        // The disk moves down the chain: same bytes, new path.
+        let child = root.path().join("child");
+        store(
+            &child,
+            &child_id,
+            Some(&parent_id),
+            &[("disks/1", &disk), ("checkpoint/memory.bin", &child_memory)],
+        );
+        let delta = root.path().join("delta.checkpoint");
+        let stats = export_chunked(&child, Some(&parent), &delta, |_| {}).unwrap();
+        assert_eq!(stats.objects, 1, "only the changed chunk travels");
+        assert!(stats.base_objects >= 6);
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(&delta).unwrap();
+        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(&delta).unwrap();
+        let base = manifest.checkpoint.unwrap().base.unwrap();
+        assert_eq!(base.id, parent_id);
+        assert_eq!(base.index_sha256, index_digest(&parent).unwrap());
+
+        let unpacked = root.path().join("unpacked");
+        smolvm_pack::extract::unpack_checkpoint_history(&delta, &footer, &unpacked).unwrap();
+        assert!(!missing_objects(&unpacked).unwrap().is_empty());
+        complete_from_base(&unpacked, &parent).unwrap();
+        assert!(missing_objects(&unpacked).unwrap().is_empty());
+
+        let parent_tree = root.path().join("parent-tree");
+        materialize_over(&parent, &parent_tree, None).unwrap();
+        let child_tree = root.path().join("child-tree");
+        let stats =
+            materialize_over(&unpacked, &child_tree, Some((&parent, &parent_tree))).unwrap();
+        assert_eq!(stats.linked_files, 1);
+        assert_eq!(stats.written_chunks, 1);
+        assert_eq!(stats.copied_chunks, 3);
+        assert_eq!(fs::read(child_tree.join("disks/1")).unwrap(), disk);
+        assert_eq!(
+            fs::read(child_tree.join("checkpoint/memory.bin")).unwrap(),
+            child_memory
+        );
+
+        // A delta whose base lacks an object it needs does not complete.
+        let other = root.path().join("unpacked-other");
+        smolvm_pack::extract::unpack_checkpoint_history(&delta, &footer, &other).unwrap();
+        let empty = root.path().join("empty");
+        fs::create_dir_all(empty.join("objects")).unwrap();
+        assert!(complete_from_base(&other, &empty).is_err());
     }
 
     /// Capture `bytes` as generation `id`, retaining `parent`'s generations.

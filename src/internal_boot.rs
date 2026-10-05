@@ -434,6 +434,11 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         if let Some(parent) = config.console_log.as_ref().and_then(|c| c.parent()) {
             read_write.push(parent.to_path_buf());
         }
+        // A store capture may ask the VMM to save its RAM image into a private
+        // directory under the service's tmpfs capture root.
+        if let Some(root) = crate::portable_checkpoint::capture_tmpfs_grant() {
+            read_write.push(root);
+        }
         if let Some(parent) = config.ssh_agent_socket.as_ref().and_then(|s| s.parent()) {
             read_write.push(parent.to_path_buf());
         }
