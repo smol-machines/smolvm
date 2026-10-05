@@ -741,6 +741,78 @@ fn copy_extent_exact(
     Ok(())
 }
 
+/// The backing file a qcow2 image names in its header, with the offset and
+/// length of the stored string. `None` when the file is not a qcow2 or names
+/// no backing file.
+pub fn qcow2_backing_entry(path: &Path) -> Option<(std::path::PathBuf, u64, usize)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header).ok()?;
+    if header[..4] != *b"QFI\xfb" {
+        return None;
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().ok()?);
+    let len = u32::from_be_bytes(header[16..20].try_into().ok()?) as usize;
+    if offset == 0 || len == 0 || len > 4096 {
+        return None;
+    }
+    let mut name = vec![0u8; len];
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    file.read_exact(&mut name).ok()?;
+    #[cfg(unix)]
+    let backing = {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&name))
+    };
+    #[cfg(not(unix))]
+    let backing = std::path::PathBuf::from(String::from_utf8_lossy(&name).into_owned());
+    Some((backing, offset, len))
+}
+
+/// Rewrite a qcow2 image's backing file name in place.
+///
+/// The new name must be no longer than the stored one, which is why callers
+/// rewrite absolute paths into relative ones and never the other way around.
+/// The string is overwritten at its existing offset and the header length
+/// field updated, so no other header structure moves. Returns an error when
+/// the file is not a qcow2 with a backing file or the new name does not fit.
+pub fn rewrite_qcow2_backing(path: &Path, new_backing: &str) -> Result<()> {
+    let (_, offset, len) = qcow2_backing_entry(path).ok_or_else(|| {
+        Error::storage(
+            "rewrite qcow2 backing",
+            format!("{} is not a qcow2 with a backing file", path.display()),
+        )
+    })?;
+    if new_backing.is_empty() || new_backing.len() > len {
+        return Err(Error::storage(
+            "rewrite qcow2 backing",
+            format!(
+                "new backing name ({} bytes) does not fit the stored one ({} bytes) in {}",
+                new_backing.len(),
+                len,
+                path.display()
+            ),
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.write_all(new_backing.as_bytes())
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.seek(SeekFrom::Start(16))
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.write_all(&(new_backing.len() as u32).to_be_bytes())
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,5 +1126,44 @@ mod tests {
             !msg.contains("too large"),
             "a valid (non-overflowing) size must not trip the overflow guard: {msg}"
         );
+    }
+
+    fn qcow2_with_backing(dir: &Path, backing: &[u8]) -> std::path::PathBuf {
+        let mut image = vec![0u8; 512];
+        image[..4].copy_from_slice(b"QFI\xfb");
+        image[8..16].copy_from_slice(&256u64.to_be_bytes());
+        image[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+        image[256..256 + backing.len()].copy_from_slice(backing);
+        let path = dir.join("disk.qcow2");
+        std::fs::write(&path, &image).unwrap();
+        path
+    }
+
+    #[test]
+    fn backing_rewrite_shortens_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = qcow2_with_backing(dir.path(), b"/very/long/absolute/seed/path.qcow2");
+        rewrite_qcow2_backing(&path, "storage.seed.qcow2").unwrap();
+        let (backing, offset, len) = qcow2_backing_entry(&path).unwrap();
+        assert_eq!(backing, std::path::PathBuf::from("storage.seed.qcow2"));
+        assert_eq!(offset, 256);
+        assert_eq!(len, "storage.seed.qcow2".len());
+    }
+
+    #[test]
+    fn backing_rewrite_rejects_a_longer_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = qcow2_with_backing(dir.path(), b"short");
+        let before = std::fs::read(&path).unwrap();
+        assert!(rewrite_qcow2_backing(&path, "much-longer-name").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn backing_rewrite_rejects_non_qcow2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.raw");
+        std::fs::write(&path, b"not a qcow2 at all").unwrap();
+        assert!(rewrite_qcow2_backing(&path, "x").is_err());
     }
 }
