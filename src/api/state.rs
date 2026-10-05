@@ -1287,7 +1287,23 @@ impl ApiState {
     ///
     /// Used by start_machine to register a booted VM so that exec/run/container
     /// endpoints can find it without server restart.
+    ///
+    /// An existing entry is replaced in place rather than swapped for a new
+    /// one. A request that looked the machine up before a start finished (an
+    /// exec queued behind the start's lifecycle lock) still holds the old
+    /// entry; with a separate entry it would reconnect a stale manager to the
+    /// new VM, adopt its process, and stop that VM when the request dropped
+    /// the last reference to it. In place, every holder sees the new manager,
+    /// and the replaced one is detached because the VM it may have reconnected
+    /// to now belongs to the new manager.
     pub fn insert_machine(&self, name: &str, entry: MachineEntry) {
+        let existing = self.machines.read().get(name).cloned();
+        if let Some(slot) = existing {
+            let replaced = std::mem::replace(&mut *slot.lock(), entry);
+            replaced.manager.detach();
+            self.machines.write().insert(name.to_string(), slot);
+            return;
+        }
         let mut machines = self.machines.write();
         machines.insert(name.to_string(), Arc::new(parking_lot::Mutex::new(entry)));
     }
@@ -2205,6 +2221,60 @@ mod tests {
         assert!(state.get_machine(name).is_err());
         assert!(entry.lock().manager.is_detached());
         assert!(state.forget_deleted_machine(name).unwrap());
+    }
+
+    /// A request that looked a machine up before a start replaced its entry
+    /// must see the started VM's manager, not keep a stale one whose drop
+    /// would stop that VM.
+    #[test]
+    fn replacing_an_entry_updates_requests_already_holding_it() {
+        let (_dir, state) = temp_api_state();
+        let name = "replace-entry-qa";
+        let entry = |image: &str| MachineEntry {
+            credentials: None,
+            external_interceptor: None,
+            manager: AgentManager::for_vm(name).unwrap(),
+            image: Some(image.to_string()),
+            mounts: vec![],
+            ports: vec![],
+            resources: ResourceSpec {
+                cpus: None,
+                memory_mb: None,
+                network: None,
+                gpu: None,
+                cuda: None,
+                nested_virt: None,
+                storage_gb: None,
+                overlay_gb: None,
+                block_io: None,
+                allowed_cidrs: None,
+                allowed_hosts: None,
+                credentials: None,
+                network_backend: None,
+                guest_subnet: None,
+            },
+            restart: RestartConfig::default(),
+            network: false,
+            secret_refs: Default::default(),
+            source_smolmachine: None,
+            forkable: false,
+            cuda_fork_pool_size: None,
+            cuda_vram_limit_mib: None,
+            forkpoint_held: false,
+        };
+        state.insert_machine(name, entry("before-start"));
+        let queued = state.get_machine(name).unwrap();
+
+        state.insert_machine(name, entry("started"));
+
+        let current = state.get_machine(name).unwrap();
+        assert!(Arc::ptr_eq(&queued, &current));
+        let seen = queued.lock();
+        assert_eq!(seen.image.as_deref(), Some("started"));
+        assert!(!seen.manager.is_detached());
+        drop(seen);
+        state.forget_deleted_machine(name).unwrap();
+        std::fs::remove_dir_all(crate::agent::vm_data_dir(name)).ok();
     }
 
     // remove_machine must clear BOTH the DB row and the in-memory registry entry
