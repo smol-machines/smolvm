@@ -1413,7 +1413,11 @@ pub fn invalidate_extraction(cache_dir: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     }
-    fs::File::open(cache_dir)?.sync_all()
+    // Persist the unlink before the tree goes. Directories are synced through
+    // a handle only on Unix; Windows cannot open one this way.
+    #[cfg(unix)]
+    fs::File::open(cache_dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Check if assets have already been extracted.
