@@ -2292,9 +2292,11 @@ fn check_port_conflicts(
     Ok(())
 }
 
-/// Start the default machine.
+/// Start the default machine when it has no record yet, creating its disks
+/// at the default sizes. A recorded default machine starts through
+/// [`start_vm_named`] with its own sizes.
 pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
-    let manager = AgentManager::new_default()?;
+    let manager = AgentManager::new_default_with_sizes(None, None)?;
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = format_pid_suffix(manager.child_pid());

@@ -1057,10 +1057,10 @@ impl AgentManager {
         Self::for_vm_with_sizes("default", storage_gb, overlay_gb)
     }
 
-    /// Get the default agent manager with default sizes.
-    ///
-    /// Canonicalized to `for_vm("default")` so that all lifecycle commands
-    /// use consistent socket/PID/storage paths.
+    /// Open the default machine to observe or reconnect to it, like
+    /// [`Self::for_vm`]: it creates nothing on disk, so it cannot launch a
+    /// machine that was never started. Launches use
+    /// [`Self::new_default_with_sizes`].
     pub fn new_default() -> Result<Self> {
         Self::for_vm("default")
     }
