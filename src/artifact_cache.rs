@@ -637,7 +637,16 @@ fn metadata_paths_for_shared(shared_dir: &Path) -> Vec<PathBuf> {
         digest.with_extension("artifact-sha256.lock"),
         shared_dir.with_extension("artifact-source.json"),
         shared_dir.with_extension("prepared.smolcheckpoint"),
+        smolvm_pack::extract::unsynced_marker_path(shared_dir),
     ]
+}
+
+/// Whether a restore in this boot is still writing `shared_dir`'s RAM back to
+/// disk. A marker left by an earlier boot only means the data is suspect, and
+/// such an extraction is extracted again on its next use, so it may go.
+fn write_back_in_progress(shared_dir: &Path) -> bool {
+    let marker = smolvm_pack::extract::unsynced_marker_path(shared_dir);
+    marker.exists() && !smolvm_pack::extract::unsynced_before_this_boot(&marker)
 }
 
 fn allocated_usage(path: &Path) -> io::Result<u64> {
@@ -947,9 +956,13 @@ fn trim_unleased_shared_packs_in(
             .shared_dirs
             .iter()
             .any(|dir| dir.with_extension("prepared.smolcheckpoint").is_file());
+        let writing_back = candidate
+            .shared_dirs
+            .iter()
+            .any(|dir| write_back_in_progress(dir));
         if referenced {
             referenced_entries += 1;
-        } else if !prepared {
+        } else if !prepared && !writing_back {
             unleased.push(candidate);
         }
     }
@@ -1321,6 +1334,28 @@ mod tests {
         trim_unleased_shared_packs_in(&root, 0, 0).unwrap().unwrap();
         assert!(prepared.exists());
         assert!(!unleased.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trim_waits_for_a_ram_write_back_and_then_removes_its_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (writing, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        let marker = smolvm_pack::extract::unsynced_marker_path(&writing);
+        smolvm_pack::extract::mark_unsynced(&marker).unwrap();
+
+        trim_unleased_shared_packs_in(&root, 0, 0).unwrap().unwrap();
+        assert!(
+            writing.exists(),
+            "an extraction still being written back stays"
+        );
+
+        smolvm_pack::extract::clear_unsynced(&marker).unwrap();
+        fs::write(&marker, b"an earlier boot\n").unwrap();
+        trim_unleased_shared_packs_in(&root, 0, 0).unwrap().unwrap();
+        assert!(!writing.exists());
+        assert!(!marker.exists(), "the marker goes with its extraction");
     }
 
     #[test]
