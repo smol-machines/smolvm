@@ -2816,6 +2816,8 @@ impl AgentManager {
         // process::place_in_cgroup (VMM_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
         // =1024) as scope properties. Required placement fails closed.
         #[cfg(target_os = "linux")]
+        let mut adopted_scope = None;
+        #[cfg(target_os = "linux")]
         if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
             if let Some(name) = self.name() {
                 let budget = crate::process::vmm_memory_budget(
@@ -2837,10 +2839,16 @@ impl AgentManager {
                     self.abort_failed_launch(child_pid)?;
                     return Err(Error::agent("adopt VM scope", e.to_string()));
                 }
+                adopted_scope = Some(name);
             }
         }
 
-        self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config)
+        let launched = self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config);
+        #[cfg(target_os = "linux")]
+        if let (Err(_), Some(name)) = (&launched, adopted_scope) {
+            release_failed_launch_scope(name, child_pid);
+        }
+        launched
     }
 
     /// Like `ensure_running_with_full_config` but uses subprocess launch.
@@ -3587,6 +3595,27 @@ fn refuse_live_launch_pid(pid: crate::process::Pid) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Stop the scope a failed launch adopted its VM process into.
+///
+/// A VM process that exits before systemd moves it (a refused start such as a
+/// published port already in use) leaves a scope whose cgroup was never
+/// populated; systemd never sees it empty, so it would stay active with no
+/// processes. The scope is stopped only once that process is confirmed dead,
+/// so it can hold nothing else of this machine's.
+#[cfg(target_os = "linux")]
+fn release_failed_launch_scope(name: &str, child_pid: i32) {
+    if process::is_alive(child_pid) {
+        tracing::warn!(
+            pid = child_pid,
+            "failed launch's VM process is still alive; keeping its scope"
+        );
+        return;
+    }
+    if let Err(error) = crate::systemd_scope::stop_scope(name) {
+        tracing::warn!(machine = name, %error, "could not stop the scope of a failed launch");
+    }
 }
 
 impl Drop for AgentManager {
