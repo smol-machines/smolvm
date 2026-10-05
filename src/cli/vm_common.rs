@@ -2912,6 +2912,9 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // Keep the record until process death and storage removal are both confirmed,
     // so a failed delete remains visible and can be retried safely.
     remove_vm_data_and_record(&SmolvmDb::open()?, name, &data_dir)?;
+    // The machine may have held the last lease on a shared extraction.
+    #[cfg(target_os = "linux")]
+    smolvm::artifact_cache::log_trim(smolvm::artifact_cache::trim_unleased_shared_packs());
 
     // Once a child record and its VMM are both gone, its parent may have an old
     // RAM generation that no remaining clone references. Reap that generation

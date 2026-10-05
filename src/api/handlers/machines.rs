@@ -1856,6 +1856,11 @@ pub async fn restore_portable_checkpoint(
     let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
+    // The restore no longer leases the checkpoint's shared extraction.
+    #[cfg(target_os = "linux")]
+    if result.is_ok() {
+        crate::artifact_cache::trim_unleased_shared_packs_soon();
+    }
     // A hit is already cached; re-linking it would only change the inode's
     // ctime under the restores still sharing it.
     if result.is_ok() && !cache_hit {
@@ -5388,6 +5393,9 @@ async fn delete_one_transaction(
             })?;
         return Err(error);
     }
+    // The machine may have held the last lease on a shared extraction.
+    #[cfg(target_os = "linux")]
+    crate::artifact_cache::trim_unleased_shared_packs_soon();
 
     if let Some(parent) = record.golden.clone() {
         let db = state.db().clone();
