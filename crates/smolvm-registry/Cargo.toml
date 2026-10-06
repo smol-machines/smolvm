@@ -9,7 +9,7 @@ readme = "README.md"
 
 [dependencies]
 smolvm-pack = { path = "../smolvm-pack", version = "1.6.1" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "stream", "json"] }
 sha2 = "0.10"
 bytes = "1"
 hex = "0.4"
@@ -28,3 +28,5 @@ futures-util = "0.3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 wiremock = "0.6"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = "0.26"

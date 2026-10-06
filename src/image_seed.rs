@@ -29,8 +29,8 @@
 
 #[cfg(unix)]
 pub use imp::{
-    prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage, seedable_image, wants_seed,
-    SEED_MACHINE_PREFIX,
+    prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage, seed_storage_with_trust,
+    seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
@@ -56,10 +56,15 @@ pub fn seed_first_start(
     let Some(image) = wants_seed(name, record, from_snapshot) else {
         return;
     };
+    // A seed is built by a separate VM. Carry the same opt-in host trust
+    // mount to that VM so a private-CA registry can use the seed fast path.
+    let trust_host_certs = record.host_mounts().iter().any(|mount| {
+        mount.read_only && mount.target == std::path::Path::new("/etc/smolvm-host-trust")
+    });
     let seeded = builder_exe()
         .map_err(|e| crate::Error::config("image seed", e.to_string()))
         .and_then(|exe| {
-            seed_storage(
+            seed_storage_with_trust(
                 &exe,
                 name,
                 &image,
@@ -68,6 +73,7 @@ pub fn seed_first_start(
                 digest_ttl,
                 proxy,
                 no_proxy,
+                trust_host_certs,
             )
         });
     if let Err(error) = seeded {
@@ -90,13 +96,27 @@ pub fn seed_ephemeral_run(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
 ) {
+    seed_ephemeral_run_with_trust(name, image, storage_gb, digest_ttl, proxy, no_proxy, false);
+}
+
+/// Seed an ephemeral run whose workload also trusts the host's certificates.
+#[allow(clippy::too_many_arguments)]
+pub fn seed_ephemeral_run_with_trust(
+    name: &str,
+    image: Option<&str>,
+    storage_gb: Option<u64>,
+    digest_ttl: Option<u64>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    trust_host_certs: bool,
+) {
     let Some(image) = seedable_image(name, image, storage_gb) else {
         return;
     };
     let seeded = builder_exe()
         .map_err(|e| crate::Error::config("image seed", e.to_string()))
         .and_then(|exe| {
-            seed_storage(
+            seed_storage_with_trust(
                 &exe,
                 name,
                 &image,
@@ -105,6 +125,7 @@ pub fn seed_ephemeral_run(
                 digest_ttl,
                 proxy,
                 no_proxy,
+                trust_host_certs,
             )
         });
     if let Err(error) = seeded {
@@ -136,6 +157,23 @@ pub fn seed_storage(
     _: Option<u64>,
     _: Option<&str>,
     _: Option<&str>,
+) -> crate::Result<bool> {
+    Ok(false)
+}
+
+/// Seeds need a Unix host; on other platforms a trust-aware seed is unavailable.
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+pub fn seed_storage_with_trust(
+    _: &std::path::Path,
+    _: &str,
+    _: &str,
+    _: &crate::registry::PullAuth,
+    _: Option<u64>,
+    _: Option<u64>,
+    _: Option<&str>,
+    _: Option<&str>,
+    _: bool,
 ) -> crate::Result<bool> {
     Ok(false)
 }
@@ -341,12 +379,39 @@ mod imp {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
     ) -> Result<bool> {
+        seed_storage_with_trust(
+            exe, name, image, auth, storage_gb, digest_ttl, proxy, no_proxy, false,
+        )
+    }
+
+    /// Build or attach an image seed with host trust in its throwaway builder
+    /// when `trust_host_certs` was selected on the parent machine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_storage_with_trust(
+        exe: &Path,
+        name: &str,
+        image: &str,
+        auth: &PullAuth,
+        storage_gb: Option<u64>,
+        digest_ttl: Option<u64>,
+        proxy: Option<&str>,
+        no_proxy: Option<&str>,
+        trust_host_certs: bool,
+    ) -> Result<bool> {
         let EnsuredSeed {
             root,
             key_dir,
             cache,
             built,
-        } = ensure_seed(exe, image, auth, digest_ttl, proxy, no_proxy)?;
+        } = ensure_seed(
+            exe,
+            image,
+            auth,
+            digest_ttl,
+            proxy,
+            no_proxy,
+            trust_host_certs,
+        )?;
         let Some((seed, format)) = seed_disk(&key_dir) else {
             return Err(Error::config(
                 "image seed",
@@ -383,6 +448,7 @@ mod imp {
         digest_ttl: Option<u64>,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
+        trust_host_certs: bool,
     ) -> Result<EnsuredSeed> {
         let template = storage_template();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -409,7 +475,16 @@ mod imp {
             // file would let new callers lock a different inode for this key.
             let _build = Lock::exclusive(&root.join(format!("{key}.lock")))?;
             if seed_disk(&key_dir).is_none() {
-                build_seed(exe, image, auth, &key, &key_dir, proxy, no_proxy)?;
+                build_seed(
+                    exe,
+                    image,
+                    auth,
+                    &key,
+                    &key_dir,
+                    proxy,
+                    no_proxy,
+                    trust_host_certs,
+                )?;
                 // The builder pulled the tag, not the digest. If the tag moved
                 // in the meantime, discard the seed rather than miskey it.
                 if resolve()? != digest {
@@ -551,7 +626,7 @@ mod imp {
         let root = seed_root();
         for image in prewarm_candidates(&root, now_secs()) {
             let started = std::time::Instant::now();
-            match ensure_seed(exe, &image, &PullAuth::FromConfig, None, None, None) {
+            match ensure_seed(exe, &image, &PullAuth::FromConfig, None, None, None, false) {
                 Ok(EnsuredSeed { built, .. }) => tracing::info!(
                     %image,
                     built,
@@ -636,6 +711,7 @@ mod imp {
         key_dir: &Path,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
+        trust_host_certs: bool,
     ) -> Result<()> {
         reap_stale_builders(exe);
         let tmp = format!("{SEED_MACHINE_PREFIX}{}-{}", &key[..16], std::process::id());
@@ -644,12 +720,13 @@ mod imp {
         let mut staged: Option<(PathBuf, PathBuf)> = None;
         let started = std::time::Instant::now();
         let built = (|| -> Result<()> {
-            run(
-                exe,
-                &[
-                    "machine", "create", "--name", &tmp, "--image", image, "--net",
-                ],
-            )?;
+            let mut create = vec![
+                "machine", "create", "--name", &tmp, "--image", image, "--net",
+            ];
+            if trust_host_certs {
+                create.push("--trust-host-certs");
+            }
+            run(exe, &create)?;
             let mut start = vec!["machine", "start", "--name", &tmp, "--no-workload"];
             if let Some(proxy) = proxy {
                 start.extend(["--proxy", proxy]);

@@ -658,7 +658,7 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub use_host_proxy: bool,
 
-    /// Trust the certificates this host trusts inside the workload — e.g. a
+    /// Trust the certificates this host trusts for image pulls and the workload — e.g. a
     /// corporate TLS-inspection root on the host. Mounts them read-only at
     /// /etc/smolvm-host-trust/ca-bundle.pem and points SSL_CERT_FILE,
     /// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE and similar at it.
@@ -1762,13 +1762,14 @@ impl RunCmd {
         // A fresh registry-image run starts on a shared seed of its image, so
         // the guest finds the image already pulled, exactly as `machine start`
         // does. Best-effort: without a seed the guest pulls as before.
-        smolvm::image_seed::seed_ephemeral_run(
+        smolvm::image_seed::seed_ephemeral_run_with_trust(
             &vm_name,
             params.image.as_deref(),
             params.storage_gb,
             self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
             self.proxy_opts.no_proxy().as_deref(),
+            self.trust_host_certs,
         );
 
         let manager =
@@ -3920,7 +3921,7 @@ pub struct CreateCmd {
     #[arg(long, help_heading = "Network")]
     pub use_host_proxy: bool,
 
-    /// Trust the certificates this host trusts inside the workload — e.g. a
+    /// Trust the certificates this host trusts for image pulls and the workload — e.g. a
     /// corporate TLS-inspection root on the host. Mounts them read-only at
     /// /etc/smolvm-host-trust/ca-bundle.pem and points SSL_CERT_FILE,
     /// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE and similar at it.

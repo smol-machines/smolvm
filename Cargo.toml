@@ -111,7 +111,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 parking_lot = "0.12"
 async-stream = "0.3"
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "stream", "json"] }
 
 # OpenAPI documentation
 utoipa = { version = "5", features = ["axum_extras"] }

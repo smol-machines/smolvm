@@ -15,10 +15,12 @@
 //!   corporate root; on Linux the system bundle) are written to a bundle,
 //!   mounted read-only into the machine, and the usual trust variables
 //!   (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, …) point at
-//!   it. Opt-in because it widens what the machine trusts to what the host does.
+//!   it. The guest image pull uses the same bundle before the workload starts.
+//!   Opt-in because it widens what the machine trusts to what the host does.
 //!
-//! Both only add environment and a volume, so a value passed with `-e` still
-//! wins, and `machine create` persists them like any other.
+//! The machine receives environment and a volume, so a value passed with `-e`
+//! still wins and `machine create` persists them like any other. Host-side
+//! registry requests also use the host's trust store.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
