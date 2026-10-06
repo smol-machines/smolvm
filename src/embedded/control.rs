@@ -132,6 +132,17 @@ pub(crate) fn create_vm_with_workload(
                 .map_err(|reason| Error::config("validate allowed CIDR", reason))?,
         );
     }
+    // A registry on the host's loopback is out of the guest's reach, so pull it
+    // here and persist the staged archive's `local:` reference, exactly as the
+    // CLI's create does; `start` then mounts it without any pull.
+    if let Some(image) = record.image.as_deref() {
+        if crate::data::local_registry::loopback_registry(image).is_some() {
+            use crate::data::image_source::{classify, resolve, ResolvedImage};
+            if let ResolvedImage::Local { reference, .. } = resolve(classify(image))? {
+                record.image = Some(reference);
+            }
+        }
+    }
     record.cmd = spec.command.clone();
     record.env = env;
     record.workdir = workdir;

@@ -194,13 +194,19 @@ const ARCHIVE_FILE: &str = "archive.tar";
 
 /// Resolve a classified [`ImageSource`] into a [`ResolvedImage`].
 ///
-/// Registry refs pass straight through (the guest pulls them). Archives are
+/// Registry refs pass straight through (the guest pulls them), except one on
+/// the host's loopback, which is pulled here and staged like an archive. Archives are
 /// content-hashed and staged into a shared cache, so identical inputs dedupe
 /// and re-runs skip the staging; directories are validated and used in place.
 /// Both local kinds yield a `packed_layers_dir` to mount and a `local:…`
 /// reference to persist on the machine record.
 pub fn resolve(source: ImageSource) -> Result<ResolvedImage> {
     match source {
+        ImageSource::Registry(reference)
+            if super::local_registry::loopback_registry(&reference).is_some() =>
+        {
+            resolve_loopback_registry(&reference)
+        }
         ImageSource::Registry(reference) => Ok(ResolvedImage::Registry(reference)),
         ImageSource::Directory(path) => resolve_directory(&path),
         ImageSource::Archive(input) => resolve_archive(input),
@@ -209,6 +215,24 @@ pub fn resolve(source: ImageSource) -> Result<ResolvedImage> {
             format!("unsupported image reference '{given}': {hint}"),
         )),
     }
+}
+
+/// A registry on the host's loopback is pulled here on the host and staged like
+/// a local archive: the guest cannot reach the host's `127.0.0.1`, and opening
+/// host loopback to it would expose every other service there too.
+fn resolve_loopback_registry(reference: &str) -> Result<ResolvedImage> {
+    let cache_base = archive_cache_base()?;
+    std::fs::create_dir_all(&cache_base)?;
+    let key = super::local_registry::pull_to_archive_cache(
+        reference,
+        &cache_base,
+        ARCHIVE_FILE,
+        max_archive_bytes(),
+    )?;
+    Ok(ResolvedImage::Local {
+        reference: format!("{LOCAL_ARCHIVE_PREFIX}{key}"),
+        packed_layers_dir: cache_base.join(key),
+    })
 }
 
 fn resolve_directory(path: &Path) -> Result<ResolvedImage> {

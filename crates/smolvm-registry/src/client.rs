@@ -24,6 +24,18 @@ use crate::token_store;
 /// the host. 32 MiB is far above any real OCI manifest (a few KB).
 const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 
+/// Docker's multi-platform manifest list, the counterpart of an OCI index.
+const DOCKER_MANIFEST_LIST_MEDIA_TYPE: &str =
+    "application/vnd.docker.distribution.manifest.list.v2+json";
+
+/// Every single- and multi-platform image manifest type, OCI and Docker schema
+/// 2. A registry that holds a Docker-pushed image may refuse (404) a request
+/// that accepts only OCI types rather than convert it.
+const IMAGE_MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
+     application/vnd.oci.image.manifest.v1+json, \
+     application/vnd.docker.distribution.manifest.list.v2+json, \
+     application/vnd.docker.distribution.manifest.v2+json";
+
 /// Maximum bytes buffered in memory for a `pull_blob` response. `pull_blob` is
 /// used only for small blobs (the OCI image config, a few KB); large layers use
 /// [`RegistryClient::pull_blob_stream`], which streams to disk. 64 MiB is a
@@ -816,13 +828,79 @@ impl RegistryClient {
     /// not reject) an image index — the caller decides whether to resolve it to a
     /// platform manifest. Used by `pull` for multi-arch fan-out.
     pub async fn get_manifest_raw(&self, repo: &str, reference: &str) -> Result<(Vec<u8>, String)> {
+        // Advertise BOTH so the registry hands back an index as an index (not a
+        // server-side-selected manifest).
+        self.get_manifest_accepting(
+            repo,
+            reference,
+            &format!("{INDEX_MEDIA_TYPE}, {MANIFEST_MEDIA_TYPE}"),
+        )
+        .await
+    }
+
+    /// Fetch a container image's manifest, resolving an OCI index or a Docker
+    /// manifest list to `platform`, and return the single-platform manifest's
+    /// bytes. Unlike [`Self::get_manifest_resolved_platform`], which is for
+    /// `.smolmachine` artifacts, this accepts Docker schema 2 documents too —
+    /// what `docker push` writes — so an image built by Docker can be pulled.
+    pub async fn get_image_manifest(
+        &self,
+        repo: &str,
+        reference: &str,
+        platform: &OciPlatform,
+    ) -> Result<Vec<u8>> {
+        let (bytes, content_type) = self
+            .get_manifest_accepting(repo, reference, IMAGE_MANIFEST_ACCEPT)
+            .await?;
+        let doc: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let is_index = content_type.contains(INDEX_MEDIA_TYPE)
+            || content_type.contains(DOCKER_MANIFEST_LIST_MEDIA_TYPE)
+            || doc.get("manifests").is_some();
+        if !is_index {
+            return Ok(bytes);
+        }
+        let index: OciIndex = serde_json::from_value(doc)?;
+        let entry = index
+            .manifests
+            .iter()
+            .find(|m| {
+                m.platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == platform.os && p.architecture == platform.architecture)
+            })
+            .ok_or_else(|| {
+                let available: Vec<String> = index
+                    .manifests
+                    .iter()
+                    .filter_map(|m| m.platform.as_ref().map(|p| p.label()))
+                    .collect();
+                RegistryError::InvalidManifest(format!(
+                    "no {} image in {repo}:{reference}; it has: {}",
+                    platform.label(),
+                    if available.is_empty() {
+                        "(none)".into()
+                    } else {
+                        available.join(", ")
+                    }
+                ))
+            })?;
+        Ok(self
+            .get_manifest_accepting(repo, &entry.digest, IMAGE_MANIFEST_ACCEPT)
+            .await?
+            .0)
+    }
+
+    async fn get_manifest_accepting(
+        &self,
+        repo: &str,
+        reference: &str,
+        accept: &str,
+    ) -> Result<(Vec<u8>, String)> {
         let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
         let resp = self
             .send_replayable(
                 self.request(reqwest::Method::GET, &url)
-                    // Advertise BOTH so the registry hands back an index as an
-                    // index (not a server-side-selected manifest).
-                    .header(ACCEPT, format!("{INDEX_MEDIA_TYPE}, {MANIFEST_MEDIA_TYPE}")),
+                    .header(ACCEPT, accept),
             )
             .await?;
 

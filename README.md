@@ -44,7 +44,10 @@ Real VMs with their own kernel, free on your laptop or your own servers. They bo
 smolvm machine create --net --name dev && smolvm machine start --name dev
 smolvm machine exec --name dev -- apk add git
 docker save myapp | smolvm machine run --image - -- ./app    # local image, no registry
+smolvm machine run --image 127.0.0.1:5000/myapp -- ./app      # registry on this host's loopback
 ```
+
+A registry on the host's loopback (`127.0.0.1`, `localhost`, `[::1]`) is pulled on the host rather than in the guest, so it works without `--net` and never exposes the host's loopback to the machine.
 
 Declare a machine in a [Smolfile](docs/smolfile.md): image, resources, ports, mounts and network policy in one checked-in file.
 
