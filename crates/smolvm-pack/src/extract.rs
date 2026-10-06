@@ -473,26 +473,12 @@ const SPARSE_WRITE_THRESHOLD: u64 = 256 * 1024 * 1024; // 256 MiB
 ///
 /// This keeps a 10 GiB overlay disk (with ~50 MB of real data) from
 /// materialising as a dense file during sidecar extraction.
-/// The extraction's running total of bytes written, and its ceiling.
-struct WriteBudget<'a> {
-    used: &'a mut u64,
-    max: u64,
-}
-
-fn exceeds_max_total(max_total_bytes: u64) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("tar archive exceeds max total size ({max_total_bytes} bytes)"),
-    )
-}
-
 fn unpack_sparse<R: Read>(
     entry: &mut tar::Entry<R>,
     path: &Path,
     entry_size: u64,
     mode: u32,
     real_dest: &Path,
-    budget: WriteBudget<'_>,
 ) -> std::io::Result<()> {
     // Before creating any directory or opening the file, verify that the real
     // (symlink-resolved) parent of `path` stays within `real_dest`. A prior
@@ -576,10 +562,6 @@ fn unpack_sparse<R: Read>(
         }
         let chunk = &buf[..n];
         if !crate::is_zero_filled(chunk) {
-            *budget.used = budget.used.saturating_add(n as u64);
-            if *budget.used > budget.max {
-                return Err(exceeds_max_total(budget.max));
-            }
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(chunk)?;
         }
@@ -963,20 +945,16 @@ fn safe_unpack_skipping<R: Read>(
                 format!("tar archive exceeds max entry count ({max_entries})"),
             ));
         }
-        // A large ordinary file is written sparsely (only its non-zero chunks
-        // reach the disk), so it is charged as it is written, in
-        // `unpack_sparse`. Charging its declared length up front would refuse
-        // a checkpoint whose disks were fully allocated on the host and archive
-        // as long runs of zeros: compressed to nearly nothing, extracted to
-        // nearly nothing, yet declaring more than the whole budget.
-        let header_size = entry.header().size().unwrap_or(0);
-        let written_sparsely =
-            entry_type == tar::EntryType::Regular && header_size >= limits.sparse_threshold;
-        if !written_sparsely {
-            total_bytes = total_bytes.saturating_add(header_size);
-            if total_bytes > max_total_bytes {
-                return Err(exceeds_max_total(max_total_bytes));
-            }
+        // Charge what extraction writes: the bytes the entry stores. For a GNU
+        // sparse entry `size()` is its logical length, holes included, so a
+        // checkpoint of a 64 GiB disk holding 2 GiB was charged 64 GiB and a
+        // large machine's checkpoint was refused outright.
+        total_bytes = total_bytes.saturating_add(entry.header().entry_size().unwrap_or(0));
+        if total_bytes > max_total_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tar archive exceeds max total size ({max_total_bytes} bytes)"),
+            ));
         }
 
         // OCI whiteouts, translated here when the host describes ownership to
@@ -1229,13 +1207,7 @@ fn safe_unpack_skipping<R: Read>(
         } else if is_regular && entry.header().size().unwrap_or(0) >= limits.sparse_threshold {
             let entry_size = entry.header().size()?;
             let mode = entry.header().mode().unwrap_or(0o644);
-            let budget = WriteBudget {
-                used: &mut total_bytes,
-                max: max_total_bytes,
-            };
-            if let Err(e) =
-                unpack_sparse(&mut entry, &full_path, entry_size, mode, &real_dest, budget)
-            {
+            if let Err(e) = unpack_sparse(&mut entry, &full_path, entry_size, mode, &real_dest) {
                 return Err(std::io::Error::new(
                     e.kind(),
                     format!("failed to unpack '{}': {}", entry_path.display(), e),
@@ -6002,17 +5974,7 @@ mod tests {
         let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
 
         let real_dest = temp_dir.path().canonicalize().unwrap();
-        let result = unpack_sparse(
-            &mut entry,
-            &dest,
-            data.len() as u64,
-            0o644,
-            &real_dest,
-            WriteBudget {
-                used: &mut 0,
-                max: u64::MAX,
-            },
-        );
+        let result = unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644, &real_dest);
 
         assert!(result.is_err(), "should reject symlink at destination");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
@@ -6492,18 +6454,7 @@ mod tests {
         let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
 
         // Header mode carries setuid (0o4000) + setgid (0o2000) + rwxr-xr-x.
-        unpack_sparse(
-            &mut entry,
-            &dest,
-            data.len() as u64,
-            0o6755,
-            &real_dest,
-            WriteBudget {
-                used: &mut 0,
-                max: u64::MAX,
-            },
-        )
-        .unwrap();
+        unpack_sparse(&mut entry, &dest, data.len() as u64, 0o6755, &real_dest).unwrap();
 
         let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o7777;
         assert_eq!(
@@ -6567,44 +6518,43 @@ mod tests {
         assert!(err.to_string().contains("max total size"));
     }
 
-    /// A fully allocated disk archives as a long run of zeros. Extraction
-    /// writes none of them, so they must not count toward the ceiling.
+    /// A sparse disk is charged the bytes it stores, not its logical length:
+    /// a large machine's checkpoint (here 64 MiB declared, 4 KiB stored) must
+    /// extract under a ceiling far below its declared size.
     #[test]
-    fn zeros_in_a_large_file_do_not_count_toward_the_total() {
+    fn a_sparse_entry_is_charged_what_it_stores() {
         let temp_dir = tempfile::tempdir().unwrap();
         let dest = temp_dir.path().join("dest");
         fs::create_dir(&dest).unwrap();
-        let mut data = vec![0u8; 1024 * 1024];
-        data[..4].copy_from_slice(b"disk");
-        let tar_bytes = make_tar("disk.raw", &data);
-        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        const LOGICAL: u64 = 64 * 1024 * 1024;
+        let data = vec![9u8; 4096];
+        let mut archive_bytes = Vec::new();
+        {
+            let mut header = tar::Header::new_gnu();
+            header.set_path("checkpoint/disks/storage/1").unwrap();
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            let stored = crate::assets::write_sparse_header(
+                &mut archive_bytes,
+                header,
+                LOGICAL,
+                &[(0, 4096)],
+            )
+            .unwrap();
+            assert_eq!(stored, 4096);
+            archive_bytes.extend_from_slice(&data);
+            archive_bytes.extend(std::iter::repeat(0u8).take(1024 * 2));
+        }
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
         let limits = SafeUnpackLimits {
             max_entries: 1_000,
-            max_total_bytes: 128 * 1024, // far below the declared 1 MiB
-            sparse_threshold: 4096,
+            max_total_bytes: 1024 * 1024, // far below the 64 MiB declared size
+            sparse_threshold: SPARSE_WRITE_THRESHOLD,
         };
         safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap();
-        let written = fs::read(dest.join("disk.raw")).unwrap();
-        assert_eq!(written.len(), data.len());
-        assert_eq!(&written[..4], b"disk");
-    }
-
-    /// Real data in a large file still counts, and the ceiling still holds.
-    #[test]
-    fn data_written_sparsely_still_counts_toward_the_total() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let dest = temp_dir.path().join("dest");
-        fs::create_dir(&dest).unwrap();
-        let data = vec![7u8; 1024 * 1024];
-        let tar_bytes = make_tar("disk.raw", &data);
-        let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        let limits = SafeUnpackLimits {
-            max_entries: 1_000,
-            max_total_bytes: 128 * 1024,
-            sparse_threshold: 4096,
-        };
-        let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
-        assert!(err.to_string().contains("max total size"), "{err}");
+        let out = dest.join("checkpoint/disks/storage/1");
+        assert_eq!(fs::metadata(&out).unwrap().len(), LOGICAL);
+        assert_eq!(&fs::read(&out).unwrap()[..4096], &data[..]);
     }
 
     #[cfg(target_os = "macos")]
@@ -6701,18 +6651,7 @@ mod tests {
         let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
 
         let real_dest = temp_dir.path().canonicalize().unwrap();
-        unpack_sparse(
-            &mut entry,
-            &dest,
-            data.len() as u64,
-            0o644,
-            &real_dest,
-            WriteBudget {
-                used: &mut 0,
-                max: u64::MAX,
-            },
-        )
-        .unwrap();
+        unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644, &real_dest).unwrap();
 
         assert_eq!(fs::read(&dest).unwrap(), data);
     }
