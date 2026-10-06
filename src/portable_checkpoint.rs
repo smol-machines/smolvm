@@ -543,7 +543,7 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
 /// How many restored checkpoints stay ready for a fast revisit, and within how
 /// much space. Each entry holds a whole checkpoint's RAM and disks, so the count
 /// alone could keep tens of GiB for large machines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RestoreCache {
     /// Checkpoints kept; 0 turns the cache off.
     pub entries: usize,
@@ -562,12 +562,46 @@ impl Default for RestoreCache {
 
 static PROCESS_RESTORE_CACHE: std::sync::OnceLock<RestoreCache> = std::sync::OnceLock::new();
 
+/// Where a server records the restore cache policy it sized for this node.
+const NODE_RESTORE_CACHE_POLICY: &str = ".restore-cache-policy.json";
+
 impl RestoreCache {
-    /// The policy this process set at startup with [`RestoreCache::set_process`],
-    /// or the default. A server sizes it for the host's disk; a CLI command
-    /// keeps the small default, or passes its own policy explicitly.
+    /// The policy this process set at startup with [`RestoreCache::set_process`];
+    /// otherwise the one a server recorded for this node; otherwise the default.
+    ///
+    /// The cache belongs to the data directory, not to a process. Every smolvm
+    /// process on a server's node trims it (a `machine delete` run by the image
+    /// seed builder, for one), and with the small CLI default each such run cut
+    /// the node's cache to three small checkpoints, throwing away every large
+    /// restored checkpoint so the next restore unpacked it again.
     pub fn process() -> Self {
-        PROCESS_RESTORE_CACHE.get().copied().unwrap_or_default()
+        PROCESS_RESTORE_CACHE
+            .get()
+            .copied()
+            .or_else(|| Self::node_policy_in(&crate::agent::vm_cache_root()))
+            .unwrap_or_default()
+    }
+
+    /// Record `self` as this node's policy, for every other smolvm process
+    /// that shares the cache to follow.
+    pub fn persist_for_node(self) -> std::io::Result<()> {
+        self.persist_in(&crate::agent::vm_cache_root())
+    }
+
+    fn persist_in(self, cache_root: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(cache_root)?;
+        let path = cache_root.join(NODE_RESTORE_CACHE_POLICY);
+        let staging = cache_root.join(format!(
+            "{NODE_RESTORE_CACHE_POLICY}.{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&staging, serde_json::to_vec(&self)?)?;
+        std::fs::rename(&staging, &path)
+    }
+
+    fn node_policy_in(cache_root: &Path) -> Option<Self> {
+        let raw = std::fs::read(cache_root.join(NODE_RESTORE_CACHE_POLICY)).ok()?;
+        serde_json::from_slice(&raw).ok()
     }
 
     /// Set the policy [`RestoreCache::process`] returns. The first call wins.
@@ -5231,6 +5265,21 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_node_policy_recorded_by_a_server_is_what_other_processes_use() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(RestoreCache::node_policy_in(root.path()), None);
+        let server = RestoreCache {
+            entries: 32,
+            max_bytes: 256 * 1024 * 1024 * 1024,
+        };
+        server.persist_in(root.path()).unwrap();
+        assert_eq!(RestoreCache::node_policy_in(root.path()), Some(server));
+        // A damaged record falls back to the default rather than failing.
+        std::fs::write(root.path().join(NODE_RESTORE_CACHE_POLICY), b"{").unwrap();
+        assert_eq!(RestoreCache::node_policy_in(root.path()), None);
+    }
+
     use super::*;
 
     /// `/proc/cpuinfo` of an M4 Max guest booted with pointer authentication off.
