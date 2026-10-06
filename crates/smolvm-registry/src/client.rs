@@ -1755,7 +1755,7 @@ mod tests {
                 let (socket, _) = listener.accept().await.unwrap();
                 if let Ok(mut socket) = acceptor.accept(socket).await {
                     let mut request = [0; 1024];
-                    socket.read(&mut request).await.unwrap();
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
                     socket
                         .write_all(
                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",

@@ -703,6 +703,7 @@ mod imp {
 
     /// Pull `image` once in a throwaway machine that never runs a workload, and
     /// publish its storage disk as the seed.
+    #[allow(clippy::too_many_arguments)]
     fn build_seed(
         exe: &Path,
         image: &str,
