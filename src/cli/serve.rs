@@ -194,7 +194,8 @@ impl ServeStartCmd {
 
         // Size the checkpoint caches for a server before any request can restore
         // or capture one.
-        let restore_cache = server_restore_cache(self.restore_cache_entries, self.restore_cache_gib);
+        let restore_cache =
+            server_restore_cache(self.restore_cache_entries, self.restore_cache_gib);
         smolvm::portable_checkpoint::RestoreCache::set_process(restore_cache);
         // Other smolvm processes on this node trim the same cache; they follow
         // this sizing rather than the CLI's.
