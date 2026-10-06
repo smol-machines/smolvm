@@ -922,20 +922,38 @@ fn tcp_relay_loop(
     };
     stream.set_nonblocking(true)?;
 
-    let poller = proxy_wake.poller().clone();
-    // SAFETY: the stream is removed from the poller below, on every return
-    // path, before it is dropped at the end of this function.
-    unsafe { poller.add(&stream, Event::none(HOST_STREAM_KEY))? };
-    let result = relay_stream(
-        &stream,
-        &poller,
+    let registered = RegisteredStream::new(stream, proxy_wake.poller().clone())?;
+    relay_stream(
+        &registered.stream,
+        &registered.poller,
         from_smoltcp,
         to_smoltcp,
         &relay_wake,
         exit_state,
-    );
-    let _ = poller.delete(&stream);
-    result
+    )
+}
+
+/// A relay's host socket registered in the relay's poller. Owning both ties
+/// the registration to the socket's lifetime: `Drop` removes it before the
+/// socket closes, on every exit path, unwinding included.
+struct RegisteredStream {
+    stream: TcpStream,
+    poller: Arc<polling::Poller>,
+}
+
+impl RegisteredStream {
+    fn new(stream: TcpStream, poller: Arc<polling::Poller>) -> io::Result<Self> {
+        // SAFETY: the stream is owned by the value returned here, whose Drop
+        // removes it from the poller before the stream itself is dropped.
+        unsafe { poller.add(&stream, Event::none(HOST_STREAM_KEY))? };
+        Ok(Self { stream, poller })
+    }
+}
+
+impl Drop for RegisteredStream {
+    fn drop(&mut self) {
+        let _ = self.poller.delete(&self.stream);
+    }
 }
 
 /// Copies bytes both ways between the host socket and the guest channels
@@ -1228,6 +1246,8 @@ mod tests {
         let mut round_trips = Vec::new();
         for byte in 0..21u8 {
             // Let the relay go idle first: the case a fixed poll interval made slow.
+            // The old 10 ms poll put the median near 15-18 ms; a woken relay is
+            // well under 1 ms, so 8 ms leaves room for a loaded CI runner.
             thread::sleep(Duration::from_millis(15));
             let started = std::time::Instant::now();
             to_proxy.try_send(vec![byte]).unwrap();
@@ -1240,7 +1260,7 @@ mod tests {
         round_trips.sort();
         let median = round_trips[round_trips.len() / 2];
         assert!(
-            median < Duration::from_millis(4),
+            median < Duration::from_millis(8),
             "median guest->host->guest round trip through an idle relay was {median:?}"
         );
     }
