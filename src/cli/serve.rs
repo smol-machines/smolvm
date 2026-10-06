@@ -494,6 +494,27 @@ impl ServeStartCmd {
             shutdown_rx.clone(),
         ));
 
+        // A new smolvm version makes every image seed stale, so the first
+        // machine of each image would wait for a seed build. Rebuild the seeds
+        // machines used recently, in the background, once startup has settled.
+        #[cfg(unix)]
+        {
+            let spawned = std::thread::Builder::new()
+                .name("image-seed-prewarm".into())
+                .spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    match smolvm::image_seed::builder_exe() {
+                        Ok(exe) => smolvm::image_seed::prewarm_recent_seeds(&exe),
+                        Err(error) => {
+                            tracing::warn!(%error, "no smolvm binary to prewarm image seeds with")
+                        }
+                    }
+                });
+            if let Err(error) = spawned {
+                tracing::warn!(%error, "could not start image seed prewarm");
+            }
+        }
+
         // Create router
         let drain_state = state.clone();
         // The loopback plain-HTTP door (fleet mode) serves a RESTRICTED router —

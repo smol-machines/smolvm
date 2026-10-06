@@ -29,7 +29,8 @@
 
 #[cfg(unix)]
 pub use imp::{
-    revalidate_seed, seed_root, seed_storage, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage, seedable_image, wants_seed,
+    SEED_MACHINE_PREFIX,
 };
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
@@ -340,6 +341,49 @@ mod imp {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
     ) -> Result<bool> {
+        let EnsuredSeed {
+            root,
+            key_dir,
+            cache,
+            built,
+        } = ensure_seed(exe, image, auth, digest_ttl, proxy, no_proxy)?;
+        let Some((seed, format)) = seed_disk(&key_dir) else {
+            return Err(Error::config(
+                "image seed",
+                "seed disappeared before overlay creation",
+            ));
+        };
+        attach_seed_disk(name, &seed, format, storage_gb)?;
+        // Recently used seeds are the last to be evicted.
+        let _ =
+            std::fs::File::open(&seed).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        drop(cache);
+        note_recent_image(&root, image);
+        if built {
+            prune(&root, max_bytes(), &seed);
+        }
+        Ok(true)
+    }
+
+    /// The seed directory for `image` once its seed exists, holding the shared
+    /// cache lock so prune cannot remove it before the caller attaches it.
+    struct EnsuredSeed {
+        root: PathBuf,
+        key_dir: PathBuf,
+        cache: CacheLock,
+        built: bool,
+    }
+
+    /// Make sure the seed for `image` at its current digest exists, building it
+    /// (with `exe`) when it does not.
+    fn ensure_seed(
+        exe: &Path,
+        image: &str,
+        auth: &PullAuth,
+        digest_ttl: Option<u64>,
+        proxy: Option<&str>,
+        no_proxy: Option<&str>,
+    ) -> Result<EnsuredSeed> {
         let template = storage_template();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -383,12 +427,21 @@ mod imp {
             }
             cache = CacheLock::shared(&root)?;
         }
-        let Some((seed, format)) = seed_disk(&key_dir) else {
-            return Err(Error::config(
-                "image seed",
-                "seed disappeared before overlay creation",
-            ));
-        };
+        Ok(EnsuredSeed {
+            root,
+            key_dir,
+            cache,
+            built,
+        })
+    }
+
+    /// Give machine `name` its storage disk over `seed`, grown to `storage_gb`.
+    fn attach_seed_disk(
+        name: &str,
+        seed: &Path,
+        format: DiskFormat,
+        storage_gb: Option<u64>,
+    ) -> Result<()> {
         let dir = crate::agent::ensure_vm_dir(name)
             .map_err(|e| Error::config("image seed", e.to_string()))?;
         let storage = dir
@@ -409,7 +462,7 @@ mod imp {
         let size_bytes = storage_gb
             .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB)
             .saturating_mul(crate::data::consts::BYTES_PER_GIB);
-        let created = attach(&staging, &seed, format).and_then(|()| {
+        let created = attach(&staging, seed, format).and_then(|()| {
             grow(&staging, format, size_bytes)?;
             // A clone keeps no link to its seed; record it for revalidation.
             if matches!(format, DiskFormat::Raw) {
@@ -432,14 +485,84 @@ mod imp {
             std::fs::write(storage.with_extension("formatted"), "1")
                 .map_err(|e| Error::config("image seed", e.to_string()))?;
         }
-        // Recently used seeds are the last to be evicted.
-        let _ =
-            std::fs::File::open(&seed).and_then(|f| f.set_modified(std::time::SystemTime::now()));
-        drop(cache);
-        if built {
-            prune(&root, max_bytes(), &seed);
+        Ok(())
+    }
+
+    /// Images whose seeds machines used recently, newest first: what to rebuild
+    /// after a new smolvm version invalidates every seed.
+    const RECENT_IMAGES: &str = ".recent-images.json";
+    /// Images the index remembers.
+    const RECENT_IMAGES_KEPT: usize = 32;
+    /// How far back a seed counts as recently used for prewarming.
+    pub(super) const PREWARM_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+    /// Seeds rebuilt at most per prewarm, so a server start does not spend
+    /// long building images nobody needs.
+    const PREWARM_MAX_IMAGES: usize = 8;
+
+    pub(super) fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    fn read_recent_images(root: &Path) -> Vec<(String, u64)> {
+        std::fs::read(root.join(RECENT_IMAGES))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Vec<(String, u64)>>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Record that a machine just used the seed for `image`. Best effort: the
+    /// index only steers prewarming.
+    pub(super) fn note_recent_image(root: &Path, image: &str) {
+        let Ok(_lock) = Lock::exclusive(&root.join(".recent-images.lock")) else {
+            return;
+        };
+        let mut images = read_recent_images(root);
+        images.retain(|(seen, _)| seen != image);
+        images.insert(0, (image.to_string(), now_secs()));
+        images.truncate(RECENT_IMAGES_KEPT);
+        let staging = root.join(format!("{RECENT_IMAGES}.{}.tmp", std::process::id()));
+        let written = serde_json::to_vec(&images)
+            .map_err(std::io::Error::other)
+            .and_then(|raw| std::fs::write(&staging, raw))
+            .and_then(|()| std::fs::rename(&staging, root.join(RECENT_IMAGES)));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&staging);
         }
-        Ok(true)
+    }
+
+    /// The images to prewarm: used within the window, newest first, capped.
+    pub(super) fn prewarm_candidates(root: &Path, now: u64) -> Vec<String> {
+        read_recent_images(root)
+            .into_iter()
+            .filter(|(_, used)| now.saturating_sub(*used) <= PREWARM_WINDOW_SECS)
+            .map(|(image, _)| image)
+            .take(PREWARM_MAX_IMAGES)
+            .collect()
+    }
+
+    /// Build seeds for the images machines used recently on this host, so the
+    /// first machine of each after an upgrade (whose version change made every
+    /// seed stale) does not wait for a build. Runs the builds one at a time;
+    /// an image this host cannot pull without the machine's own credentials is
+    /// skipped and seeds on its next machine as before.
+    pub fn prewarm_recent_seeds(exe: &Path) {
+        let root = seed_root();
+        for image in prewarm_candidates(&root, now_secs()) {
+            let started = std::time::Instant::now();
+            match ensure_seed(exe, &image, &PullAuth::FromConfig, None, None, None) {
+                Ok(EnsuredSeed { built, .. }) => tracing::info!(
+                    %image,
+                    built,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "prewarmed image seed"
+                ),
+                Err(error) => {
+                    tracing::info!(%image, %error, "could not prewarm image seed; it seeds on first use")
+                }
+            }
+        }
     }
 
     /// Reauthorize a seed attached at API create with the credentials supplied
@@ -1001,6 +1124,22 @@ mod imp {
 mod tests {
     use super::imp::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn recently_used_images_are_prewarmed_newest_first_within_the_window() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(prewarm_candidates(root.path(), 0).is_empty());
+        note_recent_image(root.path(), "alpine");
+        note_recent_image(root.path(), "docker:dind");
+        note_recent_image(root.path(), "alpine"); // used again: moves to the front
+        let now = now_secs();
+        assert_eq!(
+            prewarm_candidates(root.path(), now),
+            vec!["alpine".to_string(), "docker:dind".to_string()]
+        );
+        // Outside the window, nothing is prewarmed.
+        assert!(prewarm_candidates(root.path(), now + PREWARM_WINDOW_SECS + 1).is_empty());
+    }
 
     #[test]
     fn a_larger_disk_seeds_and_a_smaller_one_pulls() {
