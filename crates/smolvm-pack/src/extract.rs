@@ -945,7 +945,11 @@ fn safe_unpack_skipping<R: Read>(
                 format!("tar archive exceeds max entry count ({max_entries})"),
             ));
         }
-        total_bytes = total_bytes.saturating_add(entry.header().size().unwrap_or(0));
+        // Charge what extraction writes: the bytes the entry stores. For a GNU
+        // sparse entry `size()` is its logical length, holes included, so a
+        // checkpoint of a 64 GiB disk holding 2 GiB was charged 64 GiB and a
+        // large machine's checkpoint was refused outright.
+        total_bytes = total_bytes.saturating_add(entry.header().entry_size().unwrap_or(0));
         if total_bytes > max_total_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -6512,6 +6516,45 @@ mod tests {
         let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("max total size"));
+    }
+
+    /// A sparse disk is charged the bytes it stores, not its logical length:
+    /// a large machine's checkpoint (here 64 MiB declared, 4 KiB stored) must
+    /// extract under a ceiling far below its declared size.
+    #[test]
+    fn a_sparse_entry_is_charged_what_it_stores() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        const LOGICAL: u64 = 64 * 1024 * 1024;
+        let data = vec![9u8; 4096];
+        let mut archive_bytes = Vec::new();
+        {
+            let mut header = tar::Header::new_gnu();
+            header.set_path("checkpoint/disks/storage/1").unwrap();
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            let stored = crate::assets::write_sparse_header(
+                &mut archive_bytes,
+                header,
+                LOGICAL,
+                &[(0, 4096)],
+            )
+            .unwrap();
+            assert_eq!(stored, 4096);
+            archive_bytes.extend_from_slice(&data);
+            archive_bytes.extend(std::iter::repeat_n(0u8, 1024 * 2));
+        }
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
+        let limits = SafeUnpackLimits {
+            max_entries: 1_000,
+            max_total_bytes: 1024 * 1024, // far below the 64 MiB declared size
+            sparse_threshold: SPARSE_WRITE_THRESHOLD,
+        };
+        safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap();
+        let out = dest.join("checkpoint/disks/storage/1");
+        assert_eq!(fs::metadata(&out).unwrap().len(), LOGICAL);
+        assert_eq!(&fs::read(&out).unwrap()[..4096], &data[..]);
     }
 
     #[cfg(target_os = "macos")]

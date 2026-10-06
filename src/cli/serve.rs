@@ -34,7 +34,7 @@ API ENDPOINTS:
   DELETE /api/v1/machines/:id         Delete machine
 
 EXAMPLES:
-  smolvm serve start                                Listen on the default Unix socket (unix:///$XDG_RUNTIME_DIR/smolvm.sock)
+  smolvm serve start                                Listen on the default address (shown under --listen)
   smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
   smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
   smolvm serve start -v                             Enable verbose logging")]
@@ -97,11 +97,12 @@ pub struct ServeStartCmd {
     #[arg(long = "allow-nested-virt")]
     allow_nested_virt: bool,
 
-    /// Flag guest traffic to destinations on this watchlist. Each line is
-    /// `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
+    /// Flag, or block, guest traffic to destinations on this watchlist. Each line
+    /// is `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
     /// lowercased DNS name (its subdomains match too) or of an IP address's text.
     /// Matches are recorded per machine and reported as `egressSignals` in the
-    /// machine API; traffic is never blocked by this. The file is re-read when it
+    /// machine API. A line ending in `block` also answers a matching lookup as
+    /// nonexistent and drops matching connections. The file is re-read when it
     /// changes. Applies to virtio-net machines. Off by default.
     #[arg(long = "egress-watchlist", value_name = "PATH")]
     egress_watchlist: Option<std::path::PathBuf>,
@@ -193,10 +194,14 @@ impl ServeStartCmd {
 
         // Size the checkpoint caches for a server before any request can restore
         // or capture one.
-        smolvm::portable_checkpoint::RestoreCache::set_process(server_restore_cache(
-            self.restore_cache_entries,
-            self.restore_cache_gib,
-        ));
+        let restore_cache =
+            server_restore_cache(self.restore_cache_entries, self.restore_cache_gib);
+        smolvm::portable_checkpoint::RestoreCache::set_process(restore_cache);
+        // Other smolvm processes on this node trim the same cache; they follow
+        // this sizing rather than the CLI's.
+        if let Err(error) = restore_cache.persist_for_node() {
+            tracing::warn!(%error, "could not record the restore cache policy for this node");
+        }
         smolvm::portable_checkpoint::set_prepared_checkpoint_budget(
             self.prepared_checkpoint_cache_gib
                 .saturating_mul(1024 * 1024 * 1024),
@@ -488,6 +493,27 @@ impl ServeStartCmd {
             state.clone(),
             shutdown_rx.clone(),
         ));
+
+        // A new smolvm version makes every image seed stale, so the first
+        // machine of each image would wait for a seed build. Rebuild the seeds
+        // machines used recently, in the background, once startup has settled.
+        #[cfg(unix)]
+        {
+            let spawned = std::thread::Builder::new()
+                .name("image-seed-prewarm".into())
+                .spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    match smolvm::image_seed::builder_exe() {
+                        Ok(exe) => smolvm::image_seed::prewarm_recent_seeds(&exe),
+                        Err(error) => {
+                            tracing::warn!(%error, "no smolvm binary to prewarm image seeds with")
+                        }
+                    }
+                });
+            if let Err(error) = spawned {
+                tracing::warn!(%error, "could not start image seed prewarm");
+            }
+        }
 
         // Create router
         let drain_state = state.clone();

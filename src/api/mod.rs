@@ -214,10 +214,40 @@ const MAX_FILE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 /// Bounded but large enough for cohorts of pre-tokenized RL prompts.
 const MAX_ROLLOUT_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 
-/// Validate that an API command payload is not empty.
+/// Linux refuses an `execve` argument of 128 KiB or more (its terminating NUL
+/// counts toward the limit).
+const MAX_COMMAND_ARG_BYTES: usize = 128 * 1024 - 1;
+/// The whole argument list shares a ~2 MiB limit with the environment and the
+/// runtime's own arguments; keep well under it.
+const MAX_COMMAND_TOTAL_BYTES: usize = 1024 * 1024;
+
+/// Validate an API command payload: not empty, and small enough for the guest
+/// to start. A larger one would only fail inside the guest as a bare
+/// "Argument list too long".
 pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
     if cmd.is_empty() {
         return Err(ApiError::BadRequest("command cannot be empty".into()));
+    }
+    let too_big = |what: String| {
+        ApiError::BadRequest(format!(
+            "{what}; upload a long script as a file and run that file instead"
+        ))
+    };
+    if let Some((index, arg)) = cmd
+        .iter()
+        .enumerate()
+        .find(|(_, arg)| arg.len() > MAX_COMMAND_ARG_BYTES)
+    {
+        return Err(too_big(format!(
+            "command argument {index} is {} bytes; one argument can be at most {MAX_COMMAND_ARG_BYTES} bytes",
+            arg.len()
+        )));
+    }
+    let total: usize = cmd.iter().map(|arg| arg.len() + 1).sum();
+    if total > MAX_COMMAND_TOTAL_BYTES {
+        return Err(too_big(format!(
+            "command is {total} bytes; all arguments together can be at most {MAX_COMMAND_TOTAL_BYTES} bytes"
+        )));
     }
     Ok(())
 }
@@ -731,6 +761,14 @@ mod tests {
         assert!(validate_command(&[]).is_err());
         assert!(validate_command(&["echo".to_string()]).is_ok());
         assert!(validate_command(&["echo".to_string(), "hello".to_string()]).is_ok());
+        // The largest argument the guest can take, and one byte over it.
+        let max = "x".repeat(super::MAX_COMMAND_ARG_BYTES);
+        assert!(validate_command(&["sh".into(), "-c".into(), max.clone()]).is_ok());
+        let over = validate_command(&["sh".into(), "-c".into(), format!("{max}x")]).unwrap_err();
+        assert!(format!("{over:?}").contains("argument 2"));
+        // Many arguments under the per-argument limit can still be too many.
+        let many: Vec<String> = (0..10).map(|_| max.clone()).collect();
+        assert!(validate_command(&many).is_err());
     }
 }
 

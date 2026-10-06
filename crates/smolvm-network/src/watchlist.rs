@@ -1,18 +1,23 @@
-//! An operator-supplied egress watchlist: destinations to flag, not block.
+//! An operator-supplied egress watchlist: destinations to flag, or to block.
 //!
 //! The list holds SHA-256 digests, never names or addresses, so a copy of the
 //! file (or this source) does not reveal what is watched. A guest DNS question
 //! matches a `dns-sha256` entry when the digest of the queried name, or of any
 //! of its parent domains, is listed; an outbound destination matches an
 //! `ip-sha256` entry when the digest of its address's canonical text is listed.
-//! A match only records a signal; the egress policy still decides the traffic.
+//! A match records a signal; unless its line says `block`, the egress policy
+//! still decides the traffic.
 //!
 //! File format, one entry per line, `#` comments and blank lines ignored:
 //!
 //! ```text
-//! <label> dns-sha256:<64 lowercase hex>
-//! <label> ip-sha256:<64 lowercase hex>
+//! <label> dns-sha256:<64 lowercase hex> [block]
+//! <label> ip-sha256:<64 lowercase hex> [block]
 //! ```
+//!
+//! A line may end in `block`: a matching lookup is then answered as
+//! nonexistent and a matching connection or datagram is dropped, as well as
+//! recorded. The guest sees an ordinary failure, not a policy refusal.
 //!
 //! `label` is 1 to 32 of `[a-z0-9_-]` and is what a match reports, so it should
 //! be opaque. Names are hashed lowercased with any trailing dot removed
@@ -50,8 +55,16 @@ type Digest32 = [u8; 32];
 /// A parsed watchlist: digests of names and of addresses, each with its label.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Watchlist {
-    dns: HashMap<Digest32, String>,
-    ip: HashMap<Digest32, String>,
+    dns: HashMap<Digest32, Entry>,
+    ip: HashMap<Digest32, Entry>,
+}
+
+/// What one line of the list says to do with a match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    label: String,
+    /// Refuse the lookup or connection as well as recording it.
+    block: bool,
 }
 
 /// Why a watchlist file was refused, with the 1-based line it failed on.
@@ -106,9 +119,15 @@ impl Watchlist {
                 reason: reason.to_string(),
             };
             let mut fields = line.split_whitespace();
-            let (Some(label), Some(entry), None) = (fields.next(), fields.next(), fields.next())
+            let (Some(label), Some(entry), action, None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
             else {
-                return Err(err("expected `<label> <kind>:<sha256>`"));
+                return Err(err("expected `<label> <kind>:<sha256> [block]`"));
+            };
+            let block = match action {
+                None => false,
+                Some("block") => true,
+                Some(_) => return Err(err("the only action is `block`")),
             };
             if !valid_label(label) {
                 return Err(err("label must be 1 to 32 of [a-z0-9_-]"));
@@ -123,7 +142,13 @@ impl Watchlist {
                 "ip-sha256" => &mut list.ip,
                 _ => return Err(err("kind must be dns-sha256 or ip-sha256")),
             };
-            table.insert(digest, label.to_string());
+            table.insert(
+                digest,
+                Entry {
+                    label: label.to_string(),
+                    block,
+                },
+            );
             if list.dns.len() + list.ip.len() > MAX_ENTRIES {
                 return Err(err("too many entries"));
             }
@@ -144,6 +169,10 @@ impl Watchlist {
     /// The label of the entry `name` (as asked in a DNS question) matches: the
     /// name itself or any parent domain, most specific first.
     pub fn match_dns(&self, name: &str) -> Option<&str> {
+        self.entry_dns(name).map(|entry| entry.label.as_str())
+    }
+
+    fn entry_dns(&self, name: &str) -> Option<&Entry> {
         if self.dns.is_empty() {
             return None;
         }
@@ -153,8 +182,8 @@ impl Watchlist {
             if rest.is_empty() {
                 return None;
             }
-            if let Some(label) = self.dns.get(&digest(rest)) {
-                return Some(label);
+            if let Some(entry) = self.dns.get(&digest(rest)) {
+                return Some(entry);
             }
             rest = rest.split_once('.')?.1;
         }
@@ -162,11 +191,24 @@ impl Watchlist {
 
     /// The label of the entry `ip` matches, by the digest of its canonical text.
     pub fn match_ip(&self, ip: IpAddr) -> Option<&str> {
+        self.entry_ip(ip).map(|entry| entry.label.as_str())
+    }
+
+    fn entry_ip(&self, ip: IpAddr) -> Option<&Entry> {
         if self.ip.is_empty() {
             return None;
         }
-        self.ip.get(&digest(&ip.to_string())).map(String::as_str)
+        self.ip.get(&digest(&ip.to_string()))
     }
+}
+
+/// What the watchlist says about one lookup or destination.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Verdict {
+    /// The label to record, unless the same match was recorded within the last minute.
+    pub record: Option<String>,
+    /// Refuse it: answer the lookup as nonexistent, or drop the connection.
+    pub block: bool,
 }
 
 /// A VM's live view of its watchlist copy: reloaded when the file changes, and
@@ -229,40 +271,47 @@ impl WatchlistSource {
         Arc::clone(&state.list)
     }
 
-    /// The label to record for a match, or `None` when nothing matched or the
-    /// same label and destination were recorded within the last minute.
+    /// What a match means for `dest`: the label to record, `None` when nothing
+    /// matched or the same label and destination were recorded within the last
+    /// minute, and whether to refuse it. Refusal never goes quiet.
     fn record_once(
         &self,
-        matched: impl FnOnce(&Watchlist) -> Option<String>,
+        matched: impl FnOnce(&Watchlist) -> Option<Entry>,
         dest: &str,
-    ) -> Option<String> {
-        let mut state = self.state.lock().ok()?;
+    ) -> Verdict {
+        let Ok(mut state) = self.state.lock() else {
+            return Verdict::default();
+        };
         let list = self.current(&mut state);
-        let label = matched(&list)?;
-        let key = (label.clone(), dest.to_string());
+        let Some(entry) = matched(&list) else {
+            return Verdict::default();
+        };
+        let key = (entry.label.clone(), dest.to_string());
         let now = Instant::now();
-        if state
+        let quiet = state
             .recent
             .get(&key)
-            .is_some_and(|at| now.duration_since(*at) < REPEAT_QUIET)
-        {
-            return None;
+            .is_some_and(|at| now.duration_since(*at) < REPEAT_QUIET);
+        if !quiet {
+            if state.recent.len() >= MAX_REMEMBERED_MATCHES {
+                state.recent.clear();
+            }
+            state.recent.insert(key, now);
         }
-        if state.recent.len() >= MAX_REMEMBERED_MATCHES {
-            state.recent.clear();
+        Verdict {
+            record: (!quiet).then_some(entry.label),
+            block: entry.block,
         }
-        state.recent.insert(key, now);
-        Some(label)
     }
 
-    /// The label to record for a DNS question about `name`, if any.
-    pub fn observe_dns(&self, name: &str) -> Option<String> {
-        self.record_once(|list| list.match_dns(name).map(str::to_string), name)
+    /// What the list says about a DNS question for `name`.
+    pub fn observe_dns(&self, name: &str) -> Verdict {
+        self.record_once(|list| list.entry_dns(name).cloned(), name)
     }
 
-    /// The label to record for an outbound destination, if any.
-    pub fn observe_ip(&self, ip: IpAddr, dest: &str) -> Option<String> {
-        self.record_once(|list| list.match_ip(ip).map(str::to_string), dest)
+    /// What the list says about an outbound destination.
+    pub fn observe_ip(&self, ip: IpAddr, dest: &str) -> Verdict {
+        self.record_once(|list| list.entry_ip(ip).cloned(), dest)
     }
 }
 
@@ -322,13 +371,16 @@ mod tests {
         let path = dir.path().join(EGRESS_WATCHLIST_FILE);
         std::fs::write(&path, format!("w1 dns-sha256:{}\n", hex("watched.example"))).unwrap();
         let source = WatchlistSource::open(path.clone()).unwrap();
-        assert_eq!(source.observe_dns("watched.example").as_deref(), Some("w1"));
         assert_eq!(
-            source.observe_dns("watched.example"),
+            source.observe_dns("watched.example").record.as_deref(),
+            Some("w1")
+        );
+        assert_eq!(
+            source.observe_dns("watched.example").record,
             None,
             "quiet on repeat"
         );
-        assert_eq!(source.observe_dns("other.example"), None);
+        assert_eq!(source.observe_dns("other.example"), Verdict::default());
 
         std::fs::write(&path, format!("w9 dns-sha256:{}\n", hex("other.example"))).unwrap();
         let mtime = SystemTime::now() + Duration::from_secs(5);
@@ -339,7 +391,58 @@ mod tests {
             .set_modified(mtime)
             .unwrap();
         source.state.lock().unwrap().checked = Instant::now() - RELOAD_CHECK_INTERVAL;
-        assert_eq!(source.observe_dns("other.example").as_deref(), Some("w9"));
+        assert_eq!(
+            source.observe_dns("other.example").record.as_deref(),
+            Some("w9")
+        );
+    }
+
+    /// A `block` entry refuses every match, including the repeats it no longer
+    /// records; an entry without it only records.
+    #[test]
+    fn a_block_entry_refuses_each_match_and_records_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EGRESS_WATCHLIST_FILE);
+        std::fs::write(
+            &path,
+            format!(
+                "b1 dns-sha256:{} block\nw1 dns-sha256:{}\nb2 ip-sha256:{} block\n",
+                hex("blocked.example"),
+                hex("watched.example"),
+                hex("192.0.2.9"),
+            ),
+        )
+        .unwrap();
+        let source = WatchlistSource::open(path).unwrap();
+        let first = source.observe_dns("pool.blocked.example");
+        assert_eq!((first.record.as_deref(), first.block), (Some("b1"), true));
+        let repeat = source.observe_dns("pool.blocked.example");
+        assert_eq!(
+            (repeat.record, repeat.block),
+            (None, true),
+            "refused even when quiet"
+        );
+        let flagged = source.observe_dns("watched.example");
+        assert_eq!(
+            (flagged.record.as_deref(), flagged.block),
+            (Some("w1"), false)
+        );
+        assert!(
+            source
+                .observe_ip("192.0.2.9".parse().unwrap(), "192.0.2.9:443")
+                .block
+        );
+        assert!(
+            !source
+                .observe_ip("192.0.2.10".parse().unwrap(), "192.0.2.10:443")
+                .block
+        );
+    }
+
+    #[test]
+    fn an_unknown_action_refuses_the_file() {
+        let line = format!("b1 dns-sha256:{} drop\n", hex("x.example"));
+        assert_eq!(Watchlist::parse(&line).unwrap_err().line, 1);
     }
 
     #[test]

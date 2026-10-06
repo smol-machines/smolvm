@@ -367,24 +367,30 @@ impl EgressPolicy {
         self.watchlist.is_some()
     }
 
-    /// Note a guest DNS question for `name` against the watchlist. Observed,
-    /// never decided here: the policy still answers or blocks the query.
-    pub fn observe_dns(&self, name: &str) {
-        if let Some(label) = self.watchlist.as_deref().and_then(|w| w.observe_dns(name)) {
-            self.record_signal(&label, &name);
+    /// Note a guest DNS question for `name` against the watchlist, returning
+    /// whether a `block` entry refuses it. Otherwise the policy decides.
+    pub fn observe_dns(&self, name: &str) -> bool {
+        let Some(watchlist) = self.watchlist.as_deref() else {
+            return false;
+        };
+        let verdict = watchlist.observe_dns(name);
+        if let Some(label) = &verdict.record {
+            self.record_signal(label, &name);
         }
+        verdict.block
     }
 
     /// Note an outbound destination against the watchlist, like `observe_dns`.
-    pub fn observe_destination(&self, destination: std::net::SocketAddr) {
+    pub fn observe_destination(&self, destination: std::net::SocketAddr) -> bool {
+        let Some(watchlist) = self.watchlist.as_deref() else {
+            return false;
+        };
         let dest = destination.to_string();
-        if let Some(label) = self
-            .watchlist
-            .as_deref()
-            .and_then(|w| w.observe_ip(destination.ip(), &dest))
-        {
-            self.record_signal(&label, &dest);
+        let verdict = watchlist.observe_ip(destination.ip(), &dest);
+        if let Some(label) = &verdict.record {
+            self.record_signal(label, &dest);
         }
+        verdict.block
     }
 
     /// Record one match. Keep the marker text stable: the host's

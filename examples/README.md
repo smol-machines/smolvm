@@ -60,7 +60,7 @@ net = true                           # outbound networking (default: false)
 gpu = true                           # GPU acceleration via virtio-gpu/Venus (Vulkan)
 gpu_vram = 2048                      # GPU shared-memory region in MiB (default: 4096)
 storage = 40                         # storage disk GiB (default: 20)
-overlay = 4                          # overlay disk GiB (default: 2)
+overlay = 4                          # overlay disk GiB (default: 10)
 
 # Network policy — egress filtering by hostname and/or CIDR
 [network]

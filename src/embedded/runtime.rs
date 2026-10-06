@@ -388,6 +388,10 @@ impl EmbeddedRuntime {
                     tracing::warn!(%error, path = %path.display(), "could not remove consumed pause artifact");
                 }
             }
+            let vm_data = crate::agent::vm_data_dir(name);
+            if let Err(error) = crate::portable_checkpoint::remove_paused_layers(&vm_data) {
+                tracing::warn!(%error, "could not remove consumed pause's pinned layers");
+            }
             Ok(())
         })
     }

@@ -366,12 +366,19 @@ fn run_network_stack(
                     // is silently dropped (a guest sees a normal UDP black hole),
                     // but the denial is recorded in the boot log — these lines are
                     // the machine's egress audit trail (`read_egress_denials`).
-                    let relay_allowed = udp_relay::should_relay_udp(destination, &datagram_egress);
+                    let mut relay_allowed =
+                        udp_relay::should_relay_udp(destination, &datagram_egress);
                     if !relay_allowed && destination.port() != 53 {
                         egress.record_denial("sendto", &destination);
                     }
-                    if relay_allowed && egress.watching() && !udp_sockets.has_socket(destination) {
-                        egress.observe_destination(destination);
+                    // A `block` entry drops the datagram like a denial, recorded
+                    // only as the watchlist match.
+                    if relay_allowed
+                        && egress.watching()
+                        && !udp_sockets.has_socket(destination)
+                        && egress.observe_destination(destination)
+                    {
+                        relay_allowed = false;
                     }
                     if relay_allowed && udp_sockets.ensure_socket(destination, &mut sockets) {
                         if matches!(
@@ -878,11 +885,14 @@ enum DnsDecision {
 /// gateway-internal plumbing, not egress, so it must resolve even under a
 /// strict allow-host policy.
 fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Addr) -> DnsDecision {
-    // Watchlist matches are observed, never decided here: the policy below
-    // still answers or blocks the query exactly as it would without one.
+    // A watchlist match is recorded; a `block` entry also answers the name as
+    // nonexistent, so the guest sees an ordinary failed lookup. Otherwise the
+    // policy below decides exactly as it would without a watchlist.
     if egress.watching() {
         if let Some(name) = dns::question_name(query) {
-            egress.observe_dns(&name);
+            if egress.observe_dns(&name) {
+                return DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN));
+            }
         }
     }
     if dns::question_name(query)

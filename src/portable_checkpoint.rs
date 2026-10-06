@@ -53,6 +53,11 @@ const UNSYNCED_INPUT_MARKER: &str = "unsynced";
 /// Suffix of the file beside a paused machine's data directory that records
 /// its disk chains' identity once it has stopped.
 const PAUSED_DISKS_SUFFIX: &str = ".paused-disks";
+/// Suffix of the directory beside a paused machine's data directory that pins
+/// the backing layers its pause artifact references instead of carrying.
+const PAUSED_LAYERS_SUFFIX: &str = ".paused-layers";
+/// The pinned layers' index inside that directory.
+const PAUSED_LAYERS_INDEX: &str = "layers";
 /// Service-owned tmpfs directory where a resume stages its checkpoint, so the
 /// RAM image it hands the VMM is never written to disk.
 #[cfg(target_os = "linux")]
@@ -543,7 +548,7 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
 /// How many restored checkpoints stay ready for a fast revisit, and within how
 /// much space. Each entry holds a whole checkpoint's RAM and disks, so the count
 /// alone could keep tens of GiB for large machines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RestoreCache {
     /// Checkpoints kept; 0 turns the cache off.
     pub entries: usize,
@@ -562,12 +567,46 @@ impl Default for RestoreCache {
 
 static PROCESS_RESTORE_CACHE: std::sync::OnceLock<RestoreCache> = std::sync::OnceLock::new();
 
+/// Where a server records the restore cache policy it sized for this node.
+const NODE_RESTORE_CACHE_POLICY: &str = ".restore-cache-policy.json";
+
 impl RestoreCache {
-    /// The policy this process set at startup with [`RestoreCache::set_process`],
-    /// or the default. A server sizes it for the host's disk; a CLI command
-    /// keeps the small default, or passes its own policy explicitly.
+    /// The policy this process set at startup with [`RestoreCache::set_process`];
+    /// otherwise the one a server recorded for this node; otherwise the default.
+    ///
+    /// The cache belongs to the data directory, not to a process. Every smolvm
+    /// process on a server's node trims it (a `machine delete` run by the image
+    /// seed builder, for one), and with the small CLI default each such run cut
+    /// the node's cache to three small checkpoints, throwing away every large
+    /// restored checkpoint so the next restore unpacked it again.
     pub fn process() -> Self {
-        PROCESS_RESTORE_CACHE.get().copied().unwrap_or_default()
+        PROCESS_RESTORE_CACHE
+            .get()
+            .copied()
+            .or_else(|| Self::node_policy_in(&crate::agent::vm_cache_root()))
+            .unwrap_or_default()
+    }
+
+    /// Record `self` as this node's policy, for every other smolvm process
+    /// that shares the cache to follow.
+    pub fn persist_for_node(self) -> std::io::Result<()> {
+        self.persist_in(&crate::agent::vm_cache_root())
+    }
+
+    fn persist_in(self, cache_root: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(cache_root)?;
+        let path = cache_root.join(NODE_RESTORE_CACHE_POLICY);
+        let staging = cache_root.join(format!(
+            "{NODE_RESTORE_CACHE_POLICY}.{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&staging, serde_json::to_vec(&self)?)?;
+        std::fs::rename(&staging, &path)
+    }
+
+    fn node_policy_in(cache_root: &Path) -> Option<Self> {
+        let raw = std::fs::read(cache_root.join(NODE_RESTORE_CACHE_POLICY)).ok()?;
+        serde_json::from_slice(&raw).ok()
     }
 
     /// Set the policy [`RestoreCache::process`] returns. The first call wins.
@@ -1636,6 +1675,14 @@ impl DeferredRetain {
     }
 }
 
+/// Whether the VMM declined a deferred RAM save in a way a synchronous SAVE
+/// covers: it lacks the command, or the guest's RAM cannot be retained as a
+/// generation (a fork clone's). A stored checkpoint ingests a synchronous
+/// SAVE's RAM image as well as a streamed one, so the store needs no exception.
+fn declined_deferred_save(reply: &str) -> bool {
+    reply.starts_with("ERR ENOTSUP") || reply.trim() == "ERR EINVAL unknown command"
+}
+
 fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1939,12 +1986,7 @@ fn capture_with_completion(
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     // A packed machine whose held save failed goes back to SAVE, never to the
     // rebasing PREPARE_SAVE.
-    if !prepared
-        && (held_in_place
-            || (options.store_dir.is_none()
-                && (reply.starts_with("ERR ENOTSUP")
-                    || reply.trim() == "ERR EINVAL unknown command")))
-    {
+    if !prepared && (held_in_place || declined_deferred_save(&reply)) {
         reply = synchronous_save()?;
         tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
@@ -1979,8 +2021,20 @@ fn capture_with_completion(
         .transpose()?;
     #[cfg(not(unix))]
     let captured_disks: Option<String> = None;
-    let (checkpoint_disks, deferred_backings) =
-        stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
+    // A pause references the layers its machine shares with another (a
+    // fork's golden) instead of compressing them into every artifact again.
+    // A stored checkpoint already writes shared chunks once.
+    #[cfg(unix)]
+    let mut pins = (stop_after_capture && stored.is_none())
+        .then(|| LayerPins::new(&crate::agent::vm_data_dir(name)))
+        .transpose()?;
+    #[cfg(not(unix))]
+    let mut pins: Option<LayerPins> = None;
+    let (checkpoint_disks, deferred_backings) = stage_disk_chains(
+        &crate::agent::vm_data_dir(name),
+        &snapshot_dir,
+        pins.as_mut(),
+    )?;
     if !stop_after_capture {
         pause.resume()?;
     }
@@ -2439,6 +2493,10 @@ fn capture_with_completion(
         log_phase(name, "capture_retain_prepared", &mut phase);
     }
     if stop_after_capture {
+        #[cfg(unix)]
+        if let Some(pins) = &pins {
+            pins.commit(output)?;
+        }
         publish_resume_point(PauseCaptureStage::Durable)?;
         pause.stop(name, vm)?;
         record_paused_disks(
@@ -3635,11 +3693,13 @@ fn qcow2_backing_patches(
 /// and status change times, and path. Any write to a file changes its line.
 /// The status change time of a backing only the service can write, such as a
 /// storage template, is left out: staging hard-links raw backings, which
-/// changes it.
+/// changes it. So is that of a backing another machine owns, such as a fork's
+/// golden: every pause of every fork pins it with a hard link.
 #[cfg(unix)]
 fn disk_chain_identity(vm_data: &Path) -> Result<String> {
     use std::fmt::Write as _;
     use std::os::unix::fs::MetadataExt;
+    let own = vm_data.canonicalize()?;
     let mut identity = String::new();
     for (role, raw_name) in [
         ("storage", crate::storage::STORAGE_DISK_FILENAME),
@@ -3658,7 +3718,10 @@ fn disk_chain_identity(vm_data: &Path) -> Result<String> {
                 .map_err(|error| Error::agent("inspect machine disk", error.to_string()))?;
             let service_only =
                 metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0;
-            let changed = if index == 0 || !service_only {
+            let anothers = source
+                .canonicalize()
+                .is_ok_and(|source| !source.starts_with(&own));
+            let changed = if index == 0 || !(service_only || anothers) {
                 format!("{}.{}", metadata.ctime(), metadata.ctime_nsec())
             } else {
                 "-".to_string()
@@ -3748,6 +3811,282 @@ fn remove_paused_disks_marker(vm_data: &Path) -> Result<()> {
     }
 }
 
+/// Where a paused machine pins the backing layers its artifact references:
+/// beside its data directory, like [`paused_disks_marker`], so its VMM cannot
+/// replace them.
+fn paused_layers_dir(vm_data: &Path) -> Result<PathBuf> {
+    match (vm_data.parent(), vm_data.file_name()) {
+        (Some(parent), Some(name)) => {
+            Ok(parent.join(format!(".{}{PAUSED_LAYERS_SUFFIX}", name.to_string_lossy())))
+        }
+        _ => Err(Error::agent(
+            "pin paused layers",
+            format!("{} has no parent", vm_data.display()),
+        )),
+    }
+}
+
+/// The data directory name a paused-layers directory belongs to, or `None`
+/// when `path` is not one.
+pub(crate) fn paused_layers_owner(path: &Path) -> Option<&str> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix('.')?
+        .strip_suffix(PAUSED_LAYERS_SUFFIX)
+        .filter(|name| !name.is_empty())
+}
+
+/// Drop a machine's pinned layers. A layer stays on disk while its owner or
+/// any other pin still links it.
+pub(crate) fn remove_paused_layers(vm_data: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(paused_layers_dir(vm_data)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A backing layer a pause artifact references rather than carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinnedLayer {
+    /// The artifact path the layer would have been packed under.
+    archive_path: String,
+    /// The pin's file name in the paused-layers directory.
+    pin: String,
+    /// The backing filename to write into a qcow2 layer when it is installed.
+    next_target: Option<String>,
+    dev: u64,
+    ino: u64,
+    size: u64,
+}
+
+/// Backing layers another machine owns that a pause links instead of
+/// packing.
+///
+/// A fork's chain ends in layers its source (a golden) owns. Every pause of
+/// every fork would otherwise compress the same immutable bytes into its own
+/// artifact again. A hard link keeps the layer alive however its owner fares,
+/// at no cost, and the artifact carries only what the machine itself wrote.
+/// Resume reads none of it while the machine's own disks are intact; when they
+/// are not, it installs the layer from its pin. Off-host export needs a
+/// complete artifact, built from the pins on demand.
+#[cfg(unix)]
+struct LayerPins {
+    vm_data: PathBuf,
+    dir: PathBuf,
+    layers: Vec<PinnedLayer>,
+}
+
+#[cfg(unix)]
+impl LayerPins {
+    /// Pins for a pause of the machine whose data directory is `vm_data`,
+    /// dropping any a failed earlier pause left.
+    fn new(vm_data: &Path) -> Result<Self> {
+        remove_paused_layers(vm_data)?;
+        Ok(Self {
+            vm_data: vm_data.canonicalize()?,
+            dir: paused_layers_dir(vm_data)?,
+            layers: Vec::new(),
+        })
+    }
+
+    /// Pin `source` as the layer at `archive_path` when another machine owns
+    /// it. `false` means the caller packs it as before.
+    fn pin(
+        &mut self,
+        source: &Path,
+        archive_path: &str,
+        next_target: Option<&str>,
+    ) -> Result<bool> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        // The machine's own layers are its to change; another's are immutable.
+        match source.canonicalize() {
+            Ok(source) if !source.starts_with(&self.vm_data) => {}
+            _ => return Ok(false),
+        }
+        if self.layers.is_empty() {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&self.dir)
+                .map_err(|error| Error::agent("pin paused layers", error.to_string()))?;
+        }
+        let pin = archive_path.replace('/', "-");
+        if let Err(error) = std::fs::hard_link(source, self.dir.join(&pin)) {
+            tracing::info!(%error, layer = archive_path, "backing layer packed: it cannot be pinned");
+            return Ok(false);
+        }
+        let metadata = std::fs::metadata(self.dir.join(&pin))
+            .map_err(|error| Error::agent("pin paused layers", error.to_string()))?;
+        self.layers.push(PinnedLayer {
+            archive_path: archive_path.to_string(),
+            pin,
+            next_target: next_target.map(str::to_string),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.len(),
+        });
+        Ok(true)
+    }
+
+    /// Durably record the pins for `artifact`, before it becomes the
+    /// machine's resume point.
+    fn commit(&self, artifact: &Path) -> Result<()> {
+        if self.layers.is_empty() {
+            return Ok(());
+        }
+        let mut index = format!("{}\n", artifact.display());
+        for layer in &self.layers {
+            index.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                layer.archive_path,
+                layer.pin,
+                layer.next_target.as_deref().unwrap_or(""),
+                layer.dev,
+                layer.ino,
+                layer.size
+            ));
+        }
+        let path = self.dir.join(PAUSED_LAYERS_INDEX);
+        let partial = path.with_extension(format!("{}", std::process::id()));
+        let mut file = std::fs::File::create(&partial)?;
+        file.write_all(index.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&partial, &path)?;
+        std::fs::File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
+}
+
+/// Without Unix file identities nothing is pinned: pauses pack every layer.
+#[cfg(not(unix))]
+struct LayerPins;
+
+#[cfg(not(unix))]
+impl LayerPins {
+    fn pin(&mut self, _: &Path, _: &str, _: Option<&str>) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+/// The layers pinned for `artifact`, the machine's current pause. None when
+/// it pinned nothing, or the pins belong to another pause.
+fn paused_layers(vm_data: &Path, artifact: &Path) -> Result<Vec<PinnedLayer>> {
+    let dir = paused_layers_dir(vm_data)?;
+    let index = match std::fs::read_to_string(dir.join(PAUSED_LAYERS_INDEX)) {
+        Ok(index) => index,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let invalid = || Error::agent("read paused layers", "malformed pinned-layer index");
+    let mut lines = index.lines();
+    if lines.next().map(Path::new) != Some(artifact) {
+        return Ok(Vec::new());
+    }
+    lines
+        .map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [archive_path, pin, next_target, dev, ino, size] = fields[..] else {
+                return Err(invalid());
+            };
+            if pin.contains('/') || pin.starts_with('.') {
+                return Err(invalid());
+            }
+            Ok(PinnedLayer {
+                archive_path: archive_path.to_string(),
+                pin: pin.to_string(),
+                next_target: (!next_target.is_empty()).then(|| next_target.to_string()),
+                dev: dev.parse().map_err(|_| invalid())?,
+                ino: ino.parse().map_err(|_| invalid())?,
+                size: size.parse().map_err(|_| invalid())?,
+            })
+        })
+        .collect()
+}
+
+/// A paused machine's saved execution as a self-contained artifact, for use
+/// on another host: the artifact itself when its pause pinned nothing, or else
+/// a new one with the pinned layers packed back in, open and already unlinked.
+/// Building it costs what packing those layers at pause would have, paid only
+/// by a pause that leaves the host.
+pub(crate) fn exportable_paused_artifact(vm_data: &Path, artifact: &Path) -> Result<std::fs::File> {
+    let pinned = paused_layers(vm_data, artifact)?;
+    if pinned.is_empty() {
+        return Ok(std::fs::File::open(artifact)?);
+    }
+    let footer = ensure_checkpoint_layout(artifact)?;
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read paused checkpoint", error.to_string()))?;
+    // Beside the pins, so raw layers link instead of copying.
+    let work = tempfile::Builder::new()
+        .prefix(".export-")
+        .tempdir_in(vm_data)?;
+    let staging = work.path().join("assets");
+    smolvm_pack::extract::extract_verified_checkpoint_sidecar(
+        artifact,
+        &staging,
+        &footer,
+        &[],
+        &[],
+    )
+    .map_err(|error| Error::agent("extract paused checkpoint", error.to_string()))?;
+    for layer in &pinned {
+        install_pinned_layer(vm_data, layer, &staging)?;
+    }
+    let output = work.path().join("complete.smolcheckpoint");
+    let collector = AssetCollector::new(staging)
+        .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
+    Packer::new(manifest)
+        .with_asset_collector(collector)
+        .with_direct_artifact_io()
+        .pack_artifact(&output)
+        .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    // The open file outlives the work directory.
+    Ok(std::fs::File::open(&output)?)
+}
+
+/// Put a pinned layer where extraction would have: at its archive path under
+/// `extracted`, with its backing filename rewritten as packing would have.
+#[cfg(unix)]
+fn install_pinned_layer(vm_data: &Path, layer: &PinnedLayer, extracted: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let pin = paused_layers_dir(vm_data)?.join(&layer.pin);
+    let metadata = std::fs::symlink_metadata(&pin)
+        .map_err(|error| Error::agent("install pinned layer", error.to_string()))?;
+    if !metadata.is_file()
+        || (metadata.dev(), metadata.ino(), metadata.len()) != (layer.dev, layer.ino, layer.size)
+    {
+        return Err(Error::agent(
+            "install pinned layer",
+            format!("{} is not the layer that was pinned", pin.display()),
+        ));
+    }
+    let destination = extracted.join(&layer.archive_path);
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match &layer.next_target {
+        Some(target) => {
+            crate::disk_utils::clone_or_copy_file(&pin, &destination)?;
+            rewrite_qcow2_backing(&destination, target)?;
+        }
+        // A raw layer has nothing to rewrite, and installs as a link.
+        None => {
+            if std::fs::hard_link(&pin, &destination).is_err() {
+                crate::disk_utils::clone_or_copy_file(&pin, &destination)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_pinned_layer(_vm_data: &Path, _layer: &PinnedLayer, _extracted: &Path) -> Result<()> {
+    Err(Error::agent(
+        "install pinned layer",
+        "pinned layers are Unix-only",
+    ))
+}
+
 /// Whether a paused machine's own disk chains are still the ones `artifact`
 /// captured: recorded when it stopped, unchanged since, and shaped as the
 /// checkpoint's chains are.
@@ -3826,9 +4165,13 @@ fn paused_disks_intact(_vm_data: &Path, _artifact: &Path, _disks: &[CheckpointDi
 /// and staged by [`DeferredBackings`] after the source resumes, so the pause
 /// does not grow with the data a restored machine inherited from its
 /// checkpoint.
+///
+/// Backing layers that `pins` takes are pinned instead of staged: their
+/// manifest entries stay, but their bytes are not packed.
 fn stage_disk_chains(
     vm_data: &Path,
     checkpoint_dir: &Path,
+    mut pins: Option<&mut LayerPins>,
 ) -> Result<(Vec<CheckpointDisk>, DeferredBackings)> {
     let mut disks = Vec::new();
     let mut deferred = DeferredBackings::default();
@@ -3876,7 +4219,15 @@ fn stage_disk_chains(
                 None
             };
             let next_target = next.as_ref().map(|(_, _, target)| target.clone());
-            let method = if cfg!(target_os = "linux") && index > 0 && format == "qcow2" {
+            let pinned = match pins.as_deref_mut() {
+                Some(pins) if index > 0 => {
+                    pins.pin(&source, &artifact_path, next_target.as_deref())?
+                }
+                _ => false,
+            };
+            let method = if pinned {
+                "pinned"
+            } else if cfg!(target_os = "linux") && index > 0 && format == "qcow2" {
                 let file = std::fs::File::open(&source)
                     .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
                 deferred.0.push(DeferredBacking {
@@ -5094,12 +5445,23 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
     if let Some(asset) = &checkpoint.credential_ca {
         required.push(PathBuf::from(&asset.path));
     }
+    // Layers the pause pinned rather than packed come from their pins.
+    let pinned = if keep_disks {
+        Vec::new()
+    } else {
+        paused_layers(&vm_data, artifact)?
+    };
     if !keep_disks {
         required.extend(
             checkpoint
                 .disks
                 .iter()
                 .flat_map(|disk| disk.files.iter())
+                .filter(|file| {
+                    !pinned
+                        .iter()
+                        .any(|layer| layer.archive_path == file.asset.path)
+                })
                 .map(|file| PathBuf::from(&file.asset.path)),
         );
     }
@@ -5116,14 +5478,18 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
             &required,
         )
         .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
+        for layer in &pinned {
+            install_pinned_layer(&vm_data, layer, staged.path())?;
+        }
         tracing::info!(machine = %record.name, phase = "extract", elapsed_ms = extract_started.elapsed().as_millis(), "paused resume phase completed");
         clear_stale_restore_state(&vm_data)?;
         install_with(staged.path(), &vm_data, checkpoint, keep_disks, None)
     };
     // Stage on tmpfs when there is room, so the RAM image handed to the VMM
     // is never written to disk. Its RAM is freed once the VMM has read it.
+    // Pinned layers are not in the artifact's size, and link only on disk.
     #[cfg(target_os = "linux")]
-    if let Some(root) = restore_tmpfs_root() {
+    if let Some(root) = restore_tmpfs_root().filter(|_| pinned.is_empty()) {
         let needed = footer
             .assets_size
             .saturating_mul(4)
@@ -5231,6 +5597,32 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_declined_deferred_save_falls_back_to_a_synchronous_one() {
+        // libkrun's reply for a fork clone, whose RAM has no file generation.
+        assert!(declined_deferred_save(
+            "ERR ENOTSUP deferred durable save requires file-backed guest RAM\n"
+        ));
+        assert!(declined_deferred_save("ERR EINVAL unknown command\n"));
+        assert!(!declined_deferred_save("OK prepared\n"));
+        assert!(!declined_deferred_save("ERR EIO save failed\n"));
+    }
+
+    #[test]
+    fn a_node_policy_recorded_by_a_server_is_what_other_processes_use() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(RestoreCache::node_policy_in(root.path()), None);
+        let server = RestoreCache {
+            entries: 32,
+            max_bytes: 256 * 1024 * 1024 * 1024,
+        };
+        server.persist_in(root.path()).unwrap();
+        assert_eq!(RestoreCache::node_policy_in(root.path()), Some(server));
+        // A damaged record falls back to the default rather than failing.
+        std::fs::write(root.path().join(NODE_RESTORE_CACHE_POLICY), b"{").unwrap();
+        assert_eq!(RestoreCache::node_policy_in(root.path()), None);
+    }
+
     use super::*;
 
     /// `/proc/cpuinfo` of an M4 Max guest booted with pointer authentication off.
@@ -6472,27 +6864,31 @@ mod tests {
         );
     }
 
+    /// Create a 64 MiB qcow2 image at `path` over `backing`.
+    #[cfg(target_os = "linux")]
+    fn create_qcow2(path: &Path, backing: &str, format: &str) {
+        use imago::FormatCreateBuilder;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        let file = ImagoFile::try_from(file).unwrap();
+        let builder = Qcow2::<ImagoFile>::create_builder(file)
+            .size(64 * 1024 * 1024)
+            .backing(backing.to_string(), format.to_string());
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(builder.create())
+            .unwrap();
+    }
+
     /// A storage chain like a restored machine's: a writable qcow2 top over
     /// the checkpoint's former top over its raw base, and a raw overlay.
     #[cfg(target_os = "linux")]
     fn restored_disk_chain(vm: &Path) -> Vec<u8> {
-        use imago::FormatCreateBuilder;
-        let create = |path: &Path, backing: &str, format: &str| {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .unwrap();
-            let file = ImagoFile::try_from(file).unwrap();
-            let builder = Qcow2::<ImagoFile>::create_builder(file)
-                .size(64 * 1024 * 1024)
-                .backing(backing.to_string(), format.to_string());
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(builder.create())
-                .unwrap();
-        };
+        let create = create_qcow2;
         std::fs::create_dir_all(vm).unwrap();
         let base = vm.join(".smolcheckpoint-storage-1.raw");
         let file = std::fs::File::create(&base).unwrap();
@@ -6520,7 +6916,7 @@ mod tests {
         let live = restored_disk_chain(&vm);
         let layer = vm.join(".smolcheckpoint-storage-layer2.qcow2");
         let staging = dir.path().join("staging");
-        let (disks, deferred) = stage_disk_chains(&vm, &staging.join("checkpoint")).unwrap();
+        let (disks, deferred) = stage_disk_chains(&vm, &staging.join("checkpoint"), None).unwrap();
         let storage = &disks[0].files;
         assert_eq!(
             storage
@@ -6568,6 +6964,125 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_pause_pins_the_layers_another_machine_owns_instead_of_packing_them() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A golden's chain, and a fork whose own top is backed by it.
+        let golden = dir.path().join("golden");
+        let live = restored_disk_chain(&golden);
+        let fork = dir.path().join("fork");
+        std::fs::create_dir(&fork).unwrap();
+        std::fs::write(fork.join(crate::storage::OVERLAY_DISK_FILENAME), b"overlay").unwrap();
+        create_qcow2(
+            &fork.join("storage.qcow2"),
+            golden.join("storage.qcow2").to_str().unwrap(),
+            "qcow2",
+        );
+
+        // Owned by the golden's VMM, not the service alone.
+        for entry in std::fs::read_dir(&golden).unwrap() {
+            use std::os::unix::fs::PermissionsExt;
+            let path = entry.unwrap().path();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        }
+        let captured = disk_chain_identity(&fork).unwrap();
+
+        let checkpoint = dir.path().join("staging/checkpoint");
+        let mut pins = LayerPins::new(&fork).unwrap();
+        let (disks, deferred) = stage_disk_chains(&fork, &checkpoint, Some(&mut pins)).unwrap();
+        // Pinning, by this pause or another fork's, leaves the fork's disks as
+        // captured, so resume still keeps them.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::hard_link(golden.join("storage.qcow2"), dir.path().join("other-pin")).unwrap();
+        assert_eq!(disk_chain_identity(&fork).unwrap(), captured);
+        let storage = &disks[0].files;
+        assert_eq!(storage.len(), 4, "the manifest still lists the whole chain");
+        assert!(deferred.0.is_empty(), "a pinned layer was also deferred");
+        // The fork's own top and its overlay are staged; the golden's are not.
+        assert!(checkpoint.join("disks/storage/0").is_file());
+        assert!(checkpoint.join("disks/overlay/0").is_file());
+        for index in 1..4 {
+            assert!(!checkpoint.join(format!("disks/storage/{index}")).exists());
+        }
+        assert_eq!(
+            pins.layers
+                .iter()
+                .map(|layer| layer.archive_path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "checkpoint/disks/storage/1",
+                "checkpoint/disks/storage/2",
+                "checkpoint/disks/storage/3"
+            ]
+        );
+        let artifact = fork.join("pause-1.smolcheckpoint");
+        pins.commit(&artifact).unwrap();
+
+        // The golden can go: its pinned layers stay.
+        std::fs::remove_dir_all(&golden).unwrap();
+        let layers = paused_layers(&fork, &artifact).unwrap();
+        assert_eq!(layers, pins.layers);
+        assert!(paused_layers(&fork, &fork.join("pause-2.smolcheckpoint"))
+            .unwrap()
+            .is_empty());
+
+        // Installing one puts it where extraction would have, patched as
+        // packing would have.
+        let extracted = dir.path().join("extracted");
+        for layer in &layers {
+            install_pinned_layer(&fork, layer, &extracted).unwrap();
+        }
+        let installed = extracted.join("checkpoint/disks/storage/2");
+        assert_eq!(
+            inspect_qcow2(&installed).unwrap(),
+            (Some(storage[3].target.clone()), Some("raw".to_string()))
+        );
+        let expected = dir.path().join("expected");
+        std::fs::write(&expected, &live).unwrap();
+        rewrite_qcow2_backing(&expected, &storage[3].target).unwrap();
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            std::fs::read(&expected).unwrap()
+        );
+        // A raw base is installed as the pinned inode itself.
+        let pin = paused_layers_dir(&fork).unwrap().join(&layers[2].pin);
+        assert_eq!(
+            std::fs::metadata(extracted.join("checkpoint/disks/storage/3"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(&pin).unwrap().ino()
+        );
+
+        // A pin that is not the recorded layer is refused.
+        std::fs::remove_file(&pin).unwrap();
+        std::fs::write(&pin, b"other").unwrap();
+        assert!(install_pinned_layer(&fork, &layers[2], &dir.path().join("again")).is_err());
+
+        remove_paused_layers(&fork).unwrap();
+        assert!(!paused_layers_dir(&fork).unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pause_does_not_pin_its_own_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = dir.path().join("vm");
+        std::fs::create_dir(&vm).unwrap();
+        std::fs::write(vm.join("own.raw"), b"own").unwrap();
+        let mut pins = LayerPins::new(&vm).unwrap();
+        assert!(!pins
+            .pin(&vm.join("own.raw"), "checkpoint/disks/storage/1", None)
+            .unwrap());
+        pins.commit(&vm.join("pause-1.smolcheckpoint")).unwrap();
+        assert!(!paused_layers_dir(&vm).unwrap().exists());
+        assert_eq!(
+            paused_layers_owner(&paused_layers_dir(&vm).unwrap()),
+            Some("vm")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn kept_staging_gets_private_rebased_copies_of_backing_layers() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
@@ -6575,7 +7090,7 @@ mod tests {
         let live = restored_disk_chain(&vm);
         let layer = vm.join(".smolcheckpoint-storage-layer2.qcow2");
         let checkpoint = dir.path().join("staging/checkpoint");
-        let (disks, deferred) = stage_disk_chains(&vm, &checkpoint).unwrap();
+        let (disks, deferred) = stage_disk_chains(&vm, &checkpoint, None).unwrap();
         // The source may be replaced after it resumes; the held file is not.
         std::fs::rename(&layer, vm.join("rotated")).unwrap();
         deferred.stage_copies().unwrap();

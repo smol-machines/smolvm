@@ -2231,6 +2231,50 @@ fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
 ///
 /// Runs on a worker thread, so it touches only this layer's own directory and
 /// reports nothing: progress belongs to the caller's thread.
+/// [`fetch_and_extract_layer`], retried on a transient network failure like the
+/// manifest and config fetches in [`run_crane`]. One dropped connection while
+/// downloading any layer otherwise fails the whole pull. A retry is safe: each
+/// attempt starts by removing what an earlier one left in `layer_dir`.
+#[allow(clippy::too_many_arguments)]
+fn fetch_and_extract_layer_with_retry(
+    image: &str,
+    layer_digest: &str,
+    layer_id: &str,
+    layer_dir: &Path,
+    oci_platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    index: usize,
+    total_layers: usize,
+) -> Result<u64> {
+    use crate::retry::{
+        is_permanent_error, is_transient_network_error, retry_with_backoff, RetryConfig,
+    };
+    retry_with_backoff(
+        RetryConfig::for_network(),
+        &format!("fetch layer {layer_id}"),
+        || {
+            fetch_and_extract_layer(
+                image,
+                layer_digest,
+                layer_id,
+                layer_dir,
+                oci_platform,
+                auth,
+                proxy,
+                no_proxy,
+                index,
+                total_layers,
+            )
+        },
+        |e| {
+            let error_msg = e.to_string();
+            !is_permanent_error(&error_msg) && is_transient_network_error(&error_msg)
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fetch_and_extract_layer(
     image: &str,
@@ -2552,7 +2596,7 @@ where
                     else {
                         break;
                     };
-                    let outcome = fetch_and_extract_layer(
+                    let outcome = fetch_and_extract_layer_with_retry(
                         image,
                         layer_digest,
                         &layer_id,

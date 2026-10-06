@@ -961,6 +961,24 @@ fn config_differences(
     differences
 }
 
+/// How much of an unreachable VM's console to keep in the node log.
+const CONSOLE_TAIL_BYTES: usize = 4096;
+
+/// The last `max` bytes of `console`, starting at a line boundary.
+fn console_tail(console: &str, max: usize) -> String {
+    if console.len() <= max {
+        return console.to_string();
+    }
+    let mut start = console.len() - max;
+    while !console.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &console[start..];
+    tail.split_once('\n')
+        .map_or(tail, |(_, rest)| rest)
+        .to_string()
+}
+
 impl AgentManager {
     /// Create a new agent manager with explicit paths (low-level).
     ///
@@ -1836,7 +1854,13 @@ impl AgentManager {
                     (true, _) => "running config unknown".to_string(),
                 }
             };
-            tracing::warn!(%reason, "restarting agent VM");
+            // An unreachable VM's own console is the only record of why it
+            // stopped answering, and the relaunch below starts a new one.
+            let console_tail = (!reachable)
+                .then(|| self.read_console_log())
+                .flatten()
+                .map(|console| console_tail(&console, CONSOLE_TAIL_BYTES));
+            tracing::warn!(%reason, console_tail = console_tail.as_deref().unwrap_or(""), "restarting agent VM");
             self.stop()?;
         } else {
             // try_connect_existing failed but state may still be Running (crashed VM).
@@ -2978,7 +3002,13 @@ impl AgentManager {
                     (true, _) => "running config unknown".to_string(),
                 }
             };
-            tracing::warn!(%reason, "restarting agent VM");
+            // An unreachable VM's own console is the only record of why it
+            // stopped answering, and the relaunch below starts a new one.
+            let console_tail = (!reachable)
+                .then(|| self.read_console_log())
+                .flatten()
+                .map(|console| console_tail(&console, CONSOLE_TAIL_BYTES));
+            tracing::warn!(%reason, console_tail = console_tail.as_deref().unwrap_or(""), "restarting agent VM");
             self.stop()?;
         } else {
             self.reset_stale_running_state();
@@ -3843,6 +3873,13 @@ fn boot_failure_reason(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_tail_keeps_whole_last_lines() {
+        assert_eq!(super::console_tail("a\nb\n", 100), "a\nb\n");
+        let console = format!("{}\nlast line\n", "x".repeat(50));
+        assert_eq!(super::console_tail(&console, 15), "last line\n");
+    }
+
     #[test]
     fn intercepted_machine_cannot_relaunch_without_an_interceptor() {
         let temp = tempfile::tempdir().unwrap();

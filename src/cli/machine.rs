@@ -346,7 +346,7 @@ pub enum MachineCmd {
     /// Run a container image in an ephemeral machine
     Run(RunCmd),
 
-    /// Run a command directly in the VM (not in a container)
+    /// Run a command in a machine (inside its image's container, if it has one)
     Exec(ExecCmd),
 
     /// Create a new named machine configuration
@@ -410,7 +410,7 @@ pub enum MachineCmd {
     /// Remove unused images and layers to free disk space
     Prune(PruneCmd),
 
-    /// Open an interactive shell in a machine (starts it if stopped)
+    /// Open an interactive shell in a running machine
     #[command(visible_alias = "sh")]
     Shell(ShellCmd),
 
@@ -3427,10 +3427,10 @@ fn persistent_overlay_owner_for_record(
     )
 }
 
-/// Execute a command directly in the VM's Alpine rootfs.
+/// Execute a command in a running machine.
 ///
-/// This runs commands at the VM level, not inside a container. Useful for
-/// debugging, inspecting the VM environment, or running VM-level operations.
+/// On a machine created from an image the command runs inside that image's
+/// container; on a bare machine it runs in the VM's Alpine rootfs.
 ///
 /// Examples:
 ///   smolvm machine exec -- uname -a
@@ -3733,7 +3733,7 @@ impl ExecEventPrinter {
 
 /// Open an interactive shell in a machine.
 ///
-/// Shortcut for `machine exec -it -- /bin/sh`. Starts the machine if stopped.
+/// Shortcut for `machine exec -it -- /bin/sh`. The machine must be running.
 ///
 /// Examples:
 ///   smolvm machine shell
@@ -3973,7 +3973,7 @@ pub struct CreateCmd {
     #[arg(long = "mount-socket", value_name = "HOST_PATH:GUEST_PATH")]
     pub mount_socket: Vec<String>,
 
-    /// Run command on every VM start (can be used multiple times)
+    /// Run command once, on the machine's first start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
 
@@ -5397,7 +5397,7 @@ impl StopCmd {
 
 /// Delete a machine configuration.
 ///
-/// Removes the VM configuration. Does not delete container data.
+/// Removes the VM configuration and its data directory, disks included.
 #[derive(Args, Debug)]
 pub struct DeleteCmd {
     /// Machine to delete

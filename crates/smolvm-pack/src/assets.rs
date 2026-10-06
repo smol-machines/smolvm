@@ -243,10 +243,18 @@ fn digest_to_filename(digest: &str) -> Result<String> {
 /// Level 19 was ~100x slower for only ~10% better compression.
 pub const ZSTD_LEVEL: i32 = 3;
 
-fn compression_permit(cache: &Path) -> Result<File> {
+/// zstd workers one asset compressor uses at most.
+const MAX_COMPRESSION_WORKERS: usize = 4;
+
+/// How long the waiting compressor sleeps between looks for a free slot.
+const COMPRESSION_SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Admission to one of `slots` asset compressors per cache root, shared with
+/// every process using that cache. Released when the file is closed.
+fn compression_permit(cache: &Path, slots: usize) -> Result<File> {
     fs::create_dir_all(cache)?;
-    // Never unlink this file: API exports run in separate CLI processes and
-    // must lock the same inode. Closing the handle releases admission on errors
+    // Never unlink these files: API exports run in separate CLI processes and
+    // must lock the same inodes. Closing the handle releases admission on errors
     // and process exit as well as success.
     let mut options = fs::OpenOptions::new();
     options.create(true).write(true).truncate(false);
@@ -255,9 +263,36 @@ fn compression_permit(cache: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(cache.join("asset-compression.lock"))?;
-    crate::extract::lock_file_exclusive(&file)?;
-    Ok(file)
+    // The first slot keeps the single lock's name, so a process of an older
+    // release still shares admission with this one.
+    let slot_path = |slot: usize| match slot {
+        0 => cache.join("asset-compression.lock"),
+        n => cache.join(format!("asset-compression.{n}.lock")),
+    };
+    let try_slots = || -> Result<Option<File>> {
+        for slot in 0..slots.max(1) {
+            let file = options.open(slot_path(slot))?;
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(file)),
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+        Ok(None)
+    };
+    if let Some(file) = try_slots()? {
+        return Ok(file);
+    }
+    // Every slot is taken. Waiters queue on this lock in the kernel, and only
+    // its holder looks for the next slot to come free.
+    let waiters = options.open(cache.join("asset-compression.wait.lock"))?;
+    crate::extract::lock_file_exclusive(&waiters)?;
+    loop {
+        if let Some(file) = try_slots()? {
+            return Ok(file);
+        }
+        std::thread::sleep(COMPRESSION_SLOT_POLL);
+    }
 }
 
 fn compression_workers(parallelism: usize) -> u32 {
@@ -265,8 +300,14 @@ fn compression_workers(parallelism: usize) -> u32 {
     if parallelism <= 1 {
         0
     } else {
-        parallelism.min(4) as u32
+        parallelism.min(MAX_COMPRESSION_WORKERS) as u32
     }
+}
+
+/// How many asset compressors may run at once: as many as keep all their
+/// workers within the host's CPUs, and always one.
+fn compression_slots(parallelism: usize) -> usize {
+    (parallelism / MAX_COMPRESSION_WORKERS).max(1)
 }
 
 /// Where an agent rootfs tar built from `rootfs_dir` as it is now is kept, so
@@ -1153,22 +1194,24 @@ impl AssetCollector {
         exclude_libs: bool,
         stream: Option<&mut crate::checkpoint_stream::CheckpointStream<'_>>,
     ) -> Result<W> {
-        // One asset compressor per cache root, including API subprocesses.
+        // A bounded number of asset compressors per cache root, including API
+        // subprocesses, so their workers together stay within the host's CPUs.
         // The permit also covers finish(), which drains outstanding zstd jobs.
+        let parallelism =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         let cache = dirs::cache_dir()
             .ok_or_else(|| PackError::Compression("cannot locate compression cache".into()))?
             .join("smolvm");
-        let _permit = compression_permit(&cache).map_err(|error| {
-            PackError::Compression(format!(
-                "acquire compression admission at {}: {error}",
-                cache.display()
-            ))
-        })?;
+        let _permit =
+            compression_permit(&cache, compression_slots(parallelism)).map_err(|error| {
+                PackError::Compression(format!(
+                    "acquire compression admission at {}: {error}",
+                    cache.display()
+                ))
+            })?;
         let mut encoder = zstd::stream::Encoder::new(output()?, ZSTD_LEVEL)
             .map_err(|e| PackError::Compression(e.to_string()))?;
-        let workers = compression_workers(
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        );
+        let workers = compression_workers(parallelism);
         if workers > 0 {
             encoder
                 .multithread(workers)
@@ -2159,6 +2202,42 @@ mod tests {
     }
 
     #[test]
+    fn compression_slots_keep_workers_within_the_host() {
+        assert_eq!(compression_slots(0), 1);
+        assert_eq!(compression_slots(1), 1);
+        assert_eq!(compression_slots(4), 1);
+        assert_eq!(compression_slots(7), 1);
+        assert_eq!(compression_slots(8), 2);
+        assert_eq!(compression_slots(12), 3);
+        assert_eq!(compression_slots(64), 16);
+    }
+
+    #[test]
+    fn compression_admission_runs_up_to_its_slots_at_once() {
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        // Each permit is its own open file, as in separate threads or processes.
+        let mut held: Vec<_> = (0..3)
+            .map(|_| compression_permit(&root, 3).unwrap())
+            .collect();
+        let (admitted, wait) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let permit = compression_permit(&root, 3).unwrap();
+            admitted.send(()).unwrap();
+            drop(permit);
+        });
+        assert!(wait.recv_timeout(Duration::from_millis(150)).is_err());
+        let released = Instant::now();
+        drop(held.remove(1));
+        wait.recv_timeout(Duration::from_secs(10))
+            .expect("waiter stayed blocked after a slot was released");
+        assert!(released.elapsed() < Duration::from_secs(1));
+        waiter.join().unwrap();
+    }
+
+    #[test]
     #[ignore = "subprocess helper for compression_admission_is_cross_process"]
     fn compression_admission_child() {
         let Some(root) = std::env::var_os("SMOLVM_TEST_COMPRESSION_ADMISSION") else {
@@ -2166,7 +2245,7 @@ mod tests {
         };
         let root = PathBuf::from(root);
         fs::write(root.join("ready"), b"ready").unwrap();
-        let _permit = compression_permit(&root).unwrap();
+        let _permit = compression_permit(&root, 1).unwrap();
         fs::write(root.join("admitted"), b"admitted").unwrap();
     }
 
@@ -2183,7 +2262,7 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let permit = compression_permit(temp.path()).unwrap();
+        let permit = compression_permit(temp.path(), 1).unwrap();
         let mut child = Child(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -2223,7 +2302,7 @@ mod tests {
         // The inode remains available for later processes; it is not a stale
         // ownership marker and does not need cleanup after the owner exits.
         assert!(temp.path().join("asset-compression.lock").exists());
-        drop(compression_permit(temp.path()).unwrap());
+        drop(compression_permit(temp.path(), 1).unwrap());
     }
 
     #[test]

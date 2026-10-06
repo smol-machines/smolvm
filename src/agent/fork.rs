@@ -271,6 +271,13 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
             }
             continue;
         }
+        // So are the layers its pause pinned.
+        if let Some(dir) = crate::portable_checkpoint::paused_layers_owner(&path) {
+            if !vms_dir.join(dir).is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            continue;
+        }
         let Some(source) = fork_source_lock_owner(&path) else {
             continue;
         };
