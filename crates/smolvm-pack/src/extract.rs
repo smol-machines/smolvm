@@ -6543,7 +6543,7 @@ mod tests {
             .unwrap();
             assert_eq!(stored, 4096);
             archive_bytes.extend_from_slice(&data);
-            archive_bytes.extend(std::iter::repeat(0u8).take(1024 * 2));
+            archive_bytes.extend(std::iter::repeat_n(0u8, 1024 * 2));
         }
         let mut archive = tar::Archive::new(archive_bytes.as_slice());
         let limits = SafeUnpackLimits {
