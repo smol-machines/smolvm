@@ -494,6 +494,7 @@ fn run_network_stack(
                 connection.from_smoltcp,
                 connection.to_smoltcp,
                 relay_wake.clone(),
+                connection.proxy_wake,
                 connection.exit_state,
             )
             .is_ok()
