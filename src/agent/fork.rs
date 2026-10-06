@@ -2281,6 +2281,9 @@ pub(crate) fn prepare_forks_reusing(
         .ok_or_else(|| Error::vm_not_found(golden))?;
     #[cfg(target_os = "linux")]
     let mut golden_rec = golden_rec;
+    for spec in specs {
+        check_pinned_ports_keep_network_backend(golden, &golden_rec, spec.pinned_ports)?;
+    }
     if !golden_rec.staged_mounts.is_empty() {
         return Err(Error::config(
             "fork",
@@ -3935,9 +3938,76 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Refuses pinned ports that would launch a clone on a different network
+/// backend than its golden's. A clone resumes the golden's running guest,
+/// whose network stack was set up for the golden's backend at boot, so a
+/// clone on another backend has no working network at all: no route out, and
+/// inbound connections accepted on the host but never answered. Publishing a
+/// port moves a machine from TSI (or no network) to virtio-net, so only a
+/// golden that already runs on virtio-net, as one with a published port does,
+/// can have its clones pin ports.
+fn check_pinned_ports_keep_network_backend(
+    golden: &str,
+    golden_rec: &VmRecord,
+    pinned_ports: &[(u16, u16)],
+) -> Result<()> {
+    use crate::network::EffectiveNetworkBackend;
+    if pinned_ports.is_empty() {
+        return Ok(());
+    }
+    let golden_backend = golden_rec.launch_network_plan().backend;
+    let mut clone_rec = golden_rec.clone();
+    clone_rec.ports = pinned_ports.to_vec();
+    if clone_rec.launch_network_plan().backend == golden_backend {
+        return Ok(());
+    }
+    let runs = match golden_backend {
+        EffectiveNetworkBackend::None => "has no network",
+        EffectiveNetworkBackend::Tsi => "runs on TSI networking because it publishes no ports",
+        EffectiveNetworkBackend::VirtioNet => "runs on virtio-net networking",
+    };
+    Err(Error::config(
+        "fork",
+        format!(
+            "cannot branch '{golden}' with --port: it {runs}, and a branch keeps the network its source booted with, so the branch could not publish a port and would have no network; publish a port on '{golden}' itself (machine create -p HOST:GUEST) to branch it with ports, or branch without --port"
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_ports_need_a_golden_already_on_the_port_capable_backend() {
+        let with_port = VmRecord::new("web".into(), 1, 512, vec![], vec![(18_080, 80)], true);
+        assert!(
+            check_pinned_ports_keep_network_backend("web", &with_port, &[(18_081, 80)]).is_ok()
+        );
+        // A guest port the golden does not publish is fine too: same backend.
+        assert!(
+            check_pinned_ports_keep_network_backend("web", &with_port, &[(18_082, 8080)]).is_ok()
+        );
+
+        let outbound_only = VmRecord::new("tsi".into(), 1, 512, vec![], vec![], true);
+        let err = check_pinned_ports_keep_network_backend("tsi", &outbound_only, &[(18_083, 80)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("runs on TSI networking because it publishes no ports"),
+            "{err}"
+        );
+        assert!(err.contains("machine create -p HOST:GUEST"), "{err}");
+
+        let offline = VmRecord::new("offline".into(), 1, 512, vec![], vec![], false);
+        let err = check_pinned_ports_keep_network_backend("offline", &offline, &[(18_084, 80)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no network"), "{err}");
+
+        // Without pinned ports a branch keeps (and remaps) its golden's own forwards.
+        assert!(check_pinned_ports_keep_network_backend("tsi", &outbound_only, &[]).is_ok());
+    }
 
     #[test]
     fn a_stopped_machines_port_is_still_reserved_against_clones() {
