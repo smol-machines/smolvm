@@ -431,6 +431,8 @@ impl Writer {
             known: &KnownFiles,
             heads: &HashMap<String, Vec<u8>>,
         ) -> io::Result<()> {
+            #[cfg(not(unix))]
+            let _ = known;
             let mut entries = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
             entries.sort_by_key(|e| e.file_name());
             for entry in entries {

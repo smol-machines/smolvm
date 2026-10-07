@@ -138,6 +138,7 @@ fn held_checkpoint(store: &Path, id: &str) -> Result<Option<PathBuf>> {
 /// Read-only files of the materialized tree of checkpoint `parent`, by inode,
 /// so a capture of a machine restored from it skips re-reading its shared
 /// disk bases. Empty when this node has no untouched tree of it.
+#[cfg(unix)]
 pub fn known_files_for(store: &Path, parent: &str) -> store::KnownFiles {
     let tree = std::fs::read_to_string(materialized_record(store, parent))
         .ok()
@@ -147,6 +148,13 @@ pub fn known_files_for(store: &Path, parent: &str) -> store::KnownFiles {
         return store::KnownFiles::default();
     };
     store::known_files(&stored, &tree).unwrap_or_default()
+}
+
+/// Windows captures still reuse cached chunks; inode-based disk reuse needs
+/// Unix file identities and is unavailable there.
+#[cfg(not(unix))]
+pub fn known_files_for(_store: &Path, _parent: &str) -> store::KnownFiles {
+    store::KnownFiles::default()
 }
 
 /// How a chunked checkpoint file became available on this node.

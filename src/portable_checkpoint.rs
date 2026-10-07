@@ -1557,12 +1557,6 @@ pub(crate) fn capture_tmpfs_grant() -> Option<PathBuf> {
     })
 }
 
-/// No tmpfs capture grant off Linux.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn capture_tmpfs_grant() -> Option<PathBuf> {
-    None
-}
-
 /// No tmpfs capture root off Linux.
 #[cfg(not(target_os = "linux"))]
 pub fn capture_tmpfs_root() -> Option<PathBuf> {
@@ -4351,7 +4345,7 @@ fn paused_disks_intact(_vm_data: &Path, _artifact: &Path, _disks: &[CheckpointDi
 ///
 /// Backing layers that `pins` takes are pinned instead of staged: their
 /// manifest entries stay, but their bytes are not packed.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn stage_disk_chains(
     vm_data: &Path,
     checkpoint_dir: &Path,

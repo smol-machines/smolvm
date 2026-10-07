@@ -919,9 +919,6 @@ fn build_seccomp_program(
         libc::SYS_read, libc::SYS_write, libc::SYS_pread64, libc::SYS_pwrite64,
         libc::SYS_preadv, libc::SYS_pwritev, libc::SYS_openat, libc::SYS_close,
         libc::SYS_close_range, libc::SYS_lseek, libc::SYS_fsync, libc::SYS_fallocate,
-        // A retained checkpoint generation streams file-backed RAM into its
-        // control socket with sendfile after the source resumes.
-        libc::SYS_sendfile,
         libc::SYS_ftruncate, libc::SYS_fstat, libc::SYS_newfstatat, libc::SYS_statx,
         libc::SYS_fstatfs, libc::SYS_statfs, libc::SYS_fcntl, libc::SYS_flock,
         libc::SYS_dup, libc::SYS_dup3, libc::SYS_getdents64,
@@ -1030,6 +1027,13 @@ fn build_seccomp_program(
         // isolation the only processes it could otherwise reach are its own VM's.
         libc::SYS_process_vm_readv,
     ];
+
+    // A retained checkpoint streams file-backed RAM into its control socket.
+    // libc omits the aarch64 number; Linux asm-generic defines it as 71.
+    #[cfg(target_arch = "aarch64")]
+    allowed.push(71);
+    #[cfg(not(target_arch = "aarch64"))]
+    allowed.push(libc::SYS_sendfile);
 
     // An async block ring is created with R_DISABLED, fixed-file-only and
     // readv/writev-only restrictions before this filter is installed.  The
