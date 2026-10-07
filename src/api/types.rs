@@ -570,6 +570,9 @@ pub struct HealthResponse {
     /// Server uptime in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_seconds: Option<u64>,
+    /// Whether this server runs nested-virtualization machines (started with
+    /// `--allow-nested-virt`), so a fleet scheduler can place them here.
+    pub nested_virt: bool,
 }
 
 /// Machine counts for health response.

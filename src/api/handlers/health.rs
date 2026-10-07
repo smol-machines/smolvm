@@ -48,6 +48,7 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> 
         version: crate::VERSION,
         machines,
         uptime_seconds: uptime,
+        nested_virt: state.nested_virt_allowed(),
     })
 }
 
