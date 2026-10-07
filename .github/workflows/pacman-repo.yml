@@ -32,9 +32,13 @@ on:
 permissions:
   contents: read
 
+# Each run publishes the repository for its own release and replaces whatever
+# was published before, so the newest run is the one that matters: it replaces
+# an older one instead of queueing behind it. Queueing let one deploy left waiting on approval (v1.21.0) hold the group
+# for a week while every later release's packages were cancelled unpublished.
 concurrency:
   group: package-pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build-pacman:
