@@ -739,7 +739,7 @@ pub async fn stream_logs(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     // get_machine only knows machines in the running map. Distinguish a real
     // typo (absent from the DB too) from a machine that exists but was never
     // started (present in the DB, no console log yet) so clients don't read a
@@ -824,18 +824,61 @@ pub async fn stream_logs(
         (Vec::new(), 0)
     };
 
-    // Create the SSE stream
-    let stream = async_stream::stream! {
+    let stream = log_event_stream(
+        log_path,
+        follow,
+        tail,
+        start_pos,
+        initial_lines,
+        json_only,
+        follow_permit,
+    );
+
+    use axum::response::IntoResponse as _;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+/// The console log at `log_path` as an SSE body: the `tail` lines already read
+/// (`initial_lines`, ending at `start_pos`), then the file from there, to its
+/// end or, with `follow`, as it grows.
+fn log_event_stream(
+    log_path: PathBuf,
+    follow: bool,
+    tail: Option<usize>,
+    start_pos: u64,
+    initial_lines: Vec<String>,
+    json_only: bool,
+    follow_permit: Option<tokio::sync::SemaphorePermit<'static>>,
+) -> impl tokio_stream::Stream<Item = Result<axum::body::Bytes, Infallible>> {
+    // One SSE event per line, as before, but many lines per write. Each write
+    // reaches an HTTP/2 client as its own DATA frame, and a client that receives
+    // too many small frames faster than it reads them (h2 counts them per
+    // connection) closes the whole connection, failing everything else on it.
+    async_stream::stream! {
         // Hold the follow permit for the stream's lifetime so it's released
         // when the client disconnects or the stream ends.
         let _permit = follow_permit;
+        let mut batch = LogEvents::default();
 
         // Emit initial tail lines first
         for line in initial_lines {
             if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
                 continue; // skip non-JSON lines in json mode
             }
-            yield Ok(Event::default().data(line));
+            batch.push(&line);
+            if batch.is_full() {
+                yield Ok::<_, Infallible>(batch.take());
+            }
+        }
+        if !batch.is_empty() {
+            yield Ok(batch.take());
         }
 
         if tail.is_some() && !follow {
@@ -845,6 +888,7 @@ pub async fn stream_logs(
         // For following or full read, poll the file for new content
         let mut pos = if tail.is_some() { start_pos } else { 0 };
         let mut partial_line = String::new();
+        let mut last_write = tokio::time::Instant::now();
 
         loop {
             // Read new content in spawn_blocking
@@ -857,47 +901,111 @@ pub async fn stream_logs(
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(e)));
 
-            match result {
+            let read_more = match result {
                 Ok((new_data, new_pos)) => {
+                    let advanced = new_pos > pos;
                     pos = new_pos;
                     if !new_data.is_empty() {
                         partial_line.push_str(&new_data);
-                        // Yield complete lines
+                        // Queue complete lines
                         while let Some(newline_pos) = partial_line.find('\n') {
                             let line = partial_line[..newline_pos].trim_end_matches('\r').to_string();
                             partial_line = partial_line[newline_pos + 1..].to_string();
                             if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
                                 continue; // skip non-JSON lines in json mode
                             }
-                            yield Ok(Event::default().data(line));
+                            batch.push(&line);
                         }
                         // Flush partial line if it exceeds the safety cap
                         if partial_line.len() > MAX_PARTIAL_LINE {
-                            yield Ok(Event::default().data(partial_line.clone()));
+                            batch.push(&partial_line);
                             partial_line.clear();
                         }
                     }
+                    advanced
                 }
                 Err(e) => {
-                    yield Ok(Event::default().data(format!("error: {}", e)));
+                    batch.push(&format!("error: {}", e));
+                    yield Ok(batch.take());
                     break;
                 }
+            };
+            if !batch.is_empty() {
+                yield Ok(batch.take());
+                last_write = tokio::time::Instant::now();
             }
 
             if !follow {
+                // A full read goes on to the end of the file, a chunk at a time.
+                if read_more {
+                    continue;
+                }
                 // Yield any remaining partial line
                 if !partial_line.is_empty() {
-                    yield Ok(Event::default().data(partial_line.clone()));
+                    batch.push(&partial_line);
+                    yield Ok(batch.take());
                 }
                 break;
+            }
+
+            // Keep an idle follower's connection open, as SSE keep-alive did.
+            if last_write.elapsed() >= LOG_KEEP_ALIVE {
+                yield Ok(axum::body::Bytes::from_static(b":\n\n"));
+                last_write = tokio::time::Instant::now();
             }
 
             // Wait before polling again
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    };
+    }
+}
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+/// How long a followed log stream may go quiet before it sends a keep-alive
+/// comment, the interval axum's SSE keep-alive used.
+const LOG_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// Log lines encoded as SSE events, written out together once they fill a
+/// read's worth.
+#[derive(Default)]
+struct LogEvents(Vec<u8>);
+
+impl LogEvents {
+    /// Appends `line` as one SSE event, encoded exactly as axum's
+    /// `Event::default().data(line)`: a `data: ` field per `\r`- or
+    /// `\n`-delimited piece, then a blank line; an empty line is the blank line
+    /// alone.
+    fn push(&mut self, line: &str) {
+        let out = &mut self.0;
+        if !line.is_empty() {
+            out.extend_from_slice(b"data: ");
+            let bytes = line.as_bytes();
+            let mut last = 0;
+            let delimiters = bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| matches!(b, b'\n' | b'\r'));
+            for (delimiter, _) in delimiters {
+                out.extend_from_slice(&bytes[last..=delimiter]);
+                out.extend_from_slice(b"data: ");
+                last = delimiter + 1;
+            }
+            out.extend_from_slice(&bytes[last..]);
+            out.push(b'\n');
+        }
+        out.push(b'\n');
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.0.len() >= MAX_READ_CHUNK as usize
+    }
+
+    fn take(&mut self) -> axum::body::Bytes {
+        axum::body::Bytes::from(std::mem::take(&mut self.0))
+    }
 }
 
 /// Read the last N lines from a file using a bounded ring buffer.
@@ -1254,5 +1362,119 @@ mod interactive_tests {
             .map(|r| r.load(Ordering::SeqCst))
             .collect();
         assert_eq!(resizes, [1, 0], "only a terminal is told its size");
+    }
+}
+
+#[cfg(test)]
+mod log_stream_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    /// What axum's `Sse` writes for these lines, one `Event::default().data(line)` each.
+    async fn axum_sse_bytes(lines: &[&str]) -> Vec<u8> {
+        use axum::response::IntoResponse as _;
+        let events: Vec<Result<Event, Infallible>> = lines
+            .iter()
+            .map(|line| Ok(Event::default().data(*line)))
+            .collect();
+        let response = Sse::new(futures_util::stream::iter(events)).into_response();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn log_events_are_encoded_as_axum_sse_encoded_them() {
+        let lines = [
+            "[    0.000000] Linux version 6.12",
+            "",
+            "carriage\rreturn inside",
+            "data: looks like a field",
+            "  leading spaces and ünïcode ✓",
+            ":starts like a comment",
+        ];
+        let mut ours = LogEvents::default();
+        for line in lines {
+            ours.push(line);
+        }
+        assert_eq!(ours.take().to_vec(), axum_sse_bytes(&lines).await);
+    }
+
+    async fn read_all(
+        stream: impl tokio_stream::Stream<Item = Result<axum::body::Bytes, Infallible>>,
+    ) -> Vec<axum::body::Bytes> {
+        let mut writes = Vec::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            writes.push(chunk.unwrap());
+        }
+        writes
+    }
+
+    /// Splits an SSE body of single-field events back into their lines.
+    fn lines_of(writes: &[axum::body::Bytes]) -> Vec<String> {
+        let body: Vec<u8> = writes.iter().flat_map(|w| w.to_vec()).collect();
+        String::from_utf8(body)
+            .unwrap()
+            .split("\n\n")
+            .filter(|event| !event.is_empty())
+            .map(|event| event.strip_prefix("data: ").unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_full_read_sends_the_whole_log_a_read_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let lines: Vec<String> = (0..12_000)
+            .map(|i| format!("[{i:>6}] console line {i}"))
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 3 * MAX_READ_CHUNK, "the log must span several reads");
+
+        let writes = read_all(log_event_stream(
+            path,
+            false,
+            None,
+            0,
+            Vec::new(),
+            false,
+            None,
+        ))
+        .await;
+
+        // Every line, past the first read's 64 KiB, which a full read used to stop at.
+        assert_eq!(lines_of(&writes), lines);
+        // A write per read of the file, not per line.
+        assert!(
+            writes.len() as u64 <= size / MAX_READ_CHUNK + 2,
+            "{} writes for {} lines",
+            writes.len(),
+            lines.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tail_sends_only_its_lines_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let (initial, end) = read_last_n_lines_bounded(&path, 2).unwrap();
+
+        let writes = read_all(log_event_stream(
+            path,
+            false,
+            Some(2),
+            end,
+            initial,
+            false,
+            None,
+        ))
+        .await;
+
+        assert_eq!(writes.len(), 1);
+        assert_eq!(lines_of(&writes), ["two", "three"]);
     }
 }
