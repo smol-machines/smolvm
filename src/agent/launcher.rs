@@ -1057,7 +1057,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             };
 
-            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, false) < 0 {
+            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, true) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "set rootfs",
@@ -1082,7 +1082,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 root_tag.as_ptr(),
                 root.as_ptr(),
                 rootfs_dax_window,
-                false,
+                true,
             ) < 0
             {
                 krun_free_ctx(ctx);
@@ -2101,7 +2101,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         tag.as_ptr(),
                         host_path.as_ptr(),
                         *packed_layers_dax_window,
-                        false,
+                        true,
                         super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
                     )
                 } else {
@@ -2117,7 +2117,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         tag.as_ptr(),
                         host_path.as_ptr(),
                         *packed_layers_dax_window,
-                        false,
+                        true,
                     )
                 };
                 if added < 0 {

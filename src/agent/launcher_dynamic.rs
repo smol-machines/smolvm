@@ -373,7 +373,7 @@ pub fn launch_agent_vm_dynamic(
             root_tag.as_ptr(),
             root.as_ptr(),
             super::virtiofs::rootfs_dax_window(),
-            false,
+            true,
         )
     } < 0
     {
@@ -913,7 +913,7 @@ pub fn launch_agent_vm_dynamic(
                     layers_tag.as_ptr(),
                     layers_path.as_ptr(),
                     super::virtiofs::legacy_packed_layers_dax_window(),
-                    false,
+                    true,
                     super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
                 )
             }
@@ -924,7 +924,7 @@ pub fn launch_agent_vm_dynamic(
                     layers_tag.as_ptr(),
                     layers_path.as_ptr(),
                     super::virtiofs::legacy_packed_layers_dax_window(),
-                    false,
+                    true,
                 )
             }
         };
