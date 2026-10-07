@@ -68,8 +68,6 @@ pub fn capture(
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let output = published.join(format!("{name}-{nanos}.checkpoint"));
-    store::trust_existing_objects(true);
-    store::defer_object_sync(true);
     let started = std::time::Instant::now();
     let result =
         crate::portable_checkpoint::capture_to_store(name, &output, &store, release_source)?;

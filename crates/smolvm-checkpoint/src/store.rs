@@ -179,6 +179,18 @@ pub struct Writer {
     pending: Vec<(std::path::PathBuf, String)>,
 }
 
+/// Capture-local object reuse and durability policy. Normal captures verify
+/// every cached object; the node's incremental path may defer verification to
+/// restore and batch new-object syncs without changing other captures.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteOptions {
+    /// Reuse an existing object by its digest and file type, deferring its
+    /// full content verification until restore.
+    pub trust_existing_objects: bool,
+    /// Sync new objects together before publishing the checkpoint index.
+    pub defer_object_sync: bool,
+}
+
 impl Writer {
     /// Start a capture in an existing, empty, private staging directory.
     ///
@@ -186,6 +198,15 @@ impl Writer {
     /// can be hard-linked. Keep both inaccessible to untrusted writers. Hold
     /// this writer until capture completes; drop it before calling [`prune`].
     pub fn new(cache: &Path, directory: &Path) -> io::Result<Self> {
+        Self::new_with_options(cache, directory, WriteOptions::default())
+    }
+
+    /// Open a capture with policy local to this writer and its worker pool.
+    pub fn new_with_options(
+        cache: &Path,
+        directory: &Path,
+        options: WriteOptions,
+    ) -> io::Result<Self> {
         fs::create_dir_all(cache)?;
         let lock = cache_lock(cache, false)?;
         let mut marker = File::options()
@@ -208,7 +229,7 @@ impl Writer {
                 ));
             }
         }
-        let pool = Pool::start(&cache, &objects)?;
+        let pool = Pool::start_with_options(&cache, &objects, options)?;
         Ok(Self {
             _lock: lock,
             cache,
@@ -1117,32 +1138,62 @@ struct Pool {
     /// reader refills, small enough that buffers stay at a few dozen MiB.
     window: usize,
     inline_paths: (std::path::PathBuf, std::path::PathBuf),
+    options: WriteOptions,
     // Released only after Drop has joined every worker.
     _permit: WorkerPermit,
 }
 
 impl Pool {
-    fn start(cache: &Path, objects: &Path) -> io::Result<Self> {
-        Self::start_with_budget(cache, objects, process_worker_budget())
+    fn start_with_options(cache: &Path, objects: &Path, options: WriteOptions) -> io::Result<Self> {
+        Self::start_with_budget_options(cache, objects, process_worker_budget(), options)
     }
 
+    #[cfg(test)]
     fn start_with_budget(
         cache: &Path,
         objects: &Path,
         budget: Arc<WorkerBudget>,
     ) -> io::Result<Self> {
-        Self::start_with_spawner(cache, objects, budget, worker_threads(), |job| {
+        Self::start_with_budget_options(cache, objects, budget, WriteOptions::default())
+    }
+
+    fn start_with_budget_options(
+        cache: &Path,
+        objects: &Path,
+        budget: Arc<WorkerBudget>,
+        options: WriteOptions,
+    ) -> io::Result<Self> {
+        Self::start_with_spawner_options(cache, objects, budget, worker_threads(), options, |job| {
             thread::Builder::new()
                 .name("checkpoint-store".into())
                 .spawn(job)
         })
     }
 
+    #[cfg(test)]
     fn start_with_spawner(
         cache: &Path,
         objects: &Path,
         budget: Arc<WorkerBudget>,
         requested: usize,
+        spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> io::Result<thread::JoinHandle<()>>,
+    ) -> io::Result<Self> {
+        Self::start_with_spawner_options(
+            cache,
+            objects,
+            budget,
+            requested,
+            WriteOptions::default(),
+            spawn,
+        )
+    }
+
+    fn start_with_spawner_options(
+        cache: &Path,
+        objects: &Path,
+        budget: Arc<WorkerBudget>,
+        requested: usize,
+        options: WriteOptions,
         mut spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> io::Result<thread::JoinHandle<()>>,
     ) -> io::Result<Self> {
         let permit = budget.acquire(requested);
@@ -1158,7 +1209,7 @@ impl Pool {
             let worker = spawn(Box::new(move || loop {
                 let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                 let Ok((seq, bytes, done)) = next else { break };
-                let result = worker_result(|| store_chunk(&cache, &objects, &bytes));
+                let result = worker_result(|| store_chunk(&cache, &objects, &bytes, options));
                 // The submitter may already have abandoned this file; its
                 // receiver being gone is not an error here.
                 let _ = done.send(Done { seq, bytes, result });
@@ -1179,14 +1230,21 @@ impl Pool {
             workers,
             window,
             inline_paths: (cache.to_path_buf(), objects.to_path_buf()),
+            options,
             _permit: permit,
         })
     }
 
     fn submit(&self, seq: usize, bytes: Vec<u8>, done: mpsc::Sender<Done>) -> Result<(), ()> {
         if self.workers.is_empty() {
-            let result =
-                worker_result(|| store_chunk(&self.inline_paths.0, &self.inline_paths.1, &bytes));
+            let result = worker_result(|| {
+                store_chunk(
+                    &self.inline_paths.0,
+                    &self.inline_paths.1,
+                    &bytes,
+                    self.options,
+                )
+            });
             return done.send(Done { seq, bytes, result }).map_err(|_| ());
         }
         self.jobs
@@ -1366,27 +1424,12 @@ impl Drop for Pool {
 /// publish it, then hard-link it into this checkpoint. Two workers (or two
 /// concurrent captures) storing the same content race on `persist_noclobber`;
 /// the loser verifies and keeps the winner's object.
-static TRUST_EXISTING_OBJECTS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-static DEFER_OBJECT_SYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Write new objects without syncing each one; [`Writer::finish`] syncs them
-/// together and only then publishes them under their digests. Per-object
-/// syncs serialize on the filesystem journal when the disk is busy.
-pub fn defer_object_sync(defer: bool) {
-    DEFER_OBJECT_SYNC.store(defer, Ordering::Relaxed);
-}
-
-/// Let captures reuse an object already in the store by its content digest
-/// alone, without decoding it to compare bytes. A damaged object is then
-/// caught when a restore reads it (every read verifies its digest) rather
-/// than when a capture reuses it.
-pub fn trust_existing_objects(trust: bool) {
-    TRUST_EXISTING_OBJECTS.store(trust, Ordering::Relaxed);
-}
-
-fn store_chunk(cache: &Path, objects: &Path, bytes: &[u8]) -> io::Result<ChunkResult> {
+fn store_chunk(
+    cache: &Path,
+    objects: &Path,
+    bytes: &[u8],
+    options: WriteOptions,
+) -> io::Result<ChunkResult> {
     let mut stats = WriteStats::default();
     let count = bytes.len() as u64;
     if smolvm_pack::is_zero_filled(bytes) {
@@ -1395,7 +1438,7 @@ fn store_chunk(cache: &Path, objects: &Path, bytes: &[u8]) -> io::Result<ChunkRe
     }
     let hash = digest(bytes);
     let cached = cache.join(&hash);
-    let existing = if TRUST_EXISTING_OBJECTS.load(Ordering::Relaxed) {
+    let existing = if options.trust_existing_objects {
         match fs::symlink_metadata(&cached) {
             Ok(metadata) if metadata.is_file() && metadata.len() > 0 => Ok(()),
             Ok(_) => Err(invalid("checkpoint object type or length mismatch")),
@@ -1412,7 +1455,7 @@ fn store_chunk(cache: &Path, objects: &Path, bytes: &[u8]) -> io::Result<ChunkRe
                 .tempfile_in(cache)?;
             let compressed = zstd::bulk::compress(bytes, 3)?;
             temp.write_all(&compressed)?;
-            if DEFER_OBJECT_SYNC.load(Ordering::Relaxed) {
+            if options.defer_object_sync {
                 let (_, path) = temp.keep().map_err(|error| error.error)?;
                 let linked = objects.join(&hash);
                 match fs::hard_link(&path, &linked) {
@@ -1452,7 +1495,7 @@ fn store_chunk(cache: &Path, objects: &Path, bytes: &[u8]) -> io::Result<ChunkRe
     match fs::hard_link(&cached, &linked) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if !TRUST_EXISTING_OBJECTS.load(Ordering::Relaxed) {
+            if !options.trust_existing_objects {
                 verify_object_matches(&linked, bytes)?;
             }
         }
@@ -2474,13 +2517,16 @@ fn own_objects(index: &Index) -> HashSet<&str> {
         .collect()
 }
 
+type KnownFileKey = (u64, u64, u64);
+type KnownFileChunks = (u32, Vec<Option<String>>);
+
 /// Immutable files a stored checkpoint already describes, keyed by inode.
 /// A capture that stages one of these exact inodes (a restored machine's
 /// read-only disk base, linked from the tree it was restored from) reuses
 /// its chunk list instead of reading and hashing it again.
 #[derive(Debug, Default)]
 pub struct KnownFiles {
-    files: HashMap<(u64, u64, u64), (u32, Vec<Option<String>>)>,
+    files: HashMap<KnownFileKey, KnownFileChunks>,
 }
 
 impl KnownFiles {
@@ -3421,6 +3467,46 @@ mod tests {
     }
 
     #[test]
+    fn trusting_cached_objects_does_not_change_other_captures() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let trusted_dir = root.path().join("trusted");
+        let verified_dir = root.path().join("verified");
+        fs::create_dir(&trusted_dir).unwrap();
+        fs::create_dir(&verified_dir).unwrap();
+        let mut trusted = Writer::new_with_options(
+            &cache,
+            &trusted_dir,
+            WriteOptions {
+                trust_existing_objects: true,
+                defer_object_sync: true,
+            },
+        )
+        .unwrap();
+        let bytes = vec![31; CHUNK_SIZE];
+        let hash = digest(&bytes);
+        fs::write(cache.join("objects").join(&hash), b"damaged object").unwrap();
+        trusted
+            .ingest(
+                "memory.bin",
+                bytes.len() as u64,
+                0o600,
+                &mut bytes.as_slice(),
+            )
+            .unwrap();
+
+        let mut verified = Writer::new(&cache, &verified_dir).unwrap();
+        verified
+            .ingest(
+                "memory.bin",
+                bytes.len() as u64,
+                0o600,
+                &mut bytes.as_slice(),
+            )
+            .unwrap_err();
+    }
+
+    #[test]
     fn partial_capture_pool_start_joins_workers_before_releasing_capacity() {
         for successful_spawns in 0..3 {
             let root = tempfile::tempdir().unwrap();
@@ -3607,7 +3693,10 @@ mod tests {
         let child_id = "b".repeat(32);
         let pattern = |seed: u8, len: usize| -> Vec<u8> {
             (0..len)
-                .map(|i| ((i as u64 * 2654435761 + seed as u64 * 97) >> 7) as u8)
+                .map(|i| {
+                    ((i as u64 * 2654435761 + (seed as u64 + (i / CHUNK_SIZE) as u64 * 17) * 97)
+                        >> 7) as u8
+                })
                 .collect()
         };
         let disk = pattern(1, 3 * CHUNK_SIZE + 5);

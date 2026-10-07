@@ -1749,6 +1749,7 @@ pub(crate) fn capture_to_path_with_source_release(
         false,
         |_| Ok(()),
         None,
+        crate::checkpoint_store::WriteOptions::default(),
     )
 }
 
@@ -1806,6 +1807,7 @@ pub(crate) fn capture_to_path_deferring_retention(
         false,
         |_| Ok(()),
         Some(&mut deferred),
+        crate::checkpoint_store::WriteOptions::default(),
     )?;
     Ok((result, deferred))
 }
@@ -1831,6 +1833,10 @@ pub(crate) fn capture_to_store(
         false,
         |_| Ok(()),
         None,
+        crate::checkpoint_store::WriteOptions {
+            trust_existing_objects: true,
+            defer_object_sync: true,
+        },
     )
 }
 
@@ -1860,6 +1866,7 @@ pub fn capture_and_stop_to_path(
         true,
         publish_resume_point,
         None,
+        crate::checkpoint_store::WriteOptions::default(),
     )
 }
 
@@ -1873,6 +1880,7 @@ fn capture_with_completion(
     stop_after_capture: bool,
     mut publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
     defer_retain: Option<&mut Option<DeferredRetain>>,
+    writer_options: crate::checkpoint_store::WriteOptions,
 ) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
     let mut phase = started;
@@ -1951,8 +1959,12 @@ fn capture_with_completion(
                 .prefix(".checkpoint-")
                 .tempdir_in(capture_root)
                 .map_err(|e| Error::agent("stage stored checkpoint", e.to_string()))?;
-            let writer = crate::checkpoint_store::Writer::new(&store, directory.path())
-                .map_err(|e| Error::agent("open checkpoint store", e.to_string()))?;
+            let writer = crate::checkpoint_store::Writer::new_with_options(
+                &store,
+                directory.path(),
+                writer_options,
+            )
+            .map_err(|e| Error::agent("open checkpoint store", e.to_string()))?;
             Ok((directory, writer))
         })
         .transpose()?;
