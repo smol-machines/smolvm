@@ -346,7 +346,7 @@ pub enum MachineCmd {
     /// Run a container image in an ephemeral machine
     Run(RunCmd),
 
-    /// Run a command directly in the VM (not in a container)
+    /// Run a command in a machine (inside its image's container, if it has one)
     Exec(ExecCmd),
 
     /// Create a new named machine configuration
@@ -410,7 +410,7 @@ pub enum MachineCmd {
     /// Remove unused images and layers to free disk space
     Prune(PruneCmd),
 
-    /// Open an interactive shell in a machine (starts it if stopped)
+    /// Open an interactive shell in a running machine
     #[command(visible_alias = "sh")]
     Shell(ShellCmd),
 
@@ -658,7 +658,7 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub use_host_proxy: bool,
 
-    /// Trust the certificates this host trusts inside the workload — e.g. a
+    /// Trust the certificates this host trusts for image pulls and the workload — e.g. a
     /// corporate TLS-inspection root on the host. Mounts them read-only at
     /// /etc/smolvm-host-trust/ca-bundle.pem and points SSL_CERT_FILE,
     /// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE and similar at it.
@@ -1762,13 +1762,14 @@ impl RunCmd {
         // A fresh registry-image run starts on a shared seed of its image, so
         // the guest finds the image already pulled, exactly as `machine start`
         // does. Best-effort: without a seed the guest pulls as before.
-        smolvm::image_seed::seed_ephemeral_run(
+        smolvm::image_seed::seed_ephemeral_run_with_trust(
             &vm_name,
             params.image.as_deref(),
             params.storage_gb,
             self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
             self.proxy_opts.no_proxy().as_deref(),
+            self.trust_host_certs,
         );
 
         let manager =
@@ -3427,10 +3428,10 @@ fn persistent_overlay_owner_for_record(
     )
 }
 
-/// Execute a command directly in the VM's Alpine rootfs.
+/// Execute a command in a running machine.
 ///
-/// This runs commands at the VM level, not inside a container. Useful for
-/// debugging, inspecting the VM environment, or running VM-level operations.
+/// On a machine created from an image the command runs inside that image's
+/// container; on a bare machine it runs in the VM's Alpine rootfs.
 ///
 /// Examples:
 ///   smolvm machine exec -- uname -a
@@ -3733,7 +3734,7 @@ impl ExecEventPrinter {
 
 /// Open an interactive shell in a machine.
 ///
-/// Shortcut for `machine exec -it -- /bin/sh`. Starts the machine if stopped.
+/// Shortcut for `machine exec -it -- /bin/sh`. The machine must be running.
 ///
 /// Examples:
 ///   smolvm machine shell
@@ -3920,7 +3921,7 @@ pub struct CreateCmd {
     #[arg(long, help_heading = "Network")]
     pub use_host_proxy: bool,
 
-    /// Trust the certificates this host trusts inside the workload — e.g. a
+    /// Trust the certificates this host trusts for image pulls and the workload — e.g. a
     /// corporate TLS-inspection root on the host. Mounts them read-only at
     /// /etc/smolvm-host-trust/ca-bundle.pem and points SSL_CERT_FILE,
     /// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE and similar at it.
@@ -3973,7 +3974,7 @@ pub struct CreateCmd {
     #[arg(long = "mount-socket", value_name = "HOST_PATH:GUEST_PATH")]
     pub mount_socket: Vec<String>,
 
-    /// Run command on every VM start (can be used multiple times)
+    /// Run command once, on the machine's first start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
 
@@ -5397,7 +5398,7 @@ impl StopCmd {
 
 /// Delete a machine configuration.
 ///
-/// Removes the VM configuration. Does not delete container data.
+/// Removes the VM configuration and its data directory, disks included.
 #[derive(Args, Debug)]
 pub struct DeleteCmd {
     /// Machine to delete
@@ -6119,30 +6120,19 @@ pub struct NetworkTestCmd {
 
 impl NetworkTestCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = vm_common::get_vm_manager(&self.name)?;
-        let label = vm_common::vm_label(&self.name);
-
-        // Ensure machine is running
-        let already_running = manager.try_connect_existing().is_some();
-        if !already_running {
-            eprintln!("Starting machine '{}'...", label);
-            manager.ensure_running()?;
-        }
-
-        // Connect and test
+        // Test a running machine as it is. Booting one here would launch it
+        // without its recorded mounts, ports and resources, or fail outright
+        // for a machine that was never started.
+        let (manager, mut client) = vm_common::ensure_running_and_connect(&self.name)?;
         println!("Testing network from machine: {}", self.url);
-        let mut client = manager.connect()?;
-        let result = client.network_test(&self.url)?;
+        let result = client.network_test(&self.url);
+        manager.detach();
+        let result = result?;
 
         println!(
             "Result: {}",
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
-
-        // VM was already running — don't stop it when we're done
-        if already_running {
-            manager.detach();
-        }
         Ok(())
     }
 }

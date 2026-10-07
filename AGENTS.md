@@ -12,6 +12,11 @@ A tool to build and run portable, self-contained virtual machines locally. <200m
 
 Windows caveats: branches require `--freeze-source`, checkpoint capture rejects active virtiofs DAX mappings, and GPU acceleration is unavailable. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
 
+## Documentation
+
+Skill packets, tested procedures an agent can follow with their scripts, are indexed in
+`docs/README.md` (https://github.com/smol-machines/smolvm/tree/main/docs).
+
 ## Quick Reference
 
 ```bash
@@ -25,7 +30,7 @@ smolvm machine create --net --name myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add python3   # installs persist
 smolvm machine exec --name myvm -- which python3      # still there
-smolvm machine shell --name myvm               # interactive shell (auto-starts if stopped)
+smolvm machine shell --name myvm               # interactive shell (machine must be running)
 smolvm machine stop --name myvm
 smolvm machine delete --name myvm
 
@@ -81,23 +86,23 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 
 ### Persistence Model
 
-- **`machine run`** — ephemeral. All changes are discarded when the command exits.
+- **`machine run`** — ephemeral. All changes are discarded when the command exits, unless `-d` leaves the machine running.
 - **`machine exec`** — persistent. Filesystem changes (package installs, config edits) persist across exec sessions for the same machine, whether bare or image-based. Changes are stored in an overlay on the machine's storage disk.
 - **`machine stop` + `start`** — changes persist across restarts. The persistent overlay is remounted preserving previous changes.
 - **`machine create --stop-on-exit`** (or Smolfile `stop_on_exit = true`) — the machine stops by itself when its workload (image entrypoint/cmd, or the command after `--`) exits, whatever the exit status. Storage is flushed exactly as for `machine stop`, so nothing the workload wrote is lost. `machine exec` sessions never trigger it. The machine's restart policy then applies as for any stop (the default, `never`, leaves it stopped); the workload's own exit status is not passed on.
 - **`pack run`** — ephemeral. Each run starts fresh from the packed image.
-- **`pack start` + `exec`** — daemon mode. `/workspace` persists across exec sessions and stop/start. Container overlay resets per exec (package installs don't persist — use `/workspace` for durable data).
+- **`pack start` + `exec`** — daemon mode. `/workspace` persists across exec sessions and stop/start. Package installs and file writes also persist across exec sessions.
 - **`machine create --from .smolmachine`** — creates a persistent named machine from a packed artifact. Boots from pre-extracted layers (~250ms, no image pull). Full `machine exec` persistence — package installs, file writes all survive across exec and stop/start.
-- **Memory-backed paths** — `/tmp`, `/run`, and `/dev/shm` are tmpfs regardless of the mode above. They keep their contents while the machine runs, including across `exec` sessions, but are empty again after a stop and start. `/workspace` and the rest of the machine filesystem are on the storage disk, so write anything that must outlive a restart there — including credentials and configuration, which should not sit in `/tmp` or behind a symlink into it.
+- **Memory-backed paths** — `/tmp`, `/run`, and `/dev/shm` are tmpfs regardless of the mode above, except that `machine run --unprivileged` keeps only `/dev/shm`. They keep their contents while the machine runs, including across `exec` sessions, but are empty again after a stop and start. `/workspace` and the rest of the machine filesystem are on the storage disk, so write anything that must outlive a restart there — including credentials and configuration, which should not sit in `/tmp` or behind a symlink into it.
 
 ## CLI Structure
 
-All commands use named flags (no positional args except `machine create --name NAME` and `machine delete --name NAME`).
+All commands name a machine with `--name`, never a positional (`machine cp SRC DST` takes its two paths as positionals).
 
 ```
 smolvm machine run --image IMAGE [-- COMMAND]     # ephemeral
 smolvm machine exec --name NAME [-- COMMAND]      # run in existing VM
-smolvm machine shell [--name NAME]                # interactive shell (auto-starts)
+smolvm machine shell [--name NAME]                # interactive shell (must be running)
 smolvm machine create --name NAME [OPTIONS]              # create persistent
 smolvm machine create --name NAME --from FILE.smolmachine  # from packed artifact
 smolvm machine start [--name NAME]                # start (default: "default")
@@ -166,7 +171,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | Flag | Short | Used on | Description |
 |------|-------|---------|-------------|
 | `--image` | `-I` | run, create, pack create | OCI image, or a local source: a `docker save` archive (`./img.tar`, or `-` for stdin) or unpacked rootfs dir (`./rootfs/`) |
-| `--name` | `-n` | run, start, stop, status, exec, update | Machine name (default: "default") |
+| `--name` | `-n` | run, start, stop, status, exec, update | Machine name (default: "default"); `exec` takes only the long form |
 | `--net` | | run, create | Enable outbound networking (off by default) |
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
@@ -180,7 +185,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
-| `--nested-virt` | | run, create | Let the guest run its own VMs (nested KVM). Off by default; it exposes the host kernel's nested-KVM code to the guest, so enable it only for trusted workloads. Over the HTTP API it is `nestedVirt`, refused with 403 unless the server runs `smolvm serve --allow-nested-virt`. |
+| `--nested` | | run, create | Let the guest run its own VMs (nested KVM). Off by default; it exposes the host kernel's nested-KVM code to the guest, so enable it only for trusted workloads. Over the HTTP API it is `nestedVirt`, refused with 403 unless the server runs `smolvm serve start --allow-nested-virt`. |
 | `--stop-on-exit` | | create | Stop the machine when its workload exits, whatever the exit status |
 
 ## Smolfile Reference
@@ -203,7 +208,7 @@ net = true                            # outbound networking (default: false)
 gpu = true                            # GPU acceleration (default: false)
 gpu_vram = 4096                       # GPU VRAM MiB (default: 4096, ignored unless gpu=true)
 storage = 40                          # storage disk GiB (default: 20)
-overlay = 4                           # overlay disk GiB (default: 2)
+overlay = 4                           # overlay disk GiB (default: 10)
 
 # Network policy — egress filtering by hostname and/or CIDR
 [network]
@@ -215,7 +220,7 @@ allow_cidrs = ["10.0.0.0/8"]         # IP/CIDR ranges (implies net)
 [dev]
 volumes = ["./src:/app"]              # host bind mounts
 ports = ["8080:8080"]                 # port forwarding
-init = ["pip install -r requirements.txt"]  # run on every VM start
+init = ["pip install -r requirements.txt"]  # run once, on the machine's first start
 env = ["APP_MODE=dev"]                # dev-only env (extends top-level)
 workdir = "/app"                      # dev-only workdir
 
@@ -518,10 +523,11 @@ smolvm machine stop --name r-sandbox
 - Larger files stream automatically: 1 MiB chunks for upload, 16 MiB
   chunks for download. The split is asymmetric because the
   host→guest direction has tighter socket-buffer headroom.
-- Per-transfer cap is **4 GiB** in either direction. Files at or
-  above this size are rejected up front (`total_size exceeds maximum`
-  on upload; `exceeding the byte cap` on download). For larger
-  blobs, mount a host directory with `--volume` instead of copying.
+- Per-transfer cap is **4 GiB** in either direction. Files above this
+  size are rejected: an upload before it starts (`total_size exceeds
+  maximum`), a download once it passes the cap (`exceeding the byte
+  cap`). For larger blobs, mount a host directory with `--volume`
+  instead of copying.
 - A throttled progress line prints to stderr while large transfers
   run, including bytes-so-far, percentage (uploads), and rate.
   Pipe captures (`> file`) only see the upload/download summary,
@@ -621,9 +627,9 @@ OpenAPI spec: `smolvm serve openapi`
 
 ## Important Defaults
 
-- Machine name defaults to `$SMOLVM_MACHINE_NAME` when set, else `"default"`, when `--name` is omitted. An explicit `--name` always wins. Meant for per-workspace tooling (direnv); `machine run`, `machine checkpoint`, and `machine branch` deliberately ignore the variable
+- Machine name defaults to `$SMOLVM_MACHINE_NAME` when set, else `"default"`, when `--name` is omitted. An explicit `--name` always wins. Meant for per-workspace tooling (direnv); `machine run`, `machine checkpoint`, and `machine branch` deliberately ignore the variable. Without the variable, `machine create` generates a `vm-<id>` name instead of `"default"`
 - Network is **off** by default (security-first)
-- CPUs: 4, Memory: 8192 MiB, Storage: 20 GiB, Overlay: 2 GiB
+- CPUs: 4, Memory: 8192 MiB, Storage: 20 GiB, Overlay: 10 GiB
 - Packed binaries use the same defaults (CPUs: 4, Memory: 8192 MiB)
 - Memory and CPU are elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest
 
@@ -633,5 +639,5 @@ OpenAPI spec: `smolvm serve openapi`
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
 - **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped.
-- **`machine run` is always ephemeral.** The VM is created, the command runs, and everything is cleaned up. No state carries over.
+- **`machine run` is ephemeral unless detached.** Without `-d` the VM is created, the command runs, and everything is cleaned up. With `-d` it stays as a named machine that `machine exec` and `machine stop` act on.
 - **`-v host:/workspace` replaces the default workspace.** Every image-based VM exposes `/workspace` backed by the VM's storage disk. Mounting a host directory at `/workspace` takes priority — the host share is used instead and the storage-disk workspace is not mounted. Any other target path (e.g. `/data`, `/app`) does not affect `/workspace`.

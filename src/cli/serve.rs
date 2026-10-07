@@ -34,7 +34,7 @@ API ENDPOINTS:
   DELETE /api/v1/machines/:id         Delete machine
 
 EXAMPLES:
-  smolvm serve start                                Listen on the default Unix socket (unix:///$XDG_RUNTIME_DIR/smolvm.sock)
+  smolvm serve start                                Listen on the default address (shown under --listen)
   smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
   smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
   smolvm serve start -v                             Enable verbose logging")]
@@ -97,11 +97,12 @@ pub struct ServeStartCmd {
     #[arg(long = "allow-nested-virt")]
     allow_nested_virt: bool,
 
-    /// Flag guest traffic to destinations on this watchlist. Each line is
-    /// `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
+    /// Flag, or block, guest traffic to destinations on this watchlist. Each line
+    /// is `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
     /// lowercased DNS name (its subdomains match too) or of an IP address's text.
     /// Matches are recorded per machine and reported as `egressSignals` in the
-    /// machine API; traffic is never blocked by this. The file is re-read when it
+    /// machine API. A line ending in `block` also answers a matching lookup as
+    /// nonexistent and drops matching connections. The file is re-read when it
     /// changes. Applies to virtio-net machines. Off by default.
     #[arg(long = "egress-watchlist", value_name = "PATH")]
     egress_watchlist: Option<std::path::PathBuf>,
@@ -138,6 +139,41 @@ pub struct ServeStartCmd {
     /// flight before stopping serve rather than raising this.
     #[arg(long = "shutdown-grace", value_name = "SECS")]
     shutdown_grace: Option<u64>,
+
+    /// Restored checkpoints to keep extracted after their machines are gone,
+    /// so restoring one again reuses it instead of fetching and unpacking it
+    /// again (0 keeps none). A server restores far more than a CLI session,
+    /// so this is larger than `machine create`'s default.
+    #[arg(
+        long = "restore-cache-entries",
+        value_name = "N",
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u16).range(0..=1024)
+    )]
+    restore_cache_entries: u16,
+
+    /// Space those kept checkpoints may hold together, in GiB. Each holds a
+    /// whole checkpoint's RAM and disks.
+    #[arg(long = "restore-cache-gib", value_name = "GiB", default_value_t = 256)]
+    restore_cache_gib: u64,
+
+    /// Space for captured checkpoints kept beside the machine's host, in GiB, so
+    /// restoring one here skips the download. SMOLVM_PREPARED_CHECKPOINT_CACHE_MAX_BYTES,
+    /// when set, still takes precedence.
+    #[arg(
+        long = "prepared-checkpoint-cache-gib",
+        value_name = "GiB",
+        default_value_t = 64
+    )]
+    prepared_checkpoint_cache_gib: u64,
+}
+
+/// The restore cache a server keeps, from its flags.
+fn server_restore_cache(entries: u16, gib: u64) -> smolvm::portable_checkpoint::RestoreCache {
+    smolvm::portable_checkpoint::RestoreCache {
+        entries: usize::from(entries),
+        max_bytes: gib.saturating_mul(1024 * 1024 * 1024),
+    }
 }
 
 impl ServeStartCmd {
@@ -155,6 +191,21 @@ impl ServeStartCmd {
         // every command in main(); calling again is idempotent. Single-threaded
         // before the tokio runtime, so set_var is safe.
         smolvm::process::apply_system_data_root(/* allow_auto */ true);
+
+        // Size the checkpoint caches for a server before any request can restore
+        // or capture one.
+        let restore_cache =
+            server_restore_cache(self.restore_cache_entries, self.restore_cache_gib);
+        smolvm::portable_checkpoint::RestoreCache::set_process(restore_cache);
+        // Other smolvm processes on this node trim the same cache; they follow
+        // this sizing rather than the CLI's.
+        if let Err(error) = restore_cache.persist_for_node() {
+            tracing::warn!(%error, "could not record the restore cache policy for this node");
+        }
+        smolvm::portable_checkpoint::set_prepared_checkpoint_budget(
+            self.prepared_checkpoint_cache_gib
+                .saturating_mul(1024 * 1024 * 1024),
+        );
 
         // Lock the state dirs holding machine records / credentials / config down
         // to 0700 so a Landlock-exempt fork clone (which runs as its golden's uid)
@@ -446,6 +497,27 @@ impl ServeStartCmd {
             state.clone(),
             shutdown_rx.clone(),
         ));
+
+        // A new smolvm version makes every image seed stale, so the first
+        // machine of each image would wait for a seed build. Rebuild the seeds
+        // machines used recently, in the background, once startup has settled.
+        #[cfg(unix)]
+        {
+            let spawned = std::thread::Builder::new()
+                .name("image-seed-prewarm".into())
+                .spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    match smolvm::image_seed::builder_exe() {
+                        Ok(exe) => smolvm::image_seed::prewarm_recent_seeds(&exe),
+                        Err(error) => {
+                            tracing::warn!(%error, "no smolvm binary to prewarm image seeds with")
+                        }
+                    }
+                });
+            if let Err(error) = spawned {
+                tracing::warn!(%error, "could not start image seed prewarm");
+            }
+        }
 
         // Create router
         let drain_state = state.clone();
@@ -988,6 +1060,40 @@ async fn shutdown_signal_or_internal(shutdown: tokio::sync::watch::Receiver<bool
 mod tests {
     use super::ListenTarget;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_server_keeps_larger_checkpoint_caches_than_the_cli() {
+        use clap::Parser;
+        let gib = 1024 * 1024 * 1024;
+        let defaults = super::ServeStartCmd::try_parse_from(["serve"]).unwrap();
+        let cache =
+            super::server_restore_cache(defaults.restore_cache_entries, defaults.restore_cache_gib);
+        assert_eq!(cache.entries, 32);
+        assert_eq!(cache.max_bytes, 256 * gib);
+        assert_eq!(defaults.prepared_checkpoint_cache_gib, 64);
+        let cli = smolvm::portable_checkpoint::RestoreCache::default();
+        assert!(cache.entries > cli.entries && cache.max_bytes > cli.max_bytes);
+
+        let sized = super::ServeStartCmd::try_parse_from([
+            "serve",
+            "--restore-cache-entries",
+            "0",
+            "--restore-cache-gib",
+            "512",
+            "--prepared-checkpoint-cache-gib",
+            "1",
+        ])
+        .unwrap();
+        let cache =
+            super::server_restore_cache(sized.restore_cache_entries, sized.restore_cache_gib);
+        assert_eq!(cache.entries, 0);
+        assert_eq!(cache.max_bytes, 512 * gib);
+        assert_eq!(sized.prepared_checkpoint_cache_gib, 1);
+        assert!(
+            super::ServeStartCmd::try_parse_from(["serve", "--restore-cache-entries", "2000"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn shutdown_grace_defaults_and_is_bounded() {

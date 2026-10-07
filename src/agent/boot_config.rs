@@ -77,6 +77,10 @@ pub struct BootConfig {
     /// `packed_layers_dir` is consumed as-is (no idmap mount).
     #[serde(default)]
     pub pack_idmap_source: Option<PathBuf>,
+    /// DAX window for `packed_layers_dir`, chosen by the launcher: the window
+    /// a restored guest booted with, or the fresh-boot size.
+    #[serde(default = "crate::agent::virtiofs::legacy_packed_layers_dax_window")]
+    pub packed_layers_dax_window: u64,
     /// Additional disk images to attach (path, read_only, format). The format
     /// lets the `pack --from-vm` exporter attach a source qcow2 disk read-only.
     #[serde(default)]

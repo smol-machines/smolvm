@@ -941,6 +941,44 @@ fn enforce_external_interceptor_requirement(
     Ok(())
 }
 
+/// Which of a VM's launch settings differ from the requested ones.
+fn config_differences(
+    inner: &AgentInner,
+    mounts: &[HostMount],
+    ports: &[PortMapping],
+    resources: &VmResources,
+) -> Vec<&'static str> {
+    let mut differences = Vec::new();
+    if inner.mounts != mounts {
+        differences.push("mounts");
+    }
+    if inner.ports != ports {
+        differences.push("ports");
+    }
+    if inner.resources != *resources {
+        differences.push("resources");
+    }
+    differences
+}
+
+/// How much of an unreachable VM's console to keep in the node log.
+const CONSOLE_TAIL_BYTES: usize = 4096;
+
+/// The last `max` bytes of `console`, starting at a line boundary.
+fn console_tail(console: &str, max: usize) -> String {
+    if console.len() <= max {
+        return console.to_string();
+    }
+    let mut start = console.len() - max;
+    while !console.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &console[start..];
+    tail.split_once('\n')
+        .map_or(tail, |(_, rest)| rest)
+        .to_string()
+}
+
 impl AgentManager {
     /// Create a new agent manager with explicit paths (low-level).
     ///
@@ -1057,10 +1095,10 @@ impl AgentManager {
         Self::for_vm_with_sizes("default", storage_gb, overlay_gb)
     }
 
-    /// Get the default agent manager with default sizes.
-    ///
-    /// Canonicalized to `for_vm("default")` so that all lifecycle commands
-    /// use consistent socket/PID/storage paths.
+    /// Open the default machine to observe or reconnect to it, like
+    /// [`Self::for_vm`]: it creates nothing on disk, so it cannot launch a
+    /// machine that was never started. Launches use
+    /// [`Self::new_default_with_sizes`].
     pub fn new_default() -> Result<Self> {
         Self::for_vm("default")
     }
@@ -1285,6 +1323,22 @@ impl AgentManager {
     /// Get the current state of the agent.
     pub fn state(&self) -> AgentState {
         self.inner.lock().state
+    }
+
+    /// The launch settings a running VM differs in from `mounts`, `ports` and
+    /// `resources`, or `None` when it matches or its settings are not known.
+    pub fn running_config_differences(
+        &self,
+        mounts: &[HostMount],
+        ports: &[PortMapping],
+        resources: &VmResources,
+    ) -> Option<Vec<&'static str>> {
+        let inner = self.inner.lock();
+        if !matches!(inner.config_state, ConfigState::Known) {
+            return None;
+        }
+        let differences = config_differences(&inner, mounts, ports, resources);
+        (!differences.is_empty()).then_some(differences)
     }
 
     /// Check if the agent is running.
@@ -1745,7 +1799,8 @@ impl AgentManager {
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
         // so the comparison below is accurate even for detached VMs.
-        if self.try_connect_existing().is_some() {
+        let reachable = self.try_connect_existing().is_some();
+        if reachable {
             let inner = self.inner.lock();
             match &inner.config_state {
                 ConfigState::Known => {
@@ -1788,7 +1843,24 @@ impl AgentManager {
                     )?;
                 }
             }
-            tracing::info!("restarting agent VM due to configuration change");
+            let reason = {
+                let inner = self.inner.lock();
+                match (reachable, &inner.config_state) {
+                    (false, _) => "agent unreachable".to_string(),
+                    (true, ConfigState::Known) => format!(
+                        "{} changed",
+                        config_differences(&inner, &mounts, &ports, &resources).join(", ")
+                    ),
+                    (true, _) => "running config unknown".to_string(),
+                }
+            };
+            // An unreachable VM's own console is the only record of why it
+            // stopped answering, and the relaunch below starts a new one.
+            let console_tail = (!reachable)
+                .then(|| self.read_console_log())
+                .flatten()
+                .map(|console| console_tail(&console, CONSOLE_TAIL_BYTES));
+            tracing::warn!(%reason, console_tail = console_tail.as_deref().unwrap_or(""), "restarting agent VM");
             self.stop()?;
         } else {
             // try_connect_existing failed but state may still be Running (crashed VM).
@@ -2561,6 +2633,12 @@ impl AgentManager {
             .map(|launch| launch.child_env())
             .unwrap_or_default();
 
+        // A fresh boot gets the small packed-layer window; a restore keeps the
+        // window its guest booted with (recorded with the snapshot).
+        let packed_layers_dax_window =
+            super::virtiofs::packed_layers_window_for_launch(features.snapshot_dir.as_deref());
+        let records_window = features.packed_layers_dir.is_some();
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -2584,6 +2662,7 @@ impl AgentManager {
             credentials: features.credentials,
             external_interceptor: features.external_interceptor,
             packed_layers_dir: features.packed_layers_dir,
+            packed_layers_dax_window,
             pack_idmap_source,
             extra_disks: {
                 let mut __d = features.extra_disks;
@@ -2801,6 +2880,17 @@ impl AgentManager {
         // the sweep is only driven from serve.) The `child` handle drops without
         // waiting (Rust `Child::drop` is a no-op), leaving the PID for the sweep.
         crate::process::register_vm_child(child_pid);
+        // Captures of this machine record the window its guest booted with.
+        if let (Some(name), true) = (self.name(), records_window) {
+            if let Some(start) = crate::process::process_start_time(child_pid) {
+                super::virtiofs::record_launch_window(
+                    &vm_data_dir(name),
+                    packed_layers_dax_window,
+                    child_pid as u32,
+                    start,
+                );
+            }
+        }
         tracing::info!(
             pid = child_pid,
             spawn_ms = spawn_start.elapsed().as_millis(),
@@ -2863,7 +2953,8 @@ impl AgentManager {
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running (same logic as ensure_running_with_full_config)
-        if self.try_connect_existing().is_some() {
+        let reachable = self.try_connect_existing().is_some();
+        if reachable {
             let inner = self.inner.lock();
             match &inner.config_state {
                 ConfigState::Known => {
@@ -2900,7 +2991,24 @@ impl AgentManager {
                     )?;
                 }
             }
-            tracing::info!("restarting agent VM due to configuration change");
+            let reason = {
+                let inner = self.inner.lock();
+                match (reachable, &inner.config_state) {
+                    (false, _) => "agent unreachable".to_string(),
+                    (true, ConfigState::Known) => format!(
+                        "{} changed",
+                        config_differences(&inner, &mounts, &ports, &resources).join(", ")
+                    ),
+                    (true, _) => "running config unknown".to_string(),
+                }
+            };
+            // An unreachable VM's own console is the only record of why it
+            // stopped answering, and the relaunch below starts a new one.
+            let console_tail = (!reachable)
+                .then(|| self.read_console_log())
+                .flatten()
+                .map(|console| console_tail(&console, CONSOLE_TAIL_BYTES));
+            tracing::warn!(%reason, console_tail = console_tail.as_deref().unwrap_or(""), "restarting agent VM");
             self.stop()?;
         } else {
             self.reset_stale_running_state();
@@ -3765,6 +3873,13 @@ fn boot_failure_reason(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_tail_keeps_whole_last_lines() {
+        assert_eq!(super::console_tail("a\nb\n", 100), "a\nb\n");
+        let console = format!("{}\nlast line\n", "x".repeat(50));
+        assert_eq!(super::console_tail(&console, 15), "last line\n");
+    }
+
     #[test]
     fn intercepted_machine_cannot_relaunch_without_an_interceptor() {
         let temp = tempfile::tempdir().unwrap();

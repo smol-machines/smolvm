@@ -29,6 +29,7 @@
 use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
+use polling::{Event, Events};
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpListenEndpoint;
@@ -47,7 +48,14 @@ const MAX_CONNECTIONS: usize = 256;
 const CHANNEL_CAPACITY: usize = 32;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const CLOSE_RETRY_LIMIT: u16 = 64;
-const PROXY_IDLE_SLEEP: Duration = Duration::from_millis(10);
+/// The longest an idle relay thread waits before rechecking both directions
+/// on its own. Every way a direction gains work wakes it sooner: the host
+/// socket turning readable or writable, and the poll loop handing it a guest
+/// payload or closing the guest side. This only bounds the cost of a missed
+/// wake.
+const RELAY_WAIT_BACKSTOP: Duration = Duration::from_millis(100);
+/// The relay thread's key for its host socket in its own poller.
+const HOST_STREAM_KEY: usize = 0;
 const PUBLISHED_PORT_START: u16 = 49_152;
 const PUBLISHED_PORT_END: u16 = 65_535;
 
@@ -103,6 +111,9 @@ pub struct NewTcpConnection {
     pub to_smoltcp: SyncSender<Vec<u8>>,
     /// Shared relay exit state.
     pub exit_state: RelayExitState,
+    /// Wakes the relay thread when the poll loop hands it a guest payload or
+    /// closes the guest side.
+    pub proxy_wake: WakePipe,
 }
 
 #[derive(Debug)]
@@ -111,7 +122,7 @@ struct TrackedConnection {
     source: SocketAddr,
     destination: SocketAddr,
     // guest -> host relay payloads
-    to_proxy: Option<SyncSender<Vec<u8>>>,
+    to_proxy: Option<ToProxy>,
 
     // host -> guest relay payloads
     from_proxy: Receiver<Vec<u8>>,
@@ -140,6 +151,50 @@ struct PendingProxyEndpoints {
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_target: RelayTarget,
+    proxy_wake: WakePipe,
+}
+
+/// The poll loop's sending half of a guest->host channel. It wakes the relay
+/// thread on every payload it hands over, and again once it is dropped, so a
+/// relay waiting on its socket sees guest data and a guest close at once.
+#[derive(Debug)]
+struct ToProxy {
+    sender: Option<SyncSender<Vec<u8>>>,
+    wake: WakePipe,
+}
+
+impl ToProxy {
+    fn try_send(&self, payload: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(TrySendError::Disconnected(Vec::new()))?;
+        sender.try_send(payload)?;
+        self.wake.wake();
+        Ok(())
+    }
+}
+
+impl Drop for ToProxy {
+    fn drop(&mut self) {
+        // Disconnect first, so the woken relay observes the closed channel.
+        drop(self.sender.take());
+        self.wake.wake();
+    }
+}
+
+/// A guest->host channel whose sender wakes the relay thread waiting on `WakePipe`.
+fn proxy_channel() -> (ToProxy, Receiver<Vec<u8>>, WakePipe) {
+    let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
+    let wake = WakePipe::new();
+    (
+        ToProxy {
+            sender: Some(sender),
+            wake: wake.share(),
+        },
+        receiver,
+        wake,
+    )
 }
 
 /// How a host-side TCP relay should obtain its remote socket.
@@ -363,7 +418,11 @@ impl TcpRelayTable {
                 .record_denial("connect", &format_args!("to {destination}"));
             return false;
         }
-        self.egress.observe_destination(destination);
+        // A `block` entry fails the connection like a denial, recorded only as
+        // the watchlist match.
+        if self.egress.observe_destination(destination) {
+            return false;
+        }
 
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
@@ -379,7 +438,7 @@ impl TcpRelayTable {
 
         let handle = sockets.add(socket);
 
-        let (to_proxy_tx, to_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (to_proxy_tx, to_proxy_rx, proxy_wake) = proxy_channel();
         let (from_proxy_tx, from_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let exit_state = RelayExitState::new();
 
@@ -396,6 +455,7 @@ impl TcpRelayTable {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
                     relay_target: self.outbound_target(destination),
+                    proxy_wake,
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -478,7 +538,7 @@ impl TcpRelayTable {
         let handle = sockets.add(socket);
         let source = SocketAddr::new(std::net::IpAddr::V4(gateway_ip), local_port);
 
-        let (to_proxy_tx, to_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (to_proxy_tx, to_proxy_rx, proxy_wake) = proxy_channel();
         let (from_proxy_tx, from_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let exit_state = RelayExitState::new();
 
@@ -495,6 +555,7 @@ impl TcpRelayTable {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
                     relay_target: RelayTarget::Attached(host_stream),
+                    proxy_wake,
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -606,6 +667,7 @@ impl TcpRelayTable {
                         from_smoltcp: endpoints.from_smoltcp,
                         to_smoltcp: endpoints.to_smoltcp,
                         exit_state: connection.exit_state.clone(),
+                        proxy_wake: endpoints.proxy_wake,
                     });
                 }
             }
@@ -700,6 +762,7 @@ pub fn spawn_tcp_relay(
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
+    proxy_wake: WakePipe,
     exit_state: RelayExitState,
 ) -> io::Result<()> {
     let thread_name = format!("smolvm-tcp-{}", destination.port());
@@ -717,6 +780,7 @@ pub fn spawn_tcp_relay(
             from_smoltcp,
             to_smoltcp,
             relay_wake,
+            proxy_wake,
             exit_state,
         )
     });
@@ -759,6 +823,7 @@ fn run_tcp_relay(
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
+    proxy_wake: WakePipe,
     exit_state: RelayExitState,
 ) {
     // The relay thread is intentionally isolated from smoltcp internals. Its
@@ -773,6 +838,7 @@ fn run_tcp_relay(
         from_smoltcp,
         to_smoltcp,
         relay_wake,
+        proxy_wake,
         &exit_state,
     ) {
         Ok(mode) => {
@@ -800,6 +866,7 @@ fn tcp_relay_loop(
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
+    proxy_wake: WakePipe,
     exit_state: &RelayExitState,
 ) -> io::Result<RelayExitMode> {
     // Host-side flow:
@@ -807,8 +874,9 @@ fn tcp_relay_loop(
     // 1. Connect a normal host TcpStream to the destination.
     // 2. Non-blockingly drain guest payloads from the channel into the socket.
     // 3. Non-blockingly read remote payloads from the socket into the channel.
-    // 4. If neither side made progress, sleep briefly to avoid a hot spin loop.
-    let mut stream = match relay_target {
+    // 4. If neither side made progress, wait until one can: the host socket
+    //    turns readable or writable, or the poll loop wakes `proxy_wake`.
+    let stream = match relay_target {
         RelayTarget::Connect(destination) => {
             virtio_net_log!(
                 "virtio-net: connecting host TCP relay socket destination={}",
@@ -854,6 +922,53 @@ fn tcp_relay_loop(
     };
     stream.set_nonblocking(true)?;
 
+    let registered = RegisteredStream::new(stream, proxy_wake.poller().clone())?;
+    relay_stream(
+        &registered.stream,
+        &registered.poller,
+        from_smoltcp,
+        to_smoltcp,
+        &relay_wake,
+        exit_state,
+    )
+}
+
+/// A relay's host socket registered in the relay's poller. Owning both ties
+/// the registration to the socket's lifetime: `Drop` removes it before the
+/// socket closes, on every exit path, unwinding included.
+struct RegisteredStream {
+    stream: TcpStream,
+    poller: Arc<polling::Poller>,
+}
+
+impl RegisteredStream {
+    fn new(stream: TcpStream, poller: Arc<polling::Poller>) -> io::Result<Self> {
+        // SAFETY: the stream is owned by the value returned here, whose Drop
+        // removes it from the poller before the stream itself is dropped.
+        unsafe { poller.add(&stream, Event::none(HOST_STREAM_KEY))? };
+        Ok(Self { stream, poller })
+    }
+}
+
+impl Drop for RegisteredStream {
+    fn drop(&mut self) {
+        let _ = self.poller.delete(&self.stream);
+    }
+}
+
+/// Copies bytes both ways between the host socket and the guest channels
+/// until the flow ends, waiting on `poller` whenever neither direction can
+/// make progress.
+fn relay_stream(
+    stream: &TcpStream,
+    poller: &polling::Poller,
+    from_smoltcp: Receiver<Vec<u8>>,
+    to_smoltcp: SyncSender<Vec<u8>>,
+    relay_wake: &WakePipe,
+    exit_state: &RelayExitState,
+) -> io::Result<RelayExitMode> {
+    let mut stream = stream;
+    let mut events = Events::new();
     let mut guest_write_closed = false;
     let mut guest_channel_closed = false;
     let mut host_read_closed = false;
@@ -945,7 +1060,16 @@ fn tcp_relay_loop(
         }
 
         if !did_work {
-            thread::sleep(PROXY_IDLE_SLEEP);
+            // Read interest while the host may still send; write interest
+            // while a guest payload waits on a full host send buffer.
+            let interest = Event::new(
+                HOST_STREAM_KEY,
+                !host_read_closed,
+                pending_guest_data.is_some(),
+            );
+            poller.modify(stream, interest)?;
+            events.clear();
+            poller.wait(&mut events, Some(RELAY_WAIT_BACKSTOP))?;
         }
     }
 }
@@ -1052,7 +1176,10 @@ mod tests {
         TrackedConnection {
             source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12_345),
             destination: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 80),
-            to_proxy: Some(to_proxy),
+            to_proxy: Some(ToProxy {
+                sender: Some(to_proxy),
+                wake: WakePipe::new(),
+            }),
             from_proxy,
             pending_proxy_endpoints: None,
             relay_spawned: true,
@@ -1077,6 +1204,82 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(exit_state.load(), RelayExitMode::Abort);
+    }
+
+    /// A host echo server for one connection, on loopback.
+    fn echo_server() -> SocketAddr {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 64];
+            while let Ok(read @ 1..) = stream.read(&mut buffer) {
+                if stream.write_all(&buffer[..read]).is_err() {
+                    break;
+                }
+            }
+        });
+        address
+    }
+
+    /// A relay thread connected to `destination`, with the poll loop's ends of its channels.
+    fn spawn_test_relay(destination: SocketAddr) -> (ToProxy, Receiver<Vec<u8>>, RelayExitState) {
+        let (to_proxy, from_smoltcp, proxy_wake) = proxy_channel();
+        let (to_smoltcp, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let exit_state = RelayExitState::new();
+        spawn_tcp_relay(
+            destination,
+            RelayTarget::Connect(destination),
+            from_smoltcp,
+            to_smoltcp,
+            Arc::new(WakePipe::new()),
+            proxy_wake,
+            exit_state.clone(),
+        )
+        .unwrap();
+        (to_proxy, from_proxy, exit_state)
+    }
+
+    #[test]
+    fn an_idle_relay_forwards_both_ways_without_waiting_out_a_poll_interval() {
+        let (to_proxy, from_proxy, _exit_state) = spawn_test_relay(echo_server());
+        let mut round_trips = Vec::new();
+        for byte in 0..21u8 {
+            // Let the relay go idle first: the case a fixed poll interval made slow.
+            // The old 10 ms poll put the median near 15-18 ms; a woken relay is
+            // well under 1 ms, so 8 ms leaves room for a loaded CI runner.
+            thread::sleep(Duration::from_millis(15));
+            let started = std::time::Instant::now();
+            to_proxy.try_send(vec![byte]).unwrap();
+            assert_eq!(
+                from_proxy.recv_timeout(Duration::from_secs(2)).unwrap(),
+                vec![byte]
+            );
+            round_trips.push(started.elapsed());
+        }
+        round_trips.sort();
+        let median = round_trips[round_trips.len() / 2];
+        assert!(
+            median < Duration::from_millis(8),
+            "median guest->host->guest round trip through an idle relay was {median:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_the_guest_side_wakes_an_idle_relay_to_finish() {
+        let (to_proxy, _from_proxy, exit_state) = spawn_test_relay(echo_server());
+        to_proxy.try_send(vec![1]).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let started = std::time::Instant::now();
+        drop(to_proxy);
+        while exit_state.load() == RelayExitMode::Running {
+            assert!(
+                started.elapsed() < RELAY_WAIT_BACKSTOP / 2,
+                "relay still running {:?} after the guest side closed",
+                started.elapsed()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
@@ -1202,6 +1405,7 @@ mod tests {
             from_smoltcp_rx,
             to_smoltcp_tx,
             wake_pipe,
+            WakePipe::new(),
             &exit_state,
         )
         .unwrap();
@@ -1249,6 +1453,7 @@ mod tests {
             from_smoltcp_rx,
             to_smoltcp_tx,
             wake_pipe,
+            WakePipe::new(),
             &exit_state,
         )
         .unwrap();
@@ -1341,6 +1546,7 @@ mod tests {
                 receiver,
                 reply,
                 Arc::new(WakePipe::new()),
+                WakePipe::new(),
                 &RelayExitState::new(),
             )
             .is_err());

@@ -21,6 +21,7 @@ pub mod terminal;
 #[cfg(unix)]
 pub mod video;
 pub(crate) mod virtiofs;
+pub use virtiofs::legacy_packed_layers_dax_window;
 /// Encoded browser video is unavailable on non-Unix hosts because the helper
 /// transport uses a mode-restricted Unix socket.
 #[cfg(not(unix))]

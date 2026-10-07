@@ -1025,7 +1025,7 @@ pub async fn capture_portable_checkpoint(
         std::env::var("SMOLVM_PREPARED_CHECKPOINT_CACHE_MAX_BYTES")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(8 * 1024 * 1024 * 1024)
+            .unwrap_or_else(crate::portable_checkpoint::prepared_checkpoint_budget)
     });
     let incremental = capture_options.incremental.unwrap_or(false);
     // Keep staging alive until the background capture finishes, even on disconnect.
@@ -2032,6 +2032,11 @@ pub async fn restore_portable_checkpoint(
     let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
+    // The restore no longer leases the checkpoint's shared extraction.
+    #[cfg(target_os = "linux")]
+    if result.is_ok() {
+        crate::artifact_cache::trim_unleased_shared_packs_soon();
+    }
     // A hit is already cached; re-linking it would only change the inode's
     // ctime under the restores still sharing it.
     if result.is_ok() && !cache_hit {
@@ -2772,6 +2777,7 @@ async fn create_machine_inner(
                             &name,
                             &image,
                             &crate::registry::PullAuth::FromConfig,
+                            storage_gb,
                             None,
                             None,
                             None,
@@ -3681,6 +3687,7 @@ pub async fn start_machine(
                         &name_clone,
                         &image,
                         &seed_auth,
+                        storage_gb,
                         None,
                         None,
                         None,
@@ -3861,6 +3868,8 @@ pub async fn start_machine(
 
     // Capture start time for PID verification
     let pid_start_time = pid.and_then(process_start_time);
+    // Past the fatal pull above, the machine's storage holds its image.
+    let image_on_storage = record.image.is_some() && !restoring_checkpoint;
 
     // Persist state to database (off the reactor)
     let record = state
@@ -3868,6 +3877,9 @@ pub async fn start_machine(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            if image_on_storage {
+                r.mark_image_on_storage();
+            }
             // An explicit start re-enables supervision: clear the user-stopped
             // flag and reset the retry budget so a machine that previously
             // exhausted max_retries can be restarted and supervised again.
@@ -4956,7 +4968,11 @@ pub async fn paused_checkpoint(
             )
         })?;
         crate::portable_checkpoint::verified_sidecar_footer(&path)?;
-        std::fs::File::open(path).map_err(SmolvmError::from)
+        // A download leaves the host, so it carries the layers a pause pinned.
+        crate::portable_checkpoint::exportable_paused_artifact(
+            &crate::agent::vm_data_dir(&name),
+            &path,
+        )
     })
     .await?
     .map_err(ApiError::from)?;
@@ -5419,6 +5435,10 @@ fn remove_machine_data_and_record(
                     "failed to remove data for machine '{name}': {error}; repair host storage and retry deletion"
                 ))
             })?;
+            // Layers a pause pinned beside the data directory go with it.
+            if let Err(error) = crate::portable_checkpoint::remove_paused_layers(data_dir) {
+                tracing::warn!(machine = name, %error, "could not remove pinned layers");
+            }
         }
         // Storage may already be gone after an interrupted delete or DB failure.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -5601,6 +5621,9 @@ async fn delete_one_transaction(
             })?;
         return Err(error);
     }
+    // The machine may have held the last lease on a shared extraction.
+    #[cfg(target_os = "linux")]
+    crate::artifact_cache::trim_unleased_shared_packs_soon();
 
     if let Some(parent) = record.golden.clone() {
         let db = state.db().clone();

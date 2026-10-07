@@ -64,9 +64,41 @@ const UPLOAD_MIN_RATE: u64 = 256 * 1024;
 /// multipart backends require.
 const FALLBACK_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Use the host's installed roots alongside the bundled public roots. When a
+/// caller explicitly supplies the same bundle used by `--trust-host-certs`,
+/// add its certificates to both registry and auth-service requests as well.
+fn registry_tls(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let path = std::env::var_os("SMOLVM_HOST_CA_BUNDLE");
+    registry_tls_with_bundle(builder, path.as_deref().map(std::path::Path::new))
+}
+
+fn registry_tls_with_bundle(
+    mut builder: reqwest::ClientBuilder,
+    bundle: Option<&std::path::Path>,
+) -> reqwest::ClientBuilder {
+    if let Some(path) = bundle {
+        match std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|pem| reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| e.to_string()))
+        {
+            Ok(certs) if !certs.is_empty() => {
+                for cert in certs {
+                    builder = builder.add_root_certificate(cert);
+                }
+            }
+            result => tracing::warn!(
+                path = %path.display(),
+                error = ?result.err(),
+                "cannot load explicit host CA bundle for registry requests"
+            ),
+        }
+    }
+    builder
+}
+
 /// The shared HTTP client for every registry request, with the deadlines above.
 fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    registry_tls(reqwest::Client::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()
@@ -85,7 +117,7 @@ fn http_client() -> reqwest::Client {
 /// the body size (see [`RegistryClient::upload_request`]), which bounds a
 /// stalled transfer without capping a slow-but-progressing one.
 fn upload_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    registry_tls(reqwest::Client::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -1687,6 +1719,72 @@ struct TokenResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn registry_clients_verify_private_ca_for_registry_and_auth_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("roots.pem");
+        std::fs::write(&bundle, cert.pem()).unwrap();
+        let config = tokio_rustls::rustls::ServerConfig::builder_with_provider(
+            std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "https://localhost:{}/v2/",
+            listener.local_addr().unwrap().port()
+        );
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (socket, _) = listener.accept().await.unwrap();
+                if let Ok(mut socket) = acceptor.accept(socket).await {
+                    let mut request = [0; 1024];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let ordinary = registry_tls_with_bundle(reqwest::Client::builder(), None)
+            .no_proxy()
+            .build()
+            .unwrap();
+        assert!(ordinary.get(&url).send().await.is_err());
+        for builder in [
+            reqwest::Client::builder().read_timeout(READ_TIMEOUT),
+            reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT),
+        ] {
+            let trusted = registry_tls_with_bundle(builder, Some(&bundle))
+                .no_proxy()
+                .build()
+                .unwrap();
+            assert_eq!(
+                trusted.get(&url).send().await.unwrap().status(),
+                reqwest::StatusCode::OK
+            );
+        }
+        server.await.unwrap();
+    }
 
     #[test]
     fn parse_next_link_extracts_rel_next() {

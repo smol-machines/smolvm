@@ -29,7 +29,8 @@
 
 #[cfg(unix)]
 pub use imp::{
-    revalidate_seed, seed_root, seed_storage, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage, seed_storage_with_trust,
+    seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
@@ -55,17 +56,24 @@ pub fn seed_first_start(
     let Some(image) = wants_seed(name, record, from_snapshot) else {
         return;
     };
+    // A seed is built by a separate VM. Carry the same opt-in host trust
+    // mount to that VM so a private-CA registry can use the seed fast path.
+    let trust_host_certs = record.host_mounts().iter().any(|mount| {
+        mount.read_only && mount.target == std::path::Path::new("/etc/smolvm-host-trust")
+    });
     let seeded = builder_exe()
         .map_err(|e| crate::Error::config("image seed", e.to_string()))
         .and_then(|exe| {
-            seed_storage(
+            seed_storage_with_trust(
                 &exe,
                 name,
                 &image,
                 &crate::registry::PullAuth::FromConfig,
+                record.storage_gb,
                 digest_ttl,
                 proxy,
                 no_proxy,
+                trust_host_certs,
             )
         });
     if let Err(error) = seeded {
@@ -88,20 +96,36 @@ pub fn seed_ephemeral_run(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
 ) {
+    seed_ephemeral_run_with_trust(name, image, storage_gb, digest_ttl, proxy, no_proxy, false);
+}
+
+/// Seed an ephemeral run whose workload also trusts the host's certificates.
+#[allow(clippy::too_many_arguments)]
+pub fn seed_ephemeral_run_with_trust(
+    name: &str,
+    image: Option<&str>,
+    storage_gb: Option<u64>,
+    digest_ttl: Option<u64>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    trust_host_certs: bool,
+) {
     let Some(image) = seedable_image(name, image, storage_gb) else {
         return;
     };
     let seeded = builder_exe()
         .map_err(|e| crate::Error::config("image seed", e.to_string()))
         .and_then(|exe| {
-            seed_storage(
+            seed_storage_with_trust(
                 &exe,
                 name,
                 &image,
                 &crate::registry::PullAuth::FromConfig,
+                storage_gb,
                 digest_ttl,
                 proxy,
                 no_proxy,
+                trust_host_certs,
             )
         });
     if let Err(error) = seeded {
@@ -123,14 +147,33 @@ pub fn seedable_image(_: &str, _: Option<&str>, _: Option<u64>) -> Option<String
 
 /// Seeds need a Unix host; elsewhere nothing seeds.
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
 pub fn seed_storage(
     _: &std::path::Path,
     _: &str,
     _: &str,
     _: &crate::registry::PullAuth,
     _: Option<u64>,
+    _: Option<u64>,
     _: Option<&str>,
     _: Option<&str>,
+) -> crate::Result<bool> {
+    Ok(false)
+}
+
+/// Seeds need a Unix host; on other platforms a trust-aware seed is unavailable.
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+pub fn seed_storage_with_trust(
+    _: &std::path::Path,
+    _: &str,
+    _: &str,
+    _: &crate::registry::PullAuth,
+    _: Option<u64>,
+    _: Option<u64>,
+    _: Option<&str>,
+    _: Option<&str>,
+    _: bool,
 ) -> crate::Result<bool> {
     Ok(false)
 }
@@ -184,8 +227,9 @@ mod imp {
     }
 
     /// `image` when a machine called `name` with that image and storage size can
-    /// start on a seed: a registry image, the default storage size, no storage
-    /// disk yet, and seeding on.
+    /// start on a seed: a registry image, at least the default storage size (a
+    /// larger disk is the seed grown, see [`grow`]), no storage disk yet, and
+    /// seeding on.
     pub fn seedable_image(
         name: &str,
         image: Option<&str>,
@@ -194,7 +238,7 @@ mod imp {
         // The builder's own machine pulls the normal way.
         if name.starts_with(SEED_MACHINE_PREFIX)
             || std::env::var("SMOLVM_IMAGE_SEEDS").is_ok_and(|v| v.trim() == "0")
-            || storage_gb.is_some_and(|gb| gb != crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+            || storage_gb.is_some_and(|gb| gb < crate::storage::DEFAULT_STORAGE_SIZE_GIB)
         {
             return None;
         }
@@ -321,17 +365,91 @@ mod imp {
     }
 
     /// Give machine `name` a storage disk over the seed for `image`, building the
-    /// seed first (with `exe`, this smolvm binary) if its digest has none yet.
+    /// seed first (with `exe`, this smolvm binary) if its digest has none yet,
+    /// and grown to `storage_gb` when that is larger than the seed.
     /// Returns `Ok(false)` when the storage template cannot back a seed.
+    #[allow(clippy::too_many_arguments)]
     pub fn seed_storage(
         exe: &Path,
         name: &str,
         image: &str,
         auth: &PullAuth,
+        storage_gb: Option<u64>,
         digest_ttl: Option<u64>,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
     ) -> Result<bool> {
+        seed_storage_with_trust(
+            exe, name, image, auth, storage_gb, digest_ttl, proxy, no_proxy, false,
+        )
+    }
+
+    /// Build or attach an image seed with host trust in its throwaway builder
+    /// when `trust_host_certs` was selected on the parent machine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_storage_with_trust(
+        exe: &Path,
+        name: &str,
+        image: &str,
+        auth: &PullAuth,
+        storage_gb: Option<u64>,
+        digest_ttl: Option<u64>,
+        proxy: Option<&str>,
+        no_proxy: Option<&str>,
+        trust_host_certs: bool,
+    ) -> Result<bool> {
+        let EnsuredSeed {
+            root,
+            key_dir,
+            cache,
+            built,
+        } = ensure_seed(
+            exe,
+            image,
+            auth,
+            digest_ttl,
+            proxy,
+            no_proxy,
+            trust_host_certs,
+        )?;
+        let Some((seed, format)) = seed_disk(&key_dir) else {
+            return Err(Error::config(
+                "image seed",
+                "seed disappeared before overlay creation",
+            ));
+        };
+        attach_seed_disk(name, &seed, format, storage_gb)?;
+        // Recently used seeds are the last to be evicted.
+        let _ =
+            std::fs::File::open(&seed).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        drop(cache);
+        note_recent_image(&root, image);
+        if built {
+            prune(&root, max_bytes(), &seed);
+        }
+        Ok(true)
+    }
+
+    /// The seed directory for `image` once its seed exists, holding the shared
+    /// cache lock so prune cannot remove it before the caller attaches it.
+    struct EnsuredSeed {
+        root: PathBuf,
+        key_dir: PathBuf,
+        cache: CacheLock,
+        built: bool,
+    }
+
+    /// Make sure the seed for `image` at its current digest exists, building it
+    /// (with `exe`) when it does not.
+    fn ensure_seed(
+        exe: &Path,
+        image: &str,
+        auth: &PullAuth,
+        digest_ttl: Option<u64>,
+        proxy: Option<&str>,
+        no_proxy: Option<&str>,
+        trust_host_certs: bool,
+    ) -> Result<EnsuredSeed> {
         let template = storage_template();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -357,7 +475,16 @@ mod imp {
             // file would let new callers lock a different inode for this key.
             let _build = Lock::exclusive(&root.join(format!("{key}.lock")))?;
             if seed_disk(&key_dir).is_none() {
-                build_seed(exe, image, auth, &key, &key_dir, proxy, no_proxy)?;
+                build_seed(
+                    exe,
+                    image,
+                    auth,
+                    &key,
+                    &key_dir,
+                    proxy,
+                    no_proxy,
+                    trust_host_certs,
+                )?;
                 // The builder pulled the tag, not the digest. If the tag moved
                 // in the meantime, discard the seed rather than miskey it.
                 if resolve()? != digest {
@@ -375,12 +502,21 @@ mod imp {
             }
             cache = CacheLock::shared(&root)?;
         }
-        let Some((seed, format)) = seed_disk(&key_dir) else {
-            return Err(Error::config(
-                "image seed",
-                "seed disappeared before overlay creation",
-            ));
-        };
+        Ok(EnsuredSeed {
+            root,
+            key_dir,
+            cache,
+            built,
+        })
+    }
+
+    /// Give machine `name` its storage disk over `seed`, grown to `storage_gb`.
+    fn attach_seed_disk(
+        name: &str,
+        seed: &Path,
+        format: DiskFormat,
+        storage_gb: Option<u64>,
+    ) -> Result<()> {
         let dir = crate::agent::ensure_vm_dir(name)
             .map_err(|e| Error::config("image seed", e.to_string()))?;
         let storage = dir
@@ -398,7 +534,11 @@ mod imp {
             std::process::id(),
             format.extension()
         ));
-        let created = attach(&staging, &seed, format).and_then(|()| {
+        let size_bytes = storage_gb
+            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+            .saturating_mul(crate::data::consts::BYTES_PER_GIB);
+        let created = attach(&staging, seed, format).and_then(|()| {
+            grow(&staging, format, size_bytes)?;
             // A clone keeps no link to its seed; record it for revalidation.
             if matches!(format, DiskFormat::Raw) {
                 std::fs::write(source_marker(&storage), seed.as_os_str().as_encoded_bytes())
@@ -420,14 +560,84 @@ mod imp {
             std::fs::write(storage.with_extension("formatted"), "1")
                 .map_err(|e| Error::config("image seed", e.to_string()))?;
         }
-        // Recently used seeds are the last to be evicted.
-        let _ =
-            std::fs::File::open(&seed).and_then(|f| f.set_modified(std::time::SystemTime::now()));
-        drop(cache);
-        if built {
-            prune(&root, max_bytes(), &seed);
+        Ok(())
+    }
+
+    /// Images whose seeds machines used recently, newest first: what to rebuild
+    /// after a new smolvm version invalidates every seed.
+    const RECENT_IMAGES: &str = ".recent-images.json";
+    /// Images the index remembers.
+    const RECENT_IMAGES_KEPT: usize = 32;
+    /// How far back a seed counts as recently used for prewarming.
+    pub(super) const PREWARM_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+    /// Seeds rebuilt at most per prewarm, so a server start does not spend
+    /// long building images nobody needs.
+    const PREWARM_MAX_IMAGES: usize = 8;
+
+    pub(super) fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    fn read_recent_images(root: &Path) -> Vec<(String, u64)> {
+        std::fs::read(root.join(RECENT_IMAGES))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Vec<(String, u64)>>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Record that a machine just used the seed for `image`. Best effort: the
+    /// index only steers prewarming.
+    pub(super) fn note_recent_image(root: &Path, image: &str) {
+        let Ok(_lock) = Lock::exclusive(&root.join(".recent-images.lock")) else {
+            return;
+        };
+        let mut images = read_recent_images(root);
+        images.retain(|(seen, _)| seen != image);
+        images.insert(0, (image.to_string(), now_secs()));
+        images.truncate(RECENT_IMAGES_KEPT);
+        let staging = root.join(format!("{RECENT_IMAGES}.{}.tmp", std::process::id()));
+        let written = serde_json::to_vec(&images)
+            .map_err(std::io::Error::other)
+            .and_then(|raw| std::fs::write(&staging, raw))
+            .and_then(|()| std::fs::rename(&staging, root.join(RECENT_IMAGES)));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&staging);
         }
-        Ok(true)
+    }
+
+    /// The images to prewarm: used within the window, newest first, capped.
+    pub(super) fn prewarm_candidates(root: &Path, now: u64) -> Vec<String> {
+        read_recent_images(root)
+            .into_iter()
+            .filter(|(_, used)| now.saturating_sub(*used) <= PREWARM_WINDOW_SECS)
+            .map(|(image, _)| image)
+            .take(PREWARM_MAX_IMAGES)
+            .collect()
+    }
+
+    /// Build seeds for the images machines used recently on this host, so the
+    /// first machine of each after an upgrade (whose version change made every
+    /// seed stale) does not wait for a build. Runs the builds one at a time;
+    /// an image this host cannot pull without the machine's own credentials is
+    /// skipped and seeds on its next machine as before.
+    pub fn prewarm_recent_seeds(exe: &Path) {
+        let root = seed_root();
+        for image in prewarm_candidates(&root, now_secs()) {
+            let started = std::time::Instant::now();
+            match ensure_seed(exe, &image, &PullAuth::FromConfig, None, None, None, false) {
+                Ok(EnsuredSeed { built, .. }) => tracing::info!(
+                    %image,
+                    built,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "prewarmed image seed"
+                ),
+                Err(error) => {
+                    tracing::info!(%image, %error, "could not prewarm image seed; it seeds on first use")
+                }
+            }
+        }
     }
 
     /// Reauthorize a seed attached at API create with the credentials supplied
@@ -493,6 +703,7 @@ mod imp {
 
     /// Pull `image` once in a throwaway machine that never runs a workload, and
     /// publish its storage disk as the seed.
+    #[allow(clippy::too_many_arguments)]
     fn build_seed(
         exe: &Path,
         image: &str,
@@ -501,6 +712,7 @@ mod imp {
         key_dir: &Path,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
+        trust_host_certs: bool,
     ) -> Result<()> {
         reap_stale_builders(exe);
         let tmp = format!("{SEED_MACHINE_PREFIX}{}-{}", &key[..16], std::process::id());
@@ -509,12 +721,13 @@ mod imp {
         let mut staged: Option<(PathBuf, PathBuf)> = None;
         let started = std::time::Instant::now();
         let built = (|| -> Result<()> {
-            run(
-                exe,
-                &[
-                    "machine", "create", "--name", &tmp, "--image", image, "--net",
-                ],
-            )?;
+            let mut create = vec![
+                "machine", "create", "--name", &tmp, "--image", image, "--net",
+            ];
+            if trust_host_certs {
+                create.push("--trust-host-certs");
+            }
+            run(exe, &create)?;
             let mut start = vec!["machine", "start", "--name", &tmp, "--no-workload"];
             if let Some(proxy) = proxy {
                 start.extend(["--proxy", proxy]);
@@ -691,6 +904,39 @@ mod imp {
         // The clone keeps the seed's read-only mode; the machine writes its disk.
         std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| Error::config("image seed", e.to_string()))
+    }
+
+    /// Grow a freshly attached disk to `size_bytes` (sparse; never shrinks). The
+    /// guest grows the seed's ext4 into the new space at boot, as it does for a
+    /// template disk, so a larger machine starts from the same seed.
+    pub(super) fn grow(disk: &Path, format: DiskFormat, size_bytes: u64) -> Result<()> {
+        let fail = |e: std::io::Error| Error::config("grow seeded disk", e.to_string());
+        match format {
+            DiskFormat::Raw => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(disk)
+                    .map_err(fail)?;
+                if file.metadata().map_err(fail)?.len() < size_bytes {
+                    file.set_len(size_bytes).map_err(fail)?;
+                }
+                Ok(())
+            }
+            DiskFormat::Qcow2 => {
+                use imago::FormatDriverBuilder;
+                let qcow = imago::qcow2::Qcow2::<imago::file::File>::builder_path(disk)
+                    .write(true)
+                    .open_sync(imago::PermissiveImplicitOpenGate::default())
+                    .map_err(fail)?;
+                let access = imago::SyncFormatAccess::new(qcow).map_err(fail)?;
+                if access.size() < size_bytes {
+                    access
+                        .resize_grow(size_bytes, imago::format::PreallocateMode::None)
+                        .map_err(fail)?;
+                }
+                access.flush().map_err(fail)
+            }
+        }
     }
 
     /// An APFS clone. Never a full copy: that would write the whole 20 GiB disk,
@@ -956,6 +1202,102 @@ mod imp {
 mod tests {
     use super::imp::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn recently_used_images_are_prewarmed_newest_first_within_the_window() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(prewarm_candidates(root.path(), 0).is_empty());
+        note_recent_image(root.path(), "alpine");
+        note_recent_image(root.path(), "docker:dind");
+        note_recent_image(root.path(), "alpine"); // used again: moves to the front
+        let now = now_secs();
+        assert_eq!(
+            prewarm_candidates(root.path(), now),
+            vec!["alpine".to_string(), "docker:dind".to_string()]
+        );
+        // Outside the window, nothing is prewarmed.
+        assert!(prewarm_candidates(root.path(), now + PREWARM_WINDOW_SECS + 1).is_empty());
+    }
+
+    #[test]
+    fn a_larger_disk_seeds_and_a_smaller_one_pulls() {
+        let default = crate::storage::DEFAULT_STORAGE_SIZE_GIB;
+        let name = "seed-size-gate-test";
+        assert!(seedable_image(name, Some("alpine"), None).is_some());
+        assert!(seedable_image(name, Some("alpine"), Some(default)).is_some());
+        assert!(seedable_image(name, Some("alpine"), Some(default * 5)).is_some());
+        assert!(seedable_image(name, Some("alpine"), Some(default - 1)).is_none());
+    }
+
+    #[test]
+    fn a_seeded_disk_grows_to_the_requested_size_and_keeps_the_seed() {
+        use crate::storage::DiskFormat;
+        use imago::{FormatCreateBuilder, FormatDriverBuilder};
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A raw clone grows sparsely and keeps its bytes.
+        let raw = dir.path().join("storage.raw");
+        std::fs::write(&raw, b"seeded").unwrap();
+        grow(&raw, DiskFormat::Raw, 64 * MIB).unwrap();
+        assert_eq!(std::fs::metadata(&raw).unwrap().len(), 64 * MIB);
+        assert_eq!(&std::fs::read(&raw).unwrap()[..6], b"seeded");
+        // Never shrinks.
+        grow(&raw, DiskFormat::Raw, MIB).unwrap();
+        assert_eq!(std::fs::metadata(&raw).unwrap().len(), 64 * MIB);
+
+        // A qcow2 overlay over a seed grows its virtual size and still reads
+        // the seed through its backing.
+        let base = dir.path().join("seed.raw");
+        let mut seed = vec![0_u8; (16 * MIB) as usize];
+        seed[..6].copy_from_slice(b"seeded");
+        std::fs::write(&base, &seed).unwrap();
+        let overlay = dir.path().join("storage.qcow2");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&overlay)
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(
+                imago::qcow2::Qcow2::<imago::file::File>::create_builder(
+                    imago::file::File::try_from(file).unwrap(),
+                )
+                .size(16 * MIB)
+                .backing("seed.raw".to_string(), "raw".to_string())
+                .create(),
+            )
+            .unwrap();
+        grow(&overlay, DiskFormat::Qcow2, 64 * MIB).unwrap();
+        let qcow = imago::qcow2::Qcow2::<imago::file::File>::builder_path(&overlay)
+            .open_sync(imago::PermissiveImplicitOpenGate::default())
+            .unwrap();
+        let access = imago::SyncFormatAccess::new(qcow).unwrap();
+        assert_eq!(access.size(), 64 * MIB);
+        let mut head = [0_u8; 6];
+        access.read(&mut head[..], 0).unwrap();
+        assert_eq!(&head, b"seeded");
+        let mut tail = [0xff_u8; 4];
+        access.read(&mut tail[..], 64 * MIB - 4).unwrap();
+        assert_eq!(tail, [0; 4]);
+    }
+
+    #[test]
+    fn a_started_machine_does_not_seed_again() {
+        let mut record = crate::config::VmRecord::new(
+            "seed-test-started-machine".to_string(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+        );
+        record.image = Some("alpine:3.20".to_string());
+        record.mark_image_on_storage();
+        assert_eq!(wants_seed(&record.name, &record, false), None);
+    }
 
     #[test]
     fn key_changes_with_digest_and_image() {

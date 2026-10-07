@@ -724,6 +724,7 @@ impl PackRunCmd {
                     .as_ref()
                     .and_then(|policy| policy.dns_filter_hosts.clone()),
                 packed_layers_dir: Some(layers_dir.to_path_buf()),
+                packed_layers_dax_window: smolvm::agent::legacy_packed_layers_dax_window(),
                 pack_idmap_source: None,
                 extra_disks: vec![],
                 pod_netns: None,
@@ -1886,6 +1887,7 @@ fn run_from_cache(
             published_sockets: Vec::new(),
             dns_filter_hosts: None,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
+            packed_layers_dax_window: smolvm::agent::legacy_packed_layers_dax_window(),
             pack_idmap_source: None,
             extra_disks: vec![],
             pod_netns: None,

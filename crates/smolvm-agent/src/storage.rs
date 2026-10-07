@@ -2231,6 +2231,50 @@ fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
 ///
 /// Runs on a worker thread, so it touches only this layer's own directory and
 /// reports nothing: progress belongs to the caller's thread.
+/// [`fetch_and_extract_layer`], retried on a transient network failure like the
+/// manifest and config fetches in [`run_crane`]. One dropped connection while
+/// downloading any layer otherwise fails the whole pull. A retry is safe: each
+/// attempt starts by removing what an earlier one left in `layer_dir`.
+#[allow(clippy::too_many_arguments)]
+fn fetch_and_extract_layer_with_retry(
+    image: &str,
+    layer_digest: &str,
+    layer_id: &str,
+    layer_dir: &Path,
+    oci_platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    index: usize,
+    total_layers: usize,
+) -> Result<u64> {
+    use crate::retry::{
+        is_permanent_error, is_transient_network_error, retry_with_backoff, RetryConfig,
+    };
+    retry_with_backoff(
+        RetryConfig::for_network(),
+        &format!("fetch layer {layer_id}"),
+        || {
+            fetch_and_extract_layer(
+                image,
+                layer_digest,
+                layer_id,
+                layer_dir,
+                oci_platform,
+                auth,
+                proxy,
+                no_proxy,
+                index,
+                total_layers,
+            )
+        },
+        |e| {
+            let error_msg = e.to_string();
+            !is_permanent_error(&error_msg) && is_transient_network_error(&error_msg)
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fetch_and_extract_layer(
     image: &str,
@@ -2287,6 +2331,7 @@ fn fetch_and_extract_layer(
     }
     crane_cmd.env("DOCKER_CONFIG", temp_dir.path());
     apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
+    apply_registry_trust(&mut crane_cmd);
 
     let mut crane = crane_cmd
         .spawn()
@@ -2552,7 +2597,7 @@ where
                     else {
                         break;
                     };
-                    let outcome = fetch_and_extract_layer(
+                    let outcome = fetch_and_extract_layer_with_retry(
                         image,
                         layer_digest,
                         &layer_id,
@@ -5039,6 +5084,19 @@ fn apply_proxy_env(cmd: &mut Command, proxy: Option<&str>, no_proxy: Option<&str
     }
 }
 
+/// The host trust volume is mounted at boot, before image pulls. Keep its
+/// trust scoped to registry subprocesses and only opt in when the bundle is
+/// present; crane (Go) reads SSL_CERT_FILE for manifests, auth and blobs.
+fn apply_registry_trust(cmd: &mut Command) {
+    apply_registry_trust_from(cmd, Path::new("/etc/smolvm-host-trust/ca-bundle.pem"));
+}
+
+fn apply_registry_trust_from(cmd: &mut Command, bundle: &Path) {
+    if bundle.is_file() {
+        cmd.env("SSL_CERT_FILE", bundle);
+    }
+}
+
 /// Run a crane command with the given operation.
 ///
 /// If auth is provided, creates a temporary Docker config for crane to use.
@@ -5094,6 +5152,7 @@ fn run_crane_once(
     cmd.env("DOCKER_CONFIG", _temp_dir.path());
 
     apply_proxy_env(&mut cmd, proxy, no_proxy);
+    apply_registry_trust(&mut cmd);
 
     let output = cmd.output()?;
 
@@ -6012,6 +6071,25 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn registry_trust_only_applies_when_the_bundle_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("ca-bundle.pem");
+        let mut cmd = Command::new("crane");
+        apply_registry_trust_from(&mut cmd, &bundle);
+        assert!(explicit_envs(&cmd).is_empty());
+
+        std::fs::write(&bundle, "certificate fixture").unwrap();
+        apply_registry_trust_from(&mut cmd, &bundle);
+        assert_eq!(
+            explicit_envs(&cmd),
+            vec![(
+                "SSL_CERT_FILE".to_string(),
+                bundle.to_string_lossy().into_owned()
+            )]
+        );
     }
 
     #[test]

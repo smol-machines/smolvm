@@ -1113,6 +1113,16 @@ impl VmRecord {
         Ok(())
     }
 
+    /// Record that this machine's storage disk holds its image, after a start
+    /// pulled it. Later starts boot the disk they have, as after the CLI's first
+    /// start, instead of seeding it, revalidating a seed (which removes the disk
+    /// when the registry check fails) or fetching the image on the host again.
+    pub fn mark_image_on_storage(&mut self) {
+        if self.image.is_some() {
+            self.init_completed = true;
+        }
+    }
+
     /// Boot from `local_ref`, a host-fetched copy of this machine's registry
     /// image whose manifest digest is `digest`, keeping the reference it came
     /// from as `image_origin`.
@@ -1517,6 +1527,25 @@ mod tests {
         let mut r = rec_with_image("alpine:3.20", false, vec![]);
         r.host_uid_owner = Some("restored".to_string());
         assert!(!r.image_needs_host_fetch());
+    }
+
+    #[test]
+    fn an_api_started_machine_keeps_its_image_once_it_loses_its_network() {
+        // A machine started with a network, then updated to have none: its
+        // first start already pulled the image onto its storage disk.
+        let mut r = rec_with_image("alpine:3.20", false, vec![]);
+        assert!(r.image_needs_host_fetch());
+        r.mark_image_on_storage();
+        assert!(r.init_completed);
+        assert!(!r.image_needs_host_fetch());
+        assert_eq!(r.image.as_deref(), Some("alpine:3.20"));
+    }
+
+    #[test]
+    fn a_machine_without_an_image_is_not_marked_initialized() {
+        let mut r = VmRecord::new("m".to_string(), 1, 512, vec![], vec![], false);
+        r.mark_image_on_storage();
+        assert!(!r.init_completed);
     }
 
     #[test]

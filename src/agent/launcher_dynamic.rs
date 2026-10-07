@@ -909,7 +909,7 @@ pub fn launch_agent_vm_dynamic(
                     ctx,
                     layers_tag.as_ptr(),
                     layers_path.as_ptr(),
-                    super::virtiofs::packed_layers_dax_window(),
+                    super::virtiofs::legacy_packed_layers_dax_window(),
                     false,
                     super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
                 )
@@ -920,7 +920,7 @@ pub fn launch_agent_vm_dynamic(
                     ctx,
                     layers_tag.as_ptr(),
                     layers_path.as_ptr(),
-                    super::virtiofs::packed_layers_dax_window(),
+                    super::virtiofs::legacy_packed_layers_dax_window(),
                     false,
                 )
             }
@@ -1206,6 +1206,12 @@ fn describe_start_error_with_probe(ret: i32, kvm_error: Option<&str>) -> String 
 /// e.g. Windows); a failure here is non-fatal.
 pub(crate) fn truncate_console_log(path: &Path) {
     if path.exists() {
+        // Keep the previous boot's console beside the new one: when a VM dies
+        // and is booted again, its console is the only record of why.
+        let previous = path.with_extension("prev.log");
+        if std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0) {
+            let _ = std::fs::copy(path, &previous);
+        }
         if let Err(e) = std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
