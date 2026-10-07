@@ -1138,12 +1138,18 @@ mod tests {
         assert_eq!(grace(Some(999_999), None).as_secs(), 3600);
     }
 
-    fn slow_app(delay: Duration) -> axum::Router {
+    /// `/slow` answers after `delay`, signalling `entered` as it starts, so a
+    /// test can stop the server while the request is known to be running.
+    fn slow_app(delay: Duration, entered: std::sync::Arc<tokio::sync::Notify>) -> axum::Router {
         axum::Router::new().route(
             "/slow",
-            axum::routing::get(move || async move {
-                tokio::time::sleep(delay).await;
-                "done"
+            axum::routing::get(move || {
+                let entered = entered.clone();
+                async move {
+                    entered.notify_one();
+                    tokio::time::sleep(delay).await;
+                    "done"
+                }
             }),
         )
     }
@@ -1151,14 +1157,8 @@ mod tests {
     /// The mTLS server's shutdown path (`arm_graceful_shutdown` driving an
     /// axum-server `Handle`), served over plain TCP so no certificates are
     /// needed. Returns the server task, the address, and the trigger.
-    async fn https_style_server(
-        handler_delay: Duration,
-        grace: Duration,
-    ) -> (
-        tokio::task::JoinHandle<std::io::Result<()>>,
-        std::net::SocketAddr,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
+    async fn https_style_server(handler_delay: Duration, grace: Duration) -> TestServer {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1174,47 +1174,47 @@ mod tests {
         let server = tokio::spawn(
             axum_server::from_tcp(listener)
                 .handle(handle.clone())
-                .serve(slow_app(handler_delay).into_make_service()),
+                .serve(slow_app(handler_delay, entered.clone()).into_make_service()),
         );
         handle.listening().await.expect("server listening");
-        (server, addr, stop_tx)
+        (server, addr, stop_tx, entered)
     }
 
     /// The Unix-socket/plain-TCP shutdown path (`finish_within_grace` around
     /// axum's own graceful shutdown).
-    async fn plain_server(
-        handler_delay: Duration,
-        grace: Duration,
-    ) -> (
-        tokio::task::JoinHandle<std::io::Result<()>>,
-        std::net::SocketAddr,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
+    async fn plain_server(handler_delay: Duration, grace: Duration) -> TestServer {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (signal, fired) = super::signal_and_notice(async move {
             let _ = stop_rx.await;
         });
-        let serve = axum::serve(listener, slow_app(handler_delay)).with_graceful_shutdown(signal);
+        let serve = axum::serve(listener, slow_app(handler_delay, entered.clone()))
+            .with_graceful_shutdown(signal);
         let server = tokio::spawn(super::finish_within_grace(
             async move { serve.await },
             fired,
             grace,
         ));
-        (server, addr, stop_tx)
+        (server, addr, stop_tx, entered)
     }
+
+    /// A test server: its task, address, stop trigger, and the signal that a
+    /// `/slow` request has reached its handler.
+    type TestServer = (
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
 
     type Reply = tokio::task::JoinHandle<Result<String, String>>;
 
     /// Send `GET /slow`, ask the server to stop while it runs, and return the
     /// pending reply plus how long the server took to return after being asked
     /// to stop.
-    async fn stop_during_request(
-        server: tokio::task::JoinHandle<std::io::Result<()>>,
-        addr: std::net::SocketAddr,
-        stop: tokio::sync::oneshot::Sender<()>,
-    ) -> (Reply, Duration) {
+    async fn stop_during_request((server, addr, stop, entered): TestServer) -> (Reply, Duration) {
         let request = tokio::spawn(async move {
             let response = reqwest::Client::new()
                 .get(format!("http://{addr}/slow"))
@@ -1223,8 +1223,13 @@ mod tests {
                 .map_err(|e| e.to_string())?;
             response.text().await.map_err(|e| e.to_string())
         });
-        // Let the request reach the handler before the stop.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Stop only once the request is running. A fixed sleep raced the
+        // client's first connection: building a reqwest client reads the
+        // system network configuration, which on macOS can take longer than
+        // the sleep, so the stop could land before the request was accepted.
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("request reached the handler");
         stop.send(()).unwrap();
         let asked = Instant::now();
         let result = tokio::time::timeout(Duration::from_secs(20), server)
@@ -1258,18 +1263,16 @@ mod tests {
     // the grace.
     #[tokio::test]
     async fn https_shutdown_delivers_an_inflight_response_then_returns() {
-        let (server, addr, stop) =
-            https_style_server(Duration::from_millis(800), Duration::from_secs(10)).await;
-        let (request, took) = stop_during_request(server, addr, stop).await;
+        let server = https_style_server(Duration::from_millis(800), Duration::from_secs(10)).await;
+        let (request, took) = stop_during_request(server).await;
         assert_eq!(reply(request).await.as_deref(), Ok("done"));
         assert!(took < Duration::from_secs(3), "returned after {took:?}");
     }
 
     #[tokio::test]
     async fn plain_shutdown_delivers_an_inflight_response_then_returns() {
-        let (server, addr, stop) =
-            plain_server(Duration::from_millis(800), Duration::from_secs(10)).await;
-        let (request, took) = stop_during_request(server, addr, stop).await;
+        let server = plain_server(Duration::from_millis(800), Duration::from_secs(10)).await;
+        let (request, took) = stop_during_request(server).await;
         assert_eq!(reply(request).await.as_deref(), Ok("done"));
         assert!(took < Duration::from_secs(3), "returned after {took:?}");
     }
@@ -1278,9 +1281,8 @@ mod tests {
     // after the grace instead of waiting for it.
     #[tokio::test]
     async fn https_shutdown_drops_a_request_that_outlives_the_grace() {
-        let (server, addr, stop) =
-            https_style_server(Duration::from_secs(60), Duration::from_millis(300)).await;
-        let (request, took) = stop_during_request(server, addr, stop).await;
+        let server = https_style_server(Duration::from_secs(60), Duration::from_millis(300)).await;
+        let (request, took) = stop_during_request(server).await;
         let response = reply(request).await;
         assert!(response.is_err(), "{response:?}");
         assert!(took < Duration::from_secs(3), "returned after {took:?}");
@@ -1288,9 +1290,8 @@ mod tests {
 
     #[tokio::test]
     async fn plain_shutdown_drops_a_request_that_outlives_the_grace() {
-        let (server, addr, stop) =
-            plain_server(Duration::from_secs(60), Duration::from_millis(300)).await;
-        let (request, took) = stop_during_request(server, addr, stop).await;
+        let server = plain_server(Duration::from_secs(60), Duration::from_millis(300)).await;
+        let (request, took) = stop_during_request(server).await;
         assert!(took < Duration::from_secs(3), "returned after {took:?}");
         // axum's serve spawns each connection, so the abandoned one ends when the
         // runtime shuts down; the server itself must not have waited for it.
