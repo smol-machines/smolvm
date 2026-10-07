@@ -306,6 +306,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_cache_disk_is_an_absolute_base_and_an_absolute_guest_path() {
+        let cache = CacheDisk::parse("/var/caches/proj:v7.img:/cache/").unwrap();
+        assert_eq!(
+            cache.base,
+            std::path::PathBuf::from("/var/caches/proj:v7.img")
+        );
+        assert_eq!(cache.mount_path, "/cache");
+        for (spec, why) in [
+            ("/base.img", "expected BASE:/guest/path"),
+            ("base.img:/cache", "absolute path"),
+            ("/base.img:cache", "absolute guest path"),
+            ("/base.img:/", "root"),
+            ("/base.img:/proc/x", "at or under /proc"),
+            ("/base.img:/storage", "at or under /storage"),
+            ("/base.img:/workspace/cache", "at or under /workspace"),
+        ] {
+            let err = CacheDisk::parse(spec).unwrap_err();
+            assert!(err.contains(why), "{spec}: {err}");
+        }
+        // A path that merely starts with a reserved name is not under it.
+        assert!(CacheDisk::parse("/base.img:/devcache").is_ok());
+    }
+
+    #[test]
+    fn a_cache_base_must_be_a_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = CacheDisk {
+            base: dir.path().join("missing.img"),
+            mount_path: "/cache".into(),
+        };
+        assert!(missing.validate().unwrap_err().contains("cannot stat"));
+        let directory = CacheDisk {
+            base: dir.path().to_path_buf(),
+            mount_path: "/cache".into(),
+        };
+        assert!(directory.validate().unwrap_err().contains("regular file"));
+        let image = dir.path().join("base.img");
+        std::fs::write(&image, [0u8; 512]).unwrap();
+        assert!(CacheDisk {
+            base: image,
+            mount_path: "/cache".into()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn a_cache_disk_round_trips_on_the_record_and_is_absent_by_default() {
+        let legacy: crate::config::VmRecord = serde_json::from_str(r#"{"name":"legacy"}"#).unwrap();
+        assert!(legacy.cache_disk.is_none());
+        let mut record = crate::config::VmRecord::new("c".into(), 1, 512, vec![], vec![], false);
+        record.cache_disk = Some(CacheDisk {
+            base: "/var/caches/v1.img".into(),
+            mount_path: "/cache".into(),
+        });
+        let decoded: crate::config::VmRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded.cache_disk, record.cache_disk);
+        assert_eq!(decoded.vm_resources().cache_disk, record.cache_disk);
+    }
+
+    #[test]
     fn disk_format_defaults_to_raw() {
         assert_eq!(DiskFormat::default(), DiskFormat::Raw);
     }
