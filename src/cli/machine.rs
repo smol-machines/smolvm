@@ -746,6 +746,18 @@ pub struct RunCmd {
     #[arg(long = "disk", value_name = "PATH[:ro]", help_heading = "Resources")]
     pub disk: Vec<String>,
 
+    /// Mount a shared cache disk at a guest path: `BASE:/guest/path`. BASE is
+    /// a disk image (raw or qcow2) that stays read-only and can back many
+    /// machines at once; this machine reads it and writes only to its own
+    /// fast local layer, which every branch of it copies. The guest mounts its
+    /// ext4 filesystem, making one if BASE is blank.
+    #[arg(
+        long = "cache-disk",
+        value_name = "BASE:/PATH",
+        help_heading = "Resources"
+    )]
+    pub cache_disk: Option<String>,
+
     /// Load VM configuration from a Smolfile (TOML)
     #[arg(
         long = "smolfile",
@@ -1393,6 +1405,7 @@ impl RunCmd {
         params.nested_virt = params.nested_virt || self.nested_virt;
         params.guest_subnet = self.guest_subnet.clone();
         params.disks = parse_attached_disks(&self.disk)?;
+        params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
         params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
@@ -1752,6 +1765,7 @@ impl RunCmd {
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
             disks: Vec::new(),
+            cache_disk: None,
         };
         validate_requested_network_backend(
             &resources,
@@ -3852,6 +3866,18 @@ pub struct CreateCmd {
     #[arg(long = "disk", value_name = "PATH[:ro]")]
     pub disk: Vec<String>,
 
+    /// Mount a shared cache disk at a guest path: `BASE:/guest/path`. BASE is
+    /// a disk image (raw or qcow2) that stays read-only and can back many
+    /// machines at once; this machine reads it and writes only to its own
+    /// fast local layer, which every branch of it copies. The guest mounts its
+    /// ext4 filesystem, making one if BASE is blank.
+    #[arg(
+        long = "cache-disk",
+        value_name = "BASE:/PATH",
+        help_heading = "Resources"
+    )]
+    pub cache_disk: Option<String>,
+
     /// Mount host directory (can be used multiple times). Also accepts
     /// S3-compatible object storage, mounted inside the guest on every start:
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
@@ -4066,6 +4092,25 @@ fn parse_guest_subnet(value: &str) -> Result<String, String> {
         .map(|subnet| subnet.to_string())
 }
 
+/// Parse and check a `--cache-disk` value, before anything is recorded.
+fn parse_cache_disk(spec: Option<&str>) -> smolvm::Result<Option<smolvm::data::disk::CacheDisk>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    if cfg!(target_os = "windows") {
+        return Err(smolvm::Error::config(
+            "cache disk",
+            "cache disks are not supported on Windows yet",
+        ));
+    }
+    let cache = smolvm::data::disk::CacheDisk::parse(spec)
+        .map_err(|e| smolvm::Error::config("cache disk", e))?;
+    cache
+        .validate()
+        .map_err(|e| smolvm::Error::config("cache disk", e))?;
+    Ok(Some(cache))
+}
+
 fn parse_attached_disks(specs: &[String]) -> smolvm::Result<Vec<smolvm::data::disk::AttachedDisk>> {
     specs
         .iter()
@@ -4181,6 +4226,7 @@ impl CreateCmd {
         // recorded against an unreadable device would fail every start with a
         // virtio-blk error that says nothing about which disk or why.
         params.disks = parse_attached_disks(&self.disk)?;
+        params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
 
         // Resolve the image source on the host now, AFTER the CLI flag and the
         // Smolfile have been merged, so both take the same path: a registry
@@ -4236,6 +4282,7 @@ impl CreateCmd {
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
             disks: Vec::new(),
+            cache_disk: None,
         };
         // Reject zero-valued resources before the machine is persisted.
         // Without this, `machine create` succeeds and the failure only
@@ -4479,6 +4526,15 @@ impl CreateCmd {
             Some(checkpoint) => smolvm::portable_checkpoint::restored_guest_subnet(checkpoint)?,
             None => None,
         };
+        // A restored guest resumes with the devices it was captured with, so a
+        // disk added now would not be the one its memory expects.
+        if checkpoint.is_some() && self.cache_disk.is_some() {
+            return Err(smolvm::Error::config(
+                "cache disk",
+                "a machine restored from a checkpoint keeps the disks it was captured with; add a cache disk to a fresh machine",
+            ));
+        }
+        let cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
         let mut params = vm_common::CreateVmParams {
             // A checkpoint carries its credential bindings and the exact
             // placeholders the captured workload holds; `build_vm_record`
@@ -4506,6 +4562,7 @@ impl CreateCmd {
                 .map(|captured| captured.credential_placeholders.clone())
                 .unwrap_or_default(),
             disks: parse_attached_disks(&self.disk)?,
+            cache_disk,
             nested_virt: self.nested_virt,
             secret_refs: manifest.secret_refs,
             name,
@@ -4636,6 +4693,7 @@ impl CreateCmd {
             overlay_gib: params.overlay_gb,
             block_io: params.block_io,
             disks: params.disks.clone(),
+            cache_disk: params.cache_disk.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
         resources.validate()?;

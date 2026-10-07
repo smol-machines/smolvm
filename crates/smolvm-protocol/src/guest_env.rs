@@ -113,3 +113,9 @@ pub const DOCKER_SOCKET: &str = "SMOLVM_DOCKER_SOCKET";
 /// by [`crate::publish_socket::encode`] (`port|dir|guest_path;…`). The agent
 /// decodes it on startup and spawns one relay per entry. Absent means none.
 pub const PUBLISH_SOCKETS: &str = "SMOLVM_PUBLISH_SOCKETS";
+
+/// The cache disk to mount, `<guest device>:<guest path>` (for example
+/// `/dev/vdc:/cache`): the machine's own copy-on-write layer over a shared
+/// base. The agent mounts its ext4 filesystem, making one on a blank base,
+/// and exposes it to every workload at the guest path.
+pub const CACHE_DISK: &str = "SMOLVM_CACHE_DISK";

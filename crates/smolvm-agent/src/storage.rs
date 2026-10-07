@@ -551,7 +551,8 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
                     return Vec::new();
                 }
             },
-            Err(_) => return Vec::new(),
+            // No host mounts; a cache disk may still be attached.
+            Err(_) => 0,
         };
 
         let mut mounts = Vec::with_capacity(count);
@@ -597,6 +598,13 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
             }
         }
 
+        // The cache disk is mounted at a staging path beside the virtiofs
+        // devices', so the binds below expose it like any boot mount: at its
+        // guest path, and in every container's own mount list.
+        if let Some(cache) = mount_cache_disk() {
+            mounts.push(cache);
+        }
+
         // Mount using existing logic with empty rootfs prefix so bind mounts
         // go to absolute guest paths (e.g., "/data"), visible to VmExec.
         if !mounts.is_empty() {
@@ -610,6 +618,141 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
     })
 }
 
+/// The staging tag the cache disk's filesystem is mounted under, beside the
+/// virtiofs devices' staging paths.
+const CACHE_MOUNT_TAG: &str = "smolvm_cache";
+
+/// The cache disk the host attached, from `SMOLVM_CACHE_DISK=<device>:<guest
+/// path>`: its guest device and the path it is exposed at.
+fn cache_disk_from_env() -> Option<(String, String)> {
+    let value = std::env::var(guest_env::CACHE_DISK).ok()?;
+    let parsed = parse_cache_disk_env(&value);
+    if parsed.is_none() {
+        warn!(value = %value, "invalid cache disk, expected /dev/vdX:/guest/path");
+    }
+    parsed
+}
+
+/// `/dev/vdX:/guest/path` as its device and guest path.
+fn parse_cache_disk_env(value: &str) -> Option<(String, String)> {
+    let (device, guest_path) = value.split_once(':')?;
+    let letter = device.strip_prefix("/dev/vd")?;
+    let valid_device = letter.len() == 1 && letter.bytes().all(|b| b.is_ascii_lowercase());
+    (valid_device && guest_path.starts_with('/') && guest_path.len() > 1)
+        .then(|| (device.to_string(), guest_path.to_string()))
+}
+
+/// Whether `device` holds an ext4 (or ext2/3) filesystem: its superblock's
+/// magic, `0xEF53` at byte 1080. An error reading it is returned, never taken
+/// for a blank disk, so a disk that merely failed to read is never formatted.
+fn has_ext_superblock(device: &Path) -> std::io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    let mut disk = std::fs::File::open(device)?;
+    disk.seek(SeekFrom::Start(1080))?;
+    let mut magic = [0u8; 2];
+    disk.read_exact(&mut magic)?;
+    Ok(magic == [0x53, 0xEF])
+}
+
+/// Mounts `device`'s ext4 filesystem at `mount_point` with `noatime`.
+#[cfg(target_os = "linux")]
+fn mount_ext4(device: &Path, mount_point: &Path) -> std::io::Result<()> {
+    let to_c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (source, target) = (to_c(device)?, to_c(mount_point)?);
+    let fstype = std::ffi::CString::new("ext4").expect("static filesystem type");
+    // SAFETY: valid NUL-terminated strings, and no mount data.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOATIME,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Mounts the cache disk at its staging path, making an ext4 filesystem on a
+/// blank one (a new cache's base), and returns its boot mount. A machine
+/// resumed from a branch arrives with it mounted already. A disk that holds a
+/// filesystem the guest cannot mount is checked and repaired once, never
+/// reformatted: it holds a cache someone built.
+#[cfg(target_os = "linux")]
+fn mount_cache_disk() -> Option<(String, String, bool)> {
+    let (device, guest_path) = cache_disk_from_env()?;
+    let device = PathBuf::from(device);
+    let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(CACHE_MOUNT_TAG);
+    if !is_mountpoint(&staging) {
+        if let Err(error) = std::fs::create_dir_all(&staging) {
+            warn!(%error, "cache disk: cannot create its staging path");
+            return None;
+        }
+        if !device.exists() {
+            // virtio-blk is major 253, sixteen minors per disk.
+            let index = device
+                .to_string_lossy()
+                .bytes()
+                .last()
+                .map_or(0, |b| b - b'a');
+            if let Ok(path) = std::ffi::CString::new(device.as_os_str().as_encoded_bytes()) {
+                // SAFETY: a block device node for a disk the host attached.
+                unsafe {
+                    libc::mknod(
+                        path.as_ptr(),
+                        libc::S_IFBLK | 0o660,
+                        libc::makedev(253, u32::from(index) * 16),
+                    );
+                }
+            }
+        }
+        match has_ext_superblock(&device) {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(device = %device.display(), "cache disk is blank, making its filesystem");
+                let made = Command::new("mkfs.ext4")
+                    .args(["-F", "-q", "-O", "^has_journal", "-L", "smolvm-cache"])
+                    .arg(&device)
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !made {
+                    warn!(device = %device.display(), "cache disk: mkfs.ext4 failed");
+                    return None;
+                }
+            }
+            Err(error) => {
+                warn!(%error, device = %device.display(), "cache disk: cannot read its superblock");
+                return None;
+            }
+        }
+        if let Err(error) = mount_ext4(&device, &staging) {
+            warn!(%error, "cache disk did not mount, checking its filesystem");
+            let _ = Command::new("fsck.ext4")
+                .args(["-y", "-f"])
+                .arg(&device)
+                .status();
+            if let Err(error) = mount_ext4(&device, &staging) {
+                warn!(%error, device = %device.display(), "cache disk did not mount after a check");
+                return None;
+            }
+        }
+        info!(device = %device.display(), guest_path = %guest_path, "cache disk mounted");
+    }
+    Some((CACHE_MOUNT_TAG.to_string(), guest_path, false))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_cache_disk() -> Option<(String, String, bool)> {
+    None
+}
+
 /// Re-establish boot-time virtiofs mounts after a fork restore.
 ///
 /// A clone resumes the golden agent after its one-time boot initialization,
@@ -621,9 +764,11 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
 /// bind the clone's fresh device before acknowledging its first host request.
 #[cfg(target_os = "linux")]
 pub fn repair_boot_volume_mounts() -> Result<()> {
+    // A cache disk is a block device the branch pivoted under its mounted
+    // filesystem, not a virtiofs session that died with the source.
     let missing = init_volume_mounts()
         .iter()
-        .filter(|(_, target, _)| !is_mountpoint(Path::new(target)))
+        .filter(|(tag, target, _)| tag != CACHE_MOUNT_TAG && !is_mountpoint(Path::new(target)))
         .cloned()
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -5326,6 +5471,45 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cache_disk_env_names_a_virtio_disk_and_an_absolute_path() {
+        assert_eq!(
+            super::parse_cache_disk_env("/dev/vdc:/cache"),
+            Some(("/dev/vdc".to_string(), "/cache".to_string()))
+        );
+        for bad in [
+            "/dev/vdc",
+            "/dev/sda:/cache",
+            "/dev/vdcc:/cache",
+            "/dev/vdc:cache",
+            "/dev/vdc:/",
+            "",
+        ] {
+            assert_eq!(super::parse_cache_disk_env(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_an_ext_superblock_counts_as_a_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let blank = dir.path().join("blank.img");
+        std::fs::write(&blank, vec![0u8; 4096]).unwrap();
+        assert!(!super::has_ext_superblock(&blank).unwrap());
+
+        let ext = dir.path().join("ext.img");
+        let mut image = vec![0u8; 4096];
+        image[1080] = 0x53;
+        image[1081] = 0xEF;
+        std::fs::write(&ext, image).unwrap();
+        assert!(super::has_ext_superblock(&ext).unwrap());
+
+        // Too short to hold a superblock is an error, never "blank": a disk
+        // that fails to read must not be formatted.
+        let short = dir.path().join("short.img");
+        std::fs::write(&short, vec![0u8; 100]).unwrap();
+        assert!(super::has_ext_superblock(&short).is_err());
+    }
     use super::*;
 
     #[test]

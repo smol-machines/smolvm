@@ -3334,6 +3334,11 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if vm.docker_socket {
         unsupported.push("Docker socket forwarding");
     }
+    // A checkpoint would carry the machine's cache layer without the shared
+    // base it is a layer over, and restore a disk that reads as garbage.
+    if vm.cache_disk.is_some() {
+        unsupported.push("cache disks (branch the machine instead)");
+    }
     if unsupported.is_empty() {
         return Ok(());
     }

@@ -456,6 +456,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
             &config.storage_disk_path,
             &config.overlay_disk_path,
             &config.extra_disks,
+            cache_disk_layer(&config).as_deref(),
         ));
         for m in &config.mounts {
             if m.read_only {
@@ -706,6 +707,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // across the process boundary.
     let egress_telemetry_path = config.vsock_socket.parent().map(|dir| dir.join("egress"));
 
+    let cache_layer = cache_disk_layer(&config);
     let result = launch_agent_vm(&LaunchConfig {
         rootfs_path: &config.rootfs_path,
         disks: &disks,
@@ -723,6 +725,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         packed_layers_dax_window: config.packed_layers_dax_window,
         extra_disks: &config.extra_disks,
+        cache_disk_layer: cache_layer.as_deref(),
         dns_filter_enabled: config
             .dns_filter_hosts
             .as_ref()
@@ -744,18 +747,28 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     crate::process::exit_child(1);
 }
 
-/// Grant backing-file reads for every attached disk, including export helpers.
+/// Grant backing-file reads for every attached disk, including export helpers
+/// and the cache disk's shared base under the machine's own layer.
 #[cfg(target_os = "linux")]
 fn boot_disk_backing_paths(
     storage: &Path,
     overlay: &Path,
     extra_disks: &[(PathBuf, bool, DiskFormat)],
+    cache_layer: Option<&Path>,
 ) -> Vec<PathBuf> {
     [storage, overlay]
         .into_iter()
         .chain(extra_disks.iter().map(|(path, _, _)| path.as_path()))
+        .chain(cache_layer)
         .flat_map(qcow2_backing_chain)
         .collect()
+}
+
+/// The machine's own layer over its cache disk's base, beside its storage disk.
+fn cache_disk_layer(config: &crate::agent::boot_config::BootConfig) -> Option<PathBuf> {
+    config.resources.cache_disk.as_ref()?;
+    let dir = config.storage_disk_path.parent()?;
+    Some(dir.join(Path::new(crate::data::storage::CACHE_DISK_FILENAME).with_extension("qcow2")))
 }
 
 /// Find a seed in the storage backing chain, including a fork's intermediate
@@ -896,7 +909,8 @@ mod backing_chain_tests {
                 boot_disk_backing_paths(
                     &primary,
                     &primary,
-                    &[(child.clone(), read_only, DiskFormat::Qcow2)]
+                    &[(child.clone(), read_only, DiskFormat::Qcow2)],
+                    None,
                 ),
                 vec![golden.clone(), raw.clone()]
             );

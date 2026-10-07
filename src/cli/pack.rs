@@ -752,6 +752,7 @@ impl PackCreateCmd {
                 overlay_gib: None,
                 block_io: Default::default(),
                 disks: Vec::new(),
+                cache_disk: None,
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,

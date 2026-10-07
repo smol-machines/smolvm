@@ -483,6 +483,8 @@ pub struct CreateVmParams {
     pub block_io: smolvm::data::resources::BlockIoEngine,
     /// Host disks attached beyond storage and overlay (`--disk`).
     pub disks: Vec<smolvm::data::disk::AttachedDisk>,
+    /// Shared cache disk (`--cache-disk`).
+    pub cache_disk: Option<smolvm::data::disk::CacheDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
@@ -780,6 +782,7 @@ pub(crate) fn build_vm_record_for(
     record.overlay_gb = params.overlay_gb;
     record.block_io = params.block_io;
     record.disks = params.disks.clone();
+    record.cache_disk = params.cache_disk.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
@@ -2107,6 +2110,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.overlay_gb = o.overlay_gb;
     r.block_io = o.block_io;
     r.disks = o.disks.clone();
+    r.cache_disk = o.cache_disk.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
     r.init = o.init.clone();
     r.init_completed = false;
@@ -2182,6 +2186,8 @@ pub struct DefaultVmOverrides {
     pub block_io: smolvm::data::resources::BlockIoEngine,
     /// Host disks attached beyond storage and overlay (`--disk`).
     pub disks: Vec<smolvm::data::disk::AttachedDisk>,
+    /// Shared cache disk (`--cache-disk`).
+    pub cache_disk: Option<smolvm::data::disk::CacheDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -2232,6 +2238,7 @@ impl DefaultVmOverrides {
             overlay_gb: params.overlay_gb,
             block_io: params.block_io,
             disks: params.disks.clone(),
+            cache_disk: params.cache_disk.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
             init: params.init.clone(),
             env: smolvm::util::parse_env_list(&params.env),

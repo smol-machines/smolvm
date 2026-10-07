@@ -92,6 +92,10 @@ pub struct VmResources {
     /// order, surfacing as `/dev/vdc`, `/dev/vdd`, ... Empty for most machines.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<crate::data::disk::AttachedDisk>,
+    /// Shared cache disk: a read-only base under the machine's own
+    /// copy-on-write layer, attached after the managed disks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_disk: Option<crate::data::disk::CacheDisk>,
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -192,6 +196,7 @@ impl Default for VmResources {
             overlay_gib: None,
             block_io: BlockIoEngine::Sync,
             disks: Vec::new(),
+            cache_disk: None,
             allowed_cidrs: None,
             dns: None,
             network_name: None,
