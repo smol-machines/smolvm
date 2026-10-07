@@ -446,6 +446,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<crate::data::disk::AttachedDisk>,
 
+    /// Shared cache disk (`--cache-disk`): a read-only base under this
+    /// machine's own copy-on-write layer, mounted in the guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_disk: Option<crate::data::disk::CacheDisk>,
+
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
@@ -840,6 +845,7 @@ impl VmRecord {
             mem,
             block_io: Default::default(),
             disks: Vec::new(),
+            cache_disk: None,
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -927,6 +933,7 @@ impl VmRecord {
             mem,
             block_io: Default::default(),
             disks: Vec::new(),
+            cache_disk: None,
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -1379,6 +1386,7 @@ impl VmRecord {
             overlay_gib: self.overlay_gb,
             block_io: self.block_io,
             disks: self.disks.clone(),
+            cache_disk: self.cache_disk.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),

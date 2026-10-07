@@ -912,10 +912,7 @@ fn prepare_running_disk_generation(
     let mut generation_lines = Vec::new();
     let mut rotations = Vec::new();
     let mut compacted = Vec::new();
-    for (id, raw) in [
-        ("storage", crate::data::storage::STORAGE_DISK_FILENAME),
-        ("overlay", crate::data::storage::OVERLAY_DISK_FILENAME),
-    ] {
+    for (id, raw) in FORK_DISK_ROLES {
         let (base, format) = resolve_disk_image(gdir, raw);
         if !base.exists() {
             continue;
@@ -1036,6 +1033,19 @@ fn prepare_running_disk_generation(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FORK_DISK_CHAIN_DEPTH: usize = 32;
+
+/// Every block disk a branch carries, as `(block id, role filename)`: the id
+/// libkrun pivots the running device by, and the `.raw` name its image is
+/// resolved from. A disk the machine does not have is skipped by whoever
+/// walks this, so a machine without a cache disk branches as before.
+const FORK_DISK_ROLES: [(&str, &str); 3] = [
+    ("storage", crate::data::storage::STORAGE_DISK_FILENAME),
+    ("overlay", crate::data::storage::OVERLAY_DISK_FILENAME),
+    (
+        crate::agent::launcher::CACHE_BLOCK_ID,
+        crate::data::storage::CACHE_DISK_FILENAME,
+    ),
+];
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn qcow2_backing_depth(path: &Path) -> Result<usize> {
@@ -1248,10 +1258,7 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
-    for raw in [
-        crate::data::storage::STORAGE_DISK_FILENAME,
-        crate::data::storage::OVERLAY_DISK_FILENAME,
-    ] {
+    for (_, raw) in FORK_DISK_ROLES {
         let (disk, format) = resolve_disk_image(gdir, raw);
         if !disk.is_file() || format != crate::data::disk::DiskFormat::Qcow2 {
             continue;
@@ -1311,6 +1318,10 @@ fn rollback_uncommitted_disk_generation(gdir: &Path, snapshot_dir: &Path) -> Res
             crate::data::storage::OVERLAY_DISK_FILENAME => {
                 (crate::data::storage::OVERLAY_DISK_FILENAME, "overlay")
             }
+            crate::data::storage::CACHE_DISK_FILENAME => (
+                crate::data::storage::CACHE_DISK_FILENAME,
+                crate::agent::launcher::CACHE_BLOCK_ID,
+            ),
             _ => {
                 return Err(Error::agent(
                     "recover disk generation",
@@ -1893,6 +1904,7 @@ fn read_generation_fork_disks(snapshot_dir: &Path) -> Result<Option<Vec<ForkDisk
             crate::data::storage::OVERLAY_DISK_FILENAME => {
                 crate::data::storage::OVERLAY_DISK_FILENAME
             }
+            crate::data::storage::CACHE_DISK_FILENAME => crate::data::storage::CACHE_DISK_FILENAME,
             _ => {
                 return Err(Error::agent(
                     "read generation disk manifest",
@@ -2963,17 +2975,15 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
     // filename (for naming the clone's disk) with the golden's real backing file
     // and its format.
     let fallback_disks = || -> Vec<ForkDisk> {
-        [
-            crate::data::storage::STORAGE_DISK_FILENAME,
-            crate::data::storage::OVERLAY_DISK_FILENAME,
-        ]
-        .into_iter()
-        .map(|raw| {
-            let (src, fmt) = resolve_disk_image(gdir, raw);
-            (raw, src, fmt)
-        })
-        .filter(|(_, src, _)| src.exists())
-        .collect()
+        FORK_DISK_ROLES
+            .into_iter()
+            .map(|(_, raw)| raw)
+            .map(|raw| {
+                let (src, fmt) = resolve_disk_image(gdir, raw);
+                (raw, src, fmt)
+            })
+            .filter(|(_, src, _)| src.exists())
+            .collect()
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let disks = read_generation_fork_disks(snapshot_dir)?.unwrap_or_else(fallback_disks);

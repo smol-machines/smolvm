@@ -132,6 +132,100 @@ impl AttachedDisk {
     }
 }
 
+/// A cache disk: a shared, read-only base image under the machine's own
+/// copy-on-write layer, mounted in the guest at `mount_path`.
+///
+/// Many machines, on one host, read the same base: container images, build
+/// layers and dependency caches a run starts from. Each machine writes only to
+/// its own local layer (`cache.qcow2` in its data directory), so a write never
+/// touches the base or another machine, and a branch gets its own layer over
+/// its source's the way it does for the machine's other disks. The base is
+/// never written; a new cache version is a new base file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheDisk {
+    /// Absolute host path of the base image (raw or qcow2). Read only.
+    pub base: std::path::PathBuf,
+    /// Absolute guest path the cache filesystem is mounted at.
+    pub mount_path: String,
+}
+
+/// Guest paths a cache disk may not be mounted over: the root, the kernel's
+/// pseudo-filesystems, and the paths smolvm's own disks and runtime use.
+const RESERVED_CACHE_MOUNTS: &[&str] = &["/proc", "/sys", "/dev", "/run", "/storage", "/workspace"];
+
+impl CacheDisk {
+    /// Parse a `--cache-disk` value, `BASE:/guest/path`. The guest path is
+    /// what follows the last colon, so a base path may itself contain one.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let spec = spec.trim();
+        let (base, mount_path) = spec
+            .rsplit_once(':')
+            .ok_or_else(|| format!("{spec}: expected BASE:/guest/path"))?;
+        let base = std::path::PathBuf::from(base);
+        if !base.is_absolute() {
+            return Err(format!(
+                "{}: cache base must be an absolute path (the VM is launched from a different working directory)",
+                base.display()
+            ));
+        }
+        if !mount_path.starts_with('/') || mount_path.contains('\0') {
+            return Err(format!(
+                "{mount_path:?}: cache mount path must be an absolute guest path"
+            ));
+        }
+        let mount_path = mount_path.trim_end_matches('/').to_string();
+        if mount_path.is_empty() {
+            return Err("cache disk cannot be mounted over the guest's root".to_string());
+        }
+        let target = std::path::Path::new(&mount_path);
+        if let Some(reserved) = RESERVED_CACHE_MOUNTS
+            .iter()
+            .find(|reserved| target.starts_with(reserved))
+        {
+            return Err(format!(
+                "{mount_path}: cache disk cannot be mounted at or under {reserved}"
+            ));
+        }
+        Ok(Self { base, mount_path })
+    }
+
+    /// Reject a base that cannot serve as one, with the reason a caller can
+    /// act on: checked at create time, so a machine is never recorded pointing
+    /// at a base that will fail at every start.
+    pub fn validate(&self) -> Result<(), String> {
+        let display = self.base.display();
+        let meta = std::fs::metadata(&self.base)
+            .map_err(|e| format!("{display}: cannot stat cache base ({e})"))?;
+        if !meta.is_file() {
+            return Err(format!(
+                "{display}: cache base must be a regular file (a disk image)"
+            ));
+        }
+        std::fs::File::open(&self.base)
+            .map_err(|e| format!("{display}: cannot open cache base for reading ({e})"))?;
+        Ok(())
+    }
+
+    /// The machine's own layer over the base in `vm_dir`, created on first use.
+    ///
+    /// An existing layer is kept as is: it holds what this machine wrote, and a
+    /// branch arrives with its own layer already made over its source's.
+    pub fn prepare_layer(&self, vm_dir: &std::path::Path) -> crate::Result<std::path::PathBuf> {
+        let layer = vm_dir.join(
+            std::path::Path::new(crate::data::storage::CACHE_DISK_FILENAME).with_extension("qcow2"),
+        );
+        if layer.exists() {
+            return Ok(layer);
+        }
+        let base = self.base.canonicalize().map_err(|e| {
+            crate::Error::agent("cache disk", format!("{}: {e}", self.base.display()))
+        })?;
+        let format = detect_disk_format(&base);
+        crate::agent::create_disk_overlays(&[(layer.clone(), base, format)])?;
+        Ok(layer)
+    }
+}
+
 /// The host mount point currently using `device`, if any (Linux only).
 #[cfg(target_os = "linux")]
 fn host_mount_of(device: &std::path::Path) -> Option<String> {
@@ -210,6 +304,68 @@ impl DiskType for Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cache_disk_is_an_absolute_base_and_an_absolute_guest_path() {
+        let cache = CacheDisk::parse("/var/caches/proj:v7.img:/cache/").unwrap();
+        assert_eq!(
+            cache.base,
+            std::path::PathBuf::from("/var/caches/proj:v7.img")
+        );
+        assert_eq!(cache.mount_path, "/cache");
+        for (spec, why) in [
+            ("/base.img", "expected BASE:/guest/path"),
+            ("base.img:/cache", "absolute path"),
+            ("/base.img:cache", "absolute guest path"),
+            ("/base.img:/", "root"),
+            ("/base.img:/proc/x", "at or under /proc"),
+            ("/base.img:/storage", "at or under /storage"),
+            ("/base.img:/workspace/cache", "at or under /workspace"),
+        ] {
+            let err = CacheDisk::parse(spec).unwrap_err();
+            assert!(err.contains(why), "{spec}: {err}");
+        }
+        // A path that merely starts with a reserved name is not under it.
+        assert!(CacheDisk::parse("/base.img:/devcache").is_ok());
+    }
+
+    #[test]
+    fn a_cache_base_must_be_a_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = CacheDisk {
+            base: dir.path().join("missing.img"),
+            mount_path: "/cache".into(),
+        };
+        assert!(missing.validate().unwrap_err().contains("cannot stat"));
+        let directory = CacheDisk {
+            base: dir.path().to_path_buf(),
+            mount_path: "/cache".into(),
+        };
+        assert!(directory.validate().unwrap_err().contains("regular file"));
+        let image = dir.path().join("base.img");
+        std::fs::write(&image, [0u8; 512]).unwrap();
+        assert!(CacheDisk {
+            base: image,
+            mount_path: "/cache".into()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn a_cache_disk_round_trips_on_the_record_and_is_absent_by_default() {
+        let legacy: crate::config::VmRecord = serde_json::from_str(r#"{"name":"legacy"}"#).unwrap();
+        assert!(legacy.cache_disk.is_none());
+        let mut record = crate::config::VmRecord::new("c".into(), 1, 512, vec![], vec![], false);
+        record.cache_disk = Some(CacheDisk {
+            base: "/var/caches/v1.img".into(),
+            mount_path: "/cache".into(),
+        });
+        let decoded: crate::config::VmRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded.cache_disk, record.cache_disk);
+        assert_eq!(decoded.vm_resources().cache_disk, record.cache_disk);
+    }
 
     #[test]
     fn disk_format_defaults_to_raw() {

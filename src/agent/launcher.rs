@@ -135,6 +135,9 @@ fn create_owned_directory(path: &Path) -> std::io::Result<()> {
 /// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
 type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
 
+/// The block id the cache disk is attached with, and pivoted by on a branch.
+pub const CACHE_BLOCK_ID: &str = "cache";
+
 /// Disks to attach to the agent VM.
 pub struct VmDisks<'a> {
     /// Storage disk for OCI layers (/dev/vda in guest).
@@ -582,6 +585,10 @@ pub struct LaunchConfig<'a> {
     pub packed_layers_dax_window: u64,
     /// Additional disk images (path, read_only, format). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool, DiskFormat)],
+    /// The machine's own qcow2 layer over its cache disk's shared base, when
+    /// `resources.cache_disk` is set. Attached right after the managed disks
+    /// with block id `cache`, the id a branch pivots it by.
+    pub cache_disk_layer: Option<&'a Path>,
     /// Whether DNS filtering was configured for this launch, even if the
     /// host-side proxy socket could not be created.
     pub dns_filter_enabled: bool,
@@ -646,6 +653,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         packed_layers_dir,
         packed_layers_dax_window,
         extra_disks,
+        cache_disk_layer,
         dns_filter_enabled,
         egress_refresh_hosts,
         egress_telemetry,
@@ -1630,6 +1638,44 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // The cache disk, right after the managed disks: the guest finds it by
+        // the device name passed below, and a branch pivots it by its block id.
+        let mut cache_disk_env = None;
+        if let (Some(layer), Some(cache)) = (cache_disk_layer, resources.cache_disk.as_ref()) {
+            let cache_id = cstr(CACHE_BLOCK_ID);
+            let layer_path = try_or_free_ctx!(
+                path_to_cstring(layer),
+                "add cache disk",
+                "path contains null byte"
+            );
+            let result = add_block_disk(
+                BlockDisk {
+                    ctx,
+                    block_id: cache_id.as_ptr(),
+                    disk_path: layer_path.as_ptr(),
+                    disk_format: DiskFormat::Qcow2.to_krun_u32(),
+                    read_only: false,
+                },
+                resources.block_io,
+                krun_add_disk2,
+                krun_add_disk4,
+            );
+            if result < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add cache disk",
+                    block_io_error(CACHE_BLOCK_ID, resources.block_io, result),
+                ));
+            }
+            // Storage is /dev/vda and the overlay, when attached, /dev/vdb.
+            let letter = if disks.overlay.is_some() { 'c' } else { 'b' };
+            cache_disk_env = Some(format!(
+                "{}=/dev/vd{letter}:{}",
+                guest_env::CACHE_DISK,
+                cache.mount_path
+            ));
+        }
+
         // Add extra disks (e.g., source VM storage for --from-vm export)
         // These appear as /dev/vdc, /dev/vdd, ... after storage and overlay
         for (i, (disk_path, read_only, format)) in extra_disks.iter().enumerate() {
@@ -2188,6 +2234,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             if let Ok(cstr) = CString::new(env_val) {
                 env_strings.push(cstr);
             }
+        }
+
+        if let Some(env) = &cache_disk_env {
+            env_strings.push(cstr(env));
         }
 
         // Pass mount count

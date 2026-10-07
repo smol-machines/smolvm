@@ -2519,6 +2519,15 @@ impl AgentManager {
                 let _ = std::fs::create_dir_all(mountpoint);
             }
         }
+        // The cache disk's own copy-on-write layer lives in the data dir. Make it
+        // before the uid-drop chown below, so the VM's uid owns it. A branch
+        // arrives with its layer already made over its source's, and is kept.
+        if let (Some(cache), Some(dir)) = (
+            resources_for_config.cache_disk.as_ref(),
+            data_dir.as_deref(),
+        ) {
+            cache.prepare_layer(dir)?;
+        }
         // Whether the per-VM uid drop is active for this boot. The idmapped pack
         // bind mount needs CAP_SYS_ADMIN (root) — the same precondition as the
         // drop — so we only keep `pack_idmap_source` when the drop is active;

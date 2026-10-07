@@ -19,6 +19,12 @@ pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
 /// Storage disk filename.
 pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
 
+/// Cache disk role filename. The machine's cache disk is always its own qcow2
+/// layer, `cache.qcow2`, over a shared base; this `.raw` name only names the
+/// role, the way the other disks' names do, for code that resolves a role to
+/// whichever of `.raw`/`.qcow2` exists.
+pub const CACHE_DISK_FILENAME: &str = "cache.raw";
+
 /// Persisted live-mount tuple: host source, guest target, read-only flag.
 pub type StoredHostMount = (String, String, bool);
 

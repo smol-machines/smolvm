@@ -1878,6 +1878,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         overlay_gib: spec.overlay_gb,
         block_io: spec.block_io.unwrap_or_default(),
         disks: Vec::new(),
+        cache_disk: None,
         allowed_cidrs: spec.allowed_cidrs.clone(),
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
