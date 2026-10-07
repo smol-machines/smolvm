@@ -736,7 +736,8 @@ impl ApiState {
     }
 
     /// Take the queued branch requests for `source` that can share one
-    /// transaction with the oldest one: those that wait for the same forkpoint.
+    /// transaction with the oldest one: those that wait for the same forkpoint
+    /// and leave the source the same way.
     /// Returns an empty batch when nothing is queued.
     pub(crate) fn take_branch_batch(&self, source: &str) -> Vec<QueuedBranch> {
         let mut queues = self.branch_queues.lock();
@@ -747,10 +748,13 @@ impl ApiState {
             queues.remove(source);
             return Vec::new();
         };
-        let key = (first.req.wait_ready, first.req.ready_timeout_secs);
+        let key = |req: &crate::api::types::ForkRequest| {
+            (req.wait_ready, req.ready_timeout_secs, req.freeze_source)
+        };
+        let first_key = key(&first.req);
         let (batch, rest): (Vec<_>, Vec<_>) = std::mem::take(queue)
             .into_iter()
-            .partition(|queued| (queued.req.wait_ready, queued.req.ready_timeout_secs) == key);
+            .partition(|queued| key(&queued.req) == first_key);
         if rest.is_empty() {
             queues.remove(source);
         } else {
@@ -2113,15 +2117,16 @@ mod tests {
     }
 
     /// Queued branches of one source are served in batches of those that wait
-    /// for the same forkpoint, oldest first; other sources are untouched.
+    /// for the same forkpoint and leave the source the same way, oldest first;
+    /// other sources are untouched.
     #[test]
-    fn queued_branches_batch_by_forkpoint_wait() {
+    fn queued_branches_batch_by_forkpoint_wait_and_source_policy() {
         let (_dir, state) = temp_api_state();
         let mut replies = Vec::new();
-        let mut queue = |source: &str, name: &str, wait_ready: bool| {
+        let mut queue = |source: &str, name: &str, wait_ready: bool, freeze_source: bool| {
             let req: crate::api::types::ForkRequest = serde_json::from_value(serde_json::json!({
                 "name": name,
-                "freezeSource": true,
+                "freezeSource": freeze_source,
                 "waitReady": wait_ready,
             }))
             .unwrap();
@@ -2129,15 +2134,18 @@ mod tests {
             replies.push(receiver);
             state.queue_branch(source, QueuedBranch { req, reply });
         };
-        queue("src", "a", false);
-        queue("src", "b", true);
-        queue("src", "c", false);
-        queue("other", "d", false);
+        queue("src", "a", false, true);
+        queue("src", "b", true, true);
+        queue("src", "c", false, true);
+        queue("src", "e", false, false);
+        queue("src", "f", false, false);
+        queue("other", "d", false, true);
         let names = |batch: Vec<QueuedBranch>| -> Vec<String> {
             batch.into_iter().map(|queued| queued.req.name).collect()
         };
         assert_eq!(names(state.take_branch_batch("src")), ["a", "c"]);
         assert_eq!(names(state.take_branch_batch("src")), ["b"]);
+        assert_eq!(names(state.take_branch_batch("src")), ["e", "f"]);
         assert!(state.take_branch_batch("src").is_empty());
         assert!(!state.branch_queues.lock().contains_key("src"));
         assert_eq!(names(state.take_branch_batch("other")), ["d"]);

@@ -3928,11 +3928,13 @@ pub(crate) async fn fork_machine_inner(
 const MAX_CONCURRENT_BRANCH_BOOTS: usize = 8;
 
 /// Whether a branch request can share its source's transaction with other
-/// requests queued for it. The children of a frozen source all restore its one
-/// retained checkpoint, so preparing them together changes nothing they
-/// inherit. Held pool slots and pinned ports keep the one-at-a-time path.
+/// requests queued for it. Every queued request was sent before the batch takes
+/// its checkpoint, so one checkpoint taken then is a state of the source each
+/// of them could have branched alone; for a running source this replaces one
+/// checkpoint per child with one per batch. Held pool slots and pinned ports
+/// keep the one-at-a-time path.
 fn coalescable_branch(req: &ForkRequest) -> bool {
-    req.freeze_source && !req.hold && req.ports.is_empty()
+    !req.hold && req.ports.is_empty()
 }
 
 /// Take the source as a single branch does, then serve every compatible
@@ -3982,8 +3984,14 @@ async fn branch_batch_transaction(
     let Some((first, _)) = accepted.first() else {
         return;
     };
-    // The batch shares one forkpoint wait (`take_branch_batch` groups by it).
+    // The batch shares one forkpoint wait and source policy
+    // (`take_branch_batch` groups by both).
     let wait_ready = first.req.wait_ready;
+    let source_policy = if first.req.freeze_source {
+        crate::agent::fork::ForkSourcePolicy::Freeze
+    } else {
+        crate::agent::fork::ForkSourcePolicy::PlatformDefault
+    };
     if wait_ready {
         let timeout = Duration::from_secs(first.req.ready_timeout_secs.unwrap_or(240));
         let golden_b = golden.to_string();
@@ -4014,6 +4022,52 @@ async fn branch_batch_transaction(
         return;
     }
 
+    // Admission sizes host headroom for every child of a batch at once, so a
+    // batch can be refused where its requests, branched one at a time, would
+    // each have been admitted. Give each such request its own attempt, as the
+    // one-at-a-time path did; any other preparation failure answers the batch.
+    if let Err((refused, error)) =
+        prepare_and_boot_branches(state, golden, accepted, wait_ready, source_policy).await
+    {
+        if refused.len() > 1 && matches!(error, ApiError::Unavailable(_)) {
+            tracing::info!(
+                golden,
+                children = refused.len(),
+                "branch batch exceeds host headroom; branching its requests one at a time"
+            );
+            for one in refused {
+                if let Err((refused, error)) =
+                    prepare_and_boot_branches(state, golden, vec![one], wait_ready, source_policy)
+                        .await
+                {
+                    for (queued, _) in refused {
+                        let _ = queued.reply.send(Err(error.clone()));
+                    }
+                }
+            }
+        } else {
+            for (queued, _) in refused {
+                let _ = queued.reply.send(Err(error.clone()));
+            }
+        }
+    }
+    drop(guards);
+}
+
+/// A branch request that passed its own checks, with its parsed environment.
+type AcceptedBranch = (crate::api::state::QueuedBranch, Vec<(String, String)>);
+
+/// Prepare `accepted` from one checkpoint of `golden` and boot the children
+/// concurrently, answering each request with its own child's result. When
+/// preparation fails nothing was created, and the requests come back unanswered
+/// with the error.
+async fn prepare_and_boot_branches(
+    state: &Arc<ApiState>,
+    golden: &str,
+    accepted: Vec<AcceptedBranch>,
+    wait_ready: bool,
+    source_policy: crate::agent::fork::ForkSourcePolicy,
+) -> Result<(), (Vec<AcceptedBranch>, ApiError)> {
     let prepared = {
         let db = state.db().clone();
         let golden_b = golden.to_string();
@@ -4042,12 +4096,7 @@ async fn branch_batch_transaction(
                     },
                 )
                 .collect();
-            crate::agent::fork::prepare_forks(
-                &db,
-                &golden_b,
-                &specs,
-                crate::agent::fork::ForkSourcePolicy::Freeze,
-            )
+            crate::agent::fork::prepare_forks(&db, &golden_b, &specs, source_policy)
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))
@@ -4055,12 +4104,7 @@ async fn branch_batch_transaction(
     };
     let forks = match prepared {
         Ok(forks) => forks,
-        Err(error) => {
-            for (queued, _) in accepted {
-                let _ = queued.reply.send(Err(error.clone()));
-            }
-            return;
-        }
+        Err(error) => return Err((accepted, error)),
     };
 
     let boots = forks
@@ -4089,7 +4133,7 @@ async fn branch_batch_transaction(
             }
         });
     run_bounded_futures(boots, MAX_CONCURRENT_BRANCH_BOOTS, |succeeded| succeeded).await;
-    drop(guards);
+    Ok(())
 }
 
 /// The checks a single branch makes before preparing its child. Returns the
