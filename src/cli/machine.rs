@@ -4290,16 +4290,33 @@ impl CreateCmd {
                 sidecar_path,
             )?)
         };
+        // A delta carries only changed objects. Complete it from the held base
+        // before the stored-checkpoint path attempts to materialize its files.
+        let imported = if footer.is_some()
+            && smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
+                .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.base.is_some())
+        {
+            smolvm::checkpoint_delta::import(sidecar_path)?
+        } else {
+            None
+        };
         // A verified single file carrying its history unpacks into a directory
         // checkpoint; everything below then follows the stored-checkpoint path.
-        let unpacked = match footer {
-            Some(_) => smolvm::portable_checkpoint::unpack_verified_history_file(sidecar_path)?,
-            None => None,
+        let unpacked = if footer.is_some() && imported.is_none() {
+            smolvm::portable_checkpoint::unpack_verified_history_file(sidecar_path)?
+        } else {
+            None
         };
-        let sidecar_path: &std::path::Path =
-            unpacked.as_ref().map(|d| d.path()).unwrap_or(sidecar_path);
+        let sidecar_path: &std::path::Path = imported
+            .as_ref()
+            .map(|checkpoint| checkpoint.directory.as_path())
+            .or_else(|| unpacked.as_ref().map(|d| d.path()))
+            .unwrap_or(sidecar_path);
         let stored = sidecar_path.is_dir();
-        let footer = if unpacked.is_some() { None } else { footer };
+        let footer = if stored { None } else { footer };
         let generation =
             smolvm::portable_checkpoint::resolve_generation(sidecar_path, self.at.as_deref())?;
         let manifest = if stored {
