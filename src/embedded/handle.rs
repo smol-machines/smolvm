@@ -104,7 +104,9 @@ impl VmHandle {
         };
         let client = self.client_mut()?;
         client.pull_with_registry_config(image)?;
-        crate::workload::launch_image_workload(client, name, record, record.env.clone())?;
+        let mut env = record.env.clone();
+        env.extend(crate::embedded::control::credential_env(record));
+        crate::workload::launch_image_workload(client, name, record, env)?;
         Ok(())
     }
 

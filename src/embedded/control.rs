@@ -64,6 +64,14 @@ pub struct MachineSpec {
     pub runtime_managed: bool,
     /// S3-compatible volumes the agent mounts inside the guest on every start.
     pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
+    /// Credentials the workload uses without seeing them, as the CLI's
+    /// `--credential`: each bound variable holds a placeholder in the guest,
+    /// and the host substitutes the real value only on HTTPS requests to the
+    /// binding's hosts. A value comes from
+    /// [`Runtime::supply_credential_values`](crate::embedded::runtime::Runtime::supply_credential_values),
+    /// else from the embedding process's own variable of the binding's name.
+    /// A policy implies networking.
+    pub credentials: Option<smolvm_protocol::CredentialPolicy>,
 }
 
 impl MachineSpec {
@@ -133,6 +141,12 @@ pub(crate) fn create_vm_with_workload(
                 .map_err(|reason| Error::config("validate allowed CIDR", reason))?,
         );
     }
+    if let Some(policy) = spec.credentials.as_ref().filter(|p| !p.is_empty()) {
+        record.credential_placeholders =
+            crate::credentials::prepare_policy(policy, record.dns_filter_hosts.as_deref())?;
+        record.credential_policy = Some(policy.clone());
+        record.network = true;
+    }
     record.cmd = spec.command.clone();
     record.env = env;
     record.workdir = workdir;
@@ -145,6 +159,18 @@ pub(crate) fn create_vm_with_workload(
             format!("machine '{}' already exists", spec.name),
         ))
     }
+}
+
+/// The guest variables a machine's credentials add to every command and to
+/// its workload: each bound variable's placeholder, plus the variables that
+/// point HTTP clients at the machine CA. None of it is secret.
+pub(crate) fn credential_env(record: &VmRecord) -> Vec<(String, String)> {
+    crate::credentials::workload_env(
+        record.credential_policy.as_ref(),
+        &record.credential_placeholders,
+        &BTreeMap::new(),
+    )
+    .1
 }
 
 /// Replace a stopped machine's outbound network policy. See
@@ -932,6 +958,69 @@ mod tests {
         let record = test_spec("flat", true).to_record();
         assert_eq!(record.nested_virt, None);
         assert!(!record.vm_resources().nested_virt);
+    }
+
+    fn notion_policy(hosts: &[&str]) -> smolvm_protocol::CredentialPolicy {
+        smolvm_protocol::CredentialPolicy {
+            credentials: vec![crate::credentials::parse_credential_flag(&format!(
+                "notion=NOTION_API_KEY@{}",
+                hosts.join(",")
+            ))
+            .unwrap()],
+        }
+    }
+
+    #[test]
+    fn a_credentialed_spec_records_its_policy_placeholders_and_network() {
+        let db = test_db();
+        let mut spec = test_spec("creds", true);
+        spec.credentials = Some(notion_policy(&["api.notion.com", "files.notion.com"]));
+        create_vm_with_workload(&db, &spec, vec![("A".into(), "1".into())], None, None).unwrap();
+        let record = get_record(&db, "creds").unwrap();
+
+        assert!(record.network, "a credential policy implies networking");
+        let policy = record.credential_policy.as_ref().expect("policy recorded");
+        assert_eq!(
+            policy.credentials[0].allowed_hosts,
+            vec!["api.notion.com", "files.notion.com"]
+        );
+        assert!(!record.credentials_supplied_by_api);
+        let placeholder = record
+            .credential_placeholders
+            .get("notion")
+            .expect("a placeholder is minted at create")
+            .clone();
+
+        let env = credential_env(&record);
+        assert!(
+            env.contains(&("NOTION_API_KEY".to_string(), placeholder.clone())),
+            "the guest variable holds the placeholder: {env:?}"
+        );
+        assert!(
+            env.iter().all(|(_, value)| !value.contains("secret_")),
+            "no value reaches the guest environment"
+        );
+        assert_eq!(record.env, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn a_credential_for_a_host_outside_the_allow_list_is_refused_at_create() {
+        let db = test_db();
+        let mut spec = test_spec("creds-outside", true);
+        spec.allowed_hosts = vec!["api.github.com".into()];
+        spec.credentials = Some(notion_policy(&["api.notion.com"]));
+        assert!(create_vm_with_workload(&db, &spec, Vec::new(), None, None).is_err());
+        assert!(db.get_vm("creds-outside").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_spec_without_credentials_adds_no_guest_variables() {
+        let db = test_db();
+        create_vm_with_workload(&db, &test_spec("plain-env", true), Vec::new(), None, None)
+            .unwrap();
+        let record = get_record(&db, "plain-env").unwrap();
+        assert!(record.credential_policy.is_none());
+        assert!(credential_env(&record).is_empty());
     }
 
     #[test]

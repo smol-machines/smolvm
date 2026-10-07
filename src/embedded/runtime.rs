@@ -866,6 +866,14 @@ impl EmbeddedRuntime {
 
     /// Stop best-effort, remove from the registry and DB, and delete storage.
     pub fn delete_machine(&self, name: &str) -> Result<()> {
+        let result = self.delete_machine_inner(name);
+        if result.is_ok() {
+            crate::credentials::forget_values(name);
+        }
+        result
+    }
+
+    fn delete_machine_inner(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
             let _source_lock = crate::agent::fork::lock_fork_source(name)?;
             let Some(record) = self.db.get_vm(name)? else {
@@ -972,6 +980,7 @@ impl EmbeddedRuntime {
         command: Vec<String>,
         options: ExecOptions,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let options = self.with_credential_env(name, options)?;
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
         let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
         let mut client = self.command_client(name)?;
@@ -1042,6 +1051,10 @@ impl EmbeddedRuntime {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let mut env_with_credentials =
+            control::credential_env(&control::get_record(&self.db, name)?);
+        env_with_credentials.extend(env);
+        let env = env_with_credentials;
         let (_, overlay_owner) = self.image_and_overlay_owner(name)?;
         let mount_bindings = self.mount_bindings_for(name)?;
         let s3_volumes = self.s3_volumes_for(name)?;
@@ -1187,6 +1200,35 @@ impl EmbeddedRuntime {
         ))
     }
 
+    /// `options` with the machine's credential variables ahead of the
+    /// caller's, so a command sees each placeholder unless it sets the
+    /// variable itself.
+    fn with_credential_env(&self, name: &str, mut options: ExecOptions) -> Result<ExecOptions> {
+        let mut env = control::credential_env(&control::get_record(&self.db, name)?);
+        env.extend(std::mem::take(&mut options.env));
+        options.env = env;
+        Ok(options)
+    }
+
+    /// Hold credential values for `name`'s next boots, by binding name, in
+    /// this process's memory only: never on disk, in a boot config or in a
+    /// checkpoint. A binding without one resolves from this process's own
+    /// variable of the binding's name. Supply them before the start that
+    /// should use them.
+    pub fn supply_credential_values(
+        &self,
+        name: &str,
+        values: std::collections::BTreeMap<String, String>,
+    ) {
+        crate::credentials::supply_values(
+            name,
+            values
+                .into_iter()
+                .map(|(binding, value)| (binding, zeroize::Zeroizing::new(value)))
+                .collect(),
+        );
+    }
+
     fn mount_bindings_for(&self, name: &str) -> Result<Vec<(String, String, bool)>> {
         let record = control::get_record(&self.db, name)?;
         Ok(crate::workload::record_mounts_to_bindings(&record))
@@ -1255,6 +1297,7 @@ impl EmbeddedRuntime {
         cancel: &ExecCancel,
         on_event: F,
     ) -> Result<()> {
+        let options = self.with_credential_env(name, options)?;
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
         let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
         if cancel.is_cancelled() {
