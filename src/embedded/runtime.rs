@@ -1357,13 +1357,20 @@ impl EmbeddedRuntime {
     }
 
     fn started_handle(&self, name: &str) -> Result<SharedHandle> {
-        if control::get_record(&self.db, name)?
-            .paused_checkpoint
-            .is_some()
-        {
+        let record = control::get_record(&self.db, name)?;
+        if record.paused_checkpoint.is_some() {
             return Err(Error::agent_conflict(
                 "access machine",
                 "machine is pausing or paused; use resume",
+            ));
+        }
+        // A frozen branch base keeps its process but never runs again; its
+        // agent would accept a command and never answer it.
+        if crate::agent::state_probe::resolve_state(name, &record) == RecordState::Frozen {
+            return Err(Error::agent_conflict(
+                "access machine",
+                "machine is frozen as a reusable branch base; branch it again, or delete its \
+                 branches and stop it",
             ));
         }
         self.cached_handle(name)?
