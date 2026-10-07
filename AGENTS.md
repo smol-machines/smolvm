@@ -559,6 +559,21 @@ Content-Type: application/json
 # event: exit
 # data: {"exitCode":0}
 ```
+
+### Interactive exec over a WebSocket
+
+`GET /api/v1/machines/:name/exec/interactive` upgrades to a WebSocket that carries a command's stdin and output in both directions.
+
+| Query parameter | Meaning |
+|---|---|
+| `cmd` | Program to run (default `/bin/sh`) |
+| `arg` | One argument to the program; repeat it for each, in order (an empty value is an argument) |
+| `tty` | `true` (default) runs the command on a PTY; `false` runs it on pipes |
+| `cols`, `rows` | Initial terminal size (`tty=true` only) |
+
+Binary frames from the client are the command's stdin; binary frames from the server are its output. When the command exits the server sends `{"type":"exit","code":N}` and closes. Closing the socket ends the session and kills the command. On a PTY, a text frame `{"type":"resize","cols":N,"rows":N}` resizes the terminal and stderr is merged into stdout.
+
+With `tty=false` the command sees plain pipes: stdout is the binary frames byte for byte, stderr arrives as text frames `{"type":"stderr","data":"..."}` (lossily UTF-8), and stdin is written with backpressure. The socket is read only as fast as the command takes its input, and no byte is dropped. Input the server has received wakes the session at once; it does not wait for agent output. Use `tty=false` for anything that is not a person at a terminal (a protocol relay, a filter). A PTY is not a reliable byte pipe: the guest agent writes its stdin without flow control, so a large or bursty write can be dropped, and the line discipline can rewrite bytes.
 ## Bare VM Mode
 
 `machine run` works without `--image` when a Smolfile provides the workload config, or for direct Alpine shell access:
@@ -617,6 +632,7 @@ POST   /api/v1/machines/:name/stop         Stop machine
 DELETE /api/v1/machines/:name              Delete machine
 POST   /api/v1/machines/:name/exec         Execute command
 POST   /api/v1/machines/:name/exec/stream  Streaming exec (SSE)
+GET    /api/v1/machines/:name/exec/interactive  Interactive exec (WebSocket)
 PUT    /api/v1/machines/:name/files/*path  Upload file
 GET    /api/v1/machines/:name/files/*path  Download file
 GET    /api/v1/machines/:name/logs         Stream logs (SSE)

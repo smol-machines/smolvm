@@ -18,6 +18,8 @@ mod manager;
 pub mod pod_net;
 pub mod state_probe;
 pub mod terminal;
+#[cfg(all(test, unix))]
+pub(crate) mod test_guest;
 #[cfg(unix)]
 pub mod video;
 pub(crate) mod virtiofs;
@@ -86,8 +88,9 @@ pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;
 pub use crate::data::storage::HostMount;
 pub use client::{
-    file_transfer_max_total, pack_export_max_total, AgentClient, ExecEvent, FileWriteMeta,
-    InteractiveInput, InteractiveOutput, PullOptions, RunConfig,
+    file_transfer_max_total, interactive_input, pack_export_max_total, AgentClient, ExecEvent,
+    FileWriteMeta, InputClosed, InteractiveInput, InteractiveInputReceiver, InteractiveInputSender,
+    InteractiveOutput, PullOptions, RunConfig,
 };
 pub use fsnotify_watch::FsNotifyWatcher;
 pub use krun::{host_layers_supported, KrunFunctions};

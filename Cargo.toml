@@ -146,6 +146,8 @@ windows-sys = { version = "0.60", features = [
 [dev-dependencies]
 tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# WebSocket client for the interactive exec tests (already locked through axum).
+tokio-tungstenite = "0.29"
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.23.7" }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
