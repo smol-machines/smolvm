@@ -402,6 +402,13 @@ impl EgressPolicy {
         }
     }
 
+    /// A policy that admits no destination and resolves no name (beyond the
+    /// gateway's own, which the stack answers itself), for a guest that has a
+    /// network device only to serve published ports.
+    pub fn deny_all() -> Self {
+        Self::new(Some(&[]), Some(&[]))
+    }
+
     pub fn from_allowed_cidrs(allowed: Option<&[String]>) -> Self {
         Self::new(allowed, None)
     }
@@ -524,6 +531,16 @@ mod tests {
         // Unrecognized falls through to the inferred default (None).
         assert_eq!(parse_floor_override(""), None);
         assert_eq!(parse_floor_override("yes"), None);
+    }
+
+    #[test]
+    fn deny_all_admits_no_destination_and_resolves_no_name() {
+        let policy = EgressPolicy::deny_all();
+        assert!(policy.is_restricted());
+        assert!(!policy.allows_v4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!policy.allows_v6("2606:4700::1111".parse().unwrap()));
+        assert!(policy.dns_filter_active());
+        assert!(!policy.hostname_allowed("example.com"));
     }
 
     #[test]

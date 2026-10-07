@@ -511,10 +511,15 @@ pub fn launch_agent_vm_dynamic(
                 .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
                 .collect();
             // Denial sink beside the vsock socket, mirroring the static launcher.
-            let mut egress = smolvm_network::EgressPolicy::new(
-                config.resources.allowed_cidrs.as_deref(),
-                config.dns_filter_hosts.as_deref(),
-            );
+            let mut egress = if network_plan.outbound {
+                smolvm_network::EgressPolicy::new(
+                    config.resources.allowed_cidrs.as_deref(),
+                    config.dns_filter_hosts.as_deref(),
+                )
+            } else {
+                // Networked only to serve published ports: inbound only.
+                smolvm_network::EgressPolicy::deny_all()
+            };
             if let Some(dir) = config.vsock_socket.parent() {
                 egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
                 egress = egress.with_watchlist(

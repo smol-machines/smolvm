@@ -72,6 +72,11 @@ pub enum EffectiveNetworkBackend {
 pub struct LaunchNetworkPlan {
     /// Selected backend.
     pub backend: EffectiveNetworkBackend,
+    /// Whether the guest may open outbound connections. A machine networked
+    /// only to serve published ports (or the smolvm host service) gets a backend
+    /// for that inbound path but no egress: publishing a port must not quietly
+    /// turn on the internet for a machine created without networking.
+    pub outbound: bool,
 }
 
 impl LaunchNetworkPlan {
@@ -143,8 +148,17 @@ pub fn plan_launch_network_with(
     if !wants_network {
         return LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::None,
+            outbound: false,
         };
     }
+    // Ports and the host service are inbound paths; everything else here is a
+    // request for egress, possibly narrowed by its own allow-list.
+    let outbound = resources.network
+        || has_cidr_policy
+        || has_dns_filter
+        || has_fabric
+        || has_guest_subnet
+        || has_credentials;
 
     // Published ports need the inbound path, which only virtio-net provides.
     // When the caller didn't pick a backend explicitly, default to virtio-net
@@ -191,11 +205,20 @@ pub fn plan_launch_network_with(
     // cross-platform and libkrun's net device bridges over an AF_UNIX path
     // (Windows 10 1809+ has native AF_UNIX). See launcher's VirtioNet arm.
     match backend {
+        // TSI serves no published ports and its filter does not hold an empty
+        // allow-list, so a TSI guest that may not open outbound connections
+        // gets no network at all rather than an unfiltered one.
+        NetworkBackend::Tsi if !outbound => LaunchNetworkPlan {
+            backend: EffectiveNetworkBackend::None,
+            outbound: false,
+        },
         NetworkBackend::Tsi => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::Tsi,
+            outbound,
         },
         NetworkBackend::VirtioNet => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::VirtioNet,
+            outbound,
         },
     }
 }
@@ -311,6 +334,41 @@ mod tests {
 
     fn resources() -> VmResources {
         VmResources::default()
+    }
+
+    #[test]
+    fn a_published_port_without_networking_serves_inbound_only() {
+        let plan = plan_launch_network(&resources(), None, 1);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        assert!(!plan.outbound, "a published port must not open egress");
+
+        let mut networked = resources();
+        networked.network = true;
+        assert!(plan_launch_network(&networked, None, 1).outbound);
+
+        let mut allow_listed = resources();
+        allow_listed.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]);
+        assert!(plan_launch_network(&allow_listed, None, 1).outbound);
+        let hosts = ["api.example.com".to_string()];
+        assert!(plan_launch_network(&resources(), Some(&hosts), 1).outbound);
+        assert!(plan_launch_network_with(&resources(), None, 1, true).outbound);
+    }
+
+    #[test]
+    fn tsi_without_outbound_attaches_no_network() {
+        let mut tsi = resources();
+        tsi.network_backend = Some(NetworkBackend::Tsi);
+        tsi.guest_subnet = None;
+        // Nothing asks for networking: no network, as before.
+        assert_eq!(
+            plan_launch_network(&tsi, None, 0).backend,
+            EffectiveNetworkBackend::None
+        );
+        // Asked for networking: TSI with egress.
+        tsi.network = true;
+        let plan = plan_launch_network(&tsi, None, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
+        assert!(plan.outbound);
     }
 
     #[test]

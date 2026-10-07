@@ -1360,10 +1360,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 let denial_log = vsock_socket
                     .parent()
                     .map(|dir| dir.join(smolvm_network::EGRESS_DENIALS_LOG));
-                let mut egress = smolvm_network::EgressPolicy::new(
-                    resources.allowed_cidrs.as_deref(),
-                    egress_refresh_hosts.as_deref(),
-                );
+                let mut egress = if network_plan.outbound {
+                    smolvm_network::EgressPolicy::new(
+                        resources.allowed_cidrs.as_deref(),
+                        egress_refresh_hosts.as_deref(),
+                    )
+                } else {
+                    // Networked only to serve published ports: inbound only.
+                    smolvm_network::EgressPolicy::deny_all()
+                };
                 if let Some(path) = denial_log {
                     egress = egress.with_denial_log(path);
                 }
