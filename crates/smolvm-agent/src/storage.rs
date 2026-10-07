@@ -5232,13 +5232,73 @@ fn apply_proxy_env(cmd: &mut Command, proxy: Option<&str>, no_proxy: Option<&str
 /// The host trust volume is mounted at boot, before image pulls. Keep its
 /// trust scoped to registry subprocesses and only opt in when the bundle is
 /// present; crane (Go) reads SSL_CERT_FILE for manifests, auth and blobs.
+///
+/// A machine with credential substitution also has its interceptor's CA
+/// mounted at boot, and the interceptor terminates TLS for the hosts its
+/// credentials are bound to. When one of those hosts is the registry's token
+/// realm (a credential for our own API, whose host serves `/v2/auth`), crane
+/// meets the interceptor's certificate mid-pull, so it must trust that CA too:
+/// it gets its usual roots followed by the machine CA, as the workload does.
 fn apply_registry_trust(cmd: &mut Command) {
-    apply_registry_trust_from(cmd, Path::new("/etc/smolvm-host-trust/ca-bundle.pem"));
+    let credential_ca = Path::new(smolvm_protocol::credentials::GUEST_CA_DIR)
+        .join(smolvm_protocol::credentials::GUEST_CA_FILE);
+    apply_registry_trust_from(
+        cmd,
+        &RegistryTrust {
+            host_bundle: Path::new("/etc/smolvm-host-trust/ca-bundle.pem"),
+            credential_ca: &credential_ca,
+            system_bundle: Path::new("/etc/ssl/certs/ca-certificates.crt"),
+            assembled: Path::new("/run/smolvm-credentials/registry-ca-bundle.pem"),
+        },
+    );
 }
 
-fn apply_registry_trust_from(cmd: &mut Command, bundle: &Path) {
-    if bundle.is_file() {
-        cmd.env("SSL_CERT_FILE", bundle);
+/// Where registry trust comes from, so tests can point it at fixtures.
+struct RegistryTrust<'a> {
+    /// Host-provided roots (`--host-trust`), a complete bundle when present.
+    host_bundle: &'a Path,
+    /// The credential interceptor's CA, when the machine has credentials.
+    credential_ca: &'a Path,
+    /// The agent's own roots, used when there is no host bundle.
+    system_bundle: &'a Path,
+    /// Where the combined bundle is written.
+    assembled: &'a Path,
+}
+
+fn apply_registry_trust_from(cmd: &mut Command, trust: &RegistryTrust<'_>) {
+    let Ok(credential_ca) = std::fs::read(trust.credential_ca) else {
+        if trust.host_bundle.is_file() {
+            cmd.env("SSL_CERT_FILE", trust.host_bundle);
+        }
+        return;
+    };
+    // SSL_CERT_FILE replaces the default store, so the bundle carries the
+    // roots crane would otherwise use, followed by the machine CA.
+    let base = if trust.host_bundle.is_file() {
+        trust.host_bundle
+    } else {
+        trust.system_bundle
+    };
+    let mut bundle = std::fs::read(base).unwrap_or_default();
+    if !bundle.is_empty() && !bundle.ends_with(b"\n") {
+        bundle.push(b'\n');
+    }
+    bundle.extend_from_slice(&credential_ca);
+    let written = trust
+        .assembled
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(trust.assembled, &bundle));
+    match written {
+        Ok(()) => {
+            cmd.env("SSL_CERT_FILE", trust.assembled);
+        }
+        Err(e) => {
+            warn!(error = %e, "could not write the registry trust bundle; pulls through the credential interceptor will fail");
+            if trust.host_bundle.is_file() {
+                cmd.env("SSL_CERT_FILE", trust.host_bundle);
+            }
+        }
     }
 }
 
@@ -6257,22 +6317,76 @@ mod tests {
             .collect()
     }
 
+    fn trust_fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        (
+            dir.join("host-ca-bundle.pem"),
+            dir.join("credentials/ca.pem"),
+            dir.join("system-ca-certificates.crt"),
+            dir.join("run/registry-ca-bundle.pem"),
+        )
+    }
+
     #[test]
     fn registry_trust_only_applies_when_the_bundle_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let bundle = dir.path().join("ca-bundle.pem");
+        let (host, credential, system, assembled) = trust_fixture(dir.path());
+        let trust = RegistryTrust {
+            host_bundle: &host,
+            credential_ca: &credential,
+            system_bundle: &system,
+            assembled: &assembled,
+        };
         let mut cmd = Command::new("crane");
-        apply_registry_trust_from(&mut cmd, &bundle);
+        apply_registry_trust_from(&mut cmd, &trust);
         assert!(explicit_envs(&cmd).is_empty());
 
-        std::fs::write(&bundle, "certificate fixture").unwrap();
-        apply_registry_trust_from(&mut cmd, &bundle);
+        std::fs::write(&host, "certificate fixture").unwrap();
+        apply_registry_trust_from(&mut cmd, &trust);
         assert_eq!(
             explicit_envs(&cmd),
             vec![(
                 "SSL_CERT_FILE".to_string(),
-                bundle.to_string_lossy().into_owned()
+                host.to_string_lossy().into_owned()
             )]
+        );
+    }
+
+    #[test]
+    fn registry_pulls_trust_the_credential_interceptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, credential, system, assembled) = trust_fixture(dir.path());
+        let trust = RegistryTrust {
+            host_bundle: &host,
+            credential_ca: &credential,
+            system_bundle: &system,
+            assembled: &assembled,
+        };
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "MACHINE CA\n").unwrap();
+        std::fs::write(&system, "SYSTEM ROOTS").unwrap();
+
+        // No host bundle: the agent's own roots, then the machine CA.
+        let mut cmd = Command::new("crane");
+        apply_registry_trust_from(&mut cmd, &trust);
+        assert_eq!(
+            explicit_envs(&cmd),
+            vec![(
+                "SSL_CERT_FILE".to_string(),
+                assembled.to_string_lossy().into_owned()
+            )]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&assembled).unwrap(),
+            "SYSTEM ROOTS\nMACHINE CA\n"
+        );
+
+        // A host bundle replaces the agent's roots as the base.
+        std::fs::write(&host, "HOST ROOTS\n").unwrap();
+        let mut cmd = Command::new("crane");
+        apply_registry_trust_from(&mut cmd, &trust);
+        assert_eq!(
+            std::fs::read_to_string(&assembled).unwrap(),
+            "HOST ROOTS\nMACHINE CA\n"
         );
     }
 

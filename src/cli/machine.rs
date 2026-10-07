@@ -78,6 +78,22 @@ fn create_flags_in_workload(command: &[String]) -> Vec<String> {
     found
 }
 
+/// The refusal for credentials on an ephemeral `.smolmachine` run. That run
+/// goes through the packed launcher, which has no credential interceptor, so
+/// it would boot with the variables unset and nothing substituted; a
+/// persistent machine boots through the launcher that has one.
+fn credentials_need_a_persistent_pack(source: &str) -> smolvm::Error {
+    smolvm::Error::config(
+        "--credential",
+        format!(
+            "credentials are not substituted for an ephemeral run of a .smolmachine \
+             ('{source}'). Create a persistent machine instead:\n  \
+             smolvm machine create --name <name> --credential ... --from|--image {source} \
+             && smolvm machine start --name <name>"
+        ),
+    )
+}
+
 /// Fold `--credential` flags into the create parameters, after any Smolfile
 /// `[[network.credentials]]` entries. A credential policy needs the network.
 fn merge_cli_credentials(
@@ -1300,6 +1316,11 @@ impl RunCmd {
         // flags pass through. Flags the sidecar runner can't honor are rejected
         // at parse time via `conflicts_with_all` on `from`.
         if let Some(from) = self.from {
+            if !self.credential.is_empty() {
+                return Err(credentials_need_a_persistent_pack(
+                    &from.display().to_string(),
+                ));
+            }
             let port = PortMappingSpec::expand_all(&self.port)
                 .map_err(|e| smolvm::Error::config("machine run ports", e))?;
             let mut env = self.env;
@@ -1448,6 +1469,13 @@ impl RunCmd {
         // the normal in-guest pull.
         if let Some(img) = params.image.clone() {
             if let Some(sidecar) = smolvm::data::pack_ref::resolve_pack_ref_blocking(&img)? {
+                if params
+                    .credential_policy
+                    .as_ref()
+                    .is_some_and(|policy| !policy.is_empty())
+                {
+                    return Err(credentials_need_a_persistent_pack(&img));
+                }
                 if self.detach {
                     // pack-run is ephemeral-only; a persistent machine from a
                     // pack ref goes through create (which reroutes the same way).
@@ -1528,8 +1556,14 @@ impl RunCmd {
         // once). `--oci-cache` extends it to a bare `--image` run with no init, so
         // the OCI image itself is cached on the host and repeat ephemeral runs skip
         // the pull — the same bake path, just with an empty init layer.
+        // A cached bake runs through the packed launcher, which cannot
+        // substitute credentials, so a credentialed run takes the direct path.
         if !self.no_init_cache
             && !self.detach
+            && params
+                .credential_policy
+                .as_ref()
+                .is_none_or(|policy| policy.is_empty())
             && image_bakeable(params.image.as_deref())
             && (!params.init.is_empty() || self.oci_cache)
         {
