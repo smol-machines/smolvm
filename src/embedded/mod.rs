@@ -5,6 +5,7 @@ mod exec;
 mod handle;
 mod runtime;
 
+pub use crate::agent::fork::ForkSourcePolicy;
 pub use control::MachineSpec;
 pub use exec::{ExecCancel, ExecOptions};
 pub use runtime::{runtime, EmbeddedRuntime, ResizeSpec, RestoreOptions};

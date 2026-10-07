@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
+use crate::agent::fork::ForkSourcePolicy;
 use crate::agent::{AgentClient, ExecEvent, RunConfig};
 use crate::config::RecordState;
 use crate::db::SmolvmDb;
@@ -621,8 +622,37 @@ impl EmbeddedRuntime {
     /// remaps the golden's forwards to fresh host ports. Supported hosts resume
     /// the source after publishing a consistent fork generation.
     pub fn fork_machine(&self, golden: &str, clone: &str, ports: &[(u16, u16)]) -> Result<()> {
+        self.fork_machine_with(
+            golden,
+            clone,
+            ports,
+            false,
+            ForkSourcePolicy::PlatformDefault,
+        )
+    }
+
+    /// Fork a machine, choosing whether the clone becomes a checkpoint source
+    /// in turn and whether `golden` resumes afterwards or stays paused as a
+    /// reusable branch base ([`ForkSourcePolicy::Freeze`]).
+    pub fn fork_machine_with(
+        &self,
+        golden: &str,
+        clone: &str,
+        ports: &[(u16, u16)],
+        checkpointable: bool,
+        source_policy: ForkSourcePolicy,
+    ) -> Result<()> {
         self.with_name_locks(&[golden, clone], || {
-            let handle = control::fork_vm(&self.db, golden, clone, ports)?;
+            let handle = control::fork_vm_with_options(
+                &self.db,
+                golden,
+                clone,
+                ports,
+                checkpointable,
+                false,
+                None,
+                source_policy,
+            )?;
             self.insert_handle(clone, handle)?;
             Ok(())
         })
@@ -637,12 +667,13 @@ impl EmbeddedRuntime {
         clone: &str,
         ports: &[(u16, u16)],
     ) -> Result<()> {
-        self.with_name_locks(&[source, clone], || {
-            let handle =
-                control::fork_vm_with_options(&self.db, source, clone, ports, true, false, None)?;
-            self.insert_handle(clone, handle)?;
-            Ok(())
-        })
+        self.fork_machine_with(
+            source,
+            clone,
+            ports,
+            true,
+            ForkSourcePolicy::PlatformDefault,
+        )
     }
 
     /// Fork several clones from one retained snapshot and boot them with
@@ -655,6 +686,25 @@ impl EmbeddedRuntime {
         ports: &[(u16, u16)],
         parallel: usize,
     ) -> Result<()> {
+        self.fork_machines_with(
+            golden,
+            clones,
+            ports,
+            parallel,
+            ForkSourcePolicy::PlatformDefault,
+        )
+    }
+
+    /// [`Self::fork_machines`], choosing whether `golden` resumes afterwards
+    /// or stays paused as a reusable branch base.
+    pub fn fork_machines_with(
+        &self,
+        golden: &str,
+        clones: &[String],
+        ports: &[(u16, u16)],
+        parallel: usize,
+        source_policy: ForkSourcePolicy,
+    ) -> Result<()> {
         let mut lock_names = Vec::with_capacity(clones.len() + 1);
         lock_names.push(golden);
         lock_names.extend(clones.iter().map(String::as_str));
@@ -663,7 +713,8 @@ impl EmbeddedRuntime {
                 .iter()
                 .map(|name| (name.clone(), ports.to_vec()))
                 .collect();
-            let mut started = control::fork_vm_batch(&self.db, golden, &requests, parallel)?;
+            let mut started =
+                control::fork_vm_batch(&self.db, golden, &requests, parallel, source_policy)?;
             let mut registry = match self.registry.write() {
                 Ok(registry) => registry,
                 Err(error) => {
@@ -699,7 +750,13 @@ impl EmbeddedRuntime {
                 .iter()
                 .map(|name| (name.clone(), ports.to_vec()))
                 .collect();
-            for (_, handle) in control::fork_vm_batch(&self.db, golden, &requests, parallel)? {
+            for (_, handle) in control::fork_vm_batch(
+                &self.db,
+                golden,
+                &requests,
+                parallel,
+                ForkSourcePolicy::PlatformDefault,
+            )? {
                 handle.detach();
             }
             Ok(())
@@ -725,6 +782,7 @@ impl EmbeddedRuntime {
                 false,
                 share_weights,
                 Some(false),
+                ForkSourcePolicy::PlatformDefault,
             )?;
             handle.detach();
             Ok(())
@@ -748,6 +806,7 @@ impl EmbeddedRuntime {
                 true,
                 false,
                 Some(false),
+                ForkSourcePolicy::PlatformDefault,
             )?;
             handle.detach();
             Ok(())

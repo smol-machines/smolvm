@@ -394,23 +394,10 @@ pub fn start_vm_with_netns(
     Ok(started.handle)
 }
 
-/// Fork a running, forkable `golden` into a new `clone` via copy-on-write guest
-/// RAM + disks (same host). Freezes the golden (it stays paused as the shared
-/// base — clones map its RAM `MAP_PRIVATE`, so it must not run again while clones
-/// exist), boots the clone from the golden's snapshot, and returns the clone's
-/// handle. `pinned_ports` are `(host, guest)` inbound forwards for the clone;
-/// empty means the golden's forwards are remapped to freshly-allocated host
-/// ports. Shares `agent::fork` with the CLI/serve fork paths.
-pub fn fork_vm(
-    db: &SmolvmDb,
-    golden: &str,
-    clone: &str,
-    pinned_ports: &[(u16, u16)],
-) -> Result<VmHandle> {
-    fork_vm_with_options(db, golden, clone, pinned_ports, false, false, None)
-}
-
 /// Fork a machine with launch options needed by non-embedded front-ends.
+/// `source_policy` decides whether the source resumes or stays paused as a
+/// reusable branch base.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fork_vm_with_options(
     db: &SmolvmDb,
     golden: &str,
@@ -419,6 +406,7 @@ pub(crate) fn fork_vm_with_options(
     clone_forkable: bool,
     share_weights: bool,
     watch_parent: Option<bool>,
+    source_policy: crate::agent::fork::ForkSourcePolicy,
 ) -> Result<VmHandle> {
     let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
     // Freeze + snapshot the source, then register the clone and its CoW disks.
@@ -430,7 +418,7 @@ pub(crate) fn fork_vm_with_options(
         clone_forkable,
         &[],
         &std::collections::BTreeMap::new(),
-        crate::agent::fork::ForkSourcePolicy::PlatformDefault,
+        source_policy,
     )?;
 
     boot_prepared_fork(db, clone, prep, share_weights, watch_parent, None)
@@ -531,6 +519,7 @@ pub fn fork_vm_batch(
     golden: &str,
     clones: &[(String, Vec<(u16, u16)>)],
     parallel: usize,
+    source_policy: crate::agent::fork::ForkSourcePolicy,
 ) -> Result<Vec<(String, VmHandle)>> {
     let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
     if clones.is_empty() {
@@ -551,12 +540,7 @@ pub fn fork_vm_batch(
             hold: false,
         })
         .collect();
-    let prepared = crate::agent::fork::prepare_forks(
-        db,
-        golden,
-        &specs,
-        crate::agent::fork::ForkSourcePolicy::PlatformDefault,
-    )?;
+    let prepared = crate::agent::fork::prepare_forks(db, golden, &specs, source_policy)?;
     let width = parallel.max(1).min(prepared.len());
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
         prepared.into_iter().enumerate().collect::<Vec<_>>(),
@@ -1081,7 +1065,7 @@ mod tests {
     #[test]
     fn embedded_batch_fork_rejects_empty_and_duplicate_groups_before_boot() {
         let db = test_db();
-        assert!(fork_vm_batch(&db, "missing", &[], 4)
+        assert!(fork_vm_batch(&db, "missing", &[], 4, Default::default())
             .err()
             .expect("empty batch must fail")
             .to_string()
@@ -1091,11 +1075,13 @@ mod tests {
             ("duplicate".to_string(), Vec::new()),
             ("duplicate".to_string(), Vec::new()),
         ];
-        assert!(fork_vm_batch(&db, "missing", &clones, 4)
-            .err()
-            .expect("duplicate batch must fail")
-            .to_string()
-            .contains("duplicate clone name"));
+        assert!(
+            fork_vm_batch(&db, "missing", &clones, 4, Default::default())
+                .err()
+                .expect("duplicate batch must fail")
+                .to_string()
+                .contains("duplicate clone name")
+        );
         assert!(db.get_vm("duplicate").unwrap().is_none());
     }
 }
