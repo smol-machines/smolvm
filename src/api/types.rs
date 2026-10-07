@@ -80,6 +80,55 @@ pub struct PortSpec {
     pub guest: u16,
 }
 
+/// A shared cache disk: a read-only base image the machine reads through its
+/// own copy-on-write layer, mounted at `mountPath`. Many machines start from
+/// one base without writing to it, and every branch gets its own layer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CacheDiskSpec {
+    /// File name of the base image in the server's cache disk directory
+    /// (`smolvm serve --cache-disk-dir`). A name, never a path.
+    #[schema(example = "deps-v3.qcow2")]
+    pub base: String,
+    /// Absolute guest path the cache filesystem is mounted at.
+    #[schema(example = "/cache")]
+    pub mount_path: String,
+    /// Where to fetch the base when this server does not have it yet: a
+    /// signed https URL on an allowed object store. Request only.
+    #[serde(default, skip_serializing)]
+    pub source_url: Option<String>,
+    /// SHA-256 (hex) a fetched base must have. Required with `sourceUrl`.
+    #[serde(default, skip_serializing)]
+    pub sha256: Option<String>,
+}
+
+/// Publish a stopped machine's cache disk as a new base.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PublishCacheDiskRequest {
+    /// File name for the new base in the server's cache disk directory. Bases
+    /// are immutable: an existing name is refused, so publish each version
+    /// under a new one.
+    #[schema(example = "deps-v4.qcow2")]
+    pub base: String,
+    /// Also upload the new base to these pre-signed object-store URLs, one
+    /// contiguous part per URL, before answering.
+    #[serde(default)]
+    pub upload_urls: Option<Vec<String>>,
+}
+
+/// A published cache disk base.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishCacheDiskResponse {
+    /// File name of the new base in the server's cache disk directory.
+    pub base: String,
+    /// Bytes the new base occupies on disk.
+    pub size_bytes: u64,
+    /// SHA-256 (hex) of the new base, to verify a later fetch of it.
+    pub sha256: String,
+}
+
 /// VM resource specification.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -121,6 +170,16 @@ pub struct ResourceSpec {
     /// reads through a restricted io_uring on Linux hosts.
     #[serde(default)]
     pub block_io: Option<crate::data::resources::BlockIoEngine>,
+    /// When guest disk writes must reach the host's disk. `full` (the default)
+    /// makes a guest `fsync` wait for the host's physical disk. `deferred`
+    /// writes everything out to the machine's disks on `fsync` but does not
+    /// wait for the physical disk: much faster for fsync-heavy work such as
+    /// database commits, but a host crash can lose recent writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_durability: Option<crate::data::resources::DiskDurability>,
+    /// Shared cache disk (see [`CacheDiskSpec`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_disk: Option<CacheDiskSpec>,
     /// Allowed egress CIDR ranges. When set, only these IP ranges are reachable.
     /// Omit for unrestricted egress. Empty list denies all egress.
     #[serde(default)]
@@ -680,6 +739,15 @@ pub struct CreateMachineRequest {
     /// Host block I/O engine. `sync` is the default; `async` is opt-in.
     #[serde(default)]
     pub block_io: Option<crate::data::resources::BlockIoEngine>,
+    /// When guest disk writes must reach the host's disk: `full` (default)
+    /// or `deferred`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_durability: Option<crate::data::resources::DiskDurability>,
+    /// Shared cache disk: a base from the server's cache disk directory,
+    /// mounted through the machine's own copy-on-write layer. Not allowed when
+    /// restoring a checkpoint, which keeps the disks it was captured with.
+    #[serde(default)]
+    pub cache_disk: Option<CacheDiskSpec>,
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -819,6 +887,11 @@ pub struct MachineInfo {
     pub overlay_gb: Option<u64>,
     /// Host block I/O engine used by this machine.
     pub block_io: crate::data::resources::BlockIoEngine,
+    /// When this machine's guest disk writes must reach the host's disk.
+    pub disk_durability: crate::data::resources::DiskDurability,
+    /// The machine's shared cache disk, its base named by file name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_disk: Option<CacheDiskSpec>,
     /// Whether ordinary starts launch this machine as a branch source.
     pub branchable: bool,
     /// Legacy alias for `branchable`.

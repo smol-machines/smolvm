@@ -441,6 +441,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub block_io: crate::data::resources::BlockIoEngine,
 
+    /// When guest disk writes must reach the host's disk.
+    #[serde(default)]
+    pub disk_durability: crate::data::resources::DiskDurability,
+
     /// Host disks attached beyond the managed storage and overlay disks
     /// (`--disk`). Persisted so every start re-attaches them in the same order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -844,6 +848,7 @@ impl VmRecord {
             cpus,
             mem,
             block_io: Default::default(),
+            disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
             mounts,
@@ -932,6 +937,7 @@ impl VmRecord {
             cpus,
             mem,
             block_io: Default::default(),
+            disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
             mounts,
@@ -1385,6 +1391,7 @@ impl VmRecord {
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             block_io: self.block_io,
+            disk_durability: self.disk_durability,
             disks: self.disks.clone(),
             cache_disk: self.cache_disk.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
@@ -2016,6 +2023,24 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
         assert_eq!(decoded.block_io, record.block_io);
         assert_eq!(decoded.vm_resources().block_io, record.block_io);
+    }
+
+    #[test]
+    fn disk_durability_defaults_to_full_and_round_trips_deferred() {
+        use crate::data::resources::DiskDurability;
+        let legacy = r#"{"name":"legacy"}"#;
+        let record: VmRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(record.disk_durability, DiskDurability::Full);
+
+        let mut record = VmRecord::new("deferred".to_string(), 2, 512, vec![], vec![], false);
+        record.disk_durability = DiskDurability::Deferred;
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""disk_durability":"deferred""#), "{json}");
+        let decoded: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.vm_resources().disk_durability,
+            DiskDurability::Deferred
+        );
     }
 
     #[test]

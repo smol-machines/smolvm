@@ -47,6 +47,38 @@ pub enum BlockIoEngine {
     Async,
 }
 
+/// When a guest's disk writes must reach the host's physical disk.
+///
+/// `Full`: an `fsync` in the guest returns only once the host has flushed the
+/// write to its physical disk, so a commit survives a host crash. `Deferred`:
+/// a guest `fsync` still writes everything out to the machine's disk files, so
+/// the machine, a restart, a checkpoint and a branch all see it, but it does
+/// not wait for the physical disk; the host kernel writes it back on its own
+/// schedule, and a host crash can lose recent writes. For machines whose state
+/// is disposable (tests, rollouts), that turns fsync-bound work such as
+/// database commits from a disk round trip into a memory copy. The guest sees
+/// the same disk either way, so a checkpoint restores under either setting.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskDurability {
+    /// A guest flush waits for the host's disk.
+    #[default]
+    Full,
+    /// Guest writes reach the host's disk on the host's schedule.
+    Deferred,
+}
+
 /// Resources available to a micro vm.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VmResources {
@@ -88,6 +120,9 @@ pub struct VmResources {
     /// Host block I/O engine. Defaults to the historical synchronous path.
     #[serde(default)]
     pub block_io: BlockIoEngine,
+    /// When guest disk writes must reach the host's disk. Defaults to full.
+    #[serde(default)]
+    pub disk_durability: DiskDurability,
     /// Host disks attached beyond the managed storage and overlay disks, in
     /// order, surfacing as `/dev/vdc`, `/dev/vdd`, ... Empty for most machines.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -195,6 +230,7 @@ impl Default for VmResources {
             storage_gib: None,
             overlay_gib: None,
             block_io: BlockIoEngine::Sync,
+            disk_durability: DiskDurability::Full,
             disks: Vec::new(),
             cache_disk: None,
             allowed_cidrs: None,

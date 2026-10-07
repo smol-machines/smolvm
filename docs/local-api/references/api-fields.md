@@ -41,7 +41,9 @@ unset, so leaving it out keeps the behaviour this packet describes. Asking for t
 a host without `io_uring` fails the boot with a message naming the way out
 (`use --block-io sync`), which is a boot failure mode none of the other packets mention. **v1.18.x adds `credentials`**, the credential substitution bindings the `credentials` packet
 covers, **and `guestSubnet`**, the API form of `--guest-subnet`; `from` now takes a
-`.smolcheckpoint` as well as a `.smolmachine` and restores its captured state. **Export the spec
+`.smolcheckpoint` as well as a `.smolmachine` and restores its captured state. **The next release adds
+`diskDurability`** (`full` or `deferred`, the API form of `--disk-durability`). Unset means `full`,
+so leaving it out keeps the behaviour this packet describes. **Export the spec
 against your own binary rather than trusting this list**, which is a snapshot of three releases.
 
 The three worth memorising, because the CLI trains you to write the other thing:

@@ -206,14 +206,42 @@ impl CacheDisk {
         Ok(())
     }
 
+    /// Resolve a cache disk named by a remote caller: `name` is a file in
+    /// `dir`, never a path, and the base must read only itself.
+    ///
+    /// A qcow2 header can name a backing file or an external data file, and
+    /// libkrun follows either, so a base carrying one would let a caller read
+    /// another host file through its machine. Bases published by smolvm never
+    /// carry one; anything that does is refused.
+    pub fn in_dir(dir: &std::path::Path, name: &str, mount_path: &str) -> Result<Self, String> {
+        validate_base_name(name)?;
+        let cache = Self::parse(&format!("{}:{mount_path}", dir.join(name).display()))?;
+        cache.validate()?;
+        ensure_self_contained(&cache.base)?;
+        Ok(cache)
+    }
+
+    /// The base's file name, the form a remote caller names it by.
+    pub fn base_name(&self) -> String {
+        self.base
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Where the machine's own layer over the base lives in `vm_dir`.
+    pub fn layer_path(vm_dir: &std::path::Path) -> std::path::PathBuf {
+        vm_dir.join(
+            std::path::Path::new(crate::data::storage::CACHE_DISK_FILENAME).with_extension("qcow2"),
+        )
+    }
+
     /// The machine's own layer over the base in `vm_dir`, created on first use.
     ///
     /// An existing layer is kept as is: it holds what this machine wrote, and a
     /// branch arrives with its own layer already made over its source's.
     pub fn prepare_layer(&self, vm_dir: &std::path::Path) -> crate::Result<std::path::PathBuf> {
-        let layer = vm_dir.join(
-            std::path::Path::new(crate::data::storage::CACHE_DISK_FILENAME).with_extension("qcow2"),
-        );
+        let layer = Self::layer_path(vm_dir);
         if layer.exists() {
             return Ok(layer);
         }
@@ -224,6 +252,65 @@ impl CacheDisk {
         crate::agent::create_disk_overlays(&[(layer.clone(), base, format)])?;
         Ok(layer)
     }
+}
+
+/// Check that `name` names a cache base as a remote caller must: one file name
+/// in the cache disk directory, never a path.
+pub fn validate_base_name(name: &str) -> Result<(), String> {
+    let single_component = !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', '\0']);
+    if single_component {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name:?}: cache base must be a file name (not a path, not starting with '.')"
+        ))
+    }
+}
+
+/// Refuse a disk image that reads any file but itself: a qcow2 naming a
+/// backing file or an external data file.
+fn ensure_self_contained(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
+    const EXTERNAL_DATA_FILE: u64 = 1 << 2;
+    let display = path.display();
+    let mut header = [0u8; 80];
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("{display}: cannot open ({e})"))?;
+    let read = file
+        .read(&mut header)
+        .map_err(|e| format!("{display}: cannot read ({e})"))?;
+    if read < 4 || header[..4] != QCOW2_MAGIC {
+        return Ok(());
+    }
+    if read < 72 {
+        return Err(format!("{display}: truncated qcow2 header"));
+    }
+    let be64 = |at: usize| u64::from_be_bytes(header[at..at + 8].try_into().unwrap());
+    let backing_offset = be64(8);
+    let backing_len = u32::from_be_bytes(header[16..20].try_into().unwrap());
+    if backing_offset != 0 || backing_len != 0 {
+        return Err(format!(
+            "{display}: cache base names a backing file; publish a self-contained base"
+        ));
+    }
+    let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
+    if version >= 3 {
+        if read < 80 {
+            return Err(format!("{display}: truncated qcow2 header"));
+        }
+        if be64(72) & EXTERNAL_DATA_FILE != 0 {
+            return Err(format!(
+                "{display}: cache base uses an external data file; publish a self-contained base"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The host mount point currently using `device`, if any (Linux only).
@@ -304,6 +391,61 @@ impl DiskType for Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn qcow2_header(backing: bool, external_data: bool) -> Vec<u8> {
+        let mut h = vec![0u8; 104];
+        h[..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
+        h[4..8].copy_from_slice(&3u32.to_be_bytes());
+        if backing {
+            h[8..16].copy_from_slice(&512u64.to_be_bytes());
+            h[16..20].copy_from_slice(&11u32.to_be_bytes());
+        }
+        if external_data {
+            h[72..80].copy_from_slice(&(1u64 << 2).to_be_bytes());
+        }
+        h
+    }
+
+    #[test]
+    fn api_cache_bases_are_plain_file_names() {
+        for ok in ["deps-v1.qcow2", "base.raw", "a"] {
+            assert!(validate_base_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a/b",
+            "../etc/passwd",
+            "/etc/passwd",
+            "a\\b",
+            "x\0",
+        ] {
+            assert!(validate_base_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn api_cache_bases_must_read_only_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("raw.img"), vec![0u8; 4096]).unwrap();
+        std::fs::write(dir.path().join("plain.qcow2"), qcow2_header(false, false)).unwrap();
+        std::fs::write(dir.path().join("backed.qcow2"), qcow2_header(true, false)).unwrap();
+        std::fs::write(dir.path().join("external.qcow2"), qcow2_header(false, true)).unwrap();
+
+        assert!(CacheDisk::in_dir(dir.path(), "raw.img", "/cache").is_ok());
+        let plain = CacheDisk::in_dir(dir.path(), "plain.qcow2", "/cache").unwrap();
+        assert_eq!(plain.base_name(), "plain.qcow2");
+        assert_eq!(plain.mount_path, "/cache");
+        let backed = CacheDisk::in_dir(dir.path(), "backed.qcow2", "/cache").unwrap_err();
+        assert!(backed.contains("backing file"), "{backed}");
+        let external = CacheDisk::in_dir(dir.path(), "external.qcow2", "/cache").unwrap_err();
+        assert!(external.contains("external data file"), "{external}");
+        assert!(CacheDisk::in_dir(dir.path(), "missing.qcow2", "/cache").is_err());
+        assert!(CacheDisk::in_dir(dir.path(), "../raw.img", "/cache").is_err());
+        assert!(CacheDisk::in_dir(dir.path(), "raw.img", "/proc/x").is_err());
+    }
 
     #[test]
     fn a_cache_disk_is_an_absolute_base_and_an_absolute_guest_path() {

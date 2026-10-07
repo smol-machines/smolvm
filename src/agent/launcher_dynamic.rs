@@ -639,6 +639,7 @@ pub fn launch_agent_vm_dynamic(
         disk_path.as_ptr(),
         storage_format,
         config.resources.block_io,
+        config.resources.disk_durability,
     );
     if storage_result < 0 {
         free_ctx_on_err!(dynamic_block_error(
@@ -661,6 +662,7 @@ pub fn launch_agent_vm_dynamic(
             overlay_disk.as_ptr(),
             overlay_format,
             config.resources.block_io,
+            config.resources.disk_durability,
         );
         if overlay_result < 0 {
             free_ctx_on_err!(dynamic_block_error(
@@ -701,6 +703,7 @@ pub fn launch_agent_vm_dynamic(
                 attached_path.as_ptr(),
                 format,
                 config.resources.block_io,
+                config.resources.disk_durability,
             )
         };
         if result < 0 {
@@ -1015,16 +1018,30 @@ fn add_dynamic_block_disk(
     disk_path: *const libc::c_char,
     disk_format: u32,
     engine: crate::data::resources::BlockIoEngine,
+    durability: crate::data::resources::DiskDurability,
 ) -> i32 {
+    use crate::data::resources::{BlockIoEngine, DiskDurability};
+    const KRUN_SYNC_RELAXED: u32 = 1;
     const KRUN_SYNC_FULL: u32 = 2;
+    const KRUN_BLOCK_IO_SYNC: u32 = 0;
     const KRUN_BLOCK_IO_ASYNC: u32 = 1;
     const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
 
-    if engine == crate::data::resources::BlockIoEngine::Async {
+    if engine == BlockIoEngine::Async || durability == DiskDurability::Deferred {
         let Some(add_disk4) = krun.add_disk4 else {
             return KRUN_ADD_DISK4_MISSING;
         };
-        // Buffered disk, full guest flush semantics, restricted io_uring engine.
+        // Buffered disk. Both modes honor guest flushes, so libkrun writes its
+        // own caches back to the image; full also fsyncs it, deferred leaves
+        // the data in the host page cache for the kernel to write back.
+        let sync_mode = match durability {
+            DiskDurability::Full => KRUN_SYNC_FULL,
+            DiskDurability::Deferred => KRUN_SYNC_RELAXED,
+        };
+        let io_engine = match engine {
+            BlockIoEngine::Sync => KRUN_BLOCK_IO_SYNC,
+            BlockIoEngine::Async => KRUN_BLOCK_IO_ASYNC,
+        };
         return unsafe {
             add_disk4(
                 ctx,
@@ -1033,8 +1050,8 @@ fn add_dynamic_block_disk(
                 disk_format,
                 false,
                 false,
-                KRUN_SYNC_FULL,
-                KRUN_BLOCK_IO_ASYNC,
+                sync_mode,
+                io_engine,
             )
         };
     }
@@ -1047,9 +1064,13 @@ fn dynamic_block_error(
     result: i32,
 ) -> String {
     const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
-    if engine == crate::data::resources::BlockIoEngine::Async && result == KRUN_ADD_DISK4_MISSING {
+    if result == KRUN_ADD_DISK4_MISSING {
+        let feature = match engine {
+            crate::data::resources::BlockIoEngine::Async => "async block I/O",
+            crate::data::resources::BlockIoEngine::Sync => "deferred disk durability",
+        };
         return format!(
-            "async block I/O for {disk} requires a newer bundled libkrun (krun_add_disk4 missing)"
+            "{feature} for {disk} requires a newer bundled libkrun (krun_add_disk4 missing)"
         );
     }
     if engine == crate::data::resources::BlockIoEngine::Async

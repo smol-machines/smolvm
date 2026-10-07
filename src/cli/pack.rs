@@ -751,6 +751,7 @@ impl PackCreateCmd {
                 storage_gib: pack_storage_gib,
                 overlay_gib: None,
                 block_io: Default::default(),
+                disk_durability: Default::default(),
                 disks: Vec::new(),
                 cache_disk: None,
                 gpu_vram_mib: None,
