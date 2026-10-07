@@ -738,6 +738,13 @@ pub struct RunCmd {
     #[arg(long = "block-io", value_enum, help_heading = "Resources")]
     pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
 
+    /// When guest disk writes must reach the host's disk. `full` (default):
+    /// a guest fsync waits for the host disk. `deferred`: guest writes reach
+    /// it on the host's schedule, much faster for fsync-heavy work such as
+    /// database commits, but a host crash can lose recent writes.
+    #[arg(long = "disk-durability", value_enum, help_heading = "Resources")]
+    pub disk_durability: Option<smolvm::data::resources::DiskDurability>,
+
     /// Attach a host disk image or block device (repeatable), appearing in the
     /// guest as /dev/vdc, /dev/vdd, ... in the order given. Append `:ro` for
     /// read-only. The disk is handed over raw — smolvm never formats or mounts
@@ -1404,6 +1411,9 @@ impl RunCmd {
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
         params.guest_subnet = self.guest_subnet.clone();
+        if let Some(durability) = self.disk_durability {
+            params.disk_durability = durability;
+        }
         params.disks = parse_attached_disks(&self.disk)?;
         params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
         params.allow_system_mounts = self.allow_system_mounts;
@@ -1764,6 +1774,7 @@ impl RunCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
+            disk_durability: params.disk_durability,
             disks: Vec::new(),
             cache_disk: None,
         };
@@ -3858,6 +3869,13 @@ pub struct CreateCmd {
     #[arg(long = "block-io", value_enum)]
     pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
 
+    /// When guest disk writes must reach the host's disk. `full` (default):
+    /// a guest fsync waits for the host disk. `deferred`: guest writes reach
+    /// it on the host's schedule, much faster for fsync-heavy work such as
+    /// database commits, but a host crash can lose recent writes.
+    #[arg(long = "disk-durability", value_enum)]
+    pub disk_durability: Option<smolvm::data::resources::DiskDurability>,
+
     /// Attach a host disk image or block device (repeatable), appearing in the
     /// guest as /dev/vdc, /dev/vdd, ... in the order given. Append `:ro` for
     /// read-only. The disk is handed over raw — smolvm never formats or mounts
@@ -4222,6 +4240,9 @@ impl CreateCmd {
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
         params.guest_subnet = self.guest_subnet.clone();
+        if let Some(durability) = self.disk_durability {
+            params.disk_durability = durability;
+        }
         // Attached host disks are validated at create, not at start: a machine
         // recorded against an unreadable device would fail every start with a
         // virtio-blk error that says nothing about which disk or why.
@@ -4281,6 +4302,7 @@ impl CreateCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
+            disk_durability: params.disk_durability,
             disks: Vec::new(),
             cache_disk: None,
         };
@@ -4626,6 +4648,7 @@ impl CreateCmd {
                 .and_then(|checkpoint| checkpoint.overlay_gib)
                 .or(self.overlay),
             block_io: self.block_io.unwrap_or_default(),
+            disk_durability: self.disk_durability.unwrap_or_default(),
             allowed_cidrs,
             restart_policy: checkpoint
                 .as_ref()
@@ -4692,6 +4715,7 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             block_io: params.block_io,
+            disk_durability: params.disk_durability,
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),

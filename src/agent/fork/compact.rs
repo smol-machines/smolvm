@@ -222,6 +222,106 @@ fn defined_ranges(layer: &Path, size: u64, into: &mut Vec<(u64, u64)>) -> Result
     Ok(())
 }
 
+/// The ranges of a raw image that hold data, from the filesystem's own
+/// allocation map. A file system without one reports the whole file as data.
+fn raw_data_ranges(path: &Path, size: u64, into: &mut Vec<(u64, u64)>) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(path).map_err(|e| compact_err("open raw layer", e))?;
+    let fd = file.as_raw_fd();
+    let end = size.min(
+        file.metadata()
+            .map_err(|e| compact_err("stat raw", e))?
+            .len(),
+    );
+    let mut offset: u64 = 0;
+    while offset < end {
+        // SAFETY: fd is open for the lifetime of `file`; lseek takes no pointers.
+        let data = unsafe { libc::lseek(fd, offset as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            into.push((offset, end));
+            return Ok(());
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        let hole = if hole < 0 {
+            end
+        } else {
+            (hole as u64).min(end)
+        };
+        if hole <= data as u64 {
+            break;
+        }
+        into.push((data as u64, hole));
+        offset = hole;
+    }
+    Ok(())
+}
+
+/// Write `out` as one self-contained qcow2 that reads exactly as `top` does:
+/// no backing file, so it can serve as a new base on its own. Only ranges some
+/// layer of the chain holds are copied, and all-zero chunks are left
+/// unallocated, so the result is no larger than the data it carries.
+pub(crate) fn flatten_standalone(top: &Path, out: &Path) -> Result<()> {
+    let layers = chain(top)?;
+    let view = open_readonly(top, true)?;
+    let size = view.size();
+    let mut ranges = Vec::new();
+    for layer in &layers {
+        if is_qcow2(layer)? {
+            defined_ranges(layer, size, &mut ranges)?;
+        } else {
+            raw_data_ranges(layer, size, &mut ranges)?;
+        }
+    }
+    runtime()?
+        .block_on(async {
+            let storage =
+                ImagoFile::create_open(StorageCreateOptions::new().filename(out).size(0)).await?;
+            Qcow2::<ImagoFile>::create_builder(storage)
+                .size(size)
+                .create()
+                .await
+        })
+        .map_err(|e| compact_err(&format!("create {}", out.display()), e))?;
+    let result = (|| {
+        let qcow = Qcow2::<ImagoFile>::builder_path(out)
+            .data_file(None)
+            .backing(None)
+            .write(true)
+            .open_sync(PermissiveImplicitOpenGate::default())
+            .map_err(|e| compact_err("open flattened image", e))?;
+        let writer = SyncFormatAccess::new(qcow).map_err(|e| compact_err("wrap flattened", e))?;
+        let mut buffer = vec![0_u8; COPY_CHUNK as usize];
+        for (start, end) in coalesce(ranges) {
+            let mut offset = start;
+            while offset < end {
+                let length = (end - offset).min(COPY_CHUNK);
+                let chunk = &mut buffer[..length as usize];
+                view.read(&mut *chunk, offset)
+                    .map_err(|e| compact_err("read chain", e))?;
+                if chunk.iter().any(|byte| *byte != 0) {
+                    writer
+                        .write(&*chunk, offset)
+                        .map_err(|e| compact_err("write data", e))?;
+                }
+                offset += length;
+            }
+        }
+        writer
+            .flush()
+            .map_err(|e| compact_err("flush flattened", e))?;
+        writer.sync().map_err(|e| compact_err("sync flattened", e))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(out);
+    }
+    result
+}
+
 fn coalesce(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     ranges.sort_unstable();
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());

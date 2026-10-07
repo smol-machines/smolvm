@@ -26,6 +26,7 @@
 //! | `cuda` | bool | No | Enable CUDA-over-vsock (host NVIDIA GPU). |
 //! | `auto_graph` | bool | No | Best-effort framework CUDA graphs; implies `cuda`. |
 //! | `block_io` | `"sync"` or `"async"` | No | Host block I/O engine; defaults to `sync`. |
+//! | `disk_durability` | `"full"` or `"deferred"` | No | Whether a guest `fsync` waits for the host disk (`full`, default) or guest writes reach it on the host's schedule (`deferred`; a host crash can lose recent writes). |
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
 //! | `ports` | string[] | No | Port mappings (`"host:guest"` or equal-length `"host-start-host-end:guest-start-guest-end"` ranges). Prefer `[dev] ports`. |
@@ -317,6 +318,8 @@ pub struct Smolfile {
     pub overlay: Option<u64>,
     /// Host block I/O engine: `sync` (default) or Linux raw-disk `async`.
     pub block_io: Option<String>,
+    /// Disk durability: `full` (default) or `deferred`.
+    pub disk_durability: Option<String>,
 
     // Legacy top-level fields (prefer [dev] section)
     /// Port mappings (e.g., `["8080:8080"]`).
@@ -714,6 +717,13 @@ protocol = "http"
 
         let sf = parse("").unwrap();
         assert_eq!(sf.block_io, None);
+    }
+
+    #[test]
+    fn parse_disk_durability_field() {
+        let sf = parse("disk_durability = \"deferred\"").unwrap();
+        assert_eq!(sf.disk_durability.as_deref(), Some("deferred"));
+        assert_eq!(parse("").unwrap().disk_durability, None);
     }
 
     #[test]

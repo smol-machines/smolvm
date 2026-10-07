@@ -120,6 +120,11 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
         block_io: record.block_io,
+        disk_durability: record.disk_durability,
+        cache_disk: record
+            .cache_disk
+            .as_ref()
+            .map(crate::api::state::cache_disk_spec),
         branchable: record.forkable_on_start(),
         forkable: record.forkable_on_start(),
         parent_machine: record.golden.clone(),
@@ -1958,6 +1963,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         .collect();
     MachineEntry {
         manager,
+        cache_disk: record.cache_disk.clone(),
         image: record.image.clone(),
         credentials: crate::credentials::CredentialLaunch::for_record(&record.name, record),
         external_interceptor: None,
@@ -2016,6 +2022,15 @@ async fn reconcile_confirmed_stopped_machine(
             ))
         })
 }
+
+/// How long to wait for a SIGKILLed VM process to exit before a delete gives up.
+///
+/// A killed process exits as soon as it leaves the kernel, but a VMM blocked in
+/// disk I/O stays until that I/O returns, which on a worker whose disk is
+/// saturated (a burst of captures and restores) takes seconds to tens of
+/// seconds. It is certain to exit, so giving up early only turns a slow delete
+/// into a failed one that the caller has to retry.
+const KILLED_VM_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Stop after confirmed guest quiescence, or discard an explicitly deleted VM.
 ///
@@ -2083,11 +2098,9 @@ fn shutdown_machine_process(
         // STILL alive.
         if is_alive(pid) {
             let _ = crate::systemd_scope::kill_scope(name);
-            for _ in 0..10 {
-                if !is_alive(pid) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(300));
+            let deadline = std::time::Instant::now() + KILLED_VM_EXIT_TIMEOUT;
+            while is_alive(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             if is_alive(pid) {
                 tracing::warn!(pid, name, "process still alive after shutdown + scope kill");
@@ -2101,7 +2114,8 @@ fn shutdown_machine_process(
         // the transient scope's cgroup directly and confirm via vsock that the VM
         // is actually gone.
         let _ = crate::systemd_scope::kill_scope(name);
-        for _ in 0..10 {
+        let deadline = std::time::Instant::now() + KILLED_VM_EXIT_TIMEOUT;
+        while std::time::Instant::now() < deadline {
             let reachable = manager
                 .as_ref()
                 .and_then(|m| AgentClient::connect(m.vsock_socket()).ok())
@@ -2561,6 +2575,20 @@ async fn create_machine_inner(
         .as_ref()
         .and_then(|checkpoint| checkpoint.overlay_gib)
         .or(req.overlay_gb);
+    // A restored guest resumes with the devices it was captured with, so a
+    // disk added now would not be the one its memory expects.
+    if manifest_checkpoint.is_some() && req.cache_disk.is_some() {
+        return Err(ApiError::BadRequest(
+            "a machine restored from a checkpoint keeps the disks it was captured with; \
+             add a cache disk to a fresh machine"
+                .into(),
+        ));
+    }
+    // Resolve before any work, so a bad base is a 400 and not a half-made machine.
+    if let Some(spec) = req.cache_disk.as_ref() {
+        fetch_cache_base(&state, spec).await?;
+        state.resolve_cache_disk(spec)?;
+    }
     let captured_ports: Vec<PortSpec> = checkpoint_network
         .map(|network| {
             network
@@ -2923,6 +2951,8 @@ async fn create_machine_inner(
         storage_gb: restored_storage_gb,
         overlay_gb: restored_overlay_gb,
         block_io: req.block_io,
+        disk_durability: req.disk_durability,
+        cache_disk: req.cache_disk.clone(),
         allowed_cidrs: normalized_cidrs,
         allowed_hosts: restored_allowed_hosts,
         // A restored checkpoint keeps the bindings its workload was captured
@@ -5759,6 +5789,264 @@ pub async fn resize_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+/// Publish a stopped machine's cache disk, its base with everything the
+/// machine wrote over it, as a new self-contained base in the server's cache
+/// disk directory. The new base appears whole or not at all, and the old one is
+/// left as it is, so machines still on it are unaffected.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/cache-disk/publish",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = crate::api::types::PublishCacheDiskRequest,
+    responses(
+        (status = 200, description = "Cache disk published as a new base", body = crate::api::types::PublishCacheDiskResponse),
+        (status = 400, description = "Invalid request, no cache disk, or cache disks disabled", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is running, or the base name is taken", body = ApiErrorResponse),
+    )
+)]
+pub async fn publish_cache_disk(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<crate::api::types::PublishCacheDiskRequest>,
+) -> Result<Json<crate::api::types::PublishCacheDiskResponse>, ApiError> {
+    let dir = state.cache_disk_dir()?;
+    crate::data::disk::validate_base_name(&req.base).map_err(ApiError::BadRequest)?;
+
+    // Held across the copy, so the machine cannot start and write its layer
+    // while the copy reads it.
+    let lifecycle = state.lifecycle_lock(&name);
+    let guard = lifecycle.lock_owned().await;
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let cache = record
+        .cache_disk
+        .clone()
+        .ok_or_else(|| ApiError::BadRequest(format!("machine '{name}' has no cache disk")))?;
+    if record.actual_state() == RecordState::Running {
+        return Err(ApiError::Conflict(format!(
+            "stop machine '{name}' before publishing its cache disk: a running machine is still writing it"
+        )));
+    }
+    let target = dir.join(&req.base);
+    if target.exists() {
+        return Err(ApiError::Conflict(format!(
+            "cache base '{}' already exists; publish each version under a new name",
+            req.base
+        )));
+    }
+
+    let upload_urls = req
+        .upload_urls
+        .as_ref()
+        .map(|urls| -> Result<Vec<reqwest::Url>, ApiError> {
+            if urls.is_empty() || urls.len() > MAX_UPLOAD_PARTS {
+                return Err(ApiError::BadRequest(format!(
+                    "uploadUrls must name 1 to {MAX_UPLOAD_PARTS} parts"
+                )));
+            }
+            urls.iter()
+                .map(|url| checked_checkpoint_source(url))
+                .collect()
+        })
+        .transpose()?;
+
+    let layer = crate::data::disk::CacheDisk::layer_path(&vm_data_dir(&name));
+    let base = req.base.clone();
+    let published = dir.join(&req.base);
+    let (size_bytes, sha256) =
+        tokio::task::spawn_blocking(move || -> Result<(u64, String), ApiError> {
+            let _guard = guard;
+            // A machine that never started has no layer yet: its cache is the base.
+            let top = if layer.exists() {
+                layer
+            } else {
+                cache.base.clone()
+            };
+            let size = publish_flattened(&top, &dir, &base)?;
+            Ok((size, file_sha256(&dir.join(&base))?))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    if let Some(urls) = upload_urls {
+        let file = std::fs::File::open(&published)
+            .map_err(|e| ApiError::internal(format!("open {}: {e}", published.display())))?;
+        upload_checkpoint_file(file, urls).await?;
+    }
+    Ok(Json(crate::api::types::PublishCacheDiskResponse {
+        base: req.base,
+        size_bytes,
+        sha256,
+    }))
+}
+
+/// The SHA-256 of a file, as lowercase hex.
+fn file_sha256(path: &std::path::Path) -> Result<String, ApiError> {
+    use sha2::Digest;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| ApiError::internal(format!("open {}: {e}", path.display())))?;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| ApiError::internal(format!("hash {}: {e}", path.display())))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Largest cache base a create may fetch.
+const MAX_CACHE_BASE_BYTES: u64 = 512 << 30;
+
+/// Fetch a requested cache base this server does not have yet from its signed
+/// source URL, verified against its SHA-256 before it appears under its name.
+/// A base already present is used as is: bases are immutable by name.
+async fn fetch_cache_base(
+    state: &ApiState,
+    spec: &crate::api::types::CacheDiskSpec,
+) -> Result<(), ApiError> {
+    use sha2::Digest;
+    let dir = state.cache_disk_dir()?;
+    crate::data::disk::validate_base_name(&spec.base).map_err(ApiError::BadRequest)?;
+    let target = dir.join(&spec.base);
+    if target.exists() {
+        return Ok(());
+    }
+    let Some(raw) = spec.source_url.as_deref() else {
+        return Ok(());
+    };
+    let expected = spec
+        .sha256
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            ApiError::BadRequest("cacheDisk.sourceUrl needs a hex sha256 to verify against".into())
+        })?;
+    let url = checked_checkpoint_source(raw)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| ApiError::internal(format!("build cache base fetch client: {e}")))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ApiError::internal(format!("fetch cache base: {}", e.without_url())))?;
+    if !response.status().is_success() {
+        return Err(ApiError::BadRequest(format!(
+            "cache base source url returned {}",
+            response.status()
+        )));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let partial = dir.join(format!(
+        ".{}.{}.{stamp}.partial",
+        spec.base,
+        std::process::id()
+    ));
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .await
+            .map_err(|e| ApiError::internal(format!("create {}: {e}", partial.display())))?;
+        let mut hasher = sha2::Sha256::new();
+        let mut received = 0_u64;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| ApiError::internal(format!("read cache base: {}", e.without_url())))?;
+            received += chunk.len() as u64;
+            if received > MAX_CACHE_BASE_BYTES {
+                return Err(ApiError::BadRequest(format!(
+                    "cache base exceeds {MAX_CACHE_BASE_BYTES} bytes"
+                )));
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| ApiError::internal(format!("write cache base: {e}")))?;
+        }
+        file.sync_all()
+            .await
+            .map_err(|e| ApiError::internal(format!("sync cache base: {e}")))?;
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected {
+            return Err(ApiError::BadRequest(format!(
+                "cache base sha256 is {actual}, expected {expected}"
+            )));
+        }
+        match std::fs::hard_link(&partial, &target) {
+            Ok(()) => Ok(()),
+            // Another create fetched the same immutable base first.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(ApiError::internal(format!(
+                "publish {}: {e}",
+                target.display()
+            ))),
+        }
+    }
+    .await;
+    let _ = std::fs::remove_file(&partial);
+    result
+}
+
+/// Flatten `top` into `dir/base`: written to a hidden partial file, then
+/// linked into place, which fails rather than replace a base that appeared
+/// meanwhile.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_flattened(
+    top: &std::path::Path,
+    dir: &std::path::Path,
+    base: &str,
+) -> Result<u64, ApiError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let partial = dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id()));
+    let target = dir.join(base);
+    let result = (|| {
+        crate::agent::fork::flatten_standalone(top, &partial).map_err(ApiError::from)?;
+        std::fs::hard_link(&partial, &target).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                ApiError::Conflict(format!(
+                    "cache base '{base}' already exists; publish each version under a new name"
+                ))
+            } else {
+                ApiError::internal(format!("publish {}: {e}", target.display()))
+            }
+        })?;
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| ApiError::internal(format!("sync {}: {e}", dir.display())))?;
+        std::fs::metadata(&target)
+            .map(|meta| meta.len())
+            .map_err(|e| ApiError::internal(format!("stat {}: {e}", target.display())))
+    })();
+    let _ = std::fs::remove_file(&partial);
+    result
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn publish_flattened(
+    _top: &std::path::Path,
+    _dir: &std::path::Path,
+    _base: &str,
+) -> Result<u64, ApiError> {
+    Err(ApiError::BadRequest(
+        "cache disks are not supported on this host".into(),
+    ))
+}
+
 /// Amend a stopped machine's egress allow list.
 #[utoipa::path(
     post,
@@ -6741,6 +7029,8 @@ mod tests {
             storage_gb: None,
             overlay_gb: None,
             block_io: None,
+            disk_durability: None,
+            cache_disk: None,
             allowed_cidrs: None,
             allowed_hosts: None,
             network_backend: None,

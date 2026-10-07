@@ -122,6 +122,10 @@ pub struct ApiState {
     /// kernel's nested-KVM code, so a server opts in for its whole fleet, and
     /// turning it back off also stops existing nested machines from starting.
     allow_nested_virt: std::sync::atomic::AtomicBool,
+    /// Directory the API's cache disk bases live in (`smolvm serve
+    /// --cache-disk-dir`). `None` refuses cache disks on the API: a remote
+    /// caller names a base by file name, so the server must choose where.
+    cache_disk_dir: RwLock<Option<std::path::PathBuf>>,
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
@@ -181,6 +185,10 @@ pub struct MachineEntry {
     pub cuda_vram_limit_mib: Option<u64>,
     /// Whether a fork clone is still parked as a clean assignable slot.
     pub forkpoint_held: bool,
+    /// The machine's shared cache disk, resolved to its base on this host.
+    /// Kept apart from `resources`, which is the API view and names a base
+    /// only by its file name.
+    pub cache_disk: Option<crate::data::disk::CacheDisk>,
 }
 
 /// Parameters for registering a new machine.
@@ -335,6 +343,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
+            cache_disk_dir: RwLock::new(None),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -356,6 +365,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
+            cache_disk_dir: RwLock::new(None),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -368,6 +378,31 @@ impl ApiState {
     pub fn set_allow_nested_virt(&self, allow: bool) {
         self.allow_nested_virt
             .store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Serve cache disk bases from `dir`. Set once from `smolvm serve
+    /// --cache-disk-dir`.
+    pub fn set_cache_disk_dir(&self, dir: Option<std::path::PathBuf>) {
+        *self.cache_disk_dir.write() = dir;
+    }
+
+    /// The directory cache disk bases live in, or a 400 naming the flag.
+    pub fn cache_disk_dir(&self) -> Result<std::path::PathBuf, ApiError> {
+        self.cache_disk_dir
+            .read()
+            .clone()
+            .ok_or_else(|| ApiError::BadRequest(CACHE_DISKS_DISABLED.to_string()))
+    }
+
+    /// Resolve a requested cache disk against this server's cache disk
+    /// directory.
+    pub fn resolve_cache_disk(
+        &self,
+        spec: &crate::api::types::CacheDiskSpec,
+    ) -> Result<crate::data::disk::CacheDisk, ApiError> {
+        let dir = self.cache_disk_dir()?;
+        crate::data::disk::CacheDisk::in_dir(&dir, &spec.base, &spec.mount_path)
+            .map_err(ApiError::BadRequest)
     }
 
     /// Whether this server lets machines run with nested virtualization.
@@ -561,6 +596,8 @@ impl ApiState {
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
                 block_io: Some(record.block_io),
+                disk_durability: Some(record.disk_durability),
+                cache_disk: record.cache_disk.as_ref().map(cache_disk_spec),
                 allowed_cidrs: record.allowed_cidrs.clone(),
                 allowed_hosts: record.dns_filter_hosts.clone(),
                 credentials: record.credential_policy.clone(),
@@ -593,6 +630,7 @@ impl ApiState {
                     machines.insert(
                         name.clone(),
                         Arc::new(parking_lot::Mutex::new(MachineEntry {
+                            cache_disk: record.cache_disk.clone(),
                             image: record.image.clone(),
                             credentials: crate::credentials::CredentialLaunch::for_record(
                                 &record.name,
@@ -1136,6 +1174,13 @@ impl ApiState {
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
         record.block_io = reg.resources.block_io.unwrap_or_default();
+        record.disk_durability = reg.resources.disk_durability.unwrap_or_default();
+        record.cache_disk = reg
+            .resources
+            .cache_disk
+            .as_ref()
+            .map(|spec| self.resolve_cache_disk(spec))
+            .transpose()?;
         // Persist egress policy + backend selection from the request (previously
         // dropped here, so API-created machines silently lost both).
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
@@ -1198,6 +1243,7 @@ impl ApiState {
                 machines.insert(
                     name,
                     Arc::new(parking_lot::Mutex::new(MachineEntry {
+                        cache_disk: record.cache_disk.clone(),
                         image: record.image.clone(),
                         credentials: crate::credentials::CredentialLaunch::for_record(
                             &record.name,
@@ -1525,7 +1571,8 @@ pub async fn ensure_machine_running(
             .map(HostMount::try_from)
             .collect::<crate::Result<Vec<_>>>()?;
         let ports: Vec<_> = entry.ports.iter().map(PortMapping::from).collect();
-        let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
+        let mut resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
+        resources.cache_disk = entry.cache_disk.clone();
 
         // An implicit start (exec/run/files/images) never restarts a machine
         // that is up. `update` refuses running machines, so its recorded
@@ -1854,6 +1901,11 @@ pub fn mounts_to_host_mounts(specs: &[MountSpec]) -> Result<Vec<HostMount>, ApiE
         .collect()
 }
 
+/// The refusal for a machine that asks for a cache disk on a server without
+/// a cache disk directory.
+pub const CACHE_DISKS_DISABLED: &str = "cache disks are disabled on this server; \
+start `smolvm serve` with --cache-disk-dir to enable them";
+
 /// The refusal for a machine that asks for nested virtualization on a server
 /// that has not opted in.
 pub const NESTED_VIRT_DISABLED: &str = "nested virtualization is disabled on this server; \
@@ -1877,6 +1929,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
         block_io: spec.block_io.unwrap_or_default(),
+        disk_durability: spec.disk_durability.unwrap_or_default(),
         disks: Vec::new(),
         cache_disk: None,
         allowed_cidrs: spec.allowed_cidrs.clone(),
@@ -1885,6 +1938,16 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         dns: None,
         network_name: None,
         guest_subnet: spec.guest_subnet.clone(),
+    }
+}
+
+/// A resolved cache disk as the API shows it: the base by file name.
+pub fn cache_disk_spec(cache: &crate::data::disk::CacheDisk) -> crate::api::types::CacheDiskSpec {
+    crate::api::types::CacheDiskSpec {
+        base: cache.base_name(),
+        mount_path: cache.mount_path.clone(),
+        source_url: None,
+        sha256: None,
     }
 }
 
@@ -1900,6 +1963,8 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         storage_gb: res.storage_gib,
         overlay_gb: res.overlay_gib,
         block_io: Some(res.block_io),
+        disk_durability: Some(res.disk_durability),
+        cache_disk: res.cache_disk.as_ref().map(cache_disk_spec),
         allowed_cidrs: res.allowed_cidrs,
         // VmResources has no hostname allow-list; callers that need it graft it
         // back from the source record (see the MachineEntry reload path).
@@ -1989,6 +2054,8 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
         block_io: entry.resources.block_io.unwrap_or_default(),
+        disk_durability: entry.resources.disk_durability.unwrap_or_default(),
+        cache_disk: entry.cache_disk.as_ref().map(cache_disk_spec),
         branchable: entry.forkable,
         forkable: entry.forkable,
         // MachineEntry is an in-memory runtime view and does not retain the
@@ -2147,6 +2214,8 @@ mod tests {
             storage_gb: None,
             overlay_gb: None,
             block_io: None,
+            disk_durability: None,
+            cache_disk: None,
             allowed_cidrs: None,
             allowed_hosts: None,
             credentials: None,
@@ -2226,6 +2295,8 @@ mod tests {
                     storage_gb: None,
                     overlay_gb: None,
                     block_io: None,
+                    disk_durability: None,
+                    cache_disk: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     credentials: None,
@@ -2240,6 +2311,7 @@ mod tests {
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
                 forkpoint_held: false,
+                cache_disk: None,
             },
         );
         assert!(!state.forget_deleted_machine(name).unwrap());
@@ -2283,6 +2355,8 @@ mod tests {
                 storage_gb: None,
                 overlay_gb: None,
                 block_io: None,
+                disk_durability: None,
+                cache_disk: None,
                 allowed_cidrs: None,
                 allowed_hosts: None,
                 credentials: None,
@@ -2297,6 +2371,7 @@ mod tests {
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             forkpoint_held: false,
+            cache_disk: None,
         };
         state.insert_machine(name, entry("before-start"));
         let queued = state.get_machine(name).unwrap();
@@ -2343,6 +2418,8 @@ mod tests {
                     storage_gb: None,
                     overlay_gb: None,
                     block_io: None,
+                    disk_durability: None,
+                    cache_disk: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     credentials: None,
@@ -2357,6 +2434,7 @@ mod tests {
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
                 forkpoint_held: false,
+                cache_disk: None,
             },
         );
 
@@ -2417,6 +2495,8 @@ mod tests {
                     storage_gb: None,
                     overlay_gb: None,
                     block_io: None,
+                    disk_durability: None,
+                    cache_disk: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     credentials: None,
@@ -2431,6 +2511,7 @@ mod tests {
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
                 forkpoint_held: false,
+                cache_disk: None,
             },
         );
 

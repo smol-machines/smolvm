@@ -82,6 +82,7 @@ impl MachineSpec {
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
         record.block_io = self.resources.block_io;
+        record.disk_durability = self.resources.disk_durability;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = if self.allowed_hosts.is_empty() {
             None

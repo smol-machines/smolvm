@@ -481,6 +481,8 @@ pub struct CreateVmParams {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub block_io: smolvm::data::resources::BlockIoEngine,
+    /// When guest disk writes must reach the host's disk (`--disk-durability`).
+    pub disk_durability: smolvm::data::resources::DiskDurability,
     /// Host disks attached beyond storage and overlay (`--disk`).
     pub disks: Vec<smolvm::data::disk::AttachedDisk>,
     /// Shared cache disk (`--cache-disk`).
@@ -781,6 +783,7 @@ pub(crate) fn build_vm_record_for(
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.block_io = params.block_io;
+    record.disk_durability = params.disk_durability;
     record.disks = params.disks.clone();
     record.cache_disk = params.cache_disk.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
@@ -2109,6 +2112,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.storage_gb = o.storage_gb;
     r.overlay_gb = o.overlay_gb;
     r.block_io = o.block_io;
+    r.disk_durability = o.disk_durability;
     r.disks = o.disks.clone();
     r.cache_disk = o.cache_disk.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
@@ -2184,6 +2188,8 @@ pub struct DefaultVmOverrides {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub block_io: smolvm::data::resources::BlockIoEngine,
+    /// When guest disk writes must reach the host's disk (`--disk-durability`).
+    pub disk_durability: smolvm::data::resources::DiskDurability,
     /// Host disks attached beyond storage and overlay (`--disk`).
     pub disks: Vec<smolvm::data::disk::AttachedDisk>,
     /// Shared cache disk (`--cache-disk`).
@@ -2237,6 +2243,7 @@ impl DefaultVmOverrides {
             storage_gb: params.storage_gb,
             overlay_gb: params.overlay_gb,
             block_io: params.block_io,
+            disk_durability: params.disk_durability,
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -3159,6 +3166,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "storage_gb": record.storage_gb,
         "overlay_gb": record.overlay_gb,
         "block_io": record.block_io,
+        "disk_durability": record.disk_durability,
         "disks": record.disks,
         "image": record.display_image(),
         "entrypoint": record.entrypoint,

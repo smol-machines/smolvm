@@ -24,6 +24,8 @@ use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod compact;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use compact::flatten_standalone;
 
 /// Bound qcow2 ancestry and recursive lifecycle work. Longer chains should be
 /// compacted into a new root rather than accumulating unbounded lookup cost.
@@ -1945,6 +1947,15 @@ fn read_generation_fork_disks(snapshot_dir: &Path) -> Result<Option<Vec<ForkDisk
     Ok(Some(disks))
 }
 
+/// How long a guest `sync` may take before a capture or branch gives up.
+///
+/// `sync` sleeps in the kernel until the guest's dirty pages reach its disks,
+/// so the agent cannot kill it or answer early. Its time is the host disk's
+/// time: a second normally, minutes when many machines on the worker are
+/// capturing or restoring at once. Giving up there fails a capture that would
+/// have succeeded, so the limit only catches a guest whose disk is wedged.
+const SYNC_FORK_SOURCE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Flush guest filesystems before capturing a new live checkpoint.
 ///
 /// A branch sees dirty guest page-cache state through the RAM snapshot, but a
@@ -1962,7 +1973,7 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
         vec!["/bin/sync".to_string()],
         Vec::new(),
         None,
-        Some(Duration::from_secs(30)),
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
         None,
     ) {
         Ok((0, _, _)) => Ok(()),
@@ -3063,7 +3074,14 @@ const REJUVENATE_ATTEMPTS: usize = 3;
 
 /// How long one re-mint may run. The agent enforces it: a VM exec runs in its
 /// own session and the whole group is killed at the deadline.
-const REJUVENATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// The script itself takes well under a second, but it writes files and
+/// generates SSH host keys, so on a worker whose disk is saturated (a burst of
+/// restores and captures) it can take tens of seconds. Killing it there turns a
+/// slow restore into a failed one, and on guests whose init cannot page its
+/// code back in, the reaped children reboot the VM. So the limit only catches
+/// a guest that is truly stuck.
+const REJUVENATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The re-mint runs as a plain shell, with nothing that outlives it.
 ///

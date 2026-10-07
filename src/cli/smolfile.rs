@@ -8,7 +8,7 @@ use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
 use smolvm::data::network::PortMappingSpec;
 use smolvm::data::resources::{
-    BlockIoEngine, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB,
+    BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB,
 };
 use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
@@ -34,6 +34,15 @@ fn parse_net_backend(raw: &str) -> smolvm::Result<NetworkBackend> {
                 "net_backend = \"{raw}\" is not a networking backend; expected \"tsi\" or \
                  \"virtio-net\" (the same values as --net-backend)"
             ),
+        )
+    })
+}
+
+fn parse_disk_durability(raw: &str) -> smolvm::Result<DiskDurability> {
+    <DiskDurability as clap::ValueEnum>::from_str(raw, false).map_err(|_| {
+        smolvm::Error::config(
+            "Smolfile",
+            format!("disk_durability = \"{raw}\" is invalid; expected \"full\" or \"deferred\""),
         )
     })
 }
@@ -150,6 +159,7 @@ pub fn build_create_params(
                 storage_gb: cli_storage_gb,
                 overlay_gb: cli_overlay_gb,
                 block_io: cli_block_io.unwrap_or_default(),
+                disk_durability: DiskDurability::default(),
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
                 restart_policy: None,
                 restart_max_retries: None,
@@ -293,6 +303,12 @@ pub fn build_create_params(
             .transpose()?
             .unwrap_or_default(),
     };
+    let disk_durability = sf
+        .disk_durability
+        .as_deref()
+        .map(parse_disk_durability)
+        .transpose()?
+        .unwrap_or_default();
 
     // Merge network policy: [network] section, then CLI extends
     let network = sf.network.unwrap_or_default();
@@ -401,6 +417,7 @@ pub fn build_create_params(
         storage_gb,
         overlay_gb,
         block_io,
+        disk_durability,
         allowed_cidrs,
         restart_policy,
         restart_max_retries,
@@ -917,6 +934,16 @@ init = ["echo init"]
                 "TORCHINDUCTOR_CUDAGRAPHS=1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn disk_durability_smolfile_selects_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "disk_durability = \"deferred\"\n").unwrap();
+
+        let params = build_from_smolfile(path).unwrap();
+        assert_eq!(params.disk_durability, DiskDurability::Deferred);
     }
 
     #[test]

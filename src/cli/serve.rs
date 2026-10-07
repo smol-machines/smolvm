@@ -97,6 +97,12 @@ pub struct ServeStartCmd {
     #[arg(long = "allow-nested-virt")]
     allow_nested_virt: bool,
 
+    /// Directory of cache disk bases the API may attach (`cacheDisk` on
+    /// create) and publish into. A request names a base by file name in this
+    /// directory, never by path. Unset: the API refuses cache disks.
+    #[arg(long = "cache-disk-dir", value_name = "DIR")]
+    cache_disk_dir: Option<std::path::PathBuf>,
+
     /// Flag, or block, guest traffic to destinations on this watchlist. Each line
     /// is `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
     /// lowercased DNS name (its subdomains match too) or of an IP address's text.
@@ -405,6 +411,22 @@ impl ServeStartCmd {
             smolvm::error::Error::config("initialize api state", format!("{:?}", e))
         })?);
         state.set_allow_nested_virt(self.allow_nested_virt);
+        if let Some(dir) = &self.cache_disk_dir {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                smolvm::error::Error::config(
+                    "cache disk directory",
+                    format!("{}: {e}", dir.display()),
+                )
+            })?;
+            let dir = dir.canonicalize().map_err(|e| {
+                smolvm::error::Error::config(
+                    "cache disk directory",
+                    format!("{}: {e}", dir.display()),
+                )
+            })?;
+            println!("Cache disks enabled from {}", dir.display());
+            state.set_cache_disk_dir(Some(dir));
+        }
         if let Some(path) = &self.egress_watchlist {
             smolvm::agent::egress_watchlist::enable(path.clone())
                 .map_err(|e| smolvm::error::Error::config("load egress watchlist", e))?;
