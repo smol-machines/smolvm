@@ -623,23 +623,54 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
 const CACHE_MOUNT_TAG: &str = "smolvm_cache";
 
 /// The cache disk the host attached, from `SMOLVM_CACHE_DISK=<device>:<guest
-/// path>`: its guest device and the path it is exposed at.
-fn cache_disk_from_env() -> Option<(String, String)> {
+/// path>[:slot]`: its guest device, the path it is exposed at, and whether it
+/// is a slot left unmounted until a restore puts a cache under it.
+fn cache_disk_from_env() -> Option<(String, String, bool)> {
     let value = std::env::var(guest_env::CACHE_DISK).ok()?;
     let parsed = parse_cache_disk_env(&value);
     if parsed.is_none() {
-        warn!(value = %value, "invalid cache disk, expected /dev/vdX:/guest/path");
+        warn!(value = %value, "invalid cache disk, expected /dev/vdX:/guest/path[:slot]");
     }
     parsed
 }
 
-/// `/dev/vdX:/guest/path` as its device and guest path.
-fn parse_cache_disk_env(value: &str) -> Option<(String, String)> {
+/// Make `path` a mount point (a bind of itself), so boot-mount setup treats
+/// it as a mounted device rather than a virtiofs share to mount.
+#[cfg(target_os = "linux")]
+fn make_self_bind(path: &Path) -> std::io::Result<()> {
+    if is_mountpoint(path) {
+        return Ok(());
+    }
+    let target = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: valid NUL-terminated path bound onto itself, no data.
+    let rc = unsafe {
+        libc::mount(
+            target.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `/dev/vdX:/guest/path[:slot]` as its device, guest path and slot flag.
+fn parse_cache_disk_env(value: &str) -> Option<(String, String, bool)> {
+    let (value, slot) = match value.strip_suffix(":slot") {
+        Some(rest) => (rest, true),
+        None => (value, false),
+    };
     let (device, guest_path) = value.split_once(':')?;
     let letter = device.strip_prefix("/dev/vd")?;
     let valid_device = letter.len() == 1 && letter.bytes().all(|b| b.is_ascii_lowercase());
     (valid_device && guest_path.starts_with('/') && guest_path.len() > 1)
-        .then(|| (device.to_string(), guest_path.to_string()))
+        .then(|| (device.to_string(), guest_path.to_string(), slot))
 }
 
 /// Whether `device` holds an ext4 (or ext2/3) filesystem: its superblock's
@@ -687,9 +718,26 @@ fn mount_ext4(device: &Path, mount_point: &Path) -> std::io::Result<()> {
 /// reformatted: it holds a cache someone built.
 #[cfg(target_os = "linux")]
 fn mount_cache_disk() -> Option<(String, String, bool)> {
-    let (device, guest_path) = cache_disk_from_env()?;
+    let (device, guest_path, slot) = cache_disk_from_env()?;
     let device = PathBuf::from(device);
     let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(CACHE_MOUNT_TAG);
+    if slot {
+        // Reserve the path, but never read or format the device: a restore
+        // swaps a cache under it and mounts that, and nothing this guest
+        // cached about the empty slot may survive the swap.
+        if let Err(error) = std::fs::create_dir_all(&staging) {
+            warn!(%error, "cache slot: cannot create its staging path");
+            return None;
+        }
+        // Boot-mount setup mounts a virtiofs share at any staging path that is
+        // not a mount point yet; the slot must not be mistaken for one.
+        if let Err(error) = make_self_bind(&staging) {
+            warn!(%error, "cache slot: cannot bind its staging path");
+            return None;
+        }
+        info!(device = %device.display(), guest_path = %guest_path, "cache slot reserved, not mounted");
+        return Some((CACHE_MOUNT_TAG.to_string(), guest_path, false));
+    }
     if !is_mountpoint(&staging) {
         if let Err(error) = std::fs::create_dir_all(&staging) {
             warn!(%error, "cache disk: cannot create its staging path");
@@ -5536,7 +5584,11 @@ mod tests {
     fn cache_disk_env_names_a_virtio_disk_and_an_absolute_path() {
         assert_eq!(
             super::parse_cache_disk_env("/dev/vdc:/cache"),
-            Some(("/dev/vdc".to_string(), "/cache".to_string()))
+            Some(("/dev/vdc".to_string(), "/cache".to_string(), false))
+        );
+        assert_eq!(
+            super::parse_cache_disk_env("/dev/vdc:/cache:slot"),
+            Some(("/dev/vdc".to_string(), "/cache".to_string(), true))
         );
         for bad in [
             "/dev/vdc",

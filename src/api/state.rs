@@ -401,8 +401,10 @@ impl ApiState {
         spec: &crate::api::types::CacheDiskSpec,
     ) -> Result<crate::data::disk::CacheDisk, ApiError> {
         let dir = self.cache_disk_dir()?;
-        crate::data::disk::CacheDisk::in_dir(&dir, &spec.base, &spec.mount_path)
-            .map_err(ApiError::BadRequest)
+        let mut cache = crate::data::disk::CacheDisk::in_dir(&dir, &spec.base, &spec.mount_path)
+            .map_err(ApiError::BadRequest)?;
+        cache.slot = spec.slot;
+        Ok(cache)
     }
 
     /// Whether this server lets machines run with nested virtualization.
@@ -1952,6 +1954,7 @@ pub fn cache_disk_spec(cache: &crate::data::disk::CacheDisk) -> crate::api::type
         mount_path: cache.mount_path.clone(),
         source_url: None,
         sha256: None,
+        slot: cache.slot,
     }
 }
 

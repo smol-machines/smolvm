@@ -147,6 +147,11 @@ pub struct CacheDisk {
     pub base: std::path::PathBuf,
     /// Absolute guest path the cache filesystem is mounted at.
     pub mount_path: String,
+    /// A slot: attached but left unmounted, so a checkpoint of the machine can
+    /// be restored with a different cache under it. The guest mounts it only
+    /// once a restore supplies that cache.
+    #[serde(default)]
+    pub slot: bool,
 }
 
 /// Guest paths a cache disk may not be mounted over: the root, the kernel's
@@ -186,7 +191,11 @@ impl CacheDisk {
                 "{mount_path}: cache disk cannot be mounted at or under {reserved}"
             ));
         }
-        Ok(Self { base, mount_path })
+        Ok(Self {
+            base,
+            mount_path,
+            slot: false,
+        })
     }
 
     /// Reject a base that cannot serve as one, with the reason a caller can
@@ -219,6 +228,23 @@ impl CacheDisk {
         cache.validate()?;
         ensure_self_contained(&cache.base)?;
         Ok(cache)
+    }
+
+    /// The size of the device the base presents: a qcow2's virtual size, a
+    /// raw image's length.
+    pub fn virtual_size(&self) -> crate::Result<u64> {
+        use std::io::Read;
+        let fail = |e: std::io::Error| {
+            crate::Error::agent("cache disk size", format!("{}: {e}", self.base.display()))
+        };
+        let mut file = std::fs::File::open(&self.base).map_err(fail)?;
+        let mut header = [0u8; 32];
+        if file.read_exact(&mut header).is_ok() && header[..4] == *b"QFI\xfb" {
+            return Ok(u64::from_be_bytes(
+                header[24..32].try_into().expect("8 bytes"),
+            ));
+        }
+        Ok(file.metadata().map_err(fail)?.len())
     }
 
     /// The base's file name, the form a remote caller names it by.
@@ -557,18 +583,21 @@ mod tests {
         let missing = CacheDisk {
             base: dir.path().join("missing.img"),
             mount_path: "/cache".into(),
+            slot: false,
         };
         assert!(missing.validate().unwrap_err().contains("cannot stat"));
         let directory = CacheDisk {
             base: dir.path().to_path_buf(),
             mount_path: "/cache".into(),
+            slot: false,
         };
         assert!(directory.validate().unwrap_err().contains("regular file"));
         let image = dir.path().join("base.img");
         std::fs::write(&image, [0u8; 512]).unwrap();
         assert!(CacheDisk {
             base: image,
-            mount_path: "/cache".into()
+            mount_path: "/cache".into(),
+            slot: false,
         }
         .validate()
         .is_ok());
@@ -582,6 +611,7 @@ mod tests {
         record.cache_disk = Some(CacheDisk {
             base: "/var/caches/v1.img".into(),
             mount_path: "/cache".into(),
+            slot: false,
         });
         let decoded: crate::config::VmRecord =
             serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
@@ -611,6 +641,7 @@ mod tests {
         let cache = CacheDisk {
             base: base.clone(),
             mount_path: "/cache".into(),
+            slot: false,
         };
         let digest = cache.base_digest().unwrap();
         assert_eq!(

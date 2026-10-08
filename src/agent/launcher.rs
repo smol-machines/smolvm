@@ -1677,10 +1677,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
             // Storage is /dev/vda and the overlay, when attached, /dev/vdb.
             let letter = if disks.overlay.is_some() { 'c' } else { 'b' };
+            // A slot carries `:slot`, so the agent leaves it unmounted until a
+            // restore puts a cache under it.
             cache_disk_env = Some(format!(
-                "{}=/dev/vd{letter}:{}",
+                "{}=/dev/vd{letter}:{}{}",
                 guest_env::CACHE_DISK,
-                cache.mount_path
+                cache.mount_path,
+                if cache.slot { ":slot" } else { "" }
             ));
         }
 

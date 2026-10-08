@@ -65,6 +65,17 @@ pub fn helper_requested() -> bool {
 ///   "not requested".
 pub fn run_helper() -> i32 {
     let args: Vec<String> = std::env::args().collect();
+    // argv: [bin, "ns-file", "mount-cache-all", path, major, minor] — runs in the
+    // caller's namespace and enters each other one through a child.
+    if args.get(2).map(String::as_str) == Some("mount-cache-all") {
+        return match mount_cache_everywhere(&args) {
+            Ok(()) => 0,
+            Err(e) => {
+                let _ = std::io::stdout().write_all(format!("ERR {e}\n").as_bytes());
+                1
+            }
+        };
+    }
     // argv: [bin, "ns-file", op, pid, path, (mode), (uid), (gid)]
     if args.len() < 5 {
         eprintln!("ns-file: usage: ns-file <read|write> <pid> <path> [mode [uid gid]]");
@@ -92,6 +103,7 @@ pub fn run_helper() -> i32 {
         "list" => helper_list(&path),
         "write" => helper_write(&path, mode, uid, gid),
         "connect" => helper_connect(&path),
+        "mount-cache" => helper_mount_cache(&path, &args),
         _ => Err("unknown op".to_string()),
     };
     match result {
@@ -101,6 +113,116 @@ pub fn run_helper() -> i32 {
             1
         }
     }
+}
+
+/// Mount the cache slot's filesystem at `path` in the namespace just joined:
+/// argv carries the block device's major and minor after the path. A namespace
+/// without `path`, or with a filesystem there already, is left alone. The
+/// device node is made in the namespace's own `/dev` only for the mount call,
+/// so nothing from the container image is needed and nothing is left behind.
+#[cfg(target_os = "linux")]
+fn helper_mount_cache(path: &str, args: &[String]) -> Result<(), String> {
+    let number = |i: usize| -> Result<u32, String> {
+        args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| {
+            "mount-cache: usage: mount-cache <pid> <path> <major> <minor>".to_string()
+        })
+    };
+    let (major, minor) = (number(5)?, number(6)?);
+    if !std::path::Path::new(path).is_dir() {
+        return Ok(());
+    }
+    let mounted = std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let fstype = line
+                .split(" - ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next());
+            fields.get(4) == Some(&path) && fstype == Some("ext4")
+        });
+    if mounted {
+        return Ok(());
+    }
+    let c = |s: &str| std::ffi::CString::new(s).map_err(|e| e.to_string());
+    let node = c("/dev/.smolvm-cache")?;
+    let target = c(path)?;
+    let fstype = c("ext4")?;
+    // SAFETY: valid NUL-terminated paths for a block device node this helper
+    // owns, mounted and then unlinked.
+    unsafe {
+        libc::unlink(node.as_ptr());
+        if libc::mknod(
+            node.as_ptr(),
+            libc::S_IFBLK | 0o600,
+            libc::makedev(major, minor),
+        ) != 0
+        {
+            return Err(format!("mknod: {}", std::io::Error::last_os_error()));
+        }
+        let rc = libc::mount(
+            node.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOATIME,
+            std::ptr::null(),
+        );
+        let error = std::io::Error::last_os_error();
+        libc::unlink(node.as_ptr());
+        if rc != 0 {
+            return Err(format!("mount {path}: {error}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_mount_cache(_path: &str, _args: &[String]) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+/// Mount the cache slot into every mount namespace but this process's own: one
+/// child per distinct namespace, each running `mount-cache` inside it. Reading
+/// `/proc` here instead of in a shell avoids a fork per process.
+fn mount_cache_everywhere(args: &[String]) -> Result<(), String> {
+    let (path, major, minor) = match (args.get(3), args.get(4), args.get(5)) {
+        (Some(p), Some(a), Some(b)) => (p.clone(), a.clone(), b.clone()),
+        _ => return Err("usage: mount-cache-all <path> <major> <minor>".to_string()),
+    };
+    let own = std::fs::read_link("/proc/self/ns/mnt").map_err(|e| format!("own namespace: {e}"))?;
+    let init = std::fs::read_link("/proc/1/ns/mnt").ok();
+    let mut seen = vec![own];
+    seen.extend(init);
+    let exe = std::env::current_exe().map_err(|e| format!("own binary: {e}"))?;
+    let entries = std::fs::read_dir("/proc").map_err(|e| format!("/proc: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let Ok(ns) = std::fs::read_link(entry.path().join("ns/mnt")) else {
+            continue; // a process that exited, or a kernel thread
+        };
+        if seen.contains(&ns) {
+            continue;
+        }
+        seen.push(ns);
+        let output = std::process::Command::new(&exe)
+            .args(["ns-file", "mount-cache", pid, &path, &major, &minor])
+            .output()
+            .map_err(|e| format!("spawn for {pid}: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "namespace of {pid}: {}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Join `pid`'s mount namespace.

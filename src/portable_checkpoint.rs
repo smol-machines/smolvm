@@ -2034,6 +2034,8 @@ fn capture_with_completion(
                 base: cache.base_name(),
                 sha256: cache.base_digest()?,
                 mount_path: cache.mount_path.clone(),
+                slot: cache.slot,
+                slot_bytes: cache.slot.then(|| cache.virtual_size()).transpose()?,
             };
             Some((base, identity))
         }
@@ -5426,6 +5428,27 @@ pub fn resolve_cache_base(
                     ),
                 ));
             }
+            // A slot was never mounted, so its captured layers hold nothing of
+            // the base: any cache that fits the device the guest saw can go
+            // under them.
+            if captured.slot {
+                let size = cache.virtual_size()?;
+                if let Some(slot) = captured.slot_bytes {
+                    if size > slot {
+                        return Err(Error::config(
+                            "cache disk",
+                            format!(
+                                "{} is {size} bytes, larger than the {slot}-byte cache slot this checkpoint was captured with",
+                                cache.base.display()
+                            ),
+                        ));
+                    }
+                }
+                let base = cache.base.canonicalize().map_err(|error| {
+                    Error::agent("cache disk", format!("{}: {error}", cache.base.display()))
+                })?;
+                return Ok(Some(base));
+            }
             let digest = cache.base_digest()?;
             if !digest.eq_ignore_ascii_case(&captured.sha256) {
                 return Err(Error::config(
@@ -5783,6 +5806,12 @@ pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
     }
     crate::agent::fork::release_forkpoint(name, &record.fork_env)?;
     log_phase(name, "restore_release_forkpoint", &mut phase);
+    // A checkpoint captured with a cache slot mounts the cache this restore
+    // put under it; any other machine skips this inside the guest.
+    if record.cache_disk.is_some() {
+        crate::agent::fork::mount_cache_slot(name)?;
+        log_phase(name, "restore_mount_cache_slot", &mut phase);
+    }
     Ok(())
 }
 
@@ -8066,12 +8095,15 @@ mod tests {
         let cache = crate::data::disk::CacheDisk {
             base: base.clone(),
             mount_path: "/cache".into(),
+            slot: false,
         };
         let captured = PortableCheckpointManifest {
             cache_disk: Some(smolvm_pack::format::CheckpointCacheDisk {
                 base: "deps-v1.raw".into(),
                 sha256: cache.base_digest().unwrap(),
                 mount_path: "/cache".into(),
+                slot: false,
+                slot_bytes: None,
             }),
             ..minimal_checkpoint_manifest()
         };
@@ -8097,6 +8129,7 @@ mod tests {
         let wrong = crate::data::disk::CacheDisk {
             base: other,
             mount_path: "/cache".into(),
+            slot: false,
         };
         let error = resolve_cache_base(&captured, Some(&wrong))
             .unwrap_err()
@@ -8107,6 +8140,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(installed.contains("cache disk chains"), "{installed}");
+    }
+
+    /// A slot was never mounted, so any cache that fits the device the guest
+    /// saw restores under it; one that does not fit, or mounts elsewhere, is refused.
+    #[test]
+    fn a_cache_slot_checkpoint_restores_with_any_cache_that_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot_base = dir.path().join("slot.raw");
+        std::fs::write(&slot_base, vec![0u8; 64]).unwrap();
+        let captured = PortableCheckpointManifest {
+            cache_disk: Some(smolvm_pack::format::CheckpointCacheDisk {
+                base: "slot.raw".into(),
+                sha256: "00".repeat(32),
+                mount_path: "/cache".into(),
+                slot: true,
+                slot_bytes: Some(64),
+            }),
+            ..minimal_checkpoint_manifest()
+        };
+        let project = dir.path().join("project-a.raw");
+        std::fs::write(&project, vec![7u8; 48]).unwrap();
+        let fits = crate::data::disk::CacheDisk {
+            base: project.clone(),
+            mount_path: "/cache".into(),
+            slot: false,
+        };
+        assert_eq!(
+            resolve_cache_base(&captured, Some(&fits)).unwrap(),
+            Some(project.canonicalize().unwrap())
+        );
+        let big = dir.path().join("project-b.raw");
+        std::fs::write(&big, vec![7u8; 65]).unwrap();
+        let too_big = crate::data::disk::CacheDisk {
+            base: big,
+            ..fits.clone()
+        };
+        let error = resolve_cache_base(&captured, Some(&too_big))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("larger than"), "{error}");
+        let elsewhere = crate::data::disk::CacheDisk {
+            mount_path: "/mnt/cache".into(),
+            ..fits
+        };
+        assert!(resolve_cache_base(&captured, Some(&elsewhere)).is_err());
     }
 
     /// The smallest manifest this host accepts, for tests of the validator.

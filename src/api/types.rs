@@ -100,6 +100,10 @@ pub struct CacheDiskSpec {
     /// SHA-256 (hex) a fetched base must have. Required with `sourceUrl`.
     #[serde(default, skip_serializing)]
     pub sha256: Option<String>,
+    /// Attach the cache disk as a slot: left unmounted, so a checkpoint of the
+    /// machine can later be restored with a different cache mounted here.
+    #[serde(default)]
+    pub slot: bool,
 }
 
 /// Publish a stopped machine's cache disk as a new base.

@@ -3098,6 +3098,67 @@ fn rejuvenation_command(script: String) -> Vec<String> {
     vec!["/bin/sh".into(), "-c".into(), script]
 }
 
+/// Mount the cache a restore put under a cache slot. The guest learns its slot
+/// from `SMOLVM_CACHE_DISK` in PID 1's boot environment, preserved in the
+/// restored RAM, so the host passes nothing. Does nothing for a machine with no
+/// slot or one already mounted, so it is safe on every restore.
+///
+/// The guest's boot partition scan may have cached blocks of the empty slot,
+/// so that device's buffers are flushed before the filesystem is read; the
+/// rest of the page cache is kept. The cache is mounted at
+/// the slot's staging path and guest path, then into the mount namespace of
+/// every container that was running when the checkpoint was taken, through
+/// the agent's own namespace helper so no tool from the image is needed.
+pub const CACHE_SLOT_MOUNT_SCRIPT: &str = r#"set -e
+spec=$(tr '\0' '\n' < /proc/1/environ | sed -n 's/^SMOLVM_CACHE_DISK=//p')
+case "$spec" in *:slot) ;; *) exit 0 ;; esac
+spec=${spec%:slot}
+dev=${spec%%:*}
+staging=/run/smolvm/virtiofs/smolvm_cache
+if grep -q " $staging ext4 " /proc/mounts; then exit 0; fi
+# Block majors are allocated at boot, so read the device's own numbers.
+majmin=$(cat "/sys/class/block/${dev#/dev/}/dev")
+major=${majmin%:*}
+minor=${majmin#*:}
+if [ ! -b "$dev" ]; then mknod "$dev" b "$major" "$minor"; fi
+# Drop only this device's cached blocks: the rest of the page cache is the
+# warm state the checkpoint was restored for.
+blockdev --flushbufs "$dev"
+magic=$(dd if="$dev" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [ "$magic" != "53ef" ]; then
+  mkfs.ext4 -F -q -O ^has_journal -L smolvm-cache "$dev"
+fi
+mount -t ext4 -o noatime "$dev" "$staging"
+path=${spec#*:}
+mount --bind "$staging" "$path"
+/usr/local/bin/smolvm-agent ns-file mount-cache-all "$path" "$major" "$minor"
+"#;
+
+/// Run [`CACHE_SLOT_MOUNT_SCRIPT`] in a restored machine.
+pub fn mount_cache_slot(name: &str) -> Result<()> {
+    let sock = vm_data_dir(name).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&sock)
+        .map_err(|e| Error::agent("mount cache slot", format!("agent connect: {e}")))?;
+    match client.vm_exec(
+        rejuvenation_command(CACHE_SLOT_MOUNT_SCRIPT.to_string()),
+        vec![],
+        None,
+        Some(REJUVENATE_TIMEOUT),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, stdout, stderr)) => Err(Error::agent(
+            "mount cache slot",
+            format!(
+                "exited {code}: {} {}",
+                String::from_utf8_lossy(&stdout).trim(),
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(e) => Err(Error::agent("mount cache slot", e.to_string())),
+    }
+}
+
 /// Build the shell script that re-mints a clone's on-disk identity. Kept as a
 /// pure function of `(clone, seed, host_epoch)` so the security-critical
 /// contents (fresh machine-id, regenerated SSH host keys, wall-clock re-stamp)

@@ -638,6 +638,15 @@ pub struct CheckpointCacheDisk {
     pub sha256: String,
     /// Absolute guest path the cache filesystem is mounted at.
     pub mount_path: String,
+    /// The cache disk was a slot: attached but never mounted, so the guest
+    /// never wrote it and its captured layers are empty. A restore may put a
+    /// different base under it and mount that.
+    #[serde(default)]
+    pub slot: bool,
+    /// For a slot, the size in bytes of the device the guest saw. A base put
+    /// under it on restore may not be larger.
+    #[serde(default)]
+    pub slot_bytes: Option<u64>,
 }
 
 /// The arm64 system counter a checkpoint's guest was reading.
