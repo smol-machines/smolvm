@@ -1379,24 +1379,10 @@ fn setup_persistent_rootfs() {
         );
     }
 
-    // Create mount point directories in new root and move special mounts
-    for dir in &["proc", "sys", "dev"] {
-        let _ = std::fs::create_dir_all(format!("{}/{}", NEWROOT, dir));
-        let src = cstr(&format!("/{}", dir));
-        let dst = cstr(&format!("{}/{}", NEWROOT, dir));
-        // SAFETY: mount --move for each special filesystem
-        unsafe {
-            libc::mount(
-                src.as_ptr(),
-                dst.as_ptr(),
-                std::ptr::null(),
-                libc::MS_MOVE,
-                std::ptr::null(),
-            );
-        }
-    }
-
-    // Join parallel storage mount and move it into new root.
+    // Join parallel storage mount and move it into new root. This must happen
+    // before /proc, /sys and /dev move below: the thread runs resize2fs, e2fsck
+    // and mount against /dev/vda by path, and once /dev moves those paths stop
+    // existing, so a resize still running then fails with ENOENT.
     // On subsequent boots, the ext4 mount succeeds and overlaps with the
     // overlayfs setup above. On first boot from macOS template, mount fails
     // and mount_storage_disk() handles it with full fsck/mkfs recovery.
@@ -1438,6 +1424,23 @@ fn setup_persistent_rootfs() {
             Err(_) => {
                 boot_log("WARN", "storage: parallel mount thread panicked");
             }
+        }
+    }
+
+    // Create mount point directories in new root and move special mounts
+    for dir in &["proc", "sys", "dev"] {
+        let _ = std::fs::create_dir_all(format!("{}/{}", NEWROOT, dir));
+        let src = cstr(&format!("/{}", dir));
+        let dst = cstr(&format!("{}/{}", NEWROOT, dir));
+        // SAFETY: mount --move for each special filesystem
+        unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_MOVE,
+                std::ptr::null(),
+            );
         }
     }
 

@@ -716,17 +716,26 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// Copy `remaining` bytes, seeking past chunks that are all zeros instead of
+/// writing them. The destination is already sized and reads as zeros there, so
+/// the result is identical, but written zeros in the source (a template that
+/// was copied with a tool that fills holes) stay holes in the copy instead of
+/// becoming gigabytes of dirty page cache the guest's first flush must sync.
 #[cfg(target_os = "linux")]
 fn copy_extent_exact(
     source: &mut impl std::io::Read,
-    destination: &mut impl std::io::Write,
+    destination: &mut (impl std::io::Write + std::io::Seek),
     mut remaining: u64,
     buffer: &mut [u8],
 ) -> std::io::Result<()> {
     while remaining > 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
         source.read_exact(&mut buffer[..count])?;
-        destination.write_all(&buffer[..count])?;
+        if buffer[..count].iter().all(|&byte| byte == 0) {
+            destination.seek(std::io::SeekFrom::Current(count as i64))?;
+        } else {
+            destination.write_all(&buffer[..count])?;
+        }
         remaining -= count as u64;
     }
     Ok(())
@@ -757,6 +766,11 @@ mod tests {
                 Ok(())
             }
         }
+        impl Seek for ShortWriter {
+            fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+                unreachable!("the input has no all-zero chunk")
+            }
+        }
         let input = b"every byte in this extent must survive";
         let mut source = &input[..];
         let mut destination = ShortWriter {
@@ -776,17 +790,60 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sparse_extent_copy_rejects_truncated_input() {
-        let error =
-            copy_extent_exact(&mut &b"short"[..], &mut Vec::new(), 6, &mut [0; 8]).unwrap_err();
+        let error = copy_extent_exact(
+            &mut &b"short"[..],
+            &mut std::io::Cursor::new(Vec::new()),
+            6,
+            &mut [0; 8],
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn sparse_extent_copy_rejects_stalled_output() {
-        let error =
-            copy_extent_exact(&mut &b"data"[..], &mut &mut [][..], 4, &mut [0; 8]).unwrap_err();
+        let error = copy_extent_exact(
+            &mut &b"data"[..],
+            &mut std::io::Cursor::new(&mut [][..]),
+            4,
+            &mut [0; 8],
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+    }
+
+    /// A template whose free space is written zeros rather than holes (what
+    /// `scp` or a plain `cp` leaves) must still copy as a sparse file, or every
+    /// machine created from it starts with its whole disk dirty in page cache.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_copy_leaves_written_zeros_as_holes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.img");
+        let dst = dir.path().join("dst.img");
+        let zeros = 64 * 1024 * 1024;
+        {
+            let mut file = std::fs::File::create(&src).unwrap();
+            file.write_all(b"superblock").unwrap();
+            file.write_all(&vec![0u8; zeros]).unwrap();
+            file.write_all(b"tail").unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(
+            std::fs::metadata(&src).unwrap().blocks() * 512 >= zeros as u64,
+            "the source must really hold its zeros"
+        );
+
+        sparse_copy(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dst).unwrap());
+        let allocated = std::fs::metadata(&dst).unwrap().blocks() * 512;
+        assert!(
+            allocated < 4 * 1024 * 1024,
+            "the copy allocated {allocated} bytes for {zeros} bytes of zeros"
+        );
     }
 
     /// `clone_or_copy_file` must reproduce a sparse file byte-for-byte on every
