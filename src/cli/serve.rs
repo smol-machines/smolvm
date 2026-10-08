@@ -343,26 +343,42 @@ impl ServeStartCmd {
 
         // Per-VM uid isolation preflight. When serve is privileged each VMM drops
         // to its own unprivileged uid (process::vm_drop_ids), containing a
-        // guest→VMM escape to one VM. That only works if the data root is
-        // traversable (others-execute) by the drop uid — an XDG-under-a-700-home
-        // layout is not, and the VMM would die with a cryptic readiness timeout.
-        // Warn loudly with the fix instead. Opt out with SMOLVM_VM_UID_DROP=off.
+        // guest→VMM escape to one VM. Every VMM must then reach its data, the
+        // libraries it loads and the agent rootfs as that uid; anything under a
+        // 0700 home (an install as root into ~/.smolvm) is out of reach and every
+        // boot failed with a message that never named the cause. Refuse to start
+        // instead, naming what blocks and how to fix it.
         #[cfg(target_os = "linux")]
         if smolvm::process::vm_uid_drop_active() {
-            let cache_root = smolvm::agent::vm_cache_root();
-            match smolvm::process::first_nontraversable_ancestor(&cache_root) {
-                Some(blocker) => tracing::warn!(
-                    blocker = %blocker.display(),
-                    "per-VM uid isolation is active but {b} is not traversable (o+x) by \
-                     unprivileged uids — VMMs will fail to start. Use a world-traversable data \
-                     root (e.g. run serve with HOME=/var/lib/smolvm) or `chmod o+x {b}`, or \
-                     disable with SMOLVM_VM_UID_DROP=off",
-                    b = blocker.display(),
-                ),
-                None => tracing::info!(
-                    "per-VM uid isolation active (each VMM drops to its own unprivileged uid)"
-                ),
+            let mut needed = vec![("data root", smolvm::agent::vm_cache_root())];
+            if let Some(lib) = smolvm::agent::find_lib_dir() {
+                needed.push(("libkrun", lib));
             }
+            if let Ok(rootfs) = smolvm::agent::AgentManager::default_rootfs_path() {
+                needed.push(("agent rootfs", rootfs));
+            }
+            let blocked: Vec<String> = needed
+                .iter()
+                .filter_map(|(what, path)| {
+                    smolvm::process::first_nontraversable_ancestor(path)
+                        .map(|b| format!("{what} {} (blocked at {})", path.display(), b.display()))
+                })
+                .collect();
+            if !blocked.is_empty() {
+                return Err(smolvm::error::Error::config(
+                    "per-VM uid isolation",
+                    format!(
+                        "each VM runs as its own unprivileged uid, which cannot reach: {}. \
+                         Reinstall as root so smolvm lives in /opt/smolvm \
+                         (curl -sSL https://smolmachines.com/install.sh | sudo bash), \
+                         or set SMOLVM_VM_UID_DROP=off to run VMs as root",
+                        blocked.join("; ")
+                    ),
+                ));
+            }
+            tracing::info!(
+                "per-VM uid isolation active (each VMM drops to its own unprivileged uid)"
+            );
         }
 
         // Create the runtime with signal handling enabled
