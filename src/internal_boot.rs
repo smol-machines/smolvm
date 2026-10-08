@@ -270,7 +270,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
                 eprintln!("[idmap] failed to mount private backing store, refusing to boot: {e}");
                 if e.raw_os_error() == Some(libc::EINVAL) {
                     eprintln!(
-                        "[idmap] the filesystem holding smolvm's data cannot back idmapped mounts (overlayfs, for one); keep it on ext4 or xfs, e.g. XDG_CACHE_HOME=/workspace/smolvm/cache XDG_DATA_HOME=/workspace/smolvm/data inside a smol machine"
+                        "[idmap] the filesystem holding smolvm's data cannot back idmapped mounts (overlayfs, for one); keep it on ext4 or xfs with SMOLVM_DATA_DIR. Inside a smol machine smolvm already uses /workspace unless XDG_CACHE_HOME or XDG_DATA_HOME points elsewhere"
                     );
                 }
                 crate::process::exit_child(1);

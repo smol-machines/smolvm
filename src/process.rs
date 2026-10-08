@@ -1310,8 +1310,14 @@ pub fn vm_uid_drop_active() -> bool {
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
 #[cfg(target_os = "linux")]
 pub fn apply_system_data_root(allow_auto: bool) {
+    let mut carry_rootfs_from = None;
     let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
         std::path::PathBuf::from(explicit)
+    } else if let Some(workspace_root) = overlay_workspace_root() {
+        // The rootfs the installer laid down sits under the old home, which a
+        // dropped VMM uid cannot traverse; bring a copy into the new root.
+        carry_rootfs_from = installed_agent_rootfs();
+        workspace_root
     } else if allow_auto
         && vm_uid_drop_active()
         && std::env::var_os("XDG_CACHE_HOME").is_none()
@@ -1347,7 +1353,102 @@ pub fn apply_system_data_root(allow_auto: bool) {
     std::env::remove_var("XDG_CACHE_HOME");
     std::env::remove_var("XDG_DATA_HOME");
     std::env::remove_var("XDG_CONFIG_HOME");
+    if let Some(src) = carry_rootfs_from {
+        let dst = root.join(".local/share/smolvm/agent-rootfs");
+        if let Err(e) = sync_agent_rootfs(&src, &dst) {
+            eprintln!(
+                "warning: could not copy the agent rootfs from {} to {}: {e}",
+                src.display(),
+                dst.display()
+            );
+        }
+    }
     tracing::info!(data_root = %root.display(), "smolvm state rooted at a system data dir");
+}
+
+/// `statfs` magic numbers for the filesystems this decision distinguishes.
+#[cfg(target_os = "linux")]
+const OVERLAYFS_MAGIC: i64 = 0x794c_7630;
+
+/// The filesystem type under `path`, as its `statfs` magic number.
+#[cfg(target_os = "linux")]
+fn fs_magic(path: &std::path::Path) -> Option<i64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0).then_some(st.f_type as i64)
+}
+
+/// Where smolvm keeps its state when the default would sit on overlayfs.
+///
+/// Per-VM uid isolation presents each VM's backing store through an idmapped
+/// mount, which overlayfs cannot back, so with a home on overlayfs every boot
+/// failed with `EINVAL`. That is the case inside a smol machine, whose root is
+/// an overlay over the image; its `/workspace` disk is a real filesystem, so
+/// state goes there. An explicit `XDG_*` choice is left alone.
+#[cfg(target_os = "linux")]
+fn overlay_workspace_root() -> Option<std::path::PathBuf> {
+    if !vm_uid_drop_active()
+        || std::env::var_os("XDG_CACHE_HOME").is_some()
+        || std::env::var_os("XDG_DATA_HOME").is_some()
+    {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    let workspace = std::path::Path::new("/workspace");
+    choose_workspace_root(
+        fs_magic(&home),
+        workspace.is_dir().then(|| fs_magic(workspace)).flatten(),
+    )
+    .then(|| workspace.join(".smolvm"))
+}
+
+/// The rule behind [`overlay_workspace_root`], apart from the filesystem probes.
+#[cfg(target_os = "linux")]
+fn choose_workspace_root(home_fs: Option<i64>, workspace_fs: Option<i64>) -> bool {
+    home_fs == Some(OVERLAYFS_MAGIC) && workspace_fs.is_some_and(|fs| fs != OVERLAYFS_MAGIC)
+}
+
+/// The agent rootfs the installer put in the data dir, when nothing else names one.
+#[cfg(target_os = "linux")]
+fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
+    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_some() {
+        return None;
+    }
+    dirs::data_local_dir()
+        .map(|d| d.join("smolvm/agent-rootfs"))
+        .filter(|d| d.is_dir())
+}
+
+/// Copy the agent rootfs to `dst` unless the copy there is already current.
+/// The agent binary's size and mtime stand for its version: `cp -a` keeps both,
+/// and an upgrade replaces the binary, so a stale copy is replaced too.
+#[cfg(target_os = "linux")]
+fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let stamp = |root: &std::path::Path| {
+        std::fs::metadata(root.join("usr/local/bin/smolvm-agent"))
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()))
+    };
+    if stamp(dst).is_some() && stamp(dst) == stamp(src) {
+        return Ok(());
+    }
+    let parent = dst
+        .parent()
+        .ok_or_else(|| std::io::Error::other("rootfs has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let staging = parent.join(".agent-rootfs.new");
+    let _ = std::fs::remove_dir_all(&staging);
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(src)
+        .arg(&staging)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("cp -a exited with {status}")));
+    }
+    let _ = std::fs::remove_dir_all(dst);
+    std::fs::rename(&staging, dst)
 }
 
 /// No-op where the data root isn't applicable (macOS dev).
@@ -3635,6 +3736,27 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
 
 #[cfg(test)]
 mod tests {
+    /// Inside a smol machine the home is overlayfs and `/workspace` is ext4, so
+    /// state moves; anywhere the home can back idmapped mounts it stays put.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_moves_to_workspace_only_off_an_overlay_home() {
+        const EXT4: i64 = 0xEF53;
+        assert!(super::choose_workspace_root(
+            Some(super::OVERLAYFS_MAGIC),
+            Some(EXT4)
+        ));
+        assert!(!super::choose_workspace_root(Some(EXT4), Some(EXT4)));
+        assert!(!super::choose_workspace_root(
+            Some(super::OVERLAYFS_MAGIC),
+            None
+        ));
+        assert!(!super::choose_workspace_root(
+            Some(super::OVERLAYFS_MAGIC),
+            Some(super::OVERLAYFS_MAGIC)
+        ));
+    }
+
     /// A forked child that watches for a parent it doesn't have exits at once
     /// (its parent is gone, as far as it can tell); one watching its real
     /// parent keeps running (#1193).
