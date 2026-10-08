@@ -26,6 +26,23 @@ use crate::data::consts::BYTES_PER_MIB;
 use crate::data::storage::HostMount;
 use tokio::sync::Semaphore;
 
+/// Refuse, rather than boot, a machine that is not already running.
+async fn require_running(
+    entry: &std::sync::Arc<parking_lot::Mutex<crate::api::state::MachineEntry>>,
+) -> Result<(), ApiError> {
+    let entry = entry.clone();
+    let running =
+        tokio::task::spawn_blocking(move || entry.lock().manager.try_connect_existing().is_some())
+            .await?;
+    if running {
+        Ok(())
+    } else {
+        Err(ApiError::Conflict(
+            "machine is not running and autoStart is false".to_string(),
+        ))
+    }
+}
+
 /// Execute a command in a machine.
 ///
 /// This executes directly in the VM (not in a container).
@@ -41,6 +58,7 @@ use tokio::sync::Semaphore;
         (status = 200, description = "Command executed", body = ExecResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine not running and autoStart is false", body = ApiErrorResponse),
         (status = 500, description = "Execution failed", body = ApiErrorResponse)
     )
 )]
@@ -55,10 +73,14 @@ pub async fn exec_command(
 
     let entry = state.get_machine(&id)?;
 
-    // Ensure machine is running and persist state to DB
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
+    if req.auto_start {
+        // Ensure machine is running and persist state to DB
+        ensure_running_and_persist(&state, &id, &entry)
+            .await
+            .map_err(classify_ensure_running_error)?;
+    } else {
+        require_running(&entry).await?;
+    }
 
     // Resolve secrets ONCE, before the background/foreground split, so a
     // detached workload gets them too (a long-lived daemon usually needs its
@@ -215,6 +237,7 @@ pub async fn exec_command(
     responses(
         (status = 200, description = "Streaming output (SSE)", content_type = "text/event-stream"),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine not running and autoStart is false", body = ApiErrorResponse),
         (status = 500, description = "Execution failed", body = ApiErrorResponse)
     )
 )]
@@ -228,9 +251,13 @@ pub async fn exec_stream(
     validate_command(&req.command)?;
 
     let entry = state.get_machine(&id)?;
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
+    if req.auto_start {
+        ensure_running_and_persist(&state, &id, &entry)
+            .await
+            .map_err(classify_ensure_running_error)?;
+    } else {
+        require_running(&entry).await?;
+    }
 
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
     crate::api::handlers::validate_request_env(&req.env)?;

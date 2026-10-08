@@ -262,6 +262,16 @@ pub struct ExecRequest {
     /// daemon — dev server, agent runner) until it exits or the machine stops.
     #[serde(default)]
     pub background: bool,
+    /// Boot a stopped machine to run the command (the default). `false` answers
+    /// 409 instead, for a caller that must reach only a machine already running,
+    /// such as a readiness probe that would otherwise wake one stopped meanwhile.
+    #[serde(default = "auto_start_default")]
+    #[schema(default = true)]
+    pub auto_start: bool,
+}
+
+fn auto_start_default() -> bool {
+    true
 }
 
 /// Request to amend a stopped machine's egress allow list: add or remove
@@ -1565,6 +1575,17 @@ pub type BranchLeaseInfo = ForkLeaseInfo;
 
 #[cfg(test)]
 mod deny_unknown_field_tests {
+    /// An exec boots a stopped machine unless the caller opts out; the opt-out
+    /// is what lets a readiness probe reach a machine without waking it.
+    #[test]
+    fn exec_auto_start_defaults_on_and_can_be_turned_off() {
+        let default: ExecRequest = serde_json::from_str(r#"{"command":["true"]}"#).unwrap();
+        assert!(default.auto_start);
+        let off: ExecRequest =
+            serde_json::from_str(r#"{"command":["true"],"autoStart":false}"#).unwrap();
+        assert!(!off.auto_start);
+    }
+
     use super::*;
 
     /// The correct camelCase `timeoutSecs` deserializes and applies.
