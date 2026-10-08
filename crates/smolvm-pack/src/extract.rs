@@ -416,7 +416,16 @@ fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> 
     {
         // NTFS keeps xattrs as alternate data streams, which is where
         // libkrun's Windows server reads the override from.
-        fs::write(format!("{}:{}", path.display(), name), value)
+        //
+        // A stream is addressed as `<file>:<name>`, and `<file>` may not end
+        // in a separator. A tar directory entry is spelled `etc/`, so its
+        // joined path arrives here as `...\etc/`, and `...\etc/:name` is not
+        // a name Windows accepts (os error 123). Rebuilding the path from its
+        // components drops the trailing separator and nothing else.
+        let mut stream = path.components().collect::<PathBuf>().into_os_string();
+        stream.push(":");
+        stream.push(name);
+        fs::write(stream, value)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -7035,6 +7044,16 @@ mod tests {
         (n >= 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
     }
 
+    #[cfg(windows)]
+    fn read_user_xattr(path: &Path, name: &str) -> Option<String> {
+        let mut stream = path.as_os_str().to_os_string();
+        stream.push(":");
+        stream.push(name);
+        fs::read(stream)
+            .ok()
+            .map(|value| String::from_utf8_lossy(&value).into_owned())
+    }
+
     /// Host-side extraction that describes ownership to the guest: every
     /// entry's archived owner and mode land in libkrun's override xattr, the
     /// host copy stays readable, OCI whiteouts become faked 0:0 character
@@ -7191,6 +7210,56 @@ mod tests {
         assert_eq!(xattr("ro/old").as_deref(), Some("0:0:020000"));
         assert_eq!(host_mode("ro") & 0o700, 0o700);
         assert_eq!(host_mode("ro/readme") & 0o600, 0o600);
+    }
+
+    /// A directory entry is spelled with a trailing separator in a tar (`etc/`),
+    /// and its owner record still has to land on the directory. On Windows the
+    /// record is an alternate data stream, and `...\etc/:name` is not a valid
+    /// stream path: every layer holding a directory failed to extract with
+    /// os error 123, so no packed image could run.
+    #[test]
+    fn owner_xattr_extraction_records_owners_of_directory_entries() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, mode: u32, uid: u64, data: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            header.set_uid(uid);
+            header.set_gid(uid);
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, data).unwrap();
+        };
+        add("private/", tar::EntryType::Directory, 0o700, 1000, b"");
+        add("private/secret", tar::EntryType::Regular, 0o600, 1000, b"s");
+        add("etc/", tar::EntryType::Directory, 0o755, 0, b"");
+        add("etc/nested/", tar::EntryType::Directory, 0o755, 0, b"");
+        add("etc/nested/conf", tar::EntryType::Regular, 0o644, 0, b"c");
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let xattr = |rel: &str| read_user_xattr(&dest.join(rel), OVERRIDE_STAT_XATTR);
+        assert_eq!(xattr("private").as_deref(), Some("1000:1000:0700"));
+        assert_eq!(xattr("private/secret").as_deref(), Some("1000:1000:0600"));
+        assert_eq!(xattr("etc").as_deref(), Some("0:0:0755"));
+        assert_eq!(xattr("etc/nested").as_deref(), Some("0:0:0755"));
+        assert_eq!(xattr("etc/nested/conf").as_deref(), Some("0:0:0644"));
+        assert_eq!(fs::read(dest.join("private/secret")).unwrap(), b"s");
     }
 
     /// A symlink entry's archived owner reaches the guest through the override
