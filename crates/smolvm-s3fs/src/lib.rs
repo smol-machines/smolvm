@@ -41,6 +41,12 @@ pub struct MountOptions {
     pub allow_other: bool,
     /// Where in-flight writes are staged before upload.
     pub scratch_dir: std::path::PathBuf,
+    /// How long lookups, misses and small files' bytes are trusted, here and
+    /// by the kernel. A change made by another writer shows up within it;
+    /// zero asks the bucket every time.
+    pub cache_ttl: std::time::Duration,
+    /// Requests served at once, so one slow request does not hold up others.
+    pub workers: usize,
 }
 
 impl Default for MountOptions {
@@ -50,6 +56,8 @@ impl Default for MountOptions {
             read_only: false,
             allow_other: true,
             scratch_dir: std::path::PathBuf::from("/var/tmp/smolvm-s3fs"),
+            cache_ttl: std::time::Duration::from_secs(10),
+            workers: 8,
         }
     }
 }
@@ -58,8 +66,13 @@ impl Default for MountOptions {
 #[cfg(target_os = "linux")]
 pub fn mount(cfg: s3::Config, opts: MountOptions) -> std::io::Result<()> {
     let client = s3::Client::new(cfg);
-    let filesystem = fs::S3Fs::new(client, opts.read_only, opts.scratch_dir)?;
-    let mut session = fuse::Session::mount(&opts.mountpoint, opts.read_only, opts.allow_other)?;
-    session.run(&filesystem);
+    let filesystem = fs::S3Fs::new(client, opts.read_only, opts.scratch_dir, opts.cache_ttl)?;
+    let mut session = fuse::Session::mount(
+        &opts.mountpoint,
+        opts.read_only,
+        opts.allow_other,
+        opts.cache_ttl,
+    )?;
+    session.run(&filesystem, opts.workers.min(s3::MAX_IN_FLIGHT));
     Ok(())
 }

@@ -113,6 +113,7 @@ pub fn run_helper() -> i32 {
         // Staging lives on the container's own writable layer so a large write
         // is bounded by the machine's disk, not by RAM.
         scratch_dir: std::path::PathBuf::from("/var/tmp/smolvm-s3fs"),
+        ..MountOptions::default()
     };
 
     eprintln!(

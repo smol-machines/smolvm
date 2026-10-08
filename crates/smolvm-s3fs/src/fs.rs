@@ -18,12 +18,20 @@
 //! * **Deletes must not resurrect data.** A staged file whose upload has not
 //!   happened yet still has to be visible to readers, so lookups consult the
 //!   staging table before the bucket.
+//! * **Every question is a round trip.** Each lookup would be a HEAD (and a
+//!   LIST when the name is not an object), and each read a GET, one network
+//!   round trip apiece, while programs ask the same questions over and over.
+//!   So answers are kept for [`S3Fs::cache_ttl`]: a listing records every
+//!   child's size and time as it goes, a miss is remembered as a miss, and a
+//!   small file is fetched once and read from memory. Changes made through
+//!   this mount update the caches as they happen; a change made by another
+//!   writer becomes visible within the TTL.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::fuse::{self, Attr, Filesystem, Reply, Request, DT_DIR, DT_REG, FUSE_ROOT_ID};
 use crate::s3;
@@ -36,6 +44,27 @@ const FILE_MODE: u32 = 0o100644;
 /// them — but a size change is real and must be applied.
 const FATTR_SIZE: u32 = 1 << 3;
 const FATTR_FH: u32 = 1 << 6;
+
+/// Objects up to this size are read whole on first access and served from
+/// memory after: a few KiB file otherwise costs a round trip per read.
+const SMALL_FILE_MAX: u64 = 1024 * 1024;
+/// Memory the small-file cache may hold; least recently used goes first.
+const SMALL_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What a path resolved to, kept for the cache TTL.
+#[derive(Clone, Debug, PartialEq)]
+enum Known {
+    Present(Node),
+    Absent,
+}
+
+/// A small object's bytes, valid while the object keeps this size and time.
+struct SmallFile {
+    size: u64,
+    mtime: u64,
+    bytes: std::sync::Arc<Vec<u8>>,
+    used: Instant,
+}
 
 /// A file opened for writing, staged on local disk until flush.
 struct Staged {
@@ -68,6 +97,12 @@ pub struct S3Fs {
     staged: Mutex<HashMap<u64, Staged>>,
     /// Paths with an unflushed staging file, so reads see pending writes.
     pending: Mutex<HashMap<String, u64>>,
+    /// How long a lookup, a miss or a small file's bytes are trusted.
+    cache_ttl: Duration,
+    /// path -> what it resolved to, and when.
+    meta: Mutex<HashMap<String, (Known, Instant)>>,
+    /// path -> the whole bytes of a small object.
+    small: Mutex<HashMap<String, SmallFile>>,
 }
 
 impl S3Fs {
@@ -75,6 +110,7 @@ impl S3Fs {
         client: s3::Client,
         read_only: bool,
         scratch: std::path::PathBuf,
+        cache_ttl: Duration,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&scratch)?;
         let mut inodes = HashMap::new();
@@ -91,7 +127,116 @@ impl S3Fs {
             paths: Mutex::new(paths),
             staged: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            cache_ttl,
+            meta: Mutex::new(HashMap::new()),
+            small: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// What `path` resolved to, while that answer is within the TTL.
+    fn known(&self, path: &str) -> Option<Known> {
+        if self.cache_ttl.is_zero() {
+            return None;
+        }
+        let meta = self.meta.lock().ok()?;
+        let (known, at) = meta.get(path)?;
+        (at.elapsed() < self.cache_ttl).then(|| known.clone())
+    }
+
+    /// Record what `path` is. A change made through this mount calls this as
+    /// it happens, so the mount always reads its own writes.
+    fn remember(&self, path: &str, known: Known) {
+        if self.cache_ttl.is_zero() {
+            return;
+        }
+        if let Ok(mut meta) = self.meta.lock() {
+            // Bounded: drop what has expired once the table grows large.
+            if meta.len() > 100_000 {
+                let ttl = self.cache_ttl;
+                meta.retain(|_, (_, at)| at.elapsed() < ttl);
+            }
+            meta.insert(path.to_string(), (known, Instant::now()));
+        }
+    }
+
+    /// Record one listed level: every child, and the directory itself.
+    fn remember_listing(&self, dir: &str, listing: &s3::Listing) {
+        if !dir.is_empty() {
+            self.remember(dir, Known::Present(Node::Dir));
+        }
+        for d in &listing.prefixes {
+            self.remember(&Self::join(dir, d), Known::Present(Node::Dir));
+        }
+        for o in &listing.objects {
+            if o.key.ends_with('/') {
+                continue;
+            }
+            self.remember(
+                &Self::join(dir, &o.key),
+                Known::Present(Node::File {
+                    size: o.size,
+                    mtime: o.last_modified_secs,
+                }),
+            );
+        }
+    }
+
+    /// Drop a small file's cached bytes after it changed through this mount.
+    fn forget_bytes(&self, path: &str) {
+        if let Ok(mut small) = self.small.lock() {
+            small.remove(path);
+        }
+    }
+
+    /// The whole bytes of a small object, from memory when this exact version
+    /// was read before, else fetched once and kept.
+    fn small_bytes(&self, path: &str, size: u64, mtime: u64) -> Option<std::sync::Arc<Vec<u8>>> {
+        if let Ok(mut small) = self.small.lock() {
+            if let Some(f) = small.get_mut(path) {
+                if f.size == size && f.mtime == mtime {
+                    f.used = Instant::now();
+                    return Some(f.bytes.clone());
+                }
+            }
+        }
+        let bytes = self.client.get(path, None).ok()?;
+        if bytes.len() as u64 != size {
+            // Changed since it was listed: refresh what we know, keep nothing.
+            self.remember(
+                path,
+                Known::Present(Node::File {
+                    size: bytes.len() as u64,
+                    mtime: Self::now(),
+                }),
+            );
+            return Some(std::sync::Arc::new(bytes));
+        }
+        let bytes = std::sync::Arc::new(bytes);
+        if let Ok(mut small) = self.small.lock() {
+            let mut total: u64 = small.values().map(|f| f.size).sum();
+            while total + size > SMALL_CACHE_BYTES {
+                let Some(oldest) = small
+                    .iter()
+                    .min_by_key(|(_, f)| f.used)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                if let Some(f) = small.remove(&oldest) {
+                    total -= f.size;
+                }
+            }
+            small.insert(
+                path.to_string(),
+                SmallFile {
+                    size,
+                    mtime,
+                    bytes: bytes.clone(),
+                    used: Instant::now(),
+                },
+            );
+        }
+        Some(bytes)
     }
 
     fn now() -> u64 {
@@ -200,21 +345,40 @@ impl S3Fs {
                 });
             }
         }
+        match self.known(path) {
+            Some(Known::Present(node)) => return Some(node),
+            Some(Known::Absent) => return None,
+            None => {}
+        }
+        let mut head_failed = false;
         match self.client.head(path) {
             Ok(Some(info)) => {
-                return Some(Node::File {
+                let node = Node::File {
                     size: info.size,
                     mtime: info.last_modified_secs,
-                })
+                };
+                self.remember(path, Known::Present(node.clone()));
+                return Some(node);
             }
             Ok(None) => {}
             Err(e) => {
+                head_failed = true;
                 tracing::debug!(path, error = %e, "head failed; treating as absent");
             }
         }
-        // Not an object: it may still be a directory prefix.
+        // Not an object: it may still be a directory prefix. The listing that
+        // answers that also describes its children, which come next.
         match self.client.list_dir(path) {
-            Ok(l) if !l.objects.is_empty() || !l.prefixes.is_empty() => Some(Node::Dir),
+            Ok(l) if !l.objects.is_empty() || !l.prefixes.is_empty() => {
+                self.remember_listing(path, &l);
+                Some(Node::Dir)
+            }
+            // Only a definite answer is remembered: a failed HEAD or LIST is a
+            // transient error, not proof the path is absent.
+            Ok(_) if !head_failed => {
+                self.remember(path, Known::Absent);
+                None
+            }
             _ => None,
         }
     }
@@ -303,6 +467,14 @@ impl S3Fs {
         };
         bytes.resize(size as usize, 0);
         self.client.put(path, &bytes).map_err(|_| libc::EIO)?;
+        self.forget_bytes(path);
+        self.remember(
+            path,
+            Known::Present(Node::File {
+                size,
+                mtime: Self::now(),
+            }),
+        );
         // The object now really is this size, so no pending entry is needed —
         // and a stale one would misreport the size of every later read.
         if let Ok(mut pending) = self.pending.lock() {
@@ -330,6 +502,14 @@ impl S3Fs {
                 return Err(libc::EIO);
             }
             st.dirty = false;
+            self.forget_bytes(path);
+            self.remember(
+                path,
+                Known::Present(Node::File {
+                    size: buf.len() as u64,
+                    mtime: Self::now(),
+                }),
+            );
         }
         if close {
             if let Some(st) = guard.remove(&fh) {
@@ -420,6 +600,9 @@ impl Filesystem for S3Fs {
                         return Reply::Error(libc::EIO);
                     }
                 };
+                // `ls -l` and the lookups that follow a listing then cost
+                // nothing: the listing already said what each child is.
+                self.remember_listing(&path, &listing);
                 let mut buf = Vec::new();
                 let mut next = 1u64;
                 for (name, kind) in [(".", DT_DIR), ("..", DT_DIR)] {
@@ -533,6 +716,15 @@ impl Filesystem for S3Fs {
                 if size == 0 {
                     return Reply::Data(Vec::new());
                 }
+                if let Some(Known::Present(Node::File { size: total, mtime })) = self.known(&path) {
+                    if total <= SMALL_FILE_MAX {
+                        if let Some(bytes) = self.small_bytes(&path, total, mtime) {
+                            let start = (offset as usize).min(bytes.len());
+                            let end = (start + size as usize).min(bytes.len());
+                            return Reply::Data(bytes[start..end].to_vec());
+                        }
+                    }
+                }
                 match self.client.get(&path, Some((offset, offset + size - 1))) {
                     Ok(d) => Reply::Data(d),
                     // A range past EOF is a normal end-of-file, not an error.
@@ -617,6 +809,8 @@ impl Filesystem for S3Fs {
                 match self.client.delete(&path) {
                     Ok(()) => {
                         self.forget_path(&path);
+                        self.forget_bytes(&path);
+                        self.remember(&path, Known::Absent);
                         Reply::Ok
                     }
                     Err(e) => {
@@ -641,7 +835,10 @@ impl Filesystem for S3Fs {
                 };
                 let path = Self::join(&parent, &name);
                 match self.client.put(&format!("{path}/"), b"") {
-                    Ok(()) => Reply::Entry(self.attr_for(self.ino_for(&path), &Node::Dir)),
+                    Ok(()) => {
+                        self.remember(&path, Known::Present(Node::Dir));
+                        Reply::Entry(self.attr_for(self.ino_for(&path), &Node::Dir))
+                    }
                     Err(e) => {
                         tracing::warn!(path, error = %e, "mkdir failed");
                         Reply::Error(libc::EIO)
@@ -667,6 +864,7 @@ impl Filesystem for S3Fs {
                     _ => match self.client.delete(&format!("{path}/")) {
                         Ok(()) => {
                             self.forget_path(&path);
+                            self.remember(&path, Known::Absent);
                             Reply::Ok
                         }
                         Err(_) => Reply::Error(libc::EIO),
@@ -703,6 +901,16 @@ impl Filesystem for S3Fs {
                 }
                 let _ = self.client.delete(&from);
                 self.rename_path(&from, &to);
+                self.forget_bytes(&from);
+                self.forget_bytes(&to);
+                self.remember(&from, Known::Absent);
+                self.remember(
+                    &to,
+                    Known::Present(Node::File {
+                        size: bytes.len() as u64,
+                        mtime: Self::now(),
+                    }),
+                );
                 Reply::Ok
             }
 
@@ -732,6 +940,12 @@ mod tests {
     use super::*;
 
     fn fs() -> S3Fs {
+        fs_with_ttl(Duration::ZERO)
+    }
+
+    /// A mount whose bucket is unreachable, so any answer it gives without an
+    /// error came from its cache.
+    fn fs_with_ttl(cache_ttl: Duration) -> S3Fs {
         let dir = std::env::temp_dir().join(format!("s3fs-test-{}", std::process::id()));
         S3Fs::new(
             s3::Client::new(s3::Config {
@@ -745,8 +959,42 @@ mod tests {
             }),
             false,
             dir,
+            cache_ttl,
         )
         .expect("scratch dir is creatable")
+    }
+
+    // Each lookup used to cost a HEAD (and a LIST on a miss) even for a name
+    // asked about a moment ago; within the TTL the answer must come from memory.
+    #[test]
+    fn a_remembered_answer_needs_no_request() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        let listing = s3::Listing {
+            objects: vec![s3::ObjectInfo {
+                key: "a.txt".into(),
+                size: 5,
+                last_modified_secs: 7,
+            }],
+            prefixes: vec!["sub".into()],
+        };
+        fs.remember_listing("d", &listing);
+        fs.remember("d/missing", Known::Absent);
+        assert!(matches!(
+            fs.stat("d/a.txt"),
+            Some(Node::File { size: 5, mtime: 7 })
+        ));
+        assert!(matches!(fs.stat("d/sub"), Some(Node::Dir)));
+        assert!(matches!(fs.stat("d"), Some(Node::Dir)));
+        assert!(fs.stat("d/missing").is_none());
+    }
+
+    // A zero TTL turns the cache off entirely, so every lookup reaches the
+    // bucket and sees other writers' changes immediately.
+    #[test]
+    fn a_zero_ttl_remembers_nothing() {
+        let fs = fs_with_ttl(Duration::ZERO);
+        fs.remember("d/a.txt", Known::Present(Node::Dir));
+        assert!(fs.known("d/a.txt").is_none());
     }
 
     // `rename(2)` keeps the inode and moves the name onto it. Forgetting the
@@ -843,6 +1091,7 @@ mod tests {
             }),
             true,
             dir,
+            Duration::ZERO,
         )
         .unwrap();
         for opcode in [

@@ -79,6 +79,9 @@ pub struct Listing {
     pub prefixes: Vec<String>,
 }
 
+/// Upper bound on requests the mount issues at once; sizes the connection pool.
+pub const MAX_IN_FLIGHT: usize = 32;
+
 pub struct Client {
     cfg: Config,
     agent: ureq::Agent,
@@ -86,7 +89,12 @@ pub struct Client {
 
 impl Client {
     pub fn new(cfg: Config) -> Self {
+        // Keep a warm connection for every request that can be in flight at
+        // once. ureq keeps one per host by default, so concurrent requests
+        // would each pay a fresh TLS handshake and then be thrown away.
         let agent = ureq::AgentBuilder::new()
+            .max_idle_connections_per_host(MAX_IN_FLIGHT)
+            .max_idle_connections(MAX_IN_FLIGHT)
             .timeout(cfg.timeout)
             .user_agent(concat!("smolvm-s3fs/", env!("CARGO_PKG_VERSION")))
             .build();
