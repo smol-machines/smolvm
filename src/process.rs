@@ -1317,6 +1317,10 @@ pub fn apply_system_data_root(allow_auto: bool) {
         // The rootfs the installer laid down sits under the old home, which a
         // dropped VMM uid cannot traverse; bring a copy into the new root.
         carry_rootfs_from = installed_agent_rootfs();
+        // Name the choice so a second pass (`serve` runs one of its own, after
+        // HOME has already moved off overlayfs) and every child keep this root
+        // instead of falling through to /var/lib/smolvm.
+        std::env::set_var("SMOLVM_DATA_DIR", &workspace_root);
         workspace_root
     } else if allow_auto
         && vm_uid_drop_active()
