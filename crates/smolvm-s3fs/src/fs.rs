@@ -63,6 +63,10 @@ struct SmallFile {
     size: u64,
     mtime: u64,
     bytes: std::sync::Arc<Vec<u8>>,
+    /// When the bytes came from the bucket. They expire with the TTL because
+    /// S3 times have one-second resolution: a same-size rewrite within that
+    /// second would otherwise look unchanged forever.
+    fetched: Instant,
     used: Instant,
 }
 
@@ -193,7 +197,7 @@ impl S3Fs {
     fn small_bytes(&self, path: &str, size: u64, mtime: u64) -> Option<std::sync::Arc<Vec<u8>>> {
         if let Ok(mut small) = self.small.lock() {
             if let Some(f) = small.get_mut(path) {
-                if f.size == size && f.mtime == mtime {
+                if f.size == size && f.mtime == mtime && f.fetched.elapsed() < self.cache_ttl {
                     f.used = Instant::now();
                     return Some(f.bytes.clone());
                 }
@@ -232,6 +236,7 @@ impl S3Fs {
                     size,
                     mtime,
                     bytes: bytes.clone(),
+                    fetched: Instant::now(),
                     used: Instant::now(),
                 },
             );
