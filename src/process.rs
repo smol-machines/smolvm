@@ -2009,8 +2009,12 @@ pub fn setup_private_idmap_mounts(
     };
 
     let result = (|| {
+        // Read-only like the seed: the shared pack serves every machine on the
+        // node built on it, so one guest must never be able to change it for
+        // the others. virtio-fs exports it read-only too; this holds even if
+        // that ever regresses.
         if let Some((shared, target)) = pack {
-            mount_idmapped(shared, target, userns_fd, false)?;
+            mount_idmapped(shared, target, userns_fd, true)?;
         }
         if let Some(seed_dir) = seed_dir {
             mount_idmapped(seed_dir, seed_dir, userns_fd, true)?;
