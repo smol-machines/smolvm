@@ -254,6 +254,86 @@ impl CacheDisk {
     }
 }
 
+impl CacheDisk {
+    /// SHA-256 (hex) of the base: what a checkpoint records so a restore can
+    /// attach the same base. Bases are immutable, so the digest is kept beside
+    /// the base and hashed again only when the file is no longer the one it
+    /// describes.
+    pub fn base_digest(&self) -> crate::Result<String> {
+        if let Some(digest) = recorded_base_digest(&self.base) {
+            return Ok(digest);
+        }
+        use sha2::Digest;
+        use std::io::Read;
+        let mut file = std::fs::File::open(&self.base).map_err(|e| {
+            crate::Error::agent("hash cache base", format!("{}: {e}", self.base.display()))
+        })?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = vec![0_u8; 1 << 20];
+        loop {
+            let read = file.read(&mut buffer).map_err(|e| {
+                crate::Error::agent("hash cache base", format!("{}: {e}", self.base.display()))
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let digest = hex::encode(hasher.finalize());
+        record_base_digest(&self.base, &digest);
+        Ok(digest)
+    }
+}
+
+/// Where a base's digest is kept: a hidden file beside it, a name no base can
+/// have.
+fn base_digest_path(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = base.file_name()?.to_str()?;
+    Some(base.with_file_name(format!(".{name}.sha256")))
+}
+
+/// What the recorded digest is bound to: the file it was computed from.
+fn base_identity(base: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(base).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let inode = 0_u64;
+    Some(format!(
+        "{} {}.{:09} {inode}",
+        meta.len(),
+        modified.as_secs(),
+        modified.subsec_nanos()
+    ))
+}
+
+/// The digest recorded for `base`, when it still describes that file.
+fn recorded_base_digest(base: &std::path::Path) -> Option<String> {
+    let recorded = std::fs::read_to_string(base_digest_path(base)?).ok()?;
+    let (identity, digest) = recorded.trim_end().split_once('\n')?;
+    let valid = digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit());
+    (valid && identity == base_identity(base)?).then(|| digest.to_ascii_lowercase())
+}
+
+/// Record `digest` as the SHA-256 of `base`, for [`CacheDisk::base_digest`].
+/// Best-effort: a directory this process cannot write only costs a rehash.
+pub fn record_base_digest(base: &std::path::Path, digest: &str) {
+    let (Some(path), Some(identity)) = (base_digest_path(base), base_identity(base)) else {
+        return;
+    };
+    let staging = path.with_extension(format!("sha256.{}", std::process::id()));
+    let written = std::fs::write(&staging, format!("{identity}\n{digest}\n"))
+        .and_then(|()| std::fs::rename(&staging, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+}
+
 /// Check that `name` names a cache base as a remote caller must: one file name
 /// in the cache disk directory, never a path.
 pub fn validate_base_name(name: &str) -> Result<(), String> {
@@ -521,6 +601,43 @@ mod tests {
         // Must match libkrun's ImageType: Raw=0, Qcow2=1.
         assert_eq!(DiskFormat::Raw.to_krun_u32(), 0);
         assert_eq!(DiskFormat::Qcow2.to_krun_u32(), 1);
+    }
+
+    #[test]
+    fn a_base_digest_is_kept_beside_it_until_the_base_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("deps-v1.raw");
+        std::fs::write(&base, b"cache contents").unwrap();
+        let cache = CacheDisk {
+            base: base.clone(),
+            mount_path: "/cache".into(),
+        };
+        let digest = cache.base_digest().unwrap();
+        assert_eq!(
+            digest,
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"cache contents"))
+        );
+        let recorded = dir.path().join(".deps-v1.raw.sha256");
+        assert!(
+            recorded.is_file(),
+            "the digest was not kept beside the base"
+        );
+        // A kept digest is used as is while it still describes the file.
+        let kept = std::fs::read_to_string(&recorded).unwrap();
+        let (identity, _) = kept.trim_end().split_once('\n').unwrap();
+        std::fs::write(&recorded, format!("{identity}\n{}\n", "ab".repeat(32))).unwrap();
+        assert_eq!(cache.base_digest().unwrap(), "ab".repeat(32));
+        // A base that changed is hashed again.
+        std::fs::remove_file(&base).unwrap();
+        std::fs::write(&base, b"other contents, longer").unwrap();
+        assert_eq!(
+            cache.base_digest().unwrap(),
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                b"other contents, longer"
+            ))
+        );
+        // The kept digest can never be taken for a base.
+        assert!(validate_base_name(".deps-v1.raw.sha256").is_err());
     }
 
     #[test]

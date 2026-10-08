@@ -410,7 +410,8 @@ pub struct CheckpointDiskFile {
 /// An exact block-image chain captured for one virtual disk.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointDisk {
-    /// Stable disk role: `storage` or `overlay`.
+    /// Stable disk role: `storage`, `overlay` or, for a machine with a cache
+    /// disk, `cache`.
     pub role: String,
     /// Ordered top-to-base chain. The first file is the disk attached to the VM.
     pub files: Vec<CheckpointDiskFile>,
@@ -620,6 +621,23 @@ pub struct PortableCheckpointManifest {
     /// contract names the source host's features in that host's own terms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_cpu_features: Option<Vec<String>>,
+    /// The cache disk the machine ran with. Its own layers are captured as the
+    /// `cache` disk chain; the shared base they sit on is not, so a restore
+    /// attaches the same base, identified here, from the restoring host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_disk: Option<CheckpointCacheDisk>,
+}
+
+/// The shared base under a checkpointed machine's cache disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointCacheDisk {
+    /// The base's file name on the capturing host.
+    pub base: String,
+    /// SHA-256 (hex) of the base. A restore attaches only a base with this
+    /// digest: the captured layers hold only the blocks the machine wrote.
+    pub sha256: String,
+    /// Absolute guest path the cache filesystem is mounted at.
+    pub mount_path: String,
 }
 
 /// The arm64 system counter a checkpoint's guest was reading.

@@ -1353,6 +1353,10 @@ pub struct RestoreCheckpointQuery {
     /// Only import a chunked checkpoint into this node's store (so deltas of
     /// it can restore here); create no machine.
     pub import_only: Option<bool>,
+    /// JSON cache disk (see [`crate::api::types::CacheDiskSpec`]) for a
+    /// checkpoint of a machine with one: the base it was captured over, which
+    /// this node fetches from `sourceUrl` when it does not have it yet.
+    pub cache_disk: Option<String>,
 }
 
 fn checkpoint_host_ports(
@@ -1796,6 +1800,12 @@ pub async fn restore_portable_checkpoint(
         .transpose()
         .map_err(|error| ApiError::BadRequest(format!("invalid restore ports: {error}")))?
         .unwrap_or_default();
+    let cache_disk: Option<serde_json::Value> = options
+        .cache_disk
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| ApiError::BadRequest(format!("invalid restore cache disk: {error}")))?;
     // A cached artifact is hard-linked straight into a staging directory:
     // nothing is created or fetched, and the cache's own inode is untouched by
     // whatever the restore does with its copy. Overlapping restores of the same
@@ -2027,6 +2037,7 @@ pub async fn restore_portable_checkpoint(
         "from": restore_path.to_string_lossy(),
         "ports": ports,
         "registryIdentityToken": registry_token,
+        "cacheDisk": cache_disk,
     }))
     .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
     // create_machine consumes and verifies the artifact before this TempDir is
@@ -2685,20 +2696,26 @@ async fn create_machine_inner(
         .as_ref()
         .and_then(|checkpoint| checkpoint.overlay_gib)
         .or(req.overlay_gb);
-    // A restored guest resumes with the devices it was captured with, so a
-    // disk added now would not be the one its memory expects.
-    if manifest_checkpoint.is_some() && req.cache_disk.is_some() {
-        return Err(ApiError::BadRequest(
-            "a machine restored from a checkpoint keeps the disks it was captured with; \
-             add a cache disk to a fresh machine"
-                .into(),
-        ));
-    }
     // Resolve before any work, so a bad base is a 400 and not a half-made machine.
-    if let Some(spec) = req.cache_disk.as_ref() {
-        fetch_cache_base(&state, spec).await?;
-        state.resolve_cache_disk(spec)?;
-    }
+    let resolved_cache = match req.cache_disk.as_ref() {
+        Some(spec) => {
+            fetch_cache_base(&state, spec).await?;
+            Some(state.resolve_cache_disk(spec)?)
+        }
+        None => None,
+    };
+    // A restored guest resumes with the devices it was captured with: a
+    // checkpoint of a machine with a cache disk restores over the same base,
+    // and one without takes none.
+    let restore_cache_base = match manifest_checkpoint.clone() {
+        Some(checkpoint) => tokio::task::spawn_blocking(move || {
+            crate::portable_checkpoint::resolve_cache_base(&checkpoint, resolved_cache.as_ref())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        None => None,
+    };
     let captured_ports: Vec<PortSpec> = checkpoint_network
         .map(|network| {
             network
@@ -2954,6 +2971,7 @@ async fn create_machine_inner(
                 &content_dir,
                 &vm_data_dir(&name_for_checkpoint),
                 &checkpoint,
+                restore_cache_base.as_deref(),
                 &mut deferred,
             )
             .and_then(|()| {
@@ -6039,7 +6057,9 @@ pub async fn publish_cache_disk(
                 cache.base.clone()
             };
             let size = publish_flattened(&top, &dir, &base)?;
-            Ok((size, file_sha256(&dir.join(&base))?))
+            let digest = file_sha256(&dir.join(&base))?;
+            crate::data::disk::record_base_digest(&dir.join(&base), &digest);
+            Ok((size, digest))
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
@@ -6155,7 +6175,12 @@ async fn fetch_cache_base(
             )));
         }
         match std::fs::hard_link(&partial, &target) {
-            Ok(()) => Ok(()),
+            // Verified as it arrived, so a checkpoint of a machine on it need
+            // not hash it again.
+            Ok(()) => {
+                crate::data::disk::record_base_digest(&target, &expected);
+                Ok(())
+            }
             // Another create fetched the same immutable base first.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(ApiError::internal(format!(

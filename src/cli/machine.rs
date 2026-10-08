@@ -1809,8 +1809,8 @@ impl RunCmd {
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_io: params.block_io,
             disk_durability: params.disk_durability,
-            disks: Vec::new(),
-            cache_disk: None,
+            disks: params.disks.clone(),
+            cache_disk: params.cache_disk.clone(),
         };
         validate_requested_network_backend(
             &resources,
@@ -4599,15 +4599,16 @@ impl CreateCmd {
             Some(checkpoint) => smolvm::portable_checkpoint::restored_guest_subnet(checkpoint)?,
             None => None,
         };
-        // A restored guest resumes with the devices it was captured with, so a
-        // disk added now would not be the one its memory expects.
-        if checkpoint.is_some() && self.cache_disk.is_some() {
-            return Err(smolvm::Error::config(
-                "cache disk",
-                "a machine restored from a checkpoint keeps the disks it was captured with; add a cache disk to a fresh machine",
-            ));
-        }
         let cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
+        // A restored guest resumes with the devices it was captured with: a
+        // checkpoint of a machine with a cache disk restores over the same
+        // base, and one without takes none.
+        let cache_base = match checkpoint.as_ref() {
+            Some(checkpoint) => {
+                smolvm::portable_checkpoint::resolve_cache_base(checkpoint, cache_disk.as_ref())?
+            }
+            None => None,
+        };
         let mut params = vm_common::CreateVmParams {
             // A checkpoint carries its credential bindings and the exact
             // placeholders the captured workload holds; `build_vm_record`
@@ -4904,7 +4905,12 @@ impl CreateCmd {
 
             if let Some(ref checkpoint) = checkpoint {
                 let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
-                smolvm::portable_checkpoint::install(&pack_content_dir, &vm_data_dir, checkpoint)?;
+                smolvm::portable_checkpoint::install(
+                    &pack_content_dir,
+                    &vm_data_dir,
+                    checkpoint,
+                    cache_base.as_deref(),
+                )?;
                 smolvm::portable_checkpoint::discard_transport_pack(&vm_data_dir)?;
                 if let Some((sidecar, reference)) =
                     smolvm::portable_checkpoint::attach_cached_checkpoint_pack(

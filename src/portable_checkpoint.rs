@@ -903,6 +903,15 @@ pub fn restore_from_path_at(
     })?;
     validate_compatibility(checkpoint)?;
     crate::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
+    if let Some(cache) = &checkpoint.cache_disk {
+        return Err(Error::config(
+            "restore checkpoint",
+            format!(
+                "this checkpoint was captured with a cache disk over base {} (sha256 {}); restore it with `smolvm machine create --from CHECKPOINT --cache-disk BASE:{}`",
+                cache.base, cache.sha256, cache.mount_path
+            ),
+        ));
+    }
     log_phase(name, "restore_verify", &mut phase);
 
     // Reserve the name before touching its data directory. SDKs and CLIs may
@@ -955,7 +964,8 @@ pub fn restore_from_path_at(
             )?;
         }
         log_phase(name, "restore_extract", &mut phase);
-        install(&cache_dir, &vm_data, checkpoint)?;
+        // A checkpoint with a cache disk was refused above.
+        install(&cache_dir, &vm_data, checkpoint, None)?;
         log_phase(name, "restore_install", &mut phase);
         discard_transport_pack(&vm_data)?;
         if let Some((sidecar, reference)) = attach_cached_checkpoint_pack(name, checkpoint)? {
@@ -2009,6 +2019,27 @@ fn capture_with_completion(
         .vms
         .get(name)
         .expect("validated checkpoint source must remain in its loaded config");
+    // The cache disk's shared base is identified, not captured. Hashing it
+    // happens here, before the source is paused; a base hashed once keeps its
+    // digest beside it.
+    let cache_disk = match vm.cache_disk.as_ref() {
+        Some(cache) => {
+            let base = cache.base.canonicalize().map_err(|error| {
+                Error::agent(
+                    "checkpoint cache disk",
+                    format!("{}: {error}", cache.base.display()),
+                )
+            })?;
+            let identity = smolvm_pack::format::CheckpointCacheDisk {
+                base: cache.base_name(),
+                sha256: cache.base_digest()?,
+                mount_path: cache.mount_path.clone(),
+            };
+            Some((base, identity))
+        }
+        None => None,
+    };
+    log_phase(name, "capture_cache_base", &mut phase);
     // This capture's place in the machine's history: a new node whose parent
     // is whatever the machine was last captured to or restored from.
     let checkpoint_id = new_checkpoint_id();
@@ -2170,6 +2201,7 @@ fn capture_with_completion(
         &snapshot_dir,
         pins.as_mut(),
         stored.is_some().then_some(&mut linked_heads),
+        cache_disk.as_ref().map(|(base, _)| base.as_path()),
     )?;
     if !stop_after_capture {
         pause.resume()?;
@@ -2438,6 +2470,7 @@ fn capture_with_completion(
         credential_ca,
         clock,
         guest_cpu_features,
+        cache_disk: cache_disk.map(|(_, identity)| identity),
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
@@ -3479,11 +3512,6 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if vm.docker_socket {
         unsupported.push("Docker socket forwarding");
     }
-    // A checkpoint would carry the machine's cache layer without the shared
-    // base it is a layer over, and restore a disk that reads as garbage.
-    if vm.cache_disk.is_some() {
-        unsupported.push("cache disks (branch the machine instead)");
-    }
     if unsupported.is_empty() {
         return Ok(());
     }
@@ -3620,6 +3648,23 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
     }
 }
 
+/// The backing name a captured cache chain's deepest layer carries in place of
+/// the capturing host's base path. A restore points it at the restoring host's
+/// copy of the same base.
+const CACHE_BASE_TARGET: &str = ".smolcheckpoint-cache-base";
+
+/// The disk roles a checkpoint captures, in the order the VM attaches them.
+fn checkpoint_disk_roles(cache: bool) -> Vec<(&'static str, &'static str)> {
+    let mut roles = vec![
+        ("storage", crate::storage::STORAGE_DISK_FILENAME),
+        ("overlay", crate::storage::OVERLAY_DISK_FILENAME),
+    ];
+    if cache {
+        roles.push(("cache", crate::data::storage::CACHE_DISK_FILENAME));
+    }
+    roles
+}
+
 fn disk_target(role: &str, index: usize, format: &str) -> Result<String> {
     if index == 0 {
         return match (role, format) {
@@ -3627,16 +3672,17 @@ fn disk_target(role: &str, index: usize, format: &str) -> Result<String> {
             ("storage", "raw") => Ok("storage.raw".to_string()),
             ("overlay", "qcow2") => Ok("overlay.qcow2".to_string()),
             ("overlay", "raw") => Ok("overlay.raw".to_string()),
+            ("cache", "qcow2") => Ok("cache.qcow2".to_string()),
             _ => Err(Error::agent(
                 "checkpoint disk",
                 format!("invalid disk role/format {role}/{format}"),
             )),
         };
     }
-    if role != "storage" && role != "overlay" {
+    if role != "storage" && role != "overlay" && !(role == "cache" && format == "qcow2") {
         return Err(Error::agent(
             "checkpoint disk",
-            format!("invalid disk role '{role}'"),
+            format!("invalid disk role/format {role}/{format}"),
         ));
     }
     if format != "raw" && format != "qcow2" {
@@ -3883,10 +3929,7 @@ fn disk_chain_identity(vm_data: &Path) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
     let own = vm_data.canonicalize()?;
     let mut identity = String::new();
-    for (role, raw_name) in [
-        ("storage", crate::storage::STORAGE_DISK_FILENAME),
-        ("overlay", crate::storage::OVERLAY_DISK_FILENAME),
-    ] {
+    for (role, raw_name) in checkpoint_disk_roles(true) {
         let (mut source, initial_format) = crate::agent::resolve_disk_image(vm_data, raw_name);
         if !source.is_file() {
             continue;
@@ -3908,9 +3951,20 @@ fn disk_chain_identity(vm_data: &Path) -> Result<String> {
             } else {
                 "-".to_string()
             };
+            // A cache chain ends at its shared base, which a checkpoint does
+            // not capture: kept in the identity, apart from the captured shape.
+            let backing = match format {
+                "qcow2" => inspect_qcow2(&source)?,
+                _ => (None, None),
+            };
+            let label = if role == "cache" && backing.0.is_none() {
+                "cache-base"
+            } else {
+                role
+            };
             let _ = writeln!(
                 identity,
-                "{role}\t{format}\t{}\t{}\t{}\t{}.{}\t{changed}\t{}",
+                "{label}\t{format}\t{}\t{}\t{}\t{}.{}\t{changed}\t{}",
                 metadata.dev(),
                 metadata.ino(),
                 metadata.size(),
@@ -3918,11 +3972,7 @@ fn disk_chain_identity(vm_data: &Path) -> Result<String> {
                 metadata.mtime_nsec(),
                 source.display()
             );
-            if format != "qcow2" {
-                break;
-            }
-            let (backing, backing_format) = inspect_qcow2(&source)?;
-            let Some(backing) = backing else {
+            let (Some(backing), backing_format) = backing else {
                 break;
             };
             let backing_source = resolve_backing_path(&source, &backing);
@@ -4313,6 +4363,7 @@ fn paused_disks_intact(vm_data: &Path, artifact: &Path, disks: &[CheckpointDisk]
             let mut fields = line.split('\t');
             Some((fields.next()?, fields.next()?))
         })
+        .filter(|(role, _)| *role != "cache-base")
         .collect();
     let expected: Vec<(&str, &str)> = disks
         .iter()
@@ -4356,23 +4407,25 @@ fn stage_disk_chains(
     checkpoint_dir: &Path,
     pins: Option<&mut LayerPins>,
 ) -> Result<(Vec<CheckpointDisk>, DeferredBackings)> {
-    stage_disk_chains_with_links(vm_data, checkpoint_dir, pins, None)
+    stage_disk_chains_with_links(vm_data, checkpoint_dir, pins, None, None)
 }
 
 /// Stage immutable qcow2 backing layers by hard link for stored captures;
 /// record the patched header separately so their shared source stays intact.
+///
+/// With `cache_base`, the machine's cache disk is captured too: its layers
+/// down to that shared base, which is not, the deepest naming
+/// [`CACHE_BASE_TARGET`] in its place.
 fn stage_disk_chains_with_links(
     vm_data: &Path,
     checkpoint_dir: &Path,
     mut pins: Option<&mut LayerPins>,
     mut linked_heads: Option<&mut std::collections::HashMap<String, Vec<u8>>>,
+    cache_base: Option<&Path>,
 ) -> Result<(Vec<CheckpointDisk>, DeferredBackings)> {
     let mut disks = Vec::new();
     let mut deferred = DeferredBackings::default();
-    for (role, raw_name) in [
-        ("storage", crate::storage::STORAGE_DISK_FILENAME),
-        ("overlay", crate::storage::OVERLAY_DISK_FILENAME),
-    ] {
+    for (role, raw_name) in checkpoint_disk_roles(cache_base.is_some()) {
         let (mut source, initial_format) = crate::agent::resolve_disk_image(vm_data, raw_name);
         if !source.is_file() {
             continue;
@@ -4385,6 +4438,7 @@ fn stage_disk_chains_with_links(
         std::fs::create_dir_all(&disk_staging)
             .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
         let mut files = Vec::new();
+        let mut reached_cache_base = false;
         for index in 0..64 {
             let started = std::time::Instant::now();
             let target = disk_target(role, index, format)?;
@@ -4394,6 +4448,17 @@ fn stage_disk_chains_with_links(
             let next = if format == "qcow2" {
                 let (backing, backing_format) = inspect_qcow2(&source)?;
                 match backing {
+                    Some(backing)
+                        if role == "cache"
+                            && cache_base.is_some_and(|base| {
+                                resolve_backing_path(&source, &backing)
+                                    .canonicalize()
+                                    .is_ok_and(|backing| backing == base)
+                            }) =>
+                    {
+                        reached_cache_base = true;
+                        None
+                    }
                     Some(backing) => {
                         let backing_source = resolve_backing_path(&source, &backing);
                         if !backing_source.is_file() {
@@ -4404,6 +4469,14 @@ fn stage_disk_chains_with_links(
                         }
                         let next_format =
                             detect_disk_format(&backing_source, backing_format.as_deref())?;
+                        // Every layer above a cache base is qcow2; anything
+                        // else is a base, and not the one the machine records.
+                        if role == "cache" && next_format != "qcow2" {
+                            return Err(Error::agent(
+                                "stage checkpoint disk",
+                                "the cache disk's layers do not sit on its recorded base",
+                            ));
+                        }
                         let next_target = disk_target(role, index + 1, next_format)?;
                         Some((backing_source, next_format, next_target))
                     }
@@ -4412,7 +4485,11 @@ fn stage_disk_chains_with_links(
             } else {
                 None
             };
-            let next_target = next.as_ref().map(|(_, _, target)| target.clone());
+            let next_target = match &next {
+                Some((_, _, target)) => Some(target.clone()),
+                None if reached_cache_base => Some(CACHE_BASE_TARGET.to_string()),
+                None => None,
+            };
             let pinned = match pins.as_deref_mut() {
                 Some(pins) if index > 0 => {
                     pins.pin(&source, &artifact_path, next_target.as_deref())?
@@ -4491,15 +4568,21 @@ fn stage_disk_chains_with_links(
                 format!("invalid or unterminated {role} disk chain"),
             ));
         }
+        if role == "cache" && !reached_cache_base {
+            return Err(Error::agent(
+                "stage checkpoint disk",
+                "the cache disk's layers do not sit on its recorded base",
+            ));
+        }
         disks.push(CheckpointDisk {
             role: role.to_string(),
             files,
         });
     }
-    if disks.len() != 2 {
+    if disks.len() != 2 + usize::from(cache_base.is_some()) {
         return Err(Error::agent(
             "stage checkpoint disk",
-            "portable checkpoints require storage and overlay disks",
+            "portable checkpoints require storage and overlay disks, and the cache disk of a machine with one",
         ));
     }
     Ok((disks, deferred))
@@ -4864,14 +4947,19 @@ fn expected_assets(
     ]
 }
 
-fn validate_disk_manifest(disks: &[CheckpointDisk]) -> Result<()> {
-    if disks.len() != 2 {
+fn validate_disk_manifest(disks: &[CheckpointDisk], cache: bool) -> Result<()> {
+    let roles = checkpoint_disk_roles(cache);
+    if disks.len() != roles.len() {
         return Err(Error::agent(
             "install checkpoint",
-            "checkpoint must contain storage and overlay disk chains",
+            if cache {
+                "checkpoint must contain storage, overlay and cache disk chains"
+            } else {
+                "checkpoint must contain storage and overlay disk chains"
+            },
         ));
     }
-    for (expected_role, disk) in ["storage", "overlay"].into_iter().zip(disks) {
+    for ((expected_role, _), disk) in roles.into_iter().zip(disks) {
         if disk.role != expected_role || disk.files.is_empty() {
             return Err(Error::agent(
                 "install checkpoint",
@@ -5276,7 +5364,12 @@ const MAX_COW_CHAIN_FILES: usize = 4;
 /// the next file of the captured chain.
 fn verify_qcow2_backing(staged: &Path, disk: &CheckpointDisk, index: usize) -> Result<()> {
     let (backing, _) = inspect_qcow2(staged)?;
-    let expected = disk.files.get(index + 1).map(|next| next.target.as_str());
+    let expected = match disk.files.get(index + 1) {
+        Some(next) => Some(next.target.as_str()),
+        // A cache chain's deepest layer sits on the base it was captured over.
+        None if disk.role == "cache" => Some(CACHE_BASE_TARGET),
+        None => None,
+    };
     if backing.as_deref() != expected {
         return Err(Error::agent(
             "install checkpoint",
@@ -5302,13 +5395,69 @@ fn same_inode(a: &Path, b: &Path) -> Result<bool> {
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
+/// The restoring host's copy of the base a checkpoint's cache disk was
+/// captured over: `cache`, the base the restore was given, checked against the
+/// checkpoint. A checkpoint without a cache disk takes none, since a restored
+/// guest keeps the devices it was captured with.
+pub fn resolve_cache_base(
+    checkpoint: &PortableCheckpointManifest,
+    cache: Option<&crate::data::disk::CacheDisk>,
+) -> Result<Option<PathBuf>> {
+    match (&checkpoint.cache_disk, cache) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(Error::config(
+            "cache disk",
+            "a machine restored from a checkpoint keeps the disks it was captured with; add a cache disk to a fresh machine",
+        )),
+        (Some(captured), None) => Err(Error::config(
+            "cache disk",
+            format!(
+                "this checkpoint was captured with a cache disk at {} over base {} (sha256 {}); restore it with that base",
+                captured.mount_path, captured.base, captured.sha256
+            ),
+        )),
+        (Some(captured), Some(cache)) => {
+            if cache.mount_path != captured.mount_path {
+                return Err(Error::config(
+                    "cache disk",
+                    format!(
+                        "this checkpoint's cache disk is mounted at {}, not {}",
+                        captured.mount_path, cache.mount_path
+                    ),
+                ));
+            }
+            let digest = cache.base_digest()?;
+            if !digest.eq_ignore_ascii_case(&captured.sha256) {
+                return Err(Error::config(
+                    "cache disk",
+                    format!(
+                        "{} is not the base this checkpoint was captured over ({}, sha256 {}; this base has sha256 {digest})",
+                        cache.base.display(),
+                        captured.base,
+                        captured.sha256
+                    ),
+                ));
+            }
+            let base = cache.base.canonicalize().map_err(|error| {
+                Error::agent("cache disk", format!("{}: {error}", cache.base.display()))
+            })?;
+            Ok(Some(base))
+        }
+    }
+}
+
 /// Install verified checkpoint state before a machine is launched.
+///
+/// A checkpoint of a machine with a cache disk installs over `cache_base`, the
+/// restoring host's copy of the base it was captured over (see
+/// [`resolve_cache_base`]).
 pub fn install(
     extracted: &Path,
     vm_data_dir: &Path,
     checkpoint: &PortableCheckpointManifest,
+    cache_base: Option<&Path>,
 ) -> Result<()> {
-    install_with(extracted, vm_data_dir, checkpoint, false, None)
+    install_with(extracted, vm_data_dir, checkpoint, false, cache_base, None)
 }
 
 /// [`install`], leaving any write-back of RAM the extraction deferred to
@@ -5317,9 +5466,17 @@ pub fn install_deferring_sync(
     extracted: &Path,
     vm_data_dir: &Path,
     checkpoint: &PortableCheckpointManifest,
+    cache_base: Option<&Path>,
     deferred: &mut DeferredRestoreSync,
 ) -> Result<()> {
-    install_with(extracted, vm_data_dir, checkpoint, false, Some(deferred))
+    install_with(
+        extracted,
+        vm_data_dir,
+        checkpoint,
+        false,
+        cache_base,
+        Some(deferred),
+    )
 }
 
 /// [`install`]; with `keep_disks`, the machine keeps the disk chains it has,
@@ -5329,10 +5486,29 @@ fn install_with(
     vm_data_dir: &Path,
     checkpoint: &PortableCheckpointManifest,
     keep_disks: bool,
+    cache_base: Option<&Path>,
     mut deferred: Option<&mut DeferredRestoreSync>,
 ) -> Result<()> {
     validate_compatibility(checkpoint)?;
-    validate_disk_manifest(&checkpoint.disks)?;
+    validate_disk_manifest(&checkpoint.disks, checkpoint.cache_disk.is_some())?;
+    let cache_base = match (&checkpoint.cache_disk, cache_base) {
+        (Some(_), Some(base)) => Some(base.to_str().ok_or_else(|| {
+            Error::agent(
+                "install checkpoint",
+                format!("cache base path {} is not UTF-8", base.display()),
+            )
+        })?),
+        (Some(cache), None) if !keep_disks => {
+            return Err(Error::config(
+                "install checkpoint",
+                format!(
+                    "this checkpoint was captured with a cache disk over base {} (sha256 {}); restore it with that base",
+                    cache.base, cache.sha256
+                ),
+            ))
+        }
+        _ => None,
+    };
     #[cfg(target_os = "linux")]
     protect_restore_directory(vm_data_dir)?;
     let destination = vm_data_dir.join(INSTALLED_DIR);
@@ -5424,6 +5600,7 @@ fn install_with(
                     if index == 0
                         && disk.files.len() == 1
                         && file.format == "raw"
+                        && disk.role != "cache"
                         && cow_restore_enabled()
                     {
                         // Copying the captured disk is most of a restore. Share it
@@ -5461,6 +5638,7 @@ fn install_with(
                     if index == 0
                         && file.format == "qcow2"
                         && (2..=MAX_COW_CHAIN_FILES).contains(&disk.files.len())
+                        && disk.role != "cache"
                         && cow_restore_enabled()
                     {
                         let layer_name = format!(
@@ -5495,7 +5673,10 @@ fn install_with(
                         }
                     }
                     staged_names.push(file.target.clone());
-                    if index == 0 {
+                    // A cache chain's deepest layer is pointed at this host's
+                    // base below, so it is a private copy too.
+                    let rebased = disk.role == "cache" && index + 1 == disk.files.len();
+                    if index == 0 || rebased {
                         // The active top layer is writable after resume and must
                         // never alias the immutable extraction cache.
                         copy_verified_sparse(&source, &staged, &file.asset)?;
@@ -5510,6 +5691,9 @@ fn install_with(
                     }
                     if file.format == "qcow2" {
                         verify_qcow2_backing(&staged, disk, index)?;
+                    }
+                    if let (true, Some(base)) = (rebased, cache_base) {
+                        rewrite_qcow2_backing(&staged, base)?;
                     }
                     tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = index == 0, "checkpoint disk installed");
                 }
@@ -5528,10 +5712,7 @@ fn install_with(
         // Publish the exact captured block chains into the paths the launcher
         // attaches. Creation is still private/uncommitted at this point, so a
         // failure causes the entire machine reservation to be rolled back.
-        for raw_name in [
-            crate::storage::STORAGE_DISK_FILENAME,
-            crate::storage::OVERLAY_DISK_FILENAME,
-        ] {
+        for (_, raw_name) in checkpoint_disk_roles(true) {
             for path in [
                 vm_data_dir.join(raw_name),
                 vm_data_dir.join(Path::new(raw_name).with_extension("qcow2")),
@@ -5551,7 +5732,7 @@ fn install_with(
                 .map_err(|error| Error::agent("publish checkpoint disk", error.to_string()))?;
         }
         crate::agent::create_disk_overlays(&cow_tops)?;
-        for disk in &checkpoint.disks {
+        for disk in checkpoint.disks.iter().filter(|disk| disk.role != "cache") {
             std::fs::write(vm_data_dir.join(format!("{}.formatted", disk.role)), b"1").map_err(
                 |error| Error::agent("mark checkpoint disk formatted", error.to_string()),
             )?;
@@ -5627,6 +5808,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .as_ref()
         .ok_or_else(|| Error::agent("resume machine", "artifact has no execution state"))?;
     validate_compatibility(checkpoint)?;
+    let cache_base = resolve_cache_base(checkpoint, record.cache_disk.as_ref())?;
     let vm_data = crate::agent::vm_data_dir(&record.name);
     // A pause leaves the machine's own disks exactly as captured unless
     // something wrote to them since; then they need not be installed again.
@@ -5694,7 +5876,14 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         }
         tracing::info!(machine = %record.name, phase = "extract", elapsed_ms = extract_started.elapsed().as_millis(), "paused resume phase completed");
         clear_stale_restore_state(&vm_data)?;
-        install_with(staged.path(), &vm_data, checkpoint, keep_disks, None)
+        install_with(
+            staged.path(),
+            &vm_data,
+            checkpoint,
+            keep_disks,
+            cache_base.as_deref(),
+            None,
+        )
     };
     // Stage on tmpfs when there is room, so the RAM image handed to the VMM
     // is never written to disk. Its RAM is freed once the VMM has read it.
@@ -6575,6 +6764,7 @@ mod tests {
             credential_ca: None,
             clock: None,
             guest_cpu_features: None,
+            cache_disk: None,
         };
         (extracted, metadata)
     }
@@ -6584,7 +6774,7 @@ mod tests {
         let (extracted, metadata) = installable_checkpoint();
         let source = extracted.path().join(ASSET_DIR);
         let machine = tempfile::tempdir().unwrap();
-        install(extracted.path(), machine.path(), &metadata).unwrap();
+        install(extracted.path(), machine.path(), &metadata, None).unwrap();
         assert!(metadata.memory.sha256.is_empty());
         assert!(pending_dir(machine.path()).is_some());
         assert_eq!(
@@ -6743,7 +6933,15 @@ mod tests {
                 dax_window_bytes,
             });
             let machine = tempfile::tempdir().unwrap();
-            install_with(extracted.path(), machine.path(), &metadata, true, None).unwrap();
+            install_with(
+                extracted.path(),
+                machine.path(),
+                &metadata,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
             let pending = pending_dir(machine.path()).unwrap();
             crate::agent::virtiofs::packed_layers_window_for_launch(Some(&pending))
         };
@@ -7736,6 +7934,181 @@ mod tests {
         assert_eq!(back.packed_layers, None);
     }
 
+    /// A machine's raw storage and overlay disks and its cache layers over
+    /// `base`: `cache.qcow2`, over a frozen branch layer when `branched`.
+    #[cfg(target_os = "linux")]
+    fn cache_disk_machine(vm: &Path, base: &Path, branched: bool) {
+        std::fs::create_dir_all(vm).unwrap();
+        for name in [
+            crate::storage::STORAGE_DISK_FILENAME,
+            crate::storage::OVERLAY_DISK_FILENAME,
+        ] {
+            std::fs::File::create(vm.join(name))
+                .unwrap()
+                .set_len(1 << 20)
+                .unwrap();
+        }
+        let base = base.to_str().unwrap();
+        if branched {
+            create_qcow2(&vm.join("cache-parent.qcow2"), base, "raw");
+            create_qcow2(&vm.join("cache.qcow2"), "cache-parent.qcow2", "qcow2");
+        } else {
+            create_qcow2(&vm.join("cache.qcow2"), base, "raw");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cache_disk_is_captured_down_to_its_base_and_not_the_base() {
+        for branched in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("bases/deps-v1.raw");
+            std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+            std::fs::File::create(&base)
+                .unwrap()
+                .set_len(64 << 20)
+                .unwrap();
+            let vm = dir.path().join("vm");
+            cache_disk_machine(&vm, &base, branched);
+            let checkpoint = dir.path().join("staging/checkpoint");
+            let (disks, deferred) = stage_disk_chains_with_links(
+                &vm,
+                &checkpoint,
+                None,
+                None,
+                Some(&base.canonicalize().unwrap()),
+            )
+            .unwrap();
+            let roles: Vec<_> = disks.iter().map(|disk| disk.role.as_str()).collect();
+            assert_eq!(roles, ["storage", "overlay", "cache"]);
+            let cache = &disks[2];
+            assert_eq!(cache.files.len(), if branched { 2 } else { 1 });
+            assert!(cache.files.iter().all(|file| file.format == "qcow2"));
+            assert_eq!(cache.files[0].target, "cache.qcow2");
+            validate_disk_manifest(&disks, true).unwrap();
+            assert!(validate_disk_manifest(&disks, false).is_err());
+            assert!(validate_disk_manifest(&disks[..2], true).is_err());
+            // The deepest layer names the placeholder, never this host's base.
+            let mut collector = AssetCollector::new(dir.path().join("staging")).unwrap();
+            deferred.pack_from_source(&mut collector).unwrap();
+            let archive = dir.path().join("assets.tar.zst");
+            collector.compress(&archive, false).unwrap();
+            let out = dir.path().join("out");
+            smolvm_pack::assets::decompress_assets_from_file(&archive, &out).unwrap();
+            let deepest = cache.files.len() - 1;
+            let packed = out.join(format!("checkpoint/disks/cache/{deepest}"));
+            let packed = if packed.exists() {
+                packed
+            } else {
+                checkpoint.join(format!("disks/cache/{deepest}"))
+            };
+            assert_eq!(
+                inspect_qcow2(&packed).unwrap().0.as_deref(),
+                Some(CACHE_BASE_TARGET)
+            );
+            for (index, _) in cache.files.iter().enumerate() {
+                let staged = out.join(format!("checkpoint/disks/cache/{index}"));
+                let staged = if staged.exists() {
+                    staged
+                } else {
+                    checkpoint.join(format!("disks/cache/{index}"))
+                };
+                verify_qcow2_backing(&staged, cache, index).unwrap();
+            }
+            // A pause's record of the disks keeps the base apart from the
+            // chains the checkpoint holds.
+            let identity = disk_chain_identity(&vm).unwrap();
+            let base_lines: Vec<_> = identity
+                .lines()
+                .filter(|line| line.starts_with("cache-base\t"))
+                .collect();
+            assert_eq!(base_lines.len(), 1, "{identity}");
+            assert!(base_lines[0].ends_with(base.to_str().unwrap()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cache_layer_that_left_its_base_is_not_captured() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("deps-v1.raw");
+        let other = dir.path().join("deps-v2.raw");
+        for path in [&base, &other] {
+            std::fs::File::create(path)
+                .unwrap()
+                .set_len(1 << 20)
+                .unwrap();
+        }
+        let vm = dir.path().join("vm");
+        cache_disk_machine(&vm, &base, false);
+        let Err(error) = stage_disk_chains_with_links(
+            &vm,
+            &dir.path().join("checkpoint"),
+            None,
+            None,
+            Some(&other.canonicalize().unwrap()),
+        ) else {
+            panic!("a cache layer over another base was captured");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("do not sit on its recorded base"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_cache_disk_checkpoint_restores_only_over_the_same_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("deps-v1.raw");
+        std::fs::write(&base, b"the published cache").unwrap();
+        let cache = crate::data::disk::CacheDisk {
+            base: base.clone(),
+            mount_path: "/cache".into(),
+        };
+        let captured = PortableCheckpointManifest {
+            cache_disk: Some(smolvm_pack::format::CheckpointCacheDisk {
+                base: "deps-v1.raw".into(),
+                sha256: cache.base_digest().unwrap(),
+                mount_path: "/cache".into(),
+            }),
+            ..minimal_checkpoint_manifest()
+        };
+        let plain = minimal_checkpoint_manifest();
+
+        assert_eq!(resolve_cache_base(&plain, None).unwrap(), None);
+        assert_eq!(
+            resolve_cache_base(&captured, Some(&cache)).unwrap(),
+            Some(base.canonicalize().unwrap())
+        );
+        // A cache disk the checkpoint's guest never had.
+        assert!(resolve_cache_base(&plain, Some(&cache)).is_err());
+        // No base, or another one, for a guest that has one.
+        let missing = resolve_cache_base(&captured, None).unwrap_err().to_string();
+        assert!(missing.contains("deps-v1.raw"), "{missing}");
+        let elsewhere = crate::data::disk::CacheDisk {
+            mount_path: "/mnt/cache".into(),
+            ..cache.clone()
+        };
+        assert!(resolve_cache_base(&captured, Some(&elsewhere)).is_err());
+        let other = dir.path().join("deps-v2.raw");
+        std::fs::write(&other, b"a later cache").unwrap();
+        let wrong = crate::data::disk::CacheDisk {
+            base: other,
+            mount_path: "/cache".into(),
+        };
+        let error = resolve_cache_base(&captured, Some(&wrong))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not the base"), "{error}");
+        // The install itself expects the cache chain such a checkpoint holds.
+        let installed = install_with(dir.path(), dir.path(), &captured, false, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(installed.contains("cache disk chains"), "{installed}");
+    }
+
     /// The smallest manifest this host accepts, for tests of the validator.
     fn minimal_checkpoint_manifest() -> PortableCheckpointManifest {
         PortableCheckpointManifest {
@@ -7777,6 +8150,7 @@ mod tests {
             credential_ca: None,
             clock: None,
             guest_cpu_features: None,
+            cache_disk: None,
         }
     }
 

@@ -3680,6 +3680,7 @@ mod tests {
             credential_ca: None,
             clock: None,
             guest_cpu_features: None,
+            cache_disk: None,
         });
         manifest
     }
