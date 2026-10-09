@@ -3009,10 +3009,23 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
         // header), then copy the `.formatted` markers so the clone never
         // reformats and wipes the inherited filesystem.
         let mut specs = Vec::with_capacity(disks.len());
+        let golden_dir_name = gdir
+            .file_name()
+            .ok_or_else(|| Error::agent("clone disk", "golden dir has no name"))?;
         for (raw, src, fmt) in &disks {
-            let base = src
-                .canonicalize()
-                .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+            // Back onto the golden by a path relative to the clone's own dir,
+            // so moving the vms root (or the whole family) never strands the
+            // chain. imago resolves relative backing against the overlay's
+            // directory, and both dirs are siblings under the machine root.
+            // Keep the full path below the golden dir: a fork-continued
+            // golden's disks live under d/<generation>/, not at the top.
+            let below_golden = src.strip_prefix(gdir).map_err(|_| {
+                Error::agent(
+                    "clone disk",
+                    format!("{}: not under the golden dir", src.display()),
+                )
+            })?;
+            let base = Path::new("..").join(golden_dir_name).join(below_golden);
             let overlay = clone_dir.join(Path::new(raw).with_extension("qcow2"));
             specs.push((overlay, base, *fmt));
         }

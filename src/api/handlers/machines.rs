@@ -691,10 +691,11 @@ impl ReceiveHasher {
 }
 
 fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
+    // Retention hard links an uploaded artifact into the shared store under
+    // the machine root, so transfers default to that volume.
     let root = std::env::var_os("SMOLVM_PACK_STAGING")
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")))
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(crate::agent::data_root);
     std::fs::create_dir_all(&root)
         .map_err(|error| ApiError::internal(format!("create checkpoint staging root: {error}")))?;
     Ok(root)

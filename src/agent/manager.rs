@@ -303,7 +303,19 @@ struct AgentInner {
 /// them. Dual-path support would silently expire VMs when their legacy
 /// name-path exceeds the kernel socket budget, so we don't offer it.
 pub fn vm_data_dir(name: &str) -> PathBuf {
-    vm_cache_root().join(vm_dir_hash(name))
+    let hash = vm_dir_hash(name);
+    let dir = vm_cache_root().join(&hash);
+    if !dir.exists() {
+        // A machine the migration skipped because it was running still lives
+        // in the legacy root. Keep resolving it there, so stop, exec and status
+        // reach the live VM and nothing creates an empty directory that would
+        // shadow its disks. It migrates the next time it is touched stopped.
+        let legacy = cache_root().join("vms").join(&hash);
+        if legacy.is_dir() {
+            return legacy;
+        }
+    }
+    dir
 }
 
 /// Reclaim CUDA transport state after a named VM process is confirmed dead.
@@ -719,13 +731,50 @@ pub fn read_egress_telemetry(name: &str) -> Option<u64> {
         .ok()
 }
 
-/// Cache root: `<cache_dir>/smolvm/vms/`.
-pub fn vm_cache_root() -> PathBuf {
+/// Root of smolvm's re-creatable cache state: `<cache_dir>/smolvm/`.
+///
+/// Image seeds, inter-VM network sockets and host trust bundles live here.
+/// Nothing irreplaceable may: the OS and cleanup tools treat the cache as
+/// expendable, and everything under it must be rebuildable on demand.
+pub fn cache_root() -> PathBuf {
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("smolvm")
-        .join("vms")
+}
+
+/// Root of smolvm's irreplaceable state: `<data_local_dir>/smolvm/`.
+///
+/// Holds the machine directories and the database. Staging areas that
+/// publish into the machine store by rename or hard link default here too,
+/// because those operations only work within one filesystem.
+pub fn data_root() -> PathBuf {
+    dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("smolvm")
+}
+
+/// Root holding every machine's directory: `<data_local_dir>/smolvm/vms/`.
+///
+/// Machine disks are irreplaceable user state, so they live in the data
+/// directory beside the database, not in the cache (#373). Machines made by
+/// older versions lived under `<cache_dir>/smolvm/vms`; the first call in a
+/// process moves them over and rewrites the absolute qcow2 backing paths
+/// that would otherwise dangle, skipping machines that are running.
+pub fn vm_cache_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = data_root().join("vms");
+        super::vm_root_migrate::migrate_legacy_vm_root(
+            &cache_root().join("vms"),
+            &root,
+            &cache_root().join("image-seeds"),
+        );
+        root
+    })
+    .clone()
 }
 
 /// Registry directory for a named inter-VM network
@@ -734,21 +783,14 @@ pub fn vm_cache_root() -> PathBuf {
 /// name hash as [`vm_data_dir`] keeps every socket path inside the kernel's
 /// `sockaddr_un` budget regardless of the network's name.
 pub fn network_registry_dir(network: &str) -> PathBuf {
-    vm_cache_root()
-        .parent()
-        .map(|smolvm_root| smolvm_root.join("net"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-net"))
-        .join(vm_dir_hash(network))
+    cache_root().join("net").join(vm_dir_hash(network))
 }
 
 /// Per-node registry for the collision-free per-VM uid allocator
 /// (`<cache_dir>/smolvm/uids/`), a sibling of the VM data dirs. Root-managed; the
 /// dropped VMMs never touch it. See `process::allocate_vm_uid`.
 pub fn vm_uid_registry_dir() -> PathBuf {
-    vm_cache_root()
-        .parent()
-        .map(|p| p.join("uids"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-uids"))
+    cache_root().join("uids")
 }
 
 /// Compute the 16-hex-char directory name for a VM.
@@ -873,6 +915,15 @@ fn prune_orphaned_ready_markers_in(rootfs: &Path, vm_cache_root: &Path) {
 /// agent launch setup). Safe to call repeatedly: the `name` file is written
 /// once and verified on subsequent calls.
 pub fn ensure_vm_dir(name: &str) -> std::io::Result<PathBuf> {
+    // A machine that was running during the bulk migration stayed in the
+    // legacy cache root. Catch it here, before a fresh empty dir in the new
+    // root could shadow its real disks forever.
+    super::vm_root_migrate::ensure_machine_migrated(
+        &cache_root().join("vms"),
+        &vm_cache_root(),
+        &cache_root().join("image-seeds"),
+        &vm_dir_hash(name),
+    );
     ensure_vm_dir_at(&vm_data_dir(name), name)
 }
 
@@ -1087,6 +1138,12 @@ impl AgentManager {
         // the platform runtime dir (`/run/user/<uid>/smolvm` on Linux,
         // `~/Library/Caches/smolvm` on macOS) — shared across ephemeral runs.
         let smolvm_runtime = if let Some(ref vm_name) = name {
+            super::vm_root_migrate::ensure_machine_migrated(
+                &cache_root().join("vms"),
+                &vm_cache_root(),
+                &cache_root().join("image-seeds"),
+                &vm_dir_hash(vm_name),
+            );
             vm_data_dir(vm_name)
         } else {
             dirs::runtime_dir()

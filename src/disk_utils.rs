@@ -475,8 +475,21 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
         tracing::debug!(
             src = %src.display(),
             errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            "clonefile failed, falling back to fs::copy"
+            "clonefile failed, falling back to sparse copy"
         );
+        // clonefile cannot cross volumes. APFS supports SEEK_DATA, so copy only
+        // the data extents; std::fs::copy would write every hole of a 20 GiB
+        // disk image as real zeros.
+        match sparse_copy(src, dst) {
+            Ok(bytes) => {
+                tracing::debug!(src = %src.display(), dst = %dst.display(), bytes_copied = bytes, "sparse copy succeeded");
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(dst);
+                tracing::debug!(src = %src.display(), error = %e, "sparse copy failed, falling back to fs::copy");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -662,8 +675,19 @@ fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// [`sparse_copy`] for callers that must never fall back to a full copy:
+/// writing every hole of a large disk image would cost more than the work the
+/// copy was meant to save.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn sparse_copy_file(src: &Path, dst: &Path) -> Result<u64> {
+    sparse_copy(src, dst).map_err(|e| {
+        let _ = std::fs::remove_file(dst);
+        Error::storage("sparse copy", e.to_string())
+    })
+}
+
 /// Copy only data regions of a sparse file via SEEK_HOLE/SEEK_DATA.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     use std::io::{Seek, SeekFrom};
     use std::os::unix::io::AsRawFd;
@@ -721,7 +745,7 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// the result is identical, but written zeros in the source (a template that
 /// was copied with a tool that fills holes) stay holes in the copy instead of
 /// becoming gigabytes of dirty page cache the guest's first flush must sync.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn copy_extent_exact(
     source: &mut impl std::io::Read,
     destination: &mut (impl std::io::Write + std::io::Seek),
@@ -738,6 +762,105 @@ fn copy_extent_exact(
         }
         remaining -= count as u64;
     }
+    Ok(())
+}
+
+/// Move a file, falling back to copy then delete when `src` and `dst` are on
+/// different filesystems. Machine directories live under the data dir and
+/// seeds and staging under the cache dir, which need not share a volume.
+/// The copy goes through [`clone_or_copy_file`], so sparse disks stay sparse.
+pub fn rename_or_move(src: &Path, dst: &Path) -> Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(error) if is_cross_device(&error) => {
+            clone_or_copy_file(src, dst)?;
+            std::fs::remove_file(src).map_err(|e| Error::storage("move file", e.to_string()))
+        }
+        Err(error) => Err(Error::storage("move file", error.to_string())),
+    }
+}
+
+fn is_cross_device(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE
+        error.raw_os_error() == Some(17)
+    }
+}
+
+/// The backing file a qcow2 image names in its header, with the offset and
+/// length of the stored string. `None` when the file is not a qcow2 or names
+/// no backing file.
+pub fn qcow2_backing_entry(path: &Path) -> Option<(std::path::PathBuf, u64, usize)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header).ok()?;
+    if header[..4] != *b"QFI\xfb" {
+        return None;
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().ok()?);
+    let len = u32::from_be_bytes(header[16..20].try_into().ok()?) as usize;
+    if offset == 0 || len == 0 || len > 4096 {
+        return None;
+    }
+    let mut name = vec![0u8; len];
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    file.read_exact(&mut name).ok()?;
+    #[cfg(unix)]
+    let backing = {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&name))
+    };
+    #[cfg(not(unix))]
+    let backing = std::path::PathBuf::from(String::from_utf8_lossy(&name).into_owned());
+    Some((backing, offset, len))
+}
+
+/// Rewrite a qcow2 image's backing file name in place.
+///
+/// The new name must be no longer than the stored one, which is why callers
+/// rewrite absolute paths into relative ones and never the other way around.
+/// The string is overwritten at its existing offset and the header length
+/// field updated, so no other header structure moves. Returns an error when
+/// the file is not a qcow2 with a backing file or the new name does not fit.
+pub fn rewrite_qcow2_backing(path: &Path, new_backing: &str) -> Result<()> {
+    let (_, offset, len) = qcow2_backing_entry(path).ok_or_else(|| {
+        Error::storage(
+            "rewrite qcow2 backing",
+            format!("{} is not a qcow2 with a backing file", path.display()),
+        )
+    })?;
+    if new_backing.is_empty() || new_backing.len() > len {
+        return Err(Error::storage(
+            "rewrite qcow2 backing",
+            format!(
+                "new backing name ({} bytes) does not fit the stored one ({} bytes) in {}",
+                new_backing.len(),
+                len,
+                path.display()
+            ),
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.write_all(new_backing.as_bytes())
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.seek(SeekFrom::Start(16))
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.write_all(&(new_backing.len() as u32).to_be_bytes())
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| Error::storage("rewrite qcow2 backing", e.to_string()))?;
     Ok(())
 }
 
@@ -816,7 +939,7 @@ mod tests {
     /// A template whose free space is written zeros rather than holes (what
     /// `scp` or a plain `cp` leaves) must still copy as a sparse file, or every
     /// machine created from it starts with its whole disk dirty in page cache.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sparse_copy_leaves_written_zeros_as_holes() {
         use std::os::unix::fs::MetadataExt;
@@ -1054,5 +1177,44 @@ mod tests {
             !msg.contains("too large"),
             "a valid (non-overflowing) size must not trip the overflow guard: {msg}"
         );
+    }
+
+    fn qcow2_with_backing(dir: &Path, backing: &[u8]) -> std::path::PathBuf {
+        let mut image = vec![0u8; 512];
+        image[..4].copy_from_slice(b"QFI\xfb");
+        image[8..16].copy_from_slice(&256u64.to_be_bytes());
+        image[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+        image[256..256 + backing.len()].copy_from_slice(backing);
+        let path = dir.join("disk.qcow2");
+        std::fs::write(&path, &image).unwrap();
+        path
+    }
+
+    #[test]
+    fn backing_rewrite_shortens_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = qcow2_with_backing(dir.path(), b"/very/long/absolute/seed/path.qcow2");
+        rewrite_qcow2_backing(&path, "storage.seed.qcow2").unwrap();
+        let (backing, offset, len) = qcow2_backing_entry(&path).unwrap();
+        assert_eq!(backing, std::path::PathBuf::from("storage.seed.qcow2"));
+        assert_eq!(offset, 256);
+        assert_eq!(len, "storage.seed.qcow2".len());
+    }
+
+    #[test]
+    fn backing_rewrite_rejects_a_longer_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = qcow2_with_backing(dir.path(), b"short");
+        let before = std::fs::read(&path).unwrap();
+        assert!(rewrite_qcow2_backing(&path, "much-longer-name").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn backing_rewrite_rejects_non_qcow2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.raw");
+        std::fs::write(&path, b"not a qcow2 at all").unwrap();
+        assert!(rewrite_qcow2_backing(&path, "x").is_err());
     }
 }

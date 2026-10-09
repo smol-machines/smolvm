@@ -403,6 +403,7 @@ mod imp {
             key_dir,
             cache,
             built,
+            digest,
         } = ensure_seed(
             exe,
             image,
@@ -418,7 +419,7 @@ mod imp {
                 "seed disappeared before overlay creation",
             ));
         };
-        attach_seed_disk(name, &seed, format, storage_gb)?;
+        attach_seed_disk(name, &seed, format, storage_gb, &key_dir, &digest)?;
         // Recently used seeds are the last to be evicted.
         let _ =
             std::fs::File::open(&seed).and_then(|f| f.set_modified(std::time::SystemTime::now()));
@@ -437,6 +438,9 @@ mod imp {
         key_dir: PathBuf,
         cache: CacheLock,
         built: bool,
+        /// The authorized digest the seed is keyed on, recorded beside the
+        /// machine's own copy so revalidation never needs the cache seed.
+        digest: String,
     }
 
     /// Make sure the seed for `image` at its current digest exists, building it
@@ -507,6 +511,7 @@ mod imp {
             key_dir,
             cache,
             built,
+            digest,
         })
     }
 
@@ -516,7 +521,13 @@ mod imp {
         seed: &Path,
         format: DiskFormat,
         storage_gb: Option<u64>,
+        key_dir: &Path,
+        digest: &str,
     ) -> Result<()> {
+        let key = key_dir
+            .file_name()
+            .map(|k| k.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let dir = crate::agent::ensure_vm_dir(name)
             .map_err(|e| Error::config("image seed", e.to_string()))?;
         let storage = dir
@@ -537,7 +548,7 @@ mod imp {
         let size_bytes = storage_gb
             .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB)
             .saturating_mul(crate::data::consts::BYTES_PER_GIB);
-        let created = attach(&staging, seed, format).and_then(|()| {
+        let created = attach(&staging, seed, format, &key).and_then(|()| {
             grow(&staging, format, size_bytes)?;
             // A clone keeps no link to its seed; record it for revalidation.
             if matches!(format, DiskFormat::Raw) {
@@ -548,12 +559,21 @@ mod imp {
         });
         if let Err(error) = created {
             let _ = std::fs::remove_file(staging);
+            // The base link stays: a concurrent start with the same key may
+            // have already built its overlay on that exact file. An orphan
+            // link costs nothing while the cache seed lives (same inode) and
+            // dies with the machine dir.
             return Err(error);
         }
         let published = std::fs::hard_link(&staging, &storage)
             .map_err(|e| Error::config("image seed", e.to_string()));
         let _ = std::fs::remove_file(staging);
+        // On a lost publish race the link stays too, for the same reason.
         published?;
+        if matches!(format, DiskFormat::Qcow2) {
+            std::fs::write(seed_digest_marker(&dir), digest)
+                .map_err(|e| Error::config("image seed", e.to_string()))?;
+        }
         if matches!(format, DiskFormat::Raw) {
             // A raw disk without its format marker counts as blank, and the
             // launcher would copy the empty template over the clone.
@@ -660,6 +680,54 @@ mod imp {
                 Err(_) => return Ok(false),
             },
         };
+        if backing.is_relative() {
+            // A machine-local chain. The digest marker says what it was
+            // authorized as. A chain the migration pinned has no marker, so
+            // fall back to comparing the link against the seed the newly
+            // authorized digest names: a hard link shares its inode, and a
+            // match backfills the marker for the day that seed is evicted.
+            let authorized = (|| -> Result<bool> {
+                let link = dir.join(&backing);
+                if !link.is_file() {
+                    return Ok(false);
+                }
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| Error::config("image seed", e.to_string()))?;
+                let digest =
+                    rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?;
+                if let Ok(recorded) = std::fs::read_to_string(seed_digest_marker(&dir)) {
+                    return Ok(recorded.trim() == digest);
+                }
+                let template = storage_template();
+                let key_dir = seed_root().join(seed_key(image, &digest, template.as_deref())?);
+                let same = seed_disk(&key_dir).is_some_and(|(seed, _)| {
+                    match (std::fs::metadata(&seed), std::fs::metadata(&link)) {
+                        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                        _ => false,
+                    }
+                });
+                if same {
+                    let _ = std::fs::write(seed_digest_marker(&dir), &digest);
+                }
+                Ok(same)
+            })();
+            return match authorized {
+                Ok(true) => Ok(true),
+                result => {
+                    // Only a fresh machine's storage overlay is passed here.
+                    // Do not leave unauthorized or stale image contents around.
+                    std::fs::remove_file(&storage)
+                        .map_err(|e| Error::config("image seed", e.to_string()))?;
+                    let _ = std::fs::remove_file(dir.join(&backing));
+                    let _ = std::fs::remove_file(seed_digest_marker(&dir));
+                    let _ = std::fs::remove_file(source_marker(&base));
+                    result?;
+                    Ok(false)
+                }
+            };
+        }
         let root = seed_root();
         let Some(key_dir) = backing.parent() else {
             return Ok(false);
@@ -769,7 +837,9 @@ mod imp {
             let seed = key_dir.join(seed_file(format));
             let staging =
                 seed.with_extension(format!("{}.{}", format.extension(), std::process::id()));
-            std::fs::rename(&disk, &staging)
+            // The builder's disk is under the machine root and the seed under
+            // the cache, which may be another volume.
+            crate::disk_utils::rename_or_move(&disk, &staging)
                 .map_err(|e| Error::config("image seed", e.to_string()))?;
             staged = Some((staging, seed));
             Ok(())
@@ -886,17 +956,42 @@ mod imp {
     }
 
     /// Where a raw clone records the seed it came from.
+    /// Machine-local hard link of the seed a storage overlay backs onto.
+    fn seed_base_name(key: &str) -> String {
+        format!("storage.base.{}.qcow2", &key[..key.len().min(8)])
+    }
+
+    /// Marker recording the digest a machine-local seed chain was authorized
+    /// for when it was attached. Read by [`revalidate_seed`], which can no
+    /// longer compare against the evictable cache seed.
+    fn seed_digest_marker(dir: &Path) -> PathBuf {
+        dir.join("storage.seed-digest")
+    }
+
     fn source_marker(storage: &Path) -> PathBuf {
         storage.with_extension("seed")
     }
 
     /// Make `staging` a new machine's storage on `seed`: a qcow2 overlay on a
     /// template-overlay seed, a copy-on-write clone of a raw one.
-    fn attach(staging: &Path, seed: &Path, format: DiskFormat) -> Result<()> {
+    fn attach(staging: &Path, seed: &Path, format: DiskFormat, key: &str) -> Result<()> {
         if matches!(format, DiskFormat::Qcow2) {
+            // Hard link the seed beside the overlay and back onto the link by
+            // a relative name. The chain then survives a cache purge, seed
+            // eviction, and the machine directory moving. The key suffix keeps
+            // concurrent starts racing a moved tag on their own links. A copy
+            // stands in when the cache sits on another filesystem.
+            let dir = staging
+                .parent()
+                .ok_or_else(|| Error::config("image seed", "staging path has no parent"))?;
+            let base_name = seed_base_name(key);
+            let link = dir.join(&base_name);
+            if !link.exists() && std::fs::hard_link(seed, &link).is_err() {
+                crate::disk_utils::clone_or_copy_file(seed, &link)?;
+            }
             return crate::agent::create_disk_overlays(&[(
                 staging.to_path_buf(),
-                seed.to_path_buf(),
+                PathBuf::from(base_name),
                 DiskFormat::Qcow2,
             )]);
         }
@@ -939,8 +1034,9 @@ mod imp {
         }
     }
 
-    /// An APFS clone. Never a full copy: that would write the whole 20 GiB disk,
-    /// far slower than the pull it replaces.
+    /// An APFS clone, or across volumes (a cache on another disk) a copy of
+    /// only the seed's data extents. Never a full copy: that would write the
+    /// whole 20 GiB disk, far slower than the pull it replaces.
     #[cfg(target_os = "macos")]
     fn clone_raw(seed: &Path, staging: &Path) -> Result<()> {
         use std::os::unix::ffi::OsStrExt;
@@ -949,13 +1045,16 @@ mod imp {
                 .map_err(|e| Error::config("image seed", e.to_string()))
         };
         let (src, dst) = (path(seed)?, path(staging)?);
-        if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
-            return Err(Error::config(
-                "image seed",
-                format!("clone seed: {}", std::io::Error::last_os_error()),
-            ));
+        if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } == 0 {
+            return Ok(());
         }
-        Ok(())
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EXDEV) {
+            return crate::disk_utils::sparse_copy_file(seed, staging)
+                .map(|_| ())
+                .map_err(|e| Error::config("image seed", e.to_string()));
+        }
+        Err(Error::config("image seed", format!("clone seed: {error}")))
     }
 
     /// A reflink where the filesystem has one, else a copy of only the seed's
@@ -967,10 +1066,7 @@ mod imp {
 
     /// `~/.cache/smolvm/image-seeds`.
     pub fn seed_root() -> PathBuf {
-        crate::agent::vm_cache_root()
-            .parent()
-            .map(|root| root.join("image-seeds"))
-            .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-image-seeds"))
+        crate::agent::cache_root().join("image-seeds")
     }
 
     fn max_bytes() -> u64 {
@@ -1002,14 +1098,20 @@ mod imp {
         if total <= max_bytes {
             return;
         }
-        let Ok(referenced) = backing_references(
-            &crate::agent::vm_cache_root()
-                .parent()
-                .map_or_else(crate::agent::vm_cache_root, Path::to_path_buf),
-        ) else {
+        // Machines live in the data root now, but any not yet migrated (they
+        // were running at migration time) still sit in the legacy cache root,
+        // so both are scanned.
+        let Ok(mut referenced) = backing_references(&crate::agent::vm_cache_root()) else {
             // An incomplete scan cannot prove an old seed is unreferenced.
             return;
         };
+        let legacy = crate::agent::cache_root().join("vms");
+        if legacy.is_dir() {
+            match backing_references(&legacy) {
+                Ok(more) => referenced.extend(more),
+                Err(_) => return,
+            }
+        }
         seeds.sort_by_key(|(_, _, used)| *used);
         for (seed, bytes, _) in seeds {
             if total <= max_bytes {

@@ -869,14 +869,11 @@ pub struct RunCmd {
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
-/// Cache directory for baked init layers: a sibling of the per-VM cache
-/// (`<cache>/smolvm/init-layers`), derived from the same canonical root as
-/// [`smolvm::agent::vm_cache_root`] so it shares the install's cache location.
+/// Cache directory for baked init layers (`<cache>/smolvm/init-layers`).
+/// Rebuildable on demand, so it lives under the cache root, not beside the
+/// machine disks in the data dir.
 fn init_layer_cache_dir() -> PathBuf {
-    smolvm::agent::vm_cache_root()
-        .parent()
-        .map(|smolvm_root| smolvm_root.join("init-layers"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/smolvm-init-layers"))
+    smolvm::agent::cache_root().join("init-layers")
 }
 
 /// Max real bytes the init-layer cache may occupy before eviction; override via
