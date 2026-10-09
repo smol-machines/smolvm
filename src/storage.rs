@@ -34,6 +34,61 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The disk templates a machine created from a pack is seeded from.
+///
+/// Decided once here for both the `machine create --from` CLI and the serve
+/// API create paths, so a pack seeds identically through either. Owned so it
+/// can outlive the manifest it was read from (both paths move the manifest
+/// into the machine record before extraction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackDiskTemplates {
+    /// Relative path to the packed root overlay template.
+    pub overlay_template: Option<String>,
+    /// Relative path to the packed persistent storage template.
+    pub storage_template: Option<String>,
+    /// Logical byte length to restore for the root overlay.
+    pub overlay_logical_size: Option<u64>,
+    /// Logical byte length to restore for persistent storage.
+    pub storage_logical_size: Option<u64>,
+}
+
+impl PackDiskTemplates {
+    /// The templates to seed from, or `None` when the pack carries no captured
+    /// disks and the machine starts on fresh default ones (see
+    /// [`smolvm_pack::PackManifest::carries_disks`]). A plain image pack lands
+    /// here even though it ships a storage template: that one is empty.
+    pub fn from_manifest(manifest: &smolvm_pack::PackManifest) -> Option<Self> {
+        if !manifest.carries_disks() {
+            return None;
+        }
+        let assets = &manifest.assets;
+        Some(Self {
+            overlay_template: assets.overlay_template.as_ref().map(|t| t.path.clone()),
+            storage_template: assets.storage_template.as_ref().map(|t| t.path.clone()),
+            overlay_logical_size: assets.overlay_logical_size,
+            storage_logical_size: assets.storage_logical_size,
+        })
+    }
+
+    /// The seed spec for [`seed_vm_mode_disks`], with the request's sizes.
+    pub fn spec<'a>(
+        &'a self,
+        artifact_sha256: Option<&'a str>,
+        overlay_gb: Option<u64>,
+        storage_gb: Option<u64>,
+    ) -> VmModeDiskSeedSpec<'a> {
+        VmModeDiskSeedSpec {
+            artifact_sha256,
+            overlay_template: self.overlay_template.as_deref(),
+            storage_template: self.storage_template.as_deref(),
+            overlay_logical_size: self.overlay_logical_size,
+            storage_logical_size: self.storage_logical_size,
+            overlay_gb,
+            storage_gb,
+        }
+    }
+}
+
 /// Seed a VM-mode machine's overlay+storage disks from extracted pack templates so
 /// it boots the source VM's filesystem rather than a freshly-mkfs'd empty overlay.
 ///
@@ -103,13 +158,20 @@ pub fn seed_vm_mode_disks(
             seed,
             crate::agent::create_disk_overlays,
         )? {
+            if seed.storage_template.is_some() {
+                smolvm_pack::extract::mark_layers_preunpacked(cache_dir);
+            }
             return Ok(());
         }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = seed.artifact_sha256;
 
-    seed_vm_mode_disks_by_copy(disk_dir, cache_dir, seed)
+    seed_vm_mode_disks_by_copy(disk_dir, cache_dir, seed)?;
+    if seed.storage_template.is_some() {
+        smolvm_pack::extract::mark_layers_preunpacked(cache_dir);
+    }
+    Ok(())
 }
 
 /// Portable sparse-copy fallback for VM-mode disks.
@@ -887,6 +949,53 @@ pub fn expand_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn container_pack_manifest() -> smolvm_pack::PackManifest {
+        let mut manifest = smolvm_pack::PackManifest::new(
+            "alpine:latest".to_string(),
+            "sha256:abc".to_string(),
+            "linux/arm64".to_string(),
+            "linux/arm64".to_string(),
+        );
+        // `pack create` always ships the empty pre-formatted storage template.
+        manifest.assets.storage_template = Some(smolvm_pack::format::AssetEntry {
+            path: "storage.ext4".to_string(),
+            size: 100 * 1024,
+        });
+        manifest
+    }
+
+    /// A plain image pack's storage template is the empty one every pack
+    /// ships; seeding from it would replace the default disks with a 512 MiB
+    /// empty storage disk and an unformatted overlay.
+    #[test]
+    fn pack_disk_templates_skip_plain_container_pack() {
+        assert_eq!(
+            PackDiskTemplates::from_manifest(&container_pack_manifest()),
+            None
+        );
+    }
+
+    /// A baked image pack carries the machine's own disks, and the machine
+    /// must start from them.
+    #[test]
+    fn pack_disk_templates_seed_baked_container_pack() {
+        let mut manifest = container_pack_manifest();
+        manifest.assets.overlay_template = Some(smolvm_pack::format::AssetEntry {
+            path: "overlay.raw".to_string(),
+            size: 1024 * 1024,
+        });
+        manifest.assets.overlay_logical_size = Some(2 * BYTES_PER_GIB);
+        manifest.assets.storage_logical_size = Some(20 * BYTES_PER_GIB);
+
+        let templates = PackDiskTemplates::from_manifest(&manifest).expect("baked pack seeds");
+        assert_eq!(templates.overlay_template.as_deref(), Some("overlay.raw"));
+        assert_eq!(templates.storage_template.as_deref(), Some("storage.ext4"));
+        let spec = templates.spec(None, None, Some(30));
+        assert_eq!(spec.overlay_logical_size, Some(2 * BYTES_PER_GIB));
+        assert_eq!(spec.storage_logical_size, Some(20 * BYTES_PER_GIB));
+        assert_eq!(spec.storage_gb, Some(30));
+    }
 
     #[cfg(target_os = "linux")]
     const TEST_ARTIFACT_SHA256: &str =

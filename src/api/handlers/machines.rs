@@ -2269,20 +2269,15 @@ fn shutdown_machine_process(
     true
 }
 
-/// Disks to restore for a VM-mode (`--from-vm`) pack. Unlike an image pack (OCI
-/// layers), a VM-mode `.smolmachine` carries the source VM's overlay + storage
-/// DISKS — the actual rootfs (`/bin/sh`, files written before packing). They must
-/// be seeded onto the new machine's disks or it boots with only the bare
-/// agent-rootfs. `pack run` does this; the API create path must too.
+/// Disks to restore for a pack that carries them. Unlike a plain image pack
+/// (OCI layers), a VM-mode `.smolmachine` carries the source VM's overlay +
+/// storage DISKS — the actual rootfs (`/bin/sh`, files written before packing) —
+/// and an image pack made by a bake carries the disks the image is already
+/// unpacked on. They must be seeded onto the new machine's disks or it boots
+/// with only the bare agent-rootfs. `pack run` does this; the API create path
+/// must too.
 struct VmModeSeed {
-    overlay_template: Option<String>,
-    storage_template: Option<String>,
-    /// Original (pre-truncation) virtual size of the overlay disk. The packed
-    /// template has its trailing zero extent stripped, so the disk must be
-    /// ftruncated back to this before boot or it isn't a valid full filesystem.
-    overlay_logical_size: Option<u64>,
-    /// Original virtual size of the packed persistent storage disk.
-    storage_logical_size: Option<u64>,
+    templates: crate::storage::PackDiskTemplates,
     /// Requested disk sizes (GiB) from the create request, honored as a lower
     /// bound on the seeded disks (the guest grows the inherited fs with resize2fs).
     storage_gb: Option<u64>,
@@ -2616,25 +2611,16 @@ async fn create_machine_inner(
                 },
             )?;
         }
-        // VM-mode packs carry disks, not layers — capture the templates so the
-        // machine's overlay/storage disks can be seeded from them below.
-        let vm_seed = if checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm
-        {
-            Some(VmModeSeed {
-                overlay_template: manifest
-                    .assets
-                    .overlay_template
-                    .as_ref()
-                    .map(|t| t.path.clone()),
-                storage_template: manifest
-                    .assets
-                    .storage_template
-                    .as_ref()
-                    .map(|t| t.path.clone()),
-                overlay_logical_size: manifest.assets.overlay_logical_size,
-                storage_logical_size: manifest.assets.storage_logical_size,
-                storage_gb: req.storage_gb,
-                overlay_gb: req.overlay_gb,
+        // Packs that carry disks (VM mode, or an image pack made by a bake) —
+        // capture the templates so the machine's overlay/storage disks can be
+        // seeded from them below. Same decision as `machine create --from`.
+        let vm_seed = if checkpoint.is_none() {
+            crate::storage::PackDiskTemplates::from_manifest(&manifest).map(|templates| {
+                VmModeSeed {
+                    templates,
+                    storage_gb: req.storage_gb,
+                    overlay_gb: req.overlay_gb,
+                }
             })
         } else {
             None
@@ -2651,7 +2637,9 @@ async fn create_machine_inner(
             .and_then(|checkpoint| checkpoint.workload.as_ref())
         {
             Some(workload.image.clone())
-        } else if vm_seed.is_some() || checkpoint.is_some() {
+        } else if manifest.mode == smolvm_pack::format::PackMode::Vm || checkpoint.is_some() {
+            // Seeding disks from an image pack's captured disks must not turn
+            // the machine into a bare VM: it still runs its image.
             None
         } else {
             Some(manifest.image)
@@ -2936,15 +2924,8 @@ async fn create_machine_inner(
             crate::storage::seed_vm_mode_disks(
                 &disk_dir,
                 &pack_content_dir,
-                crate::storage::VmModeDiskSeedSpec {
-                    artifact_sha256: artifact_sha256.as_deref(),
-                    overlay_template: seed.overlay_template.as_deref(),
-                    storage_template: seed.storage_template.as_deref(),
-                    overlay_logical_size: seed.overlay_logical_size,
-                    storage_logical_size: seed.storage_logical_size,
-                    overlay_gb: seed.overlay_gb,
-                    storage_gb: seed.storage_gb,
-                },
+                seed.templates
+                    .spec(artifact_sha256.as_deref(), seed.overlay_gb, seed.storage_gb),
             )
             .map_err(|e| ApiError::internal(format!("seed VM-mode disks: {}", e)))
         })
