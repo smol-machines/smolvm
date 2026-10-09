@@ -3807,7 +3807,10 @@ pub async fn start_machine(
                     seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
                 }
                 Err(error) => {
-                    tracing::warn!(machine = %name_clone, %error, "pre-created image seed rejected; pulling in the guest");
+                    // The rejected disk is gone, so the machine can take a seed
+                    // of the image it boots now, such as its host-fetched archive.
+                    tracing::warn!(machine = %name_clone, %error, "pre-created image seed rejected");
+                    seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
                 }
             }
         }
