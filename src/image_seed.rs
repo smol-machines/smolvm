@@ -706,8 +706,14 @@ mod imp {
                 .enable_all()
                 .build()
                 .map_err(|e| Error::config("image seed", e.to_string()))?;
-            let digest =
-                rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?;
+            // A staged archive is named by its content hash; there is no
+            // registry to ask.
+            let digest = match crate::data::image_source::local_archive_hash(image) {
+                Some(hash) => hash.to_string(),
+                None => {
+                    rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?
+                }
+            };
             let key_dir = root.join(seed_key(image, &digest, template.as_deref())?);
             seed_disk(&key_dir)
                 .map(|(seed, _)| seed)
