@@ -794,6 +794,16 @@ impl EgressPolicy {
         }
     }
 
+    pub(crate) fn learned_hostname(&self, ip: IpAddr) -> Option<String> {
+        let list = self.inner.as_ref()?;
+        let learned = list.learned.lock().ok()?;
+        let entry = learned.get(&ip)?;
+        let name = entry.name.as_ref()?;
+        (entry.expires_at > Instant::now()
+            && smolvm_protocol::mediated_egress::hostname_hint_valid(name))
+        .then(|| name.clone())
+    }
+
     /// Convenience for IPv4 call sites.
     pub fn allows_v4(&self, ip: Ipv4Addr) -> bool {
         self.allows(IpAddr::V4(ip))
@@ -909,6 +919,44 @@ mod tests {
             .unwrap();
         assert!(!policy.allows(github));
         assert!(policy.allows(pypi));
+    }
+
+    #[test]
+    fn learned_hostname_names_the_answer_that_admitted_an_address() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        let unnamed = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 7));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        policy.learn_ip_records(&[(unnamed, 300)]);
+        assert_eq!(
+            policy.learned_hostname(github).as_deref(),
+            Some("api.github.com")
+        );
+        assert_eq!(policy.learned_hostname(unnamed), None);
+        assert_eq!(
+            policy.learned_hostname(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            None
+        );
+    }
+
+    #[test]
+    fn learned_hostname_skips_expired_and_unrestricted_policies() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        if let Some(list) = &policy.inner {
+            list.learned
+                .lock()
+                .unwrap()
+                .get_mut(&github)
+                .unwrap()
+                .expires_at = Instant::now();
+        }
+        assert_eq!(policy.learned_hostname(github), None);
+
+        let open = EgressPolicy::unrestricted();
+        open.learn(Some("api.github.com".into()), &[(github, 300)]);
+        assert_eq!(open.learned_hostname(github), None);
     }
 
     #[test]

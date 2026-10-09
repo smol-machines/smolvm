@@ -224,6 +224,7 @@ pub enum RelayTarget {
         destination: SocketAddr,
         direct_address: SocketAddr,
         direct_allowed: bool,
+        hostname: Option<String>,
         audit: EgressPolicy,
     },
 }
@@ -341,6 +342,7 @@ impl TcpRelayTable {
                             self.host_connect_addr(destination).ip(),
                             Some(destination.port()),
                         ),
+                        hostname: self.egress.learned_hostname(destination.ip()),
                         audit: self.egress.clone(),
                     };
                 }
@@ -367,6 +369,7 @@ impl TcpRelayTable {
                 direct_address: self.host_connect_addr(destination),
                 direct_allowed: self.egress.allows(self.host_connect_addr(destination).ip())
                     || self.is_host_service_destination(destination),
+                hostname: self.egress.learned_hostname(destination.ip()),
                 audit: self.egress.clone(),
             },
             _ => RelayTarget::Connect(self.host_connect_addr(destination)),
@@ -1033,6 +1036,7 @@ fn tcp_relay_loop(
             destination,
             direct_address,
             direct_allowed,
+            hostname,
             audit,
         } => {
             // The guest handshake is complete, but the origin has not been
@@ -1054,6 +1058,7 @@ fn tcp_relay_loop(
                     machine_id: binding.machine_id,
                     parent_id: binding.parent_id,
                     destination,
+                    hostname,
                     initial_bytes: first
                         .as_ref()
                         .map_or_else(Vec::new, |bytes| bytes[..first_len].to_vec()),
@@ -1710,6 +1715,40 @@ mod tests {
     }
 
     #[test]
+    fn mediated_target_carries_the_name_the_guest_resolved() {
+        let policy = EgressPolicy::new(None, Some(&["api.example.com".into()]));
+        let resolved = Ipv4Addr::new(93, 184, 215, 14);
+        let mut answer = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        for label in ["api", "example", "com"] {
+            answer.push(label.len() as u8);
+            answer.extend_from_slice(label.as_bytes());
+        }
+        answer.extend_from_slice(&[0, 0, 1, 0, 1, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
+        answer.extend_from_slice(&resolved.octets());
+        policy.learn_dns_answer(&answer);
+
+        let table = TcpRelayTable::new(None, policy, vec!["100.96.0.1".parse().unwrap()], None)
+            .with_intercept(Some(crate::StreamInterception::Mediated(
+                crate::MediatedBinding {
+                    endpoint: crate::InterceptEndpoint {
+                        addr: "127.0.0.1:43123".parse().unwrap(),
+                        token: [9; 32],
+                    },
+                    machine_id: [7; 16],
+                    parent_id: [0; 16],
+                },
+            )));
+        assert!(matches!(
+            table.outbound_target(SocketAddr::new(resolved.into(), 443)),
+            RelayTarget::Mediated { hostname: Some(name), .. } if name == "api.example.com"
+        ));
+        assert!(matches!(
+            table.outbound_target("93.184.215.15:443".parse().unwrap()),
+            RelayTarget::Mediated { hostname: None, .. }
+        ));
+    }
+
+    #[test]
     fn guest_fin_drops_to_proxy_channel() {
         let (to_proxy, from_smoltcp) = mpsc::sync_channel(1);
         let connection = test_connection(to_proxy);
@@ -1902,6 +1941,7 @@ mod tests {
                 assert_eq!(prelude.machine_id, binding.machine_id);
                 assert_eq!(prelude.parent_id, binding.parent_id);
                 assert_eq!(prelude.destination, destination);
+                assert_eq!(prelude.hostname.as_deref(), Some("one.one.one.one"));
                 assert_eq!(prelude.initial_bytes, b"hello");
                 // Nothing may have reached the origin while the broker is
                 // deciding, including a direct-allow candidate.
@@ -1938,6 +1978,7 @@ mod tests {
                     destination,
                     direct_address: origin_addr,
                     direct_allowed: true,
+                    hostname: Some("one.one.one.one".into()),
                     audit: EgressPolicy::unrestricted(),
                 },
                 guest_rx,
@@ -2012,6 +2053,7 @@ mod tests {
                         destination,
                         direct_address: destination,
                         direct_allowed: false,
+                        hostname: None,
                         audit: EgressPolicy::unrestricted(),
                     },
                     guest_rx,
