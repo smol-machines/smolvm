@@ -494,6 +494,9 @@ pub struct CreateVmParams {
     pub allowed_cidrs: Option<Vec<String>>,
     /// `--block-private` and its `--allow-private` exceptions.
     pub block_private: Option<Vec<String>>,
+    /// Ordered egress rules. `--deny-cidr` and `[network] deny_cidrs` become
+    /// `Deny` rules at the front, so a deny wins over any later allow.
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
     pub restart_max_backoff_secs: Option<u64>,
@@ -834,6 +837,7 @@ pub(crate) fn build_vm_record_for(
     record.cache_disk = params.cache_disk.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.block_private = params.block_private.clone();
+    record.egress_rules = params.egress_rules.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.dns_options = params.dns_options.clone();
@@ -2206,6 +2210,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.cache_disk = o.cache_disk.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
     r.block_private = o.block_private.clone();
+    r.egress_rules = o.egress_rules.clone();
     r.init = o.init.clone();
     r.init_completed = false;
     r.env = o.env.clone();
@@ -2291,6 +2296,7 @@ pub struct DefaultVmOverrides {
     pub allowed_cidrs: Option<Vec<String>>,
     /// `--block-private` and its `--allow-private` exceptions.
     pub block_private: Option<Vec<String>>,
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub secret_refs: BTreeMap<String, SecretRef>,
@@ -2308,6 +2314,33 @@ pub struct DefaultVmOverrides {
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,
     pub rosetta: bool,
+}
+
+/// One `Deny` egress rule per CIDR, in order.
+pub fn deny_cidr_rules(cidrs: &[String]) -> Vec<smolvm_protocol::EgressRule> {
+    cidrs
+        .iter()
+        .map(|cidr| smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some(cidr.clone()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        })
+        .collect()
+}
+
+impl CreateVmParams {
+    /// Put deny rules for `cidrs` ahead of every other rule, so a deny wins
+    /// over any allow. Denying implies networking, like allowing does.
+    pub fn prepend_deny_cidrs(&mut self, cidrs: &[String]) {
+        if cidrs.is_empty() {
+            return;
+        }
+        let mut rules = deny_cidr_rules(cidrs);
+        rules.append(&mut self.egress_rules);
+        self.egress_rules = rules;
+        self.net = true;
+    }
 }
 
 impl DefaultVmOverrides {
@@ -2346,6 +2379,7 @@ impl DefaultVmOverrides {
             cache_disk: params.cache_disk.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
             block_private: params.block_private.clone(),
+            egress_rules: params.egress_rules.clone(),
             init: params.init.clone(),
             env: smolvm::util::parse_env_list(&params.env),
             workdir: params.workdir.clone(),

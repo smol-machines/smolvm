@@ -182,6 +182,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-cidr` | | run, create, update | CIDR egress filter (implies --net) |
 | `--block-private` | | run, create | Block private and internal destinations, keep the public internet (implies --net) |
 | `--allow-private` | | run, create | Re-open one private CIDR under `--block-private` |
+| `--deny-cidr` | | run, create | Deny egress to a CIDR, checked before anything is allowed (implies --net) |
 | `--allow-host` | | run, create, update | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create, update | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create, pack run | Forward host SSH agent (git/ssh without exposing keys) |
@@ -226,6 +227,9 @@ metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
 registry. Metadata stays blocked either way. Both imply `--net` and use the
 virtio-net backend; the Smolfile form is `[network] block_private = true` and
 `allow_private = ["10.20.0.0/16"]`.
+`--deny-cidr CIDR` refuses a range even where an allow would admit it,
+including the host's loopback reached through the gateway. It implies `--net`;
+the Smolfile form is `[network] deny_cidrs`.
 Every rule, the Smolfile keys and `--guest-subnet`:
 `docs/throwaway-machine/README.md`.
 
