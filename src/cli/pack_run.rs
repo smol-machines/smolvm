@@ -537,19 +537,7 @@ impl PackRunCmd {
         let storage_gib = storage_gib_for_manifest(self.storage, &manifest);
 
         // Create storage disk (each invocation gets its own copy)
-        let template = manifest
-            .assets
-            .storage_template
-            .as_ref()
-            .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(
-            &cache_dir,
-            template,
-            &storage_path,
-            manifest.assets.storage_logical_size,
-            storage_gib,
-        )
-        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+        create_storage_disk(&manifest, &cache_dir, &storage_path, storage_gib)?;
 
         let overlay_runtime_path = setup_vm_overlay(
             &manifest,
@@ -958,6 +946,37 @@ fn resolve_sidecar_path(explicit: Option<&Path>) -> smolvm::Result<PathBuf> {
     ))
 }
 
+/// Create a run's storage disk from the pack's storage template.
+///
+/// When the pack carries captured disks that template is the baked machine's
+/// storage disk, which already holds the image unpacked, so the guest is told
+/// to use it rather than unpack the staged layers again. Every other pack's
+/// template is empty and gets no such marker.
+fn create_storage_disk(
+    manifest: &smolvm_pack::PackManifest,
+    cache_dir: &Path,
+    storage_path: &Path,
+    storage_gib: Option<u64>,
+) -> smolvm::Result<()> {
+    let template = manifest
+        .assets
+        .storage_template
+        .as_ref()
+        .map(|t| t.path.as_str());
+    extract::create_or_copy_storage_disk(
+        cache_dir,
+        template,
+        storage_path,
+        manifest.assets.storage_logical_size,
+        storage_gib,
+    )
+    .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+    if template.is_some() && manifest.carries_disks() {
+        extract::mark_layers_preunpacked(cache_dir);
+    }
+    Ok(())
+}
+
 /// Set up the overlay disk from the pack's template: VM-mode packs always
 /// carry one, and an image-based pack carries one when it was exported with
 /// its disks (the overlay then holds the machine's state exactly as baked).
@@ -973,7 +992,7 @@ fn setup_vm_overlay(
     dest: &Path,
     overlay_gb: Option<u64>,
 ) -> smolvm::Result<Option<PathBuf>> {
-    if manifest.mode == PackMode::Vm || manifest.assets.overlay_template.is_some() {
+    if manifest.carries_disks() {
         // VM mode: use the overlay template from the pack
         let overlay_template = manifest
             .assets
@@ -1776,19 +1795,7 @@ fn run_from_cache(
     let storage_gib = storage_gib_for_manifest(args.storage, manifest);
     let ssh_agent_socket = resolve_ssh_agent_socket(args.ssh_agent)?;
 
-    let template = manifest
-        .assets
-        .storage_template
-        .as_ref()
-        .map(|t| t.path.as_str());
-    extract::create_or_copy_storage_disk(
-        cache_dir,
-        template,
-        &storage_path,
-        manifest.assets.storage_logical_size,
-        storage_gib,
-    )
-    .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+    create_storage_disk(manifest, cache_dir, &storage_path, storage_gib)?;
 
     let overlay_runtime_path = setup_vm_overlay(
         manifest,
@@ -2215,19 +2222,7 @@ fn daemon_start(
     let storage_gib = storage_gib_for_manifest(args.storage, &manifest);
     let storage_path = daemon.join("storage.ext4");
     if !storage_path.exists() {
-        let template = manifest
-            .assets
-            .storage_template
-            .as_ref()
-            .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(
-            &cache_dir,
-            template,
-            &storage_path,
-            manifest.assets.storage_logical_size,
-            storage_gib,
-        )
-        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+        create_storage_disk(&manifest, &cache_dir, &storage_path, storage_gib)?;
     }
 
     // Create overlay disk (preserves existing disk on restart)

@@ -955,7 +955,10 @@ const GUEST_LAYERS_DIR: &str = "packed-layers";
 /// set's signature so a restart reuses the work and a changed pack redoes it.
 const GUEST_LAYERS_MARKER: &str = ".extracted";
 /// Left by the host beside the staged tars when the storage disk was seeded
-/// from the pack's captured disk (see `smolvm_pack::extract`).
+/// from the pack's captured disk (see `smolvm_pack::extract`). Only honored
+/// together with the image actually being in this disk's local store, which a
+/// bake leaves and an ordinary pack's empty disk never has; it never vouches
+/// for a staged unpack, which is always checked against its signature.
 const LAYERS_PREUNPACKED_MARKER: &str = ".preunpacked";
 
 /// Whether the packed layers for `image` are already on this storage disk in
@@ -1062,13 +1065,6 @@ where
         .unwrap_or("packed");
     let out = Path::new(STORAGE_ROOT).join(GUEST_LAYERS_DIR).join(key);
     let marker = out.join(GUEST_LAYERS_MARKER);
-    // The host seeded this storage disk from the pack's own captured disk,
-    // whose layers a guest unpacked at bake time; the staged tars describe the
-    // same filesystem, so there is nothing left to unpack.
-    if packed_dir.join(LAYERS_PREUNPACKED_MARKER).is_file() && marker.is_file() {
-        info!(layers = %out.display(), "using layers unpacked at bake time");
-        return Ok(Some(out));
-    }
     let signature = staged_tars_signature(&tars)?;
     if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
         return Ok(Some(out));

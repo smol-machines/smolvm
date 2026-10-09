@@ -4776,36 +4776,6 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
     Ok(Some(lib_dir))
 }
 
-/// Copy `src` to `dst` while preserving holes (sparseness), regardless of the
-/// platform or filesystem.
-///
-/// `std::fs::copy` is *not* reliably hole-preserving. On Linux it prefers
-/// `copy_file_range`/`sendfile`, but those fall back to a dense byte-for-byte
-/// copy when the source and destination live on different mounts or on a
-/// filesystem where the accelerated path isn't available — both common in CI
-/// containers and under overlayfs. When that happens, a multi-GiB sparse
-/// template (e.g. the 20 GiB `storage-template.ext4`, only ~25 MiB of which is
-/// real data) is rehydrated into its full logical size of literal zeros on
-/// disk, so two extractions can exhaust the runner and fail with ENOSPC.
-///
-/// This copy creates the destination as a sparse skeleton (`set_len` to the
-/// source's logical size) and then writes only the regions that hold real data,
-/// leaving every zero run as a hole. It mirrors the write-side
-/// `assets::sparse_copy_overlay`, so behavior is consistent on both ends and on
-/// APFS/ext4/xfs/NTFS alike.
-///
-/// The holes are located by asking the filesystem (`SEEK_DATA`/`SEEK_HOLE`)
-/// rather than by reading across them. Reading a hole costs no *disk* I/O — the
-/// kernel serves zero pages — but it still costs a syscall and a memory scan per
-/// chunk, and that is not free at scale: the 20 GiB `storage-template.ext4`
-/// holds ~9 MiB of real data, so a linear scan performed 40,960 read-and-compare
-/// iterations to find it and took ~11 s, which landed on the critical path of
-/// every packed `run`. Seeking straight between data extents reduces that to a
-/// handful of syscalls.
-///
-/// Used on both ends: the extract/run side here, and the pack-create side in
-/// `assets::create_storage_template` when it copies the pre-formatted
-/// `storage-template.ext4` into the staging directory.
 /// Copy a disk template as a copy-on-write clone where the filesystem can
 /// (APFS `clonefile`, Linux `FICLONE` on btrfs/xfs), so a multi-GiB template
 /// costs nothing per run; otherwise a hole-preserving copy. `dst` must not
@@ -4845,6 +4815,36 @@ pub(crate) fn clone_or_sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()
     sparse_copy(src, dst)
 }
 
+/// Copy `src` to `dst` while preserving holes (sparseness), regardless of the
+/// platform or filesystem.
+///
+/// `std::fs::copy` is *not* reliably hole-preserving. On Linux it prefers
+/// `copy_file_range`/`sendfile`, but those fall back to a dense byte-for-byte
+/// copy when the source and destination live on different mounts or on a
+/// filesystem where the accelerated path isn't available — both common in CI
+/// containers and under overlayfs. When that happens, a multi-GiB sparse
+/// template (e.g. the 20 GiB `storage-template.ext4`, only ~25 MiB of which is
+/// real data) is rehydrated into its full logical size of literal zeros on
+/// disk, so two extractions can exhaust the runner and fail with ENOSPC.
+///
+/// This copy creates the destination as a sparse skeleton (`set_len` to the
+/// source's logical size) and then writes only the regions that hold real data,
+/// leaving every zero run as a hole. It mirrors the write-side
+/// `assets::sparse_copy_overlay`, so behavior is consistent on both ends and on
+/// APFS/ext4/xfs/NTFS alike.
+///
+/// The holes are located by asking the filesystem (`SEEK_DATA`/`SEEK_HOLE`)
+/// rather than by reading across them. Reading a hole costs no *disk* I/O — the
+/// kernel serves zero pages — but it still costs a syscall and a memory scan per
+/// chunk, and that is not free at scale: the 20 GiB `storage-template.ext4`
+/// holds ~9 MiB of real data, so a linear scan performed 40,960 read-and-compare
+/// iterations to find it and took ~11 s, which landed on the critical path of
+/// every packed `run`. Seeking straight between data extents reduces that to a
+/// handful of syscalls.
+///
+/// Used on both ends: the extract/run side here, and the pack-create side in
+/// `assets::create_storage_template` when it copies the pre-formatted
+/// `storage-template.ext4` into the staging directory.
 pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mut src_file = File::open(src)?;
     let size = src_file.metadata()?.len();
@@ -5036,13 +5036,18 @@ pub fn copy_overlay_template(
 }
 
 /// Marker the host leaves beside the staged layer tars once a storage disk was
-/// seeded from the pack's own captured disk. That disk already holds these
-/// layers unpacked (by a guest, as root, at bake time), so the guest may use
-/// them without unpacking the tars again. The guest still requires its own
-/// unpack marker on the disk, so a disk that was not seeded is unaffected.
+/// seeded from the pack's own captured disk. That disk already holds the image
+/// in its local store (pulled and unpacked by a guest, as root, at bake time),
+/// so the guest may use it without unpacking the tars again. The guest still
+/// checks that the image really is on the disk, so a stale marker only costs
+/// that lookup.
 pub const LAYERS_PREUNPACKED_MARKER: &str = ".preunpacked";
 
 /// Leave [`LAYERS_PREUNPACKED_MARKER`] beside the staged layer tars in `cache_dir`.
+///
+/// Only for a storage disk seeded from a pack that carries captured disks
+/// ([`crate::format::PackManifest::carries_disks`]); the empty template every
+/// other pack ships has nothing unpacked on it.
 pub fn mark_layers_preunpacked(cache_dir: &Path) {
     let layers = cache_dir.join("layers");
     if layers.is_dir() {
@@ -5094,7 +5099,6 @@ pub fn create_or_copy_storage_disk(
                 mark_file_sparse(&file)?;
                 file.set_len(desired)?;
             }
-            mark_layers_preunpacked(cache_dir);
             return Ok(());
         }
     }
@@ -7445,32 +7449,19 @@ mod tests {
         );
     }
 
-    /// Seeding the storage disk from the pack's captured disk leaves the
-    /// marker beside the staged layers, so the guest knows the layers on that
-    /// disk are already unpacked; an empty disk (no template) leaves none.
+    /// Copying a storage template never claims unpacked layers on its own:
+    /// every container pack ships an empty template, so only a caller that
+    /// knows the pack carries captured disks may leave the marker.
     #[test]
-    fn test_create_or_copy_storage_disk_marks_layers_preunpacked() {
+    fn test_create_or_copy_storage_disk_leaves_no_preunpacked_marker() {
         let cache_dir = tempfile::tempdir().unwrap();
         fs::create_dir(cache_dir.path().join("layers")).unwrap();
         let template = cache_dir.path().join("storage-template.ext4");
-        fs::write(&template, b"captured disk stand-in").unwrap();
+        fs::write(&template, b"empty template stand-in").unwrap();
         let marker = cache_dir
             .path()
             .join("layers")
             .join(LAYERS_PREUNPACKED_MARKER);
-
-        create_or_copy_storage_disk(
-            cache_dir.path(),
-            None,
-            &cache_dir.path().join("fresh.ext4"),
-            Some(1024 * 1024),
-            None,
-        )
-        .unwrap();
-        assert!(
-            !marker.exists(),
-            "an empty disk must not claim unpacked layers"
-        );
 
         create_or_copy_storage_disk(
             cache_dir.path(),
@@ -7480,6 +7471,12 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(
+            !marker.exists(),
+            "an uncaptured template must not claim unpacked layers"
+        );
+
+        mark_layers_preunpacked(cache_dir.path());
         assert!(marker.is_file());
     }
 

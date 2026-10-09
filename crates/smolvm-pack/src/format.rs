@@ -826,8 +826,10 @@ pub struct AssetInventory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_logical_size: Option<u64>,
 
-    /// Overlay disk template (optional, VM mode only).
-    /// Contains the VM's persistent rootfs state from a `--from-vm` pack.
+    /// Overlay disk template: always present in a VM-mode pack, and in an
+    /// image-based pack only when it was exported with its disks
+    /// (`--include-disks`, which a cached image bake uses). Contains the
+    /// machine's rootfs overlay state from a `--from-vm` pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_template: Option<AssetEntry>,
 
@@ -913,6 +915,17 @@ impl PackManifest {
             },
             checkpoint: None,
         }
+    }
+
+    /// Whether a machine made from this pack must be seeded from the pack's
+    /// captured disks rather than starting on fresh ones.
+    ///
+    /// A VM-mode pack's disks are its rootfs. An image-based pack carries them
+    /// only when exported with its disks, and the overlay template is what
+    /// marks that: `storage_template` cannot, because every pack ships an empty
+    /// pre-formatted one.
+    pub fn carries_disks(&self) -> bool {
+        self.mode == PackMode::Vm || self.assets.overlay_template.is_some()
     }
 
     /// Serialize manifest to JSON.
@@ -1077,6 +1090,33 @@ mod tests {
     #[test]
     fn test_pack_mode_default_is_container() {
         assert_eq!(PackMode::default(), PackMode::Container);
+    }
+
+    #[test]
+    fn test_carries_disks_only_for_captured_disks() {
+        let mut manifest = PackManifest::new(
+            "alpine:latest".to_string(),
+            "sha256:abc".to_string(),
+            "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
+        );
+        // Every container pack ships the empty pre-formatted storage template.
+        manifest.assets.storage_template = Some(AssetEntry {
+            path: "storage.ext4".to_string(),
+            size: 100 * 1024,
+        });
+        assert!(!manifest.carries_disks());
+
+        // A baked pack also carries the machine's overlay.
+        manifest.assets.overlay_template = Some(AssetEntry {
+            path: "overlay.raw".to_string(),
+            size: 1024 * 1024,
+        });
+        assert!(manifest.carries_disks());
+
+        manifest.assets.overlay_template = None;
+        manifest.mode = PackMode::Vm;
+        assert!(manifest.carries_disks());
     }
 
     #[test]

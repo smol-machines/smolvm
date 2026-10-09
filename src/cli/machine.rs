@@ -4484,37 +4484,14 @@ impl CreateCmd {
         smolvm::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
 
         // A VM-mode pack (`--from-vm`) carries the source VM's overlay+storage
-        // DISKS (the real rootfs), not OCI layers. Capture the templates before
-        // `manifest` is moved into `params`; the disks are seeded from them after
-        // extraction below, or the machine boots the bare agent-rootfs with no
-        // /bin/sh (mirrors pack_run + the serve API create path).
-        struct VmModeSeed {
-            overlay_template: Option<String>,
-            storage_template: Option<String>,
-            overlay_logical_size: Option<u64>,
-            storage_logical_size: Option<u64>,
-        }
-        // VM-mode packs always carry disk templates; an image-based pack may
-        // carry them too (a bake keeps its unpacked disks), and seeding from
-        // them is what lets the machine start without unpacking the layers.
-        let carries_disks = manifest.assets.storage_template.is_some();
-        let vm_seed = if checkpoint.is_none()
-            && (manifest.mode == smolvm_pack::format::PackMode::Vm || carries_disks)
-        {
-            Some(VmModeSeed {
-                overlay_template: manifest
-                    .assets
-                    .overlay_template
-                    .as_ref()
-                    .map(|t| t.path.clone()),
-                storage_template: manifest
-                    .assets
-                    .storage_template
-                    .as_ref()
-                    .map(|t| t.path.clone()),
-                overlay_logical_size: manifest.assets.overlay_logical_size,
-                storage_logical_size: manifest.assets.storage_logical_size,
-            })
+        // DISKS (the real rootfs), not OCI layers, and an image pack made by a
+        // bake carries the disks it already unpacked the image onto. Capture the
+        // templates before `manifest` is moved into `params`; the disks are seeded
+        // from them after extraction below, or the machine boots the bare
+        // agent-rootfs with no /bin/sh (mirrors pack_run + the serve API create
+        // path, which share this decision).
+        let vm_seed = if checkpoint.is_none() {
+            smolvm::storage::PackDiskTemplates::from_manifest(&manifest)
         } else {
             None
         };
@@ -4904,15 +4881,11 @@ impl CreateCmd {
                 smolvm::storage::seed_vm_mode_disks(
                     &disk_dir,
                     &pack_content_dir,
-                    smolvm::storage::VmModeDiskSeedSpec {
-                        artifact_sha256: artifact_sha256.as_deref(),
-                        overlay_template: seed.overlay_template.as_deref(),
-                        storage_template: seed.storage_template.as_deref(),
-                        overlay_logical_size: seed.overlay_logical_size,
-                        storage_logical_size: seed.storage_logical_size,
-                        overlay_gb: params.overlay_gb,
-                        storage_gb: params.storage_gb,
-                    },
+                    seed.spec(
+                        artifact_sha256.as_deref(),
+                        params.overlay_gb,
+                        params.storage_gb,
+                    ),
                 )
                 .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
             }
