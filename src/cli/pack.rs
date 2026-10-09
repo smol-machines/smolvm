@@ -506,6 +506,81 @@ pub struct PackCreateCmd {
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
+/// The lock file a pack holds inside its staging directory while it runs.
+const STAGING_LOCK: &str = ".in-use";
+
+/// A pack's staging directory, held for as long as the pack runs. The lock is
+/// declared first so it is released before the directory is removed.
+struct Staging {
+    _lock: std::fs::File,
+    dir: tempfile::TempDir,
+}
+
+/// Create this pack's staging directory under `root`, first removing any left
+/// by a pack that died without cleaning up (killed mid-run, the host restarted).
+/// Nothing else removes those, and each is as large as the image it packed.
+fn create_staging(root: &std::path::Path) -> smolvm::Result<Staging> {
+    sweep_abandoned_staging(
+        root,
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(24 * 60 * 60),
+    );
+    let dir = tempfile::Builder::new()
+        .prefix("pack-staging-")
+        .tempdir_in(root)
+        .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
+    let lock = std::fs::File::create(dir.path().join(STAGING_LOCK))
+        .and_then(|lock| lock.lock().map(|()| lock))
+        .map_err(|e| Error::agent("lock staging directory", e.to_string()))?;
+    Ok(Staging { _lock: lock, dir })
+}
+
+/// Remove the staging directories under `root` that no running pack holds.
+///
+/// A directory belongs to a pack only while that pack holds its lock. One newer
+/// than `settle` is left alone (its pack may not have locked it yet), and one
+/// from before staging carried a lock is removed only once older than `legacy`.
+fn sweep_abandoned_staging(
+    root: &std::path::Path,
+    settle: std::time::Duration,
+    legacy: std::time::Duration,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_staging = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("pack-staging-")
+            && entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !is_staging {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .unwrap_or_default();
+        let path = entry.path();
+        let abandoned = match std::fs::File::open(path.join(STAGING_LOCK)) {
+            Ok(lock) => age >= settle && lock.try_lock().is_ok(),
+            Err(_) => age >= legacy,
+        };
+        if abandoned {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    info!(path = %path.display(), "removed an abandoned pack staging directory")
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "could not remove an abandoned pack staging directory")
+                }
+            }
+        }
+    }
+}
+
 impl PackCreateCmd {
     /// Storage disk size (GiB) for the temporary pack VM.
     ///
@@ -653,10 +728,8 @@ impl PackCreateCmd {
         info!(image = %image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
-        let temp_dir = tempfile::Builder::new()
-            .prefix("pack-staging-")
-            .tempdir_in(self.staging_root()?)
-            .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
+        let staging = create_staging(&self.staging_root()?)?;
+        let temp_dir = &staging.dir;
         let staging_dir = temp_dir.path().join("staging");
 
         // Start a temporary agent VM with a unique identity so concurrent
@@ -991,10 +1064,8 @@ impl PackCreateCmd {
         println!("Packing VM '{}' snapshot...", vm_name);
 
         // 2. Create temporary staging directory
-        let temp_dir = tempfile::Builder::new()
-            .prefix("pack-staging-")
-            .tempdir_in(self.staging_root()?)
-            .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
+        let staging = create_staging(&self.staging_root()?)?;
+        let temp_dir = &staging.dir;
         let staging_dir = temp_dir.path().join("staging");
 
         let mut collector = AssetCollector::new(staging_dir.clone())
@@ -2244,5 +2315,46 @@ mod tests {
             err_msg.contains("pack create --from-vm"),
             "Expected recommendation to use pack create --from-vm, got: {err_msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // A pack killed mid-run leaves its staging directory behind; the next pack
+    // removes it, but never one a running pack still holds, nor anything else.
+    #[test]
+    fn only_abandoned_staging_directories_are_swept() {
+        let root = tempfile::tempdir().unwrap();
+        let held = create_staging(root.path()).unwrap();
+        let abandoned = root.path().join("pack-staging-abandoned");
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::File::create(abandoned.join(STAGING_LOCK)).unwrap();
+        let legacy = root.path().join("pack-staging-legacy");
+        std::fs::create_dir(&legacy).unwrap();
+        let unrelated = root.path().join("vms");
+        std::fs::create_dir(&unrelated).unwrap();
+
+        sweep_abandoned_staging(root.path(), Duration::ZERO, Duration::from_secs(3600));
+
+        assert!(
+            held.dir.path().exists(),
+            "a running pack keeps its directory"
+        );
+        assert!(!abandoned.exists(), "an unheld directory is removed");
+        assert!(
+            legacy.exists(),
+            "a recent directory without a lock is left alone"
+        );
+        assert!(unrelated.exists(), "only staging directories are touched");
+
+        sweep_abandoned_staging(root.path(), Duration::ZERO, Duration::ZERO);
+        assert!(
+            !legacy.exists(),
+            "an old directory without a lock is removed"
+        );
+        assert!(held.dir.path().exists());
     }
 }
