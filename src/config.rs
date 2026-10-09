@@ -1363,6 +1363,40 @@ impl VmRecord {
         Ok(Some(next))
     }
 
+    /// Refuse an egress change a running machine can't take: `next` is this
+    /// record after the change. The machine's network runtime enforces an allow
+    /// list it already has and follows changes to it, so the change must keep
+    /// one and keep the backend; lifting it or adding one where there was none
+    /// needs a restart.
+    pub fn check_live_egress(&self, next: &VmRecord) -> Result<()> {
+        use crate::network::launch::EffectiveNetworkBackend;
+        let restricted = |r: &VmRecord| r.allowed_cidrs.is_some() || r.dns_filter_hosts.is_some();
+        let now = self.launch_network_plan();
+        if !(now.outbound && now.backend == EffectiveNetworkBackend::VirtioNet && restricted(self))
+        {
+            return Err(crate::Error::config(
+                "egress policy",
+                format!(
+                    "machine '{}' is running without an allow list, so its egress can only \
+                     change while it is stopped",
+                    self.name
+                ),
+            ));
+        }
+        let after = next.launch_network_plan();
+        if !restricted(next) || after.backend != now.backend || !after.outbound {
+            return Err(crate::Error::config(
+                "egress policy",
+                format!(
+                    "this change lifts machine '{}''s allow list, which needs a restart; stop \
+                     the machine first",
+                    self.name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// The network this machine launches with. A credential policy steers the
     /// default backend to virtio-net, so anything that records or checks the
     /// backend (validation, checkpoint capture) must plan it the same way the
@@ -1467,6 +1501,56 @@ mod tests {
             .unwrap();
         assert!(opened.allowed_cidrs.is_none());
         assert!(opened.network);
+    }
+
+    #[test]
+    fn a_running_machine_takes_allow_list_changes_that_keep_an_allow_list() {
+        let mut record = VmRecord::new("e".to_string(), 1, 512, vec![], vec![], true);
+        record.dns_filter_hosts = Some(vec!["api.github.com".to_string()]);
+
+        let grant = record
+            .updated_egress(&EgressUpdate {
+                allow_hosts: vec!["pypi.org".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        record.check_live_egress(&grant).unwrap();
+
+        let revoke = grant
+            .updated_egress(&EgressUpdate {
+                remove_allow_hosts: vec!["api.github.com".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        grant.check_live_egress(&revoke).unwrap();
+
+        // Lifting the allow list needs a restart.
+        let opened = revoke
+            .updated_egress(&EgressUpdate {
+                remove_allow_hosts: vec!["pypi.org".to_string()],
+                allow_all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let err = revoke.check_live_egress(&opened).unwrap_err().to_string();
+        assert!(err.contains("restart"), "{err}");
+    }
+
+    #[test]
+    fn a_machine_running_without_an_allow_list_cannot_gain_one_live() {
+        let open = VmRecord::new("e".to_string(), 1, 512, vec![], vec![], true);
+        let restricted = open
+            .updated_egress(&EgressUpdate {
+                allow_hosts: vec!["pypi.org".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let err = open.check_live_egress(&restricted).unwrap_err().to_string();
+        assert!(err.contains("without an allow list"), "{err}");
     }
 
     // `create` used to accept this and every `start` died with a raw Go DNS

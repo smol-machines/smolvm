@@ -6247,7 +6247,9 @@ fn publish_flattened(
     ))
 }
 
-/// Amend a stopped machine's egress allow list.
+/// Amend a machine's egress allow list. A stopped machine takes any change; a
+/// running one takes changes that keep an allow list in force, effective for
+/// its next connection or lookup.
 #[utoipa::path(
     post,
     path = "/api/v1/machines/{name}/egress",
@@ -6260,7 +6262,7 @@ fn publish_flattened(
         (status = 200, description = "Egress updated", body = MachineInfo),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "Machine must be stopped", body = ApiErrorResponse),
+        (status = 409, description = "Change needs the machine stopped", body = ApiErrorResponse),
         (status = 500, description = "Update failed", body = ApiErrorResponse)
     )
 )]
@@ -6280,15 +6282,16 @@ pub async fn update_machine_egress(
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     let actual_state = record.actual_state();
-    match actual_state {
-        RecordState::Stopped | RecordState::Created => {}
+    let running = match actual_state {
+        RecordState::Stopped | RecordState::Created => false,
+        RecordState::Running => true,
         _ => {
             return Err(ApiError::Conflict(format!(
-                "machine '{}' must be stopped before its egress changes. Current state: {:?}",
+                "machine '{}' must be stopped or running before its egress changes. Current state: {:?}",
                 name, actual_state
             )));
         }
-    }
+    };
 
     // Normalize CIDRs with the CLI's parser, so a malformed entry is a 400
     // here instead of a silently narrower or wider policy later.
@@ -6317,18 +6320,39 @@ pub async fn update_machine_egress(
         })?
         .ok_or_else(|| ApiError::BadRequest("request contains no egress changes".into()))?;
 
-    let record = state
-        .update_vm(&name, move |r| {
-            r.network = next.network;
-            r.allowed_cidrs = next.allowed_cidrs.clone();
-            r.dns_filter_hosts = next.dns_filter_hosts.clone();
-        })
-        .await?
-        .ok_or_else(|| {
+    if running {
+        record
+            .check_live_egress(&next)
+            .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        crate::agent::write_live_egress_policy(&name, &next)?;
+    }
+    let updated = {
+        let next = next.clone();
+        state
+            .update_vm(&name, move |r| {
+                r.network = next.network;
+                r.allowed_cidrs = next.allowed_cidrs.clone();
+                r.dns_filter_hosts = next.dns_filter_hosts.clone();
+            })
+            .await
+    };
+    let updated = updated.and_then(|updated| {
+        updated.ok_or_else(|| {
             ApiError::NotFound(format!("machine '{}' disappeared during update", name))
-        })?;
+        })
+    });
+    let updated = match updated {
+        Ok(updated) => updated,
+        Err(error) => {
+            // The record keeps the old allow list, so the running machine must too.
+            if running {
+                let _ = crate::agent::write_live_egress_policy(&name, &record);
+            }
+            return Err(error);
+        }
+    };
 
-    Ok(Json(record_to_info(&name, &record)))
+    Ok(Json(record_to_info(&name, &updated)))
 }
 
 /// Where the export subprocess writes its executable stub. `pack create -o X` derives the

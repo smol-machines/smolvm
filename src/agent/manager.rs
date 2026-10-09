@@ -458,6 +458,34 @@ pub fn egress_denials_log_file(name: &str) -> PathBuf {
     vm_data_dir(name).join(smolvm_network::EGRESS_DENIALS_LOG)
 }
 
+/// Per-VM live egress policy: `<vm_data_dir>/egress-policy`, the whole allow
+/// list of a running machine, followed by its network runtime. Resolved from
+/// the name on both sides of the process boundary, like
+/// [`egress_denials_log_file`].
+pub fn live_egress_policy_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(smolvm_network::EGRESS_POLICY_FILE)
+}
+
+/// Point a running machine's network runtime at `record`'s allow list. The
+/// file is replaced in one rename, so the runtime never reads half of it.
+pub fn write_live_egress_policy(name: &str, record: &crate::config::VmRecord) -> Result<()> {
+    let path = live_egress_policy_file(name);
+    let contents = smolvm_network::egress::render_live_policy(
+        record.allowed_cidrs.as_deref().unwrap_or(&[]),
+        record.dns_filter_hosts.as_deref().unwrap_or(&[]),
+    );
+    let staging = path.with_extension("tmp");
+    std::fs::write(&staging, contents)
+        .and_then(|()| std::fs::rename(&staging, &path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&staging);
+            Error::config(
+                "egress policy",
+                format!("could not update machine '{name}''s running egress policy: {e}"),
+            )
+        })
+}
+
 /// One egress denial observed by the VMM: the policy refused a guest's
 /// connect or sendto toward `dest`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

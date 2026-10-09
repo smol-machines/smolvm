@@ -1372,6 +1372,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 if let Some(path) = denial_log {
                     egress = egress.with_denial_log(path);
                 }
+                if let Some(dir) = vsock_socket.parent() {
+                    egress = crate::network::launch::follow_live_egress_policy(
+                        egress,
+                        dir,
+                        network_plan.outbound,
+                    );
+                }
                 // The operator's watchlist copy, written by `serve
                 // --egress-watchlist` before boot; absent means none for this VM.
                 if let Some(dir) = vsock_socket.parent() {

@@ -312,6 +312,12 @@ impl StreamInterception {
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
 
+/// Filename of the per-VM live egress policy: the whole allow list, written by
+/// the host when a running machine's allow list changes and followed by the
+/// network runtime (see [`egress`]). The launcher removes it at boot, so a
+/// machine starts from the allow list its record holds.
+pub const EGRESS_POLICY_FILE: &str = "egress-policy";
+
 /// Filename of the per-VM egress signal log: watchlist matches, recorded beside
 /// the denial log by the launcher and read back by the host's
 /// `read_egress_signals`. Created on the first match only.

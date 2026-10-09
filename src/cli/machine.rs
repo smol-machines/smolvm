@@ -5755,16 +5755,19 @@ impl ResizeCmd {
 // Update Command
 // ============================================================================
 
-/// Modify settings on a stopped machine.
+/// Modify settings on a stopped machine, or the allow list of a running one.
 ///
 /// Changes are applied to the DB record and take effect on the next
-/// `machine start`. The machine must be stopped.
+/// `machine start`. The machine must be stopped, except to add or remove
+/// allowed hosts and CIDRs on a machine started with an allow list: those take
+/// effect on its next connection or DNS lookup.
 ///
 /// Examples:
 ///   smolvm machine update --name myvm -v ./src:/app -p 8080:8080
 ///   smolvm machine update --name myvm --cpus 4 --mem 4096
 ///   smolvm machine update --name myvm --remove-volume ./src:/app
 ///   smolvm machine update --name myvm --net -e DEBUG=1
+///   smolvm machine update --name myvm --allow-host pypi.org   # while running
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
@@ -5910,6 +5913,108 @@ impl UpdateCmd {
         })
     }
 
+    /// Whether this update changes the allow list and nothing else, the one
+    /// change a running machine takes.
+    fn changes_only_egress(&self) -> bool {
+        let Self {
+            name: _,
+            volume,
+            allow_system_mounts: _,
+            remove_volume,
+            port,
+            remove_port,
+            cpus,
+            mem,
+            net,
+            no_net,
+            no_egress_interceptor,
+            allow_host,
+            allow_host_pattern,
+            allow_cidr,
+            outbound_localhost_only,
+            remove_allow_host,
+            remove_allow_cidr,
+            env,
+            remove_env,
+            workdir,
+            gpu,
+            no_gpu,
+            rosetta,
+            no_rosetta,
+            storage,
+            overlay,
+            block_io,
+        } = self;
+        let egress = *net
+            || *outbound_localhost_only
+            || !allow_host.is_empty()
+            || !allow_host_pattern.is_empty()
+            || !allow_cidr.is_empty()
+            || !remove_allow_host.is_empty()
+            || !remove_allow_cidr.is_empty();
+        let other = !volume.is_empty()
+            || !remove_volume.is_empty()
+            || !port.is_empty()
+            || !remove_port.is_empty()
+            || cpus.is_some()
+            || mem.is_some()
+            || *no_net
+            || *no_egress_interceptor
+            || !env.is_empty()
+            || !remove_env.is_empty()
+            || workdir.is_some()
+            || *gpu
+            || *no_gpu
+            || *rosetta
+            || *no_rosetta
+            || storage.is_some()
+            || overlay.is_some()
+            || block_io.is_some();
+        egress && !other
+    }
+
+    /// Change a running machine's allow list: the record, and the policy its
+    /// network runtime follows from its next connection or lookup.
+    fn update_running_egress(
+        &self,
+        db: &smolvm::db::SmolvmDb,
+        record: &smolvm::config::VmRecord,
+    ) -> smolvm::Result<()> {
+        let next = self
+            .next_egress(record)?
+            .ok_or_else(|| smolvm::Error::config("update", "no egress changes given"))?;
+        record.check_live_egress(&next)?;
+        smolvm::agent::write_live_egress_policy(&self.name, &next)?;
+        let saved = db.update_vm(&self.name, |r| {
+            r.network = next.network;
+            r.allowed_cidrs = next.allowed_cidrs.clone();
+            r.dns_filter_hosts = next.dns_filter_hosts.clone();
+        });
+        if !matches!(saved, Ok(Some(_))) {
+            // The record keeps the old allow list, so the running machine must too.
+            let _ = smolvm::agent::write_live_egress_policy(&self.name, record);
+            saved?;
+            return Err(smolvm::Error::config(
+                "update",
+                format!("machine '{}' disappeared during update", self.name),
+            ));
+        }
+        println!("Updated machine '{}' (running; applies now):", self.name);
+        for cidr in next.allowed_cidrs.as_deref().unwrap_or(&[]) {
+            println!("  allow cidr: {cidr}");
+        }
+        for host in next.dns_filter_hosts.as_deref().unwrap_or(&[]) {
+            println!("  allow host: {host}");
+        }
+        if !self.remove_allow_host.is_empty() && next.allowed_cidrs.is_some() {
+            println!(
+                "Allowed CIDRs stay allowed, including addresses `machine create --allow-host` \
+                 resolved; remove them with --remove-allow-cidr."
+            );
+        }
+        Ok(())
+    }
+
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::config::RecordState;
         use smolvm::data::storage::HostMount;
@@ -5919,8 +6024,12 @@ impl UpdateCmd {
             smolvm::Error::config("update", format!("machine '{}' not found", self.name))
         })?;
 
-        // Must be stopped (same check as resize)
         let state = record.actual_state();
+        if state == RecordState::Running && self.changes_only_egress() {
+            return self.update_running_egress(&db, &record);
+        }
+
+        // Must be stopped (same check as resize)
         match state {
             RecordState::Stopped | RecordState::Created => {}
             _ => {

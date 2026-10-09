@@ -14,10 +14,17 @@
 //!
 //! Disallowed destinations are dropped before any host socket is created. DNS
 //! forwarding (gateway-internal) is never gated by this filter.
+//!
+//! A restricted policy can follow a live policy file
+//! ([`crate::EGRESS_POLICY_FILE`]) that the host rewrites while the machine
+//! runs. The file holds the whole allow list, so the newest file is the policy;
+//! without one the policy the machine booted with applies. No file can lift the
+//! policy: an empty one admits nothing.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::dns;
@@ -25,6 +32,18 @@ use crate::dns;
 /// Learned-IP TTL clamp, matching libkrun's DNS filter.
 const MIN_LEARNED_TTL: u64 = 60;
 const MAX_LEARNED_TTL: u64 = 3600;
+
+/// How often an admitted connection or lookup may re-read the live policy file,
+/// which bounds how long a revoked destination stays reachable.
+const LIVE_POLICY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often a refusal may re-read it. A grant only turns a refusal into an
+/// admission, so re-reading before refusing makes a grant apply to the very
+/// next attempt.
+const LIVE_POLICY_RECHECK_BEFORE_DENY: Duration = Duration::from_millis(10);
+
+/// The largest live policy file read, so a bad file can't exhaust memory.
+const MAX_LIVE_POLICY_BYTES: u64 = 1024 * 1024;
 
 /// A parsed CIDR (IPv4 or IPv6) with cheap containment testing.
 #[derive(Clone, Copy, Debug)]
@@ -85,12 +104,211 @@ impl Cidr {
     }
 }
 
-struct AllowList {
+/// The destinations an allow list admits.
+struct Rules {
     cidrs: Vec<Cidr>,
     /// Normalized allow-host names. `None` = no DNS hostname filtering.
     allowed_hosts: Option<Vec<String>>,
-    /// IPs learned from allowed DNS answers → expiry instant.
-    learned: Mutex<HashMap<IpAddr, Instant>>,
+}
+
+impl Rules {
+    fn build(allowed_cidrs: Option<&[String]>, allowed_hosts: Option<&[String]>) -> Self {
+        let cidrs = allowed_cidrs
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|spec| {
+                let parsed = Cidr::parse(spec);
+                if parsed.is_none() {
+                    tracing::warn!(cidr = %spec, "ignoring unparseable egress CIDR");
+                }
+                parsed
+            })
+            .collect();
+        let allowed_hosts = allowed_hosts.map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(|h| dns::normalize_hostname(h))
+                .collect()
+        });
+        Self {
+            cidrs,
+            allowed_hosts,
+        }
+    }
+
+    fn hostname_allowed(&self, hostname: &str) -> bool {
+        match &self.allowed_hosts {
+            None => true,
+            Some(hosts) => dns::hostname_allowed(hostname, hosts),
+        }
+    }
+}
+
+/// An IP learned from an allowed DNS answer.
+struct Learned {
+    expires_at: Instant,
+    /// The name whose answer admitted it, so revoking the name revokes it.
+    name: Option<String>,
+}
+
+struct AllowList {
+    rules: RwLock<Arc<Rules>>,
+    /// The rules the machine booted with, restored when the live file goes away.
+    boot: Arc<Rules>,
+    /// IPs learned from allowed DNS answers.
+    learned: Mutex<HashMap<IpAddr, Learned>>,
+    live: Option<LiveFile>,
+}
+
+/// The host's live policy file and what was last read from it.
+struct LiveFile {
+    path: PathBuf,
+    state: Mutex<LiveState>,
+}
+
+#[derive(Default)]
+struct LiveState {
+    checked: Option<Instant>,
+    contents: Option<Vec<u8>>,
+}
+
+impl AllowList {
+    /// The rules in force, after picking up a changed live policy file.
+    fn rules(&self) -> Arc<Rules> {
+        self.rules_checked(LIVE_POLICY_CHECK_INTERVAL)
+    }
+
+    /// Whether `admit` holds under the rules in force. A refusal re-reads a
+    /// changed live policy file first, so a grant applies at once.
+    fn admits(&self, admit: impl Fn(&Rules) -> bool) -> bool {
+        admit(&self.rules())
+            || (self.live.is_some() && admit(&self.rules_checked(LIVE_POLICY_RECHECK_BEFORE_DENY)))
+    }
+
+    fn rules_checked(&self, interval: Duration) -> Arc<Rules> {
+        self.refresh_live(interval);
+        self.rules
+            .read()
+            .map(|rules| Arc::clone(&rules))
+            .unwrap_or_else(|_| Arc::clone(&self.boot))
+    }
+
+    fn refresh_live(&self, interval: Duration) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        let Ok(mut state) = live.state.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        if state
+            .checked
+            .is_some_and(|at| now.duration_since(at) < interval)
+        {
+            return;
+        }
+        state.checked = Some(now);
+        let contents = match read_live_policy(&live.path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                tracing::warn!(path = %live.path.display(), %error, "egress policy file unreadable; keeping the current policy");
+                return;
+            }
+        };
+        if contents == state.contents {
+            return;
+        }
+        let next = match &contents {
+            None => Arc::clone(&self.boot),
+            Some(bytes) => match parse_live_policy(bytes) {
+                Ok(rules) => Arc::new(rules),
+                Err(error) => {
+                    tracing::warn!(path = %live.path.display(), %error, "egress policy file refused; keeping the current policy");
+                    state.contents = contents;
+                    return;
+                }
+            },
+        };
+        state.contents = contents;
+        if let Ok(mut learned) = self.learned.lock() {
+            learned.retain(|_, entry| {
+                entry
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| next.hostname_allowed(name))
+            });
+        }
+        if let Ok(mut rules) = self.rules.write() {
+            *rules = next;
+        }
+        tracing::info!(path = %live.path.display(), "egress policy updated");
+    }
+}
+
+/// The live policy file's bytes, or `None` when there is none.
+fn read_live_policy(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    match std::fs::File::open(path) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(MAX_LIVE_POLICY_BYTES).read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Render an allow list as a live policy file: one `cidr <range>` or
+/// `host <name-or-pattern>` per line, hosts as `machine create` stores them.
+pub fn render_live_policy(cidrs: &[String], hosts: &[String]) -> String {
+    let mut out = String::from("# smolvm egress policy: the whole allow list\n");
+    for cidr in cidrs {
+        out.push_str("cidr ");
+        out.push_str(cidr.trim());
+        out.push('\n');
+    }
+    for host in hosts {
+        out.push_str("host ");
+        out.push_str(host.trim());
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse a live policy file. An absent kind of entry means none of it, and a
+/// file with no entries at all admits nothing.
+fn parse_live_policy(bytes: &[u8]) -> Result<Rules, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
+    let mut cidrs = Vec::new();
+    let mut hosts = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_once(char::is_whitespace) {
+            Some(("cidr", value)) if Cidr::parse(value.trim()).is_some() => {
+                cidrs.push(value.trim().to_string())
+            }
+            Some(("host", value)) if !value.trim().is_empty() => {
+                hosts.push(value.trim().to_string())
+            }
+            _ => {
+                return Err(format!(
+                    "line {}: expected `cidr <range>` or `host <name>`",
+                    index + 1
+                ))
+            }
+        }
+    }
+    if cidrs.is_empty() && hosts.is_empty() {
+        return Ok(Rules::build(Some(&[]), Some(&[])));
+    }
+    Ok(Rules::build(
+        (!cidrs.is_empty()).then_some(cidrs.as_slice()),
+        (!hosts.is_empty()).then_some(hosts.as_slice()),
+    ))
 }
 
 /// How much of the platform hard-floor applies, chosen once per policy from the
@@ -295,34 +513,35 @@ impl EgressPolicy {
         if allowed_cidrs.is_none() && allowed_hosts.is_none() {
             return Self::unrestricted();
         }
-        let cidrs = allowed_cidrs
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|spec| {
-                let parsed = Cidr::parse(spec);
-                if parsed.is_none() {
-                    tracing::warn!(cidr = %spec, "ignoring unparseable egress CIDR");
-                }
-                parsed
-            })
-            .collect();
-        let allowed_hosts = allowed_hosts.map(|hosts| {
-            hosts
-                .iter()
-                .filter_map(|h| dns::normalize_hostname(h))
-                .collect()
-        });
+        let boot = Arc::new(Rules::build(allowed_cidrs, allowed_hosts));
         Self {
             inner: Some(Arc::new(AllowList {
-                cidrs,
-                allowed_hosts,
+                rules: RwLock::new(Arc::clone(&boot)),
+                boot,
                 learned: Mutex::new(HashMap::new()),
+                live: None,
             })),
             floor: floor_mode(),
             denial_log: None,
             watchlist: None,
             signal_log: None,
         }
+    }
+
+    /// Follow the host's live policy file at `path` (see the module docs). Only
+    /// a restricted policy follows one, and only before it is shared.
+    pub fn with_live_policy(mut self, path: PathBuf) -> Self {
+        match self.inner.as_mut().map(Arc::get_mut) {
+            Some(Some(list)) => {
+                list.live = Some(LiveFile {
+                    path,
+                    state: Mutex::new(LiveState::default()),
+                })
+            }
+            Some(None) => tracing::warn!("egress policy already shared; live policy file ignored"),
+            None => {}
+        }
+        self
     }
 
     /// Convenience for the CIDR-only case.
@@ -422,7 +641,7 @@ impl EgressPolicy {
     pub fn dns_filter_active(&self) -> bool {
         self.inner
             .as_ref()
-            .is_some_and(|list| list.allowed_hosts.is_some())
+            .is_some_and(|list| list.rules().allowed_hosts.is_some())
     }
 
     /// Whether a DNS query for `hostname` should be forwarded upstream. With no
@@ -430,10 +649,7 @@ impl EgressPolicy {
     pub fn hostname_allowed(&self, hostname: &str) -> bool {
         match &self.inner {
             None => true,
-            Some(list) => match &list.allowed_hosts {
-                None => true,
-                Some(hosts) => dns::hostname_allowed(hostname, hosts),
-            },
+            Some(list) => list.admits(|rules| rules.hostname_allowed(hostname)),
         }
     }
 
@@ -452,17 +668,16 @@ impl EgressPolicy {
             // (link-local) and — under Strict — the internal ranges stay
             // absolute: no allow-list entry can re-expose the credential door.
             if self.floor != FloorMode::Strict && is_host_loopback(ip) {
-                return self
-                    .inner
-                    .as_ref()
-                    .is_some_and(|list| list.cidrs.iter().any(|cidr| cidr.contains(ip)));
+                return self.inner.as_ref().is_some_and(|list| {
+                    list.admits(|rules| rules.cidrs.iter().any(|cidr| cidr.contains(ip)))
+                });
             }
             return false;
         }
         match &self.inner {
             None => true,
             Some(list) => {
-                if list.cidrs.iter().any(|cidr| cidr.contains(ip)) {
+                if list.admits(|rules| rules.cidrs.iter().any(|cidr| cidr.contains(ip))) {
                     return true;
                 }
                 list.learned
@@ -470,7 +685,7 @@ impl EgressPolicy {
                     .map(|learned| {
                         learned
                             .get(&ip)
-                            .is_some_and(|expires_at| *expires_at > Instant::now())
+                            .is_some_and(|entry| entry.expires_at > Instant::now())
                     })
                     .unwrap_or(false)
             }
@@ -491,6 +706,23 @@ impl EgressPolicy {
     /// IPs. TTLs are clamped to [60s, 3600s]; expired entries are pruned. No-op
     /// when unrestricted.
     pub fn learn_ip_records(&self, records: &[(IpAddr, u32)]) {
+        self.learn(None, records);
+    }
+
+    /// Learn the A/AAAA records of an allowed DNS `answer`, remembering the
+    /// name asked so revoking that name later revokes these IPs too. An answer
+    /// for a name revoked while the query was in flight is not learned.
+    pub fn learn_dns_answer(&self, answer: &[u8]) {
+        let name = dns::question_name(answer).and_then(|n| dns::normalize_hostname(&n));
+        if let (Some(list), Some(name)) = (&self.inner, name.as_deref()) {
+            if !list.rules().hostname_allowed(name) {
+                return;
+            }
+        }
+        self.learn(name, &dns::answer_ip_records(answer));
+    }
+
+    fn learn(&self, name: Option<String>, records: &[(IpAddr, u32)]) {
         let Some(list) = &self.inner else {
             return;
         };
@@ -498,14 +730,18 @@ impl EgressPolicy {
             return;
         };
         let now = Instant::now();
-        learned.retain(|_, expires_at| *expires_at > now);
+        learned.retain(|_, entry| entry.expires_at > now);
         for (ip, ttl) in records {
             let ttl = u64::from(*ttl).clamp(MIN_LEARNED_TTL, MAX_LEARNED_TTL);
             let expires_at = now + Duration::from_secs(ttl);
-            learned
-                .entry(*ip)
-                .and_modify(|existing| *existing = (*existing).max(expires_at))
-                .or_insert(expires_at);
+            let entry = learned.entry(*ip).or_insert(Learned {
+                expires_at,
+                name: name.clone(),
+            });
+            if expires_at >= entry.expires_at {
+                entry.expires_at = expires_at;
+                entry.name = name.clone();
+            }
         }
     }
 }
@@ -513,6 +749,134 @@ impl EgressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A policy following a live file in a fresh directory, and that file.
+    fn live_policy(
+        cidrs: Option<&[String]>,
+        hosts: Option<&[String]>,
+    ) -> (EgressPolicy, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::EGRESS_POLICY_FILE);
+        let policy = EgressPolicy::new(cidrs, hosts).with_live_policy(path.clone());
+        (policy, dir, path)
+    }
+
+    /// Write the live file and let the next decision read it at once.
+    fn rewrite(policy: &EgressPolicy, path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        let list = policy.inner.as_ref().unwrap();
+        list.live.as_ref().unwrap().state.lock().unwrap().checked = None;
+    }
+
+    #[test]
+    fn a_live_policy_file_grants_and_revokes_while_the_machine_runs() {
+        let (policy, _dir, path) = live_policy(None, Some(&["api.github.com".into()]));
+        assert!(!policy.hostname_allowed("pypi.org"));
+
+        rewrite(
+            &policy,
+            &path,
+            &render_live_policy(&[], &["api.github.com".into(), "pypi.org".into()]),
+        );
+        assert!(policy.hostname_allowed("pypi.org"));
+        assert!(policy.hostname_allowed("api.github.com"));
+
+        rewrite(
+            &policy,
+            &path,
+            &render_live_policy(&["8.8.8.0/24".into()], &["pypi.org".into()]),
+        );
+        assert!(!policy.hostname_allowed("api.github.com"));
+        assert!(policy.allows_v4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn a_grant_applies_to_the_next_attempt_without_waiting_for_a_recheck() {
+        let (policy, _dir, path) = live_policy(None, Some(&["api.github.com".into()]));
+        // A decision just read the file, so the ordinary recheck is 250ms away.
+        assert!(!policy.hostname_allowed("pypi.org"));
+        std::fs::write(&path, render_live_policy(&[], &["pypi.org".into()])).unwrap();
+        std::thread::sleep(LIVE_POLICY_RECHECK_BEFORE_DENY * 2);
+        assert!(policy.hostname_allowed("pypi.org"));
+    }
+
+    #[test]
+    fn without_a_live_file_the_boot_policy_applies() {
+        let (policy, _dir, path) = live_policy(None, Some(&["api.github.com".into()]));
+        rewrite(
+            &policy,
+            &path,
+            &render_live_policy(&[], &["pypi.org".into()]),
+        );
+        assert!(!policy.hostname_allowed("api.github.com"));
+        std::fs::remove_file(&path).unwrap();
+        policy
+            .inner
+            .as_ref()
+            .unwrap()
+            .live
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .checked = None;
+        assert!(policy.hostname_allowed("api.github.com"));
+        assert!(!policy.hostname_allowed("pypi.org"));
+    }
+
+    #[test]
+    fn an_empty_live_file_admits_nothing_and_never_lifts_the_policy() {
+        let (policy, _dir, path) = live_policy(Some(&["8.8.8.0/24".into()]), None);
+        rewrite(&policy, &path, "# nothing allowed\n");
+        assert!(policy.is_restricted());
+        assert!(!policy.allows_v4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!policy.hostname_allowed("example.com"));
+    }
+
+    #[test]
+    fn a_bad_live_file_keeps_the_current_policy() {
+        let (policy, _dir, path) = live_policy(None, Some(&["api.github.com".into()]));
+        rewrite(
+            &policy,
+            &path,
+            &render_live_policy(&[], &["pypi.org".into()]),
+        );
+        assert!(policy.hostname_allowed("pypi.org"));
+        rewrite(&policy, &path, "allow everything\n");
+        assert!(policy.hostname_allowed("pypi.org"));
+        rewrite(&policy, &path, "cidr not-a-cidr\n");
+        assert!(policy.hostname_allowed("pypi.org"));
+    }
+
+    #[test]
+    fn revoking_a_host_revokes_the_addresses_learned_for_it() {
+        let (policy, _dir, path) =
+            live_policy(None, Some(&["api.github.com".into(), "pypi.org".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        let pypi = IpAddr::V4(Ipv4Addr::new(151, 101, 0, 223));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        policy.learn(Some("pypi.org".into()), &[(pypi, 300)]);
+        assert!(policy.allows(github));
+
+        rewrite(
+            &policy,
+            &path,
+            &render_live_policy(&[], &["pypi.org".into()]),
+        );
+        assert!(!policy.allows(github));
+        assert!(policy.allows(pypi));
+    }
+
+    #[test]
+    fn only_a_restricted_policy_follows_a_live_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::EGRESS_POLICY_FILE);
+        std::fs::write(&path, render_live_policy(&[], &["pypi.org".into()])).unwrap();
+        let open = EgressPolicy::unrestricted().with_live_policy(path);
+        assert!(!open.is_restricted());
+        assert!(open.hostname_allowed("example.com"));
+    }
 
     #[test]
     fn floor_override_parsing() {

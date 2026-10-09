@@ -1004,7 +1004,7 @@ fn deliver_dns_responses(
         if let Some(pending) = gateway.pending_udp.remove(&response.id) {
             if let Some(answer) = response.answer {
                 if pending.learn {
-                    egress.learn_ip_records(&dns::answer_ip_records(&answer));
+                    egress.learn_dns_answer(&answer);
                 }
                 let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
                 let response_meta = UdpMetadata {
@@ -1024,7 +1024,7 @@ fn deliver_dns_responses(
                     conn.awaiting = None;
                     if let Some(answer) = response.answer {
                         if pending.learn {
-                            egress.learn_ip_records(&dns::answer_ip_records(&answer));
+                            egress.learn_dns_answer(&answer);
                         }
                         frame_dns_tcp_response(conn, &answer);
                     }

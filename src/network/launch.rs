@@ -223,6 +223,28 @@ pub fn plan_launch_network_with(
     }
 }
 
+/// Start a machine from the allow list its record holds and let it follow the
+/// host's live policy file in `vm_dir` from then on: a file left by an earlier
+/// boot is removed first. Only a guest that may open outbound connections
+/// follows one; an inbound-only guest stays closed.
+pub fn follow_live_egress_policy(
+    egress: smolvm_network::EgressPolicy,
+    vm_dir: &std::path::Path,
+    outbound: bool,
+) -> smolvm_network::EgressPolicy {
+    let path = vm_dir.join(smolvm_network::EGRESS_POLICY_FILE);
+    if let Err(error) = std::fs::remove_file(&path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), %error, "could not remove a previous live egress policy");
+        }
+    }
+    if outbound && egress.is_restricted() {
+        egress.with_live_policy(path)
+    } else {
+        egress
+    }
+}
+
 /// Validate the requested networking against what each backend can do.
 ///
 /// - Published ports need virtio-net: TSI is outbound-only, so a port request on

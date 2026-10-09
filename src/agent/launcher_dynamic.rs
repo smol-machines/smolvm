@@ -522,6 +522,11 @@ pub fn launch_agent_vm_dynamic(
             };
             if let Some(dir) = config.vsock_socket.parent() {
                 egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
+                egress = crate::network::launch::follow_live_egress_policy(
+                    egress,
+                    dir,
+                    network_plan.outbound,
+                );
                 egress = egress.with_watchlist(
                     dir.join(smolvm_network::watchlist::EGRESS_WATCHLIST_FILE),
                     dir.join(smolvm_network::EGRESS_SIGNALS_LOG),
