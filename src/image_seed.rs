@@ -21,6 +21,14 @@
 //! Seeding is best-effort: any failure falls back to the in-guest pull.
 //! `SMOLVM_IMAGE_SEEDS=0` turns it off.
 //!
+//! A machine with no network boots its registry image from an archive the host
+//! fetched (and a machine created from `--image ./app.tar` boots the archive it
+//! was given). The guest flattens that archive onto the machine's storage disk
+//! on its first start, which every new machine of the same archive repeats.
+//! Such an archive gets a seed too, keyed by its content hash: the builder boots
+//! the same archive with no network and flattens it once. The content cannot
+//! move, so there is no registry to consult.
+//!
 //! Without a sized storage template (macOS, or an SDK install that ships none)
 //! the seed is the builder's raw disk instead, and each machine takes a
 //! copy-on-write clone of it: an APFS clone on macOS, a reflink or sparse copy
@@ -243,10 +251,20 @@ mod imp {
             return None;
         }
         let image = image?;
-        if crate::data::image_source::is_local_ref(image)
-            || crate::data::image_source::packed_layers_dir_for_ref(image).is_some()
-        {
-            return None;
+        match local_archive(image) {
+            // A staged archive seeds while its file is still in the cache.
+            Some(archive) => {
+                if !archive.is_file() {
+                    return None;
+                }
+            }
+            None => {
+                if crate::data::image_source::is_local_ref(image)
+                    || crate::data::image_source::packed_layers_dir_for_ref(image).is_some()
+                {
+                    return None;
+                }
+            }
         }
         // An existing disk already holds whatever it pulled.
         let storage = crate::agent::vm_data_dir(name).join(crate::storage::STORAGE_DISK_FILENAME);
@@ -258,6 +276,13 @@ mod imp {
             return None;
         }
         Some(image.to_string())
+    }
+
+    /// The staged archive file a `local:` archive reference boots from, or
+    /// `None` for a registry reference or a rootfs directory.
+    fn local_archive(image: &str) -> Option<PathBuf> {
+        crate::data::image_source::local_archive_hash(image)?;
+        crate::data::image_source::archive_file_for_ref(image)
     }
 
     /// One remembered resolution: the digest `image` pointed to for one
@@ -456,7 +481,12 @@ mod imp {
             .build()
             .map_err(|e| Error::config("image seed", e.to_string()))?;
         let resolve = || rt.block_on(crate::image_store::authorized_reference_digest(image, auth));
-        let digest = resolved_digest(image, auth, digest_ttl, resolve)?;
+        // A staged archive is named by its content hash, which is its digest.
+        let archive_hash = crate::data::image_source::local_archive_hash(image);
+        let digest = match archive_hash {
+            Some(hash) => hash.to_string(),
+            None => resolved_digest(image, auth, digest_ttl, resolve)?,
+        };
         let key = seed_key(image, &digest, template.as_deref())?;
         let root = seed_root();
         std::fs::create_dir_all(&root).map_err(|e| Error::config("image seed", e.to_string()))?;
@@ -486,8 +516,9 @@ mod imp {
                     trust_host_certs,
                 )?;
                 // The builder pulled the tag, not the digest. If the tag moved
-                // in the meantime, discard the seed rather than miskey it.
-                if resolve()? != digest {
+                // in the meantime, discard the seed rather than miskey it. An
+                // archive is its content, so it cannot have moved.
+                if archive_hash.is_none() && resolve()? != digest {
                     let _ = std::fs::remove_dir_all(&key_dir);
                     // The cached digest is what moved. Drop it, or every
                     // retry inside the TTL window repeats this build and
@@ -720,10 +751,19 @@ mod imp {
         // Set once the builder's disk format is known.
         let mut staged: Option<(PathBuf, PathBuf)> = None;
         let started = std::time::Instant::now();
+        let archive = local_archive(image);
+        let archive_path = archive
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
         let built = (|| -> Result<()> {
-            let mut create = vec![
-                "machine", "create", "--name", &tmp, "--image", image, "--net",
-            ];
+            // An archive boots from its staged file with no network, exactly as
+            // the machines that will use the seed do.
+            let mut create = match archive_path.as_deref() {
+                Some(path) => vec!["machine", "create", "--name", &tmp, "--image", path],
+                None => vec![
+                    "machine", "create", "--name", &tmp, "--image", image, "--net",
+                ],
+            };
             if trust_host_certs {
                 create.push("--trust-host-certs");
             }
@@ -741,6 +781,16 @@ mod imp {
             // tag ABA and a registry mirror serving different image bytes.
             let manager = crate::agent::AgentManager::for_vm(&tmp)?;
             let mut client = manager.connect()?;
+            if archive.is_some() {
+                // A start skips the pull for an archive; the guest flattens it
+                // when first asked for the image. Ask now, with no workload.
+                client.pull(image, crate::agent::PullOptions::new())?;
+                client.query(image)?.ok_or_else(|| {
+                    Error::config("image seed", "builder did not flatten its archive")
+                })?;
+                run(exe, &["machine", "stop", "--name", &tmp])?;
+                return stage_builder_disk(&tmp, key_dir, &mut staged);
+            }
             let pulled = client
                 .query(image)?
                 .ok_or_else(|| Error::config("image seed", "builder did not cache its image"))?;
@@ -757,22 +807,7 @@ mod imp {
                 ));
             }
             run(exe, &["machine", "stop", "--name", &tmp])?;
-            // A template overlay where the host has a sized template, else the
-            // builder's own raw disk.
-            let builder = crate::agent::vm_data_dir(&tmp);
-            let (disk, format) = seed_disk_in(&builder, crate::storage::STORAGE_DISK_FILENAME)
-                .ok_or_else(|| Error::config("image seed", "the builder has no storage disk"))?;
-            std::fs::create_dir_all(key_dir)
-                .map_err(|e| Error::config("image seed", e.to_string()))?;
-            std::fs::set_permissions(key_dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| Error::config("image seed", e.to_string()))?;
-            let seed = key_dir.join(seed_file(format));
-            let staging =
-                seed.with_extension(format!("{}.{}", format.extension(), std::process::id()));
-            std::fs::rename(&disk, &staging)
-                .map_err(|e| Error::config("image seed", e.to_string()))?;
-            staged = Some((staging, seed));
-            Ok(())
+            stage_builder_disk(&tmp, key_dir, &mut staged)
         })();
         let _ = run(exe, &["machine", "delete", "--name", &tmp, "-f"]);
         let published = built.and_then(|()| {
@@ -791,6 +826,27 @@ mod imp {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "built image seed"
         );
+        Ok(())
+    }
+
+    /// Move the stopped builder `tmp`'s storage disk into `key_dir` as the
+    /// seed-to-be: a template overlay where the host has a sized template, else
+    /// the builder's own raw disk.
+    fn stage_builder_disk(
+        tmp: &str,
+        key_dir: &Path,
+        staged: &mut Option<(PathBuf, PathBuf)>,
+    ) -> Result<()> {
+        let builder = crate::agent::vm_data_dir(tmp);
+        let (disk, format) = seed_disk_in(&builder, crate::storage::STORAGE_DISK_FILENAME)
+            .ok_or_else(|| Error::config("image seed", "the builder has no storage disk"))?;
+        std::fs::create_dir_all(key_dir).map_err(|e| Error::config("image seed", e.to_string()))?;
+        std::fs::set_permissions(key_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| Error::config("image seed", e.to_string()))?;
+        let seed = key_dir.join(seed_file(format));
+        let staging = seed.with_extension(format!("{}.{}", format.extension(), std::process::id()));
+        std::fs::rename(&disk, &staging).map_err(|e| Error::config("image seed", e.to_string()))?;
+        *staged = Some((staging, seed));
         Ok(())
     }
 
@@ -1227,6 +1283,23 @@ mod tests {
         assert!(seedable_image(name, Some("alpine"), Some(default)).is_some());
         assert!(seedable_image(name, Some("alpine"), Some(default * 5)).is_some());
         assert!(seedable_image(name, Some("alpine"), Some(default - 1)).is_none());
+    }
+
+    #[test]
+    fn a_staged_archive_seeds_while_its_file_is_cached() {
+        let name = "seed-archive-gate-test";
+        let hash = format!("{:064x}", std::process::id());
+        let reference = format!("local:{hash}");
+        // Not staged: nothing to seed from.
+        assert!(seedable_image(name, Some(&reference), None).is_none());
+        let archive = crate::data::image_source::archive_file_for_ref(&reference).unwrap();
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"archive").unwrap();
+        let seedable = seedable_image(name, Some(&reference), None);
+        let _ = std::fs::remove_dir_all(archive.parent().unwrap());
+        assert_eq!(seedable.as_deref(), Some(reference.as_str()));
+        // A rootfs directory still boots as it is.
+        assert!(seedable_image(name, Some("local-dir:/srv/rootfs"), None).is_none());
     }
 
     #[test]
