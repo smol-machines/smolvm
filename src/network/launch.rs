@@ -223,25 +223,59 @@ pub fn plan_launch_network_with(
     }
 }
 
-/// Start a machine from the allow list its record holds and let it follow the
-/// host's live policy file in `vm_dir` from then on: a file left by an earlier
-/// boot is removed first. Only a guest that may open outbound connections
-/// follows one; an inbound-only guest stays closed.
-pub fn follow_live_egress_policy(
-    egress: smolvm_network::EgressPolicy,
+/// The longest replacement allow list the egress control socket reads.
+const MAX_EGRESS_REQUEST_BYTES: u64 = 1024 * 1024;
+
+/// Serve the egress control socket in `vm_dir` for a machine whose guest may
+/// open outbound connections under an allow list: each connection sends a
+/// replacement list and gets back `ok` or `error: <reason>`. A machine with no
+/// allow list, or an inbound-only guest, gets no socket.
+pub fn serve_egress_control(
+    egress: &smolvm_network::EgressPolicy,
     vm_dir: &std::path::Path,
     outbound: bool,
-) -> smolvm_network::EgressPolicy {
-    let path = vm_dir.join(smolvm_network::EGRESS_POLICY_FILE);
-    if let Err(error) = std::fs::remove_file(&path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(path = %path.display(), %error, "could not remove a previous live egress policy");
-        }
+) {
+    use std::io::{Read, Write};
+    let path = vm_dir.join(smolvm_network::EGRESS_SOCKET);
+    let _ = std::fs::remove_file(&path);
+    if !outbound || !egress.is_restricted() {
+        return;
     }
-    if outbound && egress.is_restricted() {
-        egress.with_live_policy(path)
-    } else {
-        egress
+    let listener = match crate::platform::uds::UdsListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "egress control socket unavailable");
+            return;
+        }
+    };
+    let egress = egress.clone();
+    let spawned = std::thread::Builder::new()
+        .name("egress-control".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut request = String::new();
+                let reply = match (&mut stream)
+                    .take(MAX_EGRESS_REQUEST_BYTES)
+                    .read_to_string(&mut request)
+                {
+                    Ok(_) => match egress.replace_allow_list(&request) {
+                        Ok(()) => {
+                            tracing::info!("egress allow list replaced");
+                            "ok\n".to_string()
+                        }
+                        Err(reason) => format!("error: {reason}\n"),
+                    },
+                    Err(error) => format!("error: {error}\n"),
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "egress control thread unavailable");
     }
 }
 

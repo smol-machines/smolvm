@@ -458,32 +458,45 @@ pub fn egress_denials_log_file(name: &str) -> PathBuf {
     vm_data_dir(name).join(smolvm_network::EGRESS_DENIALS_LOG)
 }
 
-/// Per-VM live egress policy: `<vm_data_dir>/egress-policy`, the whole allow
-/// list of a running machine, followed by its network runtime. Resolved from
-/// the name on both sides of the process boundary, like
-/// [`egress_denials_log_file`].
-pub fn live_egress_policy_file(name: &str) -> PathBuf {
-    vm_data_dir(name).join(smolvm_network::EGRESS_POLICY_FILE)
-}
-
-/// Point a running machine's network runtime at `record`'s allow list. The
-/// file is replaced in one rename, so the runtime never reads half of it.
-pub fn write_live_egress_policy(name: &str, record: &crate::config::VmRecord) -> Result<()> {
-    let path = live_egress_policy_file(name);
-    let contents = smolvm_network::egress::render_live_policy(
+/// Replace a running machine's allow list with `record`'s, through the egress
+/// control socket its network runtime serves. Returns once the runtime has the
+/// new list in force.
+pub fn apply_live_egress_policy(name: &str, record: &crate::config::VmRecord) -> Result<()> {
+    use std::io::{Read, Write};
+    let fail = |reason: String| {
+        Error::config(
+            "egress policy",
+            format!("could not change machine '{name}''s allow list while it runs: {reason}"),
+        )
+    };
+    let path = vm_data_dir(name).join(smolvm_network::EGRESS_SOCKET);
+    let mut stream =
+        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2)).map_err(
+            |e| {
+                fail(format!(
+                    "{e}; a machine started before live changes were supported needs a restart"
+                ))
+            },
+        )?;
+    let rendered = smolvm_network::egress::render_live_policy(
         record.allowed_cidrs.as_deref().unwrap_or(&[]),
         record.dns_filter_hosts.as_deref().unwrap_or(&[]),
     );
-    let staging = path.with_extension("tmp");
-    std::fs::write(&staging, contents)
-        .and_then(|()| std::fs::rename(&staging, &path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&staging);
-            Error::config(
-                "egress policy",
-                format!("could not update machine '{name}''s running egress policy: {e}"),
-            )
-        })
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| stream.write_all(rendered.as_bytes()))
+        .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+        .map_err(|e| fail(e.to_string()))?;
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .map_err(|e| fail(e.to_string()))?;
+    match reply.trim() {
+        "ok" => Ok(()),
+        other => Err(fail(
+            other.strip_prefix("error: ").unwrap_or(other).to_string(),
+        )),
+    }
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's

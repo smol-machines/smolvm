@@ -6324,7 +6324,7 @@ pub async fn update_machine_egress(
         record
             .check_live_egress(&next)
             .map_err(|error| ApiError::Conflict(error.to_string()))?;
-        crate::agent::write_live_egress_policy(&name, &next)?;
+        crate::agent::apply_live_egress_policy(&name, &next)?;
     }
     let updated = {
         let next = next.clone();
@@ -6346,7 +6346,7 @@ pub async fn update_machine_egress(
         Err(error) => {
             // The record keeps the old allow list, so the running machine must too.
             if running {
-                let _ = crate::agent::write_live_egress_policy(&name, &record);
+                let _ = crate::agent::apply_live_egress_policy(&name, &record);
             }
             return Err(error);
         }

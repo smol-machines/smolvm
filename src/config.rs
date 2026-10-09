@@ -1365,9 +1365,9 @@ impl VmRecord {
 
     /// Refuse an egress change a running machine can't take: `next` is this
     /// record after the change. The machine's network runtime enforces an allow
-    /// list it already has and follows changes to it, so the change must keep
-    /// one and keep the backend; lifting it or adding one where there was none
-    /// needs a restart.
+    /// list it already has and takes a replacement over its egress control
+    /// socket, so the change must keep one and keep the backend; lifting it or
+    /// adding one where there was none needs a restart.
     pub fn check_live_egress(&self, next: &VmRecord) -> Result<()> {
         use crate::network::launch::EffectiveNetworkBackend;
         let restricted = |r: &VmRecord| r.allowed_cidrs.is_some() || r.dns_filter_hosts.is_some();

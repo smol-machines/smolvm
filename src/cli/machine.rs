@@ -5984,7 +5984,7 @@ impl UpdateCmd {
             .next_egress(record)?
             .ok_or_else(|| smolvm::Error::config("update", "no egress changes given"))?;
         record.check_live_egress(&next)?;
-        smolvm::agent::write_live_egress_policy(&self.name, &next)?;
+        smolvm::agent::apply_live_egress_policy(&self.name, &next)?;
         let saved = db.update_vm(&self.name, |r| {
             r.network = next.network;
             r.allowed_cidrs = next.allowed_cidrs.clone();
@@ -5992,7 +5992,7 @@ impl UpdateCmd {
         });
         if !matches!(saved, Ok(Some(_))) {
             // The record keeps the old allow list, so the running machine must too.
-            let _ = smolvm::agent::write_live_egress_policy(&self.name, record);
+            let _ = smolvm::agent::apply_live_egress_policy(&self.name, record);
             saved?;
             return Err(smolvm::Error::config(
                 "update",
