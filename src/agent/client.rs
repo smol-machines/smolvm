@@ -19,6 +19,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Old agent rootfs builds reject this request before sending any layer bytes.
+/// Explain the version skew while leaving all other export failures intact.
+fn explain_unsupported_flatten(error: Error) -> Error {
+    if let Error::Agent { reason, .. } = &error {
+        if reason.contains("unknown variant") && reason.contains("flatten_layers") {
+            return Error::agent(
+                "flatten layers",
+                "the guest agent does not support pack export; install an agent-rootfs from the \
+                 same smolvm release (reinstall smolvm or set SMOLVM_AGENT_ROOTFS to a matching rootfs)",
+            );
+        }
+    }
+    error
+}
+
 /// Metadata applied to an uploaded file after it lands: permissions and
 /// ownership. Ownership matters for non-root workload images — a root-owned
 /// upload is unreadable/unwritable to the user the container actually runs as.
@@ -1788,11 +1803,13 @@ impl AgentClient {
         // window for the whole flatten, as the file-read paths do for large
         // transfers. Configurable because pack size is unbounded.
         let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
-        let resp = self.request(&AgentRequest::FlattenLayers {
-            lowerdirs: lowerdirs.to_vec(),
-            output: Some(output.to_string()),
-        })?;
-        expect_ok(resp, "flatten layers")
+        let resp = self
+            .request(&AgentRequest::FlattenLayers {
+                lowerdirs: lowerdirs.to_vec(),
+                output: Some(output.to_string()),
+            })
+            .map_err(explain_unsupported_flatten)?;
+        expect_ok(resp, "flatten layers").map_err(explain_unsupported_flatten)
     }
 
     /// Merge `lowerdirs` (topmost first — the order the agent stacks them in)
@@ -1817,6 +1834,7 @@ impl AgentClient {
             output: None,
         })?;
         self.receive_stream_to_path(local_path, cap, on_progress, "flatten layers")
+            .map_err(explain_unsupported_flatten)
     }
 
     /// Get storage status.
@@ -4671,6 +4689,63 @@ mod term_default_tests {
         let env = with_term_default(vec![("A".to_string(), "b".to_string())], false);
         assert_eq!(term_of(&env), None);
         assert_eq!(env.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod flatten_version_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn mock_flatten_response(response: AgentResponse) -> String {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut header = [0u8; 4];
+            server_stream.read_exact(&mut header).unwrap();
+            let mut request = vec![0u8; u32::from_be_bytes(header) as usize];
+            server_stream.read_exact(&mut request).unwrap();
+            let envelope: Envelope<AgentRequest> = serde_json::from_slice(&request).unwrap();
+            assert!(matches!(
+                envelope.body,
+                AgentRequest::FlattenLayers { output: None, .. }
+            ));
+            server_stream
+                .write_all(&encode_message(&response).unwrap())
+                .unwrap();
+        });
+        let output = tempfile::tempdir().unwrap();
+        let error = AgentClient::from_stream(client_stream)
+            .flatten_layers_to_path(
+                &["/storage/layers".into()],
+                &output.path().join("out.tar"),
+                1024,
+                |_| {},
+            )
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(!output.path().join("out.tar").exists());
+        error.to_string()
+    }
+
+    #[test]
+    fn old_guest_agent_explains_how_to_resolve_version_skew() {
+        let error = mock_flatten_response(AgentResponse::Error {
+            message: "invalid request: unknown variant `flatten_layers`, expected `ping`".into(),
+            code: None,
+        });
+        assert!(error.contains("matching rootfs"), "{error}");
+        assert!(error.contains("SMOLVM_AGENT_ROOTFS"), "{error}");
+        assert!(!error.contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn other_guest_errors_are_not_misidentified_as_version_skew() {
+        let error = mock_flatten_response(AgentResponse::Error {
+            message: "storage disk is full".into(),
+            code: None,
+        });
+        assert!(error.contains("storage disk is full"), "{error}");
+        assert!(!error.contains("matching rootfs"), "{error}");
     }
 }
 
