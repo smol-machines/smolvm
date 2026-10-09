@@ -110,6 +110,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         cuda: record.cuda,
         network_backend: record.network_backend,
         allowed_cidrs: record.allowed_cidrs.clone(),
+        egress_rules: record.egress_rules.clone(),
         allowed_hosts: record.dns_filter_hosts.clone(),
         // Report the RESOLVED provisioned disk sizes, not the request echo: a
         // machine created without an explicit size still gets a real disk at the
@@ -2516,6 +2517,9 @@ async fn create_machine_inner(
         ),
         None => None,
     };
+    smolvm_network::EgressPolicy::unrestricted()
+        .with_rules(&req.egress_rules)
+        .map_err(ApiError::BadRequest)?;
 
     // SHA-256 taken while a restored checkpoint was received, handed to the
     // shared extraction so it does not hash the artifact again.
@@ -3082,6 +3086,10 @@ async fn create_machine_inner(
         disk_durability: req.disk_durability,
         cache_disk: req.cache_disk.clone(),
         allowed_cidrs: normalized_cidrs,
+        egress_rules: checkpoint_network.map_or_else(
+            || req.egress_rules.clone(),
+            |network| network.egress_rules.clone(),
+        ),
         allowed_hosts: restored_allowed_hosts,
         // A restored checkpoint keeps the bindings its workload was captured
         // with unless the request names its own.
@@ -3098,6 +3106,15 @@ async fn create_machine_inner(
             None => guest_subnet,
         },
     };
+    smolvm_network::EgressPolicy::unrestricted()
+        .with_rules(&resources.egress_rules)
+        .map_err(ApiError::BadRequest)?;
+    crate::network::validate_requested_network_backend(
+        &crate::api::state::resource_spec_to_vm_resources(&resources, network),
+        resources.allowed_hosts.as_deref(),
+        restored_ports.len(),
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
     // Validate request-body secret refs before persisting. Untrusted
     // scope rejects every source kind, so any non-empty `secrets` map on
@@ -3149,6 +3166,8 @@ async fn create_machine_inner(
             }
         },
         network,
+        mediated_egress_required: checkpoint_network
+            .is_some_and(|network| network.mediated_egress_required),
         forkable: manifest_checkpoint.is_some(),
         init_completed: manifest_checkpoint.is_some(),
         docker_socket: req.docker_socket,
@@ -3338,6 +3357,67 @@ pub async fn get_machine_egress_events(
     Ok(Json(EgressEventsResponse { events }))
 }
 
+/// Return the bounded host-side decision record for a mediated machine.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{name}/mediation-events",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name"),
+        EgressEventsQuery
+    ),
+    responses(
+        (status = 200, description = "Mediated egress decisions", body = crate::api::types::MediationEventsResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+    )
+)]
+pub async fn get_machine_mediation_events(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<EgressEventsQuery>,
+) -> Result<Json<crate::api::types::MediationEventsResponse>, ApiError> {
+    state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let events = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = vm_data_dir(&name).join(smolvm_network::EGRESS_DECISIONS_LOG);
+        let mut events: Vec<crate::api::types::MediationDecisionEvent> = Vec::new();
+        for path in [path.with_extension("jsonl.1"), path] {
+            let mut file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let len = file.metadata()?.len();
+            let start = len.saturating_sub(512 * 1024);
+            file.seek(SeekFrom::Start(start))?;
+            let mut bytes = String::new();
+            file.read_to_string(&mut bytes)?;
+            if start > 0 {
+                bytes = bytes
+                    .split_once('\n')
+                    .map_or(String::new(), |(_, rest)| rest.to_owned());
+            }
+            events.extend(
+                bytes
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok()),
+            );
+        }
+        if events.len() > limit {
+            events.drain(..events.len() - limit);
+        }
+        Ok::<_, std::io::Error>(events)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("audit read task failed: {error}")))?
+    .map_err(|error| ApiError::internal(format!("audit read failed: {error}")))?;
+    Ok(Json(crate::api::types::MediationEventsResponse { events }))
+}
+
 /// Classify a VM launch/boot failure. A published host-port bind conflict — the
 /// virtio-net runtime couldn't bind `0.0.0.0:<hostPort>` because something
 /// (typically an orphaned VMM) still holds it — is surfaced as `PortConflict`
@@ -3437,6 +3517,10 @@ pub async fn start_machine(
     let request: crate::api::types::StartMachineRequest = optional_json_body(&headers, &body)?;
     let registry_auth: Option<crate::registry::RegistryAuth> =
         request.registry_auth.map(Into::into);
+    let mediated_egress = request
+        .egress_interceptor
+        .as_ref()
+        .is_some_and(|spec| spec.mediated);
     let external_interceptor = request
         .egress_interceptor
         .map(|spec| {
@@ -3480,15 +3564,6 @@ pub async fn start_machine(
             false,
         )
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        if query.forkable
-            || query.fork_pool_size.is_some()
-            || record.forkable_on_start()
-            || crate::portable_checkpoint::pending_dir(&vm_data_dir(&name)).is_some()
-        {
-            return Err(ApiError::BadRequest(
-                "external interception does not support checkpoint or branch launches".into(),
-            ));
-        }
     }
 
     // Resolve via the shared probe (PID + vsock ping) so we don't
@@ -3781,6 +3856,7 @@ pub async fn start_machine(
         features.cuda_fork_pool_size = cuda_fork_pool_size;
         features.cuda_vram_limit_mib = cuda_vram_limit_mib;
         features.external_interceptor = external_interceptor;
+        features.mediated_egress = mediated_egress;
         let _ = manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)
             .map_err(|e| format!("failed to start machine: {}", e))?;
@@ -4393,6 +4469,21 @@ async fn fork_machine_transaction(
     let _golden_guard = golden_lifecycle.lock().await;
     let _source_lock = acquire_fork_source_lock(golden.clone()).await?;
 
+    if state
+        .lookup_vm(&golden)
+        .await?
+        .is_some_and(|record| record.external_interceptor_required)
+        && state
+            .get_machine(&golden)
+            .ok()
+            .and_then(|entry| entry.lock().external_interceptor)
+            .is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "branch source interceptor binding is unavailable; rebind it before branching".into(),
+        ));
+    }
+
     // Reject an already-registered target before taking its lifecycle lock.
     // Besides avoiding a pointless forkpoint wait, this prevents two invalid
     // cross-forks (X -> Y and Y -> X) from each holding one golden while waiting
@@ -4695,6 +4786,28 @@ async fn boot_prepared_fork_inner(
     prep: crate::agent::fork::PreparedFork,
     boot: PreparedForkBoot,
 ) -> Result<MachineInfo, ApiError> {
+    let inherited_interceptor = if prep.clone_record.external_interceptor_required {
+        let source = prep.clone_record.golden.as_deref().ok_or_else(|| {
+            ApiError::BadRequest("intercepted branch has no source machine".into())
+        })?;
+        let binding = state
+            .get_machine(source)
+            .ok()
+            .and_then(|entry| entry.lock().external_interceptor);
+        if binding.is_none() {
+            // A reconciler can reach this path without the request preflight.
+            // Dispose of its prepared child before returning a binding error.
+            let _ = state.db().remove_vm(&clone);
+            let _ = std::fs::remove_dir_all(vm_data_dir(&clone));
+            return Err(ApiError::BadRequest(
+                "branch source interceptor binding is unavailable; rebind it before branching"
+                    .into(),
+            ));
+        }
+        binding
+    } else {
+        None
+    };
     let PreparedForkBoot {
         share_weights,
         fork_env,
@@ -4738,6 +4851,8 @@ async fn boot_prepared_fork_inner(
         features.cuda_preload_modules = record.cuda_preload_modules;
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+        features.external_interceptor = inherited_interceptor;
+        features.mediated_egress = record.mediated_egress_required;
 
         if let Err(e) = manager.ensure_running_via_subprocess(mounts, ports, resources, features) {
             // Boot failed: roll back the clone registration so a failed fork
@@ -4820,7 +4935,9 @@ async fn boot_prepared_fork_inner(
     .map_err(classify_prepared_fork_boot_error)?;
 
     // Register the clone so exec/run endpoints can reach it.
-    state.insert_machine(&clone, machine_entry_from_record(&clone_record, manager));
+    let mut entry = machine_entry_from_record(&clone_record, manager);
+    entry.external_interceptor = inherited_interceptor;
+    state.insert_machine(&clone, entry);
 
     // Persist the running state.
     let pid_start_time = pid.and_then(process_start_time);
@@ -7267,6 +7384,7 @@ mod tests {
             disk_durability: None,
             cache_disk: None,
             allowed_cidrs: None,
+            egress_rules: Vec::new(),
             allowed_hosts: None,
             network_backend: None,
             guest_subnet: None,

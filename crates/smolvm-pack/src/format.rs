@@ -482,6 +482,12 @@ pub struct CheckpointNetwork {
     /// Captured outbound CIDR allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Ordered L4 egress rules captured with the machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
+    /// Restore must provide a new host mediator binding before execution.
+    #[serde(default)]
+    pub mediated_egress_required: bool,
     /// Captured outbound DNS hostname allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,

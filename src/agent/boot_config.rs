@@ -99,4 +99,10 @@ pub struct BootConfig {
     /// Launch-scoped host interceptor; never copied to the machine record.
     #[serde(default)]
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// A versioned per-flow decision is required for external interception.
+    #[serde(default)]
+    pub mediated_egress: bool,
+    /// Host-only identity of a branch source's launch.
+    #[serde(default)]
+    pub mediated_parent_id: [u8; 16],
 }

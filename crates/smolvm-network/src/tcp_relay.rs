@@ -33,6 +33,8 @@ use polling::{Event, Events};
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpListenEndpoint;
+use smolvm_protocol::mediated_egress::{Decision, FlowPrelude, MAX_INITIAL_BYTES};
+use smolvm_protocol::{FlowTransport, RuleAction};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
@@ -40,7 +42,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TCP_RX_BUFFER_BYTES: usize = 64 * 1024;
 const TCP_TX_BUFFER_BYTES: usize = 64 * 1024;
@@ -56,6 +58,10 @@ const CLOSE_RETRY_LIMIT: u16 = 64;
 const RELAY_WAIT_BACKSTOP: Duration = Duration::from_millis(100);
 /// The relay thread's key for its host socket in its own poller.
 const HOST_STREAM_KEY: usize = 0;
+const FIRST_PAYLOAD_HOLD: Duration = Duration::from_millis(100);
+const MEDIATED_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MEDIATED_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MEDIATED_MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 const PUBLISHED_PORT_START: u16 = 49_152;
 const PUBLISHED_PORT_END: u16 = 65_535;
 
@@ -202,6 +208,8 @@ fn proxy_channel() -> (ToProxy, Receiver<Vec<u8>>, WakePipe) {
 pub enum RelayTarget {
     /// Open a new outbound host `TcpStream` to the destination.
     Connect(SocketAddr),
+    /// Static allow under mediation; still subject to mediated time limits.
+    DirectMediated(SocketAddr),
     /// Use an already-accepted host `TcpStream` from a published port listener.
     Attached(TcpStream),
     /// Dial the credential interceptor and announce the guest's real
@@ -209,6 +217,14 @@ pub enum RelayTarget {
     Intercept {
         endpoint: crate::InterceptEndpoint,
         destination: SocketAddr,
+    },
+    /// Ask a host decider before connecting to the origin or using its stream.
+    Mediated {
+        binding: crate::MediatedBinding,
+        destination: SocketAddr,
+        direct_address: SocketAddr,
+        direct_allowed: bool,
+        audit: EgressPolicy,
     },
 }
 
@@ -295,6 +311,42 @@ impl TcpRelayTable {
 
     /// Relay target for a guest-initiated flow that egress already admitted.
     fn outbound_target(&self, destination: SocketAddr) -> RelayTarget {
+        // The dedicated rollout ingress is a smolvm-owned service on the
+        // gateway, not an outbound origin. Keep it available even when every
+        // external TCP flow is delegated to a broker.
+        if self.is_host_service_destination(destination) {
+            return RelayTarget::Connect(self.host_connect_addr(destination));
+        }
+        match self.egress.rule_action(
+            FlowTransport::Tcp,
+            destination.ip(),
+            Some(destination.port()),
+        ) {
+            Some(RuleAction::Allow) => {
+                let address = self.host_connect_addr(destination);
+                return if matches!(self.intercept, Some(crate::StreamInterception::Mediated(_))) {
+                    RelayTarget::DirectMediated(address)
+                } else {
+                    RelayTarget::Connect(address)
+                };
+            }
+            Some(RuleAction::Redirect) => {
+                if let Some(crate::StreamInterception::Mediated(binding)) = self.intercept {
+                    return RelayTarget::Mediated {
+                        binding,
+                        destination,
+                        direct_address: self.host_connect_addr(destination),
+                        direct_allowed: self.egress.allows_flow(
+                            FlowTransport::Tcp,
+                            self.host_connect_addr(destination).ip(),
+                            Some(destination.port()),
+                        ),
+                        audit: self.egress.clone(),
+                    };
+                }
+            }
+            _ => {}
+        }
         match self.intercept {
             Some(crate::StreamInterception::Https(endpoint))
                 if destination.port() == INTERCEPTED_PORT
@@ -308,6 +360,14 @@ impl TcpRelayTable {
             Some(crate::StreamInterception::AllTcp(endpoint)) => RelayTarget::Intercept {
                 endpoint,
                 destination,
+            },
+            Some(crate::StreamInterception::Mediated(binding)) => RelayTarget::Mediated {
+                binding,
+                destination,
+                direct_address: self.host_connect_addr(destination),
+                direct_allowed: self.egress.allows(self.host_connect_addr(destination).ip())
+                    || self.is_host_service_destination(destination),
+                audit: self.egress.clone(),
             },
             _ => RelayTarget::Connect(self.host_connect_addr(destination)),
         }
@@ -332,11 +392,29 @@ impl TcpRelayTable {
     }
 
     fn destination_allowed(&self, destination: SocketAddr) -> bool {
-        self.egress.allows(destination.ip())
-            || (self
-                .host_service
-                .is_some_and(|service| service.guest_port == destination.port())
-                && self.gateway_ips.contains(&destination.ip()))
+        if self.is_host_service_destination(destination) {
+            return true;
+        }
+        if self.egress.rule_action(
+            FlowTransport::Tcp,
+            destination.ip(),
+            Some(destination.port()),
+        ) == Some(RuleAction::Redirect)
+            && !matches!(self.intercept, Some(crate::StreamInterception::Mediated(_)))
+        {
+            return false;
+        }
+        self.egress.allows_flow(
+            FlowTransport::Tcp,
+            destination.ip(),
+            Some(destination.port()),
+        )
+    }
+
+    fn is_host_service_destination(&self, destination: SocketAddr) -> bool {
+        self.host_service
+            .is_some_and(|service| service.guest_port == destination.port())
+            && self.gateway_ips.contains(&destination.ip())
     }
 
     /// The host-side address the relay should dial for a guest flow.
@@ -421,6 +499,29 @@ impl TcpRelayTable {
         // A `block` entry fails the connection like a denial, recorded only as
         // the watchlist match.
         if self.egress.observe_destination(destination) {
+            return false;
+        }
+        if self.is_host_service_destination(destination)
+            && self
+                .egress
+                .record_decision("tcp", "allow", &destination, "internal_service")
+                .is_err()
+        {
+            self.egress
+                .record_denial("connect", &format_args!("to {destination}"));
+            return false;
+        }
+        if self.egress.rule_action(
+            FlowTransport::Tcp,
+            destination.ip(),
+            Some(destination.port()),
+        ) == Some(RuleAction::Allow)
+            && self
+                .egress
+                .record_decision("tcp", "allow", &destination, "static_rule")
+                .is_err()
+        {
+            self.egress.record_denial("connect", &destination);
             return false;
         }
 
@@ -876,6 +977,11 @@ fn tcp_relay_loop(
     // 3. Non-blockingly read remote payloads from the socket into the channel.
     // 4. If neither side made progress, wait until one can: the host socket
     //    turns readable or writable, or the poll loop wakes `proxy_wake`.
+    let mediated = matches!(
+        &relay_target,
+        RelayTarget::Mediated { .. } | RelayTarget::DirectMediated(_)
+    );
+    let mut pending_guest_data: Option<(Vec<u8>, usize)> = None;
     let stream = match relay_target {
         RelayTarget::Connect(destination) => {
             virtio_net_log!(
@@ -888,6 +994,9 @@ fn tcp_relay_loop(
                 destination
             );
             stream
+        }
+        RelayTarget::DirectMediated(destination) => {
+            TcpStream::connect_timeout(&destination, INTERCEPT_VERDICT_TIMEOUT)?
         }
         RelayTarget::Attached(stream) => {
             virtio_net_log!(
@@ -919,6 +1028,88 @@ fn tcp_relay_loop(
             stream.set_read_timeout(None)?;
             stream
         }
+        RelayTarget::Mediated {
+            binding,
+            destination,
+            direct_address,
+            direct_allowed,
+            audit,
+        } => {
+            // The guest handshake is complete, but the origin has not been
+            // dialed. Wait briefly for application bytes so a host decider can
+            // inspect them before choosing a route. Server-speaks-first flows
+            // continue after this bounded hold with an empty initial payload.
+            let first = from_smoltcp.recv_timeout(FIRST_PAYLOAD_HOLD).ok();
+            if first.is_some() {
+                relay_wake.wake();
+            }
+            let first_len = first
+                .as_ref()
+                .map_or(0, |bytes| bytes.len().min(MAX_INITIAL_BYTES));
+            let broker_result = (|| -> io::Result<(TcpStream, Decision)> {
+                let mut broker =
+                    TcpStream::connect_timeout(&binding.endpoint.addr, MEDIATED_CONNECT_TIMEOUT)?;
+                broker.set_write_timeout(Some(INTERCEPT_VERDICT_TIMEOUT))?;
+                FlowPrelude {
+                    machine_id: binding.machine_id,
+                    parent_id: binding.parent_id,
+                    destination,
+                    initial_bytes: first
+                        .as_ref()
+                        .map_or_else(Vec::new, |bytes| bytes[..first_len].to_vec()),
+                }
+                .write_to(&mut broker, &binding.endpoint.token)?;
+                broker.set_read_timeout(Some(INTERCEPT_VERDICT_TIMEOUT))?;
+                let decision = Decision::read_from(&mut broker)?;
+                broker.set_read_timeout(None)?;
+                broker.set_write_timeout(None)?;
+                Ok((broker, decision))
+            })();
+            let (broker, decision) = match broker_result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ =
+                        audit.record_decision("tcp", "deny", &destination, "broker_unavailable");
+                    return Err(error);
+                }
+            };
+            if decision == Decision::AllowDirect && !direct_allowed {
+                audit.record_decision("tcp", "deny", &destination, "direct_target_policy")?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "egress policy denied direct target",
+                ));
+            }
+            let action = match decision {
+                Decision::AllowDirect => "allow",
+                Decision::Deny => "deny",
+                Decision::Redirect => "redirect",
+            };
+            audit.record_decision("tcp", action, &destination, "broker_decision")?;
+            match decision {
+                Decision::Deny => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "egress decider denied flow",
+                    ));
+                }
+                Decision::Redirect => {
+                    if let Some(first) = first {
+                        if first_len < first.len() {
+                            pending_guest_data = Some((first, first_len));
+                        }
+                    }
+                    broker
+                }
+                Decision::AllowDirect => {
+                    if let Some(first) = first {
+                        pending_guest_data = Some((first, 0));
+                    }
+                    drop(broker);
+                    TcpStream::connect_timeout(&direct_address, INTERCEPT_VERDICT_TIMEOUT)?
+                }
+            }
+        }
     };
     stream.set_nonblocking(true)?;
 
@@ -930,6 +1121,8 @@ fn tcp_relay_loop(
         to_smoltcp,
         &relay_wake,
         exit_state,
+        mediated,
+        pending_guest_data,
     )
 }
 
@@ -966,16 +1159,28 @@ fn relay_stream(
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: &WakePipe,
     exit_state: &RelayExitState,
+    mediated: bool,
+    mut pending_guest_data: Option<(Vec<u8>, usize)>,
 ) -> io::Result<RelayExitMode> {
     let mut stream = stream;
     let mut events = Events::new();
     let mut guest_write_closed = false;
     let mut guest_channel_closed = false;
     let mut host_read_closed = false;
-    let mut pending_guest_data: Option<(Vec<u8>, usize)> = None;
     let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];
+    let started = Instant::now();
+    let mut last_activity = started;
 
     loop {
+        if mediated
+            && (started.elapsed() >= MEDIATED_MAX_LIFETIME
+                || last_activity.elapsed() >= MEDIATED_IDLE_TIMEOUT)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mediated TCP flow lifetime expired",
+            ));
+        }
         let mut did_work = false;
 
         if pending_guest_data.is_none() && !guest_channel_closed {
@@ -1070,6 +1275,8 @@ fn relay_stream(
             poller.modify(stream, interest)?;
             events.clear();
             poller.wait(&mut events, Some(RELAY_WAIT_BACKSTOP))?;
+        } else {
+            last_activity = Instant::now();
         }
     }
 }
@@ -1346,6 +1553,20 @@ mod tests {
             table.host_connect_addr(SocketAddr::new(gateway, 10_081)),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_081)
         );
+        let mediated = table.with_intercept(Some(crate::StreamInterception::Mediated(
+            crate::MediatedBinding {
+                endpoint: crate::InterceptEndpoint {
+                    addr: "127.0.0.1:43123".parse().unwrap(),
+                    token: [9; 32],
+                },
+                machine_id: [7; 16],
+                parent_id: [0; 16],
+            },
+        )));
+        assert!(matches!(
+            mediated.outbound_target(SocketAddr::new(gateway, 10_081)),
+            RelayTarget::Connect(address) if address == "127.0.0.1:40081".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -1511,6 +1732,160 @@ mod tests {
             assert!(matches!(table.outbound_target(requested),
                 RelayTarget::Intercept { endpoint: actual, destination }
                     if actual == endpoint && destination == requested));
+        }
+    }
+
+    #[test]
+    fn mediated_decision_precedes_origin_dial_and_preserves_first_bytes() {
+        use std::net::TcpListener;
+
+        for decision in [Decision::Deny, Decision::AllowDirect, Decision::Redirect] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin_addr = origin.local_addr().unwrap();
+            origin.set_nonblocking(true).unwrap();
+            let broker = TcpListener::bind("127.0.0.1:0").unwrap();
+            let binding = crate::MediatedBinding {
+                endpoint: crate::InterceptEndpoint {
+                    addr: broker.local_addr().unwrap(),
+                    token: [0x5a; 32],
+                },
+                machine_id: [7; 16],
+                parent_id: [3; 16],
+            };
+            let destination: SocketAddr = "1.1.1.1:443".parse().unwrap();
+            let broker_thread = thread::spawn(move || {
+                let (mut stream, _) = broker.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let prelude = FlowPrelude::read_from(&mut stream, &binding.endpoint.token).unwrap();
+                assert_eq!(prelude.machine_id, binding.machine_id);
+                assert_eq!(prelude.parent_id, binding.parent_id);
+                assert_eq!(prelude.destination, destination);
+                assert_eq!(prelude.initial_bytes, b"hello");
+                // Nothing may have reached the origin while the broker is
+                // deciding, including a direct-allow candidate.
+                assert!(
+                    matches!(origin.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                );
+                decision.write_to(&mut stream).unwrap();
+                if decision == Decision::Redirect {
+                    stream.write_all(b"redirected").unwrap();
+                }
+                if decision == Decision::AllowDirect {
+                    origin.set_nonblocking(false).unwrap();
+                    let (mut upstream, _) = origin.accept().unwrap();
+                    let mut data = [0; 5];
+                    upstream.read_exact(&mut data).unwrap();
+                    assert_eq!(&data, b"hello");
+                    upstream.write_all(b"direct").unwrap();
+                }
+                if decision == Decision::Deny {
+                    assert!(
+                        matches!(origin.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                    );
+                }
+            });
+            let (guest_tx, guest_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+            let (reply_tx, reply_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+            guest_tx.send(b"hello".to_vec()).unwrap();
+            drop(guest_tx);
+            let state = RelayExitState::new();
+            let result = tcp_relay_loop(
+                destination,
+                RelayTarget::Mediated {
+                    binding,
+                    destination,
+                    direct_address: origin_addr,
+                    direct_allowed: true,
+                    audit: EgressPolicy::unrestricted(),
+                },
+                guest_rx,
+                reply_tx,
+                Arc::new(WakePipe::new()),
+                &state,
+            );
+            broker_thread.join().unwrap();
+            if decision == Decision::Deny {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(
+                    reply_rx.recv().unwrap(),
+                    if decision == Decision::Redirect {
+                        b"redirected".to_vec()
+                    } else {
+                        b"direct".to_vec()
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mediated_hold_handles_server_first_and_payload_cap() {
+        use std::net::TcpListener;
+
+        for payload in [None, Some(vec![b'x'; MAX_INITIAL_BYTES + 808])] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let binding = crate::MediatedBinding {
+                endpoint: crate::InterceptEndpoint {
+                    addr: listener.local_addr().unwrap(),
+                    token: [4; 32],
+                },
+                machine_id: [5; 16],
+                parent_id: [0; 16],
+            };
+            let destination: SocketAddr = "1.1.1.1:25".parse().unwrap();
+            let expected = payload.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let prelude = FlowPrelude::read_from(&mut stream, &binding.endpoint.token).unwrap();
+                if expected.is_some() {
+                    assert_eq!(prelude.initial_bytes, vec![b'x'; MAX_INITIAL_BYTES]);
+                } else {
+                    assert!(prelude.initial_bytes.is_empty());
+                }
+                Decision::Redirect.write_to(&mut stream).unwrap();
+                if expected.is_some() {
+                    let mut rest = vec![0; 808];
+                    stream.read_exact(&mut rest).unwrap();
+                    assert_eq!(rest, vec![b'x'; 808]);
+                }
+                stream.write_all(b"greeting").unwrap();
+            });
+            let (guest_tx, guest_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+            let (reply_tx, reply_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+            if let Some(payload) = payload {
+                guest_tx.send(payload).unwrap();
+            }
+            let state = RelayExitState::new();
+            let relay = thread::spawn(move || {
+                tcp_relay_loop(
+                    destination,
+                    RelayTarget::Mediated {
+                        binding,
+                        destination,
+                        direct_address: destination,
+                        direct_allowed: false,
+                        audit: EgressPolicy::unrestricted(),
+                    },
+                    guest_rx,
+                    reply_tx,
+                    Arc::new(WakePipe::new()),
+                    &state,
+                )
+            });
+            assert_eq!(
+                reply_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                b"greeting"
+            );
+            drop(guest_tx);
+            assert!(relay.join().unwrap().is_ok());
+            server.join().unwrap();
         }
     }
 

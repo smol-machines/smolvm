@@ -51,16 +51,19 @@ pub struct S3Volume {
 }
 
 pub mod credentials;
+pub mod egress_rule;
 pub mod forkpoint;
 pub mod guest_env;
 pub mod host_pattern;
 pub mod image_ref;
 pub mod intercept;
+pub mod mediated_egress;
 pub mod publish_socket;
 pub mod retry;
 pub mod secrets;
 
 pub use credentials::{CredentialBinding, CredentialPolicy};
+pub use egress_rule::{EgressRule, FlowTransport, PortRange, RuleAction};
 pub use image_ref::{image_repo, normalize_image_ref};
 pub use intercept::InterceptEndpoint;
 pub use secrets::{SecretRef, SecretSourceKind};

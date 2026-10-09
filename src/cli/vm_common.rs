@@ -922,6 +922,7 @@ pub struct ForkVmOptions<'a> {
     pub wait_ready: Option<std::time::Duration>,
     pub hold: bool,
     pub freeze_source: bool,
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 }
 
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
@@ -937,6 +938,12 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     // clone's mount wedges its container namespace and every exec hangs.
     // Refuse cleanly until fork remounts remote volumes on restore.
     if let Some(record) = db.get_vm(golden)? {
+        if record.external_interceptor_required && options.external_interceptor.is_none() {
+            return Err(smolvm::Error::config(
+                "machine branch",
+                "source requires --egress-interceptor and SMOLVM_INTERCEPTOR_TOKEN for each child",
+            ));
+        }
         if !record.remote_volumes.is_empty() {
             return Err(smolvm::Error::config(
                 "machine fork",
@@ -1002,6 +1009,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         options.share_weights,
         options.fork_env,
         None,
+        options.external_interceptor,
     ) {
         return retain_failed_fork(golden, &snapshot_dir, error);
     }
@@ -1043,6 +1051,7 @@ pub struct ForkBatchOptions<'a> {
     /// Wait this long for each released child to run `smolvm-worker-ready`,
     /// tearing the batch down if one never does.
     pub worker_ready: Option<std::time::Duration>,
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 }
 
 pub fn fork_vm_batch(
@@ -1058,6 +1067,7 @@ pub fn fork_vm_batch(
         hold,
         freeze_source,
         worker_ready,
+        external_interceptor,
     } = options;
     let source_policy = if freeze_source {
         smolvm::agent::fork::ForkSourcePolicy::Freeze
@@ -1071,6 +1081,12 @@ pub fn fork_vm_batch(
     // clone's mount wedges its container namespace and every exec hangs.
     // Refuse cleanly until fork remounts remote volumes on restore.
     if let Some(record) = db.get_vm(golden)? {
+        if record.external_interceptor_required && external_interceptor.is_none() {
+            return Err(smolvm::Error::config(
+                "machine branch",
+                "source requires --egress-interceptor and SMOLVM_INTERCEPTOR_TOKEN for each child",
+            ));
+        }
         if !record.remote_volumes.is_empty() {
             return Err(smolvm::Error::config(
                 "machine fork",
@@ -1148,6 +1164,7 @@ pub fn fork_vm_batch(
                                 share_weights,
                                 &env,
                                 Some(retry_gate),
+                                external_interceptor,
                             )
                         }))
                         .unwrap_or_else(|_| {
@@ -1348,6 +1365,7 @@ fn boot_prepared_fork(
     share_weights: bool,
     fork_env: &[(String, String)],
     retry_gate: Option<&std::sync::Mutex<()>>,
+    external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 ) -> smolvm::Result<()> {
     let preload_modules = prep.clone_record.cuda_preload_modules;
     let clone_forkable = prep.clone_record.forkable;
@@ -1369,7 +1387,11 @@ fn boot_prepared_fork(
             },
             // A clone inherits the golden's running workload from the snapshot
             // (from_snapshot = true already skips relaunch); never provision-only.
-            StartOptions::default(),
+            StartOptions {
+                external_interceptor,
+                mediated_egress: prep.clone_record.mediated_egress_required,
+                ..Default::default()
+            },
         )
     };
     let started = match retry_gate {
@@ -1576,6 +1598,7 @@ pub struct StartOptions {
     /// Reuse an image digest resolved at most this many seconds ago when
     /// seeding, instead of resolving at the registry on every first start.
     pub seed_digest_ttl: Option<u64>,
+    pub mediated_egress: bool,
 }
 
 /// Start a named machine that has a config record.
@@ -1609,6 +1632,7 @@ fn start_vm_named_with_db(
         no_workload,
         external_interceptor,
         seed_digest_ttl,
+        mediated_egress,
     } = options;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
@@ -1626,12 +1650,6 @@ fn start_vm_named_with_db(
             record.credential_policy.is_some(),
             false,
         )?;
-        if from_snapshot || fork.forkable || record.forkable_on_start() {
-            return Err(Error::config(
-                "egress interceptor",
-                "external interception does not support checkpoint or branch launches",
-            ));
-        }
     }
 
     // A Smolfile-declared fork base starts forkable without requiring the user
@@ -1826,6 +1844,7 @@ fn start_vm_named_with_db(
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
         external_interceptor,
+        mediated_egress,
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
         // 0700 data dir.

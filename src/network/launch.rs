@@ -127,11 +127,10 @@ pub fn plan_launch_network_with(
     has_credentials: bool,
 ) -> LaunchNetworkPlan {
     let has_ports = port_count > 0;
-    let has_cidr_policy = resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|cidrs| !cidrs.is_empty());
-    let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
+    // Some([]) is a deny-all policy, not an absent policy. Treating it as
+    // absent would allow an explicit TSI launch to bypass enforcement.
+    let has_cidr_policy = resources.allowed_cidrs.is_some() || !resources.egress_rules.is_empty();
+    let has_dns_filter = dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
     let has_fabric = resources.network_name.is_some();
     // A custom guest subnet shapes the virtio-net link, so like a named
@@ -291,11 +290,9 @@ pub fn validate_requested_network_backend(
 ) -> crate::Result<()> {
     // An egress policy is only enforced under virtio-net; TSI would silently let
     // it through.
-    let has_egress_policy = resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|c| !c.is_empty())
-        || dns_filter_hosts.is_some_and(|h| !h.is_empty());
+    let has_egress_policy = resources.allowed_cidrs.is_some()
+        || !resources.egress_rules.is_empty()
+        || dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
 
     // Mirror plan_launch_network's default: unset backend + (ports OR egress
@@ -367,11 +364,8 @@ pub fn validate_requested_network_backend(
         return Ok(());
     }
 
-    let has_cidr_policy = resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|cidrs| !cidrs.is_empty());
-    let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
+    let has_cidr_policy = resources.allowed_cidrs.is_some() || !resources.egress_rules.is_empty();
+    let has_dns_filter = dns_filter_hosts.is_some();
     let wants_network = resources.network || port_count > 0 || has_cidr_policy || has_dns_filter;
 
     if !wants_network {
@@ -550,6 +544,21 @@ mod tests {
         resources.network_backend = Some(NetworkBackend::Tsi);
         resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
         assert!(validate_requested_network_backend(&resources, None, 0).is_err());
+    }
+
+    #[test]
+    fn empty_allow_lists_still_require_enforcing_backend() {
+        let mut resources = resources();
+        resources.allowed_cidrs = Some(vec![]);
+        assert_eq!(
+            plan_launch_network(&resources, None, 0).backend,
+            EffectiveNetworkBackend::VirtioNet
+        );
+        resources.network_backend = Some(NetworkBackend::Tsi);
+        assert!(validate_requested_network_backend(&resources, None, 0).is_err());
+
+        resources.allowed_cidrs = None;
+        assert!(validate_requested_network_backend(&resources, Some(&[]), 0).is_err());
     }
 
     #[test]

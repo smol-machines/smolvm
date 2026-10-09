@@ -300,17 +300,29 @@ pub enum StreamInterception {
     /// Route every outbound TCP flow; DNS remains host-managed and other
     /// outbound datagrams are denied.
     AllTcp(InterceptEndpoint),
+    /// Decide every admitted TCP flow through the versioned host-only protocol.
+    Mediated(MediatedBinding),
+}
+
+/// Launch-scoped identity for the mediated egress decider. Never given to the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediatedBinding {
+    pub endpoint: InterceptEndpoint,
+    pub machine_id: [u8; 16],
+    pub parent_id: [u8; 16],
 }
 
 impl StreamInterception {
     pub(crate) fn all_tcp(&self) -> bool {
-        matches!(self, Self::AllTcp(_))
+        matches!(self, Self::AllTcp(_) | Self::Mediated(_))
     }
 }
 
 /// Filename of the per-VM egress denial audit log, created beside the vsock
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
+/// Structured decisions for a VM running the mediated egress protocol.
+pub const EGRESS_DECISIONS_LOG: &str = "egress-decisions.jsonl";
 
 /// Filename of the per-VM egress control socket, served by the network runtime
 /// of a machine started with an allow list. The host sends it a replacement

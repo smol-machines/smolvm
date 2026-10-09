@@ -207,6 +207,8 @@ pub struct MachineRegistration {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// A restored checkpoint cannot start until its host mediator is rebound.
+    pub mediated_egress_required: bool,
     /// Whether ordinary starts should preserve file-backed, forkable RAM.
     pub forkable: bool,
     /// Whether image pull and init were already completed in captured state.
@@ -601,6 +603,7 @@ impl ApiState {
                 disk_durability: Some(record.disk_durability),
                 cache_disk: record.cache_disk.as_ref().map(cache_disk_spec),
                 allowed_cidrs: record.allowed_cidrs.clone(),
+                egress_rules: record.egress_rules.clone(),
                 allowed_hosts: record.dns_filter_hosts.clone(),
                 credentials: record.credential_policy.clone(),
                 network_backend: record.network_backend,
@@ -1190,6 +1193,9 @@ impl ApiState {
         // Persist egress policy + backend selection from the request (previously
         // dropped here, so API-created machines silently lost both).
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
+        record.egress_rules = reg.resources.egress_rules.clone();
+        record.mediated_egress_required = reg.mediated_egress_required;
+        record.external_interceptor_required = reg.mediated_egress_required;
         record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
         if let Some(policy) = reg.resources.credentials.clone().filter(|p| !p.is_empty()) {
             record.credential_placeholders = if reg.credential_placeholders.is_empty() {
@@ -1939,6 +1945,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         disks: Vec::new(),
         cache_disk: None,
         allowed_cidrs: spec.allowed_cidrs.clone(),
+        egress_rules: spec.egress_rules.clone(),
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
         dns: None,
@@ -1973,6 +1980,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         disk_durability: Some(res.disk_durability),
         cache_disk: res.cache_disk.as_ref().map(cache_disk_spec),
         allowed_cidrs: res.allowed_cidrs,
+        egress_rules: res.egress_rules,
         // VmResources has no hostname allow-list; callers that need it graft it
         // back from the source record (see the MachineEntry reload path).
         allowed_hosts: None,
@@ -2057,6 +2065,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         cuda: entry.resources.cuda.unwrap_or(false),
         network_backend: entry.resources.network_backend,
         allowed_cidrs: entry.resources.allowed_cidrs.clone(),
+        egress_rules: entry.resources.egress_rules.clone(),
         allowed_hosts: entry.resources.allowed_hosts.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
@@ -2228,6 +2237,7 @@ mod tests {
             disk_durability: None,
             cache_disk: None,
             allowed_cidrs: None,
+            egress_rules: Vec::new(),
             allowed_hosts: None,
             credentials: None,
             network_backend: None,
@@ -2309,6 +2319,7 @@ mod tests {
                     disk_durability: None,
                     cache_disk: None,
                     allowed_cidrs: None,
+                    egress_rules: Vec::new(),
                     allowed_hosts: None,
                     credentials: None,
                     network_backend: None,
@@ -2432,6 +2443,7 @@ mod tests {
                     disk_durability: None,
                     cache_disk: None,
                     allowed_cidrs: None,
+                    egress_rules: Vec::new(),
                     allowed_hosts: None,
                     credentials: None,
                     network_backend: None,
@@ -2509,6 +2521,7 @@ mod tests {
                     disk_durability: None,
                     cache_disk: None,
                     allowed_cidrs: None,
+                    egress_rules: Vec::new(),
                     allowed_hosts: None,
                     credentials: None,
                     network_backend: None,

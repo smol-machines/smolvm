@@ -550,6 +550,9 @@ pub struct VmRecord {
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Ordered host-enforced L4 egress rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
 
     /// Preferred network backend override for machine launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -677,6 +680,12 @@ pub struct VmRecord {
     /// are never written to the machine record.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub external_interceptor_required: bool,
+
+    /// This machine requires the versioned mediated protocol on every start.
+    /// The broker binding remains launch-scoped; a legacy binding cannot
+    /// silently downgrade a previously mediated machine.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mediated_egress_required: bool,
 
     /// Binding name → placeholder handed to the guest in the bound variable.
     /// Minted once at create and kept stable so processes captured in a
@@ -872,6 +881,7 @@ impl VmRecord {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            egress_rules: Vec::new(),
             network_backend: None,
             dns: None,
             network_name: None,
@@ -898,6 +908,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
+            mediated_egress_required: false,
             credential_placeholders: std::collections::BTreeMap::new(),
             credentials_supplied_by_api: false,
             ephemeral: false,
@@ -961,6 +972,7 @@ impl VmRecord {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            egress_rules: Vec::new(),
             network_backend: None,
             dns: None,
             network_name: None,
@@ -987,6 +999,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
+            mediated_egress_required: false,
             credential_placeholders: std::collections::BTreeMap::new(),
             credentials_supplied_by_api: false,
             ephemeral: false,
@@ -1429,6 +1442,7 @@ impl VmRecord {
             disks: self.disks.clone(),
             cache_disk: self.cache_disk.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
+            egress_rules: self.egress_rules.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),

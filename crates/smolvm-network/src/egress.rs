@@ -1,10 +1,9 @@
 //! Outbound egress policy for the virtio-net gateway.
 //!
-//! TSI enforces `allowed_cidrs` + `--allow-host` inside libkrun's socket-intercept
-//! layer; the virtio-net gateway terminates every guest flow itself, so it applies
-//! the same allow-list at the point it opens a host connection
-//! (`TcpRelayTable::create_tcp_socket`). This mirrors libkrun's `vsock/dns_filter.rs`
-//! `EgressPolicy` so both backends behave identically:
+//! The virtio-net gateway terminates every guest flow and applies this policy
+//! before it opens a host connection (`TcpRelayTable::create_tcp_socket`). TSI
+//! is rejected for policy-bearing machines because its libkrun filter has not
+//! enforced the equivalent policy in empirical tests:
 //!
 //! - static `allowed_cidrs` (IPv4 or IPv6) are always permitted;
 //! - `--allow-host` names are matched by the gateway's DNS interception, and the
@@ -25,6 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::dns;
+use smolvm_protocol::{EgressRule, FlowTransport, RuleAction};
 
 /// Learned-IP TTL clamp, matching libkrun's DNS filter.
 const MIN_LEARNED_TTL: u64 = 60;
@@ -348,6 +348,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
 #[derive(Clone)]
 pub struct EgressPolicy {
     inner: Option<Arc<AllowList>>,
+    rules: Arc<Vec<CompiledRule>>,
     /// Hard-floor scope, resolved once from the deployment context at creation.
     floor: FloorMode,
     /// Audit sink for denials. When set, every denied connect/sendto/resolve is
@@ -360,6 +361,7 @@ pub struct EgressPolicy {
     /// Audit sink for watchlist matches, kept apart from denials so neither
     /// evicts the other. Created on the first match only.
     signal_log: Option<Arc<std::path::PathBuf>>,
+    decision_log: Option<Arc<DecisionLog>>,
 }
 
 /// Append one timestamped line to an audit file, rotating it once past 8 MiB
@@ -384,15 +386,41 @@ fn append_audit_line(path: &std::path::Path, message: &str) {
     }
 }
 
+impl std::fmt::Debug for EgressPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EgressPolicy")
+            .field("restricted", &self.is_restricted())
+            .finish()
+    }
+}
+
+struct DecisionLog {
+    path: std::path::PathBuf,
+    machine_id: [u8; 16],
+    parent_id: [u8; 16],
+    lock: Mutex<()>,
+}
+
+#[derive(Clone)]
+struct CompiledRule {
+    transport: Option<FlowTransport>,
+    cidr: Option<Cidr>,
+    ports: Option<smolvm_protocol::PortRange>,
+    action: RuleAction,
+}
+
 impl EgressPolicy {
     /// No allow-list — every destination is allowed EXCEPT the platform hard-floor.
     pub fn unrestricted() -> Self {
         Self {
             inner: None,
+            rules: Arc::new(Vec::new()),
             floor: floor_mode(),
             denial_log: None,
             watchlist: None,
             signal_log: None,
+            decision_log: None,
         }
     }
 
@@ -409,10 +437,12 @@ impl EgressPolicy {
                 rules: RwLock::new(Arc::new(Rules::build(allowed_cidrs, allowed_hosts))),
                 learned: Mutex::new(HashMap::new()),
             })),
+            rules: Arc::new(Vec::new()),
             floor: floor_mode(),
             denial_log: None,
             watchlist: None,
             signal_log: None,
+            decision_log: None,
         }
     }
 
@@ -445,6 +475,148 @@ impl EgressPolicy {
         self
     }
 
+    /// Compile an ordered rule list at launch. Invalid rules fail launch rather
+    /// than silently weakening the effective policy.
+    pub fn with_rules(mut self, rules: &[EgressRule]) -> Result<Self, String> {
+        let mut compiled = Vec::with_capacity(rules.len());
+        for (index, rule) in rules.iter().enumerate() {
+            let cidr = match rule.cidr.as_deref() {
+                Some(spec) => Some(
+                    Cidr::parse(spec)
+                        .ok_or_else(|| format!("egress rule {index}: invalid CIDR"))?,
+                ),
+                None => None,
+            };
+            if let Some(ports) = rule.ports {
+                if ports.start == 0
+                    || ports.end < ports.start
+                    || rule.transport == Some(FlowTransport::Icmp)
+                {
+                    return Err(format!(
+                        "egress rule {index}: invalid port range or transport"
+                    ));
+                }
+            }
+            if rule.action == RuleAction::Redirect && rule.transport != Some(FlowTransport::Tcp) {
+                return Err(format!(
+                    "egress rule {index}: redirect requires TCP transport"
+                ));
+            }
+            compiled.push(CompiledRule {
+                transport: rule.transport,
+                cidr,
+                ports: rule.ports,
+                action: rule.action,
+            });
+        }
+        self.rules = Arc::new(compiled);
+        Ok(self)
+    }
+
+    /// First matching rule after the platform floor. The strict floor is
+    /// absolute; local loopback needs an explicit matching static allow.
+    pub fn rule_action(
+        &self,
+        transport: FlowTransport,
+        ip: IpAddr,
+        port: Option<u16>,
+    ) -> Option<RuleAction> {
+        let action = self
+            .rules
+            .iter()
+            .find(|rule| {
+                rule.transport.is_none_or(|value| value == transport)
+                    && rule.cidr.is_none_or(|cidr| cidr.contains(ip))
+                    && rule.ports.is_none_or(|ports| {
+                        port.is_some_and(|port| (ports.start..=ports.end).contains(&port))
+                    })
+            })
+            .map(|rule| rule.action);
+        action?;
+        if !is_floored(ip, self.floor) {
+            return action;
+        }
+        if self.floor != FloorMode::Strict
+            && is_host_loopback(ip)
+            && action == Some(RuleAction::Allow)
+        {
+            return action;
+        }
+        Some(RuleAction::Deny)
+    }
+
+    pub fn allows_flow(&self, transport: FlowTransport, ip: IpAddr, port: Option<u16>) -> bool {
+        match self.rule_action(transport, ip, port) {
+            Some(RuleAction::Allow | RuleAction::Redirect) => true,
+            Some(RuleAction::Deny) => false,
+            None => self.allows(ip),
+        }
+    }
+
+    /// Attach the structured decision record for a host-minted launch.
+    pub fn with_mediation_audit(
+        mut self,
+        path: std::path::PathBuf,
+        machine_id: [u8; 16],
+        parent_id: [u8; 16],
+    ) -> Self {
+        self.decision_log = Some(Arc::new(DecisionLog {
+            path,
+            machine_id,
+            parent_id,
+            lock: Mutex::new(()),
+        }));
+        self
+    }
+
+    /// Append one host-observed enforcement decision. A caller admitting a
+    /// flow must propagate an I/O error rather than dial without its record.
+    pub fn record_decision(
+        &self,
+        transport: &str,
+        action: &str,
+        destination: &dyn std::fmt::Display,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let Some(log) = &self.decision_log else {
+            return Ok(());
+        };
+        let _guard = log
+            .lock
+            .lock()
+            .map_err(|_| std::io::Error::other("mediated egress audit lock is poisoned"))?;
+        const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+        if std::fs::metadata(&log.path).is_ok_and(|metadata| metadata.len() >= ROTATE_BYTES) {
+            std::fs::rename(&log.path, log.path.with_extension("jsonl.1"))?;
+        }
+        let hex_id = |bytes: &[u8; 16]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let event = serde_json::json!({
+            "timestampMs": timestamp_ms,
+            "machineId": hex_id(&log.machine_id),
+            "parentId": hex_id(&log.parent_id),
+            "transport": transport,
+            "action": action,
+            "destination": destination.to_string(),
+            "reason": reason,
+        });
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log.path)?;
+        serde_json::to_writer(&mut file, &event)?;
+        file.write_all(b"\n")
+    }
+
     /// Record one denial: a stderr line for anyone tailing the boot log, and —
     /// when a sink is attached — an appended line in the dedicated audit file,
     /// which connection chatter can never evict. Keep the marker text stable:
@@ -453,6 +625,16 @@ impl EgressPolicy {
     /// The sink rotates once past 8 MiB (`.1` suffix) so a workload hammering a
     /// denied destination at packet rate can't fill the host disk.
     pub fn record_denial(&self, operation: &str, dest: &dyn std::fmt::Display) {
+        let transport = match operation {
+            "connect" => "tcp",
+            "sendto" => "udp",
+            "icmp" => "icmp",
+            "resolve" => "dns",
+            _ => "unknown",
+        };
+        if let Err(error) = self.record_decision(transport, "deny", dest, "local_policy") {
+            tracing::warn!(%error, "could not record mediated egress denial");
+        }
         crate::virtio_net_log!("egress policy denied {} {}", operation, dest);
         if let Some(path) = self.denial_log.as_deref() {
             append_audit_line(path, &format!("egress policy denied {operation} {dest}"));
@@ -525,9 +707,31 @@ impl EgressPolicy {
         Self::new(allowed, None)
     }
 
+    /// Deny outbound datagrams while retaining this VM's floor and audit sink.
+    /// Full TCP interception uses this for UDP and ICMP so neither protocol can
+    /// bypass the interceptor, and denials remain visible in the VM audit log.
+    pub fn deny_all_datagrams(&self) -> Self {
+        Self {
+            // No CIDR admits anything, and DNS filtering stays as it was off.
+            inner: Some(Arc::new(AllowList {
+                rules: RwLock::new(Arc::new(Rules {
+                    cidrs: Vec::new(),
+                    allowed_hosts: None,
+                })),
+                learned: Mutex::new(HashMap::new()),
+            })),
+            rules: self.rules.clone(),
+            floor: self.floor,
+            denial_log: self.denial_log.clone(),
+            watchlist: self.watchlist.clone(),
+            signal_log: self.signal_log.clone(),
+            decision_log: self.decision_log.clone(),
+        }
+    }
+
     /// Whether any policy is in force (false = allow-all).
     pub fn is_restricted(&self) -> bool {
-        self.inner.is_some()
+        self.inner.is_some() || !self.rules.is_empty()
     }
 
     /// Whether the gateway should DNS-filter queries (an allow-host list is set).
@@ -540,10 +744,14 @@ impl EgressPolicy {
     /// Whether a DNS query for `hostname` should be forwarded upstream. With no
     /// allow-host list, all queries pass (exact + subdomain match otherwise).
     pub fn hostname_allowed(&self, hostname: &str) -> bool {
-        match &self.inner {
+        let allowed = match &self.inner {
             None => true,
             Some(list) => list.rules().hostname_allowed(hostname),
-        }
+        };
+        allowed
+            && self
+                .record_decision("dns", "allow", &hostname, "local_policy")
+                .is_ok()
     }
 
     /// Whether an outbound connection to `ip` (v4 or v6) is permitted.
@@ -710,6 +918,126 @@ mod tests {
             .replace_allow_list(&render_live_policy(&[], &["pypi.org".into()]))
             .is_err());
         assert!(!open.is_restricted());
+    }
+
+    #[test]
+    fn ordered_rules_match_transport_cidr_and_port_before_legacy_policy() {
+        use smolvm_protocol::{EgressRule, FlowTransport, PortRange, RuleAction};
+        let policy = EgressPolicy::from_allowed_cidrs(Some(&[]))
+            .with_rules(&[
+                EgressRule {
+                    transport: Some(FlowTransport::Tcp),
+                    cidr: Some("1.1.1.0/24".into()),
+                    ports: Some(PortRange {
+                        start: 443,
+                        end: 443,
+                    }),
+                    action: RuleAction::Deny,
+                },
+                EgressRule {
+                    transport: Some(FlowTransport::Tcp),
+                    cidr: Some("1.1.1.0/24".into()),
+                    ports: Some(PortRange {
+                        start: 400,
+                        end: 500,
+                    }),
+                    action: RuleAction::Allow,
+                },
+                EgressRule {
+                    transport: Some(FlowTransport::Udp),
+                    cidr: Some("1.1.1.1".into()),
+                    ports: Some(PortRange {
+                        start: 123,
+                        end: 123,
+                    }),
+                    action: RuleAction::Allow,
+                },
+            ])
+            .unwrap();
+        let target = "1.1.1.1".parse().unwrap();
+        assert!(!policy.allows_flow(FlowTransport::Tcp, target, Some(443)));
+        assert!(policy.allows_flow(FlowTransport::Tcp, target, Some(444)));
+        assert!(!policy.allows_flow(FlowTransport::Tcp, target, Some(123)));
+        assert!(policy.allows_flow(FlowTransport::Udp, target, Some(123)));
+        assert!(!policy.allows_flow(FlowTransport::Icmp, target, None));
+    }
+
+    #[test]
+    fn invalid_rules_fail_launch_and_strict_floor_cannot_be_overridden() {
+        use smolvm_protocol::{EgressRule, FlowTransport, PortRange, RuleAction};
+        let allow = |cidr: &str| EgressRule {
+            transport: Some(FlowTransport::Tcp),
+            cidr: Some(cidr.into()),
+            ports: None,
+            action: RuleAction::Allow,
+        };
+        assert!(EgressPolicy::unrestricted()
+            .with_rules(&[allow("bad-cidr")])
+            .is_err());
+        assert!(EgressPolicy::unrestricted()
+            .with_rules(&[EgressRule {
+                transport: Some(FlowTransport::Icmp),
+                cidr: None,
+                ports: Some(PortRange { start: 1, end: 2 }),
+                action: RuleAction::Allow
+            }])
+            .is_err());
+        assert!(EgressPolicy::unrestricted()
+            .with_rules(&[EgressRule {
+                transport: None,
+                cidr: None,
+                ports: None,
+                action: RuleAction::Redirect
+            }])
+            .is_err());
+        let mut policy = EgressPolicy::unrestricted()
+            .with_rules(&[allow("127.0.0.1")])
+            .unwrap();
+        policy.floor = FloorMode::Strict;
+        assert!(!policy.allows_flow(FlowTransport::Tcp, "127.0.0.1".parse().unwrap(), Some(80)));
+    }
+
+    #[test]
+    fn intercepted_datagrams_are_denied_without_losing_the_audit_sink() {
+        let original = EgressPolicy::unrestricted()
+            .with_denial_log(std::path::PathBuf::from("/tmp/smolvm-egress-audit-test"));
+        let datagrams = original.deny_all_datagrams();
+        let destination = "1.1.1.1".parse().unwrap();
+        assert!(original.allows(destination));
+        assert!(!datagrams.allows(destination));
+        assert!(Arc::ptr_eq(
+            original.denial_log.as_ref().unwrap(),
+            datagrams.denial_log.as_ref().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn mediated_decisions_are_structured_and_dns_fails_closed_without_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let policy =
+            EgressPolicy::unrestricted().with_mediation_audit(path.clone(), [7; 16], [3; 16]);
+        assert!(policy.hostname_allowed("example.com"));
+        policy
+            .record_decision("tcp", "redirect", &"1.1.1.1:443", "broker_decision")
+            .unwrap();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["transport"], "dns");
+        assert_eq!(events[1]["action"], "redirect");
+        assert_eq!(events[1]["machineId"], "07".repeat(16));
+        assert_eq!(events[1]["parentId"], "03".repeat(16));
+
+        let unwritable = EgressPolicy::unrestricted().with_mediation_audit(
+            dir.path().to_path_buf(),
+            [7; 16],
+            [0; 16],
+        );
+        assert!(!unwritable.hostname_allowed("example.com"));
     }
 
     #[test]

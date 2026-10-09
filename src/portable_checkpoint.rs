@@ -1388,6 +1388,13 @@ fn restored_record(
     record.storage_gb = checkpoint.storage_gib;
     record.overlay_gb = checkpoint.overlay_gib;
     record.allowed_cidrs = network.and_then(|network| network.allowed_cidrs.clone());
+    record.egress_rules = network.map_or_else(Vec::new, |network| network.egress_rules.clone());
+    smolvm_network::EgressPolicy::unrestricted()
+        .with_rules(&record.egress_rules)
+        .map_err(|reason| Error::config("restore checkpoint egress rules", reason))?;
+    record.mediated_egress_required =
+        network.is_some_and(|network| network.mediated_egress_required);
+    record.external_interceptor_required = record.mediated_egress_required;
     record.dns_filter_hosts = network.and_then(|network| network.dns_filter_hosts.clone());
     if let Some(policy) = network.and_then(|network| network.credential_policy.clone()) {
         // The artifact is untrusted: hold its policy to the same rules create
@@ -3638,6 +3645,8 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         network_name: vm.network_name.clone(),
         guest_subnet: vm.guest_subnet.clone(),
         allowed_cidrs: vm.allowed_cidrs.clone(),
+        egress_rules: vm.egress_rules.clone(),
+        mediated_egress_required: vm.mediated_egress_required,
         dns_filter_hosts: vm.dns_filter_hosts.clone(),
         // The captured workload holds its placeholders (in its environment and
         // possibly its RAM), so the policy and the exact placeholders must
@@ -8286,6 +8295,32 @@ mod tests {
             ..CheckpointNetwork::default()
         });
         assert!(restored_record("cred-restored", &manifest, &checkpoint).is_err());
+    }
+
+    #[test]
+    fn mediated_rules_and_rebind_requirement_survive_checkpoint_restore() {
+        let mut record = VmRecord::new("mediated".into(), 2, 1024, Vec::new(), Vec::new(), true);
+        record.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: Some(smolvm_protocol::FlowTransport::Tcp),
+            cidr: Some("1.1.1.1/32".into()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Redirect,
+        }];
+        record.mediated_egress_required = true;
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.network = Some(checkpoint_network(&record));
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://mediated".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let restored = restored_record("mediated-restored", &manifest, &checkpoint).unwrap();
+        assert_eq!(restored.egress_rules, record.egress_rules);
+        assert!(restored.mediated_egress_required && restored.external_interceptor_required);
+
+        checkpoint.network.as_mut().unwrap().egress_rules[0].cidr = Some("invalid".into());
+        assert!(restored_record("bad-mediated", &manifest, &checkpoint).is_err());
     }
 
     #[test]

@@ -380,7 +380,11 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
     }
 
-    let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
+    let network_plan = plan_launch_network(
+        &config.resources,
+        config.dns_filter_hosts.as_deref(),
+        config.port_mappings.len(),
+    );
 
     // `mut` is only needed on unix (the VirtioNet arm assigns it); on Windows
     // the runtime is owned by the accept thread, so the binding stays `None`.
@@ -414,68 +418,6 @@ pub fn launch_agent_vm_dynamic(
 
             if unsafe { (krun.set_port_map)(ctx, port_ptrs.as_ptr()) } < 0 {
                 free_ctx_on_err!("krun_set_port_map failed");
-            }
-
-            // Egress policy: static CIDRs plus DNS allow-host filtering enforced
-            // inside libkrun, mirroring the main launcher's TSI arm. When
-            // allow-hosts are set, guest UDP:53 queries are forwarded only to the
-            // trusted resolver and A/AAAA answers for allowed hosts become
-            // temporarily allowed IPs.
-            let egress_hosts = config.dns_filter_hosts.clone().unwrap_or_default();
-            let has_cidrs = config
-                .resources
-                .allowed_cidrs
-                .as_ref()
-                .is_some_and(|cidrs| !cidrs.is_empty());
-            if has_cidrs || !egress_hosts.is_empty() {
-                let set_egress = krun.set_egress_policy.ok_or_else(|| {
-                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                     Update libkrun or remove --allow-cidr/--allow-host flags."
-                        .to_string()
-                })?;
-
-                let mut all_cidrs = config.resources.allowed_cidrs.clone().unwrap_or_default();
-                crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
-
-                let cidr_cstrings: Vec<CString> = match all_cidrs
-                    .iter()
-                    .map(|c| CString::new(c.as_str()))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                {
-                    Ok(v) => v,
-                    Err(_) => free_ctx_on_err!("allow-CIDR contains an interior NUL byte"),
-                };
-                let mut cidr_ptrs: Vec<*const libc::c_char> =
-                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                cidr_ptrs.push(std::ptr::null());
-
-                let host_cstrings: Vec<CString> = match egress_hosts
-                    .iter()
-                    .map(|h| CString::new(h.as_str()))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                {
-                    Ok(v) => v,
-                    Err(_) => free_ctx_on_err!("allow-host contains an interior NUL byte"),
-                };
-                let mut host_ptrs: Vec<*const libc::c_char> =
-                    host_cstrings.iter().map(|s| s.as_ptr()).collect();
-                host_ptrs.push(std::ptr::null());
-
-                let resolver_cstring =
-                    CString::new(crate::data::network::default_dns_addr().to_string())
-                        .expect("resolver IP has no null bytes");
-                let resolver_ptrs: Vec<*const libc::c_char> =
-                    vec![resolver_cstring.as_ptr(), std::ptr::null()];
-
-                let (host_arg, resolver_arg) = if egress_hosts.is_empty() {
-                    (std::ptr::null(), std::ptr::null())
-                } else {
-                    (host_ptrs.as_ptr(), resolver_ptrs.as_ptr())
-                };
-
-                if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr(), host_arg, resolver_arg) } < 0 {
-                    free_ctx_on_err!("krun_set_egress_policy failed");
-                }
             }
 
             tracing::info!("network backend: tsi");
@@ -516,8 +458,11 @@ pub fn launch_agent_vm_dynamic(
                     config.resources.allowed_cidrs.as_deref(),
                     config.dns_filter_hosts.as_deref(),
                 )
+                .with_rules(&config.resources.egress_rules)
+                .map_err(|reason| format!("invalid egress rules: {reason}"))?
             } else {
-                // Networked only to serve published ports: inbound only.
+                // Networked only to serve published ports: inbound only,
+                // and no egress rule may reopen outbound.
                 smolvm_network::EgressPolicy::deny_all()
             };
             if let Some(dir) = config.vsock_socket.parent() {

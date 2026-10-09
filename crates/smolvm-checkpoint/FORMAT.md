@@ -229,6 +229,8 @@ format and is unaffected by the file extension.
 | `backend` | `"tsi"` \| `"virtio-net"` | Optional |
 | `ports` | array of `{ "host", "guest" }` | Optional. Non-zero, unique host ports; requires `virtio-net` |
 | `allowed_cidrs`, `dns_filter_hosts` | string arrays | Optional egress policy |
+| `egress_rules` | array of ordered L4 rules | Optional; restored before the machine starts |
+| `mediated_egress_required` | boolean | A restored machine must supply a new host interceptor binding |
 | `guest_subnet` | string | Optional |
 | `credential_policy` | object | Optional. Section 10 |
 | `credential_placeholders` | object | Optional. Environment variable name to placeholder value; not secret |

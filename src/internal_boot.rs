@@ -744,6 +744,8 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         pod_net: pod_net_launch,
         credentials: config.credentials.as_ref(),
         external_interceptor: config.external_interceptor,
+        mediated_egress: config.mediated_egress,
+        mediated_parent_id: config.mediated_parent_id,
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

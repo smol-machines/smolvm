@@ -275,6 +275,10 @@ pub struct LaunchFeatures {
     pub credentials: Option<crate::credentials::CredentialLaunch>,
     /// Trusted host service for this launch; never persisted in a machine record.
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// Require a host decision before each outbound TCP origin dial.
+    pub mediated_egress: bool,
+    /// Host-only identity of the source launch when booting a branch.
+    pub mediated_parent_id: [u8; 16],
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     /// The launcher assigns each a vsock port, wires libkrun, and tells the guest
     /// agent to start the matching relay.
@@ -615,7 +619,14 @@ pub struct LaunchConfig<'a> {
     pub credentials: Option<&'a crate::credentials::CredentialLaunch>,
     /// Launch-scoped host service for all outbound TCP streams.
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// Use the versioned mediated-egress protocol for the external binding.
+    pub mediated_egress: bool,
+    /// Host-only identity of the source launch when booting a branch.
+    pub mediated_parent_id: [u8; 16],
 }
+
+/// Host-only launch identity read by a branch child; never mounted in the guest.
+pub const MEDIATED_IDENTITY_FILE: &str = "mediated-identity";
 
 /// Launch the agent VM using libkrun.
 ///
@@ -660,13 +671,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         pod_net,
         credentials,
         external_interceptor,
+        mediated_egress,
+        mediated_parent_id,
     } = config;
     // `pod_net` drives the Linux-only pod netns-tap datapath; on other targets the
     // field exists (cross-platform LaunchConfig) but is never read.
     #[cfg(not(target_os = "linux"))]
     let _ = &pod_net;
 
-    crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    crate::network::validate_requested_network_backend(
+        resources,
+        egress_refresh_hosts.as_deref(),
+        port_mappings.len(),
+    )?;
     if let Some(endpoint) = external_interceptor {
         validate_external_interceptor(
             endpoint,
@@ -674,6 +691,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             credentials.is_some(),
             pod_net.is_some(),
         )?;
+    }
+    if *mediated_egress && external_interceptor.is_none() {
+        return Err(Error::config(
+            "mediated egress",
+            "an external interceptor is required",
+        ));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if *mediated_egress {
+        return Err(Error::config(
+            "mediated egress",
+            "mediated egress requires a Linux or macOS host",
+        ));
     }
 
     // CUDA machines get an implicit dax RING mount: a per-machine host dir the
@@ -1149,85 +1179,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
                 }
 
-                // Egress policy: static CIDRs plus DNS allow-host filtering
-                // enforced inside libkrun. When allow-hosts are set, the guest's
-                // UDP DNS queries to port 53 are intercepted and forwarded only
-                // to the host-trusted resolver; A/AAAA answers are learned as
-                // temporary allowed IPs. The guest-side DNS proxy is left off
-                // (see below) so those queries leave as real UDP datagrams.
-                let egress_hosts = egress_refresh_hosts.clone().unwrap_or_default();
-                if resources.allowed_cidrs.is_some() || !egress_hosts.is_empty() {
-                    let Some(set_egress) = krun.set_egress_policy else {
-                        krun_free_ctx(ctx);
-                        return Err(Error::agent(
-                            "set egress policy",
-                            "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                             Update libkrun or remove --allow-cidr/--allow-host flags.",
-                        ));
-                    };
-
-                    // CIDRs (plus the resolver IP via ensure_dns_in_cidrs) — a
-                    // null-terminated array.
-                    let mut all_cidrs = resources.allowed_cidrs.clone().unwrap_or_default();
-                    crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
-                    let cidr_cstrings: Vec<CString> = match all_cidrs
-                        .iter()
-                        .map(|c| CString::new(c.as_str()))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                    {
-                        Ok(v) => v,
-                        Err(_) => {
-                            krun_free_ctx(ctx);
-                            return Err(Error::agent(
-                                "set egress policy",
-                                "allow-CIDR contains an interior NUL byte",
-                            ));
-                        }
-                    };
-                    let mut cidr_ptrs: Vec<*const libc::c_char> =
-                        cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                    cidr_ptrs.push(std::ptr::null());
-
-                    // Allow-host list + trusted resolver, only when hosts are set.
-                    let host_cstrings: Vec<CString> = match egress_hosts
-                        .iter()
-                        .map(|h| CString::new(h.as_str()))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                    {
-                        Ok(v) => v,
-                        Err(_) => {
-                            krun_free_ctx(ctx);
-                            return Err(Error::agent(
-                                "set egress policy",
-                                "allow-host contains an interior NUL byte",
-                            ));
-                        }
-                    };
-                    let mut host_ptrs: Vec<*const libc::c_char> =
-                        host_cstrings.iter().map(|s| s.as_ptr()).collect();
-                    host_ptrs.push(std::ptr::null());
-
-                    let resolver_cstring =
-                        CString::new(crate::data::network::default_dns_addr().to_string())
-                            .expect("resolver IP has no null bytes");
-                    let resolver_ptrs: Vec<*const libc::c_char> =
-                        vec![resolver_cstring.as_ptr(), std::ptr::null()];
-
-                    let (host_arg, resolver_arg) = if egress_hosts.is_empty() {
-                        (std::ptr::null(), std::ptr::null())
-                    } else {
-                        (host_ptrs.as_ptr(), resolver_ptrs.as_ptr())
-                    };
-
-                    if set_egress(ctx, cidr_ptrs.as_ptr(), host_arg, resolver_arg) < 0 {
-                        krun_free_ctx(ctx);
-                        return Err(Error::agent(
-                            "set egress policy",
-                            "krun_set_egress_policy failed",
-                        ));
-                    }
-                }
-
                 // TSI terminates guest connects inside libkrun, so redirecting
                 // HTTPS flows to the interceptor needs the fork's hook; without
                 // it a credential policy cannot be enforced on this backend.
@@ -1303,8 +1254,37 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     _credential_interceptor = Some(interceptor);
                 }
                 if let Some(endpoint) = external_interceptor {
-                    guest_network.intercept =
-                        Some(smolvm_network::StreamInterception::AllTcp(*endpoint));
+                    guest_network.intercept = Some(if *mediated_egress {
+                        let mut machine_id = [0u8; 16];
+                        getrandom::fill(&mut machine_id).map_err(|error| {
+                            Error::agent(
+                                "mediated egress",
+                                format!("cannot mint VM identity: {error}"),
+                            )
+                        })?;
+                        machine_id[0] |= 1;
+                        let identity_path = vsock_socket
+                            .parent()
+                            .ok_or_else(|| {
+                                Error::agent("mediated egress", "VM data directory is unavailable")
+                            })?
+                            .join(MEDIATED_IDENTITY_FILE);
+                        std::fs::write(&identity_path, machine_id).map_err(|error| {
+                            Error::agent(
+                                "mediated egress",
+                                format!("cannot save launch identity: {error}"),
+                            )
+                        })?;
+                        smolvm_network::StreamInterception::Mediated(
+                            smolvm_network::MediatedBinding {
+                                endpoint: *endpoint,
+                                machine_id,
+                                parent_id: *mediated_parent_id,
+                            },
+                        )
+                    } else {
+                        smolvm_network::StreamInterception::AllTcp(*endpoint)
+                    });
                 }
                 // A custom resolver (--dns) becomes the gateway's upstream: the
                 // guest still points at the gateway (100.96.0.1 by default), which forwards
@@ -1365,12 +1345,27 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         resources.allowed_cidrs.as_deref(),
                         egress_refresh_hosts.as_deref(),
                     )
+                    .with_rules(&resources.egress_rules)
+                    .map_err(|reason| Error::agent("egress rules", reason))?
                 } else {
-                    // Networked only to serve published ports: inbound only.
+                    // Networked only to serve published ports: inbound only,
+                    // and no egress rule may reopen outbound.
                     smolvm_network::EgressPolicy::deny_all()
                 };
                 if let Some(path) = denial_log {
                     egress = egress.with_denial_log(path);
+                }
+                if let Some(smolvm_network::StreamInterception::Mediated(binding)) =
+                    guest_network.intercept
+                {
+                    let path = vsock_socket
+                        .parent()
+                        .ok_or_else(|| {
+                            Error::agent("mediated egress", "VM data directory is unavailable")
+                        })?
+                        .join(smolvm_network::EGRESS_DECISIONS_LOG);
+                    egress =
+                        egress.with_mediation_audit(path, binding.machine_id, binding.parent_id);
                 }
                 // The operator's watchlist copy, written by `serve
                 // --egress-watchlist` before boot; absent means none for this VM.

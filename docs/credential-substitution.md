@@ -223,8 +223,9 @@ including non-HTTPS ports and IPv6, to the service. The machine's egress
 allowlist still applies before interception. Gateway DNS remains host-managed;
 other outbound UDP and ICMP are blocked. An unavailable interceptor, rejected
 connection, or failed handshake never falls back to dialing the destination.
-TSI, named/pod networks, checkpoint/branch launches, and simultaneous built-in
-credential bindings are rejected.
+TSI, named/pod networks, and simultaneous built-in credential bindings are
+rejected. The versioned mediated mode supports API branches and checkpoint
+restore with a fresh binding; see [mediated egress](mediated-egress.md).
 
 The service implements the existing handshake in
 [`smolvm-protocol::intercept`](../crates/smolvm-protocol/src/intercept.rs):

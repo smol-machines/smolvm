@@ -436,6 +436,12 @@ pub(crate) fn fork_vm_with_options(
     source_policy: crate::agent::fork::ForkSourcePolicy,
 ) -> Result<VmHandle> {
     let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
+    if get_record(db, golden)?.mediated_egress_required {
+        return Err(Error::config(
+            "fork clone",
+            "this embedded fork path cannot bind a mediated interceptor; use the machine branch API",
+        ));
+    }
     // Freeze + snapshot the source, then register the clone and its CoW disks.
     let prep = crate::agent::fork::prepare_fork(
         db,
@@ -548,11 +554,26 @@ pub fn fork_vm_batch(
     parallel: usize,
     source_policy: crate::agent::fork::ForkSourcePolicy,
 ) -> Result<Vec<(String, VmHandle)>> {
-    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
     if clones.is_empty() {
         return Err(Error::config(
             "fork batch",
             "at least one clone is required",
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    for (name, _) in clones {
+        if !names.insert(name) {
+            return Err(Error::config(
+                "fork batch",
+                format!("duplicate clone name '{name}'"),
+            ));
+        }
+    }
+    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
+    if get_record(db, golden)?.mediated_egress_required {
+        return Err(Error::config(
+            "fork batch",
+            "this embedded fork path cannot bind a mediated interceptor; use the machine branch API",
         ));
     }
     let empty_secrets = std::collections::BTreeMap::new();

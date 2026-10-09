@@ -257,7 +257,7 @@ fn run_network_stack(
     .with_published_port_seed(port_seed)
     .with_intercept(config.intercept);
     let datagram_egress = if config.intercept.is_some_and(|mode| mode.all_tcp()) {
-        EgressPolicy::from_allowed_cidrs(Some(&[]))
+        egress.deny_all_datagrams()
     } else {
         egress.clone()
     };
@@ -379,6 +379,13 @@ fn run_network_stack(
                         && egress.observe_destination(destination)
                     {
                         relay_allowed = false;
+                    }
+                    // Audit only what is actually relayed, after the watchlist had
+                    // its say; an audit that cannot be written fails closed.
+                    if relay_allowed {
+                        relay_allowed = datagram_egress
+                            .record_decision("udp", "allow", &destination, "local_policy")
+                            .is_ok();
                     }
                     if relay_allowed && udp_sockets.ensure_socket(destination, &mut sockets) {
                         if matches!(
@@ -702,8 +709,17 @@ fn drain_icmp_echo(
     let mut local_replies = Vec::new();
     for echo in echoes {
         if gateway_addrs.contains(&echo.destination) {
-            local_replies.push(echo);
-        } else if icmp_relay::should_relay_icmp(echo.destination, egress) {
+            if egress
+                .record_decision("icmp", "allow", &echo.destination, "internal_gateway")
+                .is_ok()
+            {
+                local_replies.push(echo);
+            }
+        } else if icmp_relay::should_relay_icmp(echo.destination, egress)
+            && egress
+                .record_decision("icmp", "allow", &echo.destination, "local_policy")
+                .is_ok()
+        {
             match to_relay.try_send(echo) {
                 Ok(()) => woke = true,
                 Err(TrySendError::Full(_)) => {
@@ -711,8 +727,9 @@ fn drain_icmp_echo(
                 }
                 Err(TrySendError::Disconnected(_)) => return woke,
             }
+        } else {
+            egress.record_denial("icmp", &echo.destination);
         }
-        // else: egress policy denies the destination — silent black hole.
     }
 
     // Phase 3: answer gateway pings straight back out the raw socket.
@@ -900,9 +917,22 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Add
         .and_then(|n| dns::normalize_hostname(&n))
         .is_some_and(|n| n == dns::GATEWAY_HOSTNAME)
     {
+        if egress
+            .record_decision("dns", "allow", &dns::GATEWAY_HOSTNAME, "internal_gateway")
+            .is_err()
+        {
+            return DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL));
+        }
         return DnsDecision::Immediate(dns::gateway_response(query, gateway_ipv4));
     }
     if !egress.dns_filter_active() {
+        let name = dns::question_name(query).unwrap_or_default();
+        if egress
+            .record_decision("dns", "allow", &name, "local_policy")
+            .is_err()
+        {
+            return DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL));
+        }
         return DnsDecision::Forward { learn: false };
     }
     match dns::question_name(query) {

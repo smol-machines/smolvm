@@ -435,7 +435,12 @@ impl Default for UdpSocketTable {
 /// DNS (:53) is excluded — it has its own intercept-and-filter path. Egress
 /// policy applies exactly as for TCP (static CIDRs + DNS-learned IPs).
 pub fn should_relay_udp(destination: SocketAddr, egress: &EgressPolicy) -> bool {
-    destination.port() != 53 && egress.allows(destination.ip())
+    destination.port() != 53
+        && egress.allows_flow(
+            smolvm_protocol::FlowTransport::Udp,
+            destination.ip(),
+            Some(destination.port()),
+        )
 }
 
 fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> SocketAddr {
