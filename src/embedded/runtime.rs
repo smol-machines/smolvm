@@ -980,7 +980,7 @@ impl EmbeddedRuntime {
         command: Vec<String>,
         options: ExecOptions,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        let options = self.with_credential_env(name, options)?;
+        let options = self.with_machine_context(name, options)?;
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
         let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
         let mut client = self.command_client(name)?;
@@ -1200,13 +1200,22 @@ impl EmbeddedRuntime {
         ))
     }
 
-    /// `options` with the machine's credential variables ahead of the
-    /// caller's, so a command sees each placeholder unless it sets the
-    /// variable itself.
-    fn with_credential_env(&self, name: &str, mut options: ExecOptions) -> Result<ExecOptions> {
-        let mut env = control::credential_env(&control::get_record(&self.db, name)?);
-        env.extend(std::mem::take(&mut options.env));
+    /// `options` completed from the machine: its env, then its credential
+    /// placeholders, then the caller's env, so a command sees the machine's
+    /// variables unless it sets them itself; and the machine's workdir unless
+    /// the caller gave one.
+    fn with_machine_context(&self, name: &str, mut options: ExecOptions) -> Result<ExecOptions> {
+        let record = control::get_record(&self.db, name)?;
+        // The machine's own env is the baseline, as for every other way a
+        // command starts in it; credential placeholders and then the caller's
+        // env layer on top.
+        let mut env = record.env.clone();
+        crate::util::layer_env(&mut env, control::credential_env(&record));
+        crate::util::layer_env(&mut env, std::mem::take(&mut options.env));
         options.env = env;
+        if options.workdir.is_none() {
+            options.workdir = record.workdir.clone();
+        }
         Ok(options)
     }
 
@@ -1297,7 +1306,7 @@ impl EmbeddedRuntime {
         cancel: &ExecCancel,
         on_event: F,
     ) -> Result<()> {
-        let options = self.with_credential_env(name, options)?;
+        let options = self.with_machine_context(name, options)?;
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
         let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
         if cancel.is_cancelled() {
@@ -1624,6 +1633,57 @@ mod tests {
             .unwrap()
             .paused_checkpoint
             .is_some());
+    }
+
+    // A command started through the embedded runtime sees what an exec through
+    // the CLI or the API sees: the machine's env and workdir, with the caller's
+    // own settings winning.
+    #[test]
+    fn an_exec_gets_the_machine_env_and_workdir_under_the_callers() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        runtime.create_machine(test_spec("ctx", true)).unwrap();
+        db.update_vm_durable("ctx", |r| {
+            r.env = vec![("A".into(), "1".into()), ("B".into(), "machine".into())];
+            r.workdir = Some("/srv".into());
+        })
+        .unwrap();
+
+        let options = runtime
+            .with_machine_context(
+                "ctx",
+                ExecOptions {
+                    env: vec![("B".into(), "caller".into())],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            options.env.contains(&("A".into(), "1".into())),
+            "{:?}",
+            options.env
+        );
+        assert_eq!(
+            options
+                .env
+                .iter()
+                .filter(|(name, _)| name == "B")
+                .collect::<Vec<_>>(),
+            vec![&("B".to_string(), "caller".to_string())],
+            "the caller's value wins and appears once"
+        );
+        assert_eq!(options.workdir.as_deref(), Some("/srv"));
+
+        let options = runtime
+            .with_machine_context(
+                "ctx",
+                ExecOptions {
+                    workdir: Some("/tmp".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(options.workdir.as_deref(), Some("/tmp"));
     }
 
     #[test]

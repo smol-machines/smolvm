@@ -109,6 +109,38 @@ fn check_env_key_shape(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A command's environment and working directory.
+pub(crate) type CommandContext = (Vec<(String, String)>, Option<String>);
+
+/// The environment and working directory of a command started in a machine,
+/// whichever way it starts: exec, a streamed exec, a run, or a terminal.
+///
+/// Each path once assembled this itself and each missed a different part: a
+/// terminal ran with none of it, and API execs never saw the machine's own
+/// environment. Precedence, lowest first: the machine's env, the request's env,
+/// the machine's secrets and credential placeholders, the request's secrets.
+/// The request's workdir wins over the machine's.
+pub(crate) fn machine_command_context(
+    entry: &std::sync::Arc<parking_lot::Mutex<MachineEntry>>,
+    record: Option<&crate::config::VmRecord>,
+    request_env: &[crate::api::types::EnvVar],
+    request_secrets: &std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
+    request_workdir: Option<String>,
+) -> Result<CommandContext, ApiError> {
+    validate_request_secrets(request_secrets)?;
+    validate_request_env(request_env)?;
+    let mut env = record.map(|record| record.env.clone()).unwrap_or_default();
+    use crate::util::layer_env;
+    layer_env(&mut env, crate::api::types::EnvVar::to_tuples(request_env));
+    layer_env(&mut env, record_secret_refs_env(entry)?);
+    layer_env(
+        &mut env,
+        crate::secrets::expose_into_env(resolve_request_secrets(request_secrets)?),
+    );
+    let workdir = request_workdir.or_else(|| record.and_then(|record| record.workdir.clone()));
+    Ok((env, workdir))
+}
+
 /// Validate an incoming `req.secrets` map against:
 ///
 /// - the per-request size cap (`MAX_REQ_SECRETS_PER_REQUEST`),

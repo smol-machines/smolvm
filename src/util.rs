@@ -370,3 +370,40 @@ mod tests {
         assert_ne!(generate_machine_name(), generate_machine_name());
     }
 }
+
+/// Add `layer` over `env`: a variable it sets replaces the earlier value
+/// rather than appearing twice.
+pub fn layer_env(env: &mut Vec<(String, String)>, layer: Vec<(String, String)>) {
+    for (name, value) in layer {
+        env.retain(|(existing, _)| existing != &name);
+        env.push((name, value));
+    }
+}
+
+#[cfg(test)]
+mod layer_env_tests {
+    use super::layer_env;
+
+    #[test]
+    fn a_later_layer_replaces_a_variable_instead_of_repeating_it() {
+        let mut env = vec![
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ];
+        layer_env(
+            &mut env,
+            vec![
+                ("B".to_string(), "3".to_string()),
+                ("C".to_string(), "4".to_string()),
+            ],
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "3".to_string()),
+                ("C".to_string(), "4".to_string()),
+            ]
+        );
+    }
+}
