@@ -467,10 +467,7 @@ pub(super) fn maybe_start_compaction(
 /// CLI) still keeps the chain short. The source keeps running meanwhile: only
 /// layers beneath its active disk are read.
 pub(super) fn compact_if_near_limit(gdir: &Path, vm_ids: Option<(u32, u32)>) -> Result<()> {
-    for (id, raw) in [
-        ("storage", crate::data::storage::STORAGE_DISK_FILENAME),
-        ("overlay", crate::data::storage::OVERLAY_DISK_FILENAME),
-    ] {
+    for (id, raw) in super::FORK_DISK_ROLES {
         let (active, _) = crate::agent::resolve_disk_image(gdir, raw);
         if !active.is_file() {
             continue;
@@ -561,7 +558,8 @@ fn flatten_in_place(
 const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Every disk layer some machine can still read: the chains under every machine's
-/// active disks and every retained branch snapshot's recorded bases. `None` when
+/// active disks (cache disks included: their generations live under `d` like
+/// the others) and every retained branch snapshot's recorded bases. `None` when
 /// a chain cannot be read, which keeps everything.
 fn reachable_layers(machine_dirs: &[PathBuf]) -> Option<HashSet<PathBuf>> {
     let mut reachable = HashSet::new();
@@ -570,10 +568,7 @@ fn reachable_layers(machine_dirs: &[PathBuf]) -> Option<HashSet<PathBuf>> {
         Some(())
     };
     for dir in machine_dirs {
-        for raw in [
-            crate::data::storage::STORAGE_DISK_FILENAME,
-            crate::data::storage::OVERLAY_DISK_FILENAME,
-        ] {
+        for (_, raw) in super::FORK_DISK_ROLES {
             let (active, _) = crate::agent::resolve_disk_image(dir, raw);
             if active.exists() {
                 walk(&active)?;
@@ -1028,6 +1023,41 @@ mod tests {
         );
         assert!(!a.exists() && !pinned.exists());
         assert!(merged.exists() && compacted.exists());
+    }
+
+    /// A cache disk's generations are collected like the others: kept while a
+    /// branch's cache chain reads them, never mistaken for orphans.
+    #[test]
+    fn a_cache_generation_a_branch_reads_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let branch = tmp.path().join("branch");
+        for dir in [&source, &branch] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let base = tmp.path().join("cdisk-v4.raw");
+        std::fs::write(&base, vec![0_u8; SIZE as usize]).unwrap();
+        let layer = |path: PathBuf, below: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            create_overlay(&path, SIZE, below).unwrap();
+            path.canonicalize().unwrap()
+        };
+        let generation = layer(source.join("d/aaaaaaaa/cache.base.qcow2"), &base);
+        layer(source.join("cache.qcow2"), &generation);
+        let below_branch = layer(source.join("d/bbbbbbbb/cache.base.qcow2"), &generation);
+        layer(branch.join("cache.qcow2"), &below_branch);
+
+        let both = [source.clone(), branch.clone()];
+        assert_eq!(collect_unreachable_layers(&source, &both).unwrap(), 0);
+        assert!(generation.exists() && below_branch.exists());
+
+        // The source's own cache chain keeps its generation once the branch goes.
+        assert_eq!(
+            collect_unreachable_layers(&source, std::slice::from_ref(&source)).unwrap(),
+            1
+        );
+        assert!(generation.exists() && !below_branch.exists());
+        assert!(base.exists());
     }
 
     /// A second claim on a disk whose merge is running is refused, and the
