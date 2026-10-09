@@ -2187,6 +2187,7 @@ fn shutdown_machine_process(
 
     if graceful && !shutdown_acknowledged {
         if pid.is_some_and(|pid| !is_alive(pid)) {
+            sweep_machine_scope(name);
             return true;
         }
         tracing::warn!(
@@ -2263,10 +2264,25 @@ fn shutdown_machine_process(
         return false;
     }
 
+    sweep_machine_scope(name);
     if let Err(error) = crate::agent::cleanup_dead_vm_runtime(name) {
         tracing::warn!(%name, %error, "failed to clean runtime after VM teardown");
     }
     true
+}
+
+/// Once the recorded VM process is gone, kill whatever else is left in the
+/// machine's scope. A second VM booted for the same machine joins its scope
+/// without becoming the recorded process, so only the scope reaches it; left
+/// alone it outlives the machine. An empty or missing scope is left as is.
+fn sweep_machine_scope(name: &str) {
+    let Some(left) = crate::systemd_scope::scope_process_count(name).filter(|&n| n > 0) else {
+        return;
+    };
+    tracing::warn!(%name, processes = left, "killing processes left in the machine's scope after its VM exited");
+    if let Err(error) = crate::systemd_scope::kill_scope(name) {
+        tracing::warn!(%name, %error, "could not sweep the machine's scope after teardown");
+    }
 }
 
 /// Disks to restore for a VM-mode (`--from-vm`) pack. Unlike an image pack (OCI

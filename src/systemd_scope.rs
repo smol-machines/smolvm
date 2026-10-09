@@ -417,6 +417,50 @@ fn scope_already_gone(stderr: &[u8]) -> bool {
     stderr.contains("not loaded") || stderr.contains("NoSuchUnit") || stderr.contains("not found")
 }
 
+/// How many processes are still in a VM's transient scope, or `None` when the
+/// scope is not loaded or this host has no systemd scopes.
+pub fn scope_process_count(machine_id: &str) -> Option<usize> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = machine_id;
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["show", "-P", "ControlGroup", &scope_name(machine_id)]);
+        let out = busctl_bounded(cmd, BUSCTL_TIMEOUT).ok()?;
+        let cgroup = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || cgroup.is_empty() {
+            return None;
+        }
+        let procs = std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/cgroup.procs")).ok()?;
+        // An exited process its parent has not reaped yet is still listed;
+        // it holds nothing and needs no kill.
+        let live = |pid: &str| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let state = stat
+                        .rsplit_once(')')?
+                        .1
+                        .split_whitespace()
+                        .next()?
+                        .to_string();
+                    Some(state != "Z" && state != "X")
+                })
+                .unwrap_or(false)
+        };
+        Some(
+            procs
+                .lines()
+                .map(str::trim)
+                .filter(|pid| !pid.is_empty() && live(pid))
+                .count(),
+        )
+    }
+}
+
 /// Force-kill a VM's transient scope: SIGKILL every process in its cgroup.
 ///
 /// This is the AUTHORITATIVE teardown when the pid-based delete can't confirm

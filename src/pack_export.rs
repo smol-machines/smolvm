@@ -791,8 +791,23 @@ fn reap_stale_export_scratch_in(root: &Path) {
         let helper_pid = std::fs::read_to_string(dir.join("agent.pid"))
             .ok()
             .and_then(|text| text.lines().next()?.trim().parse().ok());
-        if !helper_pid.is_some_and(process_definitely_gone) {
-            continue;
+        match helper_pid {
+            Some(helper) if process_definitely_gone(helper) => {}
+            // Its creator is gone and nothing else uses an export helper, so
+            // one still running was orphaned when the creator died and keeps
+            // its RAM until stopped here.
+            Some(helper) if helper_runs_from(helper, &dir) => {
+                warn!(path = %dir.display(), helper, "stopping an export helper whose creator is gone");
+                unsafe { libc::kill(helper, libc::SIGKILL) };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !process_definitely_gone(helper) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !process_definitely_gone(helper) {
+                    continue;
+                }
+            }
+            _ => continue,
         }
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => tracing::debug!(
@@ -805,6 +820,19 @@ fn reap_stale_export_scratch_in(root: &Path) {
             ),
         }
     }
+}
+
+/// Whether `pid` is a VM booted from the scratch directory `dir`: its command
+/// line names a file under it, so a recycled pid is never mistaken for one.
+#[cfg(unix)]
+fn helper_runs_from(pid: crate::process::Pid, dir: &Path) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let dir = dir.to_string_lossy();
+    cmdline
+        .split(|byte| *byte == 0)
+        .any(|arg| String::from_utf8_lossy(arg).starts_with(&format!("{dir}/")))
 }
 
 // Retain scratch until equivalent nonblocking launch-lock checks are available.
@@ -910,6 +938,69 @@ mod cached_export_tests {
     use crate::platform::uds::UdsStream;
     use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
     use std::io::{Read, Write};
+    /// An export helper whose creator died is stopped and its scratch removed;
+    /// a live process that was not booted from the scratch is left alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_orphaned_export_helper_is_stopped_and_its_scratch_removed() {
+        let root = tempfile::tempdir().unwrap();
+        // Above any pid_max, so no live process can hold it while tests run in
+        // parallel and recycle pids.
+        let gone: u32 = 2_147_483_000;
+        let scratch = |dir: &std::path::Path, helper: u32| {
+            std::fs::create_dir_all(dir).unwrap();
+            let name = format!("pack-fromvm-{gone}-1");
+            std::fs::write(dir.join("name"), &name).unwrap();
+            std::fs::write(dir.join(super::EXPORT_SCRATCH_MARKER), &name).unwrap();
+            std::fs::write(dir.join("vm.lock"), b"").unwrap();
+            std::fs::write(dir.join("agent.pid"), helper.to_string()).unwrap();
+        };
+
+        let orphan_dir = root.path().join("orphan");
+        // Like a real orphan, the helper is not this process's child: its
+        // creator is gone, so init reaps it once it is killed.
+        let launched = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "sh -c 'sleep 60' \"$0\" </dev/null >/dev/null 2>&1 & echo $!",
+                &format!("{}/boot-config.json", orphan_dir.display()),
+            ])
+            .output()
+            .unwrap();
+        let helper: u32 = String::from_utf8_lossy(&launched.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        scratch(&orphan_dir, helper);
+
+        let other_dir = root.path().join("other");
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        scratch(&other_dir, unrelated.id());
+
+        super::reap_stale_export_scratch_in(root.path());
+
+        assert!(
+            !orphan_dir.exists(),
+            "the orphaned helper's scratch is removed"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{helper}")).exists(),
+            "the orphaned helper is stopped"
+        );
+        assert!(
+            other_dir.exists(),
+            "scratch whose recorded pid is someone else's is kept"
+        );
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "an unrelated process is never killed"
+        );
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+    }
 
     fn exercise(
         mount_code: i32,
