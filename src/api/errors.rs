@@ -151,11 +151,28 @@ impl From<crate::error::Error> for ApiError {
                 crate::error::AgentErrorKind::NotFound => ApiError::NotFound(reason.clone()),
                 crate::error::AgentErrorKind::Conflict => ApiError::Conflict(reason.clone()),
                 crate::error::AgentErrorKind::Forbidden => ApiError::Forbidden(reason.clone()),
+                crate::error::AgentErrorKind::Other if is_invalid_image_archive(reason) => {
+                    ApiError::BadRequest(reason.clone())
+                }
                 crate::error::AgentErrorKind::Other => ApiError::Internal(reason.clone()),
             },
             _ => ApiError::Internal(err.to_string()),
         }
     }
+}
+
+/// Whether a failure says the caller's image archive is not a container image:
+/// empty or truncated (no `manifest.json`), not a tar at all, or corrupt gzip.
+/// Retrying cannot help and only the caller can fix it, so it is a 400.
+pub(crate) fn is_invalid_image_archive(message: &str) -> bool {
+    [
+        "manifest.json not found in tar",
+        "archive/tar: invalid tar header",
+        "invalid gzip header",
+        "corrupt deflate stream",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 /// Classify errors from `ensure_machine_running` into proper HTTP status codes.
@@ -183,6 +200,21 @@ impl From<tokio::task::JoinError> for ApiError {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    #[test]
+    fn an_archive_that_is_not_a_container_image_is_the_callers_error() {
+        for reason in [
+            "crane export failed: Error: reading tarball from stdin: file manifest.json not found in tar (is the image a valid `docker save` / OCI archive?)",
+            "crane export failed: Error: reading tarball from stdin: archive/tar: invalid tar header (is the image a valid `docker save` / OCI archive?)",
+            "failed to decompress archive: invalid gzip header",
+        ] {
+            let err = crate::error::Error::agent("pull image", reason);
+            assert!(matches!(ApiError::from(err), ApiError::BadRequest(_)), "{reason}");
+        }
+        let err =
+            crate::error::Error::agent("pull image", "failed to spawn crane export: No such file");
+        assert!(matches!(ApiError::from(err), ApiError::Internal(_)));
+    }
 
     #[test]
     fn test_api_error_status_codes() {

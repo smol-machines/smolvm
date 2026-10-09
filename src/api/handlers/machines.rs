@@ -3342,9 +3342,14 @@ pub async fn get_machine_egress_events(
 /// virtio-net runtime couldn't bind `0.0.0.0:<hostPort>` because something
 /// (typically an orphaned VMM) still holds it — is surfaced as `PortConflict`
 /// (409 `PORT_IN_USE`), which the control plane recognizes and retries on a
-/// freshly-allocated port. Everything else stays a 500. Matching is scoped to
-/// the virtio-net path so an unrelated AddrInUse can't be mistaken for it.
+/// freshly-allocated port. An image archive that is not a container image is
+/// the caller's to fix, so it is a 400. Everything else stays a 500. Matching is
+/// scoped to the virtio-net path so an unrelated AddrInUse can't be mistaken for
+/// it.
 fn classify_launch_error(e: String) -> ApiError {
+    if crate::api::error::is_invalid_image_archive(&e) {
+        return ApiError::BadRequest(e);
+    }
     let lc = e.to_ascii_lowercase();
     // Windows words the same bind failure as WSAEADDRINUSE (os error 10048).
     let in_use = lc.contains("address already in use") || lc.contains("os error 10048");
@@ -7078,6 +7083,17 @@ mod tests {
             classify_launch_error("failed to start machine: kernel panic".to_string()),
             ApiError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn classify_launch_error_returns_an_invalid_archive_to_the_caller() {
+        // A start of a machine whose image file is not a `docker save` archive
+        // must say so with a 400, not report a server fault.
+        let e = "failed to start machine: agent operation failed: pull image: crane export \
+                 failed: Error: reading tarball from stdin: file manifest.json not found in \
+                 tar (is the image a valid `docker save` / OCI archive?)"
+            .to_string();
+        assert!(matches!(classify_launch_error(e), ApiError::BadRequest(_)));
     }
 
     #[test]
