@@ -3128,7 +3128,7 @@ magic=$(dd if="$dev" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' 
 if [ "$magic" != "53ef" ]; then
   mkfs.ext4 -F -q -O ^has_journal -L smolvm-cache "$dev"
 fi
-mount -t ext4 -o noatime "$dev" "$staging"
+mount -t ext4 -o noatime,nosuid,nodev "$dev" "$staging"
 path=${spec#*:}
 mount --bind "$staging" "$path"
 /usr/local/bin/smolvm-agent ns-file mount-cache-all "$path" "$major" "$minor"

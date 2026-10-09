@@ -165,7 +165,9 @@ fn helper_mount_cache(path: &str, args: &[String]) -> Result<(), String> {
             node.as_ptr(),
             target.as_ptr(),
             fstype.as_ptr(),
-            libc::MS_NOATIME,
+            // A cache is shared state, not part of the image: never let it
+            // carry setuid binaries or device nodes into the container.
+            libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV,
             std::ptr::null(),
         );
         let error = std::io::Error::last_os_error();
@@ -182,47 +184,71 @@ fn helper_mount_cache(_path: &str, _args: &[String]) -> Result<(), String> {
     Err("mount namespaces are Linux-only".to_string())
 }
 
-/// Mount the cache slot into every mount namespace but this process's own: one
-/// child per distinct namespace, each running `mount-cache` inside it. Reading
-/// `/proc` here instead of in a shell avoids a fork per process.
+/// Mount the cache slot into the mount namespace of every container this
+/// machine runs, one child per distinct namespace. Only crun's own containers
+/// are entered: a container the user runs inside one (Docker in the machine,
+/// an `unshare`) has a namespace of its own and never asked for the cache.
+/// Every container is tried, and all failures are reported together, so one
+/// namespace that refuses the mount does not leave the rest without it.
+#[cfg(target_os = "linux")]
 fn mount_cache_everywhere(args: &[String]) -> Result<(), String> {
     let (path, major, minor) = match (args.get(3), args.get(4), args.get(5)) {
         (Some(p), Some(a), Some(b)) => (p.clone(), a.clone(), b.clone()),
         _ => return Err("usage: mount-cache-all <path> <major> <minor>".to_string()),
     };
     let own = std::fs::read_link("/proc/self/ns/mnt").map_err(|e| format!("own namespace: {e}"))?;
-    let init = std::fs::read_link("/proc/1/ns/mnt").ok();
-    let mut seen = vec![own];
-    seen.extend(init);
+    let skip = [Some(own), std::fs::read_link("/proc/1/ns/mnt").ok()];
+    let containers = live_containers().into_iter().filter_map(|pid| {
+        std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+            .ok()
+            .map(|ns| (pid, ns))
+    });
     let exe = std::env::current_exe().map_err(|e| format!("own binary: {e}"))?;
-    let entries = std::fs::read_dir("/proc").map_err(|e| format!("/proc: {e}"))?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
-            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
-        else {
-            continue;
-        };
-        let Ok(ns) = std::fs::read_link(entry.path().join("ns/mnt")) else {
-            continue; // a process that exited, or a kernel thread
-        };
-        if seen.contains(&ns) {
+    let mut failures = Vec::new();
+    for pid in namespaces_to_enter(containers, &skip) {
+        let pid = pid.to_string();
+        match std::process::Command::new(&exe)
+            .args(["ns-file", "mount-cache", &pid, &path, &major, &minor])
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => failures.push(format!(
+                "container {pid}: {}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            )),
+            Err(e) => failures.push(format!("container {pid}: spawn: {e}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_cache_everywhere(_args: &[String]) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+/// One PID per distinct mount namespace among `candidates`, leaving out the
+/// namespaces in `skip` (the caller's own and the VM's, which already have the
+/// cache).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn namespaces_to_enter<N: PartialEq>(
+    candidates: impl IntoIterator<Item = (u32, N)>,
+    skip: &[Option<N>],
+) -> Vec<u32> {
+    let mut seen: Vec<N> = Vec::new();
+    let mut pids = Vec::new();
+    for (pid, ns) in candidates {
+        if skip.iter().flatten().any(|s| *s == ns) || seen.contains(&ns) {
             continue;
         }
         seen.push(ns);
-        let output = std::process::Command::new(&exe)
-            .args(["ns-file", "mount-cache", pid, &path, &major, &minor])
-            .output()
-            .map_err(|e| format!("spawn for {pid}: {e}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "namespace of {pid}: {}",
-                String::from_utf8_lossy(&output.stdout).trim()
-            ));
-        }
+        pids.push(pid);
     }
-    Ok(())
+    pids
 }
 
 /// Join `pid`'s mount namespace.
@@ -770,6 +796,15 @@ mod tests {
         // Guards the dispatch in `main`: matching too loosely would turn a normal
         // agent boot into a helper run.
         assert_eq!(HELPER_ARG, "ns-file");
+    }
+
+    // The cache goes into each container's namespace once, and never into the
+    // caller's or the VM's, which already have it.
+    #[test]
+    fn each_container_namespace_is_entered_once() {
+        let candidates = [(10, "vm"), (20, "a"), (21, "a"), (30, "b"), (40, "self")];
+        let pids = namespaces_to_enter(candidates, &[Some("self"), Some("vm")]);
+        assert_eq!(pids, vec![20, 30]);
     }
 
     #[test]
