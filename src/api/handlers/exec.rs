@@ -17,9 +17,7 @@ use std::time::Duration;
 
 use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
-use crate::api::types::{
-    ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
-};
+use crate::api::types::{ApiErrorResponse, ExecRequest, ExecResponse, LogsQuery, RunRequest};
 use crate::api::validate_command;
 use crate::api::TraceId;
 use crate::data::consts::BYTES_PER_MIB;
@@ -89,13 +87,14 @@ pub async fn exec_command(
     // TrustedLocal actor) → req.secrets (ad-hoc, Untrusted). Validation runs
     // before resolution so structural/scope violations surface as 400 without
     // the resolution audit firing.
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(record_env);
-    env.extend(crate::secrets::expose_into_env(req_env));
+    let machine_rec = state.lookup_vm(&id).await?;
+    let (env, workdir) = crate::api::handlers::machine_command_context(
+        &entry,
+        machine_rec.as_ref(),
+        &req.env,
+        &req.secrets,
+        req.workdir.clone(),
+    )?;
 
     // Detached/background: spawn the process and return its PID immediately, so a
     // long-lived daemon (dev server, agent runner) keeps running after the
@@ -103,9 +102,8 @@ pub async fn exec_command(
     // overlay); plain machines run it in the VM.
     if req.background {
         let command = req.command.clone();
-        let workdir = req.workdir.clone();
         let user = req.user.clone();
-        let machine_rec = state.lookup_vm(&id).await?;
+        let machine_rec = machine_rec.clone();
         // An exec may be what establishes the workload container — the machine's
         // command exited, or the image's own default was short-lived — and that
         // container is where the mount lives, so the config has to target the
@@ -153,10 +151,9 @@ pub async fn exec_command(
         }));
     }
 
-    // Secrets already resolved into `env` above (shared with the background
-    // path); env precedence is req.env < record.secret_refs < req.secrets.
+    // Env and workdir were resolved once above, shared with the background
+    // path (see `machine_command_context` for precedence).
     let command = req.command.clone();
-    let workdir = req.workdir.clone();
     let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let stdin_data = req.stdin.clone();
@@ -166,7 +163,6 @@ pub async fn exec_command(
     // sessions. Without this, exec runs in the bare agent VM (no `python3`,
     // etc.) — the image is never entered. Plain machines exec in the VM
     // directly via `vm_exec`.
-    let machine_rec = state.lookup_vm(&id).await?;
     // An exec may be what establishes the workload container — the machine's
     // command exited, or the image's own default was short-lived — and that
     // container is where the mount lives, so the config has to target the
@@ -259,16 +255,16 @@ pub async fn exec_stream(
         require_running(&entry).await?;
     }
 
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
+    let machine_rec = state.lookup_vm(&id).await?;
+    let (env, workdir) = crate::api::handlers::machine_command_context(
+        &entry,
+        machine_rec.as_ref(),
+        &req.env,
+        &req.secrets,
+        req.workdir.clone(),
+    )?;
 
     let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(record_env);
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
     let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
@@ -276,7 +272,7 @@ pub async fn exec_stream(
     // overlay keyed by machine name); plain machines stream from the VM
     // directly. Without this, streaming exec on an image machine produces no
     // output (the agent-base streaming path doesn't enter the container).
-    let machine_rec = state.lookup_vm(&id).await?;
+    let machine_rec = machine_rec.clone();
     // An exec may be what establishes the workload container — the machine's
     // command exited, or the image's own default was short-lived — and that
     // container is where the mount lives, so the config has to target the
@@ -401,17 +397,20 @@ pub async fn run_command(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
+    let machine_rec = state.lookup_vm(&id).await?;
+    // `run` starts a different image in the machine, where the machine's own
+    // workdir may not exist: it takes the machine's env, not its workdir.
+    let (env, _) = crate::api::handlers::machine_command_context(
+        &entry,
+        machine_rec.as_ref(),
+        &req.env,
+        &req.secrets,
+        None,
+    )?;
+    let workdir = req.workdir.clone();
 
     let image = req.image.clone();
     let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(record_env);
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
     let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
@@ -538,14 +537,16 @@ pub async fn exec_interactive(
     // An interactive session may be what establishes the workload container,
     // and the mount lives there.
     let machine_for_run = machine_record.clone();
-    // A terminal sees what an `exec` sees: the machine's own environment and
-    // its resolved secret references. Without them a console shell ran with
-    // neither, so a tool reading an API key from the environment found none.
-    let mut env = machine_record
-        .as_ref()
-        .map(|record| record.env.clone())
-        .unwrap_or_default();
-    env.extend(crate::api::handlers::record_secret_refs_env(&entry)?);
+    // A terminal sees what an `exec` sees: the machine's environment, secrets
+    // and working directory. Without them a console shell ran with none, so a
+    // tool reading an API key from the environment found nothing.
+    let (env, workdir) = crate::api::handlers::machine_command_context(
+        &entry,
+        machine_record.as_ref(),
+        &[],
+        &Default::default(),
+        None,
+    )?;
 
     let init_size = (q.cols.unwrap_or(80), q.rows.unwrap_or(24));
 
@@ -599,6 +600,7 @@ pub async fn exec_interactive(
                         }
                         let config = crate::agent::RunConfig::new(image, command)
                             .with_env(env.clone())
+                            .with_workdir(workdir)
                             .with_mounts(mounts_config)
                             .with_tty(tty)
                             .in_machine_opt(machine_for_run.as_ref(), &id, &env);
@@ -610,7 +612,7 @@ pub async fn exec_interactive(
                             })
                     } else {
                         client
-                            .vm_exec_interactive_io(command, env, None, tty, input, on_output)
+                            .vm_exec_interactive_io(command, env, workdir, tty, input, on_output)
                             .unwrap_or_else(|e| {
                                 tracing::warn!(error = ?e, "interactive: vm exec failed");
                                 -1
