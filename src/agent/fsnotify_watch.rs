@@ -260,6 +260,87 @@ fn connect_to_agent(socket_path: &Path, stop: &AtomicBool) -> Option<AgentClient
     None
 }
 
+/// Maximum depth to inspect for recent file modifications when a directory event fires.
+const MAX_DIR_SCAN_DEPTH: usize = 3;
+
+/// Maximum number of recent child events to emit from a single directory event
+/// to avoid flooding vsock if a large directory is touched.
+const MAX_DIR_SCAN_EVENTS: usize = 64;
+
+/// Time window within which a file's mtime is considered to match the event.
+const RECENT_MTIME_WINDOW: Duration = Duration::from_secs(2);
+
+/// Directories that should not be traversed during directory rescans.
+fn is_ignored_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".cache"
+            | ".turbo"
+            | ".venv"
+            | "__pycache__"
+    )
+}
+
+/// Recursively find files within `dir` modified within `threshold`.
+fn find_recent_files(
+    dir: &Path,
+    threshold: Duration,
+    max_depth: usize,
+    results: &mut Vec<PathBuf>,
+) {
+    if max_depth == 0 || results.len() >= MAX_DIR_SCAN_EVENTS {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let now = std::time::SystemTime::now();
+
+    for entry in entries.flatten() {
+        if results.len() >= MAX_DIR_SCAN_EVENTS {
+            break;
+        }
+
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+
+        if file_type.is_dir() {
+            if is_ignored_dir(&name_str) {
+                continue;
+            }
+            find_recent_files(&entry.path(), threshold, max_depth - 1, results);
+        } else if file_type.is_file() || file_type.is_symlink() {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    let is_recent = if let Ok(elapsed) = now.duration_since(mtime) {
+                        elapsed <= threshold
+                    } else if let Ok(future) = mtime.duration_since(now) {
+                        future <= threshold
+                    } else {
+                        false
+                    };
+
+                    if is_recent {
+                        results.push(entry.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Translate one host event into guest-side [`FsNotifyEvent`]s, appended to `out`.
 fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotifyEvent>) {
     for host_path in &event.paths {
@@ -269,19 +350,49 @@ fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotify
         let Ok(rel) = host_path.strip_prefix(&t.host_source) else {
             continue;
         };
-        // The watched root itself firing (empty rel) carries no useful child.
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
 
         if host_path.exists() {
-            // Create/modify/attrib on an existing path: fire directly on it.
-            // fsnotify_dentry() in the guest propagates to the parent dir's
-            // watchers with the child name, so both file- and dir-watches fire.
-            out.push(FsNotifyEvent {
-                path: join_guest(&t.guest_base, rel),
-                mask: mask_for(&event.kind, host_path),
-            });
+            if host_path.is_dir() {
+                // On macOS, FSEvents often notifies at the directory level rather
+                // than reporting individual file changes. Scan the directory for
+                // files modified within the coalesce window so file-level watchers
+                // in the guest (e.g. Vite HMR, Webpack, Chokidar) receive events
+                // for the actual changed files rather than only an anonymous
+                // directory-level modification.
+                let mut recent_files = Vec::new();
+                find_recent_files(
+                    host_path,
+                    RECENT_MTIME_WINDOW,
+                    MAX_DIR_SCAN_DEPTH,
+                    &mut recent_files,
+                );
+
+                for child_path in recent_files {
+                    if let Ok(child_rel) = child_path.strip_prefix(&t.host_source) {
+                        out.push(FsNotifyEvent {
+                            path: join_guest(&t.guest_base, child_rel),
+                            mask: mask_for(&event.kind, &child_path),
+                        });
+                    }
+                }
+
+                // If this is a subdirectory (not the watched root itself), also
+                // fire on the directory itself so directory-level watchers wake.
+                if !rel.as_os_str().is_empty() {
+                    out.push(FsNotifyEvent {
+                        path: join_guest(&t.guest_base, rel),
+                        mask: mask_for(&event.kind, host_path),
+                    });
+                }
+            } else {
+                // Regular file: fire directly on it. fsnotify_dentry() in the
+                // guest propagates to the parent dir's watchers with the child
+                // name, so both file- and dir-watches fire.
+                out.push(FsNotifyEvent {
+                    path: join_guest(&t.guest_base, rel),
+                    mask: mask_for(&event.kind, host_path),
+                });
+            }
         } else if let Some(parent) = rel.parent() {
             // The guest may still cache the removed path. Send the exact name
             // so the kernel can expire that entry and preserve the filename in
@@ -430,5 +541,102 @@ mod tests {
         let selected = matching_target(Path::new("/host/project/vendor/lib.js"), &targets)
             .expect("nested path should match");
         assert_eq!(selected.guest_base, "/run/smolvm/virtiofs/smolvm1");
+    }
+
+    #[test]
+    fn directory_event_uncovers_recent_child_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp_dir.path().to_path_buf();
+        let src_dir = project_dir.join("src");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        let app_file = src_dir.join("app.js");
+        std::fs::write(&app_file, "console.log('hello')").expect("write app.js");
+
+        let targets = vec![WatchTarget {
+            host_source: project_dir,
+            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+        }];
+
+        let ev = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![src_dir],
+            attrs: Default::default(),
+        };
+
+        let mut out = Vec::new();
+        collect_events(&ev, &targets, &mut out);
+
+        // Should contain both the child file event (for Vite/Chokidar) and the directory event
+        assert!(
+            out.iter()
+                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/src/app.js"
+                    && (e.mask & fsnotify_mask::FS_MODIFY) != 0
+                    && (e.mask & fsnotify_mask::FS_ISDIR) == 0),
+            "expected file-level event for app.js without FS_ISDIR, got: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/src"
+                    && (e.mask & fsnotify_mask::FS_ISDIR) != 0),
+            "expected directory-level event for src with FS_ISDIR, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn root_directory_event_uncovers_recent_top_level_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp_dir.path().to_path_buf();
+        let config_file = project_dir.join("vite.config.ts");
+        std::fs::write(&config_file, "export default {}").expect("write vite.config.ts");
+
+        let targets = vec![WatchTarget {
+            host_source: project_dir.clone(),
+            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+        }];
+
+        let ev = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![project_dir],
+            attrs: Default::default(),
+        };
+
+        let mut out = Vec::new();
+        collect_events(&ev, &targets, &mut out);
+
+        assert!(
+            out.iter()
+                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/vite.config.ts"
+                    && (e.mask & fsnotify_mask::FS_MODIFY) != 0),
+            "expected file-level event for top-level vite.config.ts, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ignored_directories_are_skipped() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp_dir.path().to_path_buf();
+        let node_modules_dir = project_dir.join("node_modules").join("dep");
+        std::fs::create_dir_all(&node_modules_dir).expect("create node_modules");
+        let dep_file = node_modules_dir.join("index.js");
+        std::fs::write(&dep_file, "module.exports = {}").expect("write dep index.js");
+
+        let targets = vec![WatchTarget {
+            host_source: project_dir.clone(),
+            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+        }];
+
+        let ev = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![project_dir],
+            attrs: Default::default(),
+        };
+
+        let mut out = Vec::new();
+        collect_events(&ev, &targets, &mut out);
+
+        assert!(
+            !out.iter().any(|e| e.path.contains("node_modules")),
+            "expected node_modules files to be ignored, got: {out:?}"
+        );
     }
 }
