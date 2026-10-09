@@ -608,6 +608,17 @@ pub struct EgressSignal {
 /// The most label and destination pairs reported per machine, latest first.
 const EGRESS_SIGNALS_REPORTED: usize = 50;
 
+/// Hex form of the host-minted identity of `name`'s current mediated launch,
+/// the same value mediated egress decisions carry as `machineId`, or `None`
+/// when the machine was not launched with mediated egress.
+pub fn read_mediation_machine_id(name: &str) -> Option<String> {
+    let bytes =
+        std::fs::read(vm_data_dir(name).join(crate::agent::launcher::MEDIATED_IDENTITY_FILE))
+            .ok()?;
+    let id: [u8; 16] = bytes.try_into().ok()?;
+    Some(id.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// Summarize the watchlist matches recorded for `name`, latest first, or `None`
 /// when there are none (no watchlist, or nothing matched). Only the log's
 /// recent tail is read, bounding the work per machine-info call.

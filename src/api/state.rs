@@ -2018,6 +2018,9 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     };
     let egress_bytes = crate::agent::read_egress_telemetry(&name);
     let egress_signals = crate::agent::read_egress_signals(&name);
+    let mediation_machine_id = (state == "running")
+        .then(|| crate::agent::read_mediation_machine_id(&name))
+        .flatten();
     // Live consumed CPU-seconds for the VMM child (host-sampled, resets on
     // restart); the control plane accumulates the durable total. None when there
     // is no live process to sample.
@@ -2084,6 +2087,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         forkpoint_held: entry.forkpoint_held,
         egress_bytes,
         egress_signals,
+        mediation_machine_id,
         cpu_seconds,
         cpu_millis,
         rss_mb,
@@ -2380,6 +2384,7 @@ mod tests {
                 disk_durability: None,
                 cache_disk: None,
                 allowed_cidrs: None,
+                egress_rules: Vec::new(),
                 allowed_hosts: None,
                 credentials: None,
                 network_backend: None,

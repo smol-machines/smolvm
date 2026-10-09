@@ -141,6 +141,11 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // Watchlist matches from the signal log the network stack writes, so
         // the control plane reads them from the machine list it already polls.
         egress_signals: crate::agent::read_egress_signals(name),
+        // Per-launch identity: stale once the process is gone, so only
+        // reported while it runs.
+        mediation_machine_id: pid
+            .filter(|_| record.mediated_egress_required)
+            .and_then(|_| crate::agent::read_mediation_machine_id(name)),
         // Live consumed CPU-seconds for the VMM child, sampled from the host
         // (user+system CPU time). Resets on restart — the control plane treats it
         // as a monotonic-with-resets counter and accumulates the durable total.

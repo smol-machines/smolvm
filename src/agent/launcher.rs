@@ -1286,6 +1286,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         smolvm_network::StreamInterception::AllTcp(*endpoint)
                     });
                 }
+                if external_interceptor.is_none() || !*mediated_egress {
+                    // A previous mediated launch's identity must not be
+                    // reported for this one.
+                    if let Some(dir) = vsock_socket.parent() {
+                        let _ = std::fs::remove_file(dir.join(MEDIATED_IDENTITY_FILE));
+                    }
+                }
                 // A custom resolver (--dns) becomes the gateway's upstream: the
                 // guest still points at the gateway (100.96.0.1 by default), which forwards
                 // queries to this address instead of the default.

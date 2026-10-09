@@ -955,6 +955,11 @@ pub struct MachineInfo {
     /// guest cannot reach, for virtio-net machines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_signals: Option<Vec<crate::agent::EgressSignal>>,
+    /// Host-minted identity of this launch, as carried by mediated egress
+    /// decisions (`machineId`), so a decider can map flows to the machine up
+    /// front. Present only while a mediated-egress machine is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mediation_machine_id: Option<String>,
     /// Consumed CPU-seconds (user+system) of the machine's CURRENT VMM process,
     /// sampled live from the host. Resets to 0 on a VM restart — it's a stateless
     /// snapshot; the control plane accumulates a durable total from it. Omitted

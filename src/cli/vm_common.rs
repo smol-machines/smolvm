@@ -2095,6 +2095,13 @@ fn start_vm_named_with_db(
         }
     }
 
+    if let Some(id) = (mediated_egress || record.mediated_egress_required)
+        .then(|| smolvm::agent::read_mediation_machine_id(name))
+        .flatten()
+    {
+        println!("Mediation machine ID: {id}");
+    }
+
     // Keep VM running (persistent)
     manager.detach();
     if stop_after_workload {

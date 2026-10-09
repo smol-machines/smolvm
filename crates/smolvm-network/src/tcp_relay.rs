@@ -1039,7 +1039,7 @@ fn tcp_relay_loop(
             // dialed. Wait briefly for application bytes so a host decider can
             // inspect them before choosing a route. Server-speaks-first flows
             // continue after this bounded hold with an empty initial payload.
-            let first = from_smoltcp.recv_timeout(FIRST_PAYLOAD_HOLD).ok();
+            let first = collect_initial_bytes(&from_smoltcp, FIRST_PAYLOAD_HOLD);
             if first.is_some() {
                 relay_wake.wake();
             }
@@ -1121,9 +1121,67 @@ fn tcp_relay_loop(
         to_smoltcp,
         &relay_wake,
         exit_state,
-        mediated,
-        pending_guest_data,
+        RelayFlow {
+            mediated,
+            pending_guest_data,
+        },
     )
+}
+
+/// Whether `bytes` already hold what a decider needs to route a flow: one whole
+/// TLS record (the ClientHello, SNI included), the whole header block of an
+/// HTTP request, or, for any other protocol, its first segment.
+///
+/// A ClientHello carrying a post-quantum key share is about 1.8 KB and often
+/// spans two segments, with the SNI in the second; a decider shown only the
+/// first segment could not route it by name.
+fn initial_bytes_complete(bytes: &[u8]) -> bool {
+    if bytes.first() == Some(&0x16) {
+        // A TLS record: content type, two version bytes, a two-byte length.
+        return bytes.len() >= 5
+            && bytes.len() >= 5 + usize::from(u16::from_be_bytes([bytes[3], bytes[4]]));
+    }
+    const METHODS: [&[u8]; 9] = [
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"HEAD ",
+        b"DELETE ",
+        b"OPTIONS ",
+        b"PATCH ",
+        b"CONNECT ",
+        b"TRACE ",
+    ];
+    if METHODS.iter().any(|method| bytes.starts_with(method)) {
+        return bytes.windows(4).any(|window| window == b"\r\n\r\n");
+    }
+    // Any other protocol may send a line and then wait for the server, so
+    // holding it for more than its first segment would only add latency.
+    true
+}
+
+/// A flow's opening bytes for the decider: the guest's segments until they are
+/// [complete](initial_bytes_complete), reach `MAX_INITIAL_BYTES`, or `hold` has
+/// passed since the first wait. `None` when the guest sent nothing in time (a
+/// server-speaks-first protocol) or closed its side.
+fn collect_initial_bytes(from: &Receiver<Vec<u8>>, hold: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + hold;
+    let mut collected: Option<Vec<u8>> = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(segment) = from.recv_timeout(remaining) else {
+            break;
+        };
+        let bytes = collected.get_or_insert_with(Vec::new);
+        bytes.extend_from_slice(&segment);
+        if bytes.len() >= MAX_INITIAL_BYTES || initial_bytes_complete(bytes) {
+            break;
+        }
+    }
+    collected
 }
 
 /// A relay's host socket registered in the relay's poller. Owning both ties
@@ -1149,6 +1207,15 @@ impl Drop for RegisteredStream {
     }
 }
 
+/// How a flow entered the relay.
+struct RelayFlow {
+    /// Bounded by the mediated connection lifetime.
+    mediated: bool,
+    /// Guest bytes already read (with the offset written so far) that must
+    /// reach the host before anything else.
+    pending_guest_data: Option<(Vec<u8>, usize)>,
+}
+
 /// Copies bytes both ways between the host socket and the guest channels
 /// until the flow ends, waiting on `poller` whenever neither direction can
 /// make progress.
@@ -1159,9 +1226,12 @@ fn relay_stream(
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: &WakePipe,
     exit_state: &RelayExitState,
-    mediated: bool,
-    mut pending_guest_data: Option<(Vec<u8>, usize)>,
+    flow: RelayFlow,
 ) -> io::Result<RelayExitMode> {
+    let RelayFlow {
+        mediated,
+        mut pending_guest_data,
+    } = flow;
     let mut stream = stream;
     let mut events = Events::new();
     let mut guest_write_closed = false;
@@ -1344,6 +1414,76 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod initial_bytes_tests {
+    use super::*;
+
+    fn tls_record(body_len: usize) -> Vec<u8> {
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(body_len as u16).to_be_bytes());
+        record.extend(std::iter::repeat_n(0xAB, body_len));
+        record
+    }
+
+    // A ClientHello split across two segments is collected whole, so a decider
+    // routing by SNI sees it even when the SNI is in the second segment.
+    #[test]
+    fn a_tls_record_split_across_segments_is_collected_whole() {
+        let record = tls_record(1795);
+        assert!(!initial_bytes_complete(&record[..3]));
+        assert!(!initial_bytes_complete(&record[..1200]));
+        assert!(initial_bytes_complete(&record));
+
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender.send(record[..1200].to_vec()).unwrap();
+        let rest = record[1200..].to_vec();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            sender.send(rest).unwrap();
+        });
+        assert_eq!(
+            collect_initial_bytes(&receiver, Duration::from_secs(2)),
+            Some(record)
+        );
+    }
+
+    #[test]
+    fn http_request_headers_are_collected_to_their_end() {
+        assert!(!initial_bytes_complete(b"GET / HTTP/1.1\r\nHost: a"));
+        assert!(initial_bytes_complete(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    }
+
+    // Another protocol is handed over after its first segment, not held for the
+    // whole deadline: it may be waiting for the server to answer.
+    #[test]
+    fn other_protocols_are_not_held_past_their_first_segment() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender.send(b"SSH-2.0-OpenSSH_9.6\r\n".to_vec()).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            collect_initial_bytes(&receiver, Duration::from_secs(5)),
+            Some(b"SSH-2.0-OpenSSH_9.6\r\n".to_vec())
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn collection_stops_at_the_cap_and_at_the_deadline() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender.send(tls_record(MAX_INITIAL_BYTES)).unwrap();
+        let collected = collect_initial_bytes(&receiver, Duration::from_secs(2)).unwrap();
+        assert!(collected.len() >= MAX_INITIAL_BYTES);
+
+        let (_sender, receiver) = mpsc::sync_channel::<Vec<u8>>(4);
+        let started = Instant::now();
+        assert_eq!(
+            collect_initial_bytes(&receiver, Duration::from_millis(50)),
+            None
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 }
 
@@ -1803,6 +1943,7 @@ mod tests {
                 guest_rx,
                 reply_tx,
                 Arc::new(WakePipe::new()),
+                WakePipe::new(),
                 &state,
             );
             broker_thread.join().unwrap();
@@ -1876,6 +2017,7 @@ mod tests {
                     guest_rx,
                     reply_tx,
                     Arc::new(WakePipe::new()),
+                    WakePipe::new(),
                     &state,
                 )
             });
