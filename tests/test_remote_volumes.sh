@@ -260,7 +260,7 @@ $S machine create --name rv-svc --image nginx:alpine --net --net-backend virtio-
 $S machine start --name rv-svc >/dev/null 2>&1
 GOT=
 n=0; while [ $n -lt 15 ]; do
-  [ "$($S machine exec --name rv-svc -- sh -c 'cat /proc/1/comm' 2>/dev/null | tr -d '\r\n')" = nginx ] && { GOT=up; break; }
+  $S machine exec --name rv-svc -- sh -c 'cat /proc/[0-9]*/comm' 2>/dev/null | grep -qx nginx && { GOT=up; break; }
   n=$((n+1)); sleep 1
 done
 check "service entrypoint runs under a remote volume" "$GOT" "up"

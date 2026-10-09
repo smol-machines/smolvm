@@ -4121,15 +4121,31 @@ fn handle_run_detached(
 
     let workload_id = format!("persistent-{}", overlay_id);
 
+    // The container's PID 1 is the agent's keep-alive init and the workload is
+    // launched into it once it runs. Were the workload PID 1, its exit would
+    // tear down the PID namespace and SIGKILL every exec still running in the
+    // machine. Init systems are the exception: they only work as PID 1.
+    let workload_is_pid1 = workload_needs_pid1(&launch.command);
+    let container_launch = if workload_is_pid1 {
+        None
+    } else {
+        Some(ResolvedLaunch {
+            command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
+            env: launch.env.clone(),
+            workdir: launch.workdir.clone(),
+            user: launch.user.clone(),
+        })
+    };
+
     // Detached containers always run non-interactively (tty: false).
     let container_id = match write_oci_bundle(
         rootfs_path,
         &bundle_path,
-        &launch,
+        container_launch.as_ref().unwrap_or(&launch),
         &mounts,
         false,
         unprivileged,
-        false,
+        !workload_is_pid1,
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -4228,8 +4244,38 @@ fn handle_run_detached(
                 container_id = %container_id,
                 "detached container started via create+start"
             );
+            let workload = if workload_is_pid1 {
+                None
+            } else {
+                match launch_workload(&container_id, rootfs_path, &launch) {
+                    Ok(workload) => Some(workload),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&id_path);
+                        let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+                        let _ = crun::CrunCommand::delete(&container_id, true).output();
+                        send_response(
+                            stream,
+                            &AgentResponse::error(
+                                format!("start workload: {e}"),
+                                error_codes::SPAWN_FAILED,
+                            ),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            };
             if stop_vm_on_exit {
-                stop_machine_when_workload_exits(container_id.clone());
+                match workload {
+                    Some(workload) => stop_machine_when_exited(move || {
+                        let stat =
+                            std::fs::read_to_string(format!("/proc/{}/stat", workload.pid)).ok()?;
+                        validate_crun_process_identity(workload, &stat)
+                    }),
+                    None => {
+                        let container_id = container_id.clone();
+                        stop_machine_when_exited(move || crun_container_pid(&container_id))
+                    }
+                }
             }
             send_response(
                 stream,
@@ -4264,26 +4310,99 @@ fn handle_run_detached(
     Ok(())
 }
 
-/// Power the machine off once the workload container `container_id` exits,
-/// whatever its exit status (`stop_on_exit`). Storage is flushed exactly as for
-/// a `machine stop` before the power-off, so nothing the workload wrote is lost.
+/// Init systems that only work as the container's PID 1 (they refuse to run,
+/// or never reap orphans, otherwise), so they keep the workload-as-PID-1
+/// launch. Anything else runs under the keep-alive init.
+#[cfg(target_os = "linux")]
+fn workload_needs_pid1(command: &[String]) -> bool {
+    let Some(program) = command.first() else {
+        return false;
+    };
+    let name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        "init" | "systemd" | "openrc-init" | "s6-svscan" | "runit" | "runit-init"
+    )
+}
+
+/// Launch the workload into the started container `container_id`, whose PID 1
+/// is the keep-alive init, and return its identity for the `stop_on_exit`
+/// watcher. Fails, with crun's reason, when the command cannot be started
+/// (say its executable does not exist), so `machine start` reports it.
+#[cfg(target_os = "linux")]
+fn launch_workload(
+    container_id: &str,
+    rootfs: &std::path::Path,
+    launch: &ResolvedLaunch,
+) -> Result<CrunProcessIdentity, String> {
+    // `crun exec --user` needs a numeric uid[:gid] and an exec gets only the
+    // environment it is given, so resolve both the way PID 1's were.
+    let mut env = launch.env.clone();
+    oci::apply_process_env(rootfs, launch.user.as_deref(), &mut env);
+    let user = oci::resolve_exec_user_spec(rootfs, launch.user.as_deref())?;
+    let log = crun::workload_log_path(container_id);
+    let pid_file = log.with_extension("pid");
+    let _ = std::fs::remove_file(&pid_file);
+    let status = crun::CrunCommand::exec_detached_with_log(
+        container_id,
+        &env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        Some(&pid_file),
+        Some(&log),
+    )
+    .user(user.as_deref())
+    .stdin_null()
+    .discard_output()
+    .status()
+    .map_err(|e| format!("run crun: {e}"))?;
+    let reason = crun::take_log(&log);
+    let pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    let _ = std::fs::remove_file(&pid_file);
+    if !status.success() {
+        return Err(if reason.is_empty() {
+            format!("crun exec {status} and reported nothing")
+        } else {
+            reason
+        });
+    }
+    let pid = pid.ok_or("crun exec reported no workload pid")?;
+    // A workload that already exited has no stat to read; the watcher then
+    // sees it gone on its first check, which is the right answer.
+    let start_time = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| proc_stat_start_time(&stat))
+        .unwrap_or(0);
+    info!(container_id = %container_id, pid, "workload launched under the keep-alive init");
+    Ok(CrunProcessIdentity { pid, start_time })
+}
+
+/// Power the machine off once the workload exits, whatever its exit status
+/// (`stop_on_exit`). `alive` returns the workload's pid while it is running.
+/// Storage is flushed exactly as for a `machine stop` before the power-off, so
+/// nothing the workload wrote is lost.
 ///
 /// The workload's process is re-parented to the agent, which does not reap
 /// unknown children, so it may linger as a zombie; both the pidfd wait and
-/// `crun_container_pid` treat a zombie as exited.
+/// the identity check behind `alive` treat a zombie as exited.
 #[cfg(target_os = "linux")]
-fn stop_machine_when_workload_exits(container_id: String) {
+fn stop_machine_when_exited(alive: impl Fn() -> Option<u32> + Send + 'static) {
     let spawned = std::thread::Builder::new()
         .name("stop-on-exit".into())
         .spawn(move || {
-            while let Some(pid) = crun_container_pid(&container_id) {
+            while let Some(pid) = alive() {
                 if !wait_for_pid_exit(pid) {
                     // No pidfd for that pid (it already exited, or poll
                     // failed): the old poll interval is the fallback.
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
-            info!(container_id = %container_id, "workload exited; stopping the machine (stop_on_exit)");
+            info!("workload exited; stopping the machine (stop_on_exit)");
             if let Err(e) = shutdown_freeze::freeze_internal_filesystems() {
                 warn!(error = %e, "stop_on_exit: flushing storage before power-off failed");
             }
@@ -4509,7 +4628,7 @@ fn validate_crun_process_identity(identity: CrunProcessIdentity, proc_stat: &str
     if matches!(state, b'Z' | b'X') {
         return None;
     }
-    let actual_start_time = fields.get(19)?.parse::<u64>().ok()?;
+    let actual_start_time = proc_stat_start_time(proc_stat)?;
 
     // Older crun status files omit the start time (encoded here as zero). In
     // that compatibility case the successfully-read, non-zombie proc record is
@@ -4518,6 +4637,13 @@ fn validate_crun_process_identity(identity: CrunProcessIdentity, proc_stat: &str
         return None;
     }
     Some(identity.pid)
+}
+
+/// `starttime` (field 22) of a `/proc/<pid>/stat` record.
+#[cfg(target_os = "linux")]
+fn proc_stat_start_time(proc_stat: &str) -> Option<u64> {
+    let (_, remainder) = proc_stat.rsplit_once(')')?;
+    remainder.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Non-Linux stub.
@@ -7841,6 +7967,41 @@ mod tests {
         assert!(parse_crun_process_identity(br#"{"pid":-1}"#).is_none());
         assert!(parse_crun_process_identity(br#"{"pid":"123"}"#).is_none());
         assert!(parse_crun_process_identity(br#"{"process-start-time":456}"#).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_init_systems_run_as_the_container_pid1() {
+        let cmd = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        for init in [
+            &["/sbin/init"][..],
+            &["/init"],
+            &["/lib/systemd/systemd", "--system"],
+            &["s6-svscan", "/etc/s6"],
+            &["runit-init"],
+        ] {
+            assert!(super::workload_needs_pid1(&cmd(init)), "{init:?}");
+        }
+        for workload in [
+            &["node"][..],
+            &["nginx", "-g", "daemon off;"],
+            &["sh", "-c", "exec /sbin/init"],
+            &["tini", "--", "server"],
+            &["/docker-entrypoint.sh", "nginx"],
+        ] {
+            assert!(!super::workload_needs_pid1(&cmd(workload)), "{workload:?}");
+        }
+        assert!(!super::workload_needs_pid1(&[]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_start_time_reads_field_22() {
+        assert_eq!(
+            super::proc_stat_start_time(&proc_stat_fixture(42, 'S', 987_654)),
+            Some(987_654)
+        );
+        assert_eq!(super::proc_stat_start_time("42 (truncated"), None);
     }
 
     #[cfg(target_os = "linux")]
