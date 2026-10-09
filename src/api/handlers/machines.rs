@@ -3813,6 +3813,13 @@ pub async fn start_machine(
                     seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
                 }
             }
+            // A fresh machine whose image the host fetched at this start still
+            // has the blank disk its create made; it holds nothing, so seed it.
+            if seed_image.is_none()
+                && crate::image_seed::discard_unbooted_archive_storage(&name_clone, &image)
+            {
+                seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+            }
         }
         if let Some(image) = seed_image {
             let seeded = crate::image_seed::builder_exe()

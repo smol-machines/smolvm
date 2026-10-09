@@ -37,8 +37,8 @@
 
 #[cfg(unix)]
 pub use imp::{
-    prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage, seed_storage_with_trust,
-    seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    discard_unbooted_archive_storage, prewarm_recent_seeds, revalidate_seed, seed_root,
+    seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
@@ -186,6 +186,12 @@ pub fn seed_storage_with_trust(
     Ok(false)
 }
 
+/// Seeds need a Unix host; elsewhere there is no seed to make room for.
+#[cfg(not(unix))]
+pub fn discard_unbooted_archive_storage(_: &str, _: &str) -> bool {
+    false
+}
+
 #[cfg(not(unix))]
 /// Seeds need a Unix host, so other platforms have nothing to revalidate.
 pub fn revalidate_seed(_: &str, _: &str, _: &crate::registry::PullAuth) -> crate::Result<bool> {
@@ -276,6 +282,32 @@ mod imp {
             return None;
         }
         Some(image.to_string())
+    }
+
+    /// Remove the blank storage disk a fresh machine `name` got at create, so its
+    /// first start can take a seed of the staged archive `image` it now boots.
+    /// Only for a staged archive: the server creates a machine's disks before
+    /// its start fetches the image on the host, so the disk exists but holds
+    /// nothing. Callers pass only machines that have never completed a start.
+    pub fn discard_unbooted_archive_storage(name: &str, image: &str) -> bool {
+        if local_archive(image).is_none_or(|archive| !archive.is_file()) {
+            return false;
+        }
+        let base = crate::agent::vm_data_dir(name).join(crate::storage::STORAGE_DISK_FILENAME);
+        for path in [
+            base.with_extension(DiskFormat::Qcow2.extension()),
+            base.with_extension("formatted"),
+            source_marker(&base),
+            base.clone(),
+        ] {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), %error, "could not clear an unbooted storage disk");
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The staged archive file a `local:` archive reference boots from, or
