@@ -3433,6 +3433,7 @@ name = "smolvm-credentials"
 version = "1.25.3"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "futures-util",
  "getrandom 0.3.4",

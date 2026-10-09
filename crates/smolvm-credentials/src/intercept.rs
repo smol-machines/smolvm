@@ -20,6 +20,7 @@ use crate::policy::{CredentialPolicy, PLACEHOLDER_PREFIX};
 use crate::resolver::{CredentialRequest, CredentialResolver};
 use crate::sni::{peek_client_hello, Peek, MAX_CLIENT_HELLO};
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
@@ -417,7 +418,9 @@ impl State {
             ));
         }
 
-        if let Some((header_name, placeholder)) = substitution {
+        if let Some(substitution) = substitution {
+            let header_name = substitution.header_name;
+            let placeholder = substitution.placeholder;
             let Some(binding_name) = self.bindings_by_placeholder.get(&placeholder) else {
                 return Ok(text(
                     StatusCode::FORBIDDEN,
@@ -468,7 +471,20 @@ impl State {
                 .context("substituted header vanished")?
                 .as_bytes()
                 .to_vec();
-            let replaced = replace_once(&current, placeholder.as_bytes(), secret.as_bytes());
+            let replaced = if substitution.basic_password {
+                // Git sends its password in a Base64-encoded Basic header. The
+                // guest's password is only a placeholder; decode and replace
+                // on the host, then encode the real password for the upstream.
+                let mut raw = b"x-access-token:".to_vec();
+                raw.extend_from_slice(secret.as_bytes());
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(raw)
+                )
+                .into_bytes()
+            } else {
+                replace_once(&current, placeholder.as_bytes(), secret.as_bytes())
+            };
             // Also refuses a value with CR, LF or other control bytes, which
             // could otherwise split the header.
             let Ok(mut value) = header::HeaderValue::from_bytes(&replaced) else {
@@ -532,12 +548,46 @@ const PROTECTED_HEADERS: &[&str] = &[
 /// is), `Ok(Some((header, placeholder)))` for exactly one occurrence, and a
 /// guest-facing reason when placeholders appear more than once or in a
 /// protected header.
+struct HeaderSubstitution {
+    header_name: header::HeaderName,
+    placeholder: String,
+    basic_password: bool,
+}
+
 fn find_placeholder(
     headers: &header::HeaderMap,
-) -> std::result::Result<Option<(header::HeaderName, String)>, &'static str> {
-    let mut found: Option<(header::HeaderName, String)> = None;
+) -> std::result::Result<Option<HeaderSubstitution>, &'static str> {
+    let mut found: Option<HeaderSubstitution> = None;
     for (name, value) in headers.iter() {
         let bytes = value.as_bytes();
+        if name == header::AUTHORIZATION && bytes.starts_with(b"Basic ") {
+            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&bytes[6..]) {
+                if contains(&decoded, PLACEHOLDER_PREFIX.as_bytes()) {
+                    let Some(password) = decoded.strip_prefix(b"x-access-token:") else {
+                        return Err(
+                            "smolvm credentials: Basic placeholder must be the Git token password",
+                        );
+                    };
+                    if !password.starts_with(PLACEHOLDER_PREFIX.as_bytes())
+                        || password[PLACEHOLDER_PREFIX.len()..]
+                            .iter()
+                            .any(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+                        || found.is_some()
+                    {
+                        return Err("smolvm credentials: malformed or multiple placeholders");
+                    }
+                    let placeholder = std::str::from_utf8(password)
+                        .map_err(|_| "smolvm credentials: malformed placeholder")?
+                        .to_string();
+                    found = Some(HeaderSubstitution {
+                        header_name: name.clone(),
+                        placeholder,
+                        basic_password: true,
+                    });
+                    continue;
+                }
+            }
+        }
         let Some(start) = find(bytes, PLACEHOLDER_PREFIX.as_bytes()) else {
             continue;
         };
@@ -555,7 +605,11 @@ fn find_placeholder(
         let placeholder = std::str::from_utf8(&bytes[start..end])
             .map_err(|_| "smolvm credentials: malformed placeholder")?
             .to_string();
-        found = Some((name.clone(), placeholder));
+        found = Some(HeaderSubstitution {
+            header_name: name.clone(),
+            placeholder,
+            basic_password: false,
+        });
     }
     Ok(found)
 }
@@ -880,6 +934,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn substitutes_git_basic_password_without_exposing_it_to_the_guest() {
+        let f = fixture().await;
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(format!("x-access-token:{}", f.placeholder));
+        let request = format!(
+            "GET /org/repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Basic {encoded}\r\nConnection: close\r\n\r\n"
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        let auth = &seen[0].0;
+        let encoded = auth.strip_prefix("Basic ").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(decoded, b"x-access-token:real-secret");
+        assert!(!auth.contains(&f.placeholder));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn splices_other_hosts_through_untouched() {
         let f = fixture().await;
         let request = format!(
@@ -991,9 +1067,10 @@ mod tests {
             header::AUTHORIZATION,
             "Bearer SMOL_PLACEHOLDER_A_1".parse().unwrap(),
         );
-        let (name, placeholder) = find_placeholder(&headers).unwrap().unwrap();
-        assert_eq!(name, header::AUTHORIZATION);
-        assert_eq!(placeholder, "SMOL_PLACEHOLDER_A_1");
+        let substitution = find_placeholder(&headers).unwrap().unwrap();
+        assert_eq!(substitution.header_name, header::AUTHORIZATION);
+        assert_eq!(substitution.placeholder, "SMOL_PLACEHOLDER_A_1");
+        assert!(!substitution.basic_password);
 
         headers.insert("x-api-key", "SMOL_PLACEHOLDER_B_2".parse().unwrap());
         assert!(find_placeholder(&headers).is_err());
@@ -1005,6 +1082,24 @@ mod tests {
         let mut headers = header::HeaderMap::new();
         headers.insert(header::ACCEPT, "application/json".parse().unwrap());
         assert!(find_placeholder(&headers).unwrap().is_none());
+
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("x-access-token:SMOL_PLACEHOLDER_A_1");
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {encoded}").parse().unwrap(),
+        );
+        let substitution = find_placeholder(&headers).unwrap().unwrap();
+        assert_eq!(substitution.placeholder, "SMOL_PLACEHOLDER_A_1");
+        assert!(substitution.basic_password);
+
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("attacker:SMOL_PLACEHOLDER_A_1");
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {encoded}").parse().unwrap(),
+        );
+        assert!(find_placeholder(&headers).is_err());
     }
 
     #[test]

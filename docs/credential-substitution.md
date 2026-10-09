@@ -84,6 +84,14 @@ Embedders resolve however they like: the engine asks a `CredentialResolver`
 with the machine name, binding name, destination host and port, method and
 path, and expects the raw value back. See `crates/smolvm-credentials`.
 
+When the serve API receives `PUT /api/v1/machines/:name/credential-values` on
+Unix, it holds those values in the API process and serves them to the VM's host
+interceptor over a private node-local Unix socket. Repeating the PUT rotates
+values for a running VM; omitting a binding revokes it on the next request.
+Neither the value nor the socket is mounted into the guest. If the API process
+or socket is unavailable, substitution fails closed. Local CLI secret sources
+continue to resolve from their host file or environment on each request.
+
 ## What the guest sees
 
 - `ENV_VAR=SMOL_PLACEHOLDER_<NAME>_<random>` in the workload environment,
@@ -133,6 +141,21 @@ unreadable, or the value has control characters. Details are in the machine's
 host log, never in the response.
 
 A request to an allowed host that carries no placeholder is forwarded as is.
+
+### GitHub HTTPS Git
+
+When a binding uses `GITHUB_TOKEN` and allows `github.com`, the workload also
+receives a Git credential helper configuration for that host. Ordinary
+`git clone https://github.com/owner/repo.git`, `git pull`, and `git push` then
+send `x-access-token` as the username and the machine's placeholder as the
+password. Git encodes both in a Basic Authorization header; the host decodes
+that header and replaces only the password before forwarding it. The real token
+never enters the guest. The same binding may allow `api.github.com` for API
+calls using `Authorization: Bearer $GITHUB_TOKEN`.
+
+The helper applies only to HTTPS requests for `github.com`. It sets Git's
+command-scope `GIT_CONFIG_*` variables for the workload; a command that needs
+its own `GIT_CONFIG_*` settings should explicitly preserve or replace those.
 
 ## Branching and checkpoints
 
