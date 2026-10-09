@@ -35,6 +35,8 @@ pub const POD_SHARE_TAG: &str = "podshare";
 
 /// Guest directory holding per-pod-container state (crun bundle dirs).
 const POD_STATE_DIR: &str = "/storage/containers/pods";
+/// Root of per-container writable state (overlay + materialized CRI mounts).
+const POD_OVERLAY_DIR: &str = "/storage/pods";
 
 // ============================================================================
 // Registry
@@ -311,6 +313,16 @@ fn parse_pod_mounts(spec: &serde_json::Value) -> Vec<PodMount> {
 /// Per-container state directory (holds the crun bundle).
 fn pod_dir(id: &str) -> PathBuf {
     PathBuf::from(POD_STATE_DIR).join(id)
+}
+
+/// Per-container writable state: the overlay `upper`/`work`/`merged` that backs
+/// the container rootfs, plus any materialized CRI mounts under `mnt/`.
+///
+/// A sibling of [`pod_dir`], on the guest's writable `/storage` disk rather than
+/// beside the crun bundle. Both are per-container and both die with the
+/// container; keeping the paths together keeps that lifecycle visible.
+fn pod_overlay_dir(id: &str) -> PathBuf {
+    PathBuf::from(POD_OVERLAY_DIR).join(id)
 }
 
 // ============================================================================
@@ -759,6 +771,32 @@ fn ticks_to_ns(ticks: u64) -> u64 {
 /// `PodDelete`: drop an exec registration, or tear down the whole container
 /// (crun delete --force best-effort + bundle dir removal + registry entry).
 /// Idempotent: deleting something unknown is Ok.
+/// Unmount and remove a container's writable overlay state.
+///
+/// Best-effort and idempotent: a container that never started has nothing
+/// mounted and may have no tree at all, and a delete must not fail because its
+/// leftovers were already gone.
+#[cfg(target_os = "linux")]
+fn reclaim_pod_overlay(id: &str) {
+    let base = pod_overlay_dir(id);
+    if !base.exists() {
+        return;
+    }
+    let merged = base.join("merged");
+    if let Ok(c) = std::ffi::CString::new(merged.to_string_lossy().as_bytes()) {
+        // MNT_DETACH: the mount is unhooked now and its last references go when
+        // whatever still holds them exits, so a busy mount cannot strand the tree.
+        unsafe { libc::umount2(c.as_ptr(), 2) };
+    }
+    if let Err(e) = std::fs::remove_dir_all(&base) {
+        warn!(id = %id, error = %e, "failed to remove pod overlay state");
+    }
+}
+
+/// Stub for non-Linux platforms, which have no overlay state to reclaim.
+#[cfg(not(target_os = "linux"))]
+fn reclaim_pod_overlay(_id: &str) {}
+
 pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
     if let Some(exec) = exec_id {
         if let Some(pod) = lock_registry().get_mut(id) {
@@ -782,6 +820,14 @@ pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
                 warn!(id = %id, error = %e, "failed to remove pod state dir");
             }
         }
+        // The container's writable state is a second root, and it outlived the
+        // container until now: the overlay stayed mounted and its tree stayed on
+        // disk. CRI gives a restarted container a FRESH id in the same sandbox,
+        // so nothing later reclaims it — a crash-looping container accumulated
+        // one live mount and one tree per restart. Unmount before removing, or
+        // the tree is busy and the files under the mountpoint are the lower
+        // layer's, not ours to delete.
+        reclaim_pod_overlay(id);
     }
     info!(id = %id, existed = existed, "pod container deleted");
     AgentResponse::ok(None)
@@ -1058,7 +1104,7 @@ fn materialize_pod_mounts(id: &str, mounts: &[PodMount]) -> Vec<(PathBuf, String
     // The copy makes the volume writable + guest-local (correct emptyDir/configMap
     // /secret semantics; smolvm's virtiofs share is read-only so a live bind of the
     // host source couldn't be written).
-    let base = Path::new("/storage/pods").join(id).join("mnt");
+    let base = pod_overlay_dir(id).join("mnt");
     let mut binds = Vec::new();
     for (n, m) in mounts.iter().enumerate() {
         let dst = base.join(n.to_string());
@@ -1268,7 +1314,7 @@ fn cgroups_available() -> bool {
 /// unmounted first.
 #[cfg(target_os = "linux")]
 fn mount_writable_rootfs(id: &str, lower: &std::path::Path) -> Result<PathBuf, String> {
-    let base = Path::new("/storage/pods").join(id);
+    let base = pod_overlay_dir(id);
     let upper = base.join("upper");
     let work = base.join("work");
     let merged = base.join("merged");
