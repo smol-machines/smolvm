@@ -538,6 +538,14 @@ pub async fn exec_interactive(
     // An interactive session may be what establishes the workload container,
     // and the mount lives there.
     let machine_for_run = machine_record.clone();
+    // A terminal sees what an `exec` sees: the machine's own environment and
+    // its resolved secret references. Without them a console shell ran with
+    // neither, so a tool reading an API key from the environment found none.
+    let mut env = machine_record
+        .as_ref()
+        .map(|record| record.env.clone())
+        .unwrap_or_default();
+    env.extend(crate::api::handlers::record_secret_refs_env(&entry)?);
 
     let init_size = (q.cols.unwrap_or(80), q.rows.unwrap_or(24));
 
@@ -590,9 +598,10 @@ pub async fn exec_interactive(
                             }
                         }
                         let config = crate::agent::RunConfig::new(image, command)
+                            .with_env(env.clone())
                             .with_mounts(mounts_config)
                             .with_tty(tty)
-                            .in_machine_opt(machine_for_run.as_ref(), &id, &[]);
+                            .in_machine_opt(machine_for_run.as_ref(), &id, &env);
                         client
                             .run_interactive_io(config, input, on_output)
                             .unwrap_or_else(|e| {
@@ -601,7 +610,7 @@ pub async fn exec_interactive(
                             })
                     } else {
                         client
-                            .vm_exec_interactive_io(command, Vec::new(), None, tty, input, on_output)
+                            .vm_exec_interactive_io(command, env, None, tty, input, on_output)
                             .unwrap_or_else(|e| {
                                 tracing::warn!(error = ?e, "interactive: vm exec failed");
                                 -1
