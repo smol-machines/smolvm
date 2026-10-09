@@ -278,9 +278,9 @@ fn auto_start_default() -> bool {
     true
 }
 
-/// Request to amend a stopped machine's egress allow list: add or remove
-/// hosts, patterns, and CIDRs without replacing the whole policy. The same
-/// merge and guards as `machine update`.
+/// Request to amend a machine's egress allow list: add or remove hosts,
+/// patterns, and CIDRs without replacing the whole policy. The same merge and
+/// guards as `machine update`, including on a running machine.
 ///
 /// `deny_unknown_fields`: a mis-cased field on a security posture must be a
 /// hard 400, never a silently dropped entry.
