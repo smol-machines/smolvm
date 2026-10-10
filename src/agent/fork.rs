@@ -605,9 +605,10 @@ fn branch_admission_required_mib(
 
 /// Refuse a fan-out before capture if it would consume the host/cgroup's safe
 /// boot headroom. This intentionally reserves only measured VMM boot overhead
-/// plus a fresh shared generation—not every child's configured guest ceiling,
-/// which would erase COW density. Managed per-VM cgroups remain the hard bound
-/// for later workload writes where the service enables them.
+/// plus what a fresh shared generation copies—the source's private pages since
+/// its last capture, not its whole RAM and not every child's configured guest
+/// ceiling, which would erase COW density. Managed per-VM cgroups remain the
+/// hard bound for later workload writes where the service enables them.
 fn admit_branch_memory(
     record: &VmRecord,
     children: usize,
@@ -632,7 +633,7 @@ fn admit_branch_memory(
         record
             .pid
             .and_then(crate::process::process_memory_stats)
-            .and_then(|stats| stats.pss_bytes)
+            .and_then(|stats| stats.anon_bytes.or(stats.pss_bytes))
             .map(|bytes| (bytes.saturating_add(MIB - 1)) / MIB)
             .unwrap_or(u64::from(record.mem))
             .min(u64::from(record.mem))
@@ -2526,8 +2527,8 @@ pub(crate) fn prepare_forks_reusing(
 
         let t_snap = std::time::Instant::now();
         tracing::info!(%golden, phase = "memory_reserved", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
-        // Active children map one sparse materialized memfd generation so CPU-
-        // and I/O-heavy work never serializes behind page-by-page delivery.
+        // Active children map one shared immutable generation so CPU- and
+        // I/O-heavy work never serializes behind page-by-page delivery.
         // Held pool slots use the same shared generation because they may run a
         // dense workload as soon as they are leased. The environment override
         // remains an operator and debugging escape hatch.
@@ -2938,9 +2939,10 @@ fn prepare_clone_from_snapshot(
         clone_rec.golden = Some(golden.to_string());
         clone_rec.fork_generation = snapshot_generation_id(snapshot_dir).map(str::to_string);
         clone_rec.fork_lineage_pid_start_time = None;
-        // Forkability is explicit per clone. A normal clone remains a cheap
-        // leaf; a forkable clone materializes its restored RAM into fresh
-        // backing files at boot so it can later checkpoint its own state.
+        // Forkability is explicit per clone. Either way the clone is a
+        // copy-on-write view of its source's generation; a forkable clone
+        // additionally gets a control socket, and branching it later captures
+        // only the pages it has written since.
         clone_rec.forkable = spec.clone_forkable;
         clone_rec.forkpoint_held = spec.hold;
         clone_rec.fork_env = spec.fork_env.to_vec();

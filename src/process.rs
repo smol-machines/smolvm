@@ -2582,6 +2582,9 @@ pub struct ProcessMemoryStats {
     pub shared_mapped_bytes: Option<u64>,
     /// Proportional swapped bytes.
     pub swap_pss_bytes: Option<u64>,
+    /// Anonymous resident bytes: the process's private copy-on-write pages,
+    /// which is all a branch source's next RAM capture has to copy.
+    pub anon_bytes: Option<u64>,
 }
 
 /// Physical-memory capacity currently available to this SmolVM process.
@@ -2619,6 +2622,7 @@ fn parse_smaps_rollup(contents: &str) -> Option<ProcessMemoryStats> {
         private_bytes: Some(private_bytes),
         shared_mapped_bytes: Some(shared_mapped_bytes),
         swap_pss_bytes: parse_kib_field(contents, "SwapPss"),
+        anon_bytes: parse_kib_field(contents, "Anonymous"),
     })
 }
 
@@ -2657,12 +2661,19 @@ pub fn process_memory_stats(pid: Pid) -> Option<ProcessMemoryStats> {
     #[cfg(not(target_os = "linux"))]
     let statm: Option<(u64, u64)> = None;
     let shared_mapped_bytes = statm.map(|(_, shared)| shared);
+    #[cfg(target_os = "linux")]
+    let anon_bytes = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|contents| parse_kib_field(&contents, "RssAnon"));
+    #[cfg(not(target_os = "linux"))]
+    let anon_bytes = None;
     Some(ProcessMemoryStats {
         rss_bytes: stats.rss_bytes,
         pss_bytes: None,
         private_bytes: shared_mapped_bytes.map(|shared| stats.rss_bytes.saturating_sub(shared)),
         shared_mapped_bytes,
         swap_pss_bytes: None,
+        anon_bytes,
     })
 }
 

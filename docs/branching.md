@@ -71,8 +71,11 @@ keeps running with the helper as its init. A batch branch waits
 single `--name` branch never waits. With `--name-prefix` or `--hold`, even a
 count of one is a batch and gets the same boundary, identity, and release.
 
-Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
-`--forkable` remain compatibility aliases. A branch takes a checkpoint of the
+Add `--branchable` to a child when it must branch again. A branchable child
+costs the same as a leaf: both share the source's memory pages, and branching
+the child later copies only the pages it has written since, so a deep tree of
+branches pays for its changes, not for a copy of RAM at every level. `fork`,
+`--golden`, and `--forkable` remain compatibility aliases. A branch takes a checkpoint of the
 source in memory; `machine checkpoint` saves that same state as a durable
 `.checkpoint` file that can be restored later or elsewhere
 ([format](../crates/smolvm-checkpoint/FORMAT.md)).
