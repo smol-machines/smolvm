@@ -2790,6 +2790,7 @@ fn extract_layer_from_file(
 
 pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
+    cache_as: Option<&str>,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
     proxy: Option<&str>,
@@ -2799,17 +2800,28 @@ pub fn pull_image_with_progress_and_auth<F>(
 where
     F: FnMut(usize, usize, &str),
 {
-    // Validate image reference before any operations
+    // Validate the fetch reference and the stable cache key before any operations.
     crate::oci::validate_image_reference(image).map_err(|e| {
         StorageError::InvalidImageReference {
             reference: image.to_string(),
             reason: e,
         }
     })?;
+    if let Some(cache_as) = cache_as {
+        crate::oci::validate_image_reference(cache_as).map_err(|e| {
+            StorageError::InvalidImageReference {
+                reference: cache_as.to_string(),
+                reason: e,
+            }
+        })?;
+    }
 
-    // Canonicalize so all equivalent refs share the same on-disk cache key.
-    let image = normalize_image_ref(image);
-    let image = image.as_str();
+    // Fetch from the effective (possibly mirrored) reference, but cache under
+    // the user's canonical reference so subsequent Query/Run requests find it.
+    let fetch_image = normalize_image_ref(image);
+    let cache_image = normalize_image_ref(cache_as.unwrap_or(image));
+    let image = fetch_image.as_str();
+    let cache_image = cache_image.as_str();
 
     // If packed layers are available, return synthetic image info
     if let Some(packed_dir) = get_packed_layers_dir() {
@@ -2819,7 +2831,7 @@ where
         let effective = effective_packed_dir_with_progress(packed_dir, |phase, _| {
             progress(0, 0, phase);
         })?;
-        return create_packed_image_info(image, &effective);
+        return create_packed_image_info(cache_image, &effective);
     }
 
     // Determine OCI platform - default to current architecture
@@ -2840,7 +2852,7 @@ where
     });
 
     // Check if already cached with correct architecture
-    if let Ok(Some(info)) = query_image(image) {
+    if let Ok(Some(info)) = query_image(cache_image) {
         // Verify cached image architecture matches requested OCI platform
         let cached_arch = &info.architecture;
         let requested_arch = oci_platform
@@ -2866,9 +2878,9 @@ where
             let root = Path::new(STORAGE_ROOT);
             let manifest_path = root
                 .join(MANIFESTS_DIR)
-                .join(sanitize_image_name(image) + ".json");
+                .join(sanitize_image_name(cache_image) + ".json");
             let _ = std::fs::remove_file(&manifest_path);
-            let _ = std::fs::remove_file(image_size_cache_path(root, image));
+            let _ = std::fs::remove_file(image_size_cache_path(root, cache_image));
         }
     }
 
@@ -2922,7 +2934,7 @@ where
     // Save manifest
     let manifest_path = root
         .join(MANIFESTS_DIR)
-        .join(sanitize_image_name(image) + ".json");
+        .join(sanitize_image_name(cache_image) + ".json");
     std::fs::write(&manifest_path, &manifest)?;
 
     // Extract layers with progress updates.
@@ -3170,7 +3182,7 @@ where
     // metadata is consulted on every persistent exec. Compute the physical
     // size once after the verified pull and keep it out of the command hot path.
     let total_size = calculate_image_size(root, &layers);
-    cache_image_size(root, image, total_size);
+    cache_image_size(root, cache_image, total_size);
 
     // Build ImageInfo
     let architecture = config_json["architecture"]
@@ -3195,7 +3207,7 @@ where
         .map(String::from);
 
     Ok(ImageInfo {
-        reference: image.to_string(),
+        reference: cache_image.to_string(),
         digest: config_digest.to_string(),
         size: total_size,
         created,

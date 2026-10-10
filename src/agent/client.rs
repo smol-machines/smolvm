@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::platform::uds::UdsStream;
-use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
+use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
@@ -1080,6 +1080,30 @@ fn is_benign_shutdown_error(error_str: &str) -> bool {
         || error_str.contains("connection reset")
 }
 
+/// Resolve credentials for the registry that will actually receive the pull.
+fn registry_pull_credentials(
+    config: &RegistryConfig,
+    effective_image: &str,
+    explicit: Option<RegistryAuth>,
+) -> Option<RegistryAuth> {
+    let registry = extract_registry(effective_image);
+    explicit
+        .or_else(|| {
+            config.get_credentials(&registry).inspect(|creds| {
+                tracing::debug!(registry = %registry, username = %creds.username, "using configured registry credentials");
+            })
+        })
+        .or_else(|| {
+            crate::docker_config::credential_for(&registry).map(|cred| {
+                tracing::debug!(registry = %registry, username = %cred.username, "using host docker credentials");
+                RegistryAuth {
+                    username: cred.username,
+                    password: cred.secret,
+                }
+            })
+        })
+}
+
 /// Client for communicating with the smolvm-agent.
 pub struct AgentClient {
     stream: UdsStream,
@@ -1473,39 +1497,11 @@ impl AgentClient {
         image: &str,
         options: PullOptions<F>,
     ) -> Result<ImageInfo> {
+        let original_image = normalize_image_ref(image);
         // Resolve effective image and auth based on options
         let (effective_image, effective_auth) = if options.use_registry_config {
             let registry_config = SmolSettings::load().unwrap_or_default().images;
             let registry = extract_registry(image);
-
-            // Get credentials from config if not explicitly provided, then from
-            // what `docker login` stored on the host (inline or in a credential
-            // helper). The guest's crane accepts a username/secret pair and an
-            // identity token alike, so both forms are forwarded.
-            let auth = options
-                .auth
-                .or_else(|| {
-                    registry_config.get_credentials(&registry).inspect(|creds| {
-                        tracing::debug!(
-                            registry = %registry,
-                            username = %creds.username,
-                            "using configured registry credentials"
-                        );
-                    })
-                })
-                .or_else(|| {
-                    crate::docker_config::credential_for(&registry).map(|cred| {
-                        tracing::debug!(
-                            registry = %registry,
-                            username = %cred.username,
-                            "using host docker credentials"
-                        );
-                        RegistryAuth {
-                            username: cred.username,
-                            password: cred.secret,
-                        }
-                    })
-                });
 
             // Apply mirror if configured
             let img = if let Some(mirror) = registry_config.get_mirror(&registry) {
@@ -1521,47 +1517,41 @@ impl AgentClient {
                 image.to_string()
             };
 
+            // Credentials must be scoped to the registry that receives the
+            // request. A mirror is a different host and cannot inherit the
+            // upstream registry's saved token or Docker login credentials.
+            let auth = registry_pull_credentials(&registry_config, &img, options.auth);
             (img, auth)
         } else {
             (image.to_string(), options.auth)
         };
 
-        self.pull_image_internal(
-            &effective_image,
-            options.oci_platform.as_deref(),
-            effective_auth.as_ref(),
-            options.proxy.as_deref(),
-            options.no_proxy.as_deref(),
-            options.progress,
-        )
+        let effective_image = normalize_image_ref(&effective_image);
+        let cache_as = (effective_image != original_image).then_some(original_image);
+        let request = AgentRequest::Pull {
+            image: effective_image,
+            cache_as,
+            oci_platform: options.oci_platform,
+            auth: effective_auth,
+            proxy: options.proxy,
+            no_proxy: options.no_proxy,
+        };
+        self.pull_image_internal(request, options.progress)
     }
 
     /// Internal implementation of image pull.
     fn pull_image_internal<F: FnMut(usize, usize, &str)>(
         &mut self,
-        image: &str,
-        oci_platform: Option<&str>,
-        auth: Option<&RegistryAuth>,
-        proxy: Option<&str>,
-        no_proxy: Option<&str>,
+        request: AgentRequest,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
-        let image = normalize_image_ref(image);
-        let image = image.as_str();
-
         // Use a long timeout for pull - large images can take minutes to download/extract.
         // The guard resets the timeout on drop (including error paths).
         self.set_read_timeout(Duration::from_secs(IMAGE_PULL_TIMEOUT_SECS))?;
         let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
 
         // Send the pull request
-        let data = self.encode_traced(&AgentRequest::Pull {
-            image: image.to_string(),
-            oci_platform: oci_platform.map(String::from),
-            auth: auth.cloned(),
-            proxy: proxy.map(String::from),
-            no_proxy: no_proxy.map(String::from),
-        })?;
+        let data = self.encode_traced(&request)?;
 
         self.stream
             .write_all(&data)
@@ -5331,5 +5321,54 @@ mod streamed_path_cleanup_tests {
             b"complete archive".len() as u64
         );
         assert_eq!(std::fs::read(&output).unwrap(), b"complete archive");
+    }
+}
+
+#[cfg(test)]
+mod mirror_auth_tests {
+    use super::*;
+
+    #[test]
+    fn mirror_uses_its_own_credentials_instead_of_upstream_credentials() {
+        let config: RegistryConfig = toml::from_str(
+            r#"
+[registries."origin.example.invalid"]
+username = "origin"
+password = "upstream-secret"
+mirror = "mirror.example.invalid"
+
+[registries."mirror.example.invalid"]
+username = "mirror"
+password = "mirror-secret"
+"#,
+        )
+        .unwrap();
+        let image = rewrite_image_registry(
+            "origin.example.invalid/app:latest",
+            "mirror.example.invalid",
+        );
+        let auth = registry_pull_credentials(&config, &image, None).unwrap();
+        assert_eq!(auth.username, "mirror");
+        assert_eq!(auth.password, "mirror-secret");
+        let original =
+            registry_pull_credentials(&config, "origin.example.invalid/app:latest", None).unwrap();
+        assert_eq!(original.username, "origin");
+        assert_eq!(original.password, "upstream-secret");
+    }
+
+    #[test]
+    fn explicit_credentials_remain_available_for_private_mirrors() {
+        let config = RegistryConfig::default();
+        let auth = registry_pull_credentials(
+            &config,
+            "mirror.example.invalid/app:latest",
+            Some(RegistryAuth {
+                username: "explicit".into(),
+                password: "secret".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(auth.username, "explicit");
+        assert_eq!(auth.password, "secret");
     }
 }
