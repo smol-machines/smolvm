@@ -3177,6 +3177,34 @@ mod tests {
     }
 
     #[test]
+    fn update_changes_ports_alone_on_a_running_machine() {
+        use smolvm::config::VmRecord;
+
+        let parse_update = |argv: &[&str]| {
+            let cli = TestMachineCli::parse_from(argv);
+            let MachineCmd::Update(cmd) = cli.command else {
+                panic!("expected machine update command");
+            };
+            cmd
+        };
+        let base = ["machine", "update", "--name", "p"];
+        let with = |extra: &[&'static str]| parse_update(&[&base[..], extra].concat());
+
+        assert!(with(&["-p", "3000:3000"]).changes_only_ports());
+        assert!(with(&["--remove-port", "3000:3000"]).changes_only_ports());
+        assert!(!with(&["-p", "3000:3000", "--cpus", "2"]).changes_only_ports());
+        assert!(!with(&["-p", "3000:3000", "--allow-host", "pypi.org"]).changes_only_ports());
+        assert!(!with(&["-p", "3000:3000", "--allow-host", "pypi.org"]).changes_only_egress());
+
+        let record = VmRecord::new("p".to_string(), 1, 512, vec![], vec![(3000, 3000)], true);
+        let next = with(&["-p", "8080:80", "--remove-port", "3000:3000"])
+            .next_ports(&record)
+            .unwrap();
+        assert_eq!(next, vec![PortMapping::new(8080, 80)]);
+        assert!(with(&["-p", "3000:4000"]).next_ports(&record).is_err());
+    }
+
+    #[test]
     fn update_outbound_localhost_only_adds_the_loopback_cidrs() {
         use smolvm::config::VmRecord;
 
@@ -5950,9 +5978,19 @@ impl UpdateCmd {
         })
     }
 
-    /// Whether this update changes the allow list and nothing else, the one
-    /// change a running machine takes.
+    /// Whether this update changes the allow list and nothing else, one of the
+    /// changes a running machine takes.
     fn changes_only_egress(&self) -> bool {
+        let (egress, ports, other) = self.changed_settings();
+        egress && !ports && !other
+    }
+
+    fn changes_only_ports(&self) -> bool {
+        let (egress, ports, other) = self.changed_settings();
+        ports && !egress && !other
+    }
+
+    fn changed_settings(&self) -> (bool, bool, bool) {
         let Self {
             name: _,
             volume,
@@ -5989,10 +6027,9 @@ impl UpdateCmd {
             || !allow_cidr.is_empty()
             || !remove_allow_host.is_empty()
             || !remove_allow_cidr.is_empty();
+        let ports = !port.is_empty() || !remove_port.is_empty();
         let other = !volume.is_empty()
             || !remove_volume.is_empty()
-            || !port.is_empty()
-            || !remove_port.is_empty()
             || cpus.is_some()
             || mem.is_some()
             || *no_net
@@ -6007,7 +6044,75 @@ impl UpdateCmd {
             || storage.is_some()
             || overlay.is_some()
             || block_io.is_some();
-        egress && !other
+        (egress, ports, other)
+    }
+
+    fn next_ports(&self, record: &smolvm::config::VmRecord) -> smolvm::Result<Vec<PortMapping>> {
+        let add_ports = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("update ports", e))?;
+        let remove_ports = PortMappingSpec::expand_all(&self.remove_port)
+            .map_err(|e| smolvm::Error::config("update remove ports", e))?;
+        let mut final_ports: Vec<PortMapping> = record
+            .ports
+            .iter()
+            .filter(|&&(h, g)| !remove_ports.iter().any(|rm| rm.host == h && rm.guest == g))
+            .map(|&(h, g)| PortMapping::new(h, g))
+            .collect();
+        for p in &add_ports {
+            if !final_ports
+                .iter()
+                .any(|existing| existing.host == p.host && existing.guest == p.guest)
+            {
+                final_ports.push(*p);
+            }
+        }
+        if final_ports.len() > MAX_PORT_MAPPINGS {
+            return Err(smolvm::Error::config(
+                "update",
+                format!(
+                    "port mappings expand to {} entries; the maximum per machine is {MAX_PORT_MAPPINGS}",
+                    final_ports.len()
+                ),
+            ));
+        }
+        PortMapping::check_duplicates(&final_ports)
+            .map_err(|e| smolvm::Error::config("update", e))?;
+        Ok(final_ports)
+    }
+
+    fn update_running_ports(
+        &self,
+        db: &smolvm::db::SmolvmDb,
+        record: &smolvm::config::VmRecord,
+    ) -> smolvm::Result<()> {
+        record.check_live_ports()?;
+        let next: Vec<(u16, u16)> = self
+            .next_ports(record)?
+            .iter()
+            .map(PortMapping::to_tuple)
+            .collect();
+        smolvm::agent::apply_live_published_ports(&self.name, &next)?;
+        let saved = db.update_vm(&self.name, |r| r.ports = next.clone());
+        if !matches!(saved, Ok(Some(_))) {
+            let _ = smolvm::agent::apply_live_published_ports(&self.name, &record.ports);
+            saved?;
+            return Err(smolvm::Error::config(
+                "update",
+                format!("machine '{}' disappeared during update", self.name),
+            ));
+        }
+        println!("Updated machine '{}' (running; applies now):", self.name);
+        for &(host, guest) in &record.ports {
+            if !next.contains(&(host, guest)) {
+                println!("  removed port: {host}:{guest}");
+            }
+        }
+        for &(host, guest) in &next {
+            if !record.ports.contains(&(host, guest)) {
+                println!("  added port: {host}:{guest}");
+            }
+        }
+        Ok(())
     }
 
     /// Change a running machine's allow list: the record, and the policy its
@@ -6065,6 +6170,9 @@ impl UpdateCmd {
         if state == RecordState::Running && self.changes_only_egress() {
             return self.update_running_egress(&db, &record);
         }
+        if state == RecordState::Running && self.changes_only_ports() {
+            return self.update_running_ports(&db, &record);
+        }
 
         // Must be stopped (same check as resize)
         match state {
@@ -6114,34 +6222,7 @@ impl UpdateCmd {
         let remove_ports = PortMappingSpec::expand_all(&self.remove_port)
             .map_err(|e| smolvm::Error::config("update remove ports", e))?;
 
-        // Validate no duplicate host ports after proposed changes
-        {
-            let mut final_ports: Vec<PortMapping> = record
-                .ports
-                .iter()
-                .filter(|&&(h, g)| !remove_ports.iter().any(|rm| rm.host == h && rm.guest == g))
-                .map(|&(h, g)| PortMapping::new(h, g))
-                .collect();
-            for p in &add_ports {
-                if !final_ports
-                    .iter()
-                    .any(|existing| existing.host == p.host && existing.guest == p.guest)
-                {
-                    final_ports.push(*p);
-                }
-            }
-            if final_ports.len() > MAX_PORT_MAPPINGS {
-                return Err(smolvm::Error::config(
-                    "update",
-                    format!(
-                        "port mappings expand to {} entries; the maximum per machine is {MAX_PORT_MAPPINGS}",
-                        final_ports.len()
-                    ),
-                ));
-            }
-            PortMapping::check_duplicates(&final_ports)
-                .map_err(|e| smolvm::Error::config("update", e))?;
-        }
+        self.next_ports(&record)?;
 
         // Compute the complete mount set in its rich form so changing a stopped
         // machine cannot lose the staged/live distinction or mount order.

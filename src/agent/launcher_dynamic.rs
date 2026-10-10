@@ -518,6 +518,9 @@ pub fn launch_agent_vm_dynamic(
                     free_ctx_on_err!("krun_add_net_unixstream failed");
                 }
 
+                if let Some(dir) = config.vsock_socket.parent() {
+                    crate::network::launch::serve_ports_control(runtime.published_ports(), dir);
+                }
                 virtio_network_runtime = Some(runtime);
             }
             #[cfg(windows)]

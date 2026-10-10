@@ -36,7 +36,7 @@ use crate::PortMapping;
 use polling::{Event, Events, Poller};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -60,8 +60,23 @@ pub struct AcceptedTcpConnection {
 
 /// Running published-port listener set for one guest NIC.
 pub struct TcpPortListeners {
+    tcp_sender: SyncSender<AcceptedTcpConnection>,
+    publish_wake: WakePipe,
+    ports: Vec<PublishedPort>,
+    closed: bool,
+}
+
+struct PublishedPort {
+    host: u16,
+    guest: Arc<AtomicU16>,
     shutdown: Arc<AtomicBool>,
     handles: Vec<ListenerThread>,
+}
+
+impl Drop for PublishedPort {
+    fn drop(&mut self) {
+        shutdown_all(&self.shutdown, &mut self.handles);
+    }
 }
 
 struct ListenerThread {
@@ -164,21 +179,73 @@ impl TcpPortListeners {
         tcp_sender: SyncSender<AcceptedTcpConnection>,
         publish_wake: WakePipe,
     ) -> io::Result<Self> {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::with_capacity(ports.0.len());
+        let mut listeners = Self {
+            tcp_sender,
+            publish_wake,
+            ports: Vec::new(),
+            closed: false,
+        };
+        listeners.ports = listeners.spawn(ports)?;
+        Ok(listeners)
+    }
 
-        for (mapping, listener, listener_v6) in ports.0 {
+    pub fn mappings(&self) -> Vec<PortMapping> {
+        self.ports
+            .iter()
+            .map(|port| PortMapping::new(port.host, port.guest.load(Ordering::SeqCst)))
+            .collect()
+    }
+
+    pub fn replace(&mut self, next: &[PortMapping]) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::other("the network runtime is shutting down"));
+        }
+        for (index, mapping) in next.iter().enumerate() {
+            if next[..index].iter().any(|other| other.host == mapping.host) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("host port {} is published twice", mapping.host),
+                ));
+            }
+        }
+        let added: Vec<PortMapping> = next
+            .iter()
+            .filter(|mapping| !self.ports.iter().any(|port| port.host == mapping.host))
+            .copied()
+            .collect();
+        let started = self.spawn(BoundPublishedPorts::bind(&added)?)?;
+        self.ports.retain(|port| {
+            next.iter()
+                .find(|mapping| mapping.host == port.host)
+                .inspect(|mapping| port.guest.store(mapping.guest, Ordering::SeqCst))
+                .is_some()
+        });
+        self.ports.extend(started);
+        Ok(())
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.ports.clear();
+    }
+
+    fn spawn(&self, bound: BoundPublishedPorts) -> io::Result<Vec<PublishedPort>> {
+        let mut started = Vec::with_capacity(bound.0.len());
+        for (mapping, listener, listener_v6) in bound.0 {
+            let mut port = PublishedPort {
+                host: mapping.host,
+                guest: Arc::new(AtomicU16::new(mapping.guest)),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                handles: Vec::with_capacity(2),
+            };
             for listener in std::iter::once(listener).chain(listener_v6) {
-                let listener = ReadyListener::new(listener).inspect_err(|_| {
-                    shutdown_all(&shutdown, &mut handles);
-                })?;
+                let listener = ReadyListener::new(listener)?;
                 let poller = listener.poller.clone();
-
-                let tcp_sender = tcp_sender.clone();
-                let publish_wake = publish_wake.clone();
-                let shutdown_flag = shutdown.clone();
+                let tcp_sender = self.tcp_sender.clone();
+                let publish_wake = self.publish_wake.clone();
+                let shutdown_flag = port.shutdown.clone();
                 let host_port = mapping.host;
-                let guest_port = mapping.guest;
+                let guest_port = port.guest.clone();
 
                 let handle = thread::Builder::new()
                     .name(format!("smolvm-tcp-{host_port}"))
@@ -193,22 +260,21 @@ impl TcpPortListeners {
                         )
                     })
                     .map_err(|err| {
-                        shutdown_all(&shutdown, &mut handles);
                         io::Error::other(format!(
                             "failed to spawn published-port listener thread for {host_port}: {err}"
                         ))
                     })?;
-                handles.push(ListenerThread { handle, poller });
+                port.handles.push(ListenerThread { handle, poller });
             }
+            started.push(port);
         }
-
-        Ok(Self { shutdown, handles })
+        Ok(started)
     }
 }
 
 impl Drop for TcpPortListeners {
     fn drop(&mut self) {
-        shutdown_all(&self.shutdown, &mut self.handles);
+        self.close();
     }
 }
 
@@ -225,7 +291,7 @@ fn shutdown_all(shutdown: &Arc<AtomicBool>, handles: &mut Vec<ListenerThread>) {
 fn run_tcp_port_listener(
     listener: ReadyListener,
     host_port: u16,
-    guest_port: u16,
+    guest_port: Arc<AtomicU16>,
     tcp_sender: SyncSender<AcceptedTcpConnection>,
     publish_wake: WakePipe,
     shutdown: Arc<AtomicBool>,
@@ -241,7 +307,7 @@ fn run_tcp_port_listener(
                 let accepted = AcceptedTcpConnection {
                     stream,
                     host_port,
-                    guest_port,
+                    guest_port: guest_port.load(Ordering::SeqCst),
                     peer_addr,
                 };
 
@@ -280,7 +346,7 @@ fn run_tcp_port_listener(
             Err(err) => {
                 tracing::warn!(
                     host_port,
-                    guest_port,
+                    guest_port = guest_port.load(Ordering::SeqCst),
                     error = %err,
                     "published port listener accept failed"
                 );
@@ -310,24 +376,89 @@ mod tests {
     fn listener_fixture(
         capacity: usize,
     ) -> (TcpPortListeners, u16, mpsc::Receiver<AcceptedTcpConnection>) {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let ready = ReadyListener::new(listener).unwrap();
-        let poller = ready.poller.clone();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let flag = shutdown.clone();
+        let port = free_port();
         let (sender, receiver) = mpsc::sync_channel(capacity);
-        let handle = thread::spawn(move || {
-            run_tcp_port_listener(ready, port, 8080, sender, WakePipe::new(), flag)
-        });
-        (
-            TcpPortListeners {
-                shutdown,
-                handles: vec![ListenerThread { handle, poller }],
-            },
-            port,
-            receiver,
+        let listeners = TcpPortListeners::start(
+            BoundPublishedPorts::bind(&[PortMapping::new(port, 8080)]).unwrap(),
+            sender,
+            WakePipe::new(),
         )
+        .unwrap();
+        (listeners, port, receiver)
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn accepted_guest_port(port: u16, receiver: &mpsc::Receiver<AcceptedTcpConnection>) -> u16 {
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .guest_port
+    }
+
+    fn refuses(port: u16) -> bool {
+        TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            Duration::from_secs(1),
+        )
+        .is_err()
+    }
+
+    #[test]
+    fn replace_publishes_remaps_and_unpublishes_while_running() {
+        let (mut listeners, kept, receiver) = listener_fixture(4);
+        let added = free_port();
+        listeners
+            .replace(&[PortMapping::new(kept, 9090), PortMapping::new(added, 3000)])
+            .unwrap();
+        assert_eq!(accepted_guest_port(kept, &receiver), 9090);
+        assert_eq!(accepted_guest_port(added, &receiver), 3000);
+        assert_eq!(
+            listeners.mappings(),
+            vec![PortMapping::new(kept, 9090), PortMapping::new(added, 3000)]
+        );
+
+        listeners.replace(&[PortMapping::new(added, 3000)]).unwrap();
+        assert!(refuses(kept));
+        assert_eq!(accepted_guest_port(added, &receiver), 3000);
+        assert_eq!(listeners.mappings(), vec![PortMapping::new(added, 3000)]);
+    }
+
+    #[test]
+    fn replace_with_a_taken_port_changes_nothing() {
+        let (mut listeners, kept, receiver) = listener_fixture(4);
+        let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken_port = taken.local_addr().unwrap().port();
+        let free = free_port();
+        assert!(listeners
+            .replace(&[
+                PortMapping::new(free, 3000),
+                PortMapping::new(taken_port, 3001)
+            ])
+            .is_err());
+        assert_eq!(listeners.mappings(), vec![PortMapping::new(kept, 8080)]);
+        assert_eq!(accepted_guest_port(kept, &receiver), 8080);
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, free)).is_ok());
+    }
+
+    #[test]
+    fn replace_refuses_a_host_port_twice_and_a_closed_set() {
+        let (mut listeners, kept, _receiver) = listener_fixture(4);
+        assert!(listeners
+            .replace(&[PortMapping::new(kept, 1), PortMapping::new(kept, 2)])
+            .is_err());
+        assert_eq!(listeners.mappings(), vec![PortMapping::new(kept, 8080)]);
+        listeners.close();
+        assert!(listeners.mappings().is_empty());
+        assert!(listeners.replace(&[PortMapping::new(kept, 8080)]).is_err());
+        assert!(refuses(kept));
     }
 
     #[test]
