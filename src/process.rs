@@ -1386,7 +1386,7 @@ pub fn prepare_embedded_data_root() -> std::io::Result<()> {
 /// one-off root CLI invocation shouldn't silently switch roots). Must be called
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
 #[cfg(target_os = "linux")]
-pub fn apply_system_data_root(allow_auto: bool) {
+pub fn apply_system_data_root(allow_auto: bool) -> std::io::Result<()> {
     let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
         std::path::PathBuf::from(explicit)
     } else if let Some(workspace_root) = overlay_workspace_root() {
@@ -1402,25 +1402,17 @@ pub fn apply_system_data_root(allow_auto: bool) {
     {
         std::path::PathBuf::from("/var/lib/smolvm")
     } else {
-        return;
+        return Ok(());
     };
     // Relocating HOME also relocates the fallback agent rootfs path. Preserve
     // the installed rootfs for explicit SMOLVM_DATA_DIR and serve's /var/lib
     // default, just as we do for the overlayfs workspace default.
     let carry_rootfs_from = installed_agent_rootfs();
-    match std::fs::create_dir_all(&root) {
-        Ok(()) => {
-            use std::os::unix::fs::PermissionsExt;
-            // 0755 so dropped VMM uids can traverse to their data.
-            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
-            if let Err(e) = secure_sensitive_state_dirs(&root) {
-                tracing::warn!(root = %root.display(), error = %e, "failed to secure smolvm state directories");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(root = %root.display(), error = %e, "failed to create smolvm data root")
-        }
-    }
+    std::fs::create_dir_all(&root)?;
+    use std::os::unix::fs::PermissionsExt;
+    // 0755 so dropped VMM uids can traverse to their data.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))?;
+    secure_sensitive_state_dirs(&root)?;
     // Registry auth (crane/docker) falls back to `$HOME/.docker`, which we're about
     // to move off the operator's real home — pin DOCKER_CONFIG to the ORIGINAL
     // `~/.docker` (if it exists and the operator hasn't set DOCKER_CONFIG) so
@@ -1450,6 +1442,7 @@ pub fn apply_system_data_root(allow_auto: bool) {
         }
     }
     tracing::info!(data_root = %root.display(), "smolvm state rooted at a system data dir");
+    Ok(())
 }
 
 /// `statfs` magic numbers for the filesystems this decision distinguishes.
@@ -1558,7 +1551,9 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
 
 /// No-op where the data root isn't applicable (macOS dev).
 #[cfg(not(target_os = "linux"))]
-pub fn apply_system_data_root(_allow_auto: bool) {}
+pub fn apply_system_data_root(_allow_auto: bool) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
 /// (others-execute) by the drop uid, or the dropped VMM can't reach its own

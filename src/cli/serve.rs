@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use smolvm::api::state::ApiState;
-use smolvm::Result;
+use smolvm::{Error, Result};
 
 use super::openapi::OpenapiCmd;
 
@@ -196,7 +196,8 @@ impl ServeStartCmd {
         // (allow_auto = true). An explicit SMOLVM_DATA_DIR was already applied for
         // every command in main(); calling again is idempotent. Single-threaded
         // before the tokio runtime, so set_var is safe.
-        smolvm::process::apply_system_data_root(/* allow_auto */ true);
+        smolvm::process::apply_system_data_root(/* allow_auto */ true)
+            .map_err(|e| Error::storage("prepare data root", e.to_string()))?;
 
         // Size the checkpoint caches for a server before any request can restore
         // or capture one.
