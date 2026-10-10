@@ -389,10 +389,14 @@ impl State {
         } else {
             format!("{host}:{}", destination.port())
         };
+        let websocket_upgrade = request
+            .headers()
+            .get(header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
         if request.uri().scheme().is_some()
             || request.uri().authority().is_some()
             || request.method() == Method::CONNECT
-            || request.headers().contains_key(header::UPGRADE)
+            || (request.headers().contains_key(header::UPGRADE) && !websocket_upgrade)
         {
             return Ok(text(
                 StatusCode::BAD_REQUEST,
@@ -413,6 +417,21 @@ impl State {
                 StatusCode::BAD_REQUEST,
                 "smolvm credentials: Host header must match the TLS server name",
             ));
+        }
+
+        // WebSocket tunneling cannot use the HTTP forwarding client. Tell
+        // clients with an HTTP fallback to retry that transport; never forward
+        // the handshake or substitute its credential into an unsupported flow.
+        if websocket_upgrade {
+            let mut reply = text(
+                StatusCode::UPGRADE_REQUIRED,
+                "smolvm credentials: WebSocket forwarding is unavailable; use HTTP/1.1",
+            );
+            reply.headers_mut().insert(
+                header::UPGRADE,
+                header::HeaderValue::from_static("HTTP/1.1"),
+            );
+            return Ok(reply);
         }
 
         let (parts, body) = request.into_parts();
@@ -1081,6 +1100,41 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(seen, vec![(String::new(), "/public".to_string())]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_upgrade_requests_get_http_fallback_without_leaking_credentials() {
+        let f = fixture().await;
+        let request = format!(
+            "GET /v1/stream HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            f.placeholder
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 426"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("upgrade: http/1.1\r\n"),
+            "{response}"
+        );
+        assert!(!response.contains(&f.placeholder), "{response}");
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
+
+        // The same client can retry over HTTP and still receive substitution.
+        let request = format!(
+            "GET /v1/stream HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            f.placeholder
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            f.upstream.seen.lock().unwrap().as_slice(),
+            &[("Bearer real-secret".to_string(), "/v1/stream".to_string())]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
