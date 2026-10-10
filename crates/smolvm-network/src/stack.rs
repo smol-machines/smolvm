@@ -134,6 +134,33 @@ pub struct VirtioPollConfig {
     pub mtu: usize,
 }
 
+fn parse_tcp_relay_capacity(value: &str) -> Option<usize> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|capacity| (1..=4096).contains(capacity))
+}
+
+/// Bound the per-machine host socket, thread, and guest buffer budget even when
+/// an operator opts into more than the default 512 concurrent TCP relays.
+fn tcp_relay_capacity_from_env() -> Option<usize> {
+    let value = match std::env::var("SMOLVM_TCP_RELAY_CAPACITY") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "ignoring invalid SMOLVM_TCP_RELAY_CAPACITY");
+            return None;
+        }
+    };
+    match parse_tcp_relay_capacity(&value) {
+        Some(capacity) => Some(capacity),
+        _ => {
+            tracing::warn!(%value, "SMOLVM_TCP_RELAY_CAPACITY must be between 1 and 4096; using default");
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameAction {
     TcpSyn {
@@ -249,7 +276,7 @@ fn run_network_stack(
     ];
     let relay_wake = Arc::new(queues.relay_wake.clone());
     let mut relays = TcpRelayTable::new(
-        None,
+        tcp_relay_capacity_from_env(),
         egress.clone(),
         gateway_addrs.to_vec(),
         config.host_service,
@@ -1537,5 +1564,19 @@ mod tests {
             classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 443), &[gw], None),
             FrameAction::TcpSyn { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod relay_capacity_tests {
+    use super::parse_tcp_relay_capacity;
+
+    #[test]
+    fn relay_capacity_rejects_unbounded_or_invalid_values() {
+        assert_eq!(parse_tcp_relay_capacity("320"), Some(320));
+        assert_eq!(parse_tcp_relay_capacity("4096"), Some(4096));
+        for value in ["0", "4097", "-1", "100000000000000000000", "bad"] {
+            assert_eq!(parse_tcp_relay_capacity(value), None);
+        }
     }
 }

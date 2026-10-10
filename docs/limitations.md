@@ -20,3 +20,9 @@ process setting (set it on `smolvm serve` for served machines), and an existing
 machine needs a stop/start to apply it. DAX does not materially accelerate
 metadata-heavy traversal. Confirm it in the guest with
 `grep virtiofs /proc/mounts`; an active mount includes `dax=always`.
+
+* Virtio-net accepts up to 512 simultaneous TCP relay connections per machine by
+  default. For higher-concurrency workloads, set `SMOLVM_TCP_RELAY_CAPACITY` on
+  the host process (1–4096); this bounds the number of host relay threads and
+  their buffers. Invalid values use the default. TSI networking does not use
+  this relay table.

@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 const TCP_RX_BUFFER_BYTES: usize = 64 * 1024;
 const TCP_TX_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_CONNECTIONS: usize = 256;
+const MAX_CONNECTIONS: usize = 512;
 const CHANNEL_CAPACITY: usize = 32;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const CLOSE_RETRY_LIMIT: u16 = 64;
@@ -1491,6 +1491,27 @@ mod initial_bytes_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn relay_accepts_burst_beyond_old_256_limit_and_honors_configured_cap() {
+        use super::*;
+        let mut sockets = SocketSet::new(vec![]);
+        let mut table = TcpRelayTable::new(Some(320), EgressPolicy::unrestricted(), vec![], None);
+        let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        for port in 40_000..40_320 {
+            let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)), port);
+            assert!(
+                table.create_tcp_socket(source, destination, &mut sockets),
+                "flow {port}"
+            );
+        }
+        assert_eq!(table.active_connections(), 320);
+        let overflow = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)), 40_320);
+        assert!(!table.create_tcp_socket(overflow, destination, &mut sockets));
+        assert_eq!(table.active_connections(), 320);
+        assert!(
+            TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None).capacity() >= 320
+        );
+    }
     #[test]
     fn seeded_published_ports_wrap_without_reusing_live_ports() {
         let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None)
