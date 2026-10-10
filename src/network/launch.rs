@@ -225,6 +225,8 @@ pub fn plan_launch_network_with(
 /// The longest replacement allow list the egress control socket reads.
 const MAX_EGRESS_REQUEST_BYTES: u64 = 1024 * 1024;
 
+const MAX_PORTS_REQUEST_BYTES: u64 = 64 * 1024;
+
 /// Serve the egress control socket in `vm_dir` for a machine whose guest may
 /// open outbound connections under an allow list: each connection sends a
 /// replacement list and gets back `ok` or `error: <reason>`. A machine with no
@@ -234,22 +236,59 @@ pub fn serve_egress_control(
     vm_dir: &std::path::Path,
     outbound: bool,
 ) {
-    use std::io::{Read, Write};
     let path = vm_dir.join(smolvm_network::EGRESS_SOCKET);
     let _ = std::fs::remove_file(&path);
     if !outbound || !egress.is_restricted() {
         return;
     }
+    let egress = egress.clone();
+    serve_control_socket(
+        path,
+        "egress-control",
+        MAX_EGRESS_REQUEST_BYTES,
+        move |request| {
+            egress.replace_allow_list(request)?;
+            tracing::info!("egress allow list replaced");
+            Ok(())
+        },
+    );
+}
+
+/// Serve the ports control socket in `vm_dir`: each connection sends the
+/// complete set of `host:guest` mappings to publish and gets back `ok` or
+/// `error: <reason>`.
+pub fn serve_ports_control(ports: smolvm_network::PublishedPorts, vm_dir: &std::path::Path) {
+    let path = vm_dir.join(smolvm_network::PORTS_SOCKET);
+    let _ = std::fs::remove_file(&path);
+    serve_control_socket(
+        path,
+        "ports-control",
+        MAX_PORTS_REQUEST_BYTES,
+        move |request| {
+            let next = smolvm_network::parse_port_mappings(request)?;
+            ports.replace(&next).map_err(|error| error.to_string())?;
+            tracing::info!(ports = %smolvm_network::render_port_mappings(&next).trim_end(), "published ports replaced");
+            Ok(())
+        },
+    );
+}
+
+fn serve_control_socket(
+    path: std::path::PathBuf,
+    thread_name: &str,
+    max_request_bytes: u64,
+    apply: impl Fn(&str) -> Result<(), String> + Send + 'static,
+) {
+    use std::io::{Read, Write};
     let listener = match crate::platform::uds::UdsListener::bind(&path) {
         Ok(listener) => listener,
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "egress control socket unavailable");
+            tracing::warn!(path = %path.display(), %error, "control socket unavailable");
             return;
         }
     };
-    let egress = egress.clone();
     let spawned = std::thread::Builder::new()
-        .name("egress-control".into())
+        .name(thread_name.into())
         .spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else {
@@ -258,14 +297,11 @@ pub fn serve_egress_control(
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let mut request = String::new();
                 let reply = match (&mut stream)
-                    .take(MAX_EGRESS_REQUEST_BYTES)
+                    .take(max_request_bytes)
                     .read_to_string(&mut request)
                 {
-                    Ok(_) => match egress.replace_allow_list(&request) {
-                        Ok(()) => {
-                            tracing::info!("egress allow list replaced");
-                            "ok\n".to_string()
-                        }
+                    Ok(_) => match apply(&request) {
+                        Ok(()) => "ok\n".to_string(),
                         Err(reason) => format!("error: {reason}\n"),
                     },
                     Err(error) => format!("error: {error}\n"),
@@ -274,7 +310,7 @@ pub fn serve_egress_control(
             }
         });
     if let Err(error) = spawned {
-        tracing::warn!(%error, "egress control thread unavailable");
+        tracing::warn!(%error, thread_name, "control thread unavailable");
     }
 }
 

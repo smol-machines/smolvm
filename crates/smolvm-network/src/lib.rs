@@ -353,6 +353,30 @@ pub const EGRESS_DECISIONS_LOG: &str = "egress-decisions.jsonl";
 /// folder, so only the host can change a running machine's allow list.
 pub const EGRESS_SOCKET: &str = "egress.sock";
 
+pub const PORTS_SOCKET: &str = "ports.sock";
+
+pub fn render_port_mappings(mappings: &[PortMapping]) -> String {
+    mappings
+        .iter()
+        .map(|mapping| format!("{}:{}\n", mapping.host, mapping.guest))
+        .collect()
+}
+
+pub fn parse_port_mappings(text: &str) -> Result<Vec<PortMapping>, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_once(':')
+                .and_then(|(host, guest)| {
+                    Some(PortMapping::new(host.parse().ok()?, guest.parse().ok()?))
+                })
+                .filter(|mapping| mapping.host != 0 && mapping.guest != 0)
+                .ok_or_else(|| format!("invalid port mapping '{line}'"))
+        })
+        .collect()
+}
+
 /// Filename of the per-VM egress signal log: watchlist matches, recorded beside
 /// the denial log by the launcher and read back by the host's
 /// `read_egress_signals`. Created on the first match only.
@@ -458,10 +482,49 @@ pub(crate) use virtio_net_log;
 pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
     _frame_bridge: FrameStreamBridge,
-    published_ports: Option<TcpPortListeners>,
+    published_ports: PublishedPorts,
     _published_udp: Option<udp_publish::UdpPortPublisher>,
     poll_handle: Option<JoinHandle<()>>,
 }
+
+#[derive(Clone)]
+pub struct PublishedPorts {
+    tcp: std::sync::Arc<std::sync::Mutex<TcpPortListeners>>,
+    /// UDP mappings, bound once at start: changing them needs a restart.
+    udp: std::sync::Arc<Vec<PortMapping>>,
+}
+
+impl PublishedPorts {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TcpPortListeners> {
+        self.tcp
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The published TCP mappings, the ones a running machine can change.
+    /// UDP mappings are bound once at start and are not listed here.
+    pub fn mappings(&self) -> Vec<PortMapping> {
+        self.lock().mappings()
+    }
+
+    /// The UDP mappings bound at start, which stay until the machine stops.
+    pub fn udp_mappings(&self) -> Vec<PortMapping> {
+        self.udp.to_vec()
+    }
+
+    /// Make `next` the published TCP set. A UDP mapping is refused: a UDP port
+    /// is bound for the runtime's life, so changing one needs a restart.
+    pub fn replace(&self, next: &[PortMapping]) -> io::Result<()> {
+        if next.iter().any(|mapping| mapping.protocol == PortProtocol::Udp) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "published UDP ports cannot change on a running machine; stop it first",
+            ));
+        }
+        self.lock().replace(next)
+    }
+}
+
 
 /// Start the host-side virtio-net runtime for one guest NIC.
 ///
@@ -544,20 +607,21 @@ pub fn start_virtio_network(
     // tcp_sender sends the accepted TCP connections to the channel
     // tcp_receiver receives the accepted TCP connections via the channel, and let it be consumed in poll thread.
     let (tcp_sender, tcp_receiver) = create_tcp_channel();
+    // UDP mappings are fixed for the runtime's life; only TCP ones are live.
+    let udp_mappings: Vec<PortMapping> = published_ports
+        .udp
+        .iter()
+        .map(|(mapping, _, _)| *mapping)
+        .collect();
     let (udp_publisher, udp_publish) =
         match udp_publish::start_udp_publisher(&mut published_ports, queues.relay_wake.clone())? {
             Some((publisher, channels)) => (Some(publisher), Some(channels)),
             None => (None, None),
         };
-    let tcp_listeners = if published_ports.tcp_is_empty() {
-        None
-    } else {
-        Some(TcpPortListeners::start(
-            published_ports,
-            tcp_sender,
-            queues.relay_wake.clone(),
-        )?)
-    };
+    // Always started, even with no TCP port yet, so ports can be published
+    // on the running machine later.
+    let tcp_listeners =
+        TcpPortListeners::start(published_ports, tcp_sender, queues.relay_wake.clone())?;
     let poll_handle = start_network_stack(
         queues.clone(),
         VirtioPollConfig {
@@ -573,7 +637,7 @@ pub fn start_virtio_network(
             intercept: guest_network.intercept,
             mtu: 1500,
         },
-        tcp_listeners.as_ref().map(|_| tcp_receiver),
+        Some(tcp_receiver),
         udp_publish,
         egress,
         fabric,
@@ -582,7 +646,10 @@ pub fn start_virtio_network(
     Ok(VirtioNetworkRuntime {
         queues,
         _frame_bridge: frame_bridge,
-        published_ports: tcp_listeners,
+        published_ports: PublishedPorts {
+            tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp_listeners)),
+            udp: std::sync::Arc::new(udp_mappings),
+        },
         _published_udp: udp_publisher,
         poll_handle: Some(poll_handle),
     })
@@ -602,6 +669,10 @@ impl VirtioNetworkRuntime {
     /// VM's runtime dir for the node API to read (the runtime is not `Clone`).
     pub fn egress_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.queues.egress_counter()
+    }
+
+    pub fn published_ports(&self) -> PublishedPorts {
+        self.published_ports.clone()
     }
 
     /// Take ownership of the runtime and block until the libkrun stream closes
@@ -626,7 +697,7 @@ impl Drop for VirtioNetworkRuntime {
     /// here because the frame bridge joins its own threads in its own `Drop`.
     fn drop(&mut self) {
         self.queues.begin_shutdown();
-        self.published_ports = None;
+        self.published_ports.lock().close();
         if let Some(handle) = self.poll_handle.take() {
             let _ = handle.join();
         }
@@ -637,6 +708,18 @@ impl Drop for VirtioNetworkRuntime {
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn port_mappings_round_trip_through_the_control_format() {
+        let mappings = vec![PortMapping::new(3000, 3000), PortMapping::new(8080, 80)];
+        let rendered = render_port_mappings(&mappings);
+        assert_eq!(rendered, "3000:3000\n8080:80\n");
+        assert_eq!(parse_port_mappings(&rendered).unwrap(), mappings);
+        assert!(parse_port_mappings("").unwrap().is_empty());
+        for bad in ["3000", "a:1", "0:80", "80:0", "70000:80"] {
+            assert!(parse_port_mappings(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn formats_timestamped_network_log_prefix() {
