@@ -240,6 +240,8 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     if let Some(ref image) = assets.image {
         manifest.image = image.clone();
     }
+    manifest.cpus = vm.cpus;
+    manifest.mem = vm.mem;
     manifest.network = vm.network;
     manifest.gpu = vm.gpu.unwrap_or(false);
     manifest.cuda = vm.cuda;
@@ -1696,6 +1698,7 @@ mod env_merge_tests {
             "darwin/arm64".to_string(),
         );
         seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert_eq!((manifest.cpus, manifest.mem), (1, 512));
         assert_eq!(manifest.user.as_deref(), Some("nginx"));
 
         vm.user = Some("501:20".to_string());

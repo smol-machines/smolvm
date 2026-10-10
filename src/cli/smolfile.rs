@@ -509,8 +509,49 @@ pub fn resolve_pack_config(
     cli_gpu: bool,
     smolfile_path: Option<PathBuf>,
 ) -> smolvm::Result<PackConfig> {
-    let default_cpus = DEFAULT_MICROVM_CPU_COUNT;
-    let default_mem = crate::cli::pack::PACK_DEFAULT_MEMORY_MIB;
+    resolve_pack_config_with_defaults(
+        PackConfigInputs {
+            cli_image,
+            cli_entrypoint,
+            cli_cpus,
+            cli_mem,
+            cli_oci_platform,
+            cli_gpu,
+            smolfile_path,
+        },
+        (
+            DEFAULT_MICROVM_CPU_COUNT,
+            crate::cli::pack::PACK_DEFAULT_MEMORY_MIB,
+        ),
+    )
+}
+
+#[derive(Default)]
+pub struct PackConfigInputs {
+    pub cli_image: Option<String>,
+    pub cli_entrypoint: Option<String>,
+    pub cli_cpus: Option<u8>,
+    pub cli_mem: Option<u32>,
+    pub cli_oci_platform: Option<String>,
+    pub cli_gpu: bool,
+    pub smolfile_path: Option<PathBuf>,
+}
+
+/// For `pack create --from-vm`, use the source VM's resource caps only when no
+/// explicit CLI or Smolfile value overrides them.
+pub fn resolve_pack_config_with_defaults(
+    inputs: PackConfigInputs,
+    (default_cpus, default_mem): (u8, u32),
+) -> smolvm::Result<PackConfig> {
+    let PackConfigInputs {
+        cli_image,
+        cli_entrypoint,
+        cli_cpus,
+        cli_mem,
+        cli_oci_platform,
+        cli_gpu,
+        smolfile_path,
+    } = inputs;
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
@@ -1142,6 +1183,34 @@ mod resource_cap_precedence_tests {
         let cfg =
             resolve_pack_config(None, None, None, None, None, false, Some(path)).expect("resolves");
         assert_eq!((cfg.cpus, cfg.mem), (16, 32768));
+    }
+
+    #[test]
+    fn packing_a_vm_inherits_resources_unless_the_smolfile_or_cli_overrides_them() {
+        let resolve = |cpus, mem, smolfile| {
+            resolve_pack_config_with_defaults(
+                PackConfigInputs {
+                    cli_cpus: cpus,
+                    cli_mem: mem,
+                    smolfile_path: smolfile,
+                    ..Default::default()
+                },
+                (1, 1024),
+            )
+            .expect("pack configuration")
+        };
+
+        let inherited = resolve(None, None, None);
+        assert_eq!((inherited.cpus, inherited.mem), (1, 1024));
+
+        let (_dir, path) = smolfile("cpus = 2\nmemory = 2048\n[artifact]\ncpus = 3\n");
+        let from_smolfile = resolve(None, None, Some(path.clone()));
+        assert_eq!((from_smolfile.cpus, from_smolfile.mem), (3, 2048));
+
+        // An explicit CLI flag overrides even an [artifact] setting; the
+        // untouched memory value still comes from the Smolfile.
+        let from_cli = resolve(Some(4), None, Some(path));
+        assert_eq!((from_cli.cpus, from_cli.mem), (4, 2048));
     }
 
     /// A trailing `""` is not a command, any more than `--entrypoint ""` is an

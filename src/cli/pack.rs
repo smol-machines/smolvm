@@ -432,12 +432,12 @@ pub struct PackCreateCmd {
     pub output: PathBuf,
 
     /// Maximum vCPUs machines from this pack may use [default: 4, or the
-    /// Smolfile value]. A cap on consumption, not a reservation.
+    /// Smolfile/source VM value]. A cap on consumption, not a reservation.
     #[arg(long, value_name = "N")]
     pub cpus: Option<u8>,
 
     /// Maximum memory in MiB machines from this pack may use [default: 8192,
-    /// or the Smolfile value]. Elastic: only touched memory is committed.
+    /// or the Smolfile/source VM value]. Elastic: only touched memory is committed.
     #[arg(long, value_name = "MiB")]
     pub mem: Option<u32>,
 
@@ -1103,14 +1103,17 @@ impl PackCreateCmd {
 
         // 4. Resolve Smolfile overrides if provided
         //    Precedence: CLI > [artifact] > Smolfile top-level > VmRecord > default
-        let pack_config = crate::cli::smolfile::resolve_pack_config(
-            None, // no image for --from-vm
-            self.entrypoint.clone(),
-            self.cpus,
-            self.mem,
-            self.oci_platform.clone(),
-            self.gpu,
-            self.smolfile.clone(),
+        let pack_config = crate::cli::smolfile::resolve_pack_config_with_defaults(
+            crate::cli::smolfile::PackConfigInputs {
+                cli_image: None, // no image for --from-vm
+                cli_entrypoint: self.entrypoint.clone(),
+                cli_cpus: self.cpus,
+                cli_mem: self.mem,
+                cli_oci_platform: self.oci_platform.clone(),
+                cli_gpu: self.gpu,
+                smolfile_path: self.smolfile.clone(),
+            },
+            (vm.cpus, vm.mem),
         )?;
 
         // 5. Build manifest: shared VM-derived baseline, then local overrides.
