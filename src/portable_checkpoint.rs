@@ -4252,10 +4252,50 @@ fn paused_layers(vm_data: &Path, artifact: &Path) -> Result<Vec<PinnedLayer>> {
 /// Building it costs what packing those layers at pause would have, paid only
 /// by a pause that leaves the host.
 pub(crate) fn exportable_paused_artifact(vm_data: &Path, artifact: &Path) -> Result<std::fs::File> {
-    let pinned = paused_layers(vm_data, artifact)?;
-    if pinned.is_empty() {
-        return Ok(std::fs::File::open(artifact)?);
+    let exported = ExportedPausedArtifact::build(vm_data, artifact)?;
+    // The open file outlives the work directory.
+    Ok(std::fs::File::open(exported.path())?)
+}
+
+/// A paused machine's saved execution as a self-contained file on disk, for
+/// a caller that reads it by path (an upload in parallel parts). The pause
+/// file itself when it pinned nothing; otherwise a complete copy that is
+/// deleted when this is dropped.
+pub struct ExportedPausedArtifact {
+    path: PathBuf,
+    _work: Option<tempfile::TempDir>,
+}
+
+impl ExportedPausedArtifact {
+    /// Build it for the pause `artifact` of the machine at `vm_data`.
+    pub(crate) fn build(vm_data: &Path, artifact: &Path) -> Result<Self> {
+        let pinned = paused_layers(vm_data, artifact)?;
+        if pinned.is_empty() {
+            return Ok(Self {
+                path: artifact.to_path_buf(),
+                _work: None,
+            });
+        }
+        let (work, path) = pack_with_pinned_layers(vm_data, artifact, &pinned)?;
+        Ok(Self {
+            path,
+            _work: Some(work),
+        })
     }
+
+    /// Where the self-contained artifact is.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Repack a pause artifact with its pinned layers back in, in a work
+/// directory beside the pins so raw layers link instead of copying.
+fn pack_with_pinned_layers(
+    vm_data: &Path,
+    artifact: &Path,
+    pinned: &[PinnedLayer],
+) -> Result<(tempfile::TempDir, PathBuf)> {
     let footer = ensure_checkpoint_layout(artifact)?;
     let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
         .map_err(|error| Error::agent("read paused checkpoint", error.to_string()))?;
@@ -4272,19 +4312,20 @@ pub(crate) fn exportable_paused_artifact(vm_data: &Path, artifact: &Path) -> Res
         &[],
     )
     .map_err(|error| Error::agent("extract paused checkpoint", error.to_string()))?;
-    for layer in &pinned {
+    for layer in pinned {
         install_pinned_layer(vm_data, layer, &staging)?;
     }
     let output = work.path().join("complete.smolcheckpoint");
-    let collector = AssetCollector::new(staging)
+    let collector = AssetCollector::new(staging.clone())
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
     Packer::new(manifest)
         .with_asset_collector(collector)
         .with_direct_artifact_io()
         .pack_artifact(&output)
         .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
-    // The open file outlives the work directory.
-    Ok(std::fs::File::open(&output)?)
+    // Only the packed file is needed from here on.
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok((work, output))
 }
 
 /// Put a pinned layer where extraction would have: at its archive path under
