@@ -5583,12 +5583,18 @@ fn run_interactive_loop(
         }
 
         // Check timeout
-        if let Some(deadline) = deadline {
+        if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
             if Instant::now() >= deadline {
                 warn!("interactive command timed out, killing process");
                 // The whole tree: in an image container the command is a
                 // grandchild. Also reaps the child, avoiding a zombie.
                 process::kill_child_tree(child);
+                send_response(
+                    stream,
+                    &AgentResponse::Stderr {
+                        data: format!("\ncommand timed out after {}ms", timeout_ms).into_bytes(),
+                    },
+                )?;
                 return Ok(124); // Timeout exit code
             }
         }
@@ -5870,10 +5876,16 @@ fn run_interactive_loop_pty(
         }
 
         // Check timeout.
-        if let Some(deadline) = deadline {
+        if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
             if Instant::now() >= deadline {
                 warn!("interactive PTY command timed out, killing process");
                 process::kill_child_tree(child);
+                send_response(
+                    stream,
+                    &AgentResponse::Stdout {
+                        data: format!("\ncommand timed out after {}ms", timeout_ms).into_bytes(),
+                    },
+                )?;
                 return Ok(124);
             }
         }
@@ -7580,6 +7592,7 @@ fn handle_vm_exec(
     // Wakes the loop the moment the child exits, rather than at the next tick.
     let exit_signal = process::ExitSignal::open(&child);
 
+    let mut timed_out_ms = None;
     let exit_code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break process::exit_code_from_status(&status),
@@ -7615,6 +7628,7 @@ fn handle_vm_exec(
                         }
                         let _ = child.kill();
                         let _ = child.wait();
+                        timed_out_ms = timeout_ms;
                         break 124; // Standard timeout exit code
                     }
                 }
@@ -7640,7 +7654,7 @@ fn handle_vm_exec(
         .and_then(|h| h.ok())
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
-    let stderr = stderr_handle
+    let mut stderr = stderr_handle
         .and_then(|h| h.ok())
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
@@ -7669,6 +7683,9 @@ fn handle_vm_exec(
             ),
             error_codes::EXEC_FAILED,
         );
+    }
+    if let Some(timeout_ms) = timed_out_ms {
+        stderr.extend_from_slice(format!("\ncommand timed out after {}ms", timeout_ms).as_bytes());
     }
     AgentResponse::Completed {
         exit_code,
@@ -8372,10 +8389,14 @@ mod tests {
             Some(&stdin_data),
         );
 
-        let AgentResponse::Completed { exit_code, .. } = response else {
+        let AgentResponse::Completed {
+            exit_code, stderr, ..
+        } = response
+        else {
             panic!("expected completed response");
         };
         assert_eq!(exit_code, 124);
+        assert!(String::from_utf8_lossy(&stderr).contains("command timed out after 100ms"));
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "blocked stdin must not prevent timeout handling"
@@ -8425,6 +8446,73 @@ mod tests {
             guest.join().unwrap();
             assert_eq!(result.unwrap(), 124);
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interactive_vm_exec_timeout_sends_reason_before_exit() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let (mut child, pty) = spawn_direct_interactive_command(
+            &["sh".to_string(), "-c".to_string(), "sleep 5".to_string()],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(pty.is_none());
+        assert_eq!(
+            run_interactive_loop(&mut agent, &mut child, Some(100)).unwrap(),
+            124
+        );
+
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut body).unwrap();
+        let response: AgentResponse = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            response,
+            AgentResponse::Stderr { data }
+                if data == b"\ncommand timed out after 100ms"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn interactive_pty_timeout_writes_reason_to_terminal() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let (mut child, pty) = spawn_direct_interactive_command(
+            &["sh".to_string(), "-c".to_string(), "sleep 5".to_string()],
+            &[],
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100)).unwrap(),
+            124
+        );
+
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut body).unwrap();
+        let response: AgentResponse = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            response,
+            AgentResponse::Stdout { data }
+                if data == b"\ncommand timed out after 100ms"
+        ));
     }
 
     #[test]
@@ -8616,6 +8704,27 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "closed child stdin must not hide a host disconnect: {elapsed:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vm_exec_exit_124_is_not_reported_as_timeout() {
+        let response = handle_vm_exec(
+            &["sh".to_string(), "-c".to_string(), "exit 124".to_string()],
+            &[],
+            None,
+            Some(5000),
+            None,
+            None,
+        );
+        let AgentResponse::Completed {
+            exit_code, stderr, ..
+        } = response
+        else {
+            panic!("expected completed response");
+        };
+        assert_eq!(exit_code, 124);
+        assert!(stderr.is_empty());
     }
 
     // ========================================================================
