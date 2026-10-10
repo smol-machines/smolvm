@@ -2761,7 +2761,11 @@ async fn create_machine_inner(
     let restored_network_backend = match manifest_checkpoint.as_ref() {
         Some(checkpoint) => crate::portable_checkpoint::restored_network_backend(checkpoint)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?,
-        None => req.network_backend,
+        None => crate::network::backend_for_docker_socket(
+            req.network_backend,
+            req.docker_socket,
+            req.network || manifest_net,
+        ),
     };
     let restored_allowed_hosts = checkpoint_network
         .and_then(|network| network.dns_filter_hosts.clone())
