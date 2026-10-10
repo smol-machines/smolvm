@@ -38,6 +38,7 @@
 //! one is actually running.
 
 use std::io::{BufRead, Read, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -286,13 +287,24 @@ fn enter_mount_namespace(_pid: u32) -> Result<(), String> {
     Err("mount namespaces are Linux-only".to_string())
 }
 
+/// Open before checking metadata without blocking on a FIFO. Checking metadata
+/// before open leaves a race where a path can be replaced by a FIFO in between.
+/// O_NONBLOCK has no effect on ordinary files; the caller still rejects every
+/// non-regular file before sending a successful read response.
+pub(crate) fn open_file_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
 fn helper_read(path: &str) -> Result<(), String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    let mut file = open_file_for_read(Path::new(path)).map_err(|e| format!("open {path}: {e}"))?;
     let meta = file.metadata().map_err(|e| format!("stat {path}: {e}"))?;
-    // Same guard the in-VM path applies, and for the same reason: a directory
-    // opens fine but fails with EISDIR only once reading starts, and a character
-    // device never EOFs. Both must be refused BEFORE the header commits us to a
-    // byte count.
+    // Same guard the in-VM path applies: a directory fails on read and a
+    // character device may never EOF. O_NONBLOCK above also lets a FIFO reach
+    // this check without waiting for a writer. Reject all of them before the
+    // header commits us to a byte count.
     if !meta.is_file() {
         // See the note in the in-VM path: a directory is named specifically so
         // the caller can retry as a listing.
@@ -790,6 +802,39 @@ fn parse_ok_reply(reply: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_read_open_does_not_block_on_a_fifo_or_a_symlink_to_one() {
+        use std::ffi::CString;
+        use std::io::Read as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = dir.path().join("pipe");
+        let name = CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&pipe, &link).unwrap();
+
+        // A blocking open of either path would hang this test without a writer.
+        for path in [pipe, link] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let file = open_file_for_read(&path).unwrap();
+                tx.send(file.metadata().unwrap().is_file()).unwrap();
+            });
+            assert!(!rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, b"hello").unwrap();
+        let mut file = open_file_for_read(&regular).unwrap();
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"hello");
+    }
 
     #[test]
     fn helper_is_selected_only_by_the_exact_marker() {
