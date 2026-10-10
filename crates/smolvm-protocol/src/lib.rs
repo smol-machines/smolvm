@@ -94,6 +94,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The agent can freeze internal filesystems before acknowledging shutdown.
 pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
+/// Guest supports preparing file access without executing a command from the image.
+pub const PREPARE_FILE_ACCESS_CAPABILITY: &str = "prepare-file-access-v1";
 
 /// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
 /// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
@@ -472,6 +474,15 @@ pub enum AgentRequest {
         /// Image reference.
         image: String,
         /// Unique workload ID for the overlay.
+        workload_id: String,
+    },
+
+    /// Start the image-independent keepalive container for file I/O without
+    /// executing any binary supplied by the image.
+    PrepareFileAccess {
+        /// Image whose persistent filesystem the file operation targets.
+        image: String,
+        /// Owner of the persistent overlay (which may differ for a fork).
         workload_id: String,
     },
 
@@ -933,6 +944,7 @@ impl AgentRequest {
             AgentRequest::ListImages => "ListImages".into(),
             AgentRequest::GarbageCollect { .. } => "GarbageCollect".into(),
             AgentRequest::PrepareOverlay { .. } => "PrepareOverlay".into(),
+            AgentRequest::PrepareFileAccess { .. } => "PrepareFileAccess".into(),
             AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
@@ -1801,6 +1813,24 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("prepare_overlay"));
+    }
+
+    #[test]
+    fn prepare_file_access_wire_only_identifies_the_image_and_overlay() {
+        let request = AgentRequest::PrepareFileAccess {
+            image: "alpine:3.20".into(),
+            workload_id: "fork-overlay-owner".into(),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"method":"prepare_file_access","image":"alpine:3.20","workload_id":"fork-overlay-owner"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&wire).unwrap(),
+            AgentRequest::PrepareFileAccess { image, workload_id }
+                if image == "alpine:3.20" && workload_id == "fork-overlay-owner"
+        ));
     }
 
     #[test]

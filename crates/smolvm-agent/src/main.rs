@@ -2369,6 +2369,7 @@ fn handle_request(
             let mut capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
+                smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_string(),
                 smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_string(),
@@ -2400,6 +2401,10 @@ fn handle_request(
 
         AgentRequest::PrepareOverlay { image, workload_id } => {
             handle_prepare_overlay(&image, &workload_id)
+        }
+
+        AgentRequest::PrepareFileAccess { image, workload_id } => {
+            handle_prepare_file_access(&image, &workload_id)
         }
 
         AgentRequest::CleanupOverlay { workload_id } => handle_cleanup_overlay(&workload_id),
@@ -6842,6 +6847,44 @@ fn handle_prepare_overlay(image: &str, workload_id: &str) -> AgentResponse {
         storage::prepare_overlay(image, workload_id),
         error_codes::OVERLAY_FAILED,
     )
+}
+
+/// Establish the image-independent keepalive for file I/O. An HTTP file
+/// request must not run `/bin/true` from the image: that path can be a slow
+/// program, have side effects, or not exist at all in a minimal image.
+fn handle_prepare_file_access(image: &str, workload_id: &str) -> AgentResponse {
+    #[cfg(target_os = "linux")]
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        if resolve_main_container(Some(workload_id)).is_some() {
+            return Ok(());
+        }
+        let launch = ResolvedLaunch::resolve(
+            image,
+            vec!["/run/smolvm/init".to_string()], // Resolved only; never executed.
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        )?;
+        let prepared = storage::prepare_for_run_persistent(image, workload_id)?;
+        storage::setup_mounts(&prepared.rootfs_path, &[])?;
+        ensure_main_container(
+            &prepared.rootfs_path,
+            Some(workload_id),
+            &[],
+            false,
+            &launch,
+            &[],
+        )?;
+        Ok(())
+    })();
+    #[cfg(not(target_os = "linux"))]
+    let result: Result<(), Box<dyn std::error::Error>> =
+        Err("file access containers require Linux".into());
+    match result {
+        Ok(()) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::OVERLAY_FAILED),
+    }
 }
 
 /// Handle overlay cleanup request.

@@ -1697,6 +1697,25 @@ impl AgentClient {
         expect_data(resp, "prepare overlay")
     }
 
+    /// Make the persistent image filesystem available to file operations
+    /// without executing a command from the image.
+    pub fn prepare_file_access(&mut self, image: &str, workload_id: &str) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY)? {
+            // Older guests do not understand the new request. Preserve their
+            // existing file API behavior until their rootfs is upgraded.
+            self.run_non_interactive(
+                RunConfig::new(image.to_string(), vec!["/bin/true".to_string()])
+                    .with_persistent_overlay(Some(workload_id.to_string())),
+            )?;
+            return Ok(());
+        }
+        let resp = self.request(&AgentRequest::PrepareFileAccess {
+            image: image.to_string(),
+            workload_id: workload_id.to_string(),
+        })?;
+        expect_ok(resp, "prepare file access")
+    }
+
     /// Clean up an overlay filesystem.
     pub fn cleanup_overlay(&mut self, workload_id: &str) -> Result<()> {
         let resp = self.request(&AgentRequest::CleanupOverlay {
@@ -4330,6 +4349,93 @@ mod run_streaming_tests {
             })
             .unwrap();
         assert_eq!(events, vec![ExecEvent::Exit(0)]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn preparing_file_access_sends_no_guest_command() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut len_buf = [0; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(request.body, AgentRequest::Ping));
+            server_stream
+                .write_all(
+                    &encode_message(&AgentResponse::Pong {
+                        version: smolvm_protocol::PROTOCOL_VERSION,
+                        capabilities: vec![smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY.into()],
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(
+                request.body,
+                AgentRequest::PrepareFileAccess { image, workload_id }
+                    if image == "alpine:3.20" && workload_id == "fork-overlay-owner"
+            ));
+            server_stream
+                .write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                .unwrap();
+        });
+        AgentClient::from_stream(client_stream)
+            .prepare_file_access("alpine:3.20", "fork-overlay-owner")
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn preparing_file_access_keeps_old_guests_working() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut len_buf = [0; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(request.body, AgentRequest::Ping));
+            server_stream
+                .write_all(
+                    &encode_message(&AgentResponse::Pong {
+                        version: smolvm_protocol::PROTOCOL_VERSION,
+                        capabilities: vec![],
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(
+                request.body,
+                AgentRequest::Run { image, command, persistent_overlay_id, .. }
+                    if image == "docker.io/library/alpine:3.20"
+                    && command == ["/bin/true"]
+                    && persistent_overlay_id.as_deref() == Some("fork-overlay-owner")
+            ));
+            server_stream
+                .write_all(
+                    &encode_message(&AgentResponse::Completed {
+                        exit_code: 0,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        AgentClient::from_stream(client_stream)
+            .prepare_file_access("alpine:3.20", "fork-overlay-owner")
+            .unwrap();
         server.join().unwrap();
     }
 
