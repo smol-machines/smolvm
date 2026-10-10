@@ -178,3 +178,26 @@ fn an_image_machines_files_are_its_containers_files() {
     );
     m.assert_files_match_exec("image-after-run");
 }
+
+#[test]
+#[ignore = "requires SMOLVM_TEST_LEGACY_GUEST=1 and an older agent rootfs"]
+fn old_guest_refuses_misdirected_bare_vm_file_writes() {
+    if std::env::var("SMOLVM_TEST_LEGACY_GUEST").as_deref() != Ok("1") {
+        return;
+    }
+    let m = Machine::create("ft-legacy", None);
+    m.assert_files_match_exec("legacy-fresh");
+    m.run("alpine:3.20", "echo keep > /root/container-file");
+    let error = m
+        .runtime
+        .write_file(&m.name, "/root/legacy-unsafe", b"bad".to_vec(), None)
+        .expect_err("an old agent cannot identify the bare VM root after an image run");
+    assert!(
+        error.to_string().contains("cannot target bare VM files"),
+        "{error}"
+    );
+    assert_eq!(
+        m.sh("test -e /root/legacy-unsafe && echo leaked || echo safe"),
+        "safe\n"
+    );
+}
