@@ -1715,7 +1715,6 @@ fn create_storage_dirs(mount_point: &str) {
         "configs",
         "manifests",
         "overlays",
-        "workspace",
         "containers/run",
         "containers/logs",
         "containers/exit",
@@ -1723,6 +1722,28 @@ fn create_storage_dirs(mount_point: &str) {
     ];
     for dir in dirs {
         let _ = std::fs::create_dir_all(std::path::Path::new(mount_point).join(dir));
+    }
+    if let Err(error) =
+        create_shared_workspace(&std::path::Path::new(mount_point).join("workspace"))
+    {
+        warn!(%error, "could not initialize shared workspace");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_shared_workspace(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::create_dir(path) {
+        Ok(()) => {
+            // The image's user may have any UID. The sticky bit prevents one
+            // non-root user from removing another user's workspace entries.
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777))
+        }
+        // Existing workspace permissions may have been set deliberately. Keep
+        // them (and their contents) unchanged on every subsequent boot.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -7854,6 +7875,24 @@ mod bg_reap_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_is_shared_on_creation_without_changing_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        create_storage_dirs(temp.path().to_str().unwrap());
+        let mode = std::fs::metadata(&workspace).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o1777);
+
+        // A user may restrict an existing workspace; restarting must respect it.
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        create_storage_dirs(temp.path().to_str().unwrap());
+        let mode = std::fs::metadata(&workspace).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700);
+    }
+
     /// A listing is what a caller uses to decide where to recurse and what to
     /// download, so the shape matters: names only, sorted, with sizes only
     /// where they mean something.
