@@ -3445,7 +3445,11 @@ fn handle_streaming_file_read(
                     stream,
                     &AgentResponse::error(
                         format!("failed to read {} in the workload container: {}", path, e),
-                        error_codes::FILE_IO_FAILED,
+                        if e.contains("No such file") || e.contains("os error 2") {
+                            error_codes::NOT_FOUND
+                        } else {
+                            error_codes::FILE_IO_FAILED
+                        },
                     ),
                 )?;
                 return Ok(());
@@ -3466,7 +3470,11 @@ fn handle_streaming_file_read(
                 stream,
                 &AgentResponse::error(
                     format!("failed to open {}: {}", path, e),
-                    error_codes::FILE_IO_FAILED,
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        error_codes::NOT_FOUND
+                    } else {
+                        error_codes::FILE_IO_FAILED
+                    },
                 ),
             )?;
             return Ok(());
@@ -8227,6 +8235,25 @@ mod tests {
         let resp: AgentResponse =
             serde_json::from_slice(&buf[4..4 + len]).expect("decode response");
         (resp, 4 + len)
+    }
+
+    #[test]
+    fn missing_streamed_file_reports_not_found() {
+        use std::os::unix::net::UnixStream;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("absent");
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        handle_streaming_file_read(&mut agent, absent.to_str().unwrap()).unwrap();
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let mut frame = vec![0u8; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut frame).unwrap();
+        let response: AgentResponse = serde_json::from_slice(&frame).unwrap();
+        assert!(matches!(
+            response,
+            AgentResponse::Error { code: Some(code), .. } if code == error_codes::NOT_FOUND
+        ));
     }
 
     #[test]

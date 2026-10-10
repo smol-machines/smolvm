@@ -3644,8 +3644,14 @@ where
                     return Ok(out);
                 }
             }
-            AgentResponse::Error { message, .. } => {
-                return Err(Error::agent("read file", message));
+            AgentResponse::Error { message, code } => {
+                return Err(
+                    if code.as_deref() == Some(smolvm_protocol::error_codes::NOT_FOUND) {
+                        Error::agent_not_found("read file", message)
+                    } else {
+                        Error::agent("read file", message)
+                    },
+                );
             }
             other => {
                 return Err(Error::agent(
@@ -3755,6 +3761,32 @@ mod read_cap_tests {
         }])
         .unwrap_err();
         assert!(format!("{}", err).contains("no such file"));
+    }
+
+    #[test]
+    fn missing_streamed_file_retains_not_found_status() {
+        let err = drive(vec![AgentResponse::Error {
+            message: "missing guest path".to_string(),
+            code: Some(smolvm_protocol::error_codes::NOT_FOUND.to_string()),
+        }])
+        .unwrap_err();
+        assert!(matches!(
+            crate::api::error::ApiError::from(err),
+            crate::api::error::ApiError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn other_stream_errors_remain_server_errors() {
+        let err = drive(vec![AgentResponse::Error {
+            message: "storage failed".to_string(),
+            code: Some(smolvm_protocol::error_codes::FILE_IO_FAILED.to_string()),
+        }])
+        .unwrap_err();
+        assert!(matches!(
+            crate::api::error::ApiError::from(err),
+            crate::api::error::ApiError::Internal(_)
+        ));
     }
 
     #[test]
