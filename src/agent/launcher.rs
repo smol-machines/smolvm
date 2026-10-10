@@ -430,10 +430,10 @@ impl LaunchFeatures {
         self.with_packed_layers_with_mode(layers_cache_dir, source_smolmachine, false)
     }
 
-    /// Like `with_packed_layers`, but use a VM-mode machine record to identify
-    /// layerless packs after their original sidecar has been removed. Container
-    /// records must pass `false` so an evicted layer cache is never treated as
-    /// a valid VM-mode extraction.
+    /// Like `with_packed_layers`, but a VM-mode machine has already copied its
+    /// packed disks into its own data dir at create time. Starting it does not
+    /// require the original bundle or its extraction cache. Container records
+    /// must pass `false`: they still need the extracted OCI layers at boot.
     pub fn with_packed_layers_with_mode(
         mut self,
         layers_cache_dir: &Path,
@@ -443,17 +443,14 @@ impl LaunchFeatures {
         let Some(sidecar_path) = source_smolmachine else {
             return Ok(self);
         };
-        // VM-mode packs contain disks but no OCI layers. They still need their
-        // extracted assets, but mounting an empty /packed_layers wastes a
-        // virtiofs device (and on x86_64, one of the limited virtio IRQs).
-        // Without an explicit VM-mode record, unreadable/missing sidecars
-        // conservatively keep the old mount layout.
-        let sidecar = Path::new(sidecar_path);
-        let has_image_layers = if vm_mode && !sidecar.exists() {
-            false
-        } else {
-            pack_has_image_layers(sidecar)
-        };
+        // A VM-mode machine has already seeded its overlay and storage disks
+        // from the bundle during create. None of its boot devices uses the
+        // extraction cache, which may be evicted along with the original bundle.
+        // Skipping the empty layer share also saves a virtiofs device/IRQ.
+        if vm_mode {
+            return Ok(self);
+        }
+        let has_image_layers = pack_has_image_layers(Path::new(sidecar_path));
 
         // Shared pack store: if create extracted the pack into the node's shared
         // content-addressed store and dropped a pointer beside this machine, the
@@ -3240,6 +3237,15 @@ mod tests {
             assert!(features.packed_layers_dir.is_none());
             assert!(features.pack_idmap_source.is_none());
         }
+        // VM-mode disks were seeded into the machine at create time. Their
+        // original extraction cache can be evicted independently of the VM.
+        let evicted = tmp.path().join("evicted-pack-cache");
+        let features = LaunchFeatures::default()
+            .with_packed_layers_with_mode(&evicted, Some(artifact_path), true)
+            .unwrap();
+        assert!(features.packed_layers_dir.is_none());
+        assert!(!evicted.exists());
+
         // An image-mode record with missing layers still needs its sidecar for
         // repair; never silently boot it without those layers.
         let missing = tmp.path().join("missing-layers");
