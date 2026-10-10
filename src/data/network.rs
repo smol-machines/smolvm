@@ -89,7 +89,13 @@ pub fn effective_dns(
 ) -> EffectiveDns {
     let resolv_conf = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     let uplink = std::fs::read_to_string(SYSTEMD_RESOLVED_UPLINK).unwrap_or_default();
-    let effective = select_dns(dns_override, backend, &resolv_conf, &uplink);
+    // A TSI guest dials its resolver itself, so the egress floor applies to it:
+    // on a cloud VM the host resolver is the metadata address, and under the
+    // strict floor a CGNAT resolver (Tailscale's 100.100.100.100) is blocked too.
+    let floor = smolvm_network::EgressPolicy::unrestricted();
+    let effective = select_dns(dns_override, backend, &resolv_conf, &uplink, &|addr| {
+        floor.allows_v4(addr)
+    });
     if effective.source == DnsSource::BackendDefault
         && backend != crate::network::EffectiveNetworkBackend::None
     {
@@ -102,12 +108,16 @@ pub fn effective_dns(
     effective
 }
 
-/// The pure half of [`effective_dns`], with both files supplied.
+/// The pure half of [`effective_dns`], with both files supplied. `reachable`
+/// says whether a TSI guest may connect to an address; a host resolver it may
+/// not reach is skipped, and with none left the guest keeps the public
+/// resolvers.
 fn select_dns(
     dns_override: Option<Ipv4Addr>,
     backend: crate::network::EffectiveNetworkBackend,
     resolv_conf: &str,
     systemd_uplink: &str,
+    reachable: &dyn Fn(Ipv4Addr) -> bool,
 ) -> EffectiveDns {
     use crate::network::EffectiveNetworkBackend;
 
@@ -127,11 +137,11 @@ fn select_dns(
         // TSI does not translate a guest loopback destination to the host's
         // loopback, so a stub address would leave the guest talking to itself.
         EffectiveNetworkBackend::Tsi => nameservers_v4(resolv_conf)
-            .find(|addr| !addr.is_loopback())
+            .find(|addr| !addr.is_loopback() && reachable(*addr))
             .map(|addr| (addr, DnsSource::HostResolvConf))
             .or_else(|| {
                 nameservers_v4(systemd_uplink)
-                    .find(|addr| !addr.is_loopback())
+                    .find(|addr| !addr.is_loopback() && reachable(*addr))
                     .map(|addr| (addr, DnsSource::SystemdUplink))
             }),
     };
@@ -427,7 +437,7 @@ mod tests {
             EffectiveNetworkBackend::Tsi,
             EffectiveNetworkBackend::VirtioNet,
         ] {
-            let chosen = select_dns(Some(nine), backend, CAMPUS, UPLINK);
+            let chosen = select_dns(Some(nine), backend, CAMPUS, UPLINK, &|_| true);
             assert_eq!(chosen.addr, Some(nine));
             assert_eq!(chosen.source, DnsSource::Override);
         }
@@ -440,7 +450,7 @@ mod tests {
             EffectiveNetworkBackend::Tsi,
             EffectiveNetworkBackend::VirtioNet,
         ] {
-            let chosen = select_dns(None, backend, CAMPUS, "");
+            let chosen = select_dns(None, backend, CAMPUS, "", &|_| true);
             assert_eq!(chosen.addr, Some(campus));
             assert_eq!(chosen.source, DnsSource::HostResolvConf);
         }
@@ -448,18 +458,24 @@ mod tests {
 
     #[test]
     fn virtio_net_takes_a_loopback_stub_but_tsi_reaches_past_it_to_the_uplink() {
-        let virtio = select_dns(None, EffectiveNetworkBackend::VirtioNet, STUB, UPLINK);
+        let virtio = select_dns(
+            None,
+            EffectiveNetworkBackend::VirtioNet,
+            STUB,
+            UPLINK,
+            &|_| true,
+        );
         assert_eq!(virtio.addr, Some(Ipv4Addr::new(127, 0, 0, 53)));
         assert_eq!(virtio.source, DnsSource::HostResolvConf);
 
-        let tsi = select_dns(None, EffectiveNetworkBackend::Tsi, STUB, UPLINK);
+        let tsi = select_dns(None, EffectiveNetworkBackend::Tsi, STUB, UPLINK, &|_| true);
         assert_eq!(tsi.addr, Some(Ipv4Addr::new(192, 168, 5, 2)));
         assert_eq!(tsi.source, DnsSource::SystemdUplink);
     }
 
     #[test]
     fn tsi_keeps_the_backend_default_when_every_host_resolver_is_loopback() {
-        let chosen = select_dns(None, EffectiveNetworkBackend::Tsi, STUB, "");
+        let chosen = select_dns(None, EffectiveNetworkBackend::Tsi, STUB, "", &|_| true);
         assert_eq!(chosen.addr, None);
         assert_eq!(chosen.source, DnsSource::BackendDefault);
     }
@@ -470,7 +486,7 @@ mod tests {
             EffectiveNetworkBackend::Tsi,
             EffectiveNetworkBackend::VirtioNet,
         ] {
-            let chosen = select_dns(None, backend, "", "");
+            let chosen = select_dns(None, backend, "", "", &|_| true);
             assert_eq!(chosen.addr, None);
             assert_eq!(chosen.source, DnsSource::BackendDefault);
         }
@@ -485,7 +501,7 @@ mod tests {
             EffectiveNetworkBackend::Tsi,
             EffectiveNetworkBackend::VirtioNet,
         ] {
-            let chosen = select_dns(None, backend, v6, "");
+            let chosen = select_dns(None, backend, v6, "", &|_| true);
             assert_eq!(chosen.addr, None);
             assert_eq!(chosen.source, DnsSource::BackendDefault);
         }
@@ -493,7 +509,9 @@ mod tests {
 
     #[test]
     fn a_machine_with_no_network_gets_no_resolver() {
-        let chosen = select_dns(None, EffectiveNetworkBackend::None, CAMPUS, UPLINK);
+        let chosen = select_dns(None, EffectiveNetworkBackend::None, CAMPUS, UPLINK, &|_| {
+            true
+        });
         assert_eq!(chosen.addr, None);
         assert_eq!(chosen.source, DnsSource::BackendDefault);
     }
@@ -503,8 +521,34 @@ mod tests {
         // File order matters: the v6 entry is first, and skipping it must not
         // also skip the usable v4 resolver on the next line.
         let mixed = "nameserver 2606:4700:4700::1111\nnameserver 128.112.128.12\n";
-        let chosen = select_dns(None, EffectiveNetworkBackend::Tsi, mixed, "");
+        let chosen = select_dns(None, EffectiveNetworkBackend::Tsi, mixed, "", &|_| true);
         assert_eq!(chosen.addr, Some(Ipv4Addr::new(128, 112, 128, 12)));
+    }
+
+    /// A GCP VM's resolver is the metadata address, which the egress floor
+    /// blocks in every mode: a TSI guest must not be handed it.
+    const GCP: &str = "nameserver 169.254.169.254\nsearch c.project.internal\n";
+
+    #[test]
+    fn a_tsi_guest_is_not_handed_a_resolver_the_egress_floor_blocks() {
+        let floor = smolvm_network::EgressPolicy::unrestricted();
+        let reachable = |addr: Ipv4Addr| floor.allows_v4(addr);
+        let chosen = select_dns(None, EffectiveNetworkBackend::Tsi, GCP, "", &reachable);
+        assert_eq!(chosen.addr, None);
+        assert_eq!(chosen.source, DnsSource::BackendDefault);
+
+        // A later nameserver the guest can reach is used instead.
+        let both = "nameserver 169.254.169.254\nnameserver 8.8.4.4\n";
+        let chosen = select_dns(None, EffectiveNetworkBackend::Tsi, both, "", &reachable);
+        assert_eq!(chosen.addr, Some(Ipv4Addr::new(8, 8, 4, 4)));
+    }
+
+    #[test]
+    fn virtio_net_keeps_a_floored_host_resolver_because_the_gateway_dials_it() {
+        let chosen = select_dns(None, EffectiveNetworkBackend::VirtioNet, GCP, "", &|_| {
+            false
+        });
+        assert_eq!(chosen.addr, Some(Ipv4Addr::new(169, 254, 169, 254)));
     }
 
     #[test]
