@@ -3356,6 +3356,14 @@ fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
     }
 }
 
+/// kqueue can report EV_ERROR as an event; only NOTE_EXIT confirms death.
+#[cfg(target_os = "macos")]
+fn mac_process_exit_event(event: &libc::kevent) -> bool {
+    event.filter == libc::EVFILT_PROC
+        && event.flags & libc::EV_ERROR == 0
+        && event.fflags & libc::NOTE_EXIT != 0
+}
+
 /// [`wait_for_exit_event`] through kqueue's `NOTE_EXIT`.
 #[cfg(target_os = "macos")]
 fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
@@ -3394,7 +3402,11 @@ fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
         // SAFETY: waits for at most one event into `event`, with a valid timeout.
         let rc = unsafe { libc::kevent(kq_fd, std::ptr::null(), 0, &mut event, 1, &wait) };
         if rc > 0 {
-            return ExitEvent::Exited;
+            return if mac_process_exit_event(&event) {
+                ExitEvent::Exited
+            } else {
+                ExitEvent::Unavailable
+            };
         }
         if rc == 0 {
             if Instant::now() < deadline {
@@ -3870,6 +3882,20 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kqueue_errors_are_not_process_exit_events() {
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        event.filter = libc::EVFILT_PROC;
+        event.fflags = libc::NOTE_EXIT;
+        assert!(super::mac_process_exit_event(&event));
+        event.flags = libc::EV_ERROR;
+        assert!(!super::mac_process_exit_event(&event));
+        event.flags = 0;
+        event.fflags = 0;
+        assert!(!super::mac_process_exit_event(&event));
+    }
+
     #[cfg(unix)]
     #[test]
     fn poll_for_exit_reads_a_child_exit_code() {

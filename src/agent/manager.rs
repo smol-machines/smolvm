@@ -4088,7 +4088,7 @@ mod tests {
             );
             assert!(
                 !survived,
-                "iteration={attempt}, the paused VM's process must be gone"
+                "iteration={attempt}, the paused VM's process must be gone: result={result:?}, start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, elapsed={elapsed:?}"
             );
             // The handshake was skipped, not merely fast: its own deadline is 5s.
             assert!(
