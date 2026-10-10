@@ -3150,43 +3150,50 @@ impl AgentClient {
             )
         })?;
 
-        let mut total = 0u64;
-        loop {
-            match self.recv_raw()? {
-                AgentResponse::DataChunk { data, done } => {
-                    let next_total = total.saturating_add(data.len() as u64);
-                    if next_total > cap {
-                        let _ = std::fs::remove_file(local_path);
-                        return Err(Error::agent(
-                            operation,
-                            format!(
-                                "guest streamed {} bytes, exceeding the {} byte cap",
-                                next_total, cap
-                            ),
-                        ));
+        // A failed read or write may leave a partial archive behind. Keep the
+        // file open through the transfer and remove it on every error after
+        // closing the handle (required on Windows).
+        let result = (|| {
+            let mut total = 0u64;
+            loop {
+                match self.recv_raw()? {
+                    AgentResponse::DataChunk { data, done } => {
+                        let next_total = total.saturating_add(data.len() as u64);
+                        if next_total > cap {
+                            return Err(Error::agent(
+                                operation,
+                                format!(
+                                    "guest streamed {} bytes, exceeding the {} byte cap",
+                                    next_total, cap
+                                ),
+                            ));
+                        }
+                        if !data.is_empty() {
+                            file.write_all(&data)
+                                .map_err(|e| Error::agent("write local file", e.to_string()))?;
+                            total = next_total;
+                            on_progress(total);
+                        }
+                        if done {
+                            file.flush()
+                                .map_err(|e| Error::agent("flush local file", e.to_string()))?;
+                            return Ok(total);
+                        }
                     }
-                    if !data.is_empty() {
-                        file.write_all(&data)
-                            .map_err(|e| Error::agent("write local file", e.to_string()))?;
-                        total = next_total;
-                        on_progress(total);
+                    AgentResponse::Error { message, .. } => {
+                        return Err(Error::agent(operation, message));
                     }
-                    if done {
-                        file.flush()
-                            .map_err(|e| Error::agent("flush local file", e.to_string()))?;
-                        return Ok(total);
+                    _ => {
+                        return Err(Error::agent(operation, "unexpected response"));
                     }
-                }
-                AgentResponse::Error { message, .. } => {
-                    let _ = std::fs::remove_file(local_path);
-                    return Err(Error::agent(operation, message));
-                }
-                _ => {
-                    let _ = std::fs::remove_file(local_path);
-                    return Err(Error::agent(operation, "unexpected response"));
                 }
             }
+        })();
+        drop(file);
+        if result.is_err() {
+            let _ = std::fs::remove_file(local_path);
         }
+        result
     }
 
     // ========================================================================
@@ -4873,5 +4880,62 @@ mod interactive_input_tests {
                 .all(|(i, byte)| *byte == (i % 251) as u8),
             "bytes arrived out of order or changed"
         );
+    }
+}
+
+#[cfg(test)]
+mod streamed_path_cleanup_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn send_response(peer: &mut UdsStream, response: AgentResponse) {
+        let data = serde_json::to_vec(&response).unwrap();
+        peer.write_all(&(data.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(&data).unwrap();
+    }
+
+    #[test]
+    fn disconnect_mid_transfer_removes_the_partial_file() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::DataChunk {
+                data: b"partial archive".to_vec(),
+                done: false,
+            },
+        );
+        drop(peer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("flat-export.tmp");
+        let mut client = AgentClient::from_stream(client_stream);
+        assert!(client
+            .receive_stream_to_path(&output, 1024, |_| {}, "flatten layers")
+            .is_err());
+        assert!(!output.exists(), "failed transfer left a partial archive");
+    }
+
+    #[test]
+    fn successful_transfer_keeps_the_file() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::DataChunk {
+                data: b"complete archive".to_vec(),
+                done: true,
+            },
+        );
+        drop(peer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("flat-export.tmp");
+        let mut client = AgentClient::from_stream(client_stream);
+        assert_eq!(
+            client
+                .receive_stream_to_path(&output, 1024, |_| {}, "flatten layers")
+                .unwrap(),
+            b"complete archive".len() as u64
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete archive");
     }
 }
