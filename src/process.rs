@@ -1310,13 +1310,9 @@ pub fn vm_uid_drop_active() -> bool {
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
 #[cfg(target_os = "linux")]
 pub fn apply_system_data_root(allow_auto: bool) {
-    let mut carry_rootfs_from = None;
     let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
         std::path::PathBuf::from(explicit)
     } else if let Some(workspace_root) = overlay_workspace_root() {
-        // The rootfs the installer laid down sits under the old home, which a
-        // dropped VMM uid cannot traverse; bring a copy into the new root.
-        carry_rootfs_from = installed_agent_rootfs();
         // Name the choice so a second pass (`serve` runs one of its own, after
         // HOME has already moved off overlayfs) and every child keep this root
         // instead of falling through to /var/lib/smolvm.
@@ -1331,6 +1327,10 @@ pub fn apply_system_data_root(allow_auto: bool) {
     } else {
         return;
     };
+    // Relocating HOME also relocates the fallback agent rootfs path. Preserve
+    // the installed rootfs for explicit SMOLVM_DATA_DIR and serve's /var/lib
+    // default, just as we do for the overlayfs workspace default.
+    let carry_rootfs_from = installed_agent_rootfs();
     match std::fs::create_dir_all(&root) {
         Ok(()) => {
             use std::os::unix::fs::PermissionsExt;
@@ -1359,12 +1359,14 @@ pub fn apply_system_data_root(allow_auto: bool) {
     std::env::remove_var("XDG_CONFIG_HOME");
     if let Some(src) = carry_rootfs_from {
         let dst = root.join(".local/share/smolvm/agent-rootfs");
-        if let Err(e) = sync_agent_rootfs(&src, &dst) {
-            eprintln!(
-                "warning: could not copy the agent rootfs from {} to {}: {e}",
-                src.display(),
-                dst.display()
-            );
+        if src != dst {
+            if let Err(e) = sync_agent_rootfs(&src, &dst) {
+                eprintln!(
+                    "warning: could not copy the agent rootfs from {} to {}: {e}",
+                    src.display(),
+                    dst.display()
+                );
+            }
         }
     }
     tracing::info!(data_root = %root.display(), "smolvm state rooted at a system data dir");
@@ -1416,7 +1418,9 @@ fn choose_workspace_root(home_fs: Option<i64>, workspace_fs: Option<i64>) -> boo
 /// The agent rootfs the installer put in the data dir, when nothing else names one.
 #[cfg(target_os = "linux")]
 fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
-    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_some() {
+    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_some()
+        || crate::embedded::bundle::agent_rootfs_tar().is_some()
+    {
         return None;
     }
     dirs::data_local_dir()
@@ -1429,6 +1433,27 @@ fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
 /// and an upgrade replaces the binary, so a stale copy is replaced too.
 #[cfg(target_os = "linux")]
 fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let parent = dst
+        .parent()
+        .ok_or_else(|| std::io::Error::other("rootfs has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    // Multiple CLI invocations may relocate the same rootfs concurrently.
+    // Keep the version check and replacement under a cross-process lock.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(parent.join(".agent-rootfs.lock"))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
     let stamp = |root: &std::path::Path| {
         std::fs::metadata(root.join("usr/local/bin/smolvm-agent"))
             .ok()
@@ -1437,10 +1462,6 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
     if stamp(dst).is_some() && stamp(dst) == stamp(src) {
         return Ok(());
     }
-    let parent = dst
-        .parent()
-        .ok_or_else(|| std::io::Error::other("rootfs has no parent"))?;
-    std::fs::create_dir_all(parent)?;
     let staging = parent.join(".agent-rootfs.new");
     let _ = std::fs::remove_dir_all(&staging);
     let status = std::process::Command::new("cp")
