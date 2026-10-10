@@ -208,9 +208,9 @@ features = [
 default-features = false
 
 [dependencies.prost]
-version = "0.14"
+version = "0.8"
 
 [dependencies.prost-types]
-version = "0.14"
+version = "0.8"
 
 [workspace]
