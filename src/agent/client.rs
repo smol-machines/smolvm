@@ -1477,7 +1477,39 @@ impl AgentClient {
         }
         self.file_target = None;
         let WorkloadTarget::Container { image, overlay_id } = target else {
-            return Ok(());
+            // Older agents infer the destination of a file operation from
+            // mounted overlays. On a bare VM, a prior run(image) can leave one
+            // mounted, so an unqualified write would silently land in that
+            // container instead of the VM where exec reads it. Permit the
+            // legacy path only when there is no persistent overlay to infer.
+            let (code, _, stderr) = self.vm_exec(
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    r#"for root in /storage/overlays/persistent-*/merged; do
+                         if [ -d "$root/bin" ] || [ -d "$root/usr" ]; then exit 1; fi
+                       done"#
+                        .into(),
+                ],
+                Vec::new(),
+                None,
+                Some(Duration::from_secs(10)),
+                None,
+            )?;
+            return match code {
+                0 => Ok(()),
+                1 => Err(Error::agent(
+                    "select VM filesystem",
+                    "this guest agent cannot target bare VM files after an image run; upgrade the guest agent and restart the machine",
+                )),
+                _ => Err(Error::agent(
+                    "select VM filesystem",
+                    format!(
+                        "could not verify the filesystem for this older guest agent (exit {code}): {}",
+                        String::from_utf8_lossy(&stderr).trim()
+                    ),
+                )),
+            };
         };
         let (code, _, stderr) = self.run_non_interactive(
             RunConfig::new(image, vec!["/bin/true".to_string()])
