@@ -321,10 +321,12 @@ fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures)
 }
 
 fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result<LaunchFeatures> {
-    let mut features = merge_record_launch_features(record, features).with_packed_layers(
-        &crate::agent::machine_layers_cache_dir(&record.name),
-        record.source_smolmachine.as_deref(),
-    )?;
+    let mut features = merge_record_launch_features(record, features)
+        .with_packed_layers_with_mode(
+            &crate::agent::machine_layers_cache_dir(&record.name),
+            record.source_smolmachine.as_deref(),
+            record.image.is_none(),
+        )?;
     if features.packed_layers_dir.is_none() {
         features.packed_layers_dir = record
             .image

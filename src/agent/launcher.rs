@@ -423,9 +423,22 @@ impl LaunchFeatures {
     /// Performs blocking filesystem work; on async paths call it from within a
     /// `spawn_blocking` context.
     pub fn with_packed_layers(
+        self,
+        layers_cache_dir: &Path,
+        source_smolmachine: Option<&str>,
+    ) -> Result<Self> {
+        self.with_packed_layers_with_mode(layers_cache_dir, source_smolmachine, false)
+    }
+
+    /// Like `with_packed_layers`, but use a VM-mode machine record to identify
+    /// layerless packs after their original sidecar has been removed. Container
+    /// records must pass `false` so an evicted layer cache is never treated as
+    /// a valid VM-mode extraction.
+    pub fn with_packed_layers_with_mode(
         mut self,
         layers_cache_dir: &Path,
         source_smolmachine: Option<&str>,
+        vm_mode: bool,
     ) -> Result<Self> {
         let Some(sidecar_path) = source_smolmachine else {
             return Ok(self);
@@ -433,8 +446,14 @@ impl LaunchFeatures {
         // VM-mode packs contain disks but no OCI layers. They still need their
         // extracted assets, but mounting an empty /packed_layers wastes a
         // virtiofs device (and on x86_64, one of the limited virtio IRQs).
-        // Unreadable/missing sidecars conservatively keep the old mount layout.
-        let has_image_layers = pack_has_image_layers(Path::new(sidecar_path));
+        // Without an explicit VM-mode record, unreadable/missing sidecars
+        // conservatively keep the old mount layout.
+        let sidecar = Path::new(sidecar_path);
+        let has_image_layers = if vm_mode && !sidecar.exists() {
+            false
+        } else {
+            pack_has_image_layers(sidecar)
+        };
 
         // Shared pack store: if create extracted the pack into the node's shared
         // content-addressed store and dropped a pointer beside this machine, the
@@ -3210,6 +3229,25 @@ mod tests {
             .with_packed_layers(&private, Some(artifact_path))
             .unwrap();
         assert!(features.packed_layers_dir.is_none());
+
+        // Once a machine has extracted its VM-mode disks, it must keep booting
+        // even if the original artifact is no longer available.
+        fs::remove_file(&artifact).unwrap();
+        for cache in [&private, &cache] {
+            let features = LaunchFeatures::default()
+                .with_packed_layers_with_mode(cache, Some(artifact_path), true)
+                .unwrap();
+            assert!(features.packed_layers_dir.is_none());
+            assert!(features.pack_idmap_source.is_none());
+        }
+        // An image-mode record with missing layers still needs its sidecar for
+        // repair; never silently boot it without those layers.
+        let missing = tmp.path().join("missing-layers");
+        fs::create_dir_all(&missing).unwrap();
+        smolvm_pack::extract::mark_extracted(&missing).unwrap();
+        assert!(LaunchFeatures::default()
+            .with_packed_layers_with_mode(&missing, Some(artifact_path), false)
+            .is_err());
     }
 
     // Regression: the shared-store branch must present the `layers/` SUBDIR of the
