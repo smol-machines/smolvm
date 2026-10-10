@@ -12,7 +12,7 @@ use containerd_shim_protos::api::DeleteResponse;
 use log::warn;
 
 use crate::backend::MockBackend;
-use crate::engine::{EnginePodBackend, ShimBackend};
+use crate::engine::{remove_sandbox_share, EnginePodBackend, ShimBackend};
 use crate::task::TaskService;
 
 pub const RUNTIME_ID: &str = "io.containerd.smolvm.v2";
@@ -62,11 +62,14 @@ impl Shim for Service {
         // already cleaned by the graceful path) is not an error.
         let id = self.id.clone();
         let _ = tokio::task::spawn_blocking(move || match smolvm::embedded::runtime() {
-            Ok(rt) => {
-                if let Err(e) = rt.delete_machine(&id) {
-                    warn!("delete_shim: reaping VM {id} failed (may already be gone): {e}");
+            Ok(rt) => match rt.delete_machine(&id) {
+                Ok(()) => {
+                    if let Err(e) = remove_sandbox_share(&id) {
+                        warn!("delete_shim: reaping share {id} failed: {e}");
+                    }
                 }
-            }
+                Err(e) => warn!("delete_shim: reaping VM {id} failed: {e}"),
+            },
             Err(e) => warn!("delete_shim: runtime unavailable, cannot reap VM {id}: {e}"),
         })
         .await;

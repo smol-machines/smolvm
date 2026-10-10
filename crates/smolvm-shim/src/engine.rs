@@ -49,6 +49,33 @@ use crate::backend::{ExitInfo, ExitWatch, PodBackend, ProcessSpec, Stdio};
 /// rejects). One `<id>/podshare` subdir per sandbox.
 const POD_SHARE_HOST_ROOT: &str = "/var/lib/containerd-shim-smolvm";
 
+/// Reap the sandbox's host share after its VM has been deleted. The sandbox id
+/// must be one path component: containerd supplies it, but it must never be
+/// allowed to escape the shim's state root during deletion.
+fn remove_sandbox_share_at(root: &Path, id: &str) -> std::io::Result<()> {
+    if id.is_empty()
+        || id.len() > 200
+        || matches!(id, "." | "..")
+        || id.starts_with('-')
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid sandbox id for share cleanup",
+        ));
+    }
+    match std::fs::remove_dir_all(root.join(id)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+pub(crate) fn remove_sandbox_share(id: &str) -> std::io::Result<()> {
+    remove_sandbox_share_at(Path::new(POD_SHARE_HOST_ROOT), id)
+}
+
 const POD_SHARE_GUEST_PATH: &str = "/podshare";
 
 /// Where the agent's pod handlers resolve `PodCreate.rootfs_rel` from:
@@ -971,7 +998,11 @@ impl PodBackend for EnginePodBackend {
                     warn!("stop sandbox VM {}: {e}", sandbox.id);
                 }
                 rt.delete_machine(&sandbox.id)
-                    .map_err(|e| format!("delete sandbox VM: {e}"))
+                    .map_err(|e| format!("delete sandbox VM: {e}"))?;
+                if let Err(e) = remove_sandbox_share(&sandbox.id) {
+                    warn!("remove sandbox share {}: {e}", sandbox.id);
+                }
+                Ok::<(), String>(())
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -1329,6 +1360,23 @@ mod tests {
 
     fn spec_with(annotations: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "annotations": annotations })
+    }
+
+    #[test]
+    fn deleting_sandbox_share_reclaims_container_copies_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let deleted = root.path().join("deleted-pod");
+        let live = root.path().join("live-pod");
+        std::fs::create_dir_all(deleted.join("podshare/ctr/rootfs")).unwrap();
+        std::fs::write(deleted.join("podshare/ctr/rootfs/data"), b"reclaimed").unwrap();
+        std::fs::create_dir(&live).unwrap();
+
+        remove_sandbox_share_at(root.path(), "deleted-pod").unwrap();
+        remove_sandbox_share_at(root.path(), "deleted-pod").unwrap();
+        assert!(!deleted.exists());
+        assert!(live.exists());
+        assert!(remove_sandbox_share_at(root.path(), "../live-pod").is_err());
+        assert!(live.exists());
     }
 
     #[test]
