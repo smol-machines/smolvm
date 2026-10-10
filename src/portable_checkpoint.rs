@@ -2892,7 +2892,87 @@ fn parse_macos_features(sysctl_output: &str) -> Vec<String> {
 fn collect_aarch64_host_features() -> Result<Vec<String>> {
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
         .map_err(|error| Error::agent("read CPU features", error.to_string()))?;
-    Ok(parse_linux_features(&cpuinfo))
+    let mut features = parse_linux_features(&cpuinfo);
+    // Linux hides SSBS from its own programs on cores with erratum 3194386
+    // (Neoverse V2, such as Google Axion), but KVM still gives it to guests. A
+    // guest's features are what KVM offers, so ask it.
+    if !features.iter().any(|name| name == "FEAT_SSBS")
+        && kvm_guest_id_aa64pfr1().is_some_and(id_aa64pfr1_has_ssbs)
+    {
+        features.push("FEAT_SSBS".to_string());
+    }
+    Ok(features)
+}
+
+/// Whether `ID_AA64PFR1_EL1` reports SSBS (field bits 7:4, non-zero).
+#[cfg(any(all(target_arch = "aarch64", target_os = "linux"), test))]
+#[allow(dead_code)]
+fn id_aa64pfr1_has_ssbs(value: u64) -> bool {
+    (value >> 4) & 0xf != 0
+}
+
+/// `ID_AA64PFR1_EL1` as KVM presents it to a guest on this host, read from a
+/// scratch vCPU, or `None` when KVM is unavailable. Read once per process: the
+/// host's CPUs do not change under it.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn kvm_guest_id_aa64pfr1() -> Option<u64> {
+    static VALUE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(read_kvm_guest_id_aa64pfr1)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn read_kvm_guest_id_aa64pfr1() -> Option<u64> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // From <linux/kvm.h> for arm64. `Ioctl` is the request type of this libc
+    // (glibc and musl differ).
+    const KVM_CREATE_VM: libc::Ioctl = 0xAE01;
+    const KVM_CREATE_VCPU: libc::Ioctl = 0xAE41;
+    const KVM_ARM_PREFERRED_TARGET: libc::Ioctl = 0x8020_AEAF_u32 as libc::Ioctl;
+    const KVM_ARM_VCPU_INIT: libc::Ioctl = 0x4020_AEAE;
+    const KVM_GET_ONE_REG: libc::Ioctl = 0x4010_AEAB;
+    // KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | op0=3, op1=0,
+    // CRn=0, CRm=4, op2=1 (ID_AA64PFR1_EL1).
+    const ID_AA64PFR1_EL1: u64 = 0x6030_0000_0013_C021;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct VcpuInit {
+        target: u32,
+        features: [u32; 7],
+    }
+    #[repr(C)]
+    struct OneReg {
+        id: u64,
+        addr: u64,
+    }
+
+    let owned = |fd: libc::c_int| (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) });
+    // SAFETY: plain open(2) of a NUL-terminated path; the fd is owned below.
+    let kvm = owned(unsafe { libc::open(c"/dev/kvm".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) })?;
+    // SAFETY: each ioctl gets the fd it is defined on and, where it takes one,
+    // a pointer to a live, correctly sized `repr(C)` value; every returned fd
+    // is owned (and closed) by an `OwnedFd`.
+    unsafe {
+        let vm = owned(libc::ioctl(kvm.as_raw_fd(), KVM_CREATE_VM, 0))?;
+        let vcpu = owned(libc::ioctl(vm.as_raw_fd(), KVM_CREATE_VCPU, 0))?;
+        let mut init = VcpuInit::default();
+        if libc::ioctl(vm.as_raw_fd(), KVM_ARM_PREFERRED_TARGET, &mut init) != 0 {
+            return None;
+        }
+        if libc::ioctl(vcpu.as_raw_fd(), KVM_ARM_VCPU_INIT, &init) != 0 {
+            return None;
+        }
+        let mut value: u64 = 0;
+        let reg = OneReg {
+            id: ID_AA64PFR1_EL1,
+            addr: &mut value as *mut u64 as u64,
+        };
+        if libc::ioctl(vcpu.as_raw_fd(), KVM_GET_ONE_REG, &reg) != 0 {
+            return None;
+        }
+        Some(value)
+    }
 }
 
 /// Pull the HWCAP names out of `/proc/cpuinfo`'s `Features` line.
@@ -8451,6 +8531,20 @@ mod aarch64_feature_contract_tests {
         for name in ["FEAT_BF16", "FEAT_I8MM", "FEAT_SSBS", "FEAT_LSE"] {
             assert!(!is_masked_from_guest(name), "{name} must be kept");
         }
+    }
+
+    /// SSBS is `ID_AA64PFR1_EL1` bits 7:4; the bits either side (BT, MTE)
+    /// must not count.
+    #[test]
+    fn ssbs_is_read_from_its_id_register_field() {
+        use super::id_aa64pfr1_has_ssbs;
+        assert!(id_aa64pfr1_has_ssbs(0x10));
+        assert!(id_aa64pfr1_has_ssbs(0x20));
+        assert!(!id_aa64pfr1_has_ssbs(0x0));
+        assert!(
+            !id_aa64pfr1_has_ssbs(0x1 | 0x100),
+            "BT and MTE are not SSBS"
+        );
     }
 
     #[test]
