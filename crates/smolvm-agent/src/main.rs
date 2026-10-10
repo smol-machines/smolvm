@@ -6867,11 +6867,15 @@ fn handle_prepare_file_access(image: &str, workload_id: &str) -> AgentResponse {
             Vec::new(),
         )?;
         let prepared = storage::prepare_for_run_persistent(image, workload_id)?;
-        storage::setup_mounts(&prepared.rootfs_path, &[])?;
+        // Match normal exec: host-injected boot mounts (including the CUDA
+        // ring and workspace volume) must be present even after the previous
+        // keepalive died and file I/O is the first operation to recreate it.
+        let mounts = storage::merged_with_boot_mounts(&[]);
+        storage::setup_mounts(&prepared.rootfs_path, &mounts)?;
         ensure_main_container(
             &prepared.rootfs_path,
             Some(workload_id),
-            &[],
+            &mounts,
             false,
             &launch,
             &[],
