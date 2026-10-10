@@ -99,7 +99,7 @@ pub use launcher::{
     DiskOverlaySpec, LaunchConfig, LaunchFeatures, VmDisks,
 };
 pub(crate) use manager::cleanup_dead_vm_runtime_in_db;
-pub use manager::{apply_live_egress_policy, cleanup_dead_vm_runtime};
+pub use manager::{apply_live_egress_policy, apply_live_published_ports, cleanup_dead_vm_runtime};
 pub use manager::{
     disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
     prune_orphaned_ready_markers, read_egress_denials, read_egress_signals, read_egress_telemetry,

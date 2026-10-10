@@ -1483,6 +1483,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                     runtime.egress_counter(),
                                 );
                             }
+                            if let Some(dir) = vsock_socket.parent() {
+                                crate::network::launch::serve_ports_control(
+                                    runtime.published_ports(),
+                                    dir,
+                                );
+                            }
                             virtio_network_runtime = Some(runtime);
                         }
                     }

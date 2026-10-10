@@ -462,40 +462,55 @@ pub fn egress_denials_log_file(name: &str) -> PathBuf {
 /// control socket its network runtime serves. Returns once the runtime has the
 /// new list in force.
 pub fn apply_live_egress_policy(name: &str, record: &crate::config::VmRecord) -> Result<()> {
-    use std::io::{Read, Write};
-    let fail = |reason: String| {
-        Error::config(
-            "egress policy",
-            format!("could not change machine '{name}''s allow list while it runs: {reason}"),
-        )
-    };
-    let path = vm_data_dir(name).join(smolvm_network::EGRESS_SOCKET);
-    let mut stream =
-        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2)).map_err(
-            |e| {
-                fail(format!(
-                    "{e}; a machine started before live changes were supported needs a restart"
-                ))
-            },
-        )?;
     let rendered = smolvm_network::egress::render_live_policy(
         record.allowed_cidrs.as_deref().unwrap_or(&[]),
         record.dns_filter_hosts.as_deref().unwrap_or(&[]),
     );
+    send_live_change(name, smolvm_network::EGRESS_SOCKET, &rendered).map_err(|reason| {
+        Error::config(
+            "egress policy",
+            format!("could not change machine '{name}''s allow list while it runs: {reason}"),
+        )
+    })
+}
+
+/// Publish exactly `ports` on a running machine through the ports control
+/// socket its network runtime serves. Returns once the listeners match.
+pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()> {
+    let mappings: Vec<smolvm_network::PortMapping> = ports
+        .iter()
+        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
+        .collect();
+    let rendered = smolvm_network::render_port_mappings(&mappings);
+    send_live_change(name, smolvm_network::PORTS_SOCKET, &rendered).map_err(|reason| {
+        Error::config(
+            "published ports",
+            format!("could not change machine '{name}''s published ports while it runs: {reason}"),
+        )
+    })
+}
+
+fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    use std::io::{Read, Write};
+    let path = vm_data_dir(name).join(socket);
+    let mut stream =
+        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2)).map_err(
+            |e| {
+                format!("{e}; a machine started before live changes were supported needs a restart")
+            },
+        )?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .and_then(|()| stream.write_all(rendered.as_bytes()))
         .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
-        .map_err(|e| fail(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     let mut reply = String::new();
     stream
         .read_to_string(&mut reply)
-        .map_err(|e| fail(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     match reply.trim() {
         "ok" => Ok(()),
-        other => Err(fail(
-            other.strip_prefix("error: ").unwrap_or(other).to_string(),
-        )),
+        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
     }
 }
 

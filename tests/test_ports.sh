@@ -93,7 +93,65 @@ test_port_conflict_across_vms() {
 }
 
 
+test_machine_ports_change_while_running() {
+    local vm_name="test-vm-liveports"
+    local port=18210
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" -p 18209:9 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
+        return 1
+    }
+
+    local ok=true
+    $SMOLVM machine exec --name "$vm_name" -- \
+        sh -c 'echo -e "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlive" | nc -l -p 8080 -w 10' &
+    local server_pid=$!
+    sleep 1
+
+    if curl -s --connect-timeout 2 "http://127.0.0.1:$port/" >/dev/null 2>&1; then
+        echo "host port $port answered before it was published"
+        ok=false
+    fi
+    $SMOLVM machine update --name "$vm_name" -p "$port:8080" 2>&1 || ok=false
+    local output
+    output=$(curl -s --connect-timeout 5 "http://127.0.0.1:$port/" 2>&1)
+    [[ "$output" == "live" ]] || { echo "published port returned: $output"; ok=false; }
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+
+    local status
+    status=$($SMOLVM machine status --name "$vm_name" 2>&1)
+    [[ "$status" == *unning* ]] || { echo "machine stopped during the update: $status"; ok=false; }
+
+    $SMOLVM machine update --name "$vm_name" --remove-port "$port:8080" 2>&1 || ok=false
+    if curl -s --connect-timeout 2 "http://127.0.0.1:$port/" >/dev/null 2>&1; then
+        echo "host port $port still answered after it was removed"
+        ok=false
+    fi
+
+    $SMOLVM machine update --name "$vm_name" -p "$port:8080" 2>&1 || ok=false
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || ok=false
+    $SMOLVM machine start --name "$vm_name" 2>&1 || ok=false
+    $SMOLVM machine exec --name "$vm_name" -- \
+        sh -c 'echo -e "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nkept" | nc -l -p 8080 -w 10' &
+    server_pid=$!
+    sleep 1
+    output=$(curl -s --connect-timeout 5 "http://127.0.0.1:$port/" 2>&1)
+    [[ "$output" == "kept" ]] || { echo "port was not kept across a restart: $output"; ok=false; }
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    [[ "$ok" == true ]]
+}
+
 run_test "Port: range mappings reach distinct guest HTTP servers" test_machine_port_range_mapping_http || true
 run_test "Port: cross-VM conflict detected" test_port_conflict_across_vms || true
+run_test "Port: published ports change while the machine runs" test_machine_ports_change_while_running || true
 
 print_summary "Port Tests"

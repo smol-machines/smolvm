@@ -331,6 +331,30 @@ pub const EGRESS_DECISIONS_LOG: &str = "egress-decisions.jsonl";
 /// folder, so only the host can change a running machine's allow list.
 pub const EGRESS_SOCKET: &str = "egress.sock";
 
+pub const PORTS_SOCKET: &str = "ports.sock";
+
+pub fn render_port_mappings(mappings: &[PortMapping]) -> String {
+    mappings
+        .iter()
+        .map(|mapping| format!("{}:{}\n", mapping.host, mapping.guest))
+        .collect()
+}
+
+pub fn parse_port_mappings(text: &str) -> Result<Vec<PortMapping>, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_once(':')
+                .and_then(|(host, guest)| {
+                    Some(PortMapping::new(host.parse().ok()?, guest.parse().ok()?))
+                })
+                .filter(|mapping| mapping.host != 0 && mapping.guest != 0)
+                .ok_or_else(|| format!("invalid port mapping '{line}'"))
+        })
+        .collect()
+}
+
 /// Filename of the per-VM egress signal log: watchlist matches, recorded beside
 /// the denial log by the launcher and read back by the host's
 /// `read_egress_signals`. Created on the first match only.
@@ -436,8 +460,27 @@ pub(crate) use virtio_net_log;
 pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
     _frame_bridge: FrameStreamBridge,
-    published_ports: Option<TcpPortListeners>,
+    published_ports: PublishedPorts,
     poll_handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+pub struct PublishedPorts(std::sync::Arc<std::sync::Mutex<TcpPortListeners>>);
+
+impl PublishedPorts {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TcpPortListeners> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn mappings(&self) -> Vec<PortMapping> {
+        self.lock().mappings()
+    }
+
+    pub fn replace(&self, next: &[PortMapping]) -> io::Result<()> {
+        self.lock().replace(next)
+    }
 }
 
 /// Start the host-side virtio-net runtime for one guest NIC.
@@ -521,15 +564,8 @@ pub fn start_virtio_network(
     // tcp_sender sends the accepted TCP connections to the channel
     // tcp_receiver receives the accepted TCP connections via the channel, and let it be consumed in poll thread.
     let (tcp_sender, tcp_receiver) = create_tcp_channel();
-    let tcp_listeners = if published_ports.is_empty() {
-        None
-    } else {
-        Some(TcpPortListeners::start(
-            published_ports,
-            tcp_sender,
-            queues.relay_wake.clone(),
-        )?)
-    };
+    let tcp_listeners =
+        TcpPortListeners::start(published_ports, tcp_sender, queues.relay_wake.clone())?;
     let poll_handle = start_network_stack(
         queues.clone(),
         VirtioPollConfig {
@@ -545,7 +581,7 @@ pub fn start_virtio_network(
             intercept: guest_network.intercept,
             mtu: 1500,
         },
-        tcp_listeners.as_ref().map(|_| tcp_receiver),
+        Some(tcp_receiver),
         egress,
         fabric,
     )?;
@@ -553,7 +589,7 @@ pub fn start_virtio_network(
     Ok(VirtioNetworkRuntime {
         queues,
         _frame_bridge: frame_bridge,
-        published_ports: tcp_listeners,
+        published_ports: PublishedPorts(std::sync::Arc::new(std::sync::Mutex::new(tcp_listeners))),
         poll_handle: Some(poll_handle),
     })
 }
@@ -572,6 +608,10 @@ impl VirtioNetworkRuntime {
     /// VM's runtime dir for the node API to read (the runtime is not `Clone`).
     pub fn egress_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.queues.egress_counter()
+    }
+
+    pub fn published_ports(&self) -> PublishedPorts {
+        self.published_ports.clone()
     }
 
     /// Take ownership of the runtime and block until the libkrun stream closes
@@ -596,7 +636,7 @@ impl Drop for VirtioNetworkRuntime {
     /// here because the frame bridge joins its own threads in its own `Drop`.
     fn drop(&mut self) {
         self.queues.begin_shutdown();
-        self.published_ports = None;
+        self.published_ports.lock().close();
         if let Some(handle) = self.poll_handle.take() {
             let _ = handle.join();
         }
@@ -607,6 +647,18 @@ impl Drop for VirtioNetworkRuntime {
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn port_mappings_round_trip_through_the_control_format() {
+        let mappings = vec![PortMapping::new(3000, 3000), PortMapping::new(8080, 80)];
+        let rendered = render_port_mappings(&mappings);
+        assert_eq!(rendered, "3000:3000\n8080:80\n");
+        assert_eq!(parse_port_mappings(&rendered).unwrap(), mappings);
+        assert!(parse_port_mappings("").unwrap().is_empty());
+        for bad in ["3000", "a:1", "0:80", "80:0", "70000:80"] {
+            assert!(parse_port_mappings(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn formats_timestamped_network_log_prefix() {
