@@ -239,10 +239,14 @@ pub fn cidrs_all_loopback(cidrs: &[String]) -> bool {
 /// intentionally blocks all external traffic, so auto-adding the DNS server
 /// would violate the user's intent (e.g. `--outbound-localhost-only`).
 pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
+    ensure_resolver_in_cidrs(cidrs, host_dns());
+}
+
+/// [`ensure_dns_in_cidrs`] for a given resolver rather than the host's.
+fn ensure_resolver_in_cidrs(cidrs: &mut Vec<String>, dns: IpAddr) {
     if cidrs_all_loopback(cidrs) {
         return;
     }
-    let dns = host_dns();
     if !cidrs_contain_ip(cidrs, &dns.to_string()) {
         cidrs.push(IpNet::from(dns).to_string());
     }
@@ -571,44 +575,44 @@ mod tests {
         assert!(!cidrs_contain_ip(&["not-a-cidr".into()], "1.1.1.1"));
     }
 
+    // The ensure-DNS tests pin the resolver: the host's own one can sit inside
+    // any range a test picks (a 10.x resolver is inside 10.0.0.0/8).
+    const RESOLVER: &str = "192.0.2.53";
+
+    fn resolver() -> IpAddr {
+        RESOLVER.parse().unwrap()
+    }
+
     #[test]
     fn test_ensure_dns_adds_when_missing() {
-        let dns_cidr = IpNet::from(host_dns()).to_string();
         let mut cidrs = vec!["10.0.0.0/8".to_string()];
-        ensure_dns_in_cidrs(&mut cidrs);
-        assert_eq!(cidrs.len(), 2);
-        assert!(cidrs.contains(&dns_cidr));
+        ensure_resolver_in_cidrs(&mut cidrs, resolver());
+        assert_eq!(cidrs, ["10.0.0.0/8", "192.0.2.53/32"]);
     }
 
     #[test]
     fn test_ensure_dns_skips_when_covered_by_subnet() {
-        // Build a subnet that actually covers the detected DNS server.
-        let dns = host_dns();
-        let covering_cidr = match dns {
-            IpAddr::V4(v4) => format!("{}.0.0.0/8", v4.octets()[0]),
-            IpAddr::V6(v6) => {
-                // Use a /16 covering the detected IPv6 address.
-                let segs = v6.segments();
-                format!("{:x}::/16", segs[0])
-            }
-        };
-        let mut cidrs = vec![covering_cidr];
-        ensure_dns_in_cidrs(&mut cidrs);
-        assert_eq!(cidrs.len(), 1);
+        let mut cidrs = vec!["192.0.2.0/24".to_string()];
+        ensure_resolver_in_cidrs(&mut cidrs, resolver());
+        assert_eq!(cidrs, ["192.0.2.0/24"]);
+
+        // A resolver inside a policy range is already reachable.
+        let mut cidrs = vec!["10.0.0.0/8".to_string()];
+        ensure_resolver_in_cidrs(&mut cidrs, "10.0.0.1".parse().unwrap());
+        assert_eq!(cidrs, ["10.0.0.0/8"]);
     }
 
     #[test]
     fn test_ensure_dns_skips_when_exact_match() {
-        let dns_cidr = IpNet::from(host_dns()).to_string();
-        let mut cidrs = vec!["10.0.0.0/8".to_string(), dns_cidr];
-        ensure_dns_in_cidrs(&mut cidrs);
+        let mut cidrs = vec!["10.0.0.0/8".to_string(), "192.0.2.53/32".to_string()];
+        ensure_resolver_in_cidrs(&mut cidrs, resolver());
         assert_eq!(cidrs.len(), 2);
     }
 
     #[test]
     fn test_ensure_dns_skips_for_loopback_only_policy() {
         let mut cidrs = vec!["127.0.0.0/8".to_string(), "::1/128".to_string()];
-        ensure_dns_in_cidrs(&mut cidrs);
+        ensure_resolver_in_cidrs(&mut cidrs, resolver());
         assert_eq!(
             cidrs.len(),
             2,
@@ -618,11 +622,20 @@ mod tests {
 
     #[test]
     fn test_ensure_dns_adds_when_non_loopback_cidr_present() {
-        let dns_cidr = IpNet::from(host_dns()).to_string();
         let mut cidrs = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
+        ensure_resolver_in_cidrs(&mut cidrs, resolver());
+        assert_eq!(cidrs, ["127.0.0.0/8", "10.0.0.0/8", "192.0.2.53/32"]);
+    }
+
+    #[test]
+    fn test_ensure_dns_uses_the_host_resolver() {
+        let dns_cidr = IpNet::from(host_dns()).to_string();
+        let mut cidrs = vec!["127.0.0.0/8".to_string(), "198.51.100.0/24".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
-        assert_eq!(cidrs.len(), 3);
-        assert!(cidrs.contains(&dns_cidr));
+        assert!(
+            cidrs_contain_ip(&cidrs, &host_dns().to_string()),
+            "{cidrs:?} lacks {dns_cidr}"
+        );
     }
 
     #[test]
