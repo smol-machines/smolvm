@@ -538,8 +538,8 @@ smolvm machine stop --name r-sandbox
   mid-stream, the staging file is cleaned up and the original
   destination (if any) is unaffected.
 
-Typical throughput on macOS (Apple Silicon): ~35-42 MB/s upload,
-~170 MB/s download.
+Typical throughput on macOS (Apple Silicon): ~150 MB/s upload,
+~180 MB/s download (see `bench/core`).
 
 ## Streaming Exec
 
