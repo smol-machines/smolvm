@@ -831,11 +831,13 @@ impl VmRecord {
 
     /// Whether an ordinary start should launch this machine as a fork base.
     ///
-    /// The pool check preserves the behavior of records created before the
-    /// explicit `forkable` field existed. Fork clones inherit CUDA capacity
-    /// settings from their golden, but remain non-forkable leaves.
+    /// Every machine is branchable: its RAM is a file, so it can be branched,
+    /// and a checkpoint snapshots that file copy-on-write instead of writing
+    /// RAM out while the machine is paused. Fork clones are the exception:
+    /// they stay non-forkable leaves unless asked, since a forkable clone keeps
+    /// a private copy of the RAM it would otherwise share with its golden.
     pub fn forkable_on_start(&self) -> bool {
-        self.forkable || (self.golden.is_none() && self.cuda_fork_pool_size.is_some())
+        self.forkable || self.golden.is_none()
     }
 
     /// Create a new VM record.
@@ -2198,7 +2200,25 @@ mod tests {
         assert_eq!(legacy.cuda_fork_pool_size, None);
         assert_eq!(legacy.cuda_vram_limit_mib, None);
         assert!(!legacy.cuda_preload_modules);
-        assert!(!legacy.forkable_on_start());
+        assert!(
+            legacy.forkable_on_start(),
+            "a machine that is not a clone starts branchable"
+        );
+    }
+
+    #[test]
+    fn every_machine_but_a_clone_starts_branchable() {
+        let plain = VmRecord::new("plain".to_string(), 2, 1024, vec![], vec![], false);
+        assert!(plain.forkable_on_start());
+
+        let mut clone = plain.clone();
+        clone.golden = Some("plain".to_string());
+        assert!(!clone.forkable_on_start(), "a clone stays a leaf");
+        clone.forkable = true;
+        assert!(
+            clone.forkable_on_start(),
+            "unless it is asked to branch again"
+        );
     }
 
     #[test]

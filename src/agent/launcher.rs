@@ -1922,20 +1922,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // process-level CPU idleness the balloon is pulsed so an idle guest's
         // page cache is evicted and handed back to the host.
         // SMOLVM_IDLE_RECLAIM=<minutes> tunes the window; `0` or `off`
-        // disables. A branch source is excluded because its RAM is the stable
-        // image for later descendants (and it may be frozen at a branchpoint).
-        // A non-branchable leaf is safe: its MAP_PRIVATE pages are disposable
-        // once the guest balloon surrenders them, while the shared generation
-        // remains unchanged for its source and siblings.
-        let reclaim_role = idle_reclaim_role(
-            std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1"),
-            std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
-        );
-        if let (Some(ctl), Some(idle_min), true) = (
-            ctl_path.clone(),
-            idle_reclaim_minutes(),
-            reclaim_role.can_reclaim(),
-        ) {
+        // disables. Every machine takes part. A branch source's RAM is a file
+        // its VMM releases pages from only while no clone maps it: branch
+        // generations are separate copies, and a frozen golden is paused, so
+        // it reports nothing. A leaf's MAP_PRIVATE pages are disposable.
+        if let (Some(ctl), Some(idle_min)) = (ctl_path.clone(), idle_reclaim_minutes()) {
             spawn_idle_reclaim(ctl, resources.memory_mib, idle_min);
         }
 
@@ -2670,29 +2661,6 @@ fn raise_fd_limits() {
 pub(crate) const IDLE_RECLAIM_DEFAULT_MINUTES: u64 = 10;
 const IDLE_RECLAIM_RSS_REARM_GROWTH: u64 = 64 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IdleReclaimRole {
-    Ordinary,
-    BranchLeaf,
-    BranchSource,
-}
-
-impl IdleReclaimRole {
-    fn can_reclaim(self) -> bool {
-        matches!(self, Self::Ordinary | Self::BranchLeaf)
-    }
-}
-
-fn idle_reclaim_role(branchable: bool, restored_branch: bool) -> IdleReclaimRole {
-    if branchable {
-        IdleReclaimRole::BranchSource
-    } else if restored_branch {
-        IdleReclaimRole::BranchLeaf
-    } else {
-        IdleReclaimRole::Ordinary
-    }
-}
-
 fn idle_reclaim_rss_refilled(baseline: Option<u64>, current: Option<u64>) -> bool {
     baseline.zip(current).is_some_and(|(baseline, current)| {
         current.saturating_sub(baseline) >= IDLE_RECLAIM_RSS_REARM_GROWTH
@@ -3024,14 +2992,6 @@ mod tests {
             block_io_error("storage", BlockIoEngine::Async, -libc::EPERM)
                 .contains("use --block-io sync")
         );
-    }
-
-    #[test]
-    fn idle_reclaim_includes_leaf_branches_but_not_future_sources() {
-        assert!(idle_reclaim_role(false, false).can_reclaim());
-        assert!(idle_reclaim_role(false, true).can_reclaim());
-        assert!(!idle_reclaim_role(true, false).can_reclaim());
-        assert!(!idle_reclaim_role(true, true).can_reclaim());
     }
 
     #[test]
