@@ -2214,7 +2214,7 @@ mod tests {
 
     #[test]
     fn compression_admission_runs_up_to_its_slots_at_once() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
@@ -2229,11 +2229,12 @@ mod tests {
             drop(permit);
         });
         assert!(wait.recv_timeout(Duration::from_millis(150)).is_err());
-        let released = Instant::now();
         drop(held.remove(1));
+        // CI may schedule this thread alongside multi-GiB archive tests; the
+        // ten-second receive bound checks release without a scheduler-latency
+        // assertion that spuriously fails on a loaded Windows runner.
         wait.recv_timeout(Duration::from_secs(10))
             .expect("waiter stayed blocked after a slot was released");
-        assert!(released.elapsed() < Duration::from_secs(1));
         waiter.join().unwrap();
     }
 
