@@ -3238,17 +3238,23 @@ impl AgentManager {
             || process::is_our_process_strict(pid, start_time)
             || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
 
-        if identity_ok {
+        let exit_confirmed = if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
                     "PID start-time not verified, identity confirmed via vsock"
                 );
             }
-            let _ = process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT);
-        }
+            // The stop helper observes the kernel's exit event or reaps our
+            // child. On macOS kill(pid, 0) can still see an exited child until
+            // it is reaped, so a second liveness probe must not override that
+            // confirmed exit (or mistake a recycled PID for this VM).
+            process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT).is_ok()
+        } else {
+            false
+        };
 
-        if process::is_alive(pid) {
+        if !exit_confirmed && process::is_alive(pid) {
             if !identity_ok {
                 // Kill was skipped (no vsock ack, start-time unverifiable) AND the
                 // process is genuinely still alive — a real orphan/leak risk.

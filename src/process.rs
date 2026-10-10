@@ -3269,7 +3269,18 @@ pub fn stop_vm_process(
 
     // Phase 1: SIGTERM + poll
     if !terminate(pid) {
-        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+        // A failed signal is not evidence of exit: EPERM leaves the VMM alive.
+        // Only return success when the child has exited or the PID is gone.
+        if let Some(code) = try_wait(pid) {
+            return Ok(code);
+        }
+        if !is_alive(pid) {
+            return Ok(UNKNOWN_EXIT_CODE);
+        }
+        return Err(Error::agent(
+            "stop vm process",
+            format!("process {pid} is still alive after SIGTERM failed"),
+        ));
     }
 
     if let Some(code) = poll_for_exit(pid, sigterm_timeout) {
