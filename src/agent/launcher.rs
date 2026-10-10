@@ -2858,7 +2858,8 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                 return None;
             }
             // FILETIME counts 100 ns intervals.
-            let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+            let ticks =
+                |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
             Some(Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
         }
         #[cfg(not(any(unix, windows)))]
