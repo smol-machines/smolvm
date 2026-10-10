@@ -24,6 +24,12 @@ pub fn sync_staged_mounts(record: &VmRecord, client: &mut AgentClient) -> Result
 /// Synchronize staged mounts from a launch configuration that has not yet been
 /// persisted as a named machine (the foreground `machine run` path).
 pub fn sync_mounts(mounts: &[HostMount], client: &mut AgentClient) -> Result<()> {
+    if !mounts.iter().any(|mount| mount.staged) {
+        return Ok(());
+    }
+    // A staged working copy is mounted at its target in the VM's own
+    // namespace, also when an image workload is running, so it is read there.
+    client.use_target(crate::agent::WorkloadTarget::Vm)?;
     for mount in mounts {
         if !mount.staged {
             continue;

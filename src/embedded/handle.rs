@@ -1,7 +1,5 @@
 //! Runtime VM handle for embedded SDK backends.
 
-use std::time::Duration;
-
 use crate::agent::{AgentClient, AgentManager, RunConfig};
 use crate::config::VmRecord;
 use crate::Result;
@@ -58,32 +56,10 @@ impl VmHandle {
         self.client_mut()?.run_non_interactive(config)
     }
 
-    /// Pull an OCI image and run a command inside it.
-    ///
-    /// Returns `(exit_code, stdout_bytes, stderr_bytes)`. Bytes are raw
-    /// to preserve binary output.
-    pub fn run(
-        &mut self,
-        image: &str,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        timeout: Option<Duration>,
-    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        // Reuse the machine's persistent overlay, exactly as the streaming sibling
-        // and the CLI do. Without it every call builds a fresh container overlay:
-        // filesystem changes from one call are invisible to the next, and the
-        // rebuild dominates the call — measured at ~2.1s per exec against ~12ms
-        // once the overlay is reused.
-        let name = self.manager.name().map(str::to_string);
-        let client = self.client_mut()?;
-        client.pull_with_registry_config(image)?;
-        let config = RunConfig::new(image, command)
-            .with_env(env)
-            .with_workdir(workdir)
-            .with_timeout(timeout)
-            .with_persistent_overlay(name);
-        client.run_non_interactive(config)
+    /// Point this connection's file operations at `target`; see
+    /// [`AgentClient::use_target`].
+    pub fn use_target(&mut self, target: crate::agent::WorkloadTarget) -> Result<()> {
+        self.client_mut()?.use_target(target)
     }
 
     /// Pull an OCI image into the VM storage.

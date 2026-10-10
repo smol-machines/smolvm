@@ -6773,20 +6773,15 @@ impl CpCmd {
         // Detach so the VM keeps running after cp exits.
         manager.detach();
 
-        // For image-based VMs, ensure the persistent container overlay is
-        // mounted so cp targets the container filesystem (not the VM rootfs).
-        // prepare_overlay is idempotent: reuses if mounted, remounts if upper
-        // exists, creates fresh otherwise.
-        if let Some(record) = smolvm::db::SmolvmDb::open()
+        // Copy into the filesystem the machine's commands run in: an image
+        // machine's container overlay, or a bare machine's own root.
+        let target = smolvm::db::SmolvmDb::open()
             .ok()
             .and_then(|db| db.get_vm(&machine_name).ok().flatten())
-        {
-            if let Some(image) = record.image.as_ref() {
-                let owner = persistent_overlay_owner_for_record(&machine_name, Some(&record));
-                let overlay_id = format!("persistent-{owner}");
-                client.prepare_overlay(image, &overlay_id)?;
-            }
-        }
+            .map_or(smolvm::agent::WorkloadTarget::Vm, |record| {
+                smolvm::workload::machine_target(&record)
+            });
+        client.use_target(target)?;
 
         if is_upload {
             let meta = smolvm::agent::FileWriteMeta {

@@ -8,10 +8,11 @@ use crate::platform::uds::UdsStream;
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
+pub use smolvm_protocol::WorkloadTarget;
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, Envelope, FsNotifyEvent, ImageInfo, MemoryStatus,
     OverlayInfo, StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE,
-    FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE, PROTOCOL_VERSION, WORKLOAD_TARGET_CAPABILITY,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -1085,6 +1086,10 @@ pub struct AgentClient {
     stream: UdsStream,
     /// Trace ID for correlating this client session's requests with host API calls.
     trace_id: Option<String>,
+    /// Filesystem this connection's file requests act on; see [`Self::use_target`].
+    file_target: Option<WorkloadTarget>,
+    /// The agent's advertised capabilities, read once per connection.
+    capabilities: Option<Vec<String>>,
 }
 
 fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
@@ -1105,6 +1110,17 @@ fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> 
 // Response match helpers
 // ============================================================================
 
+/// The host error for an agent error response: codes a caller can act on map
+/// to their kind; the rest stay generic agent errors.
+fn agent_error(op: &str, message: String, code: Option<&str>) -> Error {
+    match code {
+        Some(smolvm_protocol::error_codes::OVERLAY_IMAGE_CONFLICT) => {
+            Error::agent_conflict(op, message)
+        }
+        _ => Error::agent(op, message),
+    }
+}
+
 /// Extract typed data from an `Ok` response.
 fn expect_data<T: serde::de::DeserializeOwned>(resp: AgentResponse, op: &str) -> Result<T> {
     match resp {
@@ -1113,7 +1129,7 @@ fn expect_data<T: serde::de::DeserializeOwned>(resp: AgentResponse, op: &str) ->
         } => {
             serde_json::from_value(data).map_err(|e| Error::agent("parse response", e.to_string()))
         }
-        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
+        AgentResponse::Error { message, code } => Err(agent_error(op, message, code.as_deref())),
         _ => Err(Error::agent(op, "unexpected response type")),
     }
 }
@@ -1190,7 +1206,7 @@ fn branchpoint_outcome<T>(
 fn expect_ok(resp: AgentResponse, op: &str) -> Result<()> {
     match resp {
         AgentResponse::Ok { .. } => Ok(()),
-        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
+        AgentResponse::Error { message, code } => Err(agent_error(op, message, code.as_deref())),
         _ => Err(Error::agent(op, "unexpected response type")),
     }
 }
@@ -1203,7 +1219,7 @@ fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, Vec<u8>, Vec<
             stdout,
             stderr,
         } => Ok((exit_code, stdout, stderr)),
-        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
+        AgentResponse::Error { message, code } => Err(agent_error(op, message, code.as_deref())),
         _ => Err(Error::agent(op, "unexpected response type")),
     }
 }
@@ -1239,6 +1255,8 @@ impl AgentClient {
         Self {
             stream,
             trace_id: None,
+            file_target: None,
+            capabilities: None,
         }
     }
 }
@@ -1354,6 +1372,8 @@ impl AgentClient {
         Ok(Self {
             stream,
             trace_id: None,
+            file_target: None,
+            capabilities: None,
         })
     }
 
@@ -1408,7 +1428,9 @@ impl AgentClient {
                 }
                 Ok((version, capabilities))
             }
-            AgentResponse::Error { message, .. } => Err(Error::agent("ping", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("ping", message, code.as_deref()))
+            }
             _ => Err(Error::agent("ping", "unexpected response type")),
         }
     }
@@ -1422,12 +1444,87 @@ impl AgentClient {
     }
 
     /// Return whether the live guest agent advertises an optional feature.
+    /// An agent's capabilities are fixed for its lifetime, so they are read
+    /// once per connection.
     pub fn supports_capability(&mut self, capability: &str) -> Result<bool> {
-        self.ping_info().map(|(_, capabilities)| {
-            capabilities
-                .iter()
-                .any(|advertised| advertised == capability)
-        })
+        if self.capabilities.is_none() {
+            self.capabilities = Some(self.ping_info()?.1);
+        }
+        Ok(self
+            .capabilities
+            .iter()
+            .flatten()
+            .any(|advertised| advertised == capability))
+    }
+
+    /// Point this connection's file requests (read, write, list, archive) at
+    /// `target`, so they see exactly the filesystem an `exec` with the same
+    /// target sees. A container target's image is pulled first if missing.
+    ///
+    /// An agent that predates [`WORKLOAD_TARGET_CAPABILITY`] infers the
+    /// filesystem itself from what is mounted and running, so for a container
+    /// target this makes that overlay the one it infers, as hosts did before
+    /// targets existed.
+    pub fn use_target(&mut self, target: WorkloadTarget) -> Result<()> {
+        if let WorkloadTarget::Container { image, .. } = &target {
+            if self.query(image)?.is_none() {
+                self.pull_with_registry_config(image)?;
+            }
+        }
+        if self.supports_capability(WORKLOAD_TARGET_CAPABILITY)? {
+            self.file_target = Some(target);
+            return Ok(());
+        }
+        self.file_target = None;
+        let WorkloadTarget::Container { image, overlay_id } = target else {
+            // Older agents infer the destination of a file operation from
+            // mounted overlays. On a bare VM, a prior run(image) can leave one
+            // mounted, so an unqualified write would silently land in that
+            // container instead of the VM where exec reads it. Permit the
+            // legacy path only when there is no persistent overlay to infer.
+            let (code, _, stderr) = self.vm_exec(
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    r#"for root in /storage/overlays/persistent-*/merged; do
+                         if [ -d "$root/bin" ] || [ -d "$root/usr" ]; then exit 1; fi
+                       done"#
+                        .into(),
+                ],
+                Vec::new(),
+                None,
+                Some(Duration::from_secs(10)),
+                None,
+            )?;
+            return match code {
+                0 => Ok(()),
+                1 => Err(Error::agent(
+                    "select VM filesystem",
+                    "this guest agent cannot target bare VM files after an image run; upgrade the guest agent and restart the machine",
+                )),
+                _ => Err(Error::agent(
+                    "select VM filesystem",
+                    format!(
+                        "could not verify the filesystem for this older guest agent (exit {code}): {}",
+                        String::from_utf8_lossy(&stderr).trim()
+                    ),
+                )),
+            };
+        };
+        let (code, _, stderr) = self.run_non_interactive(
+            RunConfig::new(image, vec!["/bin/true".to_string()])
+                .with_persistent_overlay(Some(overlay_id)),
+        )?;
+        if code != 0 {
+            return Err(Error::agent(
+                "activate image overlay",
+                format!(
+                    "container probe exited {code}: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Replay host-originated filesystem changes into the guest as fsnotify
@@ -1440,7 +1537,9 @@ impl AgentClient {
         }
         match self.request(&AgentRequest::FsNotify { events })? {
             AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::agent("fsnotify", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("fsnotify", message, code.as_deref()))
+            }
             _ => Err(Error::agent("fsnotify", "unexpected response type")),
         }
     }
@@ -1653,7 +1752,9 @@ impl AgentClient {
                 Ok(Some(info))
             }
             AgentResponse::Error { code, .. } if code.as_deref() == Some("NOT_FOUND") => Ok(None),
-            AgentResponse::Error { message, .. } => Err(Error::agent("query image", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("query image", message, code.as_deref()))
+            }
             _ => Err(Error::agent("query image", "unexpected response type")),
         }
     }
@@ -1678,7 +1779,9 @@ impl AgentClient {
                 let freed = data["freed_bytes"].as_u64().unwrap_or(0);
                 Ok(freed)
             }
-            AgentResponse::Error { message, .. } => Err(Error::agent("garbage collect", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("garbage collect", message, code.as_deref()))
+            }
             _ => Err(Error::agent("garbage collect", "unexpected response type")),
         }
     }
@@ -1852,6 +1955,7 @@ impl AgentClient {
     pub fn list_directory(&mut self, path: &str) -> Result<Vec<smolvm_protocol::DirectoryEntry>> {
         let resp = self.request(&AgentRequest::ListDirectory {
             path: path.to_string(),
+            target: self.file_target.clone(),
         })?;
         #[derive(serde::Deserialize)]
         struct Listing {
@@ -1899,7 +2003,9 @@ impl AgentClient {
                     String::from_utf8_lossy(&stderr)
                 ),
             )),
-            AgentResponse::Error { message, .. } => Err(Error::agent("grow filesystem", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("grow filesystem", message, code.as_deref()))
+            }
             _ => Err(Error::agent("grow filesystem", "unexpected response type")),
         }
     }
@@ -1921,7 +2027,9 @@ impl AgentClient {
             {
                 Ok(())
             }
-            AgentResponse::Error { message, .. } => Err(Error::agent("online CPUs", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("online CPUs", message, code.as_deref()))
+            }
             _ => Err(Error::agent(
                 "online CPUs",
                 "guest did not verify the requested CPU count",
@@ -1946,7 +2054,9 @@ impl AgentClient {
             {
                 Ok(())
             }
-            AgentResponse::Error { message, .. } => Err(Error::agent("offline CPUs", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("offline CPUs", message, code.as_deref()))
+            }
             _ => Err(Error::agent(
                 "offline CPUs",
                 "guest did not verify the requested CPU count",
@@ -1977,7 +2087,9 @@ impl AgentClient {
             {
                 Ok(())
             }
-            AgentResponse::Error { message, .. } => Err(Error::agent("online RAM", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("online RAM", message, code.as_deref()))
+            }
             _ => Err(Error::agent(
                 "online RAM",
                 "guest did not verify the requested RAM range",
@@ -2003,7 +2115,9 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Ok { data: Some(data) } => Ok(data),
-            AgentResponse::Error { message, .. } => Err(Error::agent("network test", message)),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("network test", message, code.as_deref()))
+            }
             _ => Err(Error::agent("network test", "unexpected response type")),
         }
     }
@@ -2908,6 +3022,7 @@ impl AgentClient {
                     mode: meta.mode,
                     uid: meta.uid,
                     gid: meta.gid,
+                    target: self.file_target.clone(),
                 },
                 Duration::from_secs(FILE_WRITE_IDLE_TIMEOUT_SECS),
             )?;
@@ -3008,6 +3123,7 @@ impl AgentClient {
                 uid: meta.uid,
                 gid: meta.gid,
                 total_size,
+                target: self.file_target.clone(),
             },
             transfer_write_timeout,
         )?;
@@ -3093,6 +3209,7 @@ impl AgentClient {
         let _timeout_guard = self.set_extended_read_timeout(FILE_READ_TIMEOUT)?;
         self.send_raw(&AgentRequest::FileRead {
             path: path.to_string(),
+            target: self.file_target.clone(),
         })?;
 
         consume_streamed_read_with_progress(|| self.recv_raw(), on_progress)
@@ -3134,6 +3251,7 @@ impl AgentClient {
         let _timeout_guard = self.set_extended_read_timeout(FILE_READ_TIMEOUT)?;
         self.send_raw(&AgentRequest::FileRead {
             path: guest_path.to_string(),
+            target: self.file_target.clone(),
         })?;
         self.receive_stream_to_path(local_path, cap, on_progress, "read file")
     }
@@ -3151,6 +3269,7 @@ impl AgentClient {
         let _timeout_guard = self.set_extended_read_timeout(ARCHIVE_READ_TIMEOUT)?;
         self.send_raw(&AgentRequest::ArchiveDirectory {
             path: guest_path.to_string(),
+            target: self.file_target.clone(),
         })?;
         self.receive_stream_to_path(
             local_path,

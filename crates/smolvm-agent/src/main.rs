@@ -10,7 +10,7 @@
 
 use smolvm_protocol::{
     error_codes, guest_env, ports, AgentRequest, AgentResponse, Envelope, FsNotifyEvent,
-    RegistryAuth, AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
+    RegistryAuth, WorkloadTarget, AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -93,6 +93,7 @@ mod disk_trim;
 mod dns_proxy;
 mod docker_bridge;
 mod forkpoint;
+mod io_target;
 mod network;
 mod nsfile;
 mod oci;
@@ -2244,13 +2245,21 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         // Handle FileRead with chunked streaming (replaces the old
         // single-shot FileData path that capped files at ~16 MiB).
-        if let AgentRequest::FileRead { ref path } = request {
-            handle_streaming_file_read(stream, path)?;
+        if let AgentRequest::FileRead {
+            ref path,
+            ref target,
+        } = request
+        {
+            handle_streaming_file_read(stream, path, target.as_ref())?;
             continue;
         }
 
-        if let AgentRequest::ArchiveDirectory { ref path } = request {
-            handle_streaming_archive_directory(stream, path)?;
+        if let AgentRequest::ArchiveDirectory {
+            ref path,
+            ref target,
+        } = request
+        {
+            handle_streaming_archive_directory(stream, path, target.as_ref())?;
             continue;
         }
 
@@ -2272,13 +2281,15 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             uid,
             gid,
             total_size,
+            target,
         } = request
         {
             // Drop any leftover session now (Drop cleans its tmp file) before
             // starting a new one. `take()` makes the drop explicit and keeps the
             // value from looking like a dead store.
             let _ = write_session.take();
-            let (new_session, response) = handle_file_write_begin(path, mode, uid, gid, total_size);
+            let (new_session, response) =
+                handle_file_write_begin(path, mode, uid, gid, total_size, target.as_ref());
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
@@ -2368,6 +2379,7 @@ fn handle_request(
         AgentRequest::Ping => {
             let mut capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
+                smolvm_protocol::WORKLOAD_TARGET_CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_string(),
@@ -2406,7 +2418,9 @@ fn handle_request(
 
         AgentRequest::FormatStorage => handle_format_storage(),
 
-        AgentRequest::ListDirectory { path } => handle_list_directory(&path),
+        AgentRequest::ListDirectory { path, target } => {
+            handle_list_directory(&path, target.as_ref())
+        }
 
         AgentRequest::StorageStatus => handle_storage_status(),
         AgentRequest::OnlineCpus { target_count } => {
@@ -2659,7 +2673,8 @@ fn handle_request(
             mode,
             uid,
             gid,
-        } => handle_file_write(&path, &data, mode, uid, gid),
+            target,
+        } => handle_file_write(&path, &data, mode, uid, gid, target.as_ref()),
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
@@ -2942,16 +2957,17 @@ fn resolve_guest_io_path_with_roots(
 
 /// Resolve guest file I/O path with strict boundary checks.
 ///
-/// For image-based persistent VMs, paths are mapped into the active
-/// `persistent-*` overlay's `merged` root (except `/workspace`, which
-/// maps to `/storage/workspace`, the bind-mount source). Both read and
+/// For a container target, paths are mapped into its persistent overlay's
+/// `merged` root (except `/workspace`, which maps to `/storage/workspace`,
+/// the bind-mount source); a VM target uses plain VM paths. Both read and
 /// write flows enforce canonicalized descendant checks against the
 /// selected root to prevent traversal and symlink escapes.
 fn resolve_guest_io_path(
     path: &str,
     access: FilePathAccess,
+    root: &io_target::IoRoot,
 ) -> std::result::Result<std::path::PathBuf, AgentResponse> {
-    let overlay = active_persistent_overlay_merged_root();
+    let overlay = root.overlay_merged_root();
     resolve_guest_io_path_with_roots(
         path,
         access,
@@ -2970,8 +2986,9 @@ fn install_file_atomic(
     mode: Option<u32>,
     uid: Option<u32>,
     gid: Option<u32>,
+    root: &io_target::IoRoot,
 ) -> AgentResponse {
-    let resolved = match resolve_guest_io_path(path, FilePathAccess::Write) {
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Write, root) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -3045,8 +3062,13 @@ fn handle_file_write(
     mode: Option<u32>,
     uid: Option<u32>,
     gid: Option<u32>,
+    target: Option<&WorkloadTarget>,
 ) -> AgentResponse {
-    match nsfile::GuestNs::for_workload() {
+    let root = match io_target::IoRoot::resolve(target) {
+        Ok(root) => root,
+        Err(response) => return response,
+    };
+    match root.namespace() {
         nsfile::GuestNs::Container(ns) => match ns.write(path, data, mode, uid, gid) {
             Ok(()) => AgentResponse::Ok { data: None },
             Err(e) => AgentResponse::error(
@@ -3057,7 +3079,7 @@ fn handle_file_write(
         // Seeding the VM's own namespace, which `install_file_atomic` maps into
         // the machine's overlay. Correct with no workload running, and a
         // deliberate branch rather than a fallthrough.
-        nsfile::GuestNs::Root(_) => install_file_atomic(path, data, mode, uid, gid),
+        nsfile::GuestNs::Root(_) => install_file_atomic(path, data, mode, uid, gid, &root),
     }
 }
 
@@ -3086,6 +3108,8 @@ struct WriteSession {
     /// Caller-declared total; the agent refuses chunks that would
     /// push `bytes_written` past it.
     total_size: u64,
+    /// Filesystem the upload targets; decides the namespace at finalize.
+    root: io_target::IoRoot,
 }
 
 impl WriteSession {
@@ -3096,6 +3120,7 @@ impl WriteSession {
         uid: Option<u32>,
         gid: Option<u32>,
         total_size: u64,
+        root: io_target::IoRoot,
     ) -> std::io::Result<Self> {
         if let Some(parent) = target.parent() {
             if !parent.as_os_str().is_empty() {
@@ -3130,6 +3155,7 @@ impl WriteSession {
             gid,
             bytes_written: 0,
             total_size,
+            root,
         })
     }
 
@@ -3198,7 +3224,7 @@ impl WriteSession {
         // streaming twin). The staged bytes are piped, never re-buffered.
         match std::fs::File::open(&self.tmp_path) {
             Ok(mut staged) => {
-                if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+                if let nsfile::GuestNs::Container(ns) = self.root.namespace() {
                     // Session Drop still cleans the staging file.
                     return match ns.write_reader(
                         &self.target.to_string_lossy(),
@@ -3284,6 +3310,7 @@ fn handle_file_write_begin(
     uid: Option<u32>,
     gid: Option<u32>,
     total_size: u64,
+    target: Option<&WorkloadTarget>,
 ) -> (Option<WriteSession>, AgentResponse) {
     if total_size > smolvm_protocol::FILE_TRANSFER_MAX_TOTAL {
         return (
@@ -3298,11 +3325,15 @@ fn handle_file_write_begin(
             ),
         );
     }
-    let resolved = match resolve_guest_io_path(&path, FilePathAccess::Write) {
+    let root = match io_target::IoRoot::resolve(target) {
+        Ok(root) => root,
+        Err(resp) => return (None, resp),
+    };
+    let resolved = match resolve_guest_io_path(&path, FilePathAccess::Write, &root) {
         Ok(p) => p,
         Err(resp) => return (None, resp),
     };
-    match WriteSession::open(resolved, mode, uid, gid, total_size) {
+    match WriteSession::open(resolved, mode, uid, gid, total_size, root) {
         Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
         Err(e) => (
             None,
@@ -3431,13 +3462,21 @@ fn send_data_chunks_body<R: Read>(
 fn handle_streaming_file_read(
     stream: &mut impl ReadWrite,
     path: &str,
+    target: Option<&WorkloadTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let root = match io_target::IoRoot::resolve(target) {
+        Ok(root) => root,
+        Err(response) => {
+            send_response(stream, &response)?;
+            return Ok(());
+        }
+    };
     // Read from the workload container when one is running, mirroring the write
     // side. Reading here — in the agent's namespace — sees the overlay's upper
     // layer, so a file the container itself created came back 404 (BUG-240).
     // Both directions must move together: fixing only writes would break the
     // upload-then-download round trip, which is self-consistent today.
-    if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+    if let nsfile::GuestNs::Container(ns) = root.namespace() {
         match ns.open(path) {
             Ok(mut cf) => {
                 info!(path = %path, size = cf.size, "streaming file read (container)");
@@ -3465,7 +3504,7 @@ fn handle_streaming_file_read(
             }
         }
     }
-    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read) {
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read, &root) {
         Ok(p) => p,
         Err(resp) => {
             send_response(stream, &resp)?;
@@ -3542,7 +3581,15 @@ fn handle_streaming_file_read(
 fn handle_streaming_archive_directory(
     stream: &mut impl ReadWrite,
     path: &str,
+    target: Option<&WorkloadTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let root = match io_target::IoRoot::resolve(target) {
+        Ok(root) => root,
+        Err(response) => {
+            send_response(stream, &response)?;
+            return Ok(());
+        }
+    };
     // Resolve through the same containment check single-file reads use, rather
     // than trusting the requested path. `normalize_guest_path` alone is lexical:
     // it rejects `..` but happily accepts a path whose final component is a
@@ -3550,7 +3597,7 @@ fn handle_streaming_archive_directory(
     // link in its workspace and have a caller archive whatever it pointed at.
     // The resolver maps the path under the workspace or overlay root and
     // canonicalizes it, so a link out of those roots is refused here.
-    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read) {
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read, &root) {
         Ok(resolved) => resolved,
         Err(response) => {
             send_response(stream, &response)?;
@@ -3692,7 +3739,10 @@ fn handle_interactive_run(
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
-            send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
+            send_response(
+                stream,
+                &io_target::storage_error_response(e, error_codes::RUN_FAILED),
+            )?;
             return Ok(());
         }
     };
@@ -4078,7 +4128,10 @@ fn handle_run_detached(
         match storage::prepare_for_run_persistent_with_progress(&image, &overlay_id, progress) {
             Ok(p) => p,
             Err(e) => {
-                send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
+                send_response(
+                    stream,
+                    &io_target::storage_error_response(e, error_codes::RUN_FAILED),
+                )?;
                 return Ok(());
             }
         };
@@ -6280,7 +6333,7 @@ fn handle_run_background(
             stdout: format!("{}", pid).into_bytes(),
             stderr: Vec::new(),
         },
-        Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
+        Err(e) => io_target::storage_error_response(e, error_codes::RUN_FAILED),
     }
 }
 
@@ -6750,7 +6803,7 @@ fn handle_run(
             stdout: result.stdout,
             stderr: result.stderr,
         }),
-        Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
+        Err(e) => io_target::storage_error_response(e, error_codes::RUN_FAILED),
     }
 }
 
@@ -6839,10 +6892,10 @@ fn handle_gc(dry_run: bool, purge_all: bool) -> AgentResponse {
 /// Handle overlay preparation request.
 fn handle_prepare_overlay(image: &str, workload_id: &str) -> AgentResponse {
     info!(image = %image, workload_id = %workload_id, "preparing overlay");
-    AgentResponse::from_result(
-        storage::prepare_overlay(image, workload_id),
-        error_codes::OVERLAY_FAILED,
-    )
+    match storage::prepare_overlay(image, workload_id) {
+        Ok(overlay) => AgentResponse::ok_with_data(overlay),
+        Err(e) => io_target::storage_error_response(e, error_codes::OVERLAY_FAILED),
+    }
 }
 
 /// Handle overlay cleanup request.
@@ -7082,18 +7135,24 @@ pub(crate) fn list_directory_entries(
 /// An image machine's files live in the container's mount namespace, which is
 /// where `FileRead` already looks; listing the VM base instead would report an
 /// empty or entirely different tree.
-fn handle_list_directory(path: &str) -> AgentResponse {
+fn handle_list_directory(path: &str, target: Option<&WorkloadTarget>) -> AgentResponse {
     // Mirror the read path exactly. An image machine's files live in the
     // workload container's mount namespace; without one, the path still has to
     // be resolved through the active persistent overlay, which is also what
     // rejects a symlink escaping the overlay or the workspace. Listing the raw
     // path instead reports the VM base, which for `/root` is simply empty.
-    let entries = match nsfile::GuestNs::for_workload() {
+    let root = match io_target::IoRoot::resolve(target) {
+        Ok(root) => root,
+        Err(response) => return response,
+    };
+    let entries = match root.namespace() {
         nsfile::GuestNs::Container(ns) => ns.list(path),
-        nsfile::GuestNs::Root(_) => match resolve_guest_io_path(path, FilePathAccess::Read) {
-            Ok(resolved) => list_directory_entries(&resolved.to_string_lossy()),
-            Err(resp) => return resp,
-        },
+        nsfile::GuestNs::Root(_) => {
+            match resolve_guest_io_path(path, FilePathAccess::Read, &root) {
+                Ok(resolved) => list_directory_entries(&resolved.to_string_lossy()),
+                Err(resp) => return resp,
+            }
+        }
     };
     match entries {
         Ok(entries) => match serde_json::to_value(&entries) {
@@ -7864,7 +7923,7 @@ mod tests {
         std::fs::write(dir.path().join("alpha.txt"), b"abc").unwrap();
         std::fs::create_dir(dir.path().join("middle")).unwrap();
 
-        let resp = handle_list_directory(dir.path().to_str().unwrap());
+        let resp = handle_list_directory(dir.path().to_str().unwrap(), None);
         let AgentResponse::Ok { data: Some(data) } = resp else {
             panic!("expected a listing, got {resp:?}");
         };
@@ -7891,13 +7950,13 @@ mod tests {
     #[test]
     fn a_missing_directory_is_an_error_not_an_empty_listing() {
         let dir = tempfile::tempdir().unwrap();
-        let resp = handle_list_directory(dir.path().join("nope").to_str().unwrap());
+        let resp = handle_list_directory(dir.path().join("nope").to_str().unwrap(), None);
         let AgentResponse::Error { code, .. } = resp else {
             panic!("expected an error, got {resp:?}");
         };
         assert_eq!(code.as_deref(), Some("NOT_FOUND"));
 
-        let empty = handle_list_directory(dir.path().to_str().unwrap());
+        let empty = handle_list_directory(dir.path().to_str().unwrap(), None);
         let AgentResponse::Ok { data: Some(data) } = empty else {
             panic!("an empty directory still lists");
         };
@@ -7915,7 +7974,7 @@ mod tests {
         std::os::unix::fs::symlink("gone.txt", dir.path().join("dangling.txt")).unwrap();
 
         let AgentResponse::Ok { data: Some(data) } =
-            handle_list_directory(dir.path().to_str().unwrap())
+            handle_list_directory(dir.path().to_str().unwrap(), None)
         else {
             panic!("expected a listing");
         };
@@ -8253,7 +8312,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let absent = tmp.path().join("absent");
         let (mut agent, mut client) = UnixStream::pair().unwrap();
-        handle_streaming_file_read(&mut agent, absent.to_str().unwrap()).unwrap();
+        handle_streaming_file_read(&mut agent, absent.to_str().unwrap(), None).unwrap();
         let mut header = [0u8; 4];
         client.read_exact(&mut header).unwrap();
         let mut frame = vec![0u8; u32::from_be_bytes(header) as usize];
@@ -8382,6 +8441,7 @@ mod tests {
             None,
             None,
             smolvm_protocol::FILE_TRANSFER_MAX_TOTAL + 1,
+            None,
         );
         assert!(session.is_none(), "session must not be created");
         assert!(
@@ -8439,6 +8499,7 @@ mod tests {
             None,
             None,
             payload.len() as u64,
+            None,
         );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
 
@@ -8481,6 +8542,7 @@ mod tests {
             None,
             None,
             total as u64,
+            None,
         );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
 
@@ -8517,7 +8579,7 @@ mod tests {
         std::fs::write(&target, b"original").unwrap();
 
         let (session, resp) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10);
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10, None);
         assert!(matches!(resp, AgentResponse::Ok { .. }));
         let (session, resp) = handle_file_write_chunk(session, b"short", true);
         assert!(session.is_none());
@@ -8532,7 +8594,7 @@ mod tests {
         let target = tmp_target(&tmp, "overflow.bin");
 
         let (session, _resp) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10);
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10, None);
         assert!(session.is_some());
 
         // First chunk fits.
@@ -8562,7 +8624,7 @@ mod tests {
         let target = tmp_target(&tmp, "dropped.bin");
 
         let (session, _) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 100);
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 100, None);
         let (session, _) = handle_file_write_chunk(session, &[0u8; 50], false);
         assert!(session.is_some());
         // Staging file exists mid-stream.
@@ -8591,7 +8653,7 @@ mod tests {
         let target = tmp_target(&tmp, "empty.bin");
 
         let (session, _) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 0);
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 0, None);
         let (session, resp) = handle_file_write_chunk(session, &[], true);
         assert!(matches!(resp, AgentResponse::Ok { .. }));
         assert!(session.is_none());
@@ -8614,7 +8676,14 @@ mod tests {
         let target = tmp_target(&tmp, "single.bin");
         let payload = b"small file contents".to_vec();
 
-        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644), None, None);
+        let resp = handle_file_write(
+            &target.to_string_lossy(),
+            &payload,
+            Some(0o644),
+            None,
+            None,
+            None,
+        );
         assert!(
             matches!(resp, AgentResponse::Ok { .. }),
             "write failed: {:?}",
@@ -8639,6 +8708,56 @@ mod tests {
             &workspace,
         );
         assert!(matches!(res, Err(AgentResponse::Error { .. })));
+    }
+
+    #[test]
+    fn a_named_target_picks_its_root_without_inference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        std::fs::create_dir_all(merged.join("etc")).unwrap();
+        std::fs::write(merged.join("etc/hostname"), b"container").unwrap();
+
+        // A VM target reads plain VM paths, whatever overlays are mounted.
+        let vm = io_target::IoRoot::Vm;
+        assert_eq!(vm.overlay_merged_root(), None);
+        assert_eq!(
+            resolve_guest_io_path("/etc/hostname", FilePathAccess::Read, &vm).unwrap(),
+            std::path::PathBuf::from("/etc/hostname")
+        );
+        assert!(matches!(
+            vm.namespace(),
+            nsfile::GuestNs::Root(nsfile::RootReason::VmTarget)
+        ));
+
+        // A container target maps into exactly that overlay.
+        let overlay = io_target::IoRoot::Overlay {
+            workload_id: "persistent-web".into(),
+            merged: merged.clone(),
+        };
+        assert_eq!(overlay.overlay_merged_root(), Some(merged.clone()));
+        let resolved =
+            resolve_guest_io_path("/etc/hostname", FilePathAccess::Read, &overlay).unwrap();
+        assert_eq!(std::fs::read(resolved).unwrap(), b"container");
+    }
+
+    #[test]
+    fn a_malformed_target_is_refused_before_storage_is_touched() {
+        for overlay_id in ["../escape", "a/b", ""] {
+            let target = WorkloadTarget::Container {
+                image: "alpine:3.20".into(),
+                overlay_id: overlay_id.into(),
+            };
+            match io_target::IoRoot::resolve(Some(&target)) {
+                Err(AgentResponse::Error { code, .. }) => {
+                    assert_eq!(
+                        code.as_deref(),
+                        Some(error_codes::INVALID_REQUEST),
+                        "{overlay_id:?}"
+                    )
+                }
+                _ => panic!("{overlay_id:?} was accepted"),
+            }
+        }
     }
 
     #[cfg(unix)]

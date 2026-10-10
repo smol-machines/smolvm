@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use crate::agent::WorkloadTarget;
 use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
 use crate::api::TraceId;
@@ -24,26 +25,16 @@ pub struct FileUploadResponse {
     pub size: u64,
 }
 
-/// The machine's image and the persistent overlay its container runs on.
-///
-/// A fork clone's inherited overlay lives under its golden's id, which is how
-/// exec resolves it (`RunConfig::in_machine`). Keying file ops by the clone's
-/// own name mounted a fresh, empty overlay the running workload never sees, so
-/// uploads to a fork silently vanished and downloads missed the fork's files.
-async fn image_and_overlay_owner(
-    state: &ApiState,
-    id: &str,
-) -> Result<(Option<String>, String), ApiError> {
-    let record = state.lookup_vm(id).await?;
-    let overlay_owner = match &record {
-        Some(record) => crate::workload::persistent_overlay_owner_with_lineage(
-            id,
-            record.golden.as_deref(),
-            record.fork_overlay_owner.as_deref(),
-        ),
-        None => id.to_string(),
-    };
-    Ok((record.and_then(|record| record.image), overlay_owner))
+/// The filesystem the machine's commands run in, which its file operations
+/// must act on too; see [`crate::workload::machine_target`]. A fork clone's
+/// inherited overlay lives under its golden's id, as exec resolves it.
+async fn machine_target(state: &ApiState, id: &str) -> Result<WorkloadTarget, ApiError> {
+    Ok(state
+        .lookup_vm(id)
+        .await?
+        .map_or(WorkloadTarget::Vm, |record| {
+            crate::workload::machine_target(&record)
+        }))
 }
 
 /// Upload a file to a machine.
@@ -88,7 +79,7 @@ pub async fn upload_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let (machine_image, overlay_id) = image_and_overlay_owner(&state, &id).await?;
+    let target = machine_target(&state, &id).await?;
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
@@ -116,22 +107,7 @@ pub async fn upload_file(
     };
 
     with_machine_client_traced(&entry, tid, move |c| {
-        // For image machines, mount the per-machine persistent container overlay
-        // (same id exec uses) so the file lands INSIDE the container, not the
-        // read-only agent base. Pull the image first if it isn't present yet.
-        if let Some(ref image) = machine_image {
-            if c.query(image)?.is_none() {
-                c.pull_with_registry_config(image)?;
-            }
-            // Activate the per-machine container overlay so the file op targets
-            // the image container, not the read-only agent base. `prepare_overlay`
-            // mounts but doesn't make it the active fs for write_file/read_file;
-            // a no-op container run (same path exec takes) does.
-            c.run_non_interactive(
-                crate::agent::RunConfig::new(image.clone(), vec!["/bin/true".to_string()])
-                    .with_persistent_overlay(Some(overlay_id.clone())),
-            )?;
-        }
+        c.use_target(target)?;
         match source {
             // The agent stages a streamed file and renames it into place only
             // once all of it is written, so a body that stops short leaves
@@ -249,27 +225,13 @@ pub async fn download_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let (machine_image, overlay_id) = image_and_overlay_owner(&state, &id).await?;
+    let target = machine_target(&state, &id).await?;
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
 
     let data = with_machine_client_traced(&entry, tid, move |c| {
-        // Read from inside the container overlay for image machines (matching
-        // upload + exec), not the agent base.
-        if let Some(ref image) = machine_image {
-            if c.query(image)?.is_none() {
-                c.pull_with_registry_config(image)?;
-            }
-            // Activate the per-machine container overlay so the file op targets
-            // the image container, not the read-only agent base. `prepare_overlay`
-            // mounts but doesn't make it the active fs for write_file/read_file;
-            // a no-op container run (same path exec takes) does.
-            c.run_non_interactive(
-                crate::agent::RunConfig::new(image.clone(), vec!["/bin/true".to_string()])
-                    .with_persistent_overlay(Some(overlay_id.clone())),
-            )?;
-        }
+        c.use_target(target)?;
         // Asking for a directory returns its listing rather than an error: a
         // caller exploring a tree should not have to know in advance which
         // paths are files, and guessing names costs a request per miss.

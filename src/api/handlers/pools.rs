@@ -314,12 +314,18 @@ fn stage_lease_payload(machine: &str, files: &[StagedLeaseFile]) -> crate::Resul
         return Ok(());
     }
     let socket = crate::agent::vm_data_dir(machine).join("agent.sock");
+    let target = crate::db::SmolvmDb::open()?
+        .get_vm(machine)?
+        .map_or(crate::agent::WorkloadTarget::Vm, |record| {
+            crate::workload::machine_target(&record)
+        });
     retry_transient_lease_stage(|| {
         // Reconnect for every attempt. FileWrite installs with an atomic rename,
         // so repeating the same validated bytes after a lost acknowledgment is
         // safe even when the first request committed inside the guest.
         let mut client = crate::agent::AgentClient::connect_with_retry(&socket)
             .map_err(|e| crate::Error::agent("stage lease payload", e.to_string()))?;
+        client.use_target(target.clone())?;
         for file in files {
             let path = format!("/workspace/{}", file.path);
             client

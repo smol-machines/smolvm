@@ -453,6 +453,8 @@ fn send_fd(sock: libc::c_int, fd: libc::c_int) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum RootReason {
+    /// The request named the VM's own filesystem.
+    VmTarget,
     /// Nothing is running: no container to enter.
     NoWorkload,
     /// Several unrelated workloads (a pod). Picking one would write into an
@@ -463,6 +465,7 @@ pub enum RootReason {
 impl std::fmt::Display for RootReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::VmTarget => write!(f, "the request targets the VM's own filesystem"),
             Self::NoWorkload => write!(f, "no running workload container"),
             Self::Ambiguous(n) => write!(f, "{n} running workload containers; cannot choose"),
         }
@@ -504,6 +507,40 @@ impl GuestNs {
             }
         }
     }
+
+    /// The namespace of a container running on persistent overlay
+    /// `workload_id`, whose mounted root is `merged`: its recorded main
+    /// container when that runs there, else any container rooted on it. With
+    /// none running, I/O goes through `merged` directly.
+    pub fn on_overlay(workload_id: &str, merged: &Path) -> Self {
+        match overlay_container(workload_id, merged) {
+            Some(pid) => Self::Container(ContainerNs { pid }),
+            None => Self::Root(RootReason::NoWorkload),
+        }
+    }
+}
+
+/// A running container whose root filesystem is the overlay mounted at
+/// `merged`. A container's root is that very mount, so the two report the
+/// same device and inode; nothing else does.
+#[cfg(target_os = "linux")]
+fn overlay_container(workload_id: &str, merged: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let root = std::fs::metadata(merged).ok()?;
+    let rooted_here = |pid: u32| {
+        std::fs::metadata(format!("/proc/{pid}/root"))
+            .is_ok_and(|m| m.dev() == root.dev() && m.ino() == root.ino())
+    };
+    let main = std::fs::read_to_string(crate::paths::main_container_id_path(workload_id))
+        .ok()
+        .and_then(|cid| crate::crun_container_pid(cid.trim()))
+        .filter(|pid| rooted_here(*pid));
+    main.or_else(|| live_containers().into_iter().find(|pid| rooted_here(*pid)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn overlay_container(_workload_id: &str, _merged: &Path) -> Option<u32> {
+    None
 }
 
 /// The init PID of the container this machine's guest I/O belongs in.

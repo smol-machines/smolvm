@@ -61,12 +61,14 @@ pub mod mediated_egress;
 pub mod publish_socket;
 pub mod retry;
 pub mod secrets;
+pub mod workload_target;
 
 pub use credentials::{CredentialBinding, CredentialPolicy};
 pub use egress_rule::{EgressRule, FlowTransport, PortRange, RuleAction};
 pub use image_ref::{image_repo, normalize_image_ref};
 pub use intercept::InterceptEndpoint;
 pub use secrets::{SecretRef, SecretSourceKind};
+pub use workload_target::{WorkloadTarget, WORKLOAD_TARGET_CAPABILITY};
 
 /// Serde helper for encoding `Vec<u8>` as a base64 string in JSON.
 ///
@@ -738,6 +740,9 @@ pub enum AgentRequest {
         /// Owner gid to apply after the write. None = leave as written (root).
         #[serde(default)]
         gid: Option<u32>,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// Open a streaming file upload session on this connection.
@@ -765,6 +770,9 @@ pub enum AgentRequest {
         /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent finalizes only after
         /// receiving exactly this many bytes.
         total_size: u64,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// Append a chunk to the currently open streaming upload.
@@ -784,6 +792,9 @@ pub enum AgentRequest {
     FileRead {
         /// Absolute path in the VM filesystem.
         path: String,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// List the entries of a guest directory.
@@ -794,6 +805,9 @@ pub enum AgentRequest {
     ListDirectory {
         /// Absolute directory path in the VM filesystem.
         path: String,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// Stream a tar archive of a guest directory without creating a guest-side
@@ -802,6 +816,9 @@ pub enum AgentRequest {
     ArchiveDirectory {
         /// Absolute directory path in the VM filesystem.
         path: String,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// Create (without starting) a Kubernetes pod container whose rootfs is a
@@ -1150,6 +1167,9 @@ pub mod error_codes {
     pub const FILE_IO_FAILED: &str = "FILE_IO_FAILED";
     /// Overlay filesystem operation failed.
     pub const OVERLAY_FAILED: &str = "OVERLAY_FAILED";
+    /// A persistent overlay was asked to run an image other than the one it
+    /// was built from.
+    pub const OVERLAY_IMAGE_CONFLICT: &str = "OVERLAY_IMAGE_CONFLICT";
     /// Cleanup operation failed.
     pub const CLEANUP_FAILED: &str = "CLEANUP_FAILED";
     /// Storage format operation failed.
@@ -1840,6 +1860,10 @@ mod tests {
             uid: Some(1000),
             gid: Some(1000),
             total_size: 123_456_789,
+            target: Some(WorkloadTarget::Container {
+                image: "alpine:3.20".into(),
+                overlay_id: "web".into(),
+            }),
         };
         let bytes = encode_message(&req).unwrap();
         let back: AgentRequest = decode_message(&bytes).unwrap();
@@ -1850,15 +1874,45 @@ mod tests {
                 uid,
                 gid,
                 total_size,
+                target,
             } => {
                 assert_eq!(path, "/tmp/target");
                 assert_eq!(mode, Some(0o600));
                 assert_eq!(uid, Some(1000));
                 assert_eq!(gid, Some(1000));
                 assert_eq!(total_size, 123_456_789);
+                assert_eq!(
+                    target,
+                    Some(WorkloadTarget::Container {
+                        image: "alpine:3.20".into(),
+                        overlay_id: "web".into(),
+                    })
+                );
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn file_requests_without_a_target_match_older_hosts_and_agents() {
+        // An older host sends no target; the agent then infers it.
+        let old: AgentRequest =
+            serde_json::from_str(r#"{"method":"file_read","path":"/etc/hostname"}"#).unwrap();
+        assert!(matches!(old, AgentRequest::FileRead { target: None, .. }));
+        // A request without a target serializes exactly as before, so an
+        // older agent sees no new field.
+        let json = serde_json::to_string(&AgentRequest::ListDirectory {
+            path: "/root".into(),
+            target: None,
+        })
+        .unwrap();
+        assert!(!json.contains("target"), "{json}");
+        let json = serde_json::to_string(&AgentRequest::ListDirectory {
+            path: "/root".into(),
+            target: Some(WorkloadTarget::Vm),
+        })
+        .unwrap();
+        assert!(json.contains(r#""target":{"kind":"vm"}"#), "{json}");
     }
 
     #[test]
