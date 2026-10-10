@@ -275,6 +275,12 @@ jobs:
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
+      # The bootstrap parser lives in our local containerd-shim patch, which is
+      # outside the workspace so the package tests above do not run it.
+      - name: Run containerd bootstrap regression tests
+        run: cargo test --manifest-path vendor/containerd-shim/Cargo.toml --lib bootstrap_tests --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
       # Note: Full VM integration tests (and critest CRI conformance) require
       # KVM + real libkrun. Run those locally on a machine with KVM access.
 
