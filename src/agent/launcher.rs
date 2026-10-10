@@ -448,6 +448,9 @@ impl LaunchFeatures {
         // extraction cache, which may be evicted along with the original bundle.
         // Skipping the empty layer share also saves a virtiofs device/IRQ.
         if vm_mode {
+            // If an older start left a private macOS layers volume mounted,
+            // release it even though this VM no longer needs its contents.
+            smolvm_pack::extract::force_detach_layers_volume(layers_cache_dir);
             return Ok(self);
         }
         let has_image_layers = pack_has_image_layers(Path::new(sidecar_path));
