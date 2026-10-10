@@ -2507,6 +2507,10 @@ impl AgentClient {
             stop_vm_on_exit: false,
         })?;
 
+        // These streaming calls do not forward host stdin. Close the guest pipe
+        // explicitly so commands that read until EOF (for example `cat`) exit.
+        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+
         collect_exec_events(self, "run streaming", on_event)
     }
 
@@ -3243,6 +3247,9 @@ impl AgentClient {
             background: false,
             stdin_data: None,
         })?;
+
+        // No stdin is forwarded on this path; tell the guest it has reached EOF.
+        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
 
         collect_exec_events(self, "streaming exec", on_event)
     }
@@ -4074,6 +4081,57 @@ mod run_streaming_tests {
     use std::thread;
 
     #[test]
+    fn vm_exec_streaming_closes_guest_stdin_before_waiting_for_exit() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let server = thread::spawn(move || {
+            for expected_eof in [false, true] {
+                let mut len_buf = [0u8; 4];
+                server_stream.read_exact(&mut len_buf).unwrap();
+                let mut payload = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                server_stream.read_exact(&mut payload).unwrap();
+                let envelope: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+                if expected_eof {
+                    assert!(
+                        matches!(envelope.body, AgentRequest::Stdin { data } if data.is_empty())
+                    );
+                } else {
+                    assert!(matches!(
+                        envelope.body,
+                        AgentRequest::VmExec {
+                            interactive: true,
+                            tty: false,
+                            ..
+                        }
+                    ));
+                }
+            }
+            for response in [
+                AgentResponse::Started,
+                AgentResponse::Exited {
+                    exit_code: 0,
+                    oom: false,
+                },
+            ] {
+                server_stream
+                    .write_all(&encode_message(&response).unwrap())
+                    .unwrap();
+            }
+        });
+        let mut client = AgentClient::from_stream(client_stream);
+        let mut events = Vec::new();
+        client
+            .vm_exec_streaming_with(vec!["cat".into()], vec![], None, None, |event| {
+                events.push(event)
+            })
+            .unwrap();
+        assert_eq!(events, vec![ExecEvent::Exit(0)]);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn run_streaming_sends_interactive_run_and_collects_events() {
         let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
 
@@ -4112,6 +4170,16 @@ mod run_streaming_tests {
                 }
                 other => panic!("expected AgentRequest::Run, got {:?}", other),
             }
+
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let envelope: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(
+                matches!(envelope.body, AgentRequest::Stdin { data } if data.is_empty()),
+                "non-interactive stream must close guest stdin"
+            );
 
             for response in [
                 AgentResponse::Started,
