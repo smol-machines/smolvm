@@ -183,6 +183,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--interactive` | `-i` | run, exec | Keep stdin open |
 | `--tty` | `-t` | run, exec | Allocate pseudo-TTY |
 | `--allow-cidr` | | run, create | CIDR egress filter (implies --net) |
+| `--deny-cidr` | | run, create | Deny egress to a CIDR, checked before anything is allowed (implies --net) |
 | `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
@@ -216,6 +217,7 @@ overlay = 4                           # overlay disk GiB (default: 10)
 allow_hosts = ["api.stripe.com"]      # resolved at VM start (implies net)
 allow_host_patterns = ["api.example.com", "*.files.example.com"] # exact / subdomains
 allow_cidrs = ["10.0.0.0/8"]         # IP/CIDR ranges (implies net)
+deny_cidrs = ["169.254.169.254"]     # denied before any allow (implies net)
 
 # Dev profile (used by `machine run` and `machine create`)
 [dev]
@@ -273,6 +275,7 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `--allow-host-pattern api.stripe.com` permits the exact hostname. `--allow-host-pattern '*.stripe.com'` permits subdomains but not the apex. Both enable DNS filtering and imply `--net`.
 - `--allow-cidr 10.0.0.0/8` enables egress only to specified IP ranges (implies `--net`)
 - `--allow-host` and `--allow-cidr` can be combined and used multiple times
+- `--deny-cidr 10.0.0.0/8` refuses that range even where an allow would admit it, and implies `--net`. It also holds when the guest reaches the host through the gateway address, and for IPv4-mapped IPv6 spellings. Over the API it is an `egressRules` entry with `action: deny`
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP). The server inside the machine must listen on `0.0.0.0` (not `127.0.0.1`): a server bound only to the guest's loopback is unreachable from the host, and connections are reset. `machine status` shows each published port's listening state. Publishing a port does not give the machine outbound access: without `--net` (or an allow-list) it serves inbound connections only.
 - `--guest-subnet 10.200.0.0/30` moves the guest link off the default `100.96.0.0/30` (gateway and resolver `.1`, guest `.2`; implies `--net`, virtio-net). Use it when the guest runs Tailscale, another VPN or carrier NAT that claims `100.64.0.0/10`, which otherwise routes the gateway away and breaks DNS. API: `guestSubnet` on create. Not combinable with `--network`

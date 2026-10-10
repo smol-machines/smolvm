@@ -371,6 +371,8 @@ pub struct ResolvedEgressPolicy {
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostnames the guest DNS filter permits resolving.
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Ordered egress rules, deny CIDRs first.
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
 }
 
 /// Outbound-network decision for a pack-run boot: a resolved policy's override
@@ -592,7 +594,11 @@ impl PackRunCmd {
                 .egress
                 .as_ref()
                 .and_then(|policy| policy.allowed_cidrs.clone()),
-            egress_rules: Vec::new(),
+            egress_rules: self
+                .egress
+                .as_ref()
+                .map(|policy| policy.egress_rules.clone())
+                .unwrap_or_default(),
         };
         validate_requested_network_backend(
             &resources,
@@ -2614,6 +2620,7 @@ mod tests {
             network_override: Some(false),
             allowed_cidrs: None,
             dns_filter_hosts: None,
+            egress_rules: Vec::new(),
         };
         assert!(!effective_network(Some(&closed), false, true, true));
 
@@ -2632,6 +2639,7 @@ mod tests {
             network_override: None,
             allowed_cidrs: Some(vec!["140.82.112.0/20".to_string()]),
             dns_filter_hosts: Some(vec!["github.com".to_string()]),
+            egress_rules: Vec::new(),
         };
         assert!(effective_network(Some(&policy), false, true, false));
         assert!(!effective_network(Some(&policy), false, false, false));

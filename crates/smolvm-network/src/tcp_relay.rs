@@ -395,6 +395,17 @@ impl TcpRelayTable {
         if self.is_host_service_destination(destination) {
             return true;
         }
+        // A gateway destination is dialed as host loopback. A deny on the
+        // dialed address has to hold even though the guest named the gateway.
+        let dialed = self.host_connect_addr(destination);
+        if dialed.ip() != destination.ip()
+            && self
+                .egress
+                .rule_action(FlowTransport::Tcp, dialed.ip(), Some(dialed.port()))
+                == Some(RuleAction::Deny)
+        {
+            return false;
+        }
         if self.egress.rule_action(
             FlowTransport::Tcp,
             destination.ip(),
@@ -1691,6 +1702,27 @@ mod tests {
             table.host_connect_addr(SocketAddr::new(lan, 3306)),
             SocketAddr::new(lan, 3306),
         );
+    }
+
+    #[test]
+    fn deny_rule_holds_against_the_address_the_relay_dials() {
+        use smolvm_protocol::{EgressRule, RuleAction};
+        // The guest names the gateway, the relay dials host loopback. A deny
+        // on loopback has to see the dialed address, not just the gateway.
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let policy = EgressPolicy::unrestricted()
+            .with_rules(&[EgressRule {
+                transport: None,
+                cidr: Some("127.0.0.0/8".into()),
+                ports: None,
+                action: RuleAction::Deny,
+            }])
+            .unwrap();
+        let table = TcpRelayTable::new(None, policy, vec![gateway], None);
+        assert!(!table.destination_allowed(SocketAddr::new(gateway, 5432)));
+        // Without the deny the same flow is not refused by the rule path.
+        let open = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None);
+        assert!(open.destination_allowed(SocketAddr::new(gateway, 5432)));
     }
 
     #[test]

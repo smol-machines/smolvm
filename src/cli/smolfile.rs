@@ -161,6 +161,7 @@ pub fn build_create_params(
                 block_io: cli_block_io.unwrap_or_default(),
                 disk_durability: DiskDurability::default(),
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
+                egress_rules: Vec::new(),
                 restart_policy: None,
                 restart_max_retries: None,
                 restart_max_backoff_secs: None,
@@ -350,6 +351,16 @@ pub fn build_create_params(
     };
     let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
 
+    // [network].deny_cidrs become Deny rules ahead of any allow.
+    let sf_deny_cidrs: Vec<String> = network
+        .deny_cidrs
+        .iter()
+        .map(|s| parse_cidr(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| smolvm::Error::config("smolfile [network] deny_cidrs", e))?;
+    let net = net || !sf_deny_cidrs.is_empty();
+    let egress_rules = crate::cli::vm_common::deny_cidr_rules(&sf_deny_cidrs);
+
     // Restart policy from [restart] section
     let restart_policy = sf
         .restart
@@ -419,6 +430,7 @@ pub fn build_create_params(
         block_io,
         disk_durability,
         allowed_cidrs,
+        egress_rules,
         restart_policy,
         restart_max_retries,
         restart_max_backoff_secs,
@@ -781,6 +793,51 @@ init = ["echo init"]
                 "net_backend = \"{declared}\" must select {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn deny_cidrs_become_deny_rules_ahead_of_cli_denies_and_imply_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[network]\ndeny_cidrs = [\"10.0.0.0/8\", \"169.254.169.254\"]\n",
+        )
+        .unwrap();
+
+        let mut params = build_from_smolfile(path).unwrap();
+        assert!(params.net, "a deny list implies networking");
+        params.prepend_deny_cidrs(&["192.168.0.0/16".to_string()]);
+
+        let cidrs: Vec<_> = params
+            .egress_rules
+            .iter()
+            .map(|rule| (rule.cidr.as_deref().unwrap(), rule.action))
+            .collect();
+        assert_eq!(
+            cidrs,
+            [
+                ("192.168.0.0/16", smolvm_protocol::RuleAction::Deny),
+                ("10.0.0.0/8", smolvm_protocol::RuleAction::Deny),
+                ("169.254.169.254/32", smolvm_protocol::RuleAction::Deny),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_deny_cidr_is_rejected_at_parse_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[network]\ndeny_cidrs = [\"10.0.0.0/33\"]\n",
+        )
+        .unwrap();
+        let error = match build_from_smolfile(path) {
+            Ok(_) => panic!("a malformed deny CIDR must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("deny_cidrs"), "{error}");
     }
 
     /// An unusable value must be rejected where it is written, naming the flag

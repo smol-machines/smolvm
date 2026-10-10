@@ -521,12 +521,20 @@ impl EgressPolicy {
         ip: IpAddr,
         port: Option<u16>,
     ) -> Option<RuleAction> {
+        // An IPv4-mapped IPv6 address reaches the same host as its IPv4 form,
+        // so a V4 rule must match it too or a Deny is bypassed by spelling.
+        let mapped = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
         let action = self
             .rules
             .iter()
             .find(|rule| {
                 rule.transport.is_none_or(|value| value == transport)
-                    && rule.cidr.is_none_or(|cidr| cidr.contains(ip))
+                    && rule.cidr.is_none_or(|cidr| {
+                        cidr.contains(ip) || mapped.is_some_and(|v4| cidr.contains(v4))
+                    })
                     && rule.ports.is_none_or(|ports| {
                         port.is_some_and(|port| (ports.start..=ports.end).contains(&port))
                     })
@@ -960,6 +968,25 @@ mod tests {
         assert!(!policy.allows_flow(FlowTransport::Tcp, target, Some(123)));
         assert!(policy.allows_flow(FlowTransport::Udp, target, Some(123)));
         assert!(!policy.allows_flow(FlowTransport::Icmp, target, None));
+    }
+
+    #[test]
+    fn v4_deny_rule_also_matches_the_ipv4_mapped_form() {
+        use smolvm_protocol::{EgressRule, FlowTransport, RuleAction};
+        let policy = EgressPolicy::unrestricted()
+            .with_rules(&[EgressRule {
+                transport: None,
+                cidr: Some("1.1.1.0/24".into()),
+                ports: None,
+                action: RuleAction::Deny,
+            }])
+            .unwrap();
+        let v4 = "1.1.1.1".parse().unwrap();
+        let mapped = "::ffff:1.1.1.1".parse().unwrap();
+        let other = "::ffff:1.0.0.1".parse().unwrap();
+        assert!(!policy.allows_flow(FlowTransport::Tcp, v4, Some(443)));
+        assert!(!policy.allows_flow(FlowTransport::Tcp, mapped, Some(443)));
+        assert!(policy.allows_flow(FlowTransport::Tcp, other, Some(443)));
     }
 
     #[test]
