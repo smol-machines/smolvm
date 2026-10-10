@@ -4981,9 +4981,8 @@ pub struct StartCmd {
     #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
 
-    /// Start as a branch source: back guest RAM with a memfd (CoW-cloneable) and
-    /// expose a control socket so the running machine can later be branched.
-    #[arg(long = "branchable", visible_alias = "forkable")]
+    /// Every machine starts branchable now; kept so existing scripts still run.
+    #[arg(long = "branchable", visible_alias = "forkable", hide = true)]
     pub forkable: bool,
 
     /// Plan a CUDA branch pool with this many runnable children. Smolvm reports a
