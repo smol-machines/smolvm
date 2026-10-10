@@ -3413,7 +3413,7 @@ pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
     match wait_for_exit_event(pid, timeout) {
         // Reaps our own child and reads its code. Anyone else's exit code is
         // not ours to read.
-        ExitEvent::Exited => return Some(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE)),
+        ExitEvent::Exited => return Some(reap_after_exit_event(pid)),
         ExitEvent::TimedOut => {
             return try_wait(pid).or_else(|| (!is_alive(pid)).then_some(UNKNOWN_EXIT_CODE));
         }
@@ -3439,6 +3439,26 @@ pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
         std::thread::sleep(interval);
     }
     None
+}
+
+/// How long to keep trying to reap a child after its exit event. The event can
+/// arrive a moment before the child is reapable; until it is reaped it stays a
+/// zombie that [`is_alive`] counts as running.
+const REAP_AFTER_EXIT_EVENT: Duration = Duration::from_millis(100);
+
+/// Reap `pid` after its exit event and read its exit code: our own child
+/// within [`REAP_AFTER_EXIT_EVENT`], anyone else's as soon as it is gone.
+fn reap_after_exit_event(pid: Pid) -> i32 {
+    let deadline = Instant::now() + REAP_AFTER_EXIT_EVENT;
+    loop {
+        if let Some(code) = try_wait(pid) {
+            return code;
+        }
+        if !is_alive(pid) || Instant::now() >= deadline {
+            return UNKNOWN_EXIT_CODE;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Result of a fork operation.
