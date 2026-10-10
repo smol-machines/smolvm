@@ -3238,17 +3238,23 @@ impl AgentManager {
             || process::is_our_process_strict(pid, start_time)
             || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
 
-        if identity_ok {
+        let exit_confirmed = if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
                     "PID start-time not verified, identity confirmed via vsock"
                 );
             }
-            let _ = process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT);
-        }
+            // The stop helper observes the kernel's exit event or reaps our
+            // child. On macOS kill(pid, 0) can still see an exited child until
+            // it is reaped, so a second liveness probe must not override that
+            // confirmed exit (or mistake a recycled PID for this VM).
+            process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT).is_ok()
+        } else {
+            false
+        };
 
-        if process::is_alive(pid) {
+        if !exit_confirmed && process::is_alive(pid) {
             if !identity_ok {
                 // Kill was skipped (no vsock ack, start-time unverifiable) AND the
                 // process is genuinely still alive — a real orphan/leak risk.
@@ -4042,26 +4048,65 @@ mod tests {
         let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
         // No agent listening, exactly as for a paused guest.
         manager.vsock_socket = temp.path().join("missing-agent.sock");
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id() as crate::process::Pid;
+        // Repeat under CI load to catch intermittent process identity races.
+        for attempt in 0..512 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = child.id() as crate::process::Pid;
 
-        let started = std::time::Instant::now();
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), true);
-        let elapsed = started.elapsed();
-        let survived = matches!(child.try_wait(), Ok(None));
-        let _ = child.kill();
-        let _ = child.wait();
+            // A freshly spawned child can briefly have no macOS proc_pidinfo
+            // start time. Wait for an identity before testing the strict stop path;
+            // without one the stop correctly refuses to signal an unknown PID.
+            let identity_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let start_time = loop {
+                if let Some(start_time) = process::process_start_time(pid) {
+                    break start_time;
+                }
+                if std::time::Instant::now() >= identity_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("spawned test child never acquired a verifiable start time");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
 
-        assert!(result.is_ok(), "a paused guest must stop: {result:?}");
-        assert!(!survived, "the paused VM's process must be gone");
-        // The handshake was skipped, not merely fast: its own deadline is 5s.
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?}, so the shutdown handshake was still attempted"
-        );
+            let before_start = process::process_start_time(pid);
+            let identity_verified = process::is_our_process_strict(pid, Some(start_time));
+            let started = std::time::Instant::now();
+            let result = manager.stop_vm_process(pid, Some(start_time), true);
+            let elapsed = started.elapsed();
+            let after_start = process::process_start_time(pid);
+            // NOTE_EXIT can arrive just before a child becomes waitable on
+            // macOS. Give the kernel a bounded interval to finish the exit.
+            let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let survived = loop {
+                match child.try_wait() {
+                    Ok(None) if std::time::Instant::now() < reap_deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(None) => break true,
+                    _ => break false,
+                }
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert!(
+                result.is_ok(),
+                "iteration={attempt}, a paused guest must stop: {result:?}; start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, survived={survived}, elapsed={elapsed:?}"
+            );
+            assert!(
+                !survived,
+                "iteration={attempt}, the paused VM's process must be gone: result={result:?}, start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, elapsed={elapsed:?}"
+            );
+            // The handshake was skipped, not merely fast: its own deadline is 5s.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "took {elapsed:?}, so the shutdown handshake was still attempted"
+            );
+        }
     }
 
     #[cfg(unix)]
