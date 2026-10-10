@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::platform::uds::UdsStream;
-use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
+use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
@@ -1080,6 +1080,30 @@ fn is_benign_shutdown_error(error_str: &str) -> bool {
         || error_str.contains("connection reset")
 }
 
+/// Resolve credentials for the registry that will actually receive the pull.
+fn registry_pull_credentials(
+    config: &RegistryConfig,
+    effective_image: &str,
+    explicit: Option<RegistryAuth>,
+) -> Option<RegistryAuth> {
+    let registry = extract_registry(effective_image);
+    explicit
+        .or_else(|| {
+            config.get_credentials(&registry).inspect(|creds| {
+                tracing::debug!(registry = %registry, username = %creds.username, "using configured registry credentials");
+            })
+        })
+        .or_else(|| {
+            crate::docker_config::credential_for(&registry).map(|cred| {
+                tracing::debug!(registry = %registry, username = %cred.username, "using host docker credentials");
+                RegistryAuth {
+                    username: cred.username,
+                    password: cred.secret,
+                }
+            })
+        })
+}
+
 /// Client for communicating with the smolvm-agent.
 pub struct AgentClient {
     stream: UdsStream,
@@ -1479,35 +1503,6 @@ impl AgentClient {
             let registry_config = SmolSettings::load().unwrap_or_default().images;
             let registry = extract_registry(image);
 
-            // Get credentials from config if not explicitly provided, then from
-            // what `docker login` stored on the host (inline or in a credential
-            // helper). The guest's crane accepts a username/secret pair and an
-            // identity token alike, so both forms are forwarded.
-            let auth = options
-                .auth
-                .or_else(|| {
-                    registry_config.get_credentials(&registry).inspect(|creds| {
-                        tracing::debug!(
-                            registry = %registry,
-                            username = %creds.username,
-                            "using configured registry credentials"
-                        );
-                    })
-                })
-                .or_else(|| {
-                    crate::docker_config::credential_for(&registry).map(|cred| {
-                        tracing::debug!(
-                            registry = %registry,
-                            username = %cred.username,
-                            "using host docker credentials"
-                        );
-                        RegistryAuth {
-                            username: cred.username,
-                            password: cred.secret,
-                        }
-                    })
-                });
-
             // Apply mirror if configured
             let img = if let Some(mirror) = registry_config.get_mirror(&registry) {
                 let mirrored = rewrite_image_registry(image, mirror);
@@ -1522,6 +1517,10 @@ impl AgentClient {
                 image.to_string()
             };
 
+            // Credentials must be scoped to the registry that receives the
+            // request. A mirror is a different host and cannot inherit the
+            // upstream registry's saved token or Docker login credentials.
+            let auth = registry_pull_credentials(&registry_config, &img, options.auth);
             (img, auth)
         } else {
             (image.to_string(), options.auth)
@@ -5322,5 +5321,54 @@ mod streamed_path_cleanup_tests {
             b"complete archive".len() as u64
         );
         assert_eq!(std::fs::read(&output).unwrap(), b"complete archive");
+    }
+}
+
+#[cfg(test)]
+mod mirror_auth_tests {
+    use super::*;
+
+    #[test]
+    fn mirror_uses_its_own_credentials_instead_of_upstream_credentials() {
+        let config: RegistryConfig = toml::from_str(
+            r#"
+[registries."origin.example.invalid"]
+username = "origin"
+password = "upstream-secret"
+mirror = "mirror.example.invalid"
+
+[registries."mirror.example.invalid"]
+username = "mirror"
+password = "mirror-secret"
+"#,
+        )
+        .unwrap();
+        let image = rewrite_image_registry(
+            "origin.example.invalid/app:latest",
+            "mirror.example.invalid",
+        );
+        let auth = registry_pull_credentials(&config, &image, None).unwrap();
+        assert_eq!(auth.username, "mirror");
+        assert_eq!(auth.password, "mirror-secret");
+        let original =
+            registry_pull_credentials(&config, "origin.example.invalid/app:latest", None).unwrap();
+        assert_eq!(original.username, "origin");
+        assert_eq!(original.password, "upstream-secret");
+    }
+
+    #[test]
+    fn explicit_credentials_remain_available_for_private_mirrors() {
+        let config = RegistryConfig::default();
+        let auth = registry_pull_credentials(
+            &config,
+            "mirror.example.invalid/app:latest",
+            Some(RegistryAuth {
+                username: "explicit".into(),
+                password: "secret".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(auth.username, "explicit");
+        assert_eq!(auth.password, "secret");
     }
 }
