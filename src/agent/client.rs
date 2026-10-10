@@ -3143,6 +3143,9 @@ impl AgentClient {
     ) -> Result<u64> {
         use std::io::Write;
 
+        // A caller may download over an existing file or symlink. Preserve it
+        // on a failed transfer; only remove files this transfer created.
+        let destination_existed = std::fs::symlink_metadata(local_path).is_ok();
         let mut file = std::fs::File::create(local_path).map_err(|e| {
             Error::agent(
                 "write local file",
@@ -3150,9 +3153,8 @@ impl AgentClient {
             )
         })?;
 
-        // A failed read or write may leave a partial archive behind. Keep the
-        // file open through the transfer and remove it on every error after
-        // closing the handle (required on Windows).
+        // A failed read or write may leave a partial new file behind. Close
+        // the handle before trying to remove it (required on Windows).
         let result = (|| {
             let mut total = 0u64;
             loop {
@@ -3190,7 +3192,7 @@ impl AgentClient {
             }
         })();
         drop(file);
-        if result.is_err() {
+        if result.is_err() && !destination_existed {
             let _ = std::fs::remove_file(local_path);
         }
         result
@@ -4913,6 +4915,28 @@ mod streamed_path_cleanup_tests {
             .receive_stream_to_path(&output, 1024, |_| {}, "flatten layers")
             .is_err());
         assert!(!output.exists(), "failed transfer left a partial archive");
+    }
+
+    #[test]
+    fn disconnect_does_not_unlink_an_existing_destination() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::DataChunk {
+                data: b"partial archive".to_vec(),
+                done: false,
+            },
+        );
+        drop(peer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("existing.txt");
+        std::fs::write(&output, b"original").unwrap();
+        let mut client = AgentClient::from_stream(client_stream);
+        assert!(client
+            .receive_stream_to_path(&output, 1024, |_| {}, "read file")
+            .is_err());
+        assert!(output.exists(), "existing destination must not be unlinked");
     }
 
     #[test]
