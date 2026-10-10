@@ -1579,19 +1579,23 @@ pub fn allocate_vm_uid(
 /// shares its golden's uid and never claims its own). Linux-only.
 #[cfg(target_os = "linux")]
 pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
+    // Machines without a UID assignment have nothing to release. In particular,
+    // their registry directory may not exist, so trying to lock it logs a false
+    // warning on every ordinary delete.
+    let Some(uid) = std::fs::read_to_string(key_dir.join(".vm-uid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
     let Ok(_registry_lock) = lock_uid_registry(registry_dir) else {
         tracing::warn!("unable to lock UID registry; retaining assignment");
         return;
     };
-    if let Some(uid) = std::fs::read_to_string(key_dir.join(".vm-uid"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
+    if uid_marker_key(registry_dir, uid).as_deref()
+        == key_dir.file_name().and_then(|name| name.to_str())
     {
-        if uid_marker_key(registry_dir, uid).as_deref()
-            == key_dir.file_name().and_then(|name| name.to_str())
-        {
-            let _ = std::fs::remove_file(registry_dir.join(uid.to_string()));
-        }
+        let _ = std::fs::remove_file(registry_dir.join(uid.to_string()));
     }
 }
 
