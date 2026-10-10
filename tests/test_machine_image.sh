@@ -58,6 +58,38 @@ test_create_with_image() {
     $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
 }
 
+# A mirror changes where layers are fetched, but the machine still asks the
+# guest for its original image reference on startup and later execs.
+test_mirrored_image_is_cached_under_original_reference() {
+    local vm_name="mirror-image-test-$$"
+    local cfg_dir
+    cfg_dir=$(mktemp -d)
+    cat > "$cfg_dir/config.toml" <<'TOML'
+[images.registries."smolvm-mirror.invalid"]
+mirror = "mirror.gcr.io"
+TOML
+
+    local result=0
+    $SMOLVM machine create --name "$vm_name" --image smolvm-mirror.invalid/library/alpine:latest --net \
+        --cpus 1 --mem 1024 --storage 3 --overlay 2 2>&1 || result=1
+    if [[ $result -eq 0 ]]; then
+        SMOLVM_CONFIG="$cfg_dir/config.toml" \
+            run_with_timeout 120 "$SMOLVM" machine start --name "$vm_name" 2>&1 || result=1
+    fi
+    if [[ $result -eq 0 ]]; then
+        $SMOLVM machine images --name "$vm_name" --json \
+            | grep -q 'smolvm-mirror.invalid/library/alpine:latest' || result=1
+    fi
+    if [[ $result -eq 0 ]]; then
+        $SMOLVM machine exec --name "$vm_name" -- cat /etc/os-release \
+            | grep -q 'Alpine' || result=1
+    fi
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    rm -rf "$cfg_dir"
+    return "$result"
+}
+
 test_create_with_image_and_env() {
     local vm_name="create-env-test-$$"
 
@@ -377,6 +409,7 @@ test_exec_join_documents_user_behavior() {
 
 
 run_test "Create with --image" test_create_with_image || true
+run_test "Mirrored pull keeps original image reference" test_mirrored_image_is_cached_under_original_reference || true
 run_test "Create with --image + env" test_create_with_image_and_env || true
 run_test "Update: settings applied on next start + refuses running VM" test_update_settings_applied_on_start || true
 run_test "Update: env var applied on next start (image-based)" test_update_env_applied_on_start || true

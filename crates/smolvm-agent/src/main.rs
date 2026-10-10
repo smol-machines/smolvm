@@ -2215,6 +2215,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // Handle Pull with progress streaming
         if let AgentRequest::Pull {
             ref image,
+            ref cache_as,
             ref oci_platform,
             ref auth,
             ref proxy,
@@ -2224,6 +2225,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             handle_streaming_pull(
                 stream,
                 image,
+                cache_as.as_deref(),
                 oci_platform.as_deref(),
                 auth.as_ref(),
                 proxy.as_deref(),
@@ -6758,6 +6760,7 @@ fn handle_run(
 fn handle_streaming_pull<S: Read + Write>(
     stream: &mut S,
     image: &str,
+    cache_as: Option<&str>,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
     proxy: Option<&str>,
@@ -6791,6 +6794,7 @@ fn handle_streaming_pull<S: Read + Write>(
     let response = AgentResponse::from_result(
         storage::pull_image_with_progress_and_auth(
             image,
+            cache_as,
             oci_platform,
             auth,
             proxy,
