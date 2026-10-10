@@ -157,6 +157,35 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// A paused machine's saved execution as a self-contained file, for use
+    /// on another host. A pause links backing layers other machines own
+    /// instead of packing them, which only this host can resolve; this packs
+    /// them back in when it did. Keep the returned value alive while reading
+    /// its path.
+    pub fn exportable_paused_checkpoint(
+        &self,
+        name: &str,
+    ) -> Result<crate::portable_checkpoint::ExportedPausedArtifact> {
+        self.with_name_lock(name, || {
+            let _source = crate::agent::fork::lock_fork_source(name)?;
+            let record = control::get_record(&self.db, name)?;
+            if record.state != RecordState::Paused || record.is_process_alive() {
+                return Err(Error::agent_conflict(
+                    "export paused checkpoint",
+                    "machine must be paused",
+                ));
+            }
+            let artifact = record.paused_checkpoint.ok_or_else(|| {
+                Error::agent_conflict("export paused checkpoint", "machine has no saved execution")
+            })?;
+            crate::portable_checkpoint::verified_sidecar_footer(&artifact)?;
+            crate::portable_checkpoint::ExportedPausedArtifact::build(
+                &crate::agent::vm_data_dir(name),
+                &artifact,
+            )
+        })
+    }
+
     /// Save execution durably and stop at that exact boundary.
     pub fn pause_machine(&self, name: &str) -> Result<()> {
         self.pause_machine_inner(name, None)
