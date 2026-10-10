@@ -886,14 +886,17 @@ mod tests {
     }
 
     fn test_db() -> SmolvmDb {
+        // The clock alone is not unique: macOS reports microseconds, so tests
+        // running in parallel can read the same instant and share one file.
+        static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "smolvm-embedded-control-{}-{}.db",
+            "smolvm-embedded-control-{}-{unique}-{sequence}.db",
             std::process::id(),
-            unique
         ));
         SmolvmDb::open_at(&path).unwrap()
     }
