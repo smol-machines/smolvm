@@ -653,8 +653,6 @@ dependencies = [
 [[package]]
 name = "containerd-shim"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a886cc76f89aab452d78a9034a62426468175d795d0fb2ee57338fe075cbdc0a"
 dependencies = [
  "async-trait",
  "cgroups-rs",
@@ -666,6 +664,8 @@ dependencies = [
  "mio 1.2.1",
  "nix 0.31.3",
  "oci-spec",
+ "prost",
+ "prost-types",
  "serde",
  "serde_json",
  "sha2",
