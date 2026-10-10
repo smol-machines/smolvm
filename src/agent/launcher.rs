@@ -423,13 +423,37 @@ impl LaunchFeatures {
     /// Performs blocking filesystem work; on async paths call it from within a
     /// `spawn_blocking` context.
     pub fn with_packed_layers(
+        self,
+        layers_cache_dir: &Path,
+        source_smolmachine: Option<&str>,
+    ) -> Result<Self> {
+        self.with_packed_layers_with_mode(layers_cache_dir, source_smolmachine, false)
+    }
+
+    /// Like `with_packed_layers`, but a VM-mode machine has already copied its
+    /// packed disks into its own data dir at create time. Starting it does not
+    /// require the original bundle or its extraction cache. Container records
+    /// must pass `false`: they still need the extracted OCI layers at boot.
+    pub fn with_packed_layers_with_mode(
         mut self,
         layers_cache_dir: &Path,
         source_smolmachine: Option<&str>,
+        vm_mode: bool,
     ) -> Result<Self> {
         let Some(sidecar_path) = source_smolmachine else {
             return Ok(self);
         };
+        // A VM-mode machine has already seeded its overlay and storage disks
+        // from the bundle during create. None of its boot devices uses the
+        // extraction cache, which may be evicted along with the original bundle.
+        // Skipping the empty layer share also saves a virtiofs device/IRQ.
+        if vm_mode {
+            // If an older start left a private macOS layers volume mounted,
+            // release it even though this VM no longer needs its contents.
+            smolvm_pack::extract::force_detach_layers_volume(layers_cache_dir);
+            return Ok(self);
+        }
+        let has_image_layers = pack_has_image_layers(Path::new(sidecar_path));
 
         // Shared pack store: if create extracted the pack into the node's shared
         // content-addressed store and dropped a pointer beside this machine, the
@@ -465,7 +489,7 @@ impl LaunchFeatures {
             // is empty by design: only a pack that has layers can have lost them.
             // Without this check every launch of a VM-mode machine (each start,
             // each branch child) re-ran the extraction and its full-pack digest.
-            if !shared_layers_populated(&layers) && pack_has_image_layers(Path::new(sidecar_path)) {
+            if !shared_layers_populated(&layers) && has_image_layers {
                 let sidecar = Path::new(sidecar_path);
                 if sidecar.exists() {
                     if let Ok(footer) = smolvm_pack::packer::read_footer_from_sidecar(sidecar) {
@@ -489,13 +513,18 @@ impl LaunchFeatures {
                     }
                 }
             }
+            if !has_image_layers {
+                return Ok(self);
+            }
             self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
             self.pack_idmap_source = Some(if layers.is_dir() { layers } else { shared });
             return Ok(self);
         }
 
         let marker_present = smolvm_pack::extract::is_extracted(layers_cache_dir);
-        if !marker_present || !smolvm_pack::extract::cached_layers_usable(layers_cache_dir) {
+        if !marker_present
+            || (has_image_layers && !smolvm_pack::extract::cached_layers_usable(layers_cache_dir))
+        {
             // Fallback: layers not yet extracted into this machine's own dir
             // (pre-this-layout machine, or an interrupted create), OR the
             // extraction marker survived while the layer files themselves were
@@ -530,6 +559,13 @@ impl LaunchFeatures {
                 false,
             )
             .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
+        }
+
+        if !has_image_layers {
+            // On macOS a fallback extraction may have mounted the private
+            // case-sensitive layers volume; no VM-mode device needs that mount.
+            smolvm_pack::extract::force_detach_layers_volume(layers_cache_dir);
+            return Ok(self);
         }
 
         let layers_lease = smolvm_pack::extract::acquire_layers_lease(layers_cache_dir, false)
@@ -3151,6 +3187,76 @@ mod tests {
         let pointer = super::super::shared_pack_pointer_path(&layers_cache_dir);
         fs::write(&pointer, shared.to_string_lossy().as_bytes()).unwrap();
         layers_cache_dir
+    }
+
+    // A VM-mode pack still needs its extracted disks, but no layer filesystem:
+    // attaching the empty share can exhaust x86_64 virtio IRQs when the machine
+    // also has host volumes. Check both shared and per-machine extraction paths.
+    #[test]
+    fn vm_mode_pack_does_not_attach_an_empty_layer_device() {
+        use smolvm_pack::{format::PackManifest, packer::Packer};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("vm.smolmachine");
+        let mut manifest = PackManifest::new(
+            "vm://source".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        manifest.mode = smolvm_pack::format::PackMode::Vm;
+        Packer::new(manifest).pack_artifact(&artifact).unwrap();
+        let artifact_path = artifact.to_str().unwrap();
+
+        let shared = tmp.path().join("_shared").join("check");
+        fs::create_dir_all(shared.join("layers")).unwrap();
+        let cache = machine_with_pointer(tmp.path(), &shared);
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&cache, Some(artifact_path))
+            .unwrap();
+        assert!(features.packed_layers_dir.is_none());
+        assert!(features.pack_idmap_source.is_none());
+
+        let private = tmp.path().join("private");
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&private, Some(artifact_path))
+            .unwrap();
+        assert!(smolvm_pack::extract::is_extracted(&private));
+        assert!(features.packed_layers_dir.is_none());
+        // Repeated starts should not re-extract a perfectly valid pack that
+        // intentionally has no image layers.
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&private, Some(artifact_path))
+            .unwrap();
+        assert!(features.packed_layers_dir.is_none());
+
+        // Once a machine has extracted its VM-mode disks, it must keep booting
+        // even if the original artifact is no longer available.
+        fs::remove_file(&artifact).unwrap();
+        for cache in [&private, &cache] {
+            let features = LaunchFeatures::default()
+                .with_packed_layers_with_mode(cache, Some(artifact_path), true)
+                .unwrap();
+            assert!(features.packed_layers_dir.is_none());
+            assert!(features.pack_idmap_source.is_none());
+        }
+        // VM-mode disks were seeded into the machine at create time. Their
+        // original extraction cache can be evicted independently of the VM.
+        let evicted = tmp.path().join("evicted-pack-cache");
+        let features = LaunchFeatures::default()
+            .with_packed_layers_with_mode(&evicted, Some(artifact_path), true)
+            .unwrap();
+        assert!(features.packed_layers_dir.is_none());
+        assert!(!evicted.exists());
+
+        // An image-mode record with missing layers still needs its sidecar for
+        // repair; never silently boot it without those layers.
+        let missing = tmp.path().join("missing-layers");
+        fs::create_dir_all(&missing).unwrap();
+        smolvm_pack::extract::mark_extracted(&missing).unwrap();
+        assert!(LaunchFeatures::default()
+            .with_packed_layers_with_mode(&missing, Some(artifact_path), false)
+            .is_err());
     }
 
     // Regression: the shared-store branch must present the `layers/` SUBDIR of the

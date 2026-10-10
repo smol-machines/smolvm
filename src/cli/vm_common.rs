@@ -1853,9 +1853,10 @@ fn start_vm_named_with_db(
         uid_share_dir: record.vm_uid_owner().map(smolvm::agent::vm_data_dir),
         ..Default::default()
     }
-    .with_packed_layers(
+    .with_packed_layers_with_mode(
         &smolvm::agent::machine_layers_cache_dir(name),
         record.source_smolmachine.as_deref(),
+        record.image.is_none(),
     )?;
     // Fork params (forkable base / clone-from-snapshot) — carried per-launch into
     // the boot subprocess's env by the manager, not via process-global env vars.

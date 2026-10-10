@@ -1532,9 +1532,10 @@ pub fn build_launch_features(
 ) -> crate::Result<crate::agent::LaunchFeatures> {
     let features = crate::agent::LaunchFeatures::default();
     let mut features = match machine_name {
-        Some(name) => features.with_packed_layers(
+        Some(name) => features.with_packed_layers_with_mode(
             &crate::agent::machine_layers_cache_dir(name),
             source_smolmachine,
+            image.is_none(),
         )?,
         None => features,
     };
