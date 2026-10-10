@@ -682,13 +682,14 @@ pub struct RunCmd {
     pub trust_host_certs: bool,
 
     /// Bind a credential the workload may use without ever seeing it:
-    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// NAME=ENV_VAR@HOST[,HOST...][:body]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
     /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
-    /// requests to the listed hosts. Can be used multiple times; implies --net.
+    /// requests to the listed hosts. Add :body for OAuth form-body tokens.
+    /// Can be used multiple times; implies --net.
     #[arg(
         long = "credential",
-        value_name = "NAME=ENV_VAR@HOST",
+        value_name = "NAME=ENV_VAR@HOST[:body]",
         help_heading = "Network"
     )]
     pub credential: Vec<String>,
@@ -4018,11 +4019,12 @@ pub struct CreateCmd {
     pub trust_host_certs: bool,
 
     /// Bind a credential the workload may use without ever seeing it:
-    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// NAME=ENV_VAR@HOST[,HOST...][:body]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
     /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
-    /// requests to the listed hosts. Can be used multiple times; implies --net.
-    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST")]
+    /// requests to the listed hosts. Add :body for OAuth form-body tokens.
+    /// Can be used multiple times; implies --net.
+    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST[:body]")]
     pub credential: Vec<String>,
 
     /// Restrict outbound to localhost only (implies --net)
