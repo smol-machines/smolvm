@@ -4078,7 +4078,18 @@ mod tests {
             let result = manager.stop_vm_process(pid, Some(start_time), true);
             let elapsed = started.elapsed();
             let after_start = process::process_start_time(pid);
-            let survived = matches!(child.try_wait(), Ok(None));
+            // NOTE_EXIT can arrive just before a child becomes waitable on
+            // macOS. Give the kernel a bounded interval to finish the exit.
+            let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let survived = loop {
+                match child.try_wait() {
+                    Ok(None) if std::time::Instant::now() < reap_deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(None) => break true,
+                    _ => break false,
+                }
+            };
             let _ = child.kill();
             let _ = child.wait();
 
