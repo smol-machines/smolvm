@@ -132,6 +132,16 @@ pub(crate) fn create_vm_with_workload(
 ) -> Result<()> {
     validate_vm_name(&spec.name, "name")
         .map_err(|reason| Error::config("validate machine name", reason))?;
+    for port in &spec.ports {
+        if port.host == 0 || port.guest == 0 {
+            return Err(Error::config(
+                "validate published ports",
+                "port 0 is not valid for VM port forwarding",
+            ));
+        }
+    }
+    PortMapping::check_duplicates(&spec.ports)
+        .map_err(|reason| Error::config("validate published ports", reason))?;
     let mut record = spec.to_record();
     if let Some(policy) = credentials.filter(|p| !p.is_empty()) {
         // A credential only ever travels over the network the machine has; it
@@ -1153,6 +1163,31 @@ mod tests {
         let launch = crate::credentials::CredentialLaunch::for_record("credentialed", &record)
             .expect("a credentialed record launches the interceptor");
         assert!(launch.supplied_only);
+    }
+
+    #[test]
+    fn embedded_create_rejects_invalid_published_ports_before_persisting() {
+        let db = test_db();
+        for (name, ports, expected) in [
+            ("zero-host", vec![PortMapping::new(0, 8080)], "port 0"),
+            ("zero-guest", vec![PortMapping::new(8080, 0)], "port 0"),
+            (
+                "duplicate-host",
+                vec![PortMapping::new(8080, 80), PortMapping::new(8080, 81)],
+                "duplicate host port",
+            ),
+        ] {
+            let mut spec = test_spec(name, true);
+            spec.ports = ports;
+            let error = create_vm(&db, &spec).unwrap_err();
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+            assert!(get_record(&db, name).is_err(), "{name} was persisted");
+        }
+
+        let mut spec = test_spec("valid-ports", true);
+        spec.ports = vec![PortMapping::new(8080, 80), PortMapping::new(8081, 80)];
+        create_vm(&db, &spec).unwrap();
+        assert_eq!(get_record(&db, "valid-ports").unwrap().ports.len(), 2);
     }
 
     #[test]
