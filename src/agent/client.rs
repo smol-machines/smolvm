@@ -3143,10 +3143,22 @@ impl AgentClient {
     ) -> Result<u64> {
         use std::io::Write;
 
-        // A caller may download over an existing file or symlink. Preserve it
-        // on a failed transfer; only remove files this transfer created.
+        // An existing destination (including a symlink) must keep its previous
+        // contents if the guest fails mid-stream. Stage those downloads until
+        // the complete stream arrives; new paths still stream straight to disk.
         let destination_existed = std::fs::symlink_metadata(local_path).is_ok();
-        let mut file = std::fs::File::create(local_path).map_err(|e| {
+        let mut file = if destination_existed {
+            // Keep large downloads on the destination filesystem when possible;
+            // a writable file in a read-only directory still works via /tmp.
+            let parent = local_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            tempfile::tempfile_in(parent).or_else(|_| tempfile::tempfile())
+        } else {
+            std::fs::File::create(local_path)
+        }
+        .map_err(|e| {
             Error::agent(
                 "write local file",
                 format!("{}: {}", local_path.display(), e),
@@ -3191,6 +3203,27 @@ impl AgentClient {
                 }
             }
         })();
+        let result = result.and_then(|total| {
+            if destination_existed {
+                use std::io::Seek;
+                file.rewind()
+                    .map_err(|e| Error::agent("read staged file", e.to_string()))?;
+                // Write through existing symlinks and hard links as File::create
+                // did before; only the guest's incomplete stream is staged.
+                let mut destination = std::fs::File::create(local_path).map_err(|e| {
+                    Error::agent(
+                        "write local file",
+                        format!("{}: {}", local_path.display(), e),
+                    )
+                })?;
+                std::io::copy(&mut file, &mut destination)
+                    .map_err(|e| Error::agent("write local file", e.to_string()))?;
+                destination
+                    .flush()
+                    .map_err(|e| Error::agent("flush local file", e.to_string()))?;
+            }
+            Ok(total)
+        });
         drop(file);
         if result.is_err() && !destination_existed {
             let _ = std::fs::remove_file(local_path);
@@ -4936,7 +4969,59 @@ mod streamed_path_cleanup_tests {
         assert!(client
             .receive_stream_to_path(&output, 1024, |_| {}, "read file")
             .is_err());
-        assert!(output.exists(), "existing destination must not be unlinked");
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"original",
+            "failed download must not truncate an existing destination"
+        );
+    }
+
+    #[test]
+    fn guest_error_does_not_truncate_an_existing_destination() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::Error {
+                message: "missing guest file".into(),
+                code: None,
+            },
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("existing.txt");
+        std::fs::write(&output, b"original").unwrap();
+        let mut client = AgentClient::from_stream(client_stream);
+        assert!(client
+            .receive_stream_to_path(&output, 1024, |_| {}, "read file")
+            .is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    }
+
+    #[test]
+    fn successful_transfer_overwrites_existing_destination() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::DataChunk {
+                data: b"new content".to_vec(),
+                done: true,
+            },
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("existing.txt");
+        std::fs::write(&output, b"original").unwrap();
+        let alias = dir.path().join("alias.txt");
+        std::fs::hard_link(&output, &alias).unwrap();
+        let mut client = AgentClient::from_stream(client_stream);
+        assert_eq!(
+            client
+                .receive_stream_to_path(&output, 1024, |_| {}, "read file")
+                .unwrap(),
+            b"new content".len() as u64
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"new content");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"new content");
     }
 
     #[test]
