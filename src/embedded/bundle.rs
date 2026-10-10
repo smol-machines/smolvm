@@ -84,7 +84,10 @@ mod tests {
         let first = set_bundle(b.clone());
         let again = set_bundle(b.clone());
         assert_eq!(first.is_ok(), again.is_ok());
-        let other = Bundle { boot_binary: Some(PathBuf::from("/elsewhere")), ..Default::default() };
+        let other = Bundle {
+            boot_binary: Some(PathBuf::from("/elsewhere")),
+            ..Default::default()
+        };
         assert!(set_bundle(other.clone()).is_err() || bundle() == Some(&other));
     }
 }

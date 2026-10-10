@@ -38,9 +38,9 @@ pub use imp::{
 /// smolvm they bundle. The CLI and the server build with themselves.
 pub fn builder_exe() -> std::io::Result<std::path::PathBuf> {
     match crate::embedded::bundle::boot_binary() {
-            Some(path) => Ok(path),
-            None => std::env::current_exe(),
-        }
+        Some(path) => Ok(path),
+        None => std::env::current_exe(),
+    }
 }
 
 /// Give a fresh registry-image machine a seeded storage disk before its first
