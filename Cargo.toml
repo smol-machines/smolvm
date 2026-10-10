@@ -180,3 +180,7 @@ lto = true
 codegen-units = 1
 panic = "abort"      # No unwinding - saves ~10% binary size
 strip = true
+
+# Temporary local patch until containerd-shim supports the 2.3 bootstrap stdin format.
+[patch.crates-io]
+containerd-shim = { path = "vendor/containerd-shim" }
