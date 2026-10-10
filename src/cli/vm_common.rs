@@ -788,7 +788,13 @@ pub(crate) fn build_vm_record_for(
     record.disks = params.disks.clone();
     record.cache_disk = params.cache_disk.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
-    record.network_backend = params.network_backend;
+    // A guest Docker daemon needs a routed NIC for bridged containers. TSI
+    // intercepts sockets in the VM but does not route the Docker bridge.
+    record.network_backend = smolvm::network::backend_for_docker_socket(
+        params.network_backend,
+        params.docker_socket,
+        params.net,
+    );
     record.dns = params.dns;
     record.network_name = params.network_name.clone();
     record.guest_subnet = params.guest_subnet.clone();

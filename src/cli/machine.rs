@@ -1797,7 +1797,11 @@ impl RunCmd {
             cpus: params.cpus,
             memory_mib: params.mem,
             network: params.net,
-            network_backend: params.network_backend,
+            network_backend: smolvm::network::backend_for_docker_socket(
+                params.network_backend,
+                self.docker_socket || params.docker_socket,
+                params.net,
+            ),
             dns: params.dns,
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
@@ -1816,6 +1820,7 @@ impl RunCmd {
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
         };
+        let selected_network_backend = resources.network_backend;
         validate_requested_network_backend(
             &resources,
             params.dns_filter_hosts.as_deref(),
@@ -2180,6 +2185,7 @@ impl RunCmd {
                                 o.ssh_agent = self.ssh_agent || o.ssh_agent;
                                 o.cuda = self.cuda || o.cuda;
                                 o.docker_socket = self.docker_socket || o.docker_socket;
+                                o.network_backend = selected_network_backend;
                                 o.gpu = self.gpu || o.gpu;
                                 o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
                                 o
@@ -2334,6 +2340,7 @@ impl RunCmd {
                             o.ssh_agent = self.ssh_agent || o.ssh_agent;
                             o.cuda = self.cuda || o.cuda;
                             o.docker_socket = self.docker_socket || o.docker_socket;
+                            o.network_backend = selected_network_backend;
                             o.gpu = self.gpu || o.gpu;
                             o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
                             o
