@@ -3472,7 +3472,7 @@ fn handle_streaming_file_read(
             return Ok(());
         }
     };
-    let mut file = match std::fs::File::open(&resolved) {
+    let mut file = match nsfile::open_file_for_read(&resolved) {
         Ok(f) => f,
         Err(e) => {
             send_response(
@@ -3489,11 +3489,10 @@ fn handle_streaming_file_read(
             return Ok(());
         }
     };
-    // Only stream regular files. Directories and special files (e.g. /dev/zero,
-    // FIFOs) `open()` successfully but misbehave on read — a directory fails with
-    // EISDIR *after* the chunk stream has started (desyncing the wire and bricking
-    // the connection), and an unbounded device never EOFs (hangs the caller). We
-    // must reject them with a clean error BEFORE the first DataChunk frame.
+    // Only stream regular files. Opening with O_NONBLOCK above prevents a FIFO
+    // from hanging before this check. Directories fail on read only after the
+    // first chunk (desyncing the wire), and devices may never reach EOF. Reject
+    // them with a clean error BEFORE the first DataChunk frame.
     let metadata = match file.metadata() {
         Ok(m) => m,
         Err(e) => {
