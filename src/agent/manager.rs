@@ -1226,7 +1226,7 @@ impl AgentManager {
         // cache dir and use that, so `npm i` / `pip install` is self-contained
         // with no separate engine install. Re-extracts when the tarball changes
         // (a new SDK version ships a newer agent).
-        if let Some(tar) = std::env::var_os("SMOLVM_AGENT_ROOTFS_TAR") {
+        if let Some(tar) = crate::embedded::bundle::agent_rootfs_tar() {
             return Self::ensure_extracted_rootfs(Path::new(&tar));
         }
 
@@ -2368,8 +2368,8 @@ impl AgentManager {
                 shared_setting.as_deref(),
                 external_daemon,
             ) {
-                let daemon_executable = match std::env::var_os("SMOLVM_BOOT_BINARY") {
-                    Some(path) => PathBuf::from(path),
+                let daemon_executable = match crate::embedded::bundle::boot_binary() {
+                    Some(path) => path,
                     None => crate::process::self_exe_for_spawn()
                         .map_err(|error| Error::agent("find smolvm binary", error.to_string()))?,
                 };
@@ -2776,8 +2776,10 @@ impl AgentManager {
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
         // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
-        let boot_binary = std::env::var_os("SMOLVM_BOOT_BINARY");
-        // An in-process embedder (the Node/Python SDK) sets SMOLVM_BOOT_BINARY and
+        // The embedder's registered helper first (`embedded::bundle`), then the
+        // SMOLVM_BOOT_BINARY override a CLI wrapper may set.
+        let boot_binary = crate::embedded::bundle::boot_binary();
+        // An in-process embedder (the Node/Python SDK) registers a boot helper and
         // owns the VM's lifetime — when that host process dies, the VM must die
         // too, or it leaks as an orphan holding the VM's full RAM. The CLI (which
         // detaches the VM on purpose) and `serve` (which reconnects to surviving
@@ -2790,9 +2792,7 @@ impl AgentManager {
         // `features.watch_parent = Some(false)` — otherwise its persistent
         // machines die the moment the CLI process exits.
         let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
-        let boot_exe = boot_binary
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| exe.clone());
+        let boot_exe = boot_binary.unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
         if let Some(service) = crate::network::launch::guest_host_service()
             .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
@@ -2816,8 +2816,12 @@ impl AgentManager {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let mut search: Vec<std::path::PathBuf> = Vec::new();
-            if let Some(dir) = std::env::var_os("SMOLVM_LIB_DIR") {
-                search.push(std::path::PathBuf::from(dir));
+            if let Some(dir) = crate::embedded::bundle::lib_dir() {
+                // The boot helper resolves libkrun through SMOLVM_LIB_DIR too, and an
+                // embedder's bundle is not in our environment, so pass it to the
+                // child explicitly. Child-only: nothing else inherits it.
+                cmd.env(crate::data::consts::ENV_SMOLVM_LIB_DIR, &dir);
+                search.push(dir);
             }
             if let Some(parent) = boot_exe.parent() {
                 search.push(parent.to_path_buf());

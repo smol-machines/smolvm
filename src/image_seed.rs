@@ -37,10 +37,10 @@ pub use imp::{
 /// so their own executable is not smolvm; they point `SMOLVM_BOOT_BINARY` at the
 /// smolvm they bundle. The CLI and the server build with themselves.
 pub fn builder_exe() -> std::io::Result<std::path::PathBuf> {
-    match std::env::var_os("SMOLVM_BOOT_BINARY") {
-        Some(path) => Ok(path.into()),
-        None => std::env::current_exe(),
-    }
+    match crate::embedded::bundle::boot_binary() {
+            Some(path) => Ok(path),
+            None => std::env::current_exe(),
+        }
 }
 
 /// Give a fresh registry-image machine a seeded storage disk before its first

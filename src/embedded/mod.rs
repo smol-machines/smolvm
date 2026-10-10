@@ -1,5 +1,6 @@
 //! Language-neutral embedded runtime support for SDK bindings.
 
+pub mod bundle;
 mod control;
 mod exec;
 mod handle;

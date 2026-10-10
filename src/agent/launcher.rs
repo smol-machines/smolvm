@@ -156,8 +156,8 @@ pub struct VmDisks<'a> {
 /// - `<exe_dir>/../../lib/linux-<arch>/` (source tree dev builds)
 pub fn find_lib_dir() -> Option<PathBuf> {
     let lib_names = [libkrun_filename(), libkrunfw_filename()];
-    if let Ok(explicit_dir) = std::env::var(ENV_SMOLVM_LIB_DIR) {
-        let path = PathBuf::from(explicit_dir);
+    // An embedder's registered bundle first, then the SMOLVM_LIB_DIR override.
+    if let Some(path) = crate::embedded::bundle::lib_dir() {
         if lib_names.iter().all(|lib| path.join(lib).exists()) {
             return path.canonicalize().ok().or(Some(path));
         }
