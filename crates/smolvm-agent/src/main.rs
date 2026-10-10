@@ -3169,6 +3169,15 @@ impl WriteSession {
     /// to close the handle first; it drops naturally when this
     /// function returns via the by-value caller pattern.
     fn finalize(&mut self) -> AgentResponse {
+        if self.bytes_written != self.total_size {
+            return AgentResponse::error(
+                format!(
+                    "incomplete file write ({} of {} bytes received)",
+                    self.bytes_written, self.total_size
+                ),
+                error_codes::INVALID_REQUEST,
+            );
+        }
         use std::io::Write;
         if let Err(e) = self.tmp_file.flush() {
             return AgentResponse::error(
@@ -8404,6 +8413,22 @@ mod tests {
         expected.extend(std::iter::repeat_n(b'B', 400));
         expected.extend(std::iter::repeat_n(b'C', 224));
         assert_eq!(got, expected);
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn streaming_write_rejects_early_final_chunk_without_replacing_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "short.bin");
+        std::fs::write(&target, b"original").unwrap();
+
+        let (session, resp) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10);
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+        let (session, resp) = handle_file_write_chunk(session, b"short", true);
+        assert!(session.is_none());
+        assert!(matches!(resp, AgentResponse::Error { .. }));
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
         assert!(staging_files_in(tmp.path()).is_empty());
     }
 

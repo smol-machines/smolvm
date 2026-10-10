@@ -762,9 +762,8 @@ pub enum AgentRequest {
         #[serde(default)]
         gid: Option<u32>,
         /// Expected total size in bytes. Rejected if it exceeds
-        /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent uses this for an
-        /// early-fail check only; the actual size written is the sum
-        /// of chunk byte lengths.
+        /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent finalizes only after
+        /// receiving exactly this many bytes.
         total_size: u64,
     },
 

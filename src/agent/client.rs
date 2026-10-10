@@ -2950,6 +2950,12 @@ impl AgentClient {
             let mut data = Vec::with_capacity(total_size as usize);
             std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size), &mut data)
                 .map_err(|e| Error::agent("read source file", e.to_string()))?;
+            if data.len() as u64 != total_size {
+                return Err(Error::agent(
+                    "read source file",
+                    format!("source ended after {} of {} bytes", data.len(), total_size),
+                ));
+            }
             return self.write_file_with_progress(path, &data, meta, on_progress);
         }
         self.write_file_streaming_from_reader(
@@ -2988,33 +2994,31 @@ impl AgentClient {
         let mut buf = vec![0u8; FILE_WRITE_CHUNK_SIZE];
         let mut bytes_sent = 0u64;
 
-        loop {
-            // Fill the chunk buffer.
+        while bytes_sent < total_size {
+            // Never read past the declared size. In particular, the final
+            // chunk can be shorter than the protocol's 1 MiB chunk size.
+            let chunk_len = (total_size - bytes_sent).min(buf.len() as u64) as usize;
             let mut filled = 0;
-            while filled < buf.len() {
-                match reader.read(&mut buf[filled..]) {
-                    Ok(0) => break,
+            while filled < chunk_len {
+                match reader.read(&mut buf[filled..chunk_len]) {
+                    Ok(0) => {
+                        return Err(Error::agent(
+                            "read source file",
+                            format!(
+                                "source ended after {} of {} bytes",
+                                bytes_sent + filled as u64,
+                                total_size
+                            ),
+                        ));
+                    }
                     Ok(n) => filled += n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(Error::agent("read source file", e.to_string())),
                 }
             }
 
-            if filled == 0 {
-                // EOF — send final empty chunk to finalize.
-                let resp = self.request_with_write_idle_timeout(
-                    &AgentRequest::FileWriteChunk {
-                        data: Vec::new(),
-                        done: true,
-                    },
-                    transfer_write_timeout,
-                )?;
-                expect_ok(resp, "finalize streaming write")?;
-                break;
-            }
-
             bytes_sent += filled as u64;
-            let done = bytes_sent >= total_size;
+            let done = bytes_sent == total_size;
 
             let resp = self.request_with_write_idle_timeout(
                 &AgentRequest::FileWriteChunk {
@@ -3877,6 +3881,112 @@ mod collect_exec_cap_tests {
             !events.iter().any(|e| matches!(e, ExecEvent::Error(_))),
             "clean exec must not inject a truncation error"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod upload_reader_tests {
+    use super::*;
+    use std::io::{Cursor, Read, Write};
+
+    #[test]
+    fn an_uneven_upload_reads_exactly_the_declared_size() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let total = FILE_WRITE_CHUNK_SIZE + 7;
+        let server = std::thread::spawn(move || {
+            let mut received = 0usize;
+            loop {
+                let mut header = [0; 4];
+                server_stream.read_exact(&mut header).unwrap();
+                let mut frame = vec![0; u32::from_be_bytes(header) as usize];
+                server_stream.read_exact(&mut frame).unwrap();
+                let request: Envelope<AgentRequest> = serde_json::from_slice(&frame).unwrap();
+                let done = match request.body {
+                    AgentRequest::FileWriteBegin { total_size, .. } => {
+                        assert_eq!(total_size, total as u64);
+                        false
+                    }
+                    AgentRequest::FileWriteChunk { data, done } => {
+                        received += data.len();
+                        assert!(received <= total, "upload overran the declared size");
+                        if done {
+                            assert_eq!(received, total);
+                            assert_eq!(data.len(), 7);
+                        }
+                        done
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                server_stream
+                    .write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                    .unwrap();
+                if done {
+                    break;
+                }
+            }
+        });
+        // Extra bytes from a generic Read source must not reach the guest.
+        let reader = Cursor::new(vec![42; total + 13]);
+        AgentClient::from_stream(client_stream)
+            .write_file_from_reader("/workspace/file", reader, total as u64, None)
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_short_single_shot_reader_does_not_upload_partial_contents() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let mut client = AgentClient::from_stream(client_stream);
+        let error = client
+            .write_file_from_reader("/workspace/file", Cursor::new(b"hi"), 5, None)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("source ended after 2 of 5 bytes"));
+        server_stream.as_socket().set_nonblocking(true).unwrap();
+        let mut header = [0; 4];
+        assert!(
+            server_stream.read(&mut header).is_err(),
+            "must not write to guest"
+        );
+    }
+
+    #[test]
+    fn an_early_eof_never_finalizes_a_short_upload() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let total = FILE_WRITE_CHUNK_SIZE + 7;
+        let server = std::thread::spawn(move || {
+            let mut chunks = 0;
+            loop {
+                let mut header = [0; 4];
+                if server_stream.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let mut frame = vec![0; u32::from_be_bytes(header) as usize];
+                server_stream.read_exact(&mut frame).unwrap();
+                let request: Envelope<AgentRequest> = serde_json::from_slice(&frame).unwrap();
+                if let AgentRequest::FileWriteChunk { done, .. } = request.body {
+                    assert!(!done, "truncated source must not finalize");
+                    chunks += 1;
+                }
+                server_stream
+                    .write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                    .unwrap();
+            }
+            assert_eq!(chunks, 1);
+        });
+        let mut client = AgentClient::from_stream(client_stream);
+        let error = client
+            .write_file_from_reader(
+                "/workspace/file",
+                Cursor::new(vec![42; FILE_WRITE_CHUNK_SIZE + 3]),
+                total as u64,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("source ended"));
+        drop(client);
+        server.join().unwrap();
     }
 }
 

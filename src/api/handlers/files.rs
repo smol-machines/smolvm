@@ -190,6 +190,9 @@ impl BodyReader {
 
 impl std::io::Read for BodyReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.remaining == 0 {
+            return Ok(0);
+        }
         while self.current.is_empty() {
             match self.chunks.blocking_recv() {
                 Some(chunk) => self.current = chunk?,
@@ -204,8 +207,11 @@ impl std::io::Read for BodyReader {
                 }
             }
         }
-        let n = buf.len().min(self.current.len());
-        self.remaining = self.remaining.saturating_sub(n as u64);
+        let n = buf
+            .len()
+            .min(self.current.len())
+            .min(self.remaining as usize);
+        self.remaining -= n as u64;
         buf[..n].copy_from_slice(&self.current[..n]);
         self.current = self.current.slice(n..);
         Ok(n)
@@ -363,6 +369,23 @@ mod body_reader_tests {
         .unwrap()
         .unwrap();
         assert_eq!(out, b"hello world");
+    }
+
+    /// A producer's final chunk can be larger than the declared remainder.
+    /// A synchronous reader must never hand more than the advertised bytes
+    /// to the guest, even when an upstream body is malformed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_reader_stops_at_the_declared_size() {
+        let reader = BodyReader::spawn(body(vec![Ok(b"hello world")]), 5);
+        let out = tokio::task::spawn_blocking(move || {
+            let mut reader = reader;
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).map(|_| out)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(out, b"hello");
     }
 
     /// A body that stops before its declared length is an error, so the
