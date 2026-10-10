@@ -652,7 +652,7 @@ impl PackCreateCmd {
             .staging_dir
             .clone()
             .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
-            .or_else(|| dirs::cache_dir().map(|c| c.join("smolvm")))
+            .or_else(|| smolvm::process::state_cache_dir().map(|c| c.join("smolvm")))
             .unwrap_or_else(std::env::temp_dir);
         std::fs::create_dir_all(&root)
             .map_err(|e| Error::agent("create staging root", e.to_string()))?;
@@ -1634,7 +1634,7 @@ impl PackPruneCmd {
         }
 
         // Clean pack sidecar cache
-        if let Some(base) = dirs::cache_dir() {
+        if let Some(base) = smolvm::process::state_cache_dir() {
             let pack_cache = base.join("smolvm-pack");
             let (freed, removed) = self.prune_cache_dir(&pack_cache, keep, "pack cache")?;
             total_freed += freed;

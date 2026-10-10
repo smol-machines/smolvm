@@ -1299,6 +1299,64 @@ pub fn vm_uid_drop_active() -> bool {
     false
 }
 
+/// Explicit Linux state root, shared by the CLI and embedded SDK. Embedders
+/// must not mutate process-wide HOME: their host application may already run
+/// threads and unrelated subprocesses.
+pub fn system_data_root() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    if let Some(root) = std::env::var_os("SMOLVM_DATA_DIR") {
+        return Some(std::path::PathBuf::from(root));
+    }
+    None
+}
+
+/// Cache directory for VM state, honoring an explicit Linux system data root.
+pub fn state_cache_dir() -> Option<std::path::PathBuf> {
+    system_data_root()
+        .map(|root| root.join(".cache"))
+        .or_else(dirs::cache_dir)
+}
+
+/// Local data directory for VM state, honoring an explicit Linux system data root.
+pub fn state_data_local_dir() -> Option<std::path::PathBuf> {
+    system_data_root()
+        .map(|root| root.join(".local/share"))
+        .or_else(dirs::data_local_dir)
+}
+
+/// Data directory for VM state, honoring an explicit Linux system data root.
+pub fn state_data_dir() -> Option<std::path::PathBuf> {
+    system_data_root()
+        .map(|root| root.join(".local/share"))
+        .or_else(dirs::data_dir)
+}
+
+/// Home directory for VM configuration, honoring an explicit Linux system data root.
+pub fn state_home_dir() -> Option<std::path::PathBuf> {
+    system_data_root().or_else(dirs::home_dir)
+}
+
+/// Make an explicit state root traversable by the per-VM uid, without changing
+/// the embedding program's environment. The CLI does this during early startup.
+#[cfg(target_os = "linux")]
+pub fn prepare_embedded_data_root() -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(root) = system_data_root() {
+        std::fs::create_dir_all(&root)?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))?;
+        // A source SDK checkout may use the separately installed agent rootfs
+        // rather than a bundled tarball. Give it the same relocated rootfs the
+        // CLI uses, without changing HOME in the embedding process.
+        if let Some(src) = installed_agent_rootfs() {
+            let dst = root.join(".local/share/smolvm/agent-rootfs");
+            if src != dst {
+                sync_agent_rootfs(&src, &dst)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Relocate all smolvm state under a single system data root by pointing `HOME`
 /// at it before any path is computed — every `dirs::`-derived path (VM dirs,
 /// agent rootfs, templates, server DB) follows. This is what lets per-VM uid

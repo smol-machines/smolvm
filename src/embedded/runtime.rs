@@ -76,6 +76,9 @@ pub struct EmbeddedRuntime {
 impl EmbeddedRuntime {
     /// Create a runtime backed by the default smolvm database.
     pub fn new() -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        crate::process::prepare_embedded_data_root()
+            .map_err(|e| Error::storage("prepare data root", e.to_string()))?;
         Ok(Self::with_db(SmolvmDb::open()?))
     }
 
