@@ -342,25 +342,31 @@ pub async fn exec_stream(
     // Yield each event as an SSE frame the instant it lands in the channel.
     let stream = async_stream::stream! {
         while let Some(event) = rx.recv().await {
-            let sse_event = match event {
-                crate::agent::ExecEvent::Stdout(data) => Event::default()
-                    .event("stdout")
-                    .data(String::from_utf8_lossy(&data)),
-                crate::agent::ExecEvent::Stderr(data) => Event::default()
-                    .event("stderr")
-                    .data(String::from_utf8_lossy(&data)),
-                crate::agent::ExecEvent::Exit(code) => Event::default()
-                    .event("exit")
-                    .data(format!("{{\"exitCode\":{}}}", code)),
-                crate::agent::ExecEvent::Error(msg) => Event::default()
-                    .event("error")
-                    .data(format!("{{\"message\":\"{}\"}}", msg)),
-            };
+            let sse_event = exec_event_to_sse(event);
             yield Ok::<_, Infallible>(sse_event);
         }
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Encode a guest exec event as an SSE frame. Errors can include arbitrary
+/// guest or transport text, so JSON-escape their payload before sending it.
+fn exec_event_to_sse(event: crate::agent::ExecEvent) -> Event {
+    match event {
+        crate::agent::ExecEvent::Stdout(data) => Event::default()
+            .event("stdout")
+            .data(String::from_utf8_lossy(&data)),
+        crate::agent::ExecEvent::Stderr(data) => Event::default()
+            .event("stderr")
+            .data(String::from_utf8_lossy(&data)),
+        crate::agent::ExecEvent::Exit(code) => Event::default()
+            .event("exit")
+            .data(serde_json::json!({"exitCode": code}).to_string()),
+        crate::agent::ExecEvent::Error(msg) => Event::default()
+            .event("error")
+            .data(serde_json::json!({"message": msg}).to_string()),
+    }
 }
 
 /// Run a command in an image.
@@ -1420,6 +1426,28 @@ mod log_stream_tests {
             .await
             .unwrap()
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn exec_error_preserves_quotes_backslashes_newlines_and_control_bytes() {
+        use axum::response::IntoResponse as _;
+        let original = "guest \"failure\" at C:\\tmp\\file\nsecond line\u{0001} ✓";
+        let response = Sse::new(futures_util::stream::iter([Ok::<_, Infallible>(
+            exec_event_to_sse(crate::agent::ExecEvent::Error(original.into())),
+        )]))
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.starts_with("event: error\ndata: "), "{text}");
+        let payload = text
+            .strip_prefix("event: error\ndata: ")
+            .unwrap()
+            .strip_suffix("\n\n")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed["message"], original);
     }
 
     #[tokio::test]
