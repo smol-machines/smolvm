@@ -215,7 +215,7 @@ const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Body cap for the file-upload route. axum's 2 MiB default silently 413s larger
 /// uploads before the handler runs; the control plane permits 100 MiB, so match
 /// it here. The agent streams the write and enforces the true ceiling.
-const MAX_FILE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_FILE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 /// Bounded but large enough for cohorts of pre-tokenized RL prompts.
 const MAX_ROLLOUT_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 

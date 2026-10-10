@@ -69,9 +69,20 @@ pub async fn upload_file(
     State(state): State<Arc<ApiState>>,
     Path((id, file_path)): Path<(String, String)>,
     trace_id: Option<axum::Extension<TraceId>>,
-    body: Bytes,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
 ) -> Result<Json<FileUploadResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
+    let limit = crate::api::MAX_FILE_UPLOAD_BYTES as u64;
+    let too_large =
+        || ApiError::PayloadTooLarge(format!("file exceeds the {} MiB upload limit", limit >> 20));
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > limit) {
+        return Err(too_large());
+    }
     let entry = state.get_machine(&id)?;
     ensure_running_and_persist(&state, &id, &entry)
         .await
@@ -81,7 +92,28 @@ pub async fn upload_file(
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
-    let size = body.len() as u64;
+
+    // A large body of known size is written into the guest as it arrives,
+    // so the upload costs one pass over the network, not that plus a second
+    // pass from memory once it has all arrived. Anything else is read whole.
+    let source = match declared {
+        Some(len) if len > smolvm_protocol::FILE_WRITE_SINGLE_SHOT_MAX as u64 => {
+            UploadSource::Streamed(len, BodyReader::spawn(body, len))
+        }
+        _ => UploadSource::Whole(axum::body::to_bytes(body, limit as usize).await.map_err(
+            |e| {
+                if e.to_string().contains("length limit") {
+                    too_large()
+                } else {
+                    ApiError::BadRequest(format!("upload body did not arrive in full: {e}"))
+                }
+            },
+        )?),
+    };
+    let size = match &source {
+        UploadSource::Streamed(len, _) => *len,
+        UploadSource::Whole(bytes) => bytes.len() as u64,
+    };
 
     with_machine_client_traced(&entry, tid, move |c| {
         // For image machines, mount the per-machine persistent container overlay
@@ -100,7 +132,15 @@ pub async fn upload_file(
                     .with_persistent_overlay(Some(overlay_id.clone())),
             )?;
         }
-        c.write_file(&guest_path, &body, None)
+        match source {
+            // The agent stages a streamed file and renames it into place only
+            // once all of it is written, so a body that stops short leaves
+            // nothing at the path.
+            UploadSource::Streamed(len, reader) => {
+                c.write_file_from_reader(&guest_path, reader, len, None)
+            }
+            UploadSource::Whole(bytes) => c.write_file(&guest_path, &bytes, None),
+        }
     })
     .await?;
 
@@ -108,6 +148,68 @@ pub async fn upload_file(
         path: format!("/{}", file_path),
         size,
     }))
+}
+
+enum UploadSource {
+    Streamed(u64, BodyReader),
+    Whole(Bytes),
+}
+
+/// A request body read synchronously, as the agent client reads its source,
+/// while a task feeds it the chunks as they arrive.
+struct BodyReader {
+    chunks: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>,
+    current: Bytes,
+    /// Bytes still owed by the declared length.
+    remaining: u64,
+}
+
+impl BodyReader {
+    fn spawn(body: axum::body::Body, len: u64) -> Self {
+        use futures_util::StreamExt;
+        // A few chunks of slack keep the network and the guest writes
+        // overlapping without holding the body in memory.
+        let (tx, chunks) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            let mut stream = body.into_data_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()));
+                let failed = chunk.is_err();
+                if tx.send(chunk).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Self {
+            chunks,
+            current: Bytes::new(),
+            remaining: len,
+        }
+    }
+}
+
+impl std::io::Read for BodyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.current.is_empty() {
+            match self.chunks.blocking_recv() {
+                Some(chunk) => self.current = chunk?,
+                None if self.remaining == 0 => return Ok(0),
+                // A body that ends before its declared length must fail the
+                // write, never finish a short file.
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("upload ended {} bytes short", self.remaining),
+                    ))
+                }
+            }
+        }
+        let n = buf.len().min(self.current.len());
+        self.remaining = self.remaining.saturating_sub(n as u64);
+        buf[..n].copy_from_slice(&self.current[..n]);
+        self.current = self.current.slice(n..);
+        Ok(n)
+    }
 }
 
 /// Download a file, or list a directory, from a machine.
@@ -236,5 +338,69 @@ mod directory_listing_tests {
             !is_directory_error("not a regular file: /run/docker.sock"),
             "a socket must not be retried as a listing"
         );
+    }
+}
+
+#[cfg(test)]
+mod body_reader_tests {
+    use super::BodyReader;
+    use std::io::Read;
+
+    fn body(chunks: Vec<Result<&'static [u8], std::io::Error>>) -> axum::body::Body {
+        axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+    }
+
+    /// A body that delivers its declared length reads back whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_whole_body_reads_back_in_full() {
+        let reader = BodyReader::spawn(body(vec![Ok(b"hello "), Ok(b"world")]), 11);
+        let out = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let mut reader = reader;
+            reader.read_to_end(&mut out).map(|_| out)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(out, b"hello world");
+    }
+
+    /// A body that stops before its declared length is an error, so the
+    /// write fails instead of finishing a short file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_that_ends_short_is_an_error() {
+        let reader = BodyReader::spawn(body(vec![Ok(b"hello")]), 11);
+        let error = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let mut reader = reader;
+            reader.read_to_end(&mut out)
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A body the client breaks off is an error too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broken_body_is_an_error() {
+        let reader = BodyReader::spawn(
+            body(vec![
+                Ok(b"hello"),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "gone",
+                )),
+            ]),
+            11,
+        );
+        let result = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let mut reader = reader;
+            reader.read_to_end(&mut out)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
     }
 }

@@ -29,6 +29,8 @@ pub enum ApiError {
     CloneIdentityRejuvenationFailed(String),
     /// Bad request - invalid input (400).
     BadRequest(String),
+    /// The request body is larger than this route accepts (413).
+    PayloadTooLarge(String),
     /// Durable refusal: retries of this operation cannot apply the resize.
     ResizeRejected {
         /// Request identity whose rejection has been persisted.
@@ -93,6 +95,9 @@ impl IntoResponse for ApiError {
                 msg,
             ),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg),
+            ApiError::PayloadTooLarge(msg) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE", msg)
+            }
             ApiError::Timeout => (
                 StatusCode::REQUEST_TIMEOUT,
                 "TIMEOUT",
@@ -228,6 +233,10 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (ApiError::BadRequest("x".into()), StatusCode::BAD_REQUEST),
+            (
+                ApiError::PayloadTooLarge("x".into()),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
             (ApiError::Timeout, StatusCode::REQUEST_TIMEOUT),
             (
                 ApiError::Unavailable("x".into()),
