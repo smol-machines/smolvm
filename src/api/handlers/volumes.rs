@@ -40,7 +40,7 @@ pub struct ProvisionVolumeResponse {
 
 /// Base directory for node-local volumes: `<data_local_dir>/smolvm/volumes`.
 fn volumes_base() -> std::path::PathBuf {
-    dirs::data_local_dir()
+    crate::process::state_data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("smolvm")
         .join("volumes")

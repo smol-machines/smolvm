@@ -1511,7 +1511,7 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
         .staging_dir
         .clone()
         .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
-        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")))
+        .or_else(|| crate::process::state_cache_dir().map(|cache| cache.join("smolvm")))
         .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&root)
         .map_err(|error| Error::agent("create checkpoint staging root", error.to_string()))?;

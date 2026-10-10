@@ -721,8 +721,8 @@ pub fn read_egress_telemetry(name: &str) -> Option<u64> {
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
-    dirs::cache_dir()
-        .or_else(dirs::data_local_dir)
+    crate::process::state_cache_dir()
+        .or_else(crate::process::state_data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("smolvm")
         .join("vms")
@@ -1090,7 +1090,7 @@ impl AgentManager {
             vm_data_dir(vm_name)
         } else {
             dirs::runtime_dir()
-                .or_else(dirs::cache_dir)
+                .or_else(crate::process::state_cache_dir)
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("smolvm")
         };
@@ -1263,8 +1263,8 @@ impl AgentManager {
             }
         }
 
-        let data_dir = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
+        let data_dir = crate::process::state_data_local_dir()
+            .or_else(crate::process::state_data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
         Ok(data_dir.join("smolvm").join("agent-rootfs"))
@@ -1335,7 +1335,7 @@ impl AgentManager {
             .unwrap_or(0);
         let key = format!("{:x}-{:x}", meta.len(), mtime);
 
-        let base = dirs::cache_dir()
+        let base = crate::process::state_cache_dir()
             .ok_or_else(|| Error::storage("resolve cache dir", "no cache directory"))?
             .join("smolvm")
             .join("rootfs");

@@ -76,7 +76,7 @@ impl SmolSettings {
             }
             return Ok(PathBuf::from(custom));
         }
-        let home = dirs::home_dir()
+        let home = crate::process::state_home_dir()
             .ok_or_else(|| Error::config("resolve path", "no home directory found"))?;
         Ok(home.join(".config").join("smolvm").join("config.toml"))
     }

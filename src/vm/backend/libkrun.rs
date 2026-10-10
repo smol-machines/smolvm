@@ -521,7 +521,7 @@ fn inject_init_krun(rootfs: &Path) -> Result<()> {
     // Look for init.krun in standard locations
     let sources = [
         // User's local smolvm data directory (macOS: ~/Library/Application Support)
-        dirs::data_local_dir().map(|d| d.join("smolvm/init.krun")),
+        crate::process::state_data_local_dir().map(|d| d.join("smolvm/init.krun")),
         // XDG data home (Linux: ~/.local/share, works on macOS too)
         dirs::home_dir().map(|d| d.join(".local/share/smolvm/init.krun")),
         // System-wide location

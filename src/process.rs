@@ -1299,6 +1299,83 @@ pub fn vm_uid_drop_active() -> bool {
     false
 }
 
+/// Explicit Linux state root, shared by the CLI and embedded SDK. Embedders
+/// must not mutate process-wide HOME: their host application may already run
+/// threads and unrelated subprocesses.
+pub fn system_data_root() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    if let Some(root) = std::env::var_os("SMOLVM_DATA_DIR") {
+        return Some(std::path::PathBuf::from(root));
+    }
+    None
+}
+
+/// Cache directory for VM state, honoring an explicit Linux system data root.
+pub fn state_cache_dir() -> Option<std::path::PathBuf> {
+    system_data_root()
+        .map(|root| root.join(".cache"))
+        .or_else(dirs::cache_dir)
+}
+
+/// Local data directory for VM state, honoring an explicit Linux system data root.
+pub fn state_data_local_dir() -> Option<std::path::PathBuf> {
+    system_data_root()
+        .map(|root| root.join(".local/share"))
+        .or_else(dirs::data_local_dir)
+}
+
+/// Data directory for VM state, honoring an explicit Linux system data root.
+pub fn state_data_dir() -> Option<std::path::PathBuf> {
+    system_data_root()
+        .map(|root| root.join(".local/share"))
+        .or_else(dirs::data_dir)
+}
+
+/// Home directory for VM configuration, honoring an explicit Linux system data root.
+pub fn state_home_dir() -> Option<std::path::PathBuf> {
+    system_data_root().or_else(dirs::home_dir)
+}
+
+/// Keep sensitive state private even when per-VM uids can traverse the data root.
+/// The CLI and embedded runtime must apply the same protection before opening
+/// the database or loading credentials.
+#[cfg(target_os = "linux")]
+fn secure_sensitive_state_dirs(root: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for relative in [
+        ".local/share/smolvm/server",
+        ".local/share/smolvm/node-credentials",
+        ".config/smolvm",
+    ] {
+        let dir = root.join(relative);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Make an explicit state root traversable by the per-VM uid, without changing
+/// the embedding program's environment. The CLI does this during early startup.
+#[cfg(target_os = "linux")]
+pub fn prepare_embedded_data_root() -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(root) = system_data_root() {
+        std::fs::create_dir_all(&root)?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))?;
+        secure_sensitive_state_dirs(&root)?;
+        // A source SDK checkout may use the separately installed agent rootfs
+        // rather than a bundled tarball. Give it the same relocated rootfs the
+        // CLI uses, without changing HOME in the embedding process.
+        if let Some(src) = installed_agent_rootfs() {
+            let dst = root.join(".local/share/smolvm/agent-rootfs");
+            if src != dst {
+                sync_agent_rootfs(&src, &dst)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Relocate all smolvm state under a single system data root by pointing `HOME`
 /// at it before any path is computed — every `dirs::`-derived path (VM dirs,
 /// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
@@ -1309,7 +1386,7 @@ pub fn vm_uid_drop_active() -> bool {
 /// one-off root CLI invocation shouldn't silently switch roots). Must be called
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
 #[cfg(target_os = "linux")]
-pub fn apply_system_data_root(allow_auto: bool) {
+pub fn apply_system_data_root(allow_auto: bool) -> std::io::Result<()> {
     let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
         std::path::PathBuf::from(explicit)
     } else if let Some(workspace_root) = overlay_workspace_root() {
@@ -1325,22 +1402,17 @@ pub fn apply_system_data_root(allow_auto: bool) {
     {
         std::path::PathBuf::from("/var/lib/smolvm")
     } else {
-        return;
+        return Ok(());
     };
     // Relocating HOME also relocates the fallback agent rootfs path. Preserve
     // the installed rootfs for explicit SMOLVM_DATA_DIR and serve's /var/lib
     // default, just as we do for the overlayfs workspace default.
     let carry_rootfs_from = installed_agent_rootfs();
-    match std::fs::create_dir_all(&root) {
-        Ok(()) => {
-            use std::os::unix::fs::PermissionsExt;
-            // 0755 so dropped VMM uids can traverse to their data.
-            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
-        }
-        Err(e) => {
-            tracing::warn!(root = %root.display(), error = %e, "failed to create smolvm data root")
-        }
-    }
+    std::fs::create_dir_all(&root)?;
+    use std::os::unix::fs::PermissionsExt;
+    // 0755 so dropped VMM uids can traverse to their data.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))?;
+    secure_sensitive_state_dirs(&root)?;
     // Registry auth (crane/docker) falls back to `$HOME/.docker`, which we're about
     // to move off the operator's real home — pin DOCKER_CONFIG to the ORIGINAL
     // `~/.docker` (if it exists and the operator hasn't set DOCKER_CONFIG) so
@@ -1370,6 +1442,7 @@ pub fn apply_system_data_root(allow_auto: bool) {
         }
     }
     tracing::info!(data_root = %root.display(), "smolvm state rooted at a system data dir");
+    Ok(())
 }
 
 /// `statfs` magic numbers for the filesystems this decision distinguishes.
@@ -1478,7 +1551,9 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
 
 /// No-op where the data root isn't applicable (macOS dev).
 #[cfg(not(target_os = "linux"))]
-pub fn apply_system_data_root(_allow_auto: bool) {}
+pub fn apply_system_data_root(_allow_auto: bool) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
 /// (others-execute) by the drop uid, or the dropped VMM can't reach its own
@@ -3913,6 +3988,37 @@ mod tests {
         assert!(waited < Duration::from_secs(2), "{waited:?}");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// Relocating VM state must never expose the database or credentials to
+    /// sibling VMs whose uids can traverse the shared state root.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relocated_sensitive_state_stays_private_and_repairs_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let server = root.path().join(".local/share/smolvm/server");
+        std::fs::create_dir_all(&server).unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = root.path().join(".local/share/smolvm");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::secure_sensitive_state_dirs(root.path()).unwrap();
+        for relative in [
+            ".local/share/smolvm/server",
+            ".local/share/smolvm/node-credentials",
+            ".config/smolvm",
+        ] {
+            let dir = root.path().join(relative);
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        // VM data and rootfs share this parent with the server; leave it traversable.
+        assert_eq!(
+            std::fs::metadata(shared).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 
     /// Inside a smol machine the home is overlayfs and `/workspace` is ext4, so
