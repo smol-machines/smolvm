@@ -4042,26 +4042,54 @@ mod tests {
         let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
         // No agent listening, exactly as for a paused guest.
         manager.vsock_socket = temp.path().join("missing-agent.sock");
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id() as crate::process::Pid;
+        // Repeat under CI load to catch intermittent process identity races.
+        for attempt in 0..512 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = child.id() as crate::process::Pid;
 
-        let started = std::time::Instant::now();
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), true);
-        let elapsed = started.elapsed();
-        let survived = matches!(child.try_wait(), Ok(None));
-        let _ = child.kill();
-        let _ = child.wait();
+            // A freshly spawned child can briefly have no macOS proc_pidinfo
+            // start time. Wait for an identity before testing the strict stop path;
+            // without one the stop correctly refuses to signal an unknown PID.
+            let identity_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let start_time = loop {
+                if let Some(start_time) = process::process_start_time(pid) {
+                    break start_time;
+                }
+                if std::time::Instant::now() >= identity_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("spawned test child never acquired a verifiable start time");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
 
-        assert!(result.is_ok(), "a paused guest must stop: {result:?}");
-        assert!(!survived, "the paused VM's process must be gone");
-        // The handshake was skipped, not merely fast: its own deadline is 5s.
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?}, so the shutdown handshake was still attempted"
-        );
+            let before_start = process::process_start_time(pid);
+            let identity_verified = process::is_our_process_strict(pid, Some(start_time));
+            let started = std::time::Instant::now();
+            let result = manager.stop_vm_process(pid, Some(start_time), true);
+            let elapsed = started.elapsed();
+            let after_start = process::process_start_time(pid);
+            let survived = matches!(child.try_wait(), Ok(None));
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert!(
+                result.is_ok(),
+                "iteration={attempt}, a paused guest must stop: {result:?}; start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, survived={survived}, elapsed={elapsed:?}"
+            );
+            assert!(
+                !survived,
+                "iteration={attempt}, the paused VM's process must be gone"
+            );
+            // The handshake was skipped, not merely fast: its own deadline is 5s.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "took {elapsed:?}, so the shutdown handshake was still attempted"
+            );
+        }
     }
 
     #[cfg(unix)]
