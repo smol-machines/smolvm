@@ -574,7 +574,9 @@ mod tests {
     #[test]
     fn test_ensure_dns_adds_when_missing() {
         let dns_cidr = IpNet::from(host_dns()).to_string();
-        let mut cidrs = vec!["10.0.0.0/8".to_string()];
+        // A documentation range no host resolver sits in: a 10/8 range would
+        // already cover a resolver on a VPN or office network.
+        let mut cidrs = vec!["192.0.2.0/24".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 2);
         assert!(cidrs.contains(&dns_cidr));
@@ -619,7 +621,7 @@ mod tests {
     #[test]
     fn test_ensure_dns_adds_when_non_loopback_cidr_present() {
         let dns_cidr = IpNet::from(host_dns()).to_string();
-        let mut cidrs = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
+        let mut cidrs = vec!["127.0.0.0/8".to_string(), "192.0.2.0/24".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 3);
         assert!(cidrs.contains(&dns_cidr));
