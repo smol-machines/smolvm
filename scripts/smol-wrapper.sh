@@ -42,10 +42,16 @@ resolve_symlink() {
 SCRIPT_PATH="$(resolve_symlink "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
-# The actual binary and libraries are in the same directory
+# The binary sits beside this script. Libraries and the agent rootfs are one
+# level up in the bin/ dist layout, or beside the script in the older flat
+# layout — probe for lib/ to tell the two apart, mirroring smolvm-wrapper.sh.
+SMOL_ROOT="$SCRIPT_DIR"
+if [[ ! -d "$SMOL_ROOT/lib" && -d "$SCRIPT_DIR/../lib" ]]; then
+    SMOL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 SMOL_BIN="$SCRIPT_DIR/smol-bin"
-SMOL_LIB="$SCRIPT_DIR/lib"
-SMOL_BUNDLED_ROOTFS="$SCRIPT_DIR/agent-rootfs"
+SMOL_LIB="$SMOL_ROOT/lib"
+SMOL_BUNDLED_ROOTFS="$SMOL_ROOT/agent-rootfs"
 
 if [[ -d "$SMOL_BUNDLED_ROOTFS" ]]; then
     export SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$SMOL_BUNDLED_ROOTFS}"
