@@ -5681,6 +5681,62 @@ pub(crate) async fn delete_one(
     .await
 }
 
+/// Remove a stopped machine's data directory, retrying while something is
+/// still adding entries to it. A delete under heavy guest I/O has failed with
+/// "Directory not empty" and then succeeded seconds later, so the writer
+/// settles: retry for a short while, and name what was left each time so the
+/// writer can be found.
+fn remove_data_dir_settling(name: &str, data_dir: &std::path::Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 6;
+    let mut attempt = 1;
+    loop {
+        match std::fs::remove_dir_all(data_dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < ATTEMPTS =>
+            {
+                tracing::warn!(
+                    machine = name,
+                    attempt,
+                    left = %data_dir_entries(data_dir).join(", "),
+                    "machine data directory gained entries while it was removed; retrying"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(250 << attempt.min(4)));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Up to 20 paths still under `dir`, relative to it, for a removal diagnostic.
+fn data_dir_entries(dir: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            found.push(
+                path.strip_prefix(dir)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
+            if found.len() >= 20 {
+                return found;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path);
+            }
+        }
+    }
+    found
+}
+
 // Called with the lifecycle and fork-source locks held, after confirmed shutdown.
 // Keep filesystem and database I/O on the blocking thread.
 fn remove_machine_data_and_record(
@@ -5693,7 +5749,7 @@ fn remove_machine_data_and_record(
             // Shutdown was confirmed before entering this helper. Release the
             // uid before removing its .vm-uid file, as in CLI deletion.
             crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), data_dir);
-            std::fs::remove_dir_all(data_dir).map_err(|error| {
+            remove_data_dir_settling(name, data_dir).map_err(|error| {
                 ApiError::internal(format!(
                     "failed to remove data for machine '{name}': {error}; repair host storage and retry deletion"
                 ))
@@ -7627,6 +7683,46 @@ mod tests {
         remove_machine_data_and_record(&recovered, name, &data_dir).unwrap();
         assert!(!data_dir.exists());
         assert!(recovered.db().get_vm(name).unwrap().is_none());
+    }
+
+    /// Something still writing into a machine's data directory while it is
+    /// removed makes the removal see a directory that is not empty; once the
+    /// writer stops, the retry removes everything.
+    #[test]
+    fn delete_cleanup_outlasts_a_writer_that_settles() {
+        let (dir, state) = setup_test_state();
+        let name = "cleanup-busy";
+        create_test_vm(state.db(), name, Some(20), Some(5));
+        let data_dir = dir.path().join("machine-data");
+        std::fs::create_dir_all(data_dir.join("nested")).unwrap();
+        for index in 0..200 {
+            std::fs::write(data_dir.join("nested").join(format!("f{index}")), b"x").unwrap();
+        }
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let (data_dir, writing) = (data_dir.clone(), writing.clone());
+            std::thread::spawn(move || {
+                let mut index = 0u64;
+                while writing.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::create_dir_all(data_dir.join("nested"));
+                    let _ = std::fs::write(data_dir.join("nested").join(format!("w{index}")), b"x");
+                    index += 1;
+                }
+            })
+        };
+        let stop = {
+            let writing = writing.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                writing.store(false, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        remove_machine_data_and_record(&state, name, &data_dir).unwrap();
+        stop.join().unwrap();
+        writer.join().unwrap();
+        // The writer may recreate a stray entry after the final pass returned;
+        // the record is gone either way.
+        assert!(state.db().get_vm(name).unwrap().is_none());
     }
 
     #[test]

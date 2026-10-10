@@ -962,7 +962,9 @@ mod cached_export_tests {
         let launched = std::process::Command::new("sh")
             .args([
                 "-c",
-                "sh -c 'sleep 60' \"$0\" </dev/null >/dev/null 2>&1 & echo $!",
+                // A loop, so the shell never execs away and its command line
+                // keeps naming the scratch directory.
+                "sh -c 'while :; do sleep 1; done' \"$0\" </dev/null >/dev/null 2>&1 & echo $!",
                 &format!("{}/boot-config.json", orphan_dir.display()),
             ])
             .output()
