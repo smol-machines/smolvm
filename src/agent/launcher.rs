@@ -430,6 +430,11 @@ impl LaunchFeatures {
         let Some(sidecar_path) = source_smolmachine else {
             return Ok(self);
         };
+        // VM-mode packs contain disks but no OCI layers. They still need their
+        // extracted assets, but mounting an empty /packed_layers wastes a
+        // virtiofs device (and on x86_64, one of the limited virtio IRQs).
+        // Unreadable/missing sidecars conservatively keep the old mount layout.
+        let has_image_layers = pack_has_image_layers(Path::new(sidecar_path));
 
         // Shared pack store: if create extracted the pack into the node's shared
         // content-addressed store and dropped a pointer beside this machine, the
@@ -465,7 +470,7 @@ impl LaunchFeatures {
             // is empty by design: only a pack that has layers can have lost them.
             // Without this check every launch of a VM-mode machine (each start,
             // each branch child) re-ran the extraction and its full-pack digest.
-            if !shared_layers_populated(&layers) && pack_has_image_layers(Path::new(sidecar_path)) {
+            if !shared_layers_populated(&layers) && has_image_layers {
                 let sidecar = Path::new(sidecar_path);
                 if sidecar.exists() {
                     if let Ok(footer) = smolvm_pack::packer::read_footer_from_sidecar(sidecar) {
@@ -489,13 +494,18 @@ impl LaunchFeatures {
                     }
                 }
             }
+            if !has_image_layers {
+                return Ok(self);
+            }
             self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
             self.pack_idmap_source = Some(if layers.is_dir() { layers } else { shared });
             return Ok(self);
         }
 
         let marker_present = smolvm_pack::extract::is_extracted(layers_cache_dir);
-        if !marker_present || !smolvm_pack::extract::cached_layers_usable(layers_cache_dir) {
+        if !marker_present
+            || (has_image_layers && !smolvm_pack::extract::cached_layers_usable(layers_cache_dir))
+        {
             // Fallback: layers not yet extracted into this machine's own dir
             // (pre-this-layout machine, or an interrupted create), OR the
             // extraction marker survived while the layer files themselves were
@@ -530,6 +540,13 @@ impl LaunchFeatures {
                 false,
             )
             .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
+        }
+
+        if !has_image_layers {
+            // On macOS a fallback extraction may have mounted the private
+            // case-sensitive layers volume; no VM-mode device needs that mount.
+            smolvm_pack::extract::force_detach_layers_volume(layers_cache_dir);
+            return Ok(self);
         }
 
         let layers_lease = smolvm_pack::extract::acquire_layers_lease(layers_cache_dir, false)
@@ -3151,6 +3168,48 @@ mod tests {
         let pointer = super::super::shared_pack_pointer_path(&layers_cache_dir);
         fs::write(&pointer, shared.to_string_lossy().as_bytes()).unwrap();
         layers_cache_dir
+    }
+
+    // A VM-mode pack still needs its extracted disks, but no layer filesystem:
+    // attaching the empty share can exhaust x86_64 virtio IRQs when the machine
+    // also has host volumes. Check both shared and per-machine extraction paths.
+    #[test]
+    fn vm_mode_pack_does_not_attach_an_empty_layer_device() {
+        use smolvm_pack::{format::PackManifest, packer::Packer};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("vm.smolmachine");
+        let mut manifest = PackManifest::new(
+            "vm://source".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        manifest.mode = smolvm_pack::format::PackMode::Vm;
+        Packer::new(manifest).pack_artifact(&artifact).unwrap();
+        let artifact_path = artifact.to_str().unwrap();
+
+        let shared = tmp.path().join("_shared").join("check");
+        fs::create_dir_all(shared.join("layers")).unwrap();
+        let cache = machine_with_pointer(tmp.path(), &shared);
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&cache, Some(artifact_path))
+            .unwrap();
+        assert!(features.packed_layers_dir.is_none());
+        assert!(features.pack_idmap_source.is_none());
+
+        let private = tmp.path().join("private");
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&private, Some(artifact_path))
+            .unwrap();
+        assert!(smolvm_pack::extract::is_extracted(&private));
+        assert!(features.packed_layers_dir.is_none());
+        // Repeated starts should not re-extract a perfectly valid pack that
+        // intentionally has no image layers.
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&private, Some(artifact_path))
+            .unwrap();
+        assert!(features.packed_layers_dir.is_none());
     }
 
     // Regression: the shared-store branch must present the `layers/` SUBDIR of the
