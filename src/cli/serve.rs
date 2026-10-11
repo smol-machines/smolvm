@@ -182,6 +182,17 @@ fn server_restore_cache(entries: u16, gib: u64) -> smolvm::portable_checkpoint::
     }
 }
 
+/// A failed `serve start` must leave VMs loaded from the database running.
+/// Their managers adopt the live child on reconnect, and would stop it on Drop
+/// unless detached before the last API state reference goes away.
+struct DetachMachinesOnExit(Arc<ApiState>);
+
+impl Drop for DetachMachinesOnExit {
+    fn drop(&mut self) {
+        self.0.detach_all();
+    }
+}
+
 impl ServeStartCmd {
     /// Run the serve command.
     pub fn run(self) -> Result<()> {
@@ -430,6 +441,10 @@ impl ServeStartCmd {
         let state = Arc::new(ApiState::new().map_err(|e| {
             smolvm::error::Error::config("initialize api state", format!("{:?}", e))
         })?);
+        // Startup can fail after reconnecting persisted VMs (a port collision,
+        // invalid TLS config, etc.). Disarm adopted managers on every exit path,
+        // including errors before the server reaches its normal shutdown path.
+        let _detach_machines = DetachMachinesOnExit(state.clone());
         state.set_allow_nested_virt(self.allow_nested_virt);
         if let Some(dir) = &self.cache_disk_dir {
             std::fs::create_dir_all(dir).map_err(|e| {
@@ -513,6 +528,18 @@ impl ServeStartCmd {
             result
         });
 
+        // Resolve the serve API's TLS posture before binding. In fleet mode this
+        // is fail-closed: a missing/partial mTLS config aborts startup rather
+        // than silently serving plain HTTP (control↔node mTLS, increment 3).
+        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
+            client_cn: self.mtls_client_cn.clone(),
+            allow_peer_blobs: self.mtls_allow_peer_blobs,
+        })
+        .map_err(|e| smolvm::error::Error::Config {
+            operation: "serve tls".to_string(),
+            reason: e.to_string(),
+        })?;
+
         // Spawn supervisor task
         let supervisor_state = state.clone();
         let supervisor_shutdown = shutdown_rx.clone();
@@ -566,18 +593,6 @@ impl ServeStartCmd {
         let local_app = smolvm::api::create_local_router(state.clone(), self.cors_origins.clone());
         let app = smolvm::api::create_router(state, self.cors_origins.clone());
 
-        // Resolve the serve API's TLS posture before binding. In fleet mode this
-        // is fail-closed: a missing/partial mTLS config aborts startup rather
-        // than silently serving plain HTTP (control↔node mTLS, increment 3).
-        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
-            client_cn: self.mtls_client_cn.clone(),
-            allow_peer_blobs: self.mtls_allow_peer_blobs,
-        })
-        .map_err(|e| smolvm::error::Error::Config {
-            operation: "serve tls".to_string(),
-            reason: e.to_string(),
-        })?;
-
         // Listen server on TCP or Unix socket
         let grace = resolve_shutdown_grace(
             self.shutdown_grace,
@@ -601,16 +616,25 @@ impl ServeStartCmd {
         // particular, a pool fill must not register a newly booted worker after
         // `detach_all` has already walked the registry.
         let _ = shutdown_tx.send(true);
-        let guest_rollout_result = guest_rollout_handle.await.map_err(|error| {
-            smolvm::error::Error::config("guest rollout ingress task", error.to_string())
-        })?;
-        if let Err(error) = guest_rollout_result {
-            tracing::error!(%error, "guest rollout ingress stopped unexpectedly");
-            if server_result.is_ok() {
-                return Err(smolvm::error::Error::Io(error));
+        let mut server_result = server_result;
+        match guest_rollout_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "guest rollout ingress stopped unexpectedly");
+                if server_result.is_ok() {
+                    server_result = Err(smolvm::error::Error::Io(error));
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "guest rollout ingress task failed");
+                if server_result.is_ok() {
+                    server_result = Err(smolvm::error::Error::config(
+                        "guest rollout ingress task",
+                        error.to_string(),
+                    ));
+                }
             }
         }
-        server_result?;
         // A blocking resize retains lifecycle ownership until its bounded
         // runtime/agent calls finish. Do not drain/detach underneath that work.
         if let Err(error) = resize_controller_handle.await {
@@ -646,21 +670,15 @@ impl ServeStartCmd {
         let drain = std::env::var("SMOLVM_DRAIN_ON_SHUTDOWN")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
-        if drain {
-            if !smolvm::api::handlers::machines::drain_machines(&drain_state).await {
-                tracing::warn!("drain incomplete; preserving remaining VMs for retry");
-            }
-            drain_state.detach_all();
-        } else {
-            // Non-draining shutdown (a binary-upgrade restart): VMs must survive
-            // for the next `serve` process to reconnect to. Skipping drain isn't
-            // enough — `AgentManager::drop` stops any VM it owns, so tearing down
-            // `ApiState` would kill every running VM. Disarm each manager's Drop
-            // first, mirroring the CLI's detach-before-exit.
-            drain_state.detach_all();
+        if drain
+            && server_result.is_ok()
+            && !smolvm::api::handlers::machines::drain_machines(&drain_state).await
+        {
+            tracing::warn!("drain incomplete; preserving remaining VMs for retry");
         }
-
-        Ok(())
+        // `_detach_machines` disarms every manager after the controllers have
+        // stopped, whether shutdown was graceful or an HTTP listener failed.
+        server_result
     }
 
     async fn serve_tcp(
