@@ -3549,8 +3549,7 @@ impl AgentClient {
         let mut writer = AgentClient {
             stream: self.stream.try_clone()?,
             trace_id: self.trace_id.clone(),
-            // Only stdin frames go out on this handle, never a file request.
-            file_target: None,
+            file_target: self.file_target.clone(),
             capabilities: self.capabilities.clone(),
         };
         std::thread::scope(|scope| {
