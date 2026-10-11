@@ -8335,8 +8335,10 @@ mod tests {
         guest.join().unwrap();
     }
 
+    // The shipped agent runs in a Linux guest on every host. macOS poll() does
+    // not report this socket hangup with POLLIN disabled, unlike guest Linux.
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn streamed_exec_reaps_child_on_disconnect_with_pending_stdin() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
