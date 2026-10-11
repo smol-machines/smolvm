@@ -12,6 +12,7 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths::{self, STORAGE_ROOT};
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use smolvm_oci_layer::extract_oci_layer;
 use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer_with_size};
@@ -19,7 +20,8 @@ use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
 };
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -1275,7 +1277,7 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
 }
 
 // =============================================================================
-// Local image archives (`docker save` / `podman save`)
+// Local image archives (`docker save`, `podman save`, and OCI layouts)
 // =============================================================================
 //
 // smolvm delegates turning a saved-image archive into a rootfs to the bundled
@@ -1365,12 +1367,16 @@ where
     std::fs::create_dir_all(&rootfs)?;
     info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
     progress("flattening local image archive", 0);
-    flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
+    let oci_config = flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
     // Recover the image config before writing the marker, so a later reuse can
     // rely on config.json being present. A docker/podman `save` always carries
     // one.
     progress("recovering image configuration", 0);
-    recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
+    if let Some(config) = oci_config {
+        std::fs::write(out_base.join(ARCHIVE_CONFIG_FILE), config)?;
+    } else {
+        recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
+    }
     std::fs::write(&marker, signature)?;
     Ok(Some(out_base))
 }
@@ -1600,10 +1606,14 @@ where
     result
 }
 
-/// Flatten a `docker save` archive into `rootfs`, delegating to the bundled
+/// Flatten a local image archive into `rootfs`, delegating to the bundled
 /// `crane export`. The flattened tar is a single layer with no whiteouts, so
 /// plain `tar -x` is sufficient (no per-layer handling needed).
-fn flatten_archive_with_progress<F>(archive: &Path, rootfs: &Path, progress: &mut F) -> Result<()>
+fn flatten_archive_with_progress<F>(
+    archive: &Path,
+    rootfs: &Path,
+    progress: &mut F,
+) -> Result<Option<Vec<u8>>>
 where
     F: FnMut(&str, u64),
 {
@@ -1623,7 +1633,9 @@ where
         // truncated archive — instead of a misleading guess.
         .stderr(Stdio::piped());
     // Held alive until crane has consumed it (the decompressed input, if any).
-    let (archive_input, _archive_tmp) = prepare_archive_input_with_progress(archive, progress)?;
+    let (mut archive_input, _archive_tmp) = prepare_archive_input_with_progress(archive, progress)?;
+    let oci = oci_archive_compatibility(&mut archive_input)?;
+    archive_input.seek(SeekFrom::Start(0))?;
 
     let mut crane_child = crane
         .spawn()
@@ -1632,8 +1644,12 @@ where
         .stdin
         .take()
         .ok_or_else(|| StorageError::new("failed to open crane stdin".to_string()))?;
-    let (input_copy_thread, input_progress) =
-        spawn_copy_with_progress(archive_input, crane_in, "reading image archive");
+    let oci_config = oci.as_ref().map(|(_, config)| config.clone());
+    let (input_copy_thread, input_progress) = if let Some((manifest, _)) = oci {
+        spawn_oci_archive_copy(archive_input, crane_in, manifest)
+    } else {
+        spawn_copy_with_progress(archive_input, crane_in, "reading image archive")
+    };
     let crane_out = crane_child
         .stdout
         .take()
@@ -1710,7 +1726,176 @@ where
         .map_err(|e| StorageError::new(format!("streaming image archive failed: {e}")))?;
     copy_result
         .map_err(|e| StorageError::new(format!("streaming flattened rootfs failed: {e}")))?;
-    Ok(())
+    Ok(oci_config)
+}
+
+// A pure OCI archive has no docker-save manifest.json, which `crane export -`
+// requires. Add only that small compatibility entry while streaming the archive
+// into crane; leave the user's archive and every layer blob untouched.
+fn spawn_oci_archive_copy(
+    input: std::fs::File,
+    output: impl Write + Send + 'static,
+    manifest: Vec<u8>,
+) -> (
+    std::thread::JoinHandle<std::io::Result<u64>>,
+    std::sync::mpsc::Receiver<(&'static str, u64)>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut archive = tar::Archive::new(input);
+        let mut builder = tar::Builder::new(output);
+        let mut bytes = 0;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let header = entry.header().clone();
+            bytes += header.size()?;
+            builder.append(&header, &mut entry)?;
+            let _ = tx.send(("reading image archive", bytes));
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder.append_data(&mut header, "manifest.json", manifest.as_slice())?;
+        builder.finish()?;
+        Ok(bytes)
+    });
+    (handle, rx)
+}
+
+// Locate the small OCI metadata blobs using tar's seekable iterator. Skipping
+// layers by seeking avoids buffering or decompressing them into guest memory.
+fn oci_archive_compatibility(file: &mut std::fs::File) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    const MAX_METADATA: u64 = 4 * 1024 * 1024;
+    let mut positions: HashMap<String, (u64, u64)> = HashMap::new();
+    {
+        let mut archive = tar::Archive::new(&mut *file);
+        for entry in archive.entries_with_seek()? {
+            let entry = entry?;
+            let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+            if name == "manifest.json" {
+                return Ok(None); // Existing docker-save path, including hybrid archives.
+            }
+            if !entry.header().entry_type().is_file()
+                || (name != "index.json" && !name.starts_with("blobs/sha256/"))
+            {
+                continue;
+            }
+            if positions
+                .insert(name, (entry.raw_file_position(), entry.size()))
+                .is_some()
+            {
+                return Err(StorageError::new("duplicate OCI archive metadata path"));
+            }
+            if positions.len() > 16_384 {
+                return Err(StorageError::new("OCI archive contains too many blobs"));
+            }
+        }
+    }
+    if !positions.contains_key("index.json") {
+        return Ok(None); // Let crane report its ordinary invalid archive error.
+    }
+    let mut read_metadata = |name: &str| -> Result<Vec<u8>> {
+        let (position, size) = positions
+            .get(name)
+            .ok_or_else(|| StorageError::new(format!("missing OCI archive member {name}")))?;
+        if *size == 0 || *size > MAX_METADATA {
+            return Err(StorageError::new("OCI archive metadata exceeds 4 MiB"));
+        }
+        file.seek(SeekFrom::Start(*position))?;
+        let mut data = vec![0; *size as usize];
+        file.read_exact(&mut data)?;
+        Ok(data)
+    };
+    let index: serde_json::Value = serde_json::from_slice(&read_metadata("index.json")?)
+        .map_err(|e| StorageError::parse_error("OCI archive index", e))?;
+    let mut get_blob = |digest: &str| -> Result<Vec<u8>> {
+        let hex = digest.strip_prefix("sha256:").unwrap_or("");
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StorageError::new("invalid OCI archive blob digest"));
+        }
+        let data = read_metadata(&format!("blobs/sha256/{hex}"))?;
+        if format!("{:x}", Sha256::digest(&data)) != hex.to_ascii_lowercase() {
+            return Err(StorageError::new("OCI archive metadata digest mismatch"));
+        }
+        Ok(data)
+    };
+    let mut descriptors = index["manifests"]
+        .as_array()
+        .ok_or_else(|| StorageError::new("OCI archive has no image manifests"))?
+        .clone();
+    let mut manifest = None;
+    for _ in 0..2 {
+        let guest_arch = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        let chosen = descriptors
+            .iter()
+            .find(|d| d["platform"]["os"] == "linux" && d["platform"]["architecture"] == guest_arch)
+            .or_else(|| {
+                if descriptors.len() == 1 {
+                    descriptors.first()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| StorageError::new("OCI archive has no image for this platform"))?;
+        let digest = chosen["digest"]
+            .as_str()
+            .ok_or_else(|| StorageError::new("OCI archive descriptor has no digest"))?;
+        let body: serde_json::Value = serde_json::from_slice(&get_blob(digest)?)
+            .map_err(|e| StorageError::parse_error("OCI archive manifest", e))?;
+        if body.get("config").is_some() {
+            manifest = Some(body);
+            break;
+        }
+        descriptors = body["manifests"]
+            .as_array()
+            .ok_or_else(|| StorageError::new("OCI archive index has no platform"))?
+            .clone();
+    }
+    let image = manifest.ok_or_else(|| StorageError::new("OCI archive has no image manifest"))?;
+    let config_digest = image["config"]["digest"]
+        .as_str()
+        .ok_or_else(|| StorageError::new("OCI image has no config digest"))?;
+    let config = get_blob(config_digest)?;
+    let parsed: serde_json::Value = serde_json::from_slice(&config)
+        .map_err(|e| StorageError::parse_error("OCI archive config", e))?;
+    if let Some(arch) = parsed["architecture"].as_str() {
+        ensure_archive_arch_compatible(arch)?;
+    }
+    let layers = image["layers"]
+        .as_array()
+        .ok_or_else(|| StorageError::new("OCI image has no layers"))?;
+    let mut paths = Vec::with_capacity(layers.len());
+    let mut sources = serde_json::Map::new();
+    for layer in layers {
+        let digest = layer["digest"]
+            .as_str()
+            .ok_or_else(|| StorageError::new("OCI layer has no digest"))?;
+        let hex = digest.strip_prefix("sha256:").unwrap_or("");
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StorageError::new("invalid OCI layer digest"));
+        }
+        let path = format!("blobs/sha256/{hex}");
+        if !positions.contains_key(&path) {
+            return Err(StorageError::new(format!(
+                "missing OCI archive member {path}"
+            )));
+        }
+        paths.push(path);
+        sources.insert(digest.to_string(), layer.clone());
+    }
+    let synthetic = serde_json::to_vec(&serde_json::json!([{
+        "Config": format!("blobs/sha256/{}", &config_digest[7..]),
+        "RepoTags": null,
+        "Layers": paths,
+        "LayerSources": sources,
+    }]))
+    .map_err(|e| StorageError::new(format!("serialize OCI archive compatibility manifest: {e}")))?;
+    Ok(Some((synthetic, config)))
 }
 
 /// Recover the image config (Entrypoint/Cmd/Env/…) from a `docker save` archive
@@ -5880,6 +6065,114 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pure_oci_archive_streams_with_docker_compatibility_manifest() {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, SeekFrom};
+
+        fn digest(bytes: &[u8]) -> String {
+            format!("sha256:{:x}", Sha256::digest(bytes))
+        }
+        fn append(builder: &mut tar::Builder<&mut std::fs::File>, name: &str, data: &[u8]) {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o600);
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, name, data).unwrap();
+        }
+        for nested in [false, true] {
+            let mut original = tempfile::tempfile().unwrap();
+            let arch = if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "amd64"
+            };
+            let config =
+                serde_json::to_vec(&serde_json::json!({"os":"linux", "architecture":arch}))
+                    .unwrap();
+            let config_digest = digest(&config);
+            let layer = b"a small layer";
+            let layer_digest = digest(layer);
+            let image = serde_json::to_vec(&serde_json::json!({
+                "config":{"digest":config_digest},
+                "layers":[{"digest":layer_digest,"mediaType":"application/vnd.oci.image.layer.v1.tar","size":layer.len()}],
+            })).unwrap();
+            let image_digest = digest(&image);
+            let wrapper = serde_json::to_vec(&serde_json::json!({
+                "manifests":[{"digest":image_digest,"mediaType":"application/vnd.oci.image.manifest.v1+json"}],
+            })).unwrap();
+            let top_digest = if nested {
+                digest(&wrapper)
+            } else {
+                image_digest.clone()
+            };
+            let index = serde_json::to_vec(&serde_json::json!({
+                "manifests":[{"digest":top_digest,"mediaType":if nested {"application/vnd.oci.image.index.v1+json"} else {"application/vnd.oci.image.manifest.v1+json"}}],
+            })).unwrap();
+            {
+                let mut builder = tar::Builder::new(&mut original);
+                append(
+                    &mut builder,
+                    &format!("blobs/sha256/{}", &layer_digest[7..]),
+                    layer,
+                );
+                append(
+                    &mut builder,
+                    &format!("blobs/sha256/{}", &image_digest[7..]),
+                    &image,
+                );
+                append(
+                    &mut builder,
+                    &format!("blobs/sha256/{}", &config_digest[7..]),
+                    &config,
+                );
+                if nested {
+                    append(
+                        &mut builder,
+                        &format!("blobs/sha256/{}", &top_digest[7..]),
+                        &wrapper,
+                    );
+                }
+                append(&mut builder, "index.json", &index); // Blob order must not matter.
+                builder.finish().unwrap();
+            }
+            original.seek(SeekFrom::Start(0)).unwrap();
+            let (synthetic, recovered) = super::oci_archive_compatibility(&mut original)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered, config);
+            let manifest: serde_json::Value = serde_json::from_slice(&synthetic).unwrap();
+            assert_eq!(
+                manifest[0]["Config"],
+                format!("blobs/sha256/{}", &config_digest[7..])
+            );
+            assert_eq!(
+                manifest[0]["Layers"][0],
+                format!("blobs/sha256/{}", &layer_digest[7..])
+            );
+
+            original.seek(SeekFrom::Start(0)).unwrap();
+            let mut result = tempfile::tempfile().unwrap();
+            let (worker, _) =
+                super::spawn_oci_archive_copy(original, result.try_clone().unwrap(), synthetic);
+            worker.join().unwrap().unwrap();
+            result.seek(SeekFrom::Start(0)).unwrap();
+            let mut output = tar::Archive::new(result);
+            let mut member = output
+                .entries()
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| entry.path().unwrap() == std::path::Path::new("manifest.json"))
+                .unwrap();
+            let mut raw = Vec::new();
+            member.read_to_end(&mut raw).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+                manifest
+            );
+        }
+    }
+
     #[test]
     fn cold_layout_is_bounded_by_manifest_and_available_disk() {
         use super::{cold_layout_fits, COLD_LAYOUT_FREE_RESERVE_BYTES, MAX_COLD_LAYOUT_BYTES};

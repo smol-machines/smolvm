@@ -19,6 +19,7 @@ smolvm-s3fs = { path = "../smolvm-s3fs", version = "1.10.0" }
 smolvm-oci-layer = { path = "../smolvm-oci-layer", version = "1.7.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 tracing = { workspace = true }
 lazy_static = "1.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

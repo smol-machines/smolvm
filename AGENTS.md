@@ -149,12 +149,11 @@ Default registry: `registry.smolmachines.com`. Digest references require `sha256
 ### Local container images
 
 `--image` also accepts a local source — useful for CI, air-gapped hosts, and fast
-local iteration. smolvm stays a microVM runtime and delegates all image work
-(flatten, whiteouts, config) to container tooling (`crane`/`docker`/`podman`); the
-archive is flattened with `crane export`.
+local iteration. smolvm accepts Docker-save and OCI layout archives, recovers
+their image configuration, and delegates filesystem flattening to `crane export`.
 
 ```
-./image.tar  ./image.tar.gz  ./image.tgz   # a `docker save` / `podman save` archive (gzip ok)
+./image.tar  ./image.tar.gz  ./image.tgz   # Docker-save or OCI layout archive (gzip ok)
 -                                           # the same archive streamed on stdin
 ./rootfs/                                   # an already-unpacked root filesystem directory
 ```
@@ -171,7 +170,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 
 | Flag | Short | Used on | Description |
 |------|-------|---------|-------------|
-| `--image` | `-I` | run, create, pack create | OCI image, or a local source: a `docker save` archive (`./img.tar`, or `-` for stdin) or unpacked rootfs dir (`./rootfs/`) |
+| `--image` | `-I` | run, create, pack create | OCI image, or a local source: a Docker-save/OCI archive (`./img.tar`, or `-` for stdin) or unpacked rootfs dir (`./rootfs/`) |
 | `--name` | `-n` | run, start, stop, status, exec, update | Machine name (default: "default"); `exec` takes only the long form |
 | `--net` | | run, create | Enable outbound networking (off by default) |
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |

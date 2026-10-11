@@ -89,6 +89,13 @@ moves it, to a loopback address only). It has no authentication and answers only
 `/readyz`, `/capacity` and `/metrics`; the machine, exec and file routes are on the TLS port. Only
 `/health` was requested here.
 
+## Local image archives can be OCI layouts
+
+`POST /api/v1/machines` accepts a server-local `image` path to a `docker save` archive or an OCI
+layout tar (optionally gzipped). For an OCI archive without Docker's `manifest.json`, the guest
+streams a small compatibility manifest into its image flattener; the input archive is unchanged.
+Choose an archive containing a Linux image for the guest's architecture.
+
 ## Only one server per host, unless you move its rollout port
 
 Every `serve start` binds `127.0.0.1:10081` for the branch-pool rollout routes, whatever `--listen`
