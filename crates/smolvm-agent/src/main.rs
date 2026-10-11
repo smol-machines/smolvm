@@ -5718,6 +5718,15 @@ fn run_interactive_loop(
                 }
             }
         }
+        // The child may close its stdin while continuing to run. A closed
+        // pipe reports POLLERR even when only POLLOUT was requested; discard
+        // the frame so the next poll can read host disconnects and controls.
+        if !pending_stdin.is_empty()
+            && poll_fds[4].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        {
+            pending_stdin.clear();
+            child_stdin = None;
+        }
         if !pending_stdin.is_empty() && poll_fds[4].revents & libc::POLLOUT != 0 {
             if let Some(ref mut stdin) = child_stdin {
                 match stdin.write(&pending_stdin[stdin_offset..]) {
@@ -8385,6 +8394,65 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "disconnected host must not leave the guest waiting for its exec timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn streamed_exec_detects_disconnect_after_child_closes_stdin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut child, pty) = spawn_direct_interactive_command(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "exec 0<&-; printf ready; sleep 5".to_string(),
+                ],
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+            assert!(pty.is_none());
+            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            let started = std::time::Instant::now();
+            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            (code, started.elapsed())
+        });
+
+        let mut saw_ready = false;
+        while !saw_ready {
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut response = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut response).unwrap();
+            match serde_json::from_slice::<AgentResponse>(&response).unwrap() {
+                AgentResponse::Started => client
+                    .write_all(
+                        &smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                            data: vec![b'x'; 512 * 1024],
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                AgentResponse::Stdout { data } if data == b"ready" => saw_ready = true,
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        // The host is gone, but the guest can only notice if it resumes
+        // polling the socket after the child has closed its input pipe.
+        drop(client);
+        let (code, elapsed) = guest.join().unwrap();
+        assert_eq!(code, 124);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "closed child stdin must not hide a host disconnect: {elapsed:?}"
         );
     }
 
