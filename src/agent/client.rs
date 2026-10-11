@@ -4695,6 +4695,60 @@ mod run_streaming_tests {
     }
 
     #[test]
+    fn choosing_container_files_on_pre_target_agent_does_not_execute_image() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let image_info = serde_json::json!({
+                "reference": "alpine:3.20", "digest": "sha256:test", "size": 0,
+                "created": null, "architecture": "amd64", "os": "linux",
+                "layer_count": 0, "layers": []
+            });
+            for response in [
+                AgentResponse::Ok {
+                    data: Some(image_info),
+                },
+                AgentResponse::Pong {
+                    version: smolvm_protocol::PROTOCOL_VERSION,
+                    capabilities: vec![smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY.into()],
+                },
+                AgentResponse::Ok { data: None },
+            ] {
+                let mut len = [0; 4];
+                server_stream.read_exact(&mut len).unwrap();
+                let mut payload = vec![0; u32::from_be_bytes(len) as usize];
+                server_stream.read_exact(&mut payload).unwrap();
+                let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+                match response {
+                    AgentResponse::Ok { data: Some(_) } => assert!(matches!(
+                        request.body, AgentRequest::Query { image } if image == "alpine:3.20"
+                    )),
+                    AgentResponse::Pong { .. } => {
+                        assert!(matches!(request.body, AgentRequest::Ping))
+                    }
+                    AgentResponse::Ok { data: None } => assert!(matches!(
+                        request.body,
+                        AgentRequest::PrepareFileAccess { image, workload_id }
+                            if image == "alpine:3.20" && workload_id == "owner"
+                    )),
+                    _ => unreachable!(),
+                }
+                server_stream
+                    .write_all(&encode_message(&response).unwrap())
+                    .unwrap();
+            }
+        });
+        let mut client = AgentClient::from_stream(client_stream);
+        client
+            .use_target(WorkloadTarget::Container {
+                image: "alpine:3.20".into(),
+                overlay_id: "owner".into(),
+            })
+            .unwrap();
+        assert!(client.file_target.is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
     fn preparing_file_access_sends_no_guest_command() {
         let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
         let server = thread::spawn(move || {
