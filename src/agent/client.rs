@@ -3630,13 +3630,12 @@ impl AgentClient {
 /// Cumulative byte ceiling for the streaming/collect exec path.
 ///
 /// The buffered (`Completed`) exec path caps guest output inside the guest at
-/// `smolvm_agent::process::MAX_EXEC_OUTPUT` (11 MiB). The streaming path,
-/// however, relays frames one at a time and the SSE handler
-/// (`api::handlers::exec::exec_stream`) buffers the *entire* event vector in
-/// host RAM before responding. Without a cap, a chatty or infinite guest
-/// command (`yes`, `cat /dev/zero`) that emits `Stdout` frames forever and
-/// never sends `Exited` grows the host `serve` process without bound → host
-/// OOM → every co-tenant VM on the node is killed (cross-tenant DoS).
+/// `smolvm_agent::process::MAX_EXEC_OUTPUT` (11 MiB). The streaming path
+/// relays frames one at a time. Its compatibility wrapper (`vm_exec_streaming`)
+/// buffers events for callers, while the HTTP SSE handler forwards them through
+/// a bounded queue. A chatty or infinite guest command (`yes`, `cat /dev/zero`)
+/// still needs a cumulative cap to bound the compatibility wrapper and stop
+/// endless guest output.
 ///
 /// We mirror the buffered path's 11 MiB ceiling: once cumulative stdout+stderr
 /// crosses it, we emit a truncation error event and stop relaying (terminating

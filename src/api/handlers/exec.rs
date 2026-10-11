@@ -281,16 +281,10 @@ pub async fn exec_stream(
     let machine_for_run = machine_rec.clone();
     let machine_image = machine_rec.and_then(|r| r.image);
 
-    // Bridge the blocking, synchronous vsock streaming exec to an async SSE
-    // stream: a spawned blocking task runs the exec and pushes each ExecEvent
-    // into an unbounded channel AS IT ARRIVES; the SSE stream below yields
-    // them live. Previously this collected every event into a Vec and only
-    // built the SSE stream AFTER the command completed, so the "stream"
-    // delivered nothing until exit — defeating streaming exec (F-16). The
-    // per-session output cap is still enforced inside the agent client's
-    // streaming collector (MAX_STREAMING_EXEC_OUTPUT), which emits a
-    // truncation Error event and stops relaying.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::agent::ExecEvent>();
+    // Bridge blocking vsock exec to a bounded async SSE channel. The callback
+    // runs inside spawn_blocking, so backpressure does not block the reactor;
+    // preserve the existing stdin forwarding and UTF-8 decoding paths.
+    let (tx, rx) = tokio::sync::mpsc::channel::<crate::agent::ExecEvent>(EXEC_STREAM_QUEUE_SIZE);
     let err_tx = tx.clone();
     let entry_exec = entry.clone();
     let start = std::time::Instant::now();
@@ -319,14 +313,14 @@ pub async fn exec_stream(
                     .with_timeout(timeout)
                     .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes);
                 c.run_streaming_with_stdin(config, stdin_data, |e| {
-                    let _ = tx.send(e);
+                    forward_exec_event(&tx, e);
                 })
             })
             .await
         } else {
             with_machine_client_traced(&entry_exec, tid, move |c| {
                 c.vm_exec_streaming_with_stdin(command, env, workdir, timeout, stdin_data, |e| {
-                    let _ = tx.send(e);
+                    forward_exec_event(&tx, e);
                 })
             })
             .await
@@ -336,7 +330,9 @@ pub async fn exec_stream(
         // status once the SSE has begun, so surface them as a terminal error
         // event instead of silently ending the stream.
         if let Err(e) = result {
-            let _ = err_tx.send(crate::agent::ExecEvent::Error(format!("{e:?}")));
+            let _ = err_tx
+                .send(crate::agent::ExecEvent::Error(format!("{e:?}")))
+                .await;
         }
     });
 
@@ -345,7 +341,7 @@ pub async fn exec_stream(
 }
 
 fn exec_event_stream(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::agent::ExecEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<crate::agent::ExecEvent>,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let mut stdout = Utf8ExecOutput::default();
@@ -433,6 +429,18 @@ impl Utf8ExecOutput {
         let partial = std::mem::take(&mut self.partial);
         (!partial.is_empty()).then(|| String::from_utf8_lossy(&partial).into_owned())
     }
+}
+
+/// Maximum number of guest events waiting for a slow HTTP reader.
+const EXEC_STREAM_QUEUE_SIZE: usize = 8;
+
+fn forward_exec_event(
+    tx: &tokio::sync::mpsc::Sender<crate::agent::ExecEvent>,
+    event: crate::agent::ExecEvent,
+) {
+    // Called only from the spawn_blocking agent callback. A closed HTTP stream
+    // drops its receiver, which releases a blocked sender immediately.
+    let _ = tx.blocking_send(event);
 }
 
 /// Encode a guest exec event as an SSE frame. Errors can include arbitrary
@@ -1495,6 +1503,37 @@ mod interactive_tests {
 }
 
 #[cfg(test)]
+mod exec_stream_queue_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_sse_reader_applies_backpressure_without_losing_events() {
+        use crate::agent::ExecEvent;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(EXEC_STREAM_QUEUE_SIZE);
+        let (filled_tx, filled_rx) = tokio::sync::oneshot::channel();
+        let mut sender = tokio::task::spawn_blocking(move || {
+            for n in 0..EXEC_STREAM_QUEUE_SIZE {
+                forward_exec_event(&tx, ExecEvent::Stdout(vec![n as u8]));
+            }
+            let _ = filled_tx.send(());
+            forward_exec_event(&tx, ExecEvent::Exit(7));
+        });
+        filled_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut sender)
+                .await
+                .is_err(),
+            "sender must wait until the HTTP reader consumes an event"
+        );
+        for n in 0..EXEC_STREAM_QUEUE_SIZE {
+            assert!(matches!(rx.recv().await, Some(ExecEvent::Stdout(data)) if data == [n as u8]));
+        }
+        assert!(matches!(rx.recv().await, Some(ExecEvent::Exit(7))));
+        sender.await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod log_stream_tests {
     use super::*;
     use futures_util::StreamExt;
@@ -1504,15 +1543,15 @@ mod log_stream_tests {
         use crate::agent::ExecEvent;
         use axum::response::IntoResponse as _;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(ExecEvent::Stdout(vec![b'h', b'i', b' ', 0xf0]))
+        let (tx, rx) = tokio::sync::mpsc::channel(EXEC_STREAM_QUEUE_SIZE);
+        tx.try_send(ExecEvent::Stdout(vec![b'h', b'i', b' ', 0xf0]))
             .unwrap();
-        tx.send(ExecEvent::Stderr(vec![0xe2])).unwrap();
-        tx.send(ExecEvent::Stdout(vec![0x9f])).unwrap();
-        tx.send(ExecEvent::Stderr(vec![0x82, 0xac])).unwrap();
-        tx.send(ExecEvent::Stdout(vec![0x90, 0xb1, 0xff, b'!', 0xe2]))
+        tx.try_send(ExecEvent::Stderr(vec![0xe2])).unwrap();
+        tx.try_send(ExecEvent::Stdout(vec![0x9f])).unwrap();
+        tx.try_send(ExecEvent::Stderr(vec![0x82, 0xac])).unwrap();
+        tx.try_send(ExecEvent::Stdout(vec![0x90, 0xb1, 0xff, b'!', 0xe2]))
             .unwrap();
-        tx.send(ExecEvent::Exit(0)).unwrap();
+        tx.try_send(ExecEvent::Exit(0)).unwrap();
         drop(tx);
 
         let response = Sse::new(exec_event_stream(rx)).into_response();
