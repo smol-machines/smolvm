@@ -10,6 +10,15 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Subdirectory holding manifests fetched by digest (see
+/// [`BlobCache::manifest_by_digest`]); a directory, so the blob walks skip it.
+const MANIFEST_DIR: &str = "manifests";
+
+/// `sha256:<hex>` of `bytes`.
+fn digest_of(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
 /// Default maximum blob-cache size when `SMOLVM_BLOB_CACHE_MAX_BYTES` is unset: 5 GB.
 const DEFAULT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
@@ -209,6 +218,7 @@ impl BlobCache {
                     fs::remove_file(entry.path())?;
                 }
             }
+            let _ = fs::remove_dir_all(self.root.join(MANIFEST_DIR));
         }
         Ok(freed)
     }
@@ -278,6 +288,62 @@ impl BlobCache {
 
         fs::rename(&partial, &path)?;
         Ok(path)
+    }
+
+    /// A manifest previously fetched from `registry`/`repo` by `digest`.
+    ///
+    /// A digest names exact content, so a manifest fetched by one never changes
+    /// and need not be fetched again. It is keyed by registry and repo as well
+    /// as digest because the registry fetch is what authorizes the caller for
+    /// that repo: a hit only reuses what was already fetched for the same repo.
+    /// The bytes are returned only while they still hash to `digest`.
+    pub fn manifest_by_digest(&self, registry: &str, repo: &str, digest: &str) -> Option<Vec<u8>> {
+        let path = self.manifest_path(registry, repo, digest)?;
+        let bytes = fs::read(&path).ok()?;
+        (digest_of(&bytes) == digest).then_some(bytes)
+    }
+
+    /// Record a manifest fetched from `registry`/`repo` by `digest`. Bytes that
+    /// do not hash to `digest` (an index resolved to one of its entries) are not
+    /// stored and `Ok(false)` is returned.
+    pub fn put_manifest_by_digest(
+        &self,
+        registry: &str,
+        repo: &str,
+        digest: &str,
+        bytes: &[u8],
+    ) -> io::Result<bool> {
+        let Some(path) = self.manifest_path(registry, repo, digest) else {
+            return Ok(false);
+        };
+        if digest_of(bytes) != digest {
+            return Ok(false);
+        }
+        let dir = self.root.join(MANIFEST_DIR);
+        fs::create_dir_all(&dir)?;
+        let mut staged = tempfile::Builder::new()
+            .suffix(".partial")
+            .tempfile_in(&dir)?;
+        staged.write_all(bytes)?;
+        staged.persist(&path).map_err(|error| error.error)?;
+        Ok(true)
+    }
+
+    /// Where a digest-addressed manifest lives, or `None` for a malformed digest.
+    fn manifest_path(&self, registry: &str, repo: &str, digest: &str) -> Option<PathBuf> {
+        let hex = digest.strip_prefix("sha256:")?;
+        if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut scope = Sha256::new();
+        scope.update(registry.as_bytes());
+        scope.update([0]);
+        scope.update(repo.as_bytes());
+        Some(self.root.join(MANIFEST_DIR).join(format!(
+            "{:x}-{}",
+            scope.finalize(),
+            hex.to_ascii_lowercase()
+        )))
     }
 
     /// Path for a blob with the given digest.
@@ -553,6 +619,78 @@ mod tests {
             "the genuinely least recently used blob is the one evicted"
         );
         assert!(cache.get(fresh).is_some());
+    }
+
+    #[test]
+    fn a_manifest_is_reused_only_for_its_registry_repo_and_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let bytes = br#"{"schemaVersion":2}"#;
+        let digest = digest_of(bytes);
+
+        assert!(cache
+            .manifest_by_digest("https://r", "a/app", &digest)
+            .is_none());
+        assert!(cache
+            .put_manifest_by_digest("https://r", "a/app", &digest, bytes)
+            .unwrap());
+        assert_eq!(
+            cache
+                .manifest_by_digest("https://r", "a/app", &digest)
+                .as_deref(),
+            Some(&bytes[..])
+        );
+        assert!(cache
+            .manifest_by_digest("https://r", "b/app", &digest)
+            .is_none());
+        assert!(cache
+            .manifest_by_digest("https://other", "a/app", &digest)
+            .is_none());
+        // A manifest is not a blob: it takes no space in the blob budget.
+        assert_eq!(cache.total_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_hash_to_its_digest_is_neither_stored_nor_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let bytes = br#"{"schemaVersion":2}"#;
+        let digest = digest_of(bytes);
+
+        // An index resolved to one entry hashes to the entry, not the index.
+        assert!(!cache
+            .put_manifest_by_digest("https://r", "a", &digest, b"other")
+            .unwrap());
+        assert!(!cache
+            .put_manifest_by_digest("https://r", "a", "v1", bytes)
+            .unwrap());
+        assert!(!cache
+            .put_manifest_by_digest("https://r", "a", "sha256:../x", bytes)
+            .unwrap());
+
+        cache
+            .put_manifest_by_digest("https://r", "a", &digest, bytes)
+            .unwrap();
+        let path = cache.manifest_path("https://r", "a", &digest).unwrap();
+        fs::write(&path, b"tampered").unwrap();
+        assert!(cache
+            .manifest_by_digest("https://r", "a", &digest)
+            .is_none());
+    }
+
+    #[test]
+    fn prune_all_drops_cached_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let bytes = br#"{"schemaVersion":2}"#;
+        let digest = digest_of(bytes);
+        cache
+            .put_manifest_by_digest("https://r", "a", &digest, bytes)
+            .unwrap();
+        cache.prune_all().unwrap();
+        assert!(cache
+            .manifest_by_digest("https://r", "a", &digest)
+            .is_none());
     }
 
     #[test]

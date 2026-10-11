@@ -79,8 +79,24 @@ pub async fn pull_with_progress(
 ) -> Result<PullResult> {
     // 1. Fetch the manifest, resolving a multi-platform index to this machine's
     //    host-platform entry (Docker-style fan-out). Shared with `inspect`.
-    tracing::info!(repo = %repo, reference = %reference, "fetching manifest...");
-    let manifest_bytes = client.get_manifest_resolved(repo, reference).await?;
+    //    A manifest already fetched from this repo by digest cannot have changed,
+    //    so it is reused without a registry round trip.
+    let manifest_bytes = match cache.manifest_by_digest(client.base_url(), repo, reference) {
+        Some(bytes) => {
+            tracing::info!(repo = %repo, reference = %reference, "manifest found in cache");
+            bytes
+        }
+        None => {
+            tracing::info!(repo = %repo, reference = %reference, "fetching manifest...");
+            let bytes = client.get_manifest_resolved(repo, reference).await?;
+            if let Err(error) =
+                cache.put_manifest_by_digest(client.base_url(), repo, reference, &bytes)
+            {
+                tracing::debug!(%error, "could not cache manifest");
+            }
+            bytes
+        }
+    };
 
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
 
@@ -475,6 +491,66 @@ mod tests {
             "blob must be adopted into cache"
         );
         // MockServer drop asserts the blob endpoint's expect(1) was satisfied.
+    }
+
+    /// A second pull of the same repo by digest is served from the cache without
+    /// asking the registry for the manifest again; a tag is always re-fetched, and
+    /// the same digest under another repo still goes to the registry.
+    #[tokio::test]
+    async fn a_digest_pull_reuses_its_manifest_and_a_tag_pull_does_not() {
+        use sha2::{Digest, Sha256};
+
+        let data = b"digest-pinned-layer".to_vec();
+        let layer = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+        let manifest = serde_json::to_vec(&manifest_for(&layer, data.len())).unwrap();
+        let pinned = format!("sha256:{}", hex::encode(Sha256::digest(&manifest)));
+
+        let server = MockServer::start().await;
+        for reference in [pinned.as_str(), "v1"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/myrepo/manifests/{reference}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(manifest.clone(), MANIFEST_MEDIA_TYPE),
+                )
+                .expect(if reference == "v1" { 2 } else { 1 })
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/other/manifests/{pinned}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(manifest.clone(), MANIFEST_MEDIA_TYPE),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{layer}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(data.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+
+        for _ in 0..3 {
+            let result = pull(&client, "myrepo", &pinned, None, &cache, &[])
+                .await
+                .unwrap();
+            assert_eq!(result.digest, layer);
+        }
+        for _ in 0..2 {
+            pull(&client, "myrepo", "v1", None, &cache, &[])
+                .await
+                .unwrap();
+        }
+        let other = pull(&client, "other", &pinned, None, &cache, &[])
+            .await
+            .unwrap();
+        assert!(other.cached, "the layer blob itself is shared by digest");
+        // MockServer drop asserts each manifest endpoint's expected hit count.
     }
 
     /// Build a manifest whose single layer declares `digest`/`size`.
