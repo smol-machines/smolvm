@@ -289,7 +289,7 @@ pub async fn exec_stream(
     // per-session output cap is still enforced inside the agent client's
     // streaming collector (MAX_STREAMING_EXEC_OUTPUT), which emits a
     // truncation Error event and stops relaying.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::agent::ExecEvent>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::agent::ExecEvent>();
     let err_tx = tx.clone();
     let entry_exec = entry.clone();
     let start = std::time::Instant::now();
@@ -340,14 +340,98 @@ pub async fn exec_stream(
     });
 
     // Yield each event as an SSE frame the instant it lands in the channel.
-    let stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            let sse_event = exec_event_to_sse(event);
-            yield Ok::<_, Infallible>(sse_event);
-        }
-    };
+    Ok(Sse::new(exec_event_stream(rx)).keep_alive(KeepAlive::default()))
+}
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+fn exec_event_stream(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::agent::ExecEvent>,
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        let mut stdout = Utf8ExecOutput::default();
+        let mut stderr = Utf8ExecOutput::default();
+        while let Some(event) = rx.recv().await {
+            match event {
+                crate::agent::ExecEvent::Stdout(bytes) => {
+                    if let Some(text) = stdout.decode(&bytes) {
+                        yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+                    }
+                }
+                crate::agent::ExecEvent::Stderr(bytes) => {
+                    if let Some(text) = stderr.decode(&bytes) {
+                        yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+                    }
+                }
+                terminal => {
+                    // A stream can end in the middle of a UTF-8 character. Emit
+                    // the replacement before exit/error, while keeping complete
+                    // characters intact across guest output chunks.
+                    if let Some(text) = stdout.finish() {
+                        yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+                    }
+                    if let Some(text) = stderr.finish() {
+                        yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+                    }
+                    yield Ok::<_, Infallible>(exec_event_to_sse(terminal));
+                }
+            }
+        }
+        if let Some(text) = stdout.finish() {
+            yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+        }
+        if let Some(text) = stderr.finish() {
+            yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+        }
+    }
+}
+
+/// Decode one output stream without replacing a valid code point split across
+/// two agent frames. Only an incomplete trailing character is retained.
+#[derive(Default)]
+struct Utf8ExecOutput {
+    partial: Vec<u8>,
+}
+
+impl Utf8ExecOutput {
+    fn decode(&mut self, bytes: &[u8]) -> Option<String> {
+        if self.partial.is_empty() {
+            if let Ok(valid) = std::str::from_utf8(bytes) {
+                return (!valid.is_empty()).then(|| valid.to_owned());
+            }
+        }
+        let mut buffer = std::mem::take(&mut self.partial);
+        buffer.extend_from_slice(bytes);
+        let mut result = String::new();
+        let mut cursor = 0;
+        while cursor < buffer.len() {
+            match std::str::from_utf8(&buffer[cursor..]) {
+                Ok(valid) => {
+                    result.push_str(valid);
+                    break;
+                }
+                Err(err) => {
+                    let valid_end = cursor + err.valid_up_to();
+                    result.push_str(std::str::from_utf8(&buffer[cursor..valid_end]).unwrap());
+                    cursor = valid_end;
+                    match err.error_len() {
+                        Some(len) => {
+                            result.push('\u{fffd}');
+                            cursor += len;
+                        }
+                        None => {
+                            self.partial.extend_from_slice(&buffer[cursor..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        (!result.is_empty()).then_some(result)
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        let partial = std::mem::take(&mut self.partial);
+        (!partial.is_empty()).then(|| String::from_utf8_lossy(&partial).into_owned())
+    }
 }
 
 /// Encode a guest exec event as an SSE frame. Errors can include arbitrary
@@ -1413,6 +1497,39 @@ mod interactive_tests {
 mod log_stream_tests {
     use super::*;
     use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn streamed_exec_keeps_split_utf8_intact_and_flushes_incomplete_output_before_exit() {
+        use crate::agent::ExecEvent;
+        use axum::response::IntoResponse as _;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(ExecEvent::Stdout(vec![b'h', b'i', b' ', 0xf0]))
+            .unwrap();
+        tx.send(ExecEvent::Stderr(vec![0xe2])).unwrap();
+        tx.send(ExecEvent::Stdout(vec![0x9f])).unwrap();
+        tx.send(ExecEvent::Stderr(vec![0x82, 0xac])).unwrap();
+        tx.send(ExecEvent::Stdout(vec![0x90, 0xb1, 0xff, b'!', 0xe2]))
+            .unwrap();
+        tx.send(ExecEvent::Exit(0)).unwrap();
+        drop(tx);
+
+        let response = Sse::new(exec_event_stream(rx)).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            body,
+            concat!(
+                "event: stdout\ndata: hi \n\n",
+                "event: stderr\ndata: €\n\n",
+                "event: stdout\ndata: 🐱�!\n\n",
+                "event: stdout\ndata: �\n\n",
+                "event: exit\ndata: {\"exitCode\":0}\n\n",
+            )
+        );
+    }
 
     /// What axum's `Sse` writes for these lines, one `Event::default().data(line)` each.
     async fn axum_sse_bytes(lines: &[&str]) -> Vec<u8> {
