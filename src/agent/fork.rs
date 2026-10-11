@@ -3161,6 +3161,26 @@ pub fn mount_cache_slot(name: &str) -> Result<()> {
     }
 }
 
+// Called from the restore identity reset, before the restored marker is
+// published. The inherited container may keep running without another overlay
+// preparation, so the clone hostname must be mapped here as well.
+fn rejuvenation_hosts_script(root: &str, clone: &str) -> String {
+    format!(
+        "HOSTS='{root}/etc/hosts'; \
+         if [ -f \"$HOSTS\" ]; then \
+             if ! /usr/bin/awk -v host='{clone}' \
+                 '$1 !~ /^#/ {{ for (i=2; i<=NF; i++) {{ if ($i ~ /^#/) break; if ($i == host) found=1 }} }} END {{ exit !found }}' \
+                 \"$HOSTS\"; then \
+                 printf '\\n127.0.1.1\\t%s\\n' '{clone}' >> \"$HOSTS\" \
+                     || echo 'rejuvenate-stage=hosts-failed' >&2; \
+             fi; \
+         else \
+             printf '127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n127.0.1.1\\t%s\\n' '{clone}' > \"$HOSTS\" \
+                 || echo 'rejuvenate-stage=hosts-failed' >&2; \
+         fi"
+    )
+}
+
 /// Build the shell script that re-mints a clone's on-disk identity. Kept as a
 /// pure function of `(clone, seed, host_epoch)` so the security-critical
 /// contents (fresh machine-id, regenerated SSH host keys, wall-clock re-stamp)
@@ -3329,6 +3349,7 @@ fn build_rejuvenation_script(
     } else {
         "echo 'rejuvenate-stage=clock-skipped' >&2".to_string()
     };
+    let hosts_block = rejuvenation_hosts_script(&root, clone);
     format!(
         "set -e; \
          echo 'rejuvenate-stage=overlay' >&2; \
@@ -3343,6 +3364,7 @@ fn build_rejuvenation_script(
          printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
          MID=$(printf '%.32s' '{s}'); \
          printf '%s\\n' '{c}' > {root}/etc/hostname; \
+         {hosts_block}; \
          printf '%s\\n' \"$MID\" > {root}/etc/machine-id; \
          if [ -f {root}/var/lib/dbus/machine-id ] && [ ! -L {root}/var/lib/dbus/machine-id ]; then \
              printf '%s\\n' \"$MID\" > {root}/var/lib/dbus/machine-id; \
@@ -3356,6 +3378,7 @@ fn build_rejuvenation_script(
         c = clone,
         s = seed,
         clock_block = clock_block,
+        hosts_block = hosts_block,
         runtime_hostname = runtime_hostname,
         restored_container = restored_container,
         state_dir = smolvm_protocol::forkpoint::STATE_DIR,
@@ -5159,6 +5182,55 @@ mod tests {
                 "script must not rename/remove the overlay root: {script}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejuvenation_maps_clone_hostname_without_replacing_custom_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("etc")).unwrap();
+        let path = tmp.path().join("etc/hosts");
+        let original = "127.0.0.1 localhost\n10.0.0.9 pinned # keep";
+        std::fs::write(&path, original).unwrap();
+        let script = super::rejuvenation_hosts_script(tmp.path().to_str().unwrap(), "clone-a");
+        for _ in 0..2 {
+            assert!(std::process::Command::new("/bin/sh")
+                .args(["-ec", &script])
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{original}\n127.0.1.1\tclone-a\n")
+        );
+        std::fs::write(&path, "10.0.0.9 clone-a # custom\n").unwrap();
+        assert!(std::process::Command::new("/bin/sh")
+            .args(["-ec", &script])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "10.0.0.9 clone-a # custom\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejuvenation_creates_hosts_when_image_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("etc")).unwrap();
+        let script = super::rejuvenation_hosts_script(tmp.path().to_str().unwrap(), "clone-b");
+        assert!(std::process::Command::new("/bin/sh")
+            .args(["-ec", &script])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("etc/hosts")).unwrap(),
+            "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tclone-b\n"
+        );
     }
 
     // The regression this guards: identity files written unprefixed land in the

@@ -3700,8 +3700,9 @@ impl OverlaySetup {
         // without it — and software that templates from it (containerd's pod
         // sandbox hosts generation, for one) hard-fails on the missing file.
         // Provide a default only when neither the image nor a previous session
-        // supplies one: unlike resolv.conf this file is never overwritten, so
-        // image-provided copies and in-container edits stay untouched. "Supplies
+        // supplies one: unlike resolv.conf, image-provided copies and
+        // in-container edits are preserved (the hostname is appended after
+        // mounting if it is not already mapped). "Supplies
         // one" means actual name mappings — Ubuntu-derived images often ship an
         // empty or comments-only /etc/hosts, and counting those left `localhost`
         // unresolvable inside the container.
@@ -3829,6 +3830,7 @@ impl OverlaySetup {
         let entry_count = self.verify_mount();
         info!(workload_id = %self.workload_id, entry_count = entry_count, "overlay mounted");
 
+        refresh_overlay_hostname(&self.merged_path);
         self.create_bundle()?;
         Ok(self.into_overlay_info())
     }
@@ -3851,6 +3853,7 @@ impl OverlaySetup {
                 info!(workload_id = %self.workload_id, "reusing existing persistent overlay");
                 // Intent: persistent-overlay DNS follows the active backend (INTENT.md).
                 refresh_overlay_resolver(&self.merged_path)?;
+                refresh_overlay_hostname(&self.merged_path);
                 self.create_bundle()?;
                 return Ok(self.into_overlay_info());
             }
@@ -3892,6 +3895,7 @@ impl OverlaySetup {
             let entry_count = self.verify_mount();
             info!(workload_id = %self.workload_id, entry_count = entry_count, "persistent overlay remounted");
 
+            refresh_overlay_hostname(&self.merged_path);
             self.create_bundle()?;
             return Ok(self.into_overlay_info());
         }
@@ -3931,6 +3935,47 @@ fn overlay_resolv_conf_contents() -> String {
     }
 
     "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
+}
+
+fn refresh_overlay_hostname(root: &Path) {
+    if let Err(error) = ensure_overlay_hostname(root, &crate::oci::container_hostname()) {
+        // Some images deliberately make /etc/hosts unwritable. Keep their
+        // previous behavior rather than making the workload fail to start.
+        warn!(path = %root.join("etc/hosts").display(), error = %error, "failed to add guest hostname to hosts");
+    }
+}
+
+/// Make the OCI container hostname resolvable without replacing the image's
+/// /etc/hosts or any mappings the workload added. Work through the mounted
+/// overlay: writing directly into a live upperdir is unsafe on overlayfs.
+fn ensure_overlay_hostname(root: &Path, hostname: &str) -> Result<()> {
+    if hostname.is_empty() || hostname == "localhost" {
+        return Ok(());
+    }
+    let path = root.join("etc/hosts");
+    let existing = match std::fs::read(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&path, overlay_hosts_contents(hostname))?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if existing.split(|&byte| byte == b'\n').any(|line| {
+        let mapping = line.split(|&byte| byte == b'#').next().unwrap_or_default();
+        mapping
+            .split(|byte| byte.is_ascii_whitespace())
+            .skip(1)
+            .any(|name| name == hostname.as_bytes())
+    }) {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(format!("127.0.1.1\t{hostname}\n").as_bytes())?;
+    Ok(())
 }
 
 /// Default /etc/hosts for images that ship without one, mirroring the file
@@ -7020,6 +7065,45 @@ mod tests {
                 "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n"
             );
         }
+    }
+
+    #[test]
+    fn mounted_overlay_preserves_image_hosts_and_resolves_active_hostname() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("etc")).unwrap();
+        let path = tmp.path().join("etc/hosts");
+        let image_hosts = "127.0.0.1 localhost\n::1 localhost\n10.0.0.9 pinned # keep\n";
+        std::fs::write(&path, image_hosts).unwrap();
+
+        ensure_overlay_hostname(tmp.path(), "worker-1").unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(updated, format!("{image_hosts}127.0.1.1\tworker-1\n"));
+        ensure_overlay_hostname(tmp.path(), "worker-1").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+        // A clone gets its new name even when it inherits the golden's hosts.
+        ensure_overlay_hostname(tmp.path(), "worker-2").unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .ends_with("127.0.1.1\tworker-2\n"));
+    }
+
+    #[test]
+    fn mounted_overlay_respects_custom_mapping_and_partial_last_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("etc")).unwrap();
+        let path = tmp.path().join("etc/hosts");
+        std::fs::write(&path, b"10.0.0.9 worker-1 # custom\n# worker-2\n").unwrap();
+        ensure_overlay_hostname(tmp.path(), "worker-1").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "10.0.0.9 worker-1 # custom\n# worker-2\n"
+        );
+        std::fs::write(&path, b"127.0.0.1 localhost").unwrap();
+        ensure_overlay_hostname(tmp.path(), "worker-2").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "127.0.0.1 localhost\n127.0.1.1\tworker-2\n"
+        );
     }
 
     #[test]
