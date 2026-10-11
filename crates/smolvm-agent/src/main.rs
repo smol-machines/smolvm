@@ -5751,8 +5751,14 @@ fn run_interactive_loop(
         if pending_stdin.is_empty() && poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let request = match input_frame.read_next(stream_fd) {
                 Ok(request) => request,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    // Keep the existing protocol-error behavior while also
+                    // reaping the workload before returning the error.
+                    process::kill_child_tree(child);
+                    return Err(error.into());
+                }
                 Err(error) => {
-                    debug!(%error, "host disconnected or sent invalid interactive frame");
+                    debug!(%error, "host disconnected during interactive exec");
                     return Ok(kill_child_on_disconnect(child));
                 }
             };
