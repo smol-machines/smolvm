@@ -75,8 +75,9 @@ written and the exit code is 0.
 ## A plain server has no authentication of any kind
 
 `serve start` exposes create, exec and file routes, and started plainly it has no TLS, token or
-auth. On loopback that is a single-user boundary; the Unix socket, whose file permissions are the
-boundary, is the safer default and is why it is smolvm's default and this packet's.
+auth. Loopback TCP is reachable by other local users. A Unix socket is the safer default: smolvm
+binds it in a private temporary directory, sets mode `0600`, then publishes it at the requested
+path before accepting connections. Run the server and its API clients as the same user.
 
 **Mutual TLS is configured from the environment, not by a flag.** With `SMOLVM_SERVE_TLS_CERT`,
 `SMOLVM_SERVE_TLS_KEY` and `SMOLVM_SERVE_TLS_CLIENT_CA` set, measured on macOS arm64 on v1.22.2: a

@@ -814,9 +814,7 @@ impl ServeStartCmd {
         internal_shutdown: tokio::sync::watch::Receiver<bool>,
         grace: std::time::Duration,
     ) -> Result<()> {
-        let socket_guard = UnixSocketGuard::bind(&path)?;
-        let listener =
-            tokio::net::UnixListener::bind(&socket_guard.path).map_err(smolvm::error::Error::Io)?;
+        let (socket_guard, listener) = bind_private_unix_socket(&path)?;
 
         tracing::info!(path = %socket_guard.path.display(), "starting HTTP API server");
         println!(
@@ -890,10 +888,41 @@ fn default_listen_value() -> String {
     }
 }
 
+// Bind under a private directory and publish only after tightening the socket
+// mode. Binding at the final path before chmod leaves a window for other local
+// users to connect and wait for the API to start accepting requests.
+#[cfg(unix)]
+fn bind_private_unix_socket(
+    path: &std::path::Path,
+) -> Result<(UnixSocketGuard, tokio::net::UnixListener)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut guard = UnixSocketGuard::bind(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        smolvm::error::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Unix socket needs a parent directory",
+        ))
+    })?;
+    let staging = tempfile::Builder::new()
+        .prefix(".smolvm-socket-")
+        .tempdir_in(parent)
+        .map_err(smolvm::error::Error::Io)?;
+    let staged_path = staging.path().join("s");
+    let listener =
+        tokio::net::UnixListener::bind(&staged_path).map_err(smolvm::error::Error::Io)?;
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(smolvm::error::Error::Io)?;
+    std::fs::rename(&staged_path, path).map_err(smolvm::error::Error::Io)?;
+    guard.published = true;
+    Ok((guard, listener))
+}
+
 #[cfg(unix)]
 #[derive(Debug)]
 struct UnixSocketGuard {
     path: PathBuf,
+    published: bool,
 }
 
 #[cfg(unix)]
@@ -903,14 +932,34 @@ impl UnixSocketGuard {
             std::fs::create_dir_all(parent).map_err(smolvm::error::Error::Io)?;
         }
 
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(_) => {
+                        return Err(smolvm::error::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "API socket already has a listener",
+                        )));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                    Err(e) => return Err(smolvm::error::Error::Io(e)),
+                }
+                std::fs::remove_file(path).map_err(smolvm::error::Error::Io)?;
+            }
+            Ok(_) => {
+                return Err(smolvm::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "refusing to replace a non-socket API path",
+                )));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(smolvm::error::Error::Io(e)),
         }
 
         Ok(Self {
             path: path.to_path_buf(),
+            published: false,
         })
     }
 }
@@ -918,6 +967,9 @@ impl UnixSocketGuard {
 #[cfg(unix)]
 impl Drop for UnixSocketGuard {
     fn drop(&mut self) {
+        if !self.published {
+            return;
+        }
         if let Err(e) = std::fs::remove_file(&self.path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = %self.path.display(), error = %e, "failed to remove unix socket");
@@ -1152,6 +1204,50 @@ mod tests {
         assert_eq!(grace(None, Some("300")).as_secs(), 300);
         assert_eq!(grace(None, None).as_secs(), 5);
         assert_eq!(grace(Some(999_999), None).as_secs(), 3600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_api_socket_is_private_before_it_can_accept_connections() {
+        use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let ordinary = dir.path().join("ordinary");
+        std::fs::write(&ordinary, "keep").unwrap();
+        assert!(super::bind_private_unix_socket(&ordinary).is_err());
+        assert_eq!(std::fs::read_to_string(&ordinary).unwrap(), "keep");
+        symlink(&ordinary, &path).unwrap();
+        assert!(super::bind_private_unix_socket(&path).is_err());
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(&path).unwrap();
+
+        let (guard, listener) = super::bind_private_unix_socket(&path).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().file_type().is_socket());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (_server, _) = listener.accept().await.unwrap();
+        drop(client);
+        drop(listener);
+        drop(guard);
+        assert!(!path.exists());
+
+        let active = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(super::bind_private_unix_socket(&path).is_err());
+        assert!(std::fs::metadata(&path).unwrap().file_type().is_socket());
+        drop(active);
+        let (guard, _listener) = super::bind_private_unix_socket(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(guard);
     }
 
     /// `/slow` answers after `delay`, signalling `entered` as it starts, so a
