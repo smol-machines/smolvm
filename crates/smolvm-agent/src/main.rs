@@ -5583,6 +5583,17 @@ fn run_interactive_loop(
             continue;
         }
 
+        // POLLHUP/POLLERR are reported even when POLLIN is disabled while a
+        // stdin frame waits for the child pipe. Without this check a client
+        // disconnect can leave a child that never reads stdin running until
+        // its timeout (or forever if there is no timeout).
+        if !pending_stdin.is_empty()
+            && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        {
+            debug!("host disconnected with pending stdin");
+            return Ok(kill_child_on_disconnect(child));
+        }
+
         // Read available stdout. If send_response fails (host disconnected),
         // kill the child and return gracefully.
         // A pipe whose writer closed reports POLLHUP, often without POLLIN,
@@ -8322,6 +8333,57 @@ mod tests {
         assert_eq!(stdout, input);
         sender.join().unwrap();
         guest.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streamed_exec_reaps_child_on_disconnect_with_pending_stdin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut child, pty) = spawn_direct_interactive_command(
+                &["sleep".to_string(), "5".to_string()],
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+            assert!(pty.is_none());
+            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            let started = std::time::Instant::now();
+            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            (code, started.elapsed())
+        });
+
+        let mut header = [0; 4];
+        client.read_exact(&mut header).unwrap();
+        let mut response = vec![0; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut response).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<AgentResponse>(&response).unwrap(),
+            AgentResponse::Started
+        ));
+        client
+            .write_all(
+                &smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                    data: vec![b'x'; 512 * 1024],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        drop(client);
+
+        let (code, elapsed) = guest.join().unwrap();
+        assert_eq!(code, 124);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "disconnected host must not leave the guest waiting for its exec timeout: {elapsed:?}"
+        );
     }
 
     // ========================================================================
