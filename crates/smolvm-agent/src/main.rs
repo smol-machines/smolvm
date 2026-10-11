@@ -5464,6 +5464,16 @@ fn run_interactive_loop(
     let mut child_stderr = child.stderr.take();
     let mut child_stdin = child.stdin.take();
 
+    // Never block the I/O loop writing into a child that may itself be
+    // blocked writing stdout. Keep draining both directions while stdin waits.
+    if let Some(ref stdin) = child_stdin {
+        if !set_nonblocking(stdin.as_raw_fd()) {
+            warn!("failed to set stdin to non-blocking mode");
+        }
+    }
+    let mut pending_stdin = Vec::new();
+    let mut stdin_offset = 0;
+
     // Set non-blocking mode on stdout/stderr
     if let Some(ref stdout) = child_stdout {
         if !set_nonblocking(stdout.as_raw_fd()) {
@@ -5537,7 +5547,13 @@ fn run_interactive_loop(
             },
             libc::pollfd {
                 fd: stream_fd,
-                events: libc::POLLIN,
+                // Finish writing a pending frame before reading another one.
+                // This keeps guest memory bounded to a single stdin frame.
+                events: if pending_stdin.is_empty() {
+                    libc::POLLIN
+                } else {
+                    0
+                },
                 revents: 0,
             },
             libc::pollfd {
@@ -5545,10 +5561,19 @@ fn run_interactive_loop(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: if pending_stdin.is_empty() {
+                    -1
+                } else {
+                    child_stdin.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1)
+                },
+                events: libc::POLLOUT,
+                revents: 0,
+            },
         ];
 
         // Wait for I/O or timeout using poll()
-        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 4, poll_timeout_ms) };
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 5, poll_timeout_ms) };
 
         if poll_result < 0 {
             let err = std::io::Error::last_os_error();
@@ -5648,7 +5673,7 @@ fn run_interactive_loop(
         // If the host disconnects (client killed, timeout), read_exact returns
         // an error. In that case, kill the child and return gracefully — the
         // agent must survive client disconnections.
-        if poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        if pending_stdin.is_empty() && poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let mut header = [0u8; 4];
             if let Err(e) = stream.read_exact(&mut header) {
                 debug!(error = %e, "host disconnected during interactive exec");
@@ -5669,9 +5694,9 @@ fn run_interactive_loop(
                 AgentRequest::Stdin { data } => {
                     if data.is_empty() {
                         drop(child_stdin.take());
-                    } else if let Some(ref mut stdin) = child_stdin {
-                        let _ = stdin.write_all(&data);
-                        let _ = stdin.flush();
+                    } else if child_stdin.is_some() {
+                        pending_stdin = data;
+                        stdin_offset = 0;
                     }
                 }
                 AgentRequest::Resize { cols, rows } => {
@@ -5679,6 +5704,28 @@ fn run_interactive_loop(
                 }
                 _ => {
                     warn!("unexpected request during interactive session");
+                }
+            }
+        }
+        if !pending_stdin.is_empty() && poll_fds[4].revents & libc::POLLOUT != 0 {
+            if let Some(ref mut stdin) = child_stdin {
+                match stdin.write(&pending_stdin[stdin_offset..]) {
+                    Ok(0) => {
+                        pending_stdin.clear();
+                        child_stdin = None;
+                    }
+                    Ok(n) => {
+                        stdin_offset += n;
+                        if stdin_offset == pending_stdin.len() {
+                            pending_stdin.clear();
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        debug!(error = %e, "child stdin closed");
+                        pending_stdin.clear();
+                        child_stdin = None;
+                    }
                 }
             }
         }
@@ -8203,6 +8250,78 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "blocked stdin must not prevent timeout handling"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streamed_cat_drains_stdout_while_writing_large_stdin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut child, pty) =
+                spawn_direct_interactive_command(&["cat".to_string()], &[], None, false).unwrap();
+            assert!(pty.is_none());
+            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            let code = run_interactive_loop(&mut agent, &mut child, Some(5000)).unwrap();
+            send_response(
+                &mut agent,
+                &AgentResponse::Exited {
+                    exit_code: code,
+                    oom: false,
+                },
+            )
+            .unwrap();
+        });
+
+        let input = vec![b'x'; 512 * 1024];
+        let mut writer = client.try_clone().unwrap();
+        let payload = input.clone();
+        let sender = std::thread::spawn(move || {
+            for chunk in payload.chunks(32 * 1024) {
+                writer
+                    .write_all(
+                        &smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                            data: chunk.to_vec(),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer
+                .write_all(
+                    &smolvm_protocol::encode_message(&AgentRequest::Stdin { data: Vec::new() })
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+
+        let mut stdout = Vec::new();
+        loop {
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut body).unwrap();
+            match serde_json::from_slice::<AgentResponse>(&body).unwrap() {
+                AgentResponse::Started => {}
+                AgentResponse::Stdout { data } => stdout.extend(data),
+                AgentResponse::Exited { exit_code, .. } => {
+                    assert_eq!(exit_code, 0);
+                    break;
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        assert_eq!(stdout, input);
+        sender.join().unwrap();
+        guest.join().unwrap();
     }
 
     // ========================================================================

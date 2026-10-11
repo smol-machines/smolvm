@@ -267,6 +267,7 @@ pub async fn exec_stream(
     let command = req.command.clone();
     let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
+    let stdin_data = req.stdin.map(String::into_bytes);
 
     // Image-based machines stream from a container in their image (persistent
     // overlay keyed by machine name); plain machines stream from the VM
@@ -317,14 +318,14 @@ pub async fn exec_stream(
                     .with_mounts(mounts_config)
                     .with_timeout(timeout)
                     .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes);
-                c.run_streaming_with(config, |e| {
+                c.run_streaming_with_stdin(config, stdin_data, |e| {
                     let _ = tx.send(e);
                 })
             })
             .await
         } else {
             with_machine_client_traced(&entry_exec, tid, move |c| {
-                c.vm_exec_streaming_with(command, env, workdir, timeout, |e| {
+                c.vm_exec_streaming_with_stdin(command, env, workdir, timeout, stdin_data, |e| {
                     let _ = tx.send(e);
                 })
             })

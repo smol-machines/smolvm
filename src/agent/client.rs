@@ -2499,6 +2499,19 @@ impl AgentClient {
     where
         F: FnMut(ExecEvent),
     {
+        self.run_streaming_with_stdin(config, None, on_event)
+    }
+
+    /// Stream an image command, optionally writing stdin before closing it.
+    pub fn run_streaming_with_stdin<F>(
+        &mut self,
+        config: RunConfig,
+        stdin_data: Option<Vec<u8>>,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExecEvent),
+    {
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
         // Keep a host-side deadline whenever the caller requested one. The
         // guest normally enforces the command timeout, but a wedged restored
@@ -2525,11 +2538,7 @@ impl AgentClient {
             stop_vm_on_exit: false,
         })?;
 
-        // These streaming calls do not forward host stdin. Close the guest pipe
-        // explicitly so commands that read until EOF (for example `cat`) exit.
-        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
-
-        collect_exec_events(self, "run streaming", on_event)
+        self.collect_with_streaming_stdin(stdin_data, "run streaming", on_event)
     }
 
     /// Run a command interactively with streaming I/O.
@@ -3298,6 +3307,22 @@ impl AgentClient {
     where
         F: FnMut(ExecEvent),
     {
+        self.vm_exec_streaming_with_stdin(command, env, workdir, timeout, None, on_event)
+    }
+
+    /// Stream a bare-VM command, optionally writing stdin before closing it.
+    pub fn vm_exec_streaming_with_stdin<F>(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        stdin_data: Option<Vec<u8>>,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExecEvent),
+    {
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
         let _timeout_guard = self.set_exec_timeout(timeout)?;
 
@@ -3312,10 +3337,79 @@ impl AgentClient {
             stdin_data: None,
         })?;
 
-        // No stdin is forwarded on this path; tell the guest it has reached EOF.
-        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+        self.collect_with_streaming_stdin(stdin_data, "streaming exec", on_event)
+    }
 
-        collect_exec_events(self, "streaming exec", on_event)
+    fn collect_with_streaming_stdin<F>(
+        &mut self,
+        stdin_data: Option<Vec<u8>>,
+        op: &str,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExecEvent),
+    {
+        let Some(data) = stdin_data.filter(|data| !data.is_empty()) else {
+            self.send_streaming_stdin(None)?;
+            return collect_exec_events(self, op, on_event);
+        };
+
+        // Write stdin on a separate handle while draining stdout/stderr on
+        // this one. Commands that echo as they read can otherwise fill both
+        // socket directions and wait on each other indefinitely.
+        let mut writer = AgentClient {
+            stream: self.stream.try_clone()?,
+            trace_id: self.trace_id.clone(),
+        };
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(move || {
+                let sent = writer.send_streaming_stdin(Some(data));
+                if sent.is_err() {
+                    // Without the EOF frame, a child waiting for stdin would
+                    // otherwise wait forever after a failed host write.
+                    let _ = writer.stream.shutdown(std::net::Shutdown::Write);
+                }
+                sent
+            });
+            let mut exited = false;
+            let mut on_event = on_event;
+            let result = collect_exec_events(self, op, |event| {
+                if matches!(event, ExecEvent::Exit(_)) {
+                    exited = true;
+                }
+                on_event(event);
+            });
+            if !sender.is_finished() {
+                // A command can exit before consuming its entire stdin. Stop
+                // any blocked socket write so joining the writer is bounded.
+                let _ = self.stream.shutdown(std::net::Shutdown::Write);
+            }
+            let sent = sender
+                .join()
+                .map_err(|_| Error::agent("send stdin", "writer thread panicked"))?;
+            result?;
+            // A command may exit without reading its input (e.g. `true`).
+            // Its valid exit result takes precedence over a broken stdin pipe.
+            if exited {
+                Ok(())
+            } else {
+                sent
+            }
+        })
+    }
+
+    fn send_streaming_stdin(&mut self, stdin_data: Option<Vec<u8>>) -> Result<()> {
+        if let Some(data) = stdin_data {
+            // Stdin frames are JSON/base64 encoded and the guest limits frame
+            // size to 16 MiB. Bound each frame even for large API requests.
+            for chunk in data.chunks(256 * 1024) {
+                self.send(&AgentRequest::Stdin {
+                    data: chunk.to_vec(),
+                })?;
+            }
+        }
+        // The guest reads until EOF; even absent input needs an explicit close.
+        self.send(&AgentRequest::Stdin { data: Vec::new() })
     }
 
     /// Low-level send without waiting for response (public).
@@ -4281,6 +4375,83 @@ mod run_streaming_tests {
     use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
     use std::io::{Read, Write};
     use std::thread;
+
+    #[test]
+    fn streamed_stdin_is_chunked_and_closed_for_bare_and_image_commands() {
+        for image in [false, true] {
+            let input = "snowman ☃".repeat(40_000).into_bytes();
+            let expected = input.clone();
+            let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let server = thread::spawn(move || {
+                let mut received = Vec::new();
+                let mut frames = 0;
+                loop {
+                    let mut header = [0u8; 4];
+                    server_stream.read_exact(&mut header).unwrap();
+                    let mut payload = vec![0; u32::from_be_bytes(header) as usize];
+                    server_stream.read_exact(&mut payload).unwrap();
+                    let envelope: Envelope<AgentRequest> =
+                        serde_json::from_slice(&payload).unwrap();
+                    match envelope.body {
+                        AgentRequest::Run {
+                            interactive: true, ..
+                        } if image && frames == 0 => {}
+                        AgentRequest::VmExec {
+                            interactive: true, ..
+                        } if !image && frames == 0 => {}
+                        AgentRequest::Stdin { data } if data.is_empty() => break,
+                        AgentRequest::Stdin { data } => {
+                            assert!(data.len() <= 256 * 1024);
+                            received.extend(data);
+                        }
+                        other => panic!("unexpected streamed exec request: {other:?}"),
+                    }
+                    frames += 1;
+                }
+                assert!(frames > 2, "large stdin must use multiple frames");
+                assert_eq!(received, expected);
+                for response in [
+                    AgentResponse::Started,
+                    AgentResponse::Exited {
+                        exit_code: 0,
+                        oom: false,
+                    },
+                ] {
+                    server_stream
+                        .write_all(&encode_message(&response).unwrap())
+                        .unwrap();
+                }
+            });
+
+            let mut client = AgentClient::from_stream(client_stream);
+            let mut events = Vec::new();
+            if image {
+                client
+                    .run_streaming_with_stdin(
+                        RunConfig::new("alpine", vec!["cat".into()]),
+                        Some(input),
+                        |event| events.push(event),
+                    )
+                    .unwrap();
+            } else {
+                client
+                    .vm_exec_streaming_with_stdin(
+                        vec!["cat".into()],
+                        vec![],
+                        None,
+                        None,
+                        Some(input),
+                        |event| events.push(event),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(events, vec![ExecEvent::Exit(0)]);
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn vm_exec_streaming_closes_guest_stdin_before_waiting_for_exit() {
