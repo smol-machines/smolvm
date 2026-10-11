@@ -5448,6 +5448,74 @@ fn kill_child_on_disconnect(child: &mut Child) -> i32 {
     124
 }
 
+/// Assemble a host stdin/control frame without blocking the command I/O loop.
+/// A readable socket may hold only one byte of a length prefix or payload;
+/// waiting for the rest would prevent output draining and timeout handling.
+#[derive(Default)]
+struct InteractiveFrame {
+    header: [u8; 4],
+    header_len: usize,
+    body: Vec<u8>,
+    body_len: usize,
+}
+
+impl InteractiveFrame {
+    fn read_next(&mut self, fd: libc::c_int) -> std::io::Result<Option<AgentRequest>> {
+        loop {
+            let (buf, received) = if self.header_len < self.header.len() {
+                (&mut self.header[..], &mut self.header_len)
+            } else {
+                (&mut self.body[..], &mut self.body_len)
+            };
+            if *received == buf.len() {
+                if self.header_len < self.header.len() {
+                    unreachable!();
+                }
+                if self.body.is_empty() {
+                    let len = u32::from_be_bytes(self.header) as usize;
+                    if len == 0 || len > MAX_MESSAGE_SIZE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid interactive frame size: {len} bytes"),
+                        ));
+                    }
+                    self.body.resize(len, 0);
+                    continue;
+                }
+                let request = serde_json::from_slice(&self.body)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                *self = Self::default();
+                return Ok(Some(request));
+            }
+            // MSG_DONTWAIT applies only to this read. Setting O_NONBLOCK on a
+            // duplicated socket would also change the concurrent writer's fd.
+            let n = unsafe {
+                libc::recv(
+                    fd,
+                    buf[*received..].as_mut_ptr().cast(),
+                    buf.len() - *received,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n > 0 {
+                *received += n as usize;
+            } else if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "host disconnected during interactive exec",
+                ));
+            } else {
+                let error = std::io::Error::last_os_error();
+                match error.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => return Ok(None),
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+}
+
 fn run_interactive_loop(
     stream: &mut impl ReadWrite,
     child: &mut Child,
@@ -5473,6 +5541,7 @@ fn run_interactive_loop(
     }
     let mut pending_stdin = Vec::new();
     let mut stdin_offset = 0;
+    let mut input_frame = InteractiveFrame::default();
 
     // Set non-blocking mode on stdout/stderr
     if let Some(ref stdout) = child_stdout {
@@ -5677,45 +5746,29 @@ fn run_interactive_loop(
             child_stderr = None;
         }
 
-        // Read incoming request from host (stdin data, resize) — only when
-        // poll confirms data is available, then use blocking read_exact which
-        // is safe because the data is already in the kernel buffer.
-        //
-        // If the host disconnects (client killed, timeout), read_exact returns
-        // an error. In that case, kill the child and return gracefully — the
-        // agent must survive client disconnections.
+        // Read only bytes currently available; a partial frame must leave the
+        // loop free to drain child output and enforce the command deadline.
         if pending_stdin.is_empty() && poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let mut header = [0u8; 4];
-            if let Err(e) = stream.read_exact(&mut header) {
-                debug!(error = %e, "host disconnected during interactive exec");
-                return Ok(kill_child_on_disconnect(child));
-            }
-            let len = u32::from_be_bytes(header) as usize;
-            if len > MAX_MESSAGE_SIZE {
-                return Err(format!("message too large: {} bytes", len).into());
-            }
-            let mut buf = vec![0u8; len];
-            if let Err(e) = stream.read_exact(&mut buf) {
-                debug!(error = %e, "host disconnected during interactive exec payload");
-                return Ok(kill_child_on_disconnect(child));
-            }
-            let request: AgentRequest = serde_json::from_slice(&buf)?;
-
-            match request {
-                AgentRequest::Stdin { data } => {
-                    if data.is_empty() {
-                        drop(child_stdin.take());
-                    } else if child_stdin.is_some() {
-                        pending_stdin = data;
-                        stdin_offset = 0;
-                    }
+            let request = match input_frame.read_next(stream_fd) {
+                Ok(request) => request,
+                Err(error) => {
+                    debug!(%error, "host disconnected or sent invalid interactive frame");
+                    return Ok(kill_child_on_disconnect(child));
                 }
-                AgentRequest::Resize { cols, rows } => {
+            };
+            match request {
+                Some(AgentRequest::Stdin { data }) if data.is_empty() => {
+                    drop(child_stdin.take());
+                }
+                Some(AgentRequest::Stdin { data }) if child_stdin.is_some() => {
+                    pending_stdin = data;
+                    stdin_offset = 0;
+                }
+                Some(AgentRequest::Resize { cols, rows }) => {
                     debug!(cols, rows, "resize requested (no PTY in pipe mode)");
                 }
-                _ => {
-                    warn!("unexpected request during interactive session");
-                }
+                Some(_) => warn!("unexpected request during interactive session"),
+                None => {}
             }
         }
         // The child may close its stdin while continuing to run. A closed
@@ -8274,6 +8327,51 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn streamed_exec_timeout_survives_partial_stdin_frame() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+            data: b"hello".to_vec(),
+        })
+        .unwrap();
+        // A frame can stall inside its length prefix or its JSON payload.
+        for fragment in [&frame[..1], &frame[..5]] {
+            let (mut agent, mut client) = UnixStream::pair().unwrap();
+            let (finished, done) = std::sync::mpsc::channel();
+            let guest = std::thread::spawn(move || {
+                let (mut child, pty) = spawn_direct_interactive_command(
+                    &["sleep".to_string(), "5".to_string()],
+                    &[],
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert!(pty.is_none());
+                send_response(&mut agent, &AgentResponse::Started).unwrap();
+                let code = run_interactive_loop(&mut agent, &mut child, Some(500)).unwrap();
+                finished.send(code).unwrap();
+            });
+
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut response = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut response).unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<AgentResponse>(&response).unwrap(),
+                AgentResponse::Started
+            ));
+
+            client.write_all(fragment).unwrap();
+            let result = done.recv_timeout(std::time::Duration::from_secs(2));
+            drop(client);
+            guest.join().unwrap();
+            assert_eq!(result.unwrap(), 124);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn streamed_cat_drains_stdout_while_writing_large_stdin() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
@@ -8306,14 +8404,21 @@ mod tests {
         let payload = input.clone();
         let sender = std::thread::spawn(move || {
             for chunk in payload.chunks(32 * 1024) {
-                writer
-                    .write_all(
-                        &smolvm_protocol::encode_message(&AgentRequest::Stdin {
-                            data: chunk.to_vec(),
-                        })
-                        .unwrap(),
-                    )
-                    .unwrap();
+                let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                    data: chunk.to_vec(),
+                })
+                .unwrap();
+                if chunk.as_ptr() == payload.as_ptr() {
+                    // Fragments across both the prefix and payload must be
+                    // assembled without losing the command's streamed output.
+                    writer.write_all(&frame[..1]).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    writer.write_all(&frame[1..5]).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    writer.write_all(&frame[5..]).unwrap();
+                } else {
+                    writer.write_all(&frame).unwrap();
+                }
             }
             writer
                 .write_all(
