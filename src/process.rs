@@ -1579,6 +1579,12 @@ pub fn allocate_vm_uid(
 /// shares its golden's uid and never claims its own). Linux-only.
 #[cfg(target_os = "linux")]
 pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
+    // Most unprivileged VMs never had an assigned uid or a registry directory.
+    // Avoid a misleading lock warning when there is no allocation to release.
+    // Callers release only after the VM has stopped.
+    if !key_dir.join(".vm-uid").exists() {
+        return;
+    }
     let Ok(_registry_lock) = lock_uid_registry(registry_dir) else {
         tracing::warn!("unable to lock UID registry; retaining assignment");
         return;
@@ -4976,6 +4982,17 @@ mod tests {
         assert!(shared_uid_owner_dir(&reg, &clone, VM_UID_BASE).is_err());
         assert_eq!(shared_uid_owner_dir(&reg, &clone, 0).unwrap(), clone);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unassigned_vm_release_does_not_open_missing_uid_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("uids");
+        let vm = dir.path().join("vms").join("ordinary");
+        std::fs::create_dir_all(&vm).unwrap();
+        free_vm_uid(&registry, &vm);
+        assert!(!registry.exists(), "unassigned VM has no uid registry");
     }
 
     #[cfg(target_os = "linux")]
