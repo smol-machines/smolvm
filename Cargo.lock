@@ -3450,6 +3450,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "x509-parser",
  "zeroize",
 ]
 
