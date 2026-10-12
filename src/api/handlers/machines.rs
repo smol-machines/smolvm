@@ -4146,6 +4146,7 @@ fn classify_fork_error(e: SmolvmError) -> ApiError {
     } else if lc.contains("already exists")
         || lc.contains("not running forkable")
         || lc.contains("no memfd-backed ram")
+        || lc.contains("not started as branchable")
         || lc.contains("control socket not responding")
         || lc.contains("not ready to fork")
     {
@@ -7480,6 +7481,12 @@ mod tests {
         let e = SmolvmError::agent(
             "fork",
             "golden FORK failed: ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)",
+        );
+        assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
+        // The same refusal as the fork layer rewords it for people.
+        let e = SmolvmError::agent(
+            "fork",
+            "machine 'g' was not started as branchable, so it has no copy-on-write memory to branch from.",
         );
         assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
         // A stopped golden's dead control socket is likewise a 409.
