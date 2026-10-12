@@ -385,6 +385,13 @@ pub struct EgressUpdate {
     /// Permit a removal that empties the list, which allows egress to every
     /// host (`--net` on the CLI, `allowAll` on the API).
     pub allow_all: bool,
+    /// Start from an empty allow list before applying this update's additions,
+    /// so the machine ends up with exactly what the update names and nothing
+    /// it allowed before (`--reset-allow-list` on the CLI, `resetAllowList` on
+    /// the API). A reset that names nothing still needs `allow_all` to open
+    /// egress; it cannot be combined with removals, which would have nothing
+    /// to remove.
+    pub reset_allow_list: bool,
 }
 
 impl EgressUpdate {
@@ -396,6 +403,7 @@ impl EgressUpdate {
             && !self.outbound_localhost_only
             && self.remove_allow_hosts.is_empty()
             && self.remove_allow_cidrs.is_empty()
+            && !self.reset_allow_list
     }
 }
 
@@ -1298,8 +1306,10 @@ impl VmRecord {
     /// This record after one add/remove amendment of its egress allow list, or
     /// `None` when the update is empty. Hosts are stored as `machine create`
     /// stores them: `allow_hosts` bare (a name and its subdomains),
-    /// `allow_host_patterns` strict-encoded. Removing the last entry would open
-    /// egress to every host, so that needs `allow_all` to say so. Shared by
+    /// `allow_host_patterns` strict-encoded. `reset_allow_list` drops the stored
+    /// list first, so the result is exactly the update's additions. Removing or
+    /// resetting away the last entry would open egress to every host, so that
+    /// needs `allow_all` to say so. Shared by
     /// `machine update` and the API's egress endpoint; the full replace-style
     /// checks (credentials, TSI, saved memory) run in [`Self::replace_egress`].
     pub fn updated_egress(&self, update: &EgressUpdate) -> Result<Option<VmRecord>> {
@@ -1310,6 +1320,18 @@ impl VmRecord {
         let mut hosts = self.dns_filter_hosts.clone().unwrap_or_default();
         let mut cidrs = self.allowed_cidrs.clone().unwrap_or_default();
         let was_restricted = !hosts.is_empty() || !cidrs.is_empty();
+
+        if update.reset_allow_list {
+            if !update.remove_allow_hosts.is_empty() || !update.remove_allow_cidrs.is_empty() {
+                return Err(crate::Error::config(
+                    "update",
+                    "resetting the allow list replaces it, so there is nothing for a removal \
+                     to remove; name the full new list instead",
+                ));
+            }
+            hosts.clear();
+            cidrs.clear();
+        }
 
         for host in &update.remove_allow_hosts {
             let strict = encode_strict(host.trim()).ok();
@@ -1459,6 +1481,70 @@ mod tests {
         let mut r = VmRecord::new("m".to_string(), 1, 512, vec![], ports, network);
         r.image = Some(image.to_string());
         r
+    }
+
+    #[test]
+    fn updated_egress_reset_replaces_the_list_and_keeps_the_last_entry_guard() {
+        let mut record = VmRecord::new("e".to_string(), 1, 512, vec![], vec![], true);
+        record.dns_filter_hosts =
+            Some(vec!["old.example".to_string(), "*.old.example".to_string()]);
+        record.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+
+        // A reset alone is a change, not a no-op, and it would open egress, so
+        // it needs allow_all like a removal of the last entry does.
+        let err = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("every host"), "{err}");
+
+        // Reset with additions: exactly the additions remain, nothing older.
+        let next = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                allow_host_patterns: vec!["pypi.org".to_string(), "*.npmjs.org".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let hosts = next.dns_filter_hosts.clone().unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert!(
+            !hosts.iter().any(|h| h.contains("old.example")),
+            "{hosts:?}"
+        );
+        assert!(next.allowed_cidrs.as_deref().unwrap_or_default().is_empty());
+
+        // Reset plus allow_all: an open machine, no list at all.
+        let open = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                allow_all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(open
+            .dns_filter_hosts
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty());
+        assert!(open.allowed_cidrs.as_deref().unwrap_or_default().is_empty());
+
+        // Reset and removal contradict each other.
+        let err = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                remove_allow_hosts: vec!["old.example".to_string()],
+                allow_hosts: vec!["new.example".to_string()],
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("replaces"), "{err}");
     }
 
     #[test]

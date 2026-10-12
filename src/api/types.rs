@@ -314,6 +314,12 @@ pub struct UpdateEgressRequest {
     /// host. Mirrors `--net` on `machine update`.
     #[serde(default)]
     pub allow_all: bool,
+    /// Start from an empty allow list before applying this request's
+    /// additions, so the machine ends up with exactly what the request names.
+    /// A reset that names nothing needs `allowAll` to open egress. Cannot be
+    /// combined with removals. Mirrors `--reset-allow-list` on `machine update`.
+    #[serde(default)]
+    pub reset_allow_list: bool,
 }
 
 /// Environment variable.

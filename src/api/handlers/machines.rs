@@ -6603,6 +6603,7 @@ pub async fn update_machine_egress(
         remove_allow_cidrs: normalize(&req.remove_allow_cidrs)?,
         outbound_localhost_only: req.outbound_localhost_only,
         allow_all: req.allow_all,
+        reset_allow_list: req.reset_allow_list,
     };
 
     let next = record

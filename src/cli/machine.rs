@@ -5891,6 +5891,16 @@ pub struct UpdateCmd {
     #[arg(long = "remove-allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub remove_allow_cidr: Vec<String>,
 
+    /// Start from an empty allow list before applying this update's
+    /// --allow-host, --allow-host-pattern and --allow-cidr entries, so the
+    /// machine ends up with exactly those and nothing it allowed before. With
+    /// --net and no entries the machine may reach every host.
+    #[arg(
+        long = "reset-allow-list",
+        conflicts_with_all = ["remove_allow_host", "remove_allow_cidr"]
+    )]
+    pub reset_allow_list: bool,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -5949,6 +5959,7 @@ impl UpdateCmd {
             remove_allow_cidrs: self.remove_allow_cidr.clone(),
             outbound_localhost_only: self.outbound_localhost_only,
             allow_all: self.net,
+            reset_allow_list: self.reset_allow_list,
         })
     }
 
@@ -5973,6 +5984,7 @@ impl UpdateCmd {
             outbound_localhost_only,
             remove_allow_host,
             remove_allow_cidr,
+            reset_allow_list,
             env,
             remove_env,
             workdir,
@@ -5990,7 +6002,8 @@ impl UpdateCmd {
             || !allow_host_pattern.is_empty()
             || !allow_cidr.is_empty()
             || !remove_allow_host.is_empty()
-            || !remove_allow_cidr.is_empty();
+            || !remove_allow_cidr.is_empty()
+            || *reset_allow_list;
         let other = !volume.is_empty()
             || !remove_volume.is_empty()
             || !port.is_empty()
