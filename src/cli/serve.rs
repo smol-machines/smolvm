@@ -38,7 +38,8 @@ EXAMPLES:
   smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
   smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
   smolvm serve start -v                             Enable verbose logging")]
-    Start(ServeStartCmd),
+    // Boxed: the server flags dwarf the other variant.
+    Start(Box<ServeStartCmd>),
 
     /// Export OpenAPI specification for SDK generation
     Openapi(OpenapiCmd),
@@ -47,7 +48,7 @@ EXAMPLES:
 impl ServeCmd {
     pub fn run(self) -> Result<()> {
         match self {
-            ServeCmd::Start(cmd) => cmd.run(),
+            ServeCmd::Start(cmd) => (*cmd).run(),
             ServeCmd::Openapi(cmd) => cmd.run(),
         }
     }
