@@ -126,6 +126,10 @@ pub struct ApiState {
     /// --cache-disk-dir`). `None` refuses cache disks on the API: a remote
     /// caller names a base by file name, so the server must choose where.
     cache_disk_dir: RwLock<Option<std::path::PathBuf>>,
+    /// Directory API callers may name local image archives and rootfs
+    /// directories under (`smolvm serve --local-image-dir`). `None` refuses
+    /// local images on the API: a path names the server's own files.
+    local_image_dir: RwLock<Option<std::path::PathBuf>>,
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
@@ -346,6 +350,7 @@ impl ApiState {
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             cache_disk_dir: RwLock::new(None),
+            local_image_dir: RwLock::new(None),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -368,6 +373,7 @@ impl ApiState {
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             cache_disk_dir: RwLock::new(None),
+            local_image_dir: RwLock::new(None),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -386,6 +392,20 @@ impl ApiState {
     /// --cache-disk-dir`.
     pub fn set_cache_disk_dir(&self, dir: Option<std::path::PathBuf>) {
         *self.cache_disk_dir.write() = dir;
+    }
+
+    /// Accept local images under `dir` (canonical). Set once from `smolvm serve
+    /// --local-image-dir`.
+    pub fn set_local_image_dir(&self, dir: Option<std::path::PathBuf>) {
+        *self.local_image_dir.write() = dir;
+    }
+
+    /// The directory local images must live in, or a 400 naming the flag.
+    pub fn local_image_dir(&self) -> Result<std::path::PathBuf, ApiError> {
+        self.local_image_dir
+            .read()
+            .clone()
+            .ok_or_else(|| ApiError::BadRequest(LOCAL_IMAGES_DISABLED.to_string()))
     }
 
     /// The directory cache disk bases live in, or a 400 naming the flag.
@@ -1912,6 +1932,11 @@ pub fn mounts_to_host_mounts(specs: &[MountSpec]) -> Result<Vec<HostMount>, ApiE
         .map(|s| HostMount::try_from(s).map_err(|e| ApiError::BadRequest(e.to_string())))
         .collect()
 }
+
+/// The refusal for a machine created from a local image path on a server
+/// without a local image directory.
+pub const LOCAL_IMAGES_DISABLED: &str = "local images are disabled on this server; \
+start `smolvm serve` with --local-image-dir to accept archives and rootfs directories under it";
 
 /// The refusal for a machine that asks for a cache disk on a server without
 /// a cache disk directory.

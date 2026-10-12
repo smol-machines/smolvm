@@ -2331,15 +2331,13 @@ pub async fn create_machine(
 /// is a private request-scoped handoff, not a public option.
 async fn create_machine_inner(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<CreateMachineRequest>,
+    Json(mut req): Json<CreateMachineRequest>,
     verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
     cached_checkpoint: bool,
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Refused before any image pull or disk work, so a server that has not opted
     // in never builds a nested machine.
     state.ensure_nested_virt_allowed(req.nested_virt)?;
-    #[cfg(target_os = "linux")]
-    let mut req = req;
     #[cfg(target_os = "linux")]
     let _prepared = if let Some(reference) = req
         .from
@@ -2376,6 +2374,12 @@ async fn create_machine_inner(
         ));
     }
 
+    // Resolve local images after validating the exclusive source choice, before
+    // creating or registering the machine. This persists a stable local: ref.
+    if let Some(image) = req.image.take() {
+        req.image = Some(resolve_api_image(&state, image).await?);
+    }
+
     // Published ports need the inbound path that only virtio-net has. With an
     // UNSET backend the launcher auto-selects virtio-net when ports are present
     // (see `plan_launch_network`), so ports "just work" without per-request
@@ -2408,8 +2412,6 @@ async fn create_machine_inner(
     }
 
     // If registry_ref is set, pull the artifact from the registry and treat as `from`
-    #[cfg(not(target_os = "linux"))]
-    let mut req = req;
     // Where a pack came from, kept on the machine so a live checkpoint of it can
     // name the pack for a host that has to fetch it.
     let mut pack_registry_ref: Option<String> = None;
@@ -3303,6 +3305,54 @@ async fn create_machine_inner(
         .ok_or_else(|| ApiError::internal("machine disappeared after creation".to_string()))?;
 
     Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Normalize an API image before the machine is registered. A registry
+/// reference passes through. A local archive or rootfs directory is accepted
+/// only under the server's `--local-image-dir`, after resolving symlinks, since
+/// a path names the server's own files; an already-resolved `local:` /
+/// `local-dir:` reference is never accepted from a caller. A request has no
+/// stdin archive stream, so `-` fails. Hashing multi-GiB archives runs off the
+/// Tokio reactor.
+async fn resolve_api_image(state: &ApiState, image: String) -> Result<String, ApiError> {
+    use crate::data::image_source::{
+        classify, is_local_ref, resolve, ArchiveInput, ImageSource, ResolvedImage,
+    };
+    if is_local_ref(&image) {
+        return Err(ApiError::BadRequest(
+            "image names a resolved local source; give the archive or directory path".into(),
+        ));
+    }
+    let path = match classify(&image) {
+        ImageSource::Registry(_) => return Ok(image),
+        ImageSource::Archive(ArchiveInput::Stdin) => {
+            return Err(ApiError::BadRequest(
+                "image '-' requires CLI stdin; give the API a server-local archive path".into(),
+            ))
+        }
+        ImageSource::Unsupported { hint, .. } => return Err(ApiError::BadRequest(hint)),
+        ImageSource::Archive(ArchiveInput::File(path)) | ImageSource::Directory(path) => path,
+    };
+    let dir = state.local_image_dir()?;
+    let canonical = path.canonicalize().map_err(|error| {
+        ApiError::BadRequest(format!("local image '{}': {error}", path.display()))
+    })?;
+    if !canonical.starts_with(&dir) {
+        return Err(ApiError::BadRequest(format!(
+            "local image '{}' is outside this server's local image directory",
+            path.display()
+        )));
+    }
+    let source = classify(&canonical.to_string_lossy());
+    tokio::task::spawn_blocking(move || resolve(source))
+        .await
+        .map_err(|error| ApiError::internal(format!("image resolution task failed: {error}")))?
+        .map(|resolved| match resolved {
+            ResolvedImage::Registry(reference) | ResolvedImage::Local { reference, .. } => {
+                reference
+            }
+        })
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 /// List all machines.
@@ -6972,6 +7022,55 @@ mod tests {
             validate_pinned_ports(&[(31028, 4318), (31028, 8080)]),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn api_local_images_need_the_local_image_dir_and_stay_inside_it() {
+        let (_db_dir, state) = setup_test_state();
+        let bad = |result: Result<String, ApiError>| matches!(result, Err(ApiError::BadRequest(_)));
+        assert_eq!(
+            resolve_api_image(&state, "alpine:3.20".into())
+                .await
+                .unwrap(),
+            "alpine:3.20"
+        );
+        assert!(bad(resolve_api_image(&state, "-".into()).await));
+
+        let images = TempDir::new().unwrap();
+        let rootfs = images.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let outside = TempDir::new().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), images.path().join("escape")).unwrap();
+
+        // No --local-image-dir: every local path is refused.
+        assert!(bad(
+            resolve_api_image(&state, rootfs.display().to_string()).await
+        ));
+
+        state.set_local_image_dir(Some(images.path().canonicalize().unwrap()));
+        let accepted = resolve_api_image(&state, rootfs.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted,
+            format!("local-dir:{}", rootfs.canonicalize().unwrap().display())
+        );
+        for refused in [
+            "/".to_string(),
+            outside.path().display().to_string(),
+            format!("{}/../", images.path().display()),
+            images.path().join("escape").display().to_string(),
+            images.path().join("missing.tar").display().to_string(),
+            format!("local-dir:{}", rootfs.display()),
+            "local-dir:/".to_string(),
+            "local:../../..".to_string(),
+        ] {
+            assert!(
+                bad(resolve_api_image(&state, refused.clone()).await),
+                "{refused} must be refused"
+            );
+        }
     }
 
     #[test]

@@ -807,7 +807,9 @@ pub struct CreateMachineRequest {
     /// Restart policy configuration.
     #[serde(default)]
     pub restart: Option<RestartSpec>,
-    /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
+    /// OCI image reference (e.g., "alpine:latest"), or a `docker save` / OCI
+    /// archive or rootfs directory under the server's `--local-image-dir`.
+    /// Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
     /// Path to a `.smolmachine` or `.checkpoint` artifact. Creates from
