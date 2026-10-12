@@ -6387,6 +6387,19 @@ fn file_sha256(path: &std::path::Path) -> Result<String, ApiError> {
 /// Largest cache base a create may fetch.
 const MAX_CACHE_BASE_BYTES: u64 = 512 << 30;
 
+/// The lock a fetch of `base` holds, shared by every create that needs it.
+fn cache_base_fetch_lock(base: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .entry(base.to_string())
+        .or_default()
+        .clone()
+}
+
 /// Fetch a requested cache base this server does not have yet from its signed
 /// source URL, verified against its SHA-256 before it appears under its name.
 /// A base already present is used as is: bases are immutable by name.
@@ -6394,7 +6407,6 @@ async fn fetch_cache_base(
     state: &ApiState,
     spec: &crate::api::types::CacheDiskSpec,
 ) -> Result<(), ApiError> {
-    use sha2::Digest;
     let dir = state.cache_disk_dir()?;
     crate::data::disk::validate_base_name(&spec.base).map_err(ApiError::BadRequest)?;
     let target = dir.join(&spec.base);
@@ -6413,23 +6425,19 @@ async fn fetch_cache_base(
             ApiError::BadRequest("cacheDisk.sourceUrl needs a hex sha256 to verify against".into())
         })?;
     let url = checked_checkpoint_source(raw)?;
+    // One download per base: a create that needs a base another create is
+    // already fetching waits for it instead of fetching it again.
+    let lock = cache_base_fetch_lock(&spec.base);
+    let _fetching = lock.lock().await;
+    if target.exists() {
+        return Ok(());
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| ApiError::internal(format!("build cache base fetch client: {e}")))?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| ApiError::internal(format!("fetch cache base: {}", e.without_url())))?;
-    if !response.status().is_success() {
-        return Err(ApiError::BadRequest(format!(
-            "cache base source url returned {}",
-            response.status()
-        )));
-    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -6440,33 +6448,14 @@ async fn fetch_cache_base(
         std::process::id()
     ));
     let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-            .await
-            .map_err(|e| ApiError::internal(format!("create {}: {e}", partial.display())))?;
-        let mut hasher = sha2::Sha256::new();
-        let mut received = 0_u64;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| ApiError::internal(format!("read cache base: {}", e.without_url())))?;
-            received += chunk.len() as u64;
-            if received > MAX_CACHE_BASE_BYTES {
-                return Err(ApiError::BadRequest(format!(
-                    "cache base exceeds {MAX_CACHE_BASE_BYTES} bytes"
-                )));
-            }
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| ApiError::internal(format!("write cache base: {e}")))?;
-        }
-        file.sync_all()
-            .await
-            .map_err(|e| ApiError::internal(format!("sync cache base: {e}")))?;
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = crate::api::cache_base_fetch::download(
+            &client,
+            &url,
+            &partial,
+            MAX_CACHE_BASE_BYTES,
+            Default::default(),
+        )
+        .await?;
         if actual != expected {
             return Err(ApiError::BadRequest(format!(
                 "cache base sha256 is {actual}, expected {expected}"
