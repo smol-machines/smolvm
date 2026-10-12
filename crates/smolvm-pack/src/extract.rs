@@ -4298,6 +4298,39 @@ pub fn has_active_leases(cache_dir: &Path) -> bool {
     }
 }
 
+/// Move this process's lease on a named machine's layers volume (`mount` is
+/// the path [`acquire_layers_lease`] returned) to the VMM that uses it, so the
+/// lease ends with the VM. A long-lived launcher such as `smolvm serve` would
+/// otherwise keep it live forever, and [`release_unused_machine_layers_volume`]
+/// would never see the volume as free. Standalone packs keep their own leases.
+pub fn hand_machine_layers_lease_to(mount: &Path, pid: i32) {
+    #[cfg(target_os = "macos")]
+    {
+        if mount.file_name().is_none_or(|name| name != CS_MOUNT_DIR) {
+            return;
+        }
+        let Some(cache_dir) = mount.parent() else {
+            return;
+        };
+        if !is_machine_layers_cache(cache_dir) {
+            return;
+        }
+        let Ok(lock) = lock_leases(cache_dir) else {
+            return;
+        };
+        let leases_dir = cache_dir.join(LEASES_DIR);
+        if fs::write(leases_dir.join(pid.to_string()), "").is_ok() {
+            let _ = fs::remove_file(leases_dir.join(std::process::id().to_string()));
+        }
+        drop(lock);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (mount, pid);
+    }
+}
+
 /// Detach a stopped named machine's layers volume once its last fork child is
 /// gone. The caller has checked that the owning VMM is not alive; this keeps
 /// the volume when a live process holds a lease (a start is mid-launch) or a
@@ -8434,6 +8467,26 @@ mod orphan_reap_tests {
         }
         assert!(machine_layers_have_dependents(&source).unwrap());
         assert!(!machine_layers_have_dependents(&unrelated).unwrap());
+    }
+
+    /// The launcher's lease moves to the VMM for named machines only; a
+    /// standalone pack's lease stays with the process that took it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn named_machine_lease_moves_to_the_vmm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = std::process::id().to_string();
+        let machine = tmp.path().join("vms/aaa/pack");
+        let standalone = tmp.path().join("packs/aaa");
+        for dir in [&machine, &standalone] {
+            fs::create_dir_all(dir.join(LEASES_DIR)).unwrap();
+            fs::write(dir.join(LEASES_DIR).join(&own), "").unwrap();
+            hand_machine_layers_lease_to(&dir.join(CS_MOUNT_DIR), 4242);
+        }
+        assert!(machine.join(LEASES_DIR).join("4242").exists());
+        assert!(!machine.join(LEASES_DIR).join(&own).exists());
+        assert!(standalone.join(LEASES_DIR).join(&own).exists());
+        assert!(!standalone.join(LEASES_DIR).join("4242").exists());
     }
 
     #[test]

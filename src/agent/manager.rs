@@ -2755,6 +2755,7 @@ impl AgentManager {
         let packed_layers_dax_window =
             super::virtiofs::packed_layers_window_for_launch(features.snapshot_dir.as_deref());
         let records_window = features.packed_layers_dir.is_some();
+        let leased_layers = features.packed_layers_dir.clone();
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
@@ -3003,6 +3004,11 @@ impl AgentManager {
         // the sweep is only driven from serve.) The `child` handle drops without
         // waiting (Rust `Child::drop` is a no-op), leaving the PID for the sweep.
         crate::process::register_vm_child(child_pid);
+        // The layers lease names this launcher; hand it to the VMM so it ends
+        // with the VM rather than with a long-lived `serve`. macOS only.
+        if let Some(layers) = leased_layers.as_deref() {
+            smolvm_pack::extract::hand_machine_layers_lease_to(layers, child_pid);
+        }
         // Captures of this machine record the window its guest booted with.
         if let (Some(name), true) = (self.name(), records_window) {
             if let Some(start) = crate::process::process_start_time(child_pid) {
