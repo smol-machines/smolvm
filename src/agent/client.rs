@@ -2029,6 +2029,15 @@ impl AgentClient {
         )
     }
 
+    /// [`shutdown`](Self::shutdown) that gives up after `maximum`, for a caller
+    /// that must exit soon whatever the guest does.
+    pub fn shutdown_within(&mut self, maximum: Duration) -> Result<()> {
+        self.shutdown_with_timeouts(
+            Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS).min(maximum),
+            maximum,
+        )
+    }
+
     #[cfg(test)]
     fn shutdown_with_deadline(&mut self, timeout: Duration) -> Result<()> {
         self.shutdown_with_timeouts(timeout, timeout)

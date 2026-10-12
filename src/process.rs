@@ -3689,13 +3689,22 @@ pub fn detach_stdio_to_stderr_file(path: &std::path::Path) -> std::io::Result<()
 /// is still caught. Uses only `getppid` and `nanosleep`.
 #[cfg(unix)]
 pub fn exit_when_parent_is_not(parent: Pid) {
+    exit_when_parent_is_not_with(parent, || {});
+}
+
+/// [`exit_when_parent_is_not`], running `before_exit` once the parent is gone
+/// and before this process exits, such as shutting a guest down cleanly so its
+/// writes reach disk. `before_exit` must bound its own time.
+#[cfg(unix)]
+pub fn exit_when_parent_is_not_with(parent: Pid, before_exit: impl FnOnce() + Send + 'static) {
     let _ = std::thread::Builder::new()
         .name("parent-death-watch".into())
-        .spawn(move || loop {
-            if unsafe { libc::getppid() } != parent {
-                exit_child(0);
+        .spawn(move || {
+            while unsafe { libc::getppid() } == parent {
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            before_exit();
+            exit_child(0);
         });
 }
 

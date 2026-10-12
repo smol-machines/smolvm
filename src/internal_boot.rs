@@ -103,9 +103,18 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // The getppid()-based reparenting check is POSIX-specific; on Windows the
     // parent-death watchdog is not wired up (the SDK in-process embedder path is
     // a Unix concern here).
+    //
+    // Before exiting it shuts the guest down cleanly once it knows how to reach
+    // the agent, as `machine stop` does: otherwise writes the guest had not
+    // flushed are lost, which a persistent machine booted again later shows
+    // as files that are simply gone.
     #[cfg(unix)]
     if std::env::var_os("SMOLVM_BOOT_WATCH_PARENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        crate::process::exit_when_parent_is_not(unsafe { libc::getppid() });
+        crate::process::exit_when_parent_is_not_with(unsafe { libc::getppid() }, || {
+            if let Some(socket) = AGENT_SOCKET.get() {
+                flush_guest_before_exit(socket);
+            }
+        });
     }
 
     // Read boot config
@@ -116,6 +125,8 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
 
     // Clean up the config file — it's no longer needed
     let _ = std::fs::remove_file(&config_path);
+    #[cfg(unix)]
+    let _ = AGENT_SOCKET.set(config.vsock_socket.clone());
 
     // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
     // debug log file so virglrenderer/MoltenVK errors are captured.
@@ -927,5 +938,28 @@ mod backing_chain_tests {
                 vec![golden.clone(), raw.clone()]
             );
         }
+    }
+}
+
+/// The guest agent's socket, known once the boot config is read, for the
+/// parent-death watchdog's clean shutdown.
+#[cfg(unix)]
+static AGENT_SOCKET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Longest the parent-death watchdog waits for the guest to shut down before
+/// exiting regardless.
+#[cfg(unix)]
+const PARENT_DEATH_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Ask the guest to freeze and flush its filesystems and power off, as `machine
+/// stop` does, so a VM whose owner exited keeps what it wrote. Best-effort: an
+/// agent that cannot be reached, or does not answer in time, is left to the
+/// exit that follows.
+#[cfg(unix)]
+fn flush_guest_before_exit(socket: &std::path::Path) {
+    let shutdown = crate::agent::AgentClient::connect(socket)
+        .and_then(|mut client| client.shutdown_within(PARENT_DEATH_SHUTDOWN));
+    if let Err(error) = shutdown {
+        tracing::warn!(%error, "owner exited; could not shut the guest down cleanly before exiting");
     }
 }
