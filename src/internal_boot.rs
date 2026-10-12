@@ -963,3 +963,37 @@ fn flush_guest_before_exit(socket: &std::path::Path) {
         tracing::warn!(%error, "owner exited; could not shut the guest down cleanly before exiting");
     }
 }
+
+#[cfg(all(test, unix))]
+mod parent_death_tests {
+    /// A guest that never answers must not keep a VM whose owner is gone
+    /// alive: the clean shutdown gives up and the exit goes ahead.
+    #[test]
+    fn an_unresponsive_agent_does_not_hold_up_the_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // Accept and hold the connection without ever replying.
+        let _held = std::thread::spawn(move || {
+            let connection = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            drop(connection);
+        });
+        let started = std::time::Instant::now();
+        super::flush_guest_before_exit(&socket);
+        assert!(
+            started.elapsed() < super::PARENT_DEATH_SHUTDOWN,
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// No agent listening at all (a guest still booting) fails at once.
+    #[test]
+    fn a_missing_agent_fails_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        super::flush_guest_before_exit(&dir.path().join("absent.sock"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+}
