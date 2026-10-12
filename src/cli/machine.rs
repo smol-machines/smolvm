@@ -6863,6 +6863,9 @@ impl SyncCmd {
             println!("Machine '{name}' has no staged mounts");
             return Ok(());
         }
+        if let Some(error) = smolvm::staged_mount::refuse_detached_sync(&record, &name) {
+            return Err(error);
+        }
 
         let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
         let (manager, mut client) = vm_common::ensure_running_and_connect(&Some(name.clone()))?;

@@ -3234,6 +3234,14 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     if let Some(cidrs) = &record.allowed_cidrs {
         fields.insert("allowed_cidrs".into(), serde_json::json!(cidrs));
     }
+    // A branch keeps its staged working copies but never writes them back;
+    // name the machine that does, so tooling can send the user there.
+    if let Some(source) = &record.staged_mounts_detached_from {
+        fields.insert(
+            "staged_mounts_detached_from".into(),
+            serde_json::json!(source),
+        );
+    }
     obj
 }
 

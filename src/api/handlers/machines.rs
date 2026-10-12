@@ -5550,6 +5550,9 @@ pub async fn sync_machine(
     if record.staged_mounts.is_empty() {
         return Ok(Json(record_to_info(&name, &record)));
     }
+    if let Some(error) = crate::staged_mount::refuse_detached_sync(&record, &name) {
+        return Err(ApiError::Conflict(error.to_string()));
+    }
     if crate::agent::state_probe::resolve_state(&name, &record) != RecordState::Running {
         return Err(ApiError::Conflict(format!(
             "machine '{name}' must be running to synchronize staged mounts"

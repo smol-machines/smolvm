@@ -474,6 +474,15 @@ pub struct VmRecord {
     #[serde(default)]
     pub staged_mounts: Vec<(usize, String, String)>,
 
+    /// The fork source whose host directories this branch's staged working
+    /// copies were seeded from. A branch keeps the copies (they live on its own
+    /// cloned storage disk and survive restarts, since the mounts stay
+    /// recorded) but never synchronizes them back: the host directories belong
+    /// to the source, and two descendants writing one tree would interleave
+    /// their changes. Inherited by the branch's own branches.
+    #[serde(default)]
+    pub staged_mounts_detached_from: Option<String>,
+
     /// Port mappings (host_port, guest_port).
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
@@ -870,6 +879,7 @@ impl VmRecord {
             cache_disk: None,
             mounts,
             staged_mounts: Vec::new(),
+            staged_mounts_detached_from: None,
             ports,
             published_sockets: Vec::new(),
             network,
@@ -961,6 +971,7 @@ impl VmRecord {
             cache_disk: None,
             mounts,
             staged_mounts: Vec::new(),
+            staged_mounts_detached_from: None,
             ports,
             published_sockets: Vec::new(),
             network,
@@ -1173,6 +1184,12 @@ impl VmRecord {
                     .iter()
                     .any(|entry| matches(apex, entry) || matches(&sub_host, entry))
             })
+    }
+
+    /// Whether this machine's staged mounts synchronize back to their host
+    /// directories. False on a branch, which only keeps the working copies.
+    pub fn staged_mounts_sync_to_host(&self) -> bool {
+        self.staged_mounts_detached_from.is_none()
     }
 
     /// Whether this machine's image can be fetched. Always: a machine with no
