@@ -1743,8 +1743,14 @@ mod tests {
         let mut wild = rec_with_image("alpine", true, vec![]);
         wild.dns_filter_hosts = Some(vec!["*.docker.io".to_string(), "*.docker.com".to_string()]);
         assert!(!wild.image_needs_host_fetch());
+        // GHCR redirects blobs to githubusercontent.com; both apexes are needed.
         let mut ghcr = rec_with_image("ghcr.io/acme/app:1", true, vec![]);
         ghcr.dns_filter_hosts = Some(vec!["=ghcr.io".to_string()]);
+        assert!(ghcr.image_needs_host_fetch());
+        ghcr.dns_filter_hosts = Some(vec![
+            "=ghcr.io".to_string(),
+            "githubusercontent.com".to_string(),
+        ]);
         assert!(!ghcr.image_needs_host_fetch());
         // A registry with a port is matched by host.
         let mut private = rec_with_image("registry.example.com:5000/team/app:2", true, vec![]);

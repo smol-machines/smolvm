@@ -1228,7 +1228,11 @@ mod tests {
         let features = merge_record_launch_features(&record, LaunchFeatures::default());
         assert_eq!(
             features.dns_filter_hosts,
-            Some(vec!["api.example.com".into(), "ghcr.io".into()])
+            Some(vec![
+                "api.example.com".into(),
+                "ghcr.io".into(),
+                "githubusercontent.com".into()
+            ])
         );
 
         record.init_completed = true;

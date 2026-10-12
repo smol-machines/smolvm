@@ -365,6 +365,10 @@ pub fn registry_pull_hosts(image: &str) -> Vec<String> {
         "docker.io" | "index.docker.io" | "registry-1.docker.io" => {
             vec!["docker.io".to_string(), "docker.com".to_string()]
         }
+        // GHCR answers manifests itself but redirects blob downloads to
+        // pkg-containers.githubusercontent.com, so a list naming only ghcr.io
+        // fails part-way through the first pull.
+        "ghcr.io" => vec!["ghcr.io".to_string(), "githubusercontent.com".to_string()],
         host if host.ends_with("smolmachines.com") => vec!["smolmachines.com".to_string()],
         host => vec![host.to_string()],
     }
@@ -725,9 +729,17 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_pull_hosts_ghcr_needs_its_blob_host() {
+        assert_eq!(
+            registry_pull_hosts("ghcr.io/acme/app:1"),
+            vec!["ghcr.io", "githubusercontent.com"]
+        );
+    }
+
+    #[test]
     fn test_registry_pull_hosts_explicit_registry() {
         // A single apex covers the registry's sub-hosts via subdomain matching.
-        assert_eq!(registry_pull_hosts("ghcr.io/acme/app:1"), vec!["ghcr.io"]);
+        assert_eq!(registry_pull_hosts("quay.io/acme/app:1"), vec!["quay.io"]);
         assert_eq!(
             registry_pull_hosts("registry.example.com:5000/img"),
             vec!["registry.example.com:5000"]

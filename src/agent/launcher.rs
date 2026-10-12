@@ -3125,7 +3125,11 @@ mod tests {
         f.allow_image_pull_egress(Some("ghcr.io/acme/app:1"), false);
         assert_eq!(
             f.dns_filter_hosts.unwrap(),
-            vec!["api.anthropic.com".to_string(), "ghcr.io".to_string()]
+            vec![
+                "api.anthropic.com".to_string(),
+                "ghcr.io".to_string(),
+                "githubusercontent.com".to_string()
+            ]
         );
     }
 
