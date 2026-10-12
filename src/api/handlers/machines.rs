@@ -4205,10 +4205,11 @@ const MAX_CONCURRENT_BRANCH_BOOTS: usize = 8;
 /// requests queued for it. Every queued request was sent before the batch takes
 /// its checkpoint, so one checkpoint taken then is a state of the source each
 /// of them could have branched alone; for a running source this replaces one
-/// checkpoint per child with one per batch. Held pool slots and pinned ports
-/// keep the one-at-a-time path.
+/// checkpoint per child with one per batch. Pinned ports go with their child,
+/// and a host port asked for twice fails only the later request. Held pool
+/// slots keep the one-at-a-time path.
 fn coalescable_branch(req: &ForkRequest) -> bool {
-    !req.hold && req.ports.is_empty()
+    !req.hold
 }
 
 /// Take the source as a single branch does, then serve every compatible
@@ -4247,8 +4248,9 @@ async fn branch_batch_transaction(
 ) {
     let mut accepted = Vec::with_capacity(batch.len());
     let mut names = std::collections::HashSet::new();
+    let mut host_ports = std::collections::HashSet::new();
     for queued in batch {
-        match check_queued_branch(state, golden, &queued.req, &mut names).await {
+        match check_queued_branch(state, golden, &queued.req, &mut names, &mut host_ports).await {
             Ok(fork_env) => accepted.push((queued, fork_env)),
             Err(error) => {
                 let _ = queued.reply.send(Err(error));
@@ -4350,6 +4352,12 @@ async fn prepare_and_boot_branches(
             .map(|(queued, fork_env)| {
                 (
                     queued.req.name.clone(),
+                    queued
+                        .req
+                        .ports
+                        .iter()
+                        .map(|p| (p.host, p.guest))
+                        .collect::<Vec<(u16, u16)>>(),
                     queued.req.forkable,
                     fork_env.clone(),
                     queued.req.secrets.clone(),
@@ -4360,9 +4368,9 @@ async fn prepare_and_boot_branches(
             let specs: Vec<_> = children
                 .iter()
                 .map(
-                    |(clone, forkable, fork_env, secrets)| crate::agent::fork::ForkSpec {
+                    |(clone, ports, forkable, fork_env, secrets)| crate::agent::fork::ForkSpec {
                         clone,
-                        pinned_ports: &[],
+                        pinned_ports: ports,
                         clone_forkable: *forkable,
                         fork_env,
                         fork_secrets: secrets,
@@ -4412,12 +4420,43 @@ async fn prepare_and_boot_branches(
 
 /// The checks a single branch makes before preparing its child. Returns the
 /// child's parsed environment. `names` collects the batch's child names.
+/// Validate a branch's pinned ports as the create path does: a branch uses
+/// these host ports as-is, so port 0 or a duplicated host port would otherwise
+/// surface only as a confusing child-boot bind failure instead of a clean 400.
+fn validate_pinned_ports(pinned_ports: &[(u16, u16)]) -> Result<(), ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    for (host, guest) in pinned_ports {
+        if *host == 0 || *guest == 0 {
+            return Err(ApiError::BadRequest(
+                "port 0 is not valid for VM port forwarding".to_string(),
+            ));
+        }
+        if !seen.insert(*host) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate host port {host}: each host port can only be mapped once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn check_queued_branch(
     state: &ApiState,
     golden: &str,
     req: &ForkRequest,
     names: &mut std::collections::HashSet<String>,
+    host_ports: &mut std::collections::HashSet<u16>,
 ) -> Result<Vec<(String, String)>, ApiError> {
+    let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+    validate_pinned_ports(&pinned_ports)?;
+    if let Some((host, _)) = pinned_ports
+        .iter()
+        .find(|(host, _)| host_ports.contains(host))
+    {
+        return Err(ApiError::Conflict(format!(
+            "host port {host} is already pinned by another branch of '{golden}'"
+        )));
+    }
     crate::api::handlers::validate_fork_secrets(&req.secrets)?;
     let fork_env = crate::util::parse_request_env_list(&req.env).map_err(ApiError::BadRequest)?;
     crate::agent::fork::validate_fork_env(&fork_env)
@@ -4434,6 +4473,7 @@ async fn check_queued_branch(
             req.name
         )));
     }
+    host_ports.extend(pinned_ports.iter().map(|(host, _)| *host));
     Ok(fork_env)
 }
 
@@ -4489,26 +4529,7 @@ async fn fork_machine_transaction(
         )));
     }
 
-    // Validate pinned ports as the create path does: fork uses these host ports
-    // as-is (no remapping), so port 0 or a duplicated host port would otherwise
-    // surface only as a confusing clone-boot bind failure instead of a clean 400.
-    for (h, g) in &pinned_ports {
-        if *h == 0 || *g == 0 {
-            return Err(ApiError::BadRequest(
-                "port 0 is not valid for VM port forwarding".to_string(),
-            ));
-        }
-    }
-    {
-        let mut seen = std::collections::HashSet::new();
-        for (h, _) in &pinned_ports {
-            if !seen.insert(*h) {
-                return Err(ApiError::BadRequest(format!(
-                    "duplicate host port {h}: each host port can only be mapped once"
-                )));
-            }
-        }
-    }
+    validate_pinned_ports(&pinned_ports)?;
 
     // A failed clone finalization may need to roll back the golden and discard
     // the retained checkpoint that produced it. Keep that state transition in
@@ -6920,6 +6941,38 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    fn branch_request(json: serde_json::Value) -> ForkRequest {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn branches_with_pinned_ports_share_their_source_transaction() {
+        let ported = branch_request(serde_json::json!({
+            "name": "child",
+            "ports": [{"host": 31028, "guest": 4318}]
+        }));
+        assert!(coalescable_branch(&ported));
+        let held = branch_request(serde_json::json!({"name": "slot", "hold": true}));
+        assert!(!coalescable_branch(&held));
+    }
+
+    #[test]
+    fn pinned_ports_reject_port_zero_and_a_repeated_host_port() {
+        assert!(validate_pinned_ports(&[(31028, 4318), (31029, 8080)]).is_ok());
+        assert!(matches!(
+            validate_pinned_ports(&[(0, 4318)]),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_pinned_ports(&[(31028, 0)]),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_pinned_ports(&[(31028, 4318), (31028, 8080)]),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
 
     #[test]
     fn start_body_is_optional_even_with_a_json_content_type() {
