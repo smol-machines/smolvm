@@ -1093,14 +1093,20 @@ impl VmRecord {
     }
 
     /// Whether this machine's registry image must be fetched on the HOST before
-    /// it boots: a REGISTRY reference, on a first boot, with no network.
+    /// it boots: a REGISTRY reference, on a first boot, that the guest's own
+    /// network cannot reach: no network, an inbound-only network (published
+    /// ports without egress), or an egress allow list that does not name the
+    /// registry.
     ///
     /// The pull normally runs inside the guest (the agent shells out to
-    /// `crane`), so a machine with no network device cannot fetch its own image.
-    /// Rather than refuse such a machine, the start path fetches the image on the
-    /// host, which has network, and pins it as a local archive the guest
-    /// flattens offline (see [`crate::image_store::fetch_image_archive`]). The
-    /// machine itself never gets network.
+    /// `crane`). Rather than refuse such a machine, the start path fetches the
+    /// image on the host, which has network, and pins it as a local archive the
+    /// guest flattens offline (see [`crate::image_store::fetch_image_archive`]).
+    /// The machine's own network policy is untouched: the pull is the engine's,
+    /// not the workload's, exactly as for a machine with no network at all. An
+    /// allow list that does name the registry (and, for Docker Hub and GHCR,
+    /// the hosts they serve downloads from) keeps the pull in the guest, where
+    /// the operator chose to route it.
     ///
     /// Deliberately narrow: only a registry reference needs fetching. A local
     /// archive or directory is already on the host, a `.smolmachine` has its
@@ -1128,7 +1134,37 @@ impl VmRecord {
         matches!(
             crate::data::image_source::classify(image),
             crate::data::image_source::ImageSource::Registry(_)
-        ) && !self.launch_network_plan().has_network()
+        ) && !self.guest_can_pull(image)
+    }
+
+    /// Whether the guest's own network reaches `image`'s registry: outbound
+    /// egress with no policy at all, or an allow list that names every apex the
+    /// pull talks to ([`crate::registry::registry_pull_hosts`]), either the apex
+    /// itself or its subdomains, since registries answer from sub-hosts.
+    /// `Some([])` is a deny-all list, not an absent one, and a CIDR-only list
+    /// cannot be checked against hostnames here, so both send the pull to the
+    /// host rather than guess.
+    fn guest_can_pull(&self, image: &str) -> bool {
+        use smolvm_protocol::host_pattern::matches;
+        if !self.launch_network_plan().outbound {
+            return false;
+        }
+        if self.dns_filter_hosts.is_none()
+            && self.allowed_cidrs.is_none()
+            && self.egress_rules.is_empty()
+        {
+            return true;
+        }
+        let hosts = self.dns_filter_hosts.as_deref().unwrap_or(&[]);
+        crate::registry::registry_pull_hosts(image)
+            .iter()
+            .all(|apex| {
+                let apex = apex.split(':').next().unwrap_or(apex);
+                let sub_host = format!("pull.{apex}");
+                hosts
+                    .iter()
+                    .any(|entry| matches(apex, entry) || matches(&sub_host, entry))
+            })
     }
 
     /// Whether this machine's image can be fetched. Always: a machine with no
@@ -1583,18 +1619,51 @@ mod tests {
     }
 
     #[test]
-    fn granting_network_any_way_leaves_the_pull_to_the_guest() {
-        // Explicit --net.
+    fn open_egress_leaves_the_pull_to_the_guest() {
         assert!(!rec_with_image("alpine", true, vec![]).image_needs_host_fetch());
-        // A published port implicitly enables networking.
-        assert!(!rec_with_image("alpine", false, vec![(8080, 80)]).image_needs_host_fetch());
-        // An egress policy also forces a network backend.
+    }
+
+    // The guest pulls with its own network, so a network that cannot reach the
+    // registry is as good as none: the host fetches.
+    #[test]
+    fn a_guest_whose_network_cannot_reach_the_registry_gets_a_host_fetch() {
+        // Published ports give an inbound path, not egress.
+        assert!(rec_with_image("alpine", false, vec![(8080, 80)]).image_needs_host_fetch());
+        // An allow list that does not name the registry, by CIDR or by host.
         let mut cidr = rec_with_image("alpine", false, vec![]);
         cidr.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
-        assert!(!cidr.image_needs_host_fetch());
+        assert!(cidr.image_needs_host_fetch());
         let mut dns = rec_with_image("alpine", false, vec![]);
         dns.dns_filter_hosts = Some(vec!["example.com".to_string()]);
-        assert!(!dns.image_needs_host_fetch());
+        assert!(dns.image_needs_host_fetch());
+        // A deny-all list is a list.
+        let mut deny = rec_with_image("alpine", true, vec![]);
+        deny.dns_filter_hosts = Some(vec![]);
+        assert!(deny.image_needs_host_fetch());
+        // Docker Hub redirects blobs to another host; naming only docker.io
+        // would fail mid-pull in the guest.
+        let mut hub = rec_with_image("alpine", true, vec![]);
+        hub.dns_filter_hosts = Some(vec!["docker.io".to_string()]);
+        assert!(hub.image_needs_host_fetch());
+    }
+
+    #[test]
+    fn an_allow_list_naming_the_registry_keeps_the_pull_in_the_guest() {
+        // Both Docker Hub apexes, as `registry_pull_hosts` names them.
+        let mut hub = rec_with_image("alpine", true, vec![]);
+        hub.dns_filter_hosts = Some(vec!["docker.io".to_string(), "docker.com".to_string()]);
+        assert!(!hub.image_needs_host_fetch());
+        // Wildcards cover the sub-hosts a registry answers from.
+        let mut wild = rec_with_image("alpine", true, vec![]);
+        wild.dns_filter_hosts = Some(vec!["*.docker.io".to_string(), "*.docker.com".to_string()]);
+        assert!(!wild.image_needs_host_fetch());
+        let mut ghcr = rec_with_image("ghcr.io/acme/app:1", true, vec![]);
+        ghcr.dns_filter_hosts = Some(vec!["=ghcr.io".to_string()]);
+        assert!(!ghcr.image_needs_host_fetch());
+        // A registry with a port is matched by host.
+        let mut private = rec_with_image("registry.example.com:5000/team/app:2", true, vec![]);
+        private.dns_filter_hosts = Some(vec!["*.example.com".to_string()]);
+        assert!(!private.image_needs_host_fetch());
     }
 
     // These resolve from bytes the host already has.
