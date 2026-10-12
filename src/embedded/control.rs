@@ -787,12 +787,21 @@ pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
             ),
         ));
     }
-    let removed = db.remove_vm(name)?;
-    if removed.is_none() {
+    if db.get_vm(name)?.is_none() {
         return Err(Error::vm_not_found(name));
     }
+    // A stopped or crashed branch source can still own the processes holding
+    // its forked RAM. Stop them while the record and their manifests exist, as
+    // the CLI and API deletes do; removing the data dir first leaks the RAM.
+    crate::agent::cleanup_dead_vm_runtime_in_db(name, db)?;
+    let Some(removed) = db.remove_vm(name)? else {
+        return Err(Error::vm_not_found(name));
+    };
 
     let data_dir = crate::agent::vm_data_dir(name);
+    // Release this machine's per-VM uid (root launches only) before the dir
+    // holding its record is removed.
+    crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
     // Detach the per-machine layers volume before removing the data dir, else on
     // macOS the live mountpoint under it makes remove_dir_all fail with "Resource
     // busy", stranding both the mount and the data dir. Unconditional on purpose:
@@ -807,6 +816,16 @@ pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
                 format!("{}: {}", data_dir.display(), e),
             )
         })?;
+    }
+
+    // With the child gone, its parent may hold a RAM generation, disk layers
+    // and a macOS layers mount that nothing references any more.
+    if let Some(parent) = removed.golden.as_deref() {
+        if let Err(error) =
+            crate::agent::fork::collect_parent_generations_after_child_delete(db, parent)
+        {
+            tracing::warn!(%parent, %error, "could not collect unreferenced fork generation");
+        }
     }
 
     Ok(())
