@@ -952,9 +952,12 @@ pub fn restore_from_path_at(
             }
         }
         log_phase(name, "restore_prepare", &mut phase);
-        if let Some(footer) = &footer {
-            smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, footer, false, false)
-                .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
+        if footer.is_some() {
+            // Extract into the host's shared store, as a server or CLI restore
+            // does: once per artifact, under its lock, so concurrent and later
+            // restores of one checkpoint share that extraction instead of each
+            // unpacking and syncing the whole RAM image again.
+            materialize_pack_layers(name, artifact)?;
         } else {
             materialize_for_restore_at(
                 artifact,
@@ -964,8 +967,10 @@ pub fn restore_from_path_at(
             )?;
         }
         log_phase(name, "restore_extract", &mut phase);
+        let content_dir =
+            crate::agent::read_shared_pack_pointer(&cache_dir).unwrap_or_else(|| cache_dir.clone());
         // A checkpoint with a cache disk was refused above.
-        install(&cache_dir, &vm_data, checkpoint, None)?;
+        install(&content_dir, &vm_data, checkpoint, None)?;
         log_phase(name, "restore_install", &mut phase);
         discard_transport_pack(&vm_data)?;
         if let Some((sidecar, reference)) = attach_cached_checkpoint_pack(name, checkpoint)? {
@@ -1000,6 +1005,10 @@ pub fn restore_from_path_at(
         }
         return Err(error);
     }
+    // The restored machine holds its own copies now; keep the shared store
+    // within the restore cache's bounds, as a server restore does.
+    #[cfg(target_os = "linux")]
+    crate::artifact_cache::trim_unleased_shared_packs_soon();
     Ok(())
 }
 
