@@ -6425,33 +6425,36 @@ async fn fetch_cache_base(
             ApiError::BadRequest("cacheDisk.sourceUrl needs a hex sha256 to verify against".into())
         })?;
     let url = checked_checkpoint_source(raw)?;
-    // One download per base: a create that needs a base another create is
-    // already fetching waits for it instead of fetching it again.
+    // One download per base, in a task of its own: a create that needs a base
+    // another create is already fetching waits for it instead of fetching it
+    // again, and a create whose caller gave up waiting leaves the download
+    // running, so the retry finds the base instead of starting over.
     let lock = cache_base_fetch_lock(&spec.base);
-    let _fetching = lock.lock().await;
-    if target.exists() {
-        return Ok(());
-    }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| ApiError::internal(format!("build cache base fetch client: {e}")))?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let partial = dir.join(format!(
-        ".{}.{}.{stamp}.partial",
-        spec.base,
-        std::process::id()
-    ));
-    let result = async {
+    let base = spec.base.clone();
+    let fetch = tokio::spawn(async move {
+        let _fetching = lock.lock_owned().await;
+        if target.exists() {
+            return Ok(());
+        }
+        // Under the lock no other fetch of this base runs in this server, so
+        // any partial download of it left behind is abandoned.
+        remove_abandoned_partials(&dir, &base);
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|e| ApiError::internal(format!("build cache base fetch client: {e}")))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let partial =
+            PartialDownload(dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id())));
         let actual = crate::api::cache_base_fetch::download(
             &client,
             &url,
-            &partial,
+            &partial.0,
             MAX_CACHE_BASE_BYTES,
             Default::default(),
         )
@@ -6461,7 +6464,7 @@ async fn fetch_cache_base(
                 "cache base sha256 is {actual}, expected {expected}"
             )));
         }
-        match std::fs::hard_link(&partial, &target) {
+        match std::fs::hard_link(&partial.0, &target) {
             // Verified as it arrived, so a checkpoint of a machine on it need
             // not hash it again.
             Ok(()) => {
@@ -6475,10 +6478,52 @@ async fn fetch_cache_base(
                 target.display()
             ))),
         }
+    });
+    fetch
+        .await
+        .map_err(|e| ApiError::internal(format!("cache base fetch task: {e}")))?
+}
+
+/// A cache base download in progress, removed when the fetch ends however it
+/// ends; a fetch that succeeded has linked it into place first.
+struct PartialDownload(std::path::PathBuf);
+
+impl Drop for PartialDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
-    .await;
-    let _ = std::fs::remove_file(&partial);
-    result
+}
+
+/// Remove partial downloads of `base` in `dir`: `.<base>.<pid>.<stamp>.partial`.
+fn remove_abandoned_partials(dir: &std::path::Path, base: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{base}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let is_partial_of_base = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".partial"))
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(pid, stamp)| {
+                !pid.is_empty()
+                    && !stamp.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && stamp.bytes().all(|b| b.is_ascii_digit())
+            });
+        if is_partial_of_base {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => tracing::info!(file = name, "removed an abandoned cache base download"),
+                Err(e) => {
+                    tracing::warn!(file = name, error = %e, "could not remove an abandoned cache base download")
+                }
+            }
+        }
+    }
 }
 
 /// Flatten `top` into `dir/base`: written to a hidden partial file, then
@@ -6981,6 +7026,37 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn only_partial_downloads_of_the_base_are_removed() {
+        let dir = TempDir::new().unwrap();
+        let names = [
+            ".cdisk-1-v1.qcow2.4242.1791794701210442779.partial",
+            ".cdisk-1-v1.qcow2.17.99.partial",
+            ".cdisk-1-v12.qcow2.4242.1791794701210442779.partial",
+            ".cdisk-1-v1.qcow2.sha256",
+            "cdisk-1-v1.qcow2",
+            ".cdisk-1-v1.qcow2.oops.partial",
+        ];
+        for name in names {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        remove_abandoned_partials(dir.path(), "cdisk-1-v1.qcow2");
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".cdisk-1-v1.qcow2.oops.partial",
+                ".cdisk-1-v1.qcow2.sha256",
+                ".cdisk-1-v12.qcow2.4242.1791794701210442779.partial",
+                "cdisk-1-v1.qcow2",
+            ]
+        );
+    }
 
     fn branch_request(json: serde_json::Value) -> ForkRequest {
         serde_json::from_value(json).unwrap()
