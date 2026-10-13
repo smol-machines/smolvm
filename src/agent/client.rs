@@ -1102,6 +1102,11 @@ fn registry_pull_credentials(
     effective_image: &str,
     explicit: Option<RegistryAuth>,
 ) -> Option<RegistryAuth> {
+    // A local archive or directory never reaches a registry. Asking the Docker
+    // credential helper anyway costs its whole timeout when the helper hangs.
+    if crate::data::image_source::is_local_ref(effective_image) {
+        return None;
+    }
     let registry = extract_registry(effective_image);
     explicit
         .or_else(|| {
@@ -5696,6 +5701,19 @@ password = "mirror-secret"
             registry_pull_credentials(&config, "origin.example.invalid/app:latest", None).unwrap();
         assert_eq!(original.username, "origin");
         assert_eq!(original.password, "upstream-secret");
+    }
+
+    #[test]
+    fn local_images_never_look_up_registry_credentials() {
+        let config = RegistryConfig::default();
+        let explicit = || {
+            Some(RegistryAuth {
+                username: "explicit".into(),
+                password: "secret".into(),
+            })
+        };
+        assert!(registry_pull_credentials(&config, "local:7fc08832", explicit()).is_none());
+        assert!(registry_pull_credentials(&config, "local-dir:/tmp/rootfs", explicit()).is_none());
     }
 
     #[test]
