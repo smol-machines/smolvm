@@ -2101,6 +2101,8 @@ fn capture_with_completion(
     let max_memory_image = max_checkpoint_memory_image(vm.mem, mounts_image_layers(vm))?;
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
+    release_free_guest_memory(name, &control);
+    log_phase(name, "capture_free_memory_hint", &mut phase);
     if stop_after_capture {
         remove_paused_disks_marker(&crate::agent::vm_data_dir(name))?;
         publish_resume_point(PauseCaptureStage::Capturing)?;
@@ -3137,6 +3139,26 @@ fn validate_clock(checkpoint: &PortableCheckpointManifest) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Have the guest hand its free memory to the host before the capture.
+///
+/// Memory a guest frees keeps whatever it last held, so after a build or a
+/// garbage collection most of a VM's RAM is stale data that a checkpoint would
+/// hash, compress and ship. The balloon's free page hinting gives the host
+/// every free block to discard, and the capture then skips it as zeros. Best
+/// effort: a VMM without `HINT_FREE` or a guest without the feature only makes
+/// the checkpoint bigger.
+fn release_free_guest_memory(name: &str, control: &Path) {
+    crate::agent::fork::compact_guest_memory(name);
+    match crate::agent::fork::control_socket_cmd_with_timeout(
+        control,
+        "HINT_FREE 2000",
+        std::time::Duration::from_secs(5),
+    ) {
+        Ok(reply) => tracing::info!(machine = name, reply = ?reply.trim(), "free page hint"),
+        Err(error) => tracing::debug!(machine = name, %error, "free page hint unavailable"),
+    }
 }
 
 fn checkpoint_cpu_contract() -> Result<CheckpointCpuContract> {

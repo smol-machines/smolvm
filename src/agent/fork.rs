@@ -2043,6 +2043,27 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
     }
 }
 
+/// Join the guest's scattered free pages into the large blocks free page
+/// hinting can hand over. Best effort: an older agent or a kernel without
+/// compaction just leaves memory as it is.
+pub fn compact_guest_memory(name: &str) {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
+        return;
+    };
+    let _ = client.vm_exec(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo 1 > /proc/sys/vm/compact_memory".to_string(),
+        ],
+        Vec::new(),
+        None,
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
+        None,
+    );
+}
+
 /// Release the workload restored in `clone` after its identity and per-fork
 /// environment are installed. The state directory is private guest RAM, so a
 /// release marker wakes only this clone even though every clone inherited the
