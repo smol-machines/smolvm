@@ -36,7 +36,7 @@ tar = "0.4"
 # against musl (its zstd-sys references glibc's `__memcpy_chk`) and the agent is
 # a static-musl binary, so runtime decompression must be pure Rust.
 flate2 = "1"
-ruzstd = "0.7"
+ruzstd = "0.9.1"
 
 # `zstd` (C-backed) is used ONLY to encode fixtures in unit tests; dev-deps are
 # excluded from the musl release binary, so it never hits the link issue above.
