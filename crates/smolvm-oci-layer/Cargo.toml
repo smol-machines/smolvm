@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 tar = "0.4"
 flate2 = "1"
-ruzstd = "0.7"
+ruzstd = "0.9.1"
 tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
