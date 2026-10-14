@@ -3604,6 +3604,7 @@ pub async fn start_machine(
     body: Bytes,
 ) -> Result<Json<MachineInfo>, ApiError> {
     let request: crate::api::types::StartMachineRequest = optional_json_body(&headers, &body)?;
+    let query = query.with_body(&request);
     let registry_auth: Option<crate::registry::RegistryAuth> =
         request.registry_auth.map(Into::into);
     let mediated_egress = request
@@ -7293,6 +7294,43 @@ mod tests {
             optional_json_body::<StartMachineRequest>(&json, b"{not json"),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn start_options_in_the_body_are_taken_like_the_query_string() {
+        use crate::api::types::StartMachineRequest;
+        let json = {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            headers
+        };
+        let body = |text: &str| -> StartMachineRequest {
+            optional_json_body(&json, text.as_bytes()).unwrap()
+        };
+
+        let start = StartMachineQuery::default().with_body(&body(r#"{"branchable":true}"#));
+        assert!(start.forkable);
+        let start = StartMachineQuery::default().with_body(&body(r#"{"forkable":true}"#));
+        assert!(start.forkable);
+        let start = StartMachineQuery::default()
+            .with_body(&body(r#"{"branchPoolSize":4,"cudaVramLimitMib":2048}"#));
+        assert_eq!(start.fork_pool_size, Some(4));
+        assert_eq!(start.cuda_vram_limit_mib, Some(2048));
+
+        // The query string wins, and an empty body changes nothing.
+        let query = StartMachineQuery {
+            forkable: true,
+            fork_pool_size: Some(2),
+            cuda_vram_limit_mib: None,
+        };
+        let start = query.with_body(&body(r#"{"branchable":false,"branchPoolSize":8}"#));
+        assert!(start.forkable);
+        assert_eq!(start.fork_pool_size, Some(2));
+        let start = StartMachineQuery::default().with_body(&body("{}"));
+        assert!(!start.forkable && start.fork_pool_size.is_none());
+
+        // Unknown fields stay tolerated for an older node.
+        assert!(!body(r#"{"someNewerField":1}"#).branchable);
     }
 
     #[test]

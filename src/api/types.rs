@@ -1190,6 +1190,19 @@ pub struct StartMachineQuery {
     pub cuda_vram_limit_mib: Option<u64>,
 }
 
+impl StartMachineQuery {
+    /// Take the start options a caller put in the JSON body as well as the
+    /// query string. Either may ask for a branchable start; a value set in
+    /// the query string wins over the body's.
+    pub fn with_body(self, body: &StartMachineRequest) -> Self {
+        Self {
+            forkable: self.forkable || body.branchable,
+            fork_pool_size: self.fork_pool_size.or(body.branch_pool_size),
+            cuda_vram_limit_mib: self.cuda_vram_limit_mib.or(body.cuda_vram_limit_mib),
+        }
+    }
+}
+
 /// Credentials for the registry a machine's image lives in.
 ///
 /// Supplied per-start rather than stored on the machine record: a customer's
@@ -1251,6 +1264,19 @@ pub struct StartMachineRequest {
     /// the API server only and is never written to the machine record.
     #[serde(default)]
     pub egress_interceptor: Option<ExternalInterceptorSpec>,
+
+    /// Start as a branch source; the same as the `branchable` query parameter,
+    /// so a caller that puts its start options in the body is not ignored.
+    #[serde(default, alias = "forkable")]
+    pub branchable: bool,
+
+    /// The `branchPoolSize` query parameter, accepted in the body too.
+    #[serde(default, alias = "forkPoolSize")]
+    pub branch_pool_size: Option<u32>,
+
+    /// The `cudaVramLimitMib` query parameter, accepted in the body too.
+    #[serde(default)]
+    pub cuda_vram_limit_mib: Option<u64>,
 }
 
 /// Host interceptor binding supplied in a machine start request.
@@ -1808,7 +1834,7 @@ mod registry_auth_tests {
         // And it must stay redacted when nested in the request struct.
         let req = StartMachineRequest {
             registry_auth: Some(spec),
-            egress_interceptor: None,
+            ..Default::default()
         };
         assert!(!format!("{req:?}").contains("ghp_super_secret_value"));
     }
