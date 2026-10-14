@@ -52,7 +52,9 @@
 #
 # ── Create and start ─────────────────────────────────────────────────────────
 #
-#   smolvm machine create --name docker -s examples/docker-in-vm/docker.smolfile --net-backend virtio-net
+#   smolvm machine create --name docker -s examples/docker-in-vm/docker.smolfile
+#   With net = true, docker_socket = true selects virtio-net for the Docker bridge.
+#   If you do not expose the socket, specify --net-backend virtio-net.
 #   smolvm machine start --name docker
 #
 # ── Start dockerd ─────────────────────────────────────────────────────────────

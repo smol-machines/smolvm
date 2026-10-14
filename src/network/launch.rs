@@ -102,6 +102,18 @@ pub fn apply_guest_subnet(
     }
 }
 
+/// Choose a routed network for guests that expose a nested Docker daemon.
+///
+/// With TSI, bridged containers have no route out of the guest. Preserve an
+/// explicit backend and never grant networking if the machine did not ask for it.
+pub fn backend_for_docker_socket(
+    requested: Option<NetworkBackend>,
+    docker_socket: bool,
+    network_enabled: bool,
+) -> Option<NetworkBackend> {
+    requested.or_else(|| (docker_socket && network_enabled).then_some(NetworkBackend::VirtioNet))
+}
+
 /// Compute the effective launch backend from user intent.
 ///
 /// virtio-net now enforces the full egress policy (CIDR + allow-host DNS
@@ -160,8 +172,12 @@ pub fn plan_launch_network_with(
         || has_credentials;
 
     // Published ports need the inbound path, which only virtio-net provides.
-    // When the caller didn't pick a backend explicitly, default to virtio-net
-    // IFF there are ports (TSI otherwise — it's lighter for outbound-only VMs).
+    // A Docker socket on a networked machine likewise defaults to virtio-net
+    // at create time: bridged containers need a routed NIC. TSI intercepts
+    // sockets in the VM but cannot route packets from a nested Docker bridge.
+    // When the caller did not select a backend (including the create-time
+    // Docker-socket selection above), ports default to virtio-net; other
+    // outbound-only machines retain the lighter TSI default.
     //
     // Fleet/multi-tenant mode (SMOLVM_PUBLISH_ADDR set) additionally routes ALL
     // machines through virtio-net, so the egress hard-floor (the smolvm-network
@@ -402,6 +418,28 @@ mod tests {
         let hosts = ["api.example.com".to_string()];
         assert!(plan_launch_network(&resources(), Some(&hosts), 1).outbound);
         assert!(plan_launch_network_with(&resources(), None, 1, true).outbound);
+    }
+
+    #[test]
+    fn docker_socket_prefers_routed_network_without_overriding_user_choice() {
+        let mut vm = resources();
+        vm.network = true;
+        vm.network_backend = backend_for_docker_socket(None, true, vm.network);
+        assert_eq!(
+            plan_launch_network(&vm, None, 0).backend,
+            EffectiveNetworkBackend::VirtioNet
+        );
+        vm.network_backend = backend_for_docker_socket(Some(NetworkBackend::Tsi), true, true);
+        assert_eq!(
+            plan_launch_network(&vm, None, 0).backend,
+            EffectiveNetworkBackend::Tsi
+        );
+        vm.network = false;
+        vm.network_backend = backend_for_docker_socket(None, true, vm.network);
+        assert_eq!(
+            plan_launch_network(&vm, None, 0).backend,
+            EffectiveNetworkBackend::None
+        );
     }
 
     #[test]
