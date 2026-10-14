@@ -119,6 +119,13 @@ host, and connections are reset. `machine status` shows each published port's li
 Publishing a port gives no outbound access: without `--net` or an allow list the machine serves
 inbound connections only.
 
+`-p HOST:GUEST/udp` forwards a UDP port, for game servers, voice and other datagram services.
+Each remote client gets its own session: the guest sees it as a distinct gateway address and
+port, and its replies reach that client from the published host port. A session ends after two
+minutes of silence. Datagrams up to 1472 bytes pass; larger ones are dropped, since the gateway
+does not fragment. TCP and UDP may publish the same host port number. A branch gets fresh host
+ports for its source's UDP forwards and prints them; `--port` on a branch pins TCP ports only.
+
 ## Mounts are authority
 
 A mount deliberately exposes a host directory to guest code, as the

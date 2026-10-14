@@ -622,8 +622,8 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Container")]
     pub allow_system_mounts: bool,
 
-    /// Expose port from container to host (single port or one-to-one range, repeatable)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]", help_heading = "Network")]
+    /// Expose port from container to host (single port or one-to-one range, repeatable; append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]", help_heading = "Network")]
     pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -2149,8 +2149,7 @@ impl RunCmd {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
                     let (mount_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
-                    let port_tuples: Vec<(u16, u16)> =
-                        params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    let port_tuples = params.port.clone();
                     let persist_result = SmolvmConfig::load().and_then(|mut config| {
                         vm_common::persist_named_running(
                             &mut config,
@@ -2314,8 +2313,7 @@ impl RunCmd {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
                     let (mount_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
-                    let port_tuples: Vec<(u16, u16)> =
-                        params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    let port_tuples = params.port.clone();
                     let mut config = SmolvmConfig::load()?;
                     vm_common::persist_named_running(
                         &mut config,
@@ -3963,8 +3961,8 @@ pub struct CreateCmd {
     #[arg(long)]
     pub allow_system_mounts: bool,
 
-    /// Expose port from VM to host (single port or one-to-one range, repeatable)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    /// Expose port from VM to host (single port or one-to-one range, repeatable; append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]")]
     pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -5258,11 +5256,23 @@ impl ForkCmd {
             self.egress_interceptor,
             self.egress_interceptor_token.as_ref(),
         )?;
-        let ports: Vec<(u16, u16)> = PortMappingSpec::expand_all(&self.port)
-            .map_err(|e| smolvm::Error::config("branch ports", e))?
-            .into_iter()
-            .map(|port| port.to_tuple())
-            .collect();
+        let ports = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("branch ports", e))?;
+        // A branch gets fresh host ports for the source's UDP forwards on its
+        // own; pins name TCP ports.
+        if let Some(udp) = ports
+            .iter()
+            .find(|port| port.protocol == smolvm::data::network::PortProtocol::Udp)
+        {
+            return Err(smolvm::Error::config(
+                "branch ports",
+                format!(
+                    "{} cannot be pinned: a branch pins TCP ports, and gets fresh host ports for UDP forwards automatically",
+                    udp.label()
+                ),
+            ));
+        }
+        let ports: Vec<(u16, u16)> = ports.into_iter().map(|port| port.to_tuple()).collect();
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
@@ -5827,8 +5837,8 @@ pub struct UpdateCmd {
     #[arg(long, value_name = "HOST:GUEST")]
     pub remove_volume: Vec<String>,
 
-    /// Add port mapping or one-to-one range
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    /// Add port mapping or one-to-one range (append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]")]
     pub port: Vec<PortMappingSpec>,
 
     /// Remove port mapping or one-to-one range
@@ -6132,16 +6142,12 @@ impl UpdateCmd {
         // Validate no duplicate host ports after proposed changes
         {
             let mut final_ports: Vec<PortMapping> = record
-                .ports
-                .iter()
-                .filter(|&&(h, g)| !remove_ports.iter().any(|rm| rm.host == h && rm.guest == g))
-                .map(|&(h, g)| PortMapping::new(h, g))
+                .port_mappings()
+                .into_iter()
+                .filter(|existing| !remove_ports.contains(existing))
                 .collect();
             for p in &add_ports {
-                if !final_ports
-                    .iter()
-                    .any(|existing| existing.host == p.host && existing.guest == p.guest)
-                {
+                if !final_ports.contains(p) {
                     final_ports.push(*p);
                 }
             }
@@ -6234,20 +6240,21 @@ impl UpdateCmd {
             }
 
             // Ports: add new, remove specified
+            let mut ports = r.port_mappings();
             for rm in &remove_ports {
-                let before = r.ports.len();
-                r.ports.retain(|&(h, g)| h != rm.host || g != rm.guest);
-                if r.ports.len() < before {
-                    changes.push(format!("  removed port: {}:{}", rm.host, rm.guest));
+                let before = ports.len();
+                ports.retain(|existing| existing != rm);
+                if ports.len() < before {
+                    changes.push(format!("  removed port: {}", rm.label()));
                 }
             }
             for p in &add_ports {
-                let tuple = p.to_tuple();
-                if !r.ports.contains(&tuple) {
-                    changes.push(format!("  added port: {}:{}", tuple.0, tuple.1));
-                    r.ports.push(tuple);
+                if !ports.contains(p) {
+                    changes.push(format!("  added port: {}", p.label()));
+                    ports.push(*p);
                 }
             }
+            r.set_port_mappings(&ports);
 
             // Resources
             if let Some(cpus) = self.cpus {
@@ -6293,7 +6300,7 @@ impl UpdateCmd {
                 // virtio-net without networking or published ports is rejected
                 // at launch, so a machine that keeps the backend could never
                 // start again. Published ports still need it.
-                if r.ports.is_empty() && r.network_backend.is_some() {
+                if r.ports.is_empty() && r.udp_ports.is_empty() && r.network_backend.is_some() {
                     changes.push("  cleared network backend".to_string());
                     r.network_backend = None;
                 }

@@ -62,8 +62,8 @@ pub struct PackedLaunchConfig<'a> {
     pub layers_dir: &'a Path,
     /// Volume mounts.
     pub mounts: &'a [PackedMount],
-    /// Port mappings (host, guest).
-    pub port_mappings: &'a [(u16, u16)],
+    /// Published port mappings.
+    pub port_mappings: &'a [crate::data::network::PortMapping],
     /// VM resources.
     pub resources: VmResources,
     /// Debug logging.
@@ -404,14 +404,10 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_add_vsock with TSI failed");
             }
 
-            let port_cstrings: Vec<CString> = config
-                .port_mappings
-                .iter()
-                .map(|(host, guest)| {
-                    CString::new(format!("{}:{}", host, guest))
-                        .expect("port mapping cannot contain null bytes")
-                })
-                .collect();
+            let port_cstrings = match crate::agent::launcher::tsi_port_map(config.port_mappings) {
+                Ok(ports) => ports,
+                Err(error) => free_ctx_on_err!(error),
+            };
             let mut port_ptrs: Vec<*const libc::c_char> =
                 port_cstrings.iter().map(|s| s.as_ptr()).collect();
             port_ptrs.push(std::ptr::null());
@@ -458,7 +454,7 @@ pub fn launch_agent_vm_dynamic(
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings
                 .iter()
-                .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
+                .map(crate::agent::launcher::virtio_port_mapping)
                 .collect();
             // Denial sink beside the vsock socket, mirroring the static launcher.
             let mut egress = if network_plan.outbound {

@@ -32,10 +32,10 @@
 //! ```
 
 use crate::queues::WakePipe;
-use crate::PortMapping;
+use crate::{PortMapping, PortProtocol};
 use polling::{Event, Events, Poller};
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -98,7 +98,10 @@ impl Drop for ReadyListener {
 ///
 /// Binding is separate so a launcher that starts the runtime only after the VM
 /// is booting (Windows) can still fail the launch on a port already in use.
-pub struct BoundPublishedPorts(Vec<(PortMapping, TcpListener, Option<TcpListener>)>);
+pub struct BoundPublishedPorts {
+    tcp: Vec<(PortMapping, TcpListener, Option<TcpListener>)>,
+    pub(crate) udp: Vec<(PortMapping, UdpSocket, Option<UdpSocket>)>,
+}
 
 impl BoundPublishedPorts {
     /// Bind every published host port, releasing any already bound on failure.
@@ -119,7 +122,31 @@ impl BoundPublishedPorts {
         };
 
         let mut bound = Vec::with_capacity(port_mappings.len());
+        let mut udp = Vec::new();
         for mapping in port_mappings {
+            if mapping.protocol == PortProtocol::Udp {
+                // Same rule as TCP: IPv4 required, IPv6 best-effort.
+                let socket = UdpSocket::bind((publish_addr, mapping.host)).map_err(|err| {
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "cannot publish host UDP {publish_addr}:{} to guest UDP {}: {err}",
+                            mapping.host, mapping.guest,
+                        ),
+                    )
+                })?;
+                let socket_v6 = UdpSocket::bind((publish_v6, mapping.host))
+                    .inspect_err(|err| {
+                        tracing::debug!(
+                            host_port = mapping.host,
+                            error = %err,
+                            "skipping IPv6 socket for published UDP port"
+                        );
+                    })
+                    .ok();
+                udp.push((*mapping, socket, socket_v6));
+                continue;
+            }
             // The IPv4 listener is required; the IPv6 one is best-effort so
             // hosts without IPv6 still publish normally.
             let listener = TcpListener::bind((publish_addr, mapping.host)).map_err(|err| {
@@ -144,12 +171,17 @@ impl BoundPublishedPorts {
             };
             bound.push((*mapping, listener, listener_v6));
         }
-        Ok(Self(bound))
+        Ok(Self { tcp: bound, udp })
     }
 
     /// True when no host port is published.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.tcp.is_empty() && self.udp.is_empty()
+    }
+
+    /// True when no host TCP port is published.
+    pub(crate) fn tcp_is_empty(&self) -> bool {
+        self.tcp.is_empty()
     }
 }
 
@@ -165,9 +197,9 @@ impl TcpPortListeners {
         publish_wake: WakePipe,
     ) -> io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::with_capacity(ports.0.len());
+        let mut handles = Vec::with_capacity(ports.tcp.len());
 
-        for (mapping, listener, listener_v6) in ports.0 {
+        for (mapping, listener, listener_v6) in ports.tcp {
             for listener in std::iter::once(listener).chain(listener_v6) {
                 let listener = ReadyListener::new(listener).inspect_err(|_| {
                     shutdown_all(&shutdown, &mut handles);
@@ -370,14 +402,8 @@ mod tests {
         let second = occupied.local_addr().unwrap().port();
         drop(available);
         let result = BoundPublishedPorts::bind(&[
-            PortMapping {
-                host: first,
-                guest: 8080,
-            },
-            PortMapping {
-                host: second,
-                guest: 8081,
-            },
+            PortMapping::new(first, 8080),
+            PortMapping::new(second, 8081),
         ]);
         assert!(result.is_err());
         assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, first)).is_ok());

@@ -1163,13 +1163,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     ));
                 }
 
-                let port_cstrings: Vec<CString> = port_mappings
-                    .iter()
-                    .map(|p| {
-                        CString::new(format!("{}:{}", p.host, p.guest))
-                            .expect("port mapping format cannot contain null bytes")
-                    })
-                    .collect();
+                let port_cstrings = match tsi_port_map(port_mappings) {
+                    Ok(ports) => ports,
+                    Err(error) => {
+                        krun_free_ctx(ctx);
+                        return Err(error);
+                    }
+                };
                 let mut port_ptrs: Vec<*const libc::c_char> =
                     port_cstrings.iter().map(|s| s.as_ptr()).collect();
                 port_ptrs.push(std::ptr::null());
@@ -1340,10 +1340,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     guest_mac = pod.mac;
                 }
 
-                let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
-                    .iter()
-                    .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
-                    .collect();
+                let virtio_port_mappings: Vec<VirtioPortMapping> =
+                    port_mappings.iter().map(virtio_port_mapping).collect();
                 // The denial sink lives beside the vsock socket — the same
                 // per-VM dir the host resolves via `vm_data_dir`, where
                 // `read_egress_denials` looks for it.
@@ -2952,6 +2950,39 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                         .map(|stats| stats.rss_bytes);
             }
         });
+}
+
+/// The virtio gateway's form of a published port mapping.
+pub(crate) fn virtio_port_mapping(mapping: &PortMapping) -> VirtioPortMapping {
+    let protocol = match mapping.protocol {
+        crate::data::network::PortProtocol::Tcp => smolvm_network::PortProtocol::Tcp,
+        crate::data::network::PortProtocol::Udp => smolvm_network::PortProtocol::Udp,
+    };
+    VirtioPortMapping::with_protocol(mapping.host, mapping.guest, protocol)
+}
+
+/// libkrun's TSI port map as `HOST:GUEST` strings. TSI publishes only TCP, so a
+/// UDP mapping refuses the launch instead of being dropped without a word.
+pub(crate) fn tsi_port_map(mappings: &[PortMapping]) -> Result<Vec<CString>> {
+    if let Some(udp) = mappings
+        .iter()
+        .find(|m| m.protocol == crate::data::network::PortProtocol::Udp)
+    {
+        return Err(Error::config(
+            "publish port",
+            format!(
+                "{} needs the virtio-net network backend; TSI publishes only TCP ports",
+                udp.label()
+            ),
+        ));
+    }
+    Ok(mappings
+        .iter()
+        .map(|p| {
+            CString::new(format!("{}:{}", p.host, p.guest))
+                .expect("port mapping format cannot contain null bytes")
+        })
+        .collect())
 }
 
 #[cfg(test)]

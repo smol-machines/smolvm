@@ -177,7 +177,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
 | `--volume` | `-v` | run, create, update, pack run | Mount host dir: `HOST:GUEST[:ro]` |
 | `--allow-system-mounts` | | run, create, update, pack run | Permit trusted read-only `/etc` and `/var/log` mounts below `/host` |
-| `--port` | `-p` | run, create, update, pack run | Port mapping: `HOST:GUEST` |
+| `--port` | `-p` | run, create, update, pack run | Port mapping: `HOST:GUEST`, or `HOST:GUEST/udp` for UDP |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
 | `--interactive` | `-i` | run, exec, pack run | Keep stdin open |
 | `--tty` | `-t` | run, exec, pack run | Allocate pseudo-TTY |
@@ -216,8 +216,10 @@ Networking is off by default. `--net` opens full outbound TCP, UDP and DNS;
 `--allow-host` (a host and its subdomains), `--allow-host-pattern` (an exact
 host, or `'*.domain'` for subdomains only) and `--allow-cidr` limit it, can be
 combined and repeated, and imply `--net`, as do `--outbound-localhost-only`
-and `--guest-subnet`. `-p HOST:GUEST` publishes a port; the server inside must
-listen on `0.0.0.0`, and a published port alone gives no outbound access.
+and `--guest-subnet`. `-p HOST:GUEST` publishes a TCP port and
+`-p HOST:GUEST/udp` a UDP one (each client gets its own session, answered from
+the same host port; datagrams up to 1472 bytes); the server inside must listen
+on `0.0.0.0`, and a published port alone gives no outbound access.
 Every rule, the Smolfile keys and `--guest-subnet`:
 `docs/throwaway-machine/README.md`.
 

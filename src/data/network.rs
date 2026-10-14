@@ -215,13 +215,69 @@ fn v4(addrs: &[IpAddr]) -> impl Iterator<Item = Ipv4Addr> + '_ {
     })
 }
 
-/// TCP port mapping from host to guest.
+/// Transport a published port forwards.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    /// TCP (the default).
+    #[default]
+    Tcp,
+    /// UDP, forwarded per remote client.
+    Udp,
+}
+
+impl PortProtocol {
+    /// Whether this is the default, TCP. Lets serialization omit the field, so
+    /// a TCP mapping keeps the shape older readers expect.
+    pub fn is_tcp(&self) -> bool {
+        *self == Self::Tcp
+    }
+
+    /// Lowercase label, as written after a port spec (`8080:80/udp`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+
+    /// Split an optional `/tcp` or `/udp` suffix off a port spec.
+    fn split_suffix(spec: &str) -> Result<(&str, Self), String> {
+        match spec.rsplit_once('/') {
+            None => Ok((spec, Self::Tcp)),
+            Some((ports, "tcp")) => Ok((ports, Self::Tcp)),
+            Some((ports, "udp")) => Ok((ports, Self::Udp)),
+            Some((_, other)) => Err(format!(
+                "unsupported port protocol '{other}': use tcp or udp, as in 8080:80/udp"
+            )),
+        }
+    }
+}
+
+/// Stored `(host, guest)` port pairs of one protocol.
+pub type PortTuples = Vec<(u16, u16)>;
+
+/// Port mapping from host to guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
     /// Port on the host.
     pub host: u16,
     /// Port inside the guest.
     pub guest: u16,
+    /// Transport forwarded; omitted for TCP.
+    #[serde(default, skip_serializing_if = "PortProtocol::is_tcp")]
+    pub protocol: PortProtocol,
 }
 
 /// Maximum concrete mappings permitted for one machine.
@@ -236,9 +292,10 @@ pub const MAX_PORT_MAPPINGS: usize = 64;
 pub struct PortMappingSpec {
     host: PortRange,
     guest: PortRange,
+    protocol: PortProtocol,
 }
 
-/// An inclusive range of TCP ports.
+/// An inclusive range of ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PortRange {
     start: u16,
@@ -303,13 +360,16 @@ impl From<PortMapping> for PortMappingSpec {
                 start: mapping.guest,
                 end: mapping.guest,
             },
+            protocol: mapping.protocol,
         }
     }
 }
 
 impl PortMappingSpec {
-    /// Parse a port mapping specification (`HOST:GUEST`, `PORT`, or equal-length ranges).
-    pub fn parse(spec: &str) -> Result<Self, String> {
+    /// Parse a port mapping specification (`HOST:GUEST`, `PORT`, or equal-length
+    /// ranges), optionally ending in `/tcp` or `/udp`.
+    pub fn parse(full: &str) -> Result<Self, String> {
+        let (spec, protocol) = PortProtocol::split_suffix(full)?;
         let (host, guest) = match spec.split_once(':') {
             Some((host, guest)) => (
                 PortRange::parse(host, "host")?,
@@ -327,7 +387,11 @@ impl PortMappingSpec {
             ));
         }
 
-        Ok(Self { host, guest })
+        Ok(Self {
+            host,
+            guest,
+            protocol,
+        })
     }
 
     /// Expand all user-supplied specs while enforcing the per-machine mapping cap.
@@ -344,7 +408,7 @@ impl PortMappingSpec {
             ports.extend(
                 (spec.host.start..=spec.host.end)
                     .zip(spec.guest.start..=spec.guest.end)
-                    .map(|(host, guest)| PortMapping::new(host, guest)),
+                    .map(|(host, guest)| PortMapping::with_protocol(host, guest, spec.protocol)),
             );
         }
         Ok(ports)
@@ -391,16 +455,30 @@ fn parse_port(spec: &str, kind: &str) -> Result<u16, String> {
 }
 
 impl PortMapping {
-    /// Create a new port mapping.
+    /// Create a new TCP port mapping.
     pub fn new(host: u16, guest: u16) -> Self {
-        Self { host, guest }
+        Self::with_protocol(host, guest, PortProtocol::Tcp)
     }
 
-    /// Create a port mapping where host and guest ports are the same.
-    pub fn same(port: u16) -> Self {
+    /// Create a new port mapping for `protocol`.
+    pub fn with_protocol(host: u16, guest: u16, protocol: PortProtocol) -> Self {
         Self {
-            host: port,
-            guest: port,
+            host,
+            guest,
+            protocol,
+        }
+    }
+
+    /// Create a TCP port mapping where host and guest ports are the same.
+    pub fn same(port: u16) -> Self {
+        Self::new(port, port)
+    }
+
+    /// `HOST:GUEST`, with `/udp` appended for a UDP mapping.
+    pub fn label(&self) -> String {
+        match self.protocol {
+            PortProtocol::Tcp => format!("{}:{}", self.host, self.guest),
+            PortProtocol::Udp => format!("{}:{}/udp", self.host, self.guest),
         }
     }
 
@@ -409,18 +487,30 @@ impl PortMapping {
         (self.host, self.guest)
     }
 
-    /// Batch convert port mappings to tuple format.
-    pub fn to_tuples(ports: &[Self]) -> Vec<(u16, u16)> {
-        ports.iter().map(|p| p.to_tuple()).collect()
+    /// Split mappings into the stored `(TCP tuples, UDP tuples)`.
+    pub fn split_tuples(ports: &[Self]) -> (PortTuples, PortTuples) {
+        let of = |protocol| {
+            ports
+                .iter()
+                .filter(|p| p.protocol == protocol)
+                .map(|p| p.to_tuple())
+                .collect()
+        };
+        (of(PortProtocol::Tcp), of(PortProtocol::Udp))
     }
 
-    /// Check for duplicate host ports in a list of mappings.
+    /// Check for duplicate host ports in a list of mappings. TCP and UDP have
+    /// separate port spaces, so `8080` and `8080/udp` may both be published.
     pub fn check_duplicates(ports: &[Self]) -> Result<(), String> {
         let mut seen = std::collections::HashSet::new();
         for p in ports {
-            if !seen.insert(p.host) {
+            if !seen.insert((p.host, p.protocol)) {
+                let suffix = match p.protocol {
+                    PortProtocol::Tcp => "",
+                    PortProtocol::Udp => "/udp",
+                };
                 return Err(format!(
-                    "duplicate host port {}: each host port can only be mapped once",
+                    "duplicate host port {}{suffix}: each host port can only be mapped once",
                     p.host
                 ));
             }
@@ -428,8 +518,17 @@ impl PortMapping {
         Ok(())
     }
 
-    /// Parse a port mapping specification (`HOST:GUEST` or `PORT`).
-    pub fn parse(spec: &str) -> Result<Self, String> {
+    /// Parse a port mapping specification (`HOST:GUEST` or `PORT`), optionally
+    /// ending in `/tcp` or `/udp`.
+    pub fn parse(full: &str) -> Result<Self, String> {
+        let (spec, protocol) = PortProtocol::split_suffix(full)?;
+        Self::parse_ports(spec).map(|mapping| Self {
+            protocol,
+            ..mapping
+        })
+    }
+
+    fn parse_ports(spec: &str) -> Result<Self, String> {
         if let Some((host, guest)) = spec.split_once(':') {
             let host: u16 = host
                 .parse()
@@ -746,6 +845,63 @@ mod tests {
     #[test]
     fn port_mapping_spec_rejects_malformed_ranges() {
         assert!(PortMappingSpec::parse("5173--5175").is_err());
+    }
+
+    #[test]
+    fn a_udp_suffix_publishes_udp_and_tcp_stays_the_default() {
+        let tcp = PortMappingSpec::expand_all(&[PortMappingSpec::parse("8080:80").unwrap()]);
+        assert_eq!(tcp.unwrap(), vec![PortMapping::new(8080, 80)]);
+        let udp = PortMappingSpec::parse("27015-27016:27015-27016/udp").unwrap();
+        assert_eq!(
+            PortMappingSpec::expand_all(&[udp]).unwrap(),
+            vec![
+                PortMapping::with_protocol(27015, 27015, PortProtocol::Udp),
+                PortMapping::with_protocol(27016, 27016, PortProtocol::Udp),
+            ]
+        );
+        assert_eq!(
+            PortMapping::parse("53/udp").unwrap(),
+            PortMapping::with_protocol(53, 53, PortProtocol::Udp)
+        );
+        assert_eq!(
+            PortMapping::parse("80/tcp").unwrap(),
+            PortMapping::new(80, 80)
+        );
+        let err = PortMappingSpec::parse("80:80/sctp").unwrap_err();
+        assert!(err.contains("unsupported port protocol 'sctp'"), "{err}");
+    }
+
+    #[test]
+    fn tcp_and_udp_may_share_a_host_port_but_not_repeat_it() {
+        let both = [
+            PortMapping::new(27015, 27015),
+            PortMapping::with_protocol(27015, 27015, PortProtocol::Udp),
+        ];
+        PortMapping::check_duplicates(&both).unwrap();
+        let twice = [
+            PortMapping::with_protocol(27015, 1, PortProtocol::Udp),
+            PortMapping::with_protocol(27015, 2, PortProtocol::Udp),
+        ];
+        let err = PortMapping::check_duplicates(&twice).unwrap_err();
+        assert!(err.contains("27015/udp"), "{err}");
+    }
+
+    /// A TCP mapping keeps the JSON shape older SDKs and records use.
+    #[test]
+    fn a_tcp_mapping_serializes_without_a_protocol() {
+        let tcp = serde_json::to_value(PortMapping::new(8080, 80)).unwrap();
+        assert_eq!(tcp, serde_json::json!({"host": 8080, "guest": 80}));
+        let udp = PortMapping::with_protocol(27015, 27015, PortProtocol::Udp);
+        assert_eq!(
+            serde_json::to_value(udp).unwrap(),
+            serde_json::json!({"host": 27015, "guest": 27015, "protocol": "udp"})
+        );
+        let old: PortMapping = serde_json::from_str(r#"{"host": 1, "guest": 2}"#).unwrap();
+        assert_eq!(old, PortMapping::new(1, 2));
+        assert_eq!(
+            PortMapping::split_tuples(&[udp, PortMapping::new(1, 2)]),
+            (vec![(1, 2)], vec![(27015, 27015)])
+        );
     }
 
     #[test]

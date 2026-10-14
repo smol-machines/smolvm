@@ -78,6 +78,14 @@ pub struct PortSpec {
     /// Port inside the machine.
     #[schema(example = 80)]
     pub guest: u16,
+    /// Transport to forward: `tcp` (the default) or `udp`. A UDP port is
+    /// forwarded per remote client, and the machine answers each client
+    /// through the same host port.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::data::network::PortProtocol::is_tcp"
+    )]
+    pub protocol: crate::data::network::PortProtocol,
 }
 
 /// A shared cache disk: a read-only base image the machine reads through its

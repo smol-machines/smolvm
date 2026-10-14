@@ -601,14 +601,7 @@ impl ApiState {
             // Convert VmRecord to MachineEntry
             let mounts: Vec<MountSpec> = record.host_mounts().iter().map(MountSpec::from).collect();
 
-            let ports: Vec<PortSpec> = record
-                .ports
-                .iter()
-                .map(|(host, guest)| PortSpec {
-                    host: *host,
-                    guest: *guest,
-                })
-                .collect();
+            let ports: Vec<PortSpec> = record.port_mappings().iter().map(PortSpec::from).collect();
 
             let resources = ResourceSpec {
                 cpus: Some(record.cpus),
@@ -1195,10 +1188,11 @@ impl ApiState {
                 .memory_mb
                 .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
             mounts,
-            reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
+            Vec::new(),
             reg.network,
             reg.restart.clone(),
         );
+        record.set_port_mappings(&reg.ports.iter().map(PortMapping::from).collect::<Vec<_>>());
         record.staged_mounts = staged_mounts;
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
@@ -1709,14 +1703,7 @@ pub async fn ensure_running_and_persist(
         refuse_implicit_start_of_paused(record)?;
         let mut e = entry.lock();
         e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
-        e.ports = record
-            .ports
-            .iter()
-            .map(|(host, guest)| PortSpec {
-                host: *host,
-                guest: *guest,
-            })
-            .collect();
+        e.ports = record.port_mappings().iter().map(PortSpec::from).collect();
         e.resources.cpus = Some(record.cpus);
         e.resources.memory_mb = Some(record.mem);
         e.network = record.network;
@@ -1910,7 +1897,7 @@ impl From<&HostMount> for MountSpec {
 
 impl From<&PortSpec> for PortMapping {
     fn from(spec: &PortSpec) -> Self {
-        PortMapping::new(spec.host, spec.guest)
+        PortMapping::with_protocol(spec.host, spec.guest, spec.protocol)
     }
 }
 
@@ -1919,6 +1906,7 @@ impl From<&PortMapping> for PortSpec {
         PortSpec {
             host: mapping.host,
             guest: mapping.guest,
+            protocol: mapping.protocol,
         }
     }
 }

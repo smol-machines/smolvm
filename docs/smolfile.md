@@ -60,7 +60,7 @@ overlay = 4                           # overlay disk GiB (default: 10)
 
 # Mounts, ports and provisioning ([dev] lists below replace these when set)
 volumes = ["./src:/app"]              # host bind mounts
-ports = ["8080:8080"]                 # host:guest port forwarding
+ports = ["8080:8080", "27015:27015/udp"]  # host:guest forwarding; /udp for UDP
 init = ["pip install -r requirements.txt"]  # run once, on the machine's first start
 
 # Network policy: egress filtering by hostname and/or CIDR

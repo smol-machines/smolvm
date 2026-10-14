@@ -483,9 +483,15 @@ pub struct VmRecord {
     #[serde(default)]
     pub staged_mounts_detached_from: Option<String>,
 
-    /// Port mappings (host_port, guest_port).
+    /// TCP port mappings (host_port, guest_port).
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
+
+    /// UDP port mappings (host_port, guest_port). Kept apart from `ports` so a
+    /// record a release without UDP publishing reads still loads, with only its
+    /// TCP mappings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp_ports: Vec<(u16, u16)>,
 
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     #[serde(default)]
@@ -881,6 +887,7 @@ impl VmRecord {
             staged_mounts: Vec::new(),
             staged_mounts_detached_from: None,
             ports,
+            udp_ports: Vec::new(),
             published_sockets: Vec::new(),
             network,
             gpu: None,
@@ -973,6 +980,7 @@ impl VmRecord {
             staged_mounts: Vec::new(),
             staged_mounts_detached_from: None,
             ports,
+            udp_ports: Vec::new(),
             published_sockets: Vec::new(),
             network,
             gpu: None,
@@ -1103,12 +1111,25 @@ impl VmRecord {
         mounts
     }
 
-    /// Convert stored ports to PortMapping format.
+    /// Convert stored ports to PortMapping format, TCP then UDP.
     pub fn port_mappings(&self) -> Vec<crate::data::network::PortMapping> {
-        self.ports
+        use crate::data::network::{PortMapping, PortProtocol};
+        let tcp = self
+            .ports
             .iter()
-            .map(|(host, guest)| crate::data::network::PortMapping::new(*host, *guest))
-            .collect()
+            .map(|(host, guest)| PortMapping::new(*host, *guest));
+        let udp = self
+            .udp_ports
+            .iter()
+            .map(|(host, guest)| PortMapping::with_protocol(*host, *guest, PortProtocol::Udp));
+        tcp.chain(udp).collect()
+    }
+
+    /// Store `mappings`, TCP into `ports` and UDP into `udp_ports`.
+    pub fn set_port_mappings(&mut self, mappings: &[crate::data::network::PortMapping]) {
+        let (tcp, udp) = crate::data::network::PortMapping::split_tuples(mappings);
+        self.ports = tcp;
+        self.udp_ports = udp;
     }
 
     /// Whether this machine's registry image must be fetched on the HOST before
@@ -1528,6 +1549,29 @@ impl VmRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// UDP mappings live beside the TCP list, so a record without any reads
+    /// and writes exactly as before, and an older reader still loads one with.
+    #[test]
+    fn udp_ports_round_trip_without_changing_tcp_only_records() {
+        use crate::data::network::{PortMapping, PortProtocol};
+        let mut record = VmRecord::new("game".into(), 1, 512, vec![], vec![(8080, 80)], true);
+        let tcp_only = serde_json::to_value(&record).unwrap();
+        assert!(tcp_only.get("udp_ports").is_none());
+
+        let udp = PortMapping::with_protocol(27015, 27015, PortProtocol::Udp);
+        record.set_port_mappings(&[PortMapping::new(8080, 80), udp]);
+        assert_eq!(record.ports, vec![(8080, 80)]);
+        assert_eq!(record.udp_ports, vec![(27015, 27015)]);
+        assert_eq!(
+            record.port_mappings(),
+            vec![PortMapping::new(8080, 80), udp]
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.port_mappings(), record.port_mappings());
+    }
 
     /// A machine with `image`, and whatever networking the args describe.
     fn rec_with_image(image: &str, network: bool, ports: Vec<(u16, u16)>) -> VmRecord {

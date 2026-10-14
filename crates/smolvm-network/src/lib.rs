@@ -74,6 +74,7 @@ pub mod queues;
 pub mod stack;
 pub mod tcp_listeners;
 pub mod tcp_relay;
+pub mod udp_publish;
 pub mod udp_relay;
 pub mod watchlist;
 
@@ -98,7 +99,17 @@ use tcp_listeners::TcpPortListeners;
 /// Default upstream DNS resolver used by the gateway runtime.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
-/// Host->guest published TCP port mapping serviced by the virtio gateway.
+/// Transport a published port forwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PortProtocol {
+    /// A host TCP listener; each accepted connection becomes a guest connection.
+    #[default]
+    Tcp,
+    /// A host UDP socket; each client address becomes a guest-facing session.
+    Udp,
+}
+
+/// Host->guest published port mapping serviced by the virtio gateway.
 ///
 /// This stays crate-local so the launchers can translate CLI/data-layer port
 /// mappings into the gateway runtime without pulling the gateway logic back
@@ -109,12 +120,23 @@ pub struct PortMapping {
     pub host: u16,
     /// Port exposed inside the guest.
     pub guest: u16,
+    /// Transport forwarded between them.
+    pub protocol: PortProtocol,
 }
 
 impl PortMapping {
-    /// Create a new published port mapping.
+    /// Create a new published TCP port mapping.
     pub const fn new(host: u16, guest: u16) -> Self {
-        Self { host, guest }
+        Self::with_protocol(host, guest, PortProtocol::Tcp)
+    }
+
+    /// Create a new published port mapping for `protocol`.
+    pub const fn with_protocol(host: u16, guest: u16, protocol: PortProtocol) -> Self {
+        Self {
+            host,
+            guest,
+            protocol,
+        }
     }
 }
 
@@ -437,6 +459,7 @@ pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
     _frame_bridge: FrameStreamBridge,
     published_ports: Option<TcpPortListeners>,
+    _published_udp: Option<udp_publish::UdpPortPublisher>,
     poll_handle: Option<JoinHandle<()>>,
 }
 
@@ -491,7 +514,7 @@ pub struct VirtioNetworkRuntime {
 pub fn start_virtio_network(
     host_stream: Socket,
     guest_network: GuestNetworkConfig,
-    published_ports: BoundPublishedPorts,
+    mut published_ports: BoundPublishedPorts,
     egress: EgressPolicy,
     fabric_lease: Option<fabric::FabricLease>,
 ) -> io::Result<VirtioNetworkRuntime> {
@@ -521,7 +544,12 @@ pub fn start_virtio_network(
     // tcp_sender sends the accepted TCP connections to the channel
     // tcp_receiver receives the accepted TCP connections via the channel, and let it be consumed in poll thread.
     let (tcp_sender, tcp_receiver) = create_tcp_channel();
-    let tcp_listeners = if published_ports.is_empty() {
+    let (udp_publisher, udp_publish) =
+        match udp_publish::start_udp_publisher(&mut published_ports, queues.relay_wake.clone())? {
+            Some((publisher, channels)) => (Some(publisher), Some(channels)),
+            None => (None, None),
+        };
+    let tcp_listeners = if published_ports.tcp_is_empty() {
         None
     } else {
         Some(TcpPortListeners::start(
@@ -546,6 +574,7 @@ pub fn start_virtio_network(
             mtu: 1500,
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
+        udp_publish,
         egress,
         fabric,
     )?;
@@ -554,6 +583,7 @@ pub fn start_virtio_network(
         queues,
         _frame_bridge: frame_bridge,
         published_ports: tcp_listeners,
+        _published_udp: udp_publisher,
         poll_handle: Some(poll_handle),
     })
 }

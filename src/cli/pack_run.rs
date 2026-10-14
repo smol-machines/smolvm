@@ -14,7 +14,7 @@ use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
-use smolvm::data::network::{PortMapping, PortMappingSpec};
+use smolvm::data::network::PortMappingSpec;
 use smolvm::data::resources::BlockIoEngine;
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
@@ -562,7 +562,7 @@ impl PackRunCmd {
         let mounts = HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
         let ports = PortMappingSpec::expand_all(&self.port)
             .map_err(|e| Error::config("pack run ports", e))?;
-        let port_mappings = PortMapping::to_tuples(&ports);
+        let port_mappings = ports.clone();
 
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
@@ -1435,8 +1435,8 @@ struct PackedRunArgs {
     #[arg(long)]
     allow_system_mounts: bool,
 
-    /// Expose port from container to host (single port or one-to-one range)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    /// Expose port from container to host (single port or one-to-one range; append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]")]
     port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -1515,8 +1515,8 @@ struct PackedStartArgs {
     #[arg(long)]
     allow_system_mounts: bool,
 
-    /// Expose port from container to host (single port or one-to-one range)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    /// Expose port from container to host (single port or one-to-one range; append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]")]
     port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -1825,7 +1825,7 @@ fn run_from_cache(
     let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed run ports", e))?;
-    let port_mappings = PortMapping::to_tuples(&ports);
+    let port_mappings = ports.clone();
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
@@ -2271,7 +2271,7 @@ fn daemon_start(
     let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed start ports", e))?;
-    let port_mappings = PortMapping::to_tuples(&ports);
+    let port_mappings = ports.clone();
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),

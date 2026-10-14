@@ -83,9 +83,10 @@ impl MachineSpec {
             self.resources.cpus,
             self.resources.memory_mib,
             mounts,
-            self.ports.iter().map(PortMapping::to_tuple).collect(),
+            Vec::new(),
             self.resources.network,
         );
+        record.set_port_mappings(&self.ports);
         record.staged_mounts = staged_mounts;
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
