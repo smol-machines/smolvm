@@ -413,6 +413,9 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// Maximum silence between complete shutdown progress frames.
 /// A timeout is not permission to terminate a guest with unflushed storage.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
+/// Overall limit on a shutdown's storage flush, on top of the time the
+/// workload is given to exit.
+const SHUTDOWN_FLUSH_LIMIT_SECS: u64 = 120;
 
 struct ShutdownDeadlines {
     idle: Instant,
@@ -806,6 +809,10 @@ pub struct RunConfig {
     /// Power the machine off once this detached workload exits. Only the
     /// workload launcher sets it; exec sessions never do.
     pub stop_vm_on_exit: bool,
+    /// Signal the detached workload is sent when the machine stops.
+    pub stop_signal: Option<String>,
+    /// Seconds the detached workload gets to exit after its stop signal.
+    pub stop_timeout_secs: Option<u64>,
 }
 
 impl RunConfig {
@@ -829,6 +836,8 @@ impl RunConfig {
             unprivileged: false,
             s3_volumes: Vec::new(),
             stop_vm_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
         }
     }
 
@@ -942,6 +951,13 @@ impl RunConfig {
     /// Power the machine off once this detached workload exits.
     pub fn with_stop_vm_on_exit(mut self, stop: bool) -> Self {
         self.stop_vm_on_exit = stop;
+        self
+    }
+
+    /// How the detached workload is stopped when the machine stops.
+    pub fn with_stop(mut self, signal: Option<String>, timeout_secs: Option<u64>) -> Self {
+        self.stop_signal = signal;
+        self.stop_timeout_secs = timeout_secs;
         self
     }
 }
@@ -2022,28 +2038,54 @@ impl AgentClient {
     /// Waits for the agent to acknowledge the shutdown request before returning.
     /// The agent must advertise safe shutdown before receiving a mutating
     /// request, then confirm internal filesystems are frozen before termination.
+    ///
+    /// The workload is first sent its stop signal and given the stop timeout
+    /// it was launched with to exit; the agent reports progress meanwhile, and
+    /// the overall limit leaves room for the longest timeout a machine may set.
     pub fn shutdown(&mut self) -> Result<()> {
         self.shutdown_with_timeouts(
             Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS),
-            Duration::from_secs(120),
+            Duration::from_secs(SHUTDOWN_FLUSH_LIMIT_SECS + smolvm_protocol::MAX_STOP_TIMEOUT_SECS),
+            None,
+        )
+    }
+
+    /// [`shutdown`](Self::shutdown) giving the workload `stop_timeout` to exit
+    /// after its stop signal instead of the timeout it was launched with; zero
+    /// kills it at once.
+    pub fn shutdown_with_stop_timeout(&mut self, stop_timeout: Duration) -> Result<()> {
+        let stop_timeout = stop_timeout
+            .as_secs()
+            .min(smolvm_protocol::MAX_STOP_TIMEOUT_SECS);
+        self.shutdown_with_timeouts(
+            Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS),
+            Duration::from_secs(SHUTDOWN_FLUSH_LIMIT_SECS + stop_timeout),
+            Some(stop_timeout),
         )
     }
 
     /// [`shutdown`](Self::shutdown) that gives up after `maximum`, for a caller
-    /// that must exit soon whatever the guest does.
+    /// that must exit soon whatever the guest does. The workload gets half of
+    /// it to exit, so the storage flush still fits in the rest.
     pub fn shutdown_within(&mut self, maximum: Duration) -> Result<()> {
         self.shutdown_with_timeouts(
             Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS).min(maximum),
             maximum,
+            Some((maximum / 2).as_secs()),
         )
     }
 
     #[cfg(test)]
     fn shutdown_with_deadline(&mut self, timeout: Duration) -> Result<()> {
-        self.shutdown_with_timeouts(timeout, timeout)
+        self.shutdown_with_timeouts(timeout, timeout, None)
     }
 
-    fn shutdown_with_timeouts(&mut self, idle: Duration, maximum: Duration) -> Result<()> {
+    fn shutdown_with_timeouts(
+        &mut self,
+        idle: Duration,
+        maximum: Duration,
+        stop_timeout_secs: Option<u64>,
+    ) -> Result<()> {
         let started = Instant::now();
         let mut deadlines = ShutdownDeadlines::new(started, idle, maximum);
         self.stream.as_socket().set_nonblocking(true)?;
@@ -2060,7 +2102,10 @@ impl AgentClient {
                 )),
                 _ => return Err(Error::agent("shutdown capability", "unexpected ping response")),
             }
-            let data = self.encode_traced(&AgentRequest::Shutdown { progress: true })?;
+            let data = self.encode_traced(&AgentRequest::Shutdown {
+                progress: true,
+                stop_timeout_secs,
+            })?;
             let mut sent = 0;
             while sent < data.len() {
                 sent += shutdown_io_until(deadlines.next(), || self.stream.write(&data[sent..]))?;
@@ -2468,6 +2513,8 @@ impl AgentClient {
             background: false,
             s3_volumes: config.s3_volumes.clone(),
             stop_vm_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
         })?;
 
         expect_completed(resp, "run command")
@@ -2496,6 +2543,8 @@ impl AgentClient {
             background: true,
             s3_volumes: config.s3_volumes.clone(),
             stop_vm_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -2554,6 +2603,8 @@ impl AgentClient {
             background: false,
             s3_volumes: config.s3_volumes.clone(),
             stop_vm_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
         })?;
 
         self.collect_with_streaming_stdin(stdin_data, "run streaming", on_event)
@@ -2593,6 +2644,8 @@ impl AgentClient {
                 background: false,
                 s3_volumes: config.s3_volumes.clone(),
                 stop_vm_on_exit: false,
+                stop_signal: None,
+                stop_timeout_secs: None,
             },
             tty,
             "run interactive",
@@ -2632,6 +2685,8 @@ impl AgentClient {
             background: false,
             s3_volumes: config.s3_volumes,
             stop_vm_on_exit: config.stop_vm_on_exit,
+            stop_signal: config.stop_signal.clone(),
+            stop_timeout_secs: config.stop_timeout_secs,
         })?;
         let resp = loop {
             match self.receive()? {
@@ -2883,6 +2938,8 @@ impl AgentClient {
                 background: false,
                 s3_volumes: config.s3_volumes.clone(),
                 stop_vm_on_exit: false,
+                stop_signal: None,
+                stop_timeout_secs: None,
             },
             input,
             on_output,
@@ -4959,7 +5016,7 @@ mod stalled_body_tests {
             }
         });
         AgentClient::from_stream(client_stream)
-            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2), None)
             .unwrap();
         server.join().unwrap();
     }
@@ -4979,7 +5036,7 @@ mod stalled_body_tests {
             peer.write_all(&body).unwrap();
         });
         let error = AgentClient::from_stream(client_stream)
-            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2), None)
             .unwrap_err();
         assert!(error.to_string().contains("filesystems were quiesced"));
         server.join().unwrap();
@@ -5024,7 +5081,7 @@ mod stalled_body_tests {
         });
         let start = Instant::now();
         let error = AgentClient::from_stream(client_stream)
-            .shutdown_with_timeouts(Duration::from_millis(80), Duration::from_millis(160))
+            .shutdown_with_timeouts(Duration::from_millis(80), Duration::from_millis(160), None)
             .unwrap_err();
         assert!(error.to_string().contains("deadline exceeded"));
         assert!(start.elapsed() < Duration::from_secs(1));

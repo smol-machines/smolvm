@@ -865,7 +865,8 @@ static LOG_FOLLOW_SEMAPHORE: std::sync::LazyLock<Semaphore> =
     params(
         ("id" = String, Path, description = "Machine name"),
         ("follow" = Option<bool>, Query, description = "Follow the logs (like tail -f)"),
-        ("tail" = Option<usize>, Query, description = "Number of lines to show from the end")
+        ("tail" = Option<usize>, Query, description = "Number of lines to show from the end"),
+        ("source" = Option<String>, Query, description = "\"console\" (default) for the agent and kernel console, or \"workload\" for the workload's stdout and stderr, readable while the machine is stopped")
     ),
     responses(
         (status = 200, description = "Log stream (SSE)", content_type = "text/event-stream"),
@@ -877,14 +878,43 @@ pub async fn stream_logs(
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    let log_path = match query.source.as_deref() {
+        None | Some("console") => console_log_path(&state, &id)?,
+        Some("workload") => workload_log_path(&state, &id).await?,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown log source '{other}': use \"console\" or \"workload\""
+            )))
+        }
+    };
+    stream_log_file(&id, log_path, query).await
+}
+
+/// A machine's workload log. It lives in the machine's data directory and is
+/// kept across restarts, so it is served whether or not the machine runs.
+async fn workload_log_path(state: &ApiState, id: &str) -> Result<PathBuf, ApiError> {
+    let db = state.db().clone();
+    let name = id.to_string();
+    let known = tokio::task::spawn_blocking(move || matches!(db.get_vm(&name), Ok(Some(_))))
+        .await
+        .map_err(ApiError::internal)?;
+    if !known {
+        return Err(ApiError::NotFound(format!("machine '{id}' not found")));
+    }
+    Ok(crate::workload_log::workload_log_path(
+        &crate::agent::vm_data_dir(id),
+    ))
+}
+
+fn console_log_path(state: &ApiState, id: &str) -> Result<PathBuf, ApiError> {
     // get_machine only knows machines in the running map. Distinguish a real
     // typo (absent from the DB too) from a machine that exists but was never
     // started (present in the DB, no console log yet) so clients don't read a
     // created machine as "not found".
-    let entry = match state.get_machine(&id) {
+    let entry = match state.get_machine(id) {
         Ok(e) => e,
         Err(_) => {
-            let known = matches!(state.db().get_vm(&id), Ok(Some(_)));
+            let known = matches!(state.db().get_vm(id), Ok(Some(_)));
             return Err(if known {
                 ApiError::NotFound(format!(
                     "machine '{id}' has not been started yet — no logs available"
@@ -895,16 +925,19 @@ pub async fn stream_logs(
         }
     };
 
-    // Get console log path
-    let log_path: PathBuf = {
-        let entry = entry.lock();
-        entry
-            .manager
-            .console_log()
-            .ok_or_else(|| ApiError::NotFound("console log not configured".into()))?
-            .to_path_buf()
-    };
+    let entry = entry.lock();
+    Ok(entry
+        .manager
+        .console_log()
+        .ok_or_else(|| ApiError::NotFound("console log not configured".into()))?
+        .to_path_buf())
+}
 
+async fn stream_log_file(
+    id: &str,
+    log_path: PathBuf,
+    query: LogsQuery,
+) -> Result<axum::response::Response, ApiError> {
     // Check if file exists (blocking check is acceptable here since it's fast)
     let path_check = log_path.clone();
     let exists = tokio::task::spawn_blocking(move || path_check.exists())

@@ -2786,6 +2786,8 @@ async fn create_machine_inner(
             ));
         }
     }
+    crate::workload::validate_stop_settings(req.stop_signal.as_deref(), req.stop_timeout_secs)
+        .map_err(ApiError::BadRequest)?;
     // Reject invalid resources up front (as the CLI does at create time), so the
     // API returns a clear 400 here instead of persisting an unbootable machine
     // that only fails with a deferred 500 when it is later started.
@@ -3194,6 +3196,8 @@ async fn create_machine_inner(
         forkable: manifest_checkpoint.is_some(),
         init_completed: manifest_checkpoint.is_some(),
         docker_socket: req.docker_socket,
+        stop_signal: req.stop_signal.clone(),
+        stop_timeout_secs: req.stop_timeout_secs,
         image: match &restored_host_image {
             Some(restored) => Some(restored.local.clone()),
             None => image,
@@ -4058,6 +4062,8 @@ pub async fn start_machine(
         // crun/overlay hiccup leaves a reachable (exec-able) VM rather than
         // failing an otherwise-pullable start — the image is already local, so a
         // retry or the health loop can bring the workload up.
+        let stop_on_exit = record.stop_on_exit;
+        let (stop_signal, stop_timeout) = (record.stop_signal.clone(), record.stop_timeout_secs);
         let launch = with_machine_client_traced(&entry, None, move |c| {
             let config = crate::agent::RunConfig::new(image, command)
                 .with_env(env)
@@ -4065,7 +4071,9 @@ pub async fn start_machine(
                 .with_user(user)
                 .with_mounts(mounts_config)
                 .with_persistent_overlay(Some(overlay_id))
-                .with_s3_volumes(s3_volumes);
+                .with_s3_volumes(s3_volumes)
+                .with_stop_vm_on_exit(stop_on_exit)
+                .with_stop(stop_signal, stop_timeout);
             c.run_container_detached(config).map(|_| ())
         })
         .await;
@@ -5336,7 +5344,8 @@ pub async fn paused_checkpoint(
     path = "/api/v1/machines/{name}/stop",
     tag = "Machines",
     params(
-        ("name" = String, Path, description = "Machine name")
+        ("name" = String, Path, description = "Machine name"),
+        ("timeout" = Option<u64>, Query, description = "Seconds the workload gets to exit after its stop signal before it is killed, instead of the machine's stop timeout; 0 kills it at once")
     ),
     responses(
         (status = 200, description = "Machine stopped", body = MachineInfo),
@@ -5347,7 +5356,11 @@ pub async fn paused_checkpoint(
 pub async fn stop_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<crate::api::types::StopQuery>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    let stop_timeout = query.timeout;
+    crate::workload::validate_stop_settings(None, stop_timeout).map_err(ApiError::BadRequest)?;
+    let stop_timeout = stop_timeout.map(std::time::Duration::from_secs);
     // Hold the per-machine lifecycle lock across the whole stop so the layers
     // volume detach below cannot race a concurrent start's acquire+mount+launch
     // (review finding #3). Acquired before the DB read and liveness probe
@@ -5483,6 +5496,8 @@ pub async fn stop_machine(
             // above, so nothing still maps its memory or disks.
             let stop = if frozen {
                 e.manager.stop_paused()
+            } else if let Some(stop_timeout) = stop_timeout {
+                e.manager.stop_with_timeout(stop_timeout)
             } else {
                 e.manager.stop()
             };
@@ -7714,6 +7729,8 @@ mod tests {
             entrypoint: vec![],
             cmd: vec![],
             docker_socket: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
             storage_gb: None,
             overlay_gb: None,
             block_io: None,

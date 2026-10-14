@@ -503,6 +503,10 @@ pub struct CreateVmParams {
     pub forkable: bool,
     /// Stop the machine once its workload exits.
     pub stop_on_exit: bool,
+    /// Signal the workload is sent when the machine stops.
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal.
+    pub stop_timeout_secs: Option<u64>,
     /// Planned number of runnable CUDA fork clones.
     pub cuda_fork_pool_size: Option<u32>,
     /// Explicit logical VRAM limit for each golden/clone CUDA session.
@@ -816,6 +820,8 @@ pub(crate) fn build_vm_record_for(
     record.cuda = params.cuda;
     record.forkable = params.forkable || params.cuda_fork_pool_size.is_some();
     record.stop_on_exit = params.stop_on_exit;
+    record.stop_signal = params.stop_signal.clone();
+    record.stop_timeout_secs = params.stop_timeout_secs;
     record.cuda_fork_pool_size = params.cuda_fork_pool_size;
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
@@ -2439,6 +2445,15 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
 /// Stop a named machine that has a config record (or fall back to
 /// agent-only stop if the name is not in config).
 pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
+    stop_vm_named_with_timeout(name, None)
+}
+
+/// [`stop_vm_named`], giving the workload `stop_timeout` to exit after its
+/// stop signal instead of the machine's own stop timeout.
+pub fn stop_vm_named_with_timeout(
+    name: &str,
+    stop_timeout: Option<std::time::Duration>,
+) -> smolvm::Result<()> {
     // Serialize against fork capture in this or another process. Stopping the
     // VMM between snapshot preparation and clone registration can otherwise
     // strand an ambiguous generation.
@@ -2553,6 +2568,8 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     }
     if frozen {
         manager.stop_paused()?;
+    } else if let Some(stop_timeout) = stop_timeout {
+        manager.stop_with_timeout(stop_timeout)?;
     } else {
         manager.stop()?;
     }
@@ -2629,7 +2646,7 @@ fn kill_orphaned_boot_process(name: &str) {
 }
 
 /// Stop the default machine.
-pub fn stop_vm_default() -> smolvm::Result<()> {
+pub fn stop_vm_default(stop_timeout: Option<std::time::Duration>) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     let record = SmolvmConfig::load()
@@ -2647,7 +2664,10 @@ pub fn stop_vm_default() -> smolvm::Result<()> {
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
         smolvm::staged_mount::sync_staged_mounts(record, &mut client)?;
     }
-    manager.stop()?;
+    match stop_timeout {
+        Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
+        None => manager.stop()?,
+    }
 
     // Update database record if it exists
     if let Ok(mut config) = SmolvmConfig::load() {
@@ -2879,7 +2899,9 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                         smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
                     smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
                 }
-                manager.stop()?;
+                // The machine is being deleted, so its workload has nothing
+                // to save: kill it at once rather than wait out its timeout.
+                manager.stop_with_timeout(std::time::Duration::ZERO)?;
                 if record.pid.is_some_and(smolvm::process::is_alive) {
                     return Err(smolvm::Error::agent(
                         "delete machine",

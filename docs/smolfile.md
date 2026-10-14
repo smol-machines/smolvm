@@ -34,7 +34,8 @@ instead of silently doing nothing.
 Common keys: `image`, `cpus`, `memory`, `net`, `ports`, `volumes`, `env`,
 `init` (runs once as root, like a Dockerfile `RUN`), `workdir`, `user` (who the
 workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`,
-`stop_on_exit` (stop the machine when its workload exits), and the
+`stop_on_exit` (stop the machine when its workload exits), `stop_signal` and
+`stop_timeout` (how the workload is stopped with the machine), and the
 `[network]`, `[dev]`, `[auth]`, `[health]`, `[restart]`, `[service]` tables.
 
 ## Reference
@@ -48,6 +49,8 @@ env = ["PORT=8080", "DEBUG=1"]        # environment variables
 workdir = "/app"                      # working directory
 user = "app"                          # who the workload runs as: a passwd name or uid[:gid]
 stop_on_exit = true                   # stop the machine when the workload exits (default: false)
+stop_signal = "SIGINT"                # sent to the workload when the machine stops (default: SIGTERM)
+stop_timeout = 30                     # seconds it gets to exit before it is killed (default: 10, max: 300)
 
 # Resources
 cpus = 2                              # vCPUs (default: 4)
@@ -162,3 +165,25 @@ Storage is flushed exactly as for `machine stop`, so files the workload wrote
 survive. `machine exec` sessions never trigger it; only the workload itself
 does. The machine's restart policy then applies as for any stop: the default
 `never` leaves it stopped. The workload's exit status is not passed on.
+
+### Stopping the workload with the machine
+
+`machine stop` sends the workload its stop signal and waits for it to exit
+before the machine powers off, so a server can save its state first. The
+signal is `SIGTERM` and the wait is 10 seconds unless the Smolfile says
+otherwise; a workload still running when the wait ends is killed.
+
+```toml
+image = "my-game-server"
+stop_signal = "SIGINT"    # the server saves the world on Ctrl-C
+stop_timeout = 60         # saving a large world can take a while
+```
+
+`stop_signal` takes a name (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGRTMIN+3`) or a
+number; `stop_timeout` is whole seconds, at most 300. The same settings are
+`machine create --stop-signal` and `--stop-timeout`, and `machine stop
+--timeout SECS` overrides the wait for one stop (`0` kills at once).
+`machine delete` does not wait.
+
+The workload's stdout and stderr go to `workload.log` in the machine's data
+directory; `machine logs` shows it, also while the machine is stopped.

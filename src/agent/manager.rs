@@ -2814,6 +2814,13 @@ impl AgentManager {
                 __d
             },
             pod_netns: features.pod_netns,
+            // Ephemeral machines share one runtime directory, so only a named
+            // machine keeps a workload log of its own.
+            workload_log: self.name.as_ref().and_then(|_| {
+                self.vsock_socket
+                    .parent()
+                    .map(crate::workload_log::workload_log_path)
+            }),
         };
         // The operator's egress watchlist, copied beside the vsock socket where
         // the network runtime looks for it (or a stale copy removed when none).
@@ -3183,6 +3190,7 @@ impl AgentManager {
         pid: crate::process::Pid,
         start_time: Option<u64>,
         guest_is_paused: bool,
+        stop_timeout: Option<Duration>,
     ) -> Result<()> {
         // A paused guest has no vCPU to service the request and nothing left to
         // flush, so skip the handshake rather than wait out its deadline and
@@ -3205,7 +3213,10 @@ impl AgentManager {
                 connected = connection.is_ok(),
                 "shutdown agent connect finished"
             );
-            let shutdown = connection.and_then(|mut client| client.shutdown());
+            let shutdown = connection.and_then(|mut client| match stop_timeout {
+                Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
+                None => client.shutdown(),
+            });
             let acked = shutdown.is_ok();
 
             // Process identity is not proof that guest writes reached disk. A slow
@@ -3298,11 +3309,14 @@ impl AgentManager {
         // Include the per-VM readiness marker so the shared rootfs doesn't
         // accumulate one stale marker per VM ever booted.
         let ready_marker = self.ready_marker_path();
+        // The workload log listener's socket; the log itself is kept.
+        let workload_log_socket = self.vsock_socket.with_extension("logs");
         for path in [
             &self.pid_file,
             &self.config_file,
             &self.vsock_socket,
             &ready_marker,
+            &workload_log_socket,
         ] {
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -3450,7 +3464,13 @@ impl AgentManager {
 
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
-        self.stop_inner(false)
+        self.stop_inner(false, None)
+    }
+
+    /// [`stop`](Self::stop), giving the workload `stop_timeout` to exit after
+    /// its stop signal instead of the timeout it was launched with.
+    pub fn stop_with_timeout(&self, stop_timeout: Duration) -> Result<()> {
+        self.stop_inner(false, Some(stop_timeout))
     }
 
     /// Stop a machine whose guest is paused and already quiesced.
@@ -3463,10 +3483,10 @@ impl AgentManager {
     /// burns the deadline and then refuses to stop a machine that is safe to
     /// terminate — leaving it running, and billing, with no way out but delete.
     pub fn stop_paused(&self) -> Result<()> {
-        self.stop_inner(true)
+        self.stop_inner(true, None)
     }
 
-    fn stop_inner(&self, guest_is_paused: bool) -> Result<()> {
+    fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
         let state = {
             let inner = self.inner.lock();
             inner.state
@@ -3476,7 +3496,8 @@ impl AgentManager {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
             if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
-                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused) {
+                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused, stop_timeout)
+                {
                     tracing::warn!(
                         pid,
                         "orphan process still alive, preserving PID/socket files"
@@ -3515,7 +3536,8 @@ impl AgentManager {
         };
 
         if let Some(pid) = child_pid {
-            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused) {
+            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused, stop_timeout)
+            {
                 // Revert to Running — don't lie about state or delete markers
                 {
                     let mut inner = self.inner.lock();
@@ -4083,7 +4105,7 @@ mod tests {
             let before_start = process::process_start_time(pid);
             let identity_verified = process::is_our_process_strict(pid, Some(start_time));
             let started = std::time::Instant::now();
-            let result = manager.stop_vm_process(pid, Some(start_time), true);
+            let result = manager.stop_vm_process(pid, Some(start_time), true, None);
             let elapsed = started.elapsed();
             let after_start = process::process_start_time(pid);
             // NOTE_EXIT can arrive just before a child becomes waitable on
@@ -4130,7 +4152,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as crate::process::Pid;
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false);
+        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false, None);
         let survived = matches!(child.try_wait(), Ok(None));
         let _ = child.kill();
         let _ = child.wait();

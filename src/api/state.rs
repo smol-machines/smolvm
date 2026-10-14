@@ -219,6 +219,10 @@ pub struct MachineRegistration {
     pub init_completed: bool,
     /// Whether to expose the guest Docker daemon socket to the host.
     pub docker_socket: bool,
+    /// Signal the workload is sent when the machine stops.
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal.
+    pub stop_timeout_secs: Option<u64>,
     /// OCI image reference (e.g., "alpine:latest").
     pub image: Option<String>,
     /// Path to .smolmachine sidecar this machine was created from.
@@ -1235,6 +1239,8 @@ impl ApiState {
         record.forkable = reg.forkable;
         record.init_completed = reg.init_completed;
         record.docker_socket = reg.docker_socket;
+        record.stop_signal = reg.stop_signal;
+        record.stop_timeout_secs = reg.stop_timeout_secs;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
         record.source_registry_ref = reg.source_registry_ref.clone();
@@ -1837,6 +1843,8 @@ async fn relaunch_image_workload(
     .await
     .map_err(|e| crate::Error::agent("pull image for workload", format!("{e:?}")))?;
 
+    let stop_on_exit = record.stop_on_exit;
+    let (stop_signal, stop_timeout) = (record.stop_signal.clone(), record.stop_timeout_secs);
     with_machine_client_traced(entry, None, move |c| {
         let config = crate::agent::RunConfig::new(image, command)
             .with_env(env)
@@ -1844,7 +1852,9 @@ async fn relaunch_image_workload(
             .with_user(user)
             .with_mounts(mounts_config)
             .with_persistent_overlay(Some(overlay_id))
-            .with_s3_volumes(s3_volumes);
+            .with_s3_volumes(s3_volumes)
+            .with_stop_vm_on_exit(stop_on_exit)
+            .with_stop(stop_signal, stop_timeout);
         c.run_container_detached(config).map(|_| ())
     })
     .await

@@ -407,6 +407,9 @@ pub enum MachineCmd {
     /// Show machine status
     Status(StatusCmd),
 
+    /// Show the workload's output (stdout and stderr), even while stopped
+    Logs(LogsCmd),
+
     /// Show egress denials — outbound connections the machine's egress policy refused
     EgressEvents(EgressEventsCmd),
 
@@ -482,6 +485,7 @@ impl MachineCmd {
             MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
+            MachineCmd::Logs(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
             MachineCmd::Resize(cmd) => cmd.run(),
@@ -3141,6 +3145,58 @@ mod tests {
     }
 
     #[test]
+    fn create_and_stop_accept_stop_settings_and_reject_bad_ones() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "worker",
+            "--stop-signal",
+            "SIGINT",
+            "--stop-timeout",
+            "45",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.stop_signal.as_deref(), Some("SIGINT"));
+        assert_eq!(cmd.stop_timeout, Some(45));
+
+        let cli = TestMachineCli::parse_from(["machine", "stop", "--name", "worker", "-t", "0"]);
+        let MachineCmd::Stop(cmd) = cli.command else {
+            panic!("expected machine stop command");
+        };
+        assert_eq!(cmd.timeout, Some(0));
+
+        for bad in [
+            vec![
+                "machine",
+                "create",
+                "--name",
+                "w",
+                "--stop-signal",
+                "SIGNOPE",
+            ],
+            vec!["machine", "create", "--name", "w", "--stop-timeout", "301"],
+            vec!["machine", "stop", "--name", "w", "--timeout", "soon"],
+        ] {
+            assert!(TestMachineCli::try_parse_from(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn logs_accepts_follow_and_tail() {
+        let cli = TestMachineCli::parse_from([
+            "machine", "logs", "--name", "worker", "-f", "--tail", "20",
+        ]);
+        let MachineCmd::Logs(cmd) = cli.command else {
+            panic!("expected machine logs command");
+        };
+        assert!(cmd.follow);
+        assert_eq!(cmd.tail, Some(20));
+    }
+
+    #[test]
     fn create_accepts_auto_graph_flag() {
         let cli =
             TestMachineCli::parse_from(["machine", "create", "--name", "golden", "--auto-graph"]);
@@ -4091,6 +4147,16 @@ pub struct CreateCmd {
     #[arg(long)]
     pub stop_on_exit: bool,
 
+    /// Signal sent to the workload when the machine stops, so it can save its
+    /// state and exit (e.g. SIGINT, SIGRTMIN+3; default SIGTERM)
+    #[arg(long, value_name = "SIGNAL", value_parser = parse_stop_signal_arg)]
+    pub stop_signal: Option<String>,
+
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed (default 10, at most 300)
+    #[arg(long, value_name = "SECONDS", value_parser = parse_stop_timeout_arg)]
+    pub stop_timeout: Option<u64>,
+
     /// Remote guest CUDA Driver-API calls to the host NVIDIA GPU over vsock
     #[arg(long)]
     pub cuda: bool,
@@ -4149,6 +4215,19 @@ pub struct CreateCmd {
 /// recorded against an unreadable device would otherwise fail every start with
 /// a virtio-blk error that names neither the disk nor the reason.
 /// Clap value parser for `--guest-subnet`: validate, and store the canonical form.
+fn parse_stop_signal_arg(value: &str) -> Result<String, String> {
+    smolvm::workload::validate_stop_settings(Some(value), None)?;
+    Ok(value.to_string())
+}
+
+fn parse_stop_timeout_arg(value: &str) -> Result<u64, String> {
+    let secs = value
+        .parse::<u64>()
+        .map_err(|_| format!("'{value}' is not a whole number of seconds"))?;
+    smolvm::workload::validate_stop_settings(None, Some(secs))?;
+    Ok(secs)
+}
+
 fn parse_guest_subnet(value: &str) -> Result<String, String> {
     value
         .parse::<smolvm_network::GuestSubnet>()
@@ -4366,6 +4445,12 @@ impl CreateCmd {
         }
         if self.stop_on_exit {
             params.stop_on_exit = true;
+        }
+        if self.stop_signal.is_some() {
+            params.stop_signal = self.stop_signal.clone();
+        }
+        if self.stop_timeout.is_some() {
+            params.stop_timeout_secs = self.stop_timeout;
         }
         if self.cuda {
             params.cuda = true;
@@ -4742,6 +4827,8 @@ impl CreateCmd {
             // fork/checkpoint source without a topology-changing restart.
             forkable: checkpoint.is_some(),
             stop_on_exit: self.stop_on_exit,
+            stop_signal: self.stop_signal.clone(),
+            stop_timeout_secs: self.stop_timeout,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
@@ -5540,6 +5627,11 @@ pub struct StopCmd {
     /// Machine to stop (default: "default")
     #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
+
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed, instead of the machine's stop timeout (0 kills it at once)
+    #[arg(short = 't', long, value_name = "SECONDS", value_parser = parse_stop_timeout_arg)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -5573,9 +5665,10 @@ impl ResumeCmd {
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = vm_common::resolve_vm_name(self.name)?;
+        let timeout = self.timeout.map(std::time::Duration::from_secs);
         match &name {
-            Some(name) => vm_common::stop_vm_named(name),
-            None => vm_common::stop_vm_default(),
+            Some(name) => vm_common::stop_vm_named_with_timeout(name, timeout),
+            None => vm_common::stop_vm_default(timeout),
         }
     }
 }
@@ -5648,6 +5741,62 @@ impl StatusCmd {
             return vm_common::status_vm_json(&self.name);
         }
         vm_common::status_vm(&self.name)
+    }
+}
+
+// ============================================================================
+// Logs Command
+// ============================================================================
+
+/// Show a machine's workload output.
+///
+/// A machine's workload (its image ENTRYPOINT/CMD or Smolfile command) writes
+/// stdout and stderr to `workload.log` in the machine's data directory. The
+/// log is kept across restarts, rotated by size, and readable while the
+/// machine is stopped.
+#[derive(Args, Debug)]
+pub struct LogsCmd {
+    /// Machine whose workload output to show (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Keep printing output as the workload writes it
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+
+    /// Show only the last N lines
+    #[arg(long, value_name = "N")]
+    pub tail: Option<usize>,
+}
+
+impl LogsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        use std::io::Write;
+        let name = vm_common::resolve_vm_name(self.name)?.unwrap_or_else(|| "default".into());
+        if smolvm::db::SmolvmDb::open()?.get_vm(&name)?.is_none() {
+            return Err(smolvm::Error::vm_not_found(&name));
+        }
+        let log = smolvm::workload_log::workload_log_path(&smolvm::agent::vm_data_dir(&name));
+        let read_err = |e: std::io::Error| smolvm::Error::agent("read workload log", e.to_string());
+        let shown = match self.tail {
+            Some(lines) => smolvm::workload_log::tail(&log, lines).map_err(read_err)?,
+            None => smolvm::workload_log::read_all(&log).map_err(read_err)?,
+        };
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&shown).map_err(read_err)?;
+        stdout.flush().map_err(read_err)?;
+        if self.follow {
+            let offset = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+            smolvm::workload_log::follow(
+                &log,
+                offset,
+                &mut stdout,
+                std::time::Duration::from_millis(200),
+                || false,
+            )
+            .map_err(read_err)?;
+        }
+        Ok(())
     }
 }
 

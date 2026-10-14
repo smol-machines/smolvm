@@ -356,6 +356,12 @@ pub struct Smolfile {
     /// Stop the machine once its workload exits, whatever the exit status.
     #[serde(default)]
     pub stop_on_exit: bool,
+    /// Signal the workload is sent when the machine stops (`SIGTERM` when
+    /// unset), as a name (`SIGINT`, `SIGRTMIN+3`) or a number.
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed (10 when unset).
+    pub stop_timeout: Option<u64>,
     /// Credential forwarding.
     pub auth: Option<AuthConfig>,
     /// Service metadata for deployment.

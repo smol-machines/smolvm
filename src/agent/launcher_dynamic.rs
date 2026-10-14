@@ -700,6 +700,7 @@ pub fn launch_agent_vm_dynamic(
         dns_filter_socket: None,
         cuda_socket: config.cuda_socket,
         docker_socket: None,
+        workload_log_socket: None,
     };
     let active_vsock: Vec<_> = vsock_service::registry()
         .iter()

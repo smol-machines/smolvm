@@ -119,3 +119,8 @@ pub const PUBLISH_SOCKETS: &str = "SMOLVM_PUBLISH_SOCKETS";
 /// base. The agent mounts its ext4 filesystem, making one on a blank base,
 /// and exposes it to every workload at the guest path.
 pub const CACHE_DISK: &str = "SMOLVM_CACHE_DISK";
+
+/// Enables forwarding a detached workload's stdout and stderr to the host over
+/// the `ports::WORKLOAD_LOGS` vsock port, where the host appends them to the
+/// machine's `workload.log`. Absent means the output is discarded.
+pub const WORKLOAD_LOGS: &str = "SMOLVM_WORKLOAD_LOGS";

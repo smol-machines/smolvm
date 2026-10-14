@@ -96,6 +96,88 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
 /// Guest supports preparing file access without executing a command from the image.
 pub const PREPARE_FILE_ACCESS_CAPABILITY: &str = "prepare-file-access-v1";
+/// The agent signals a machine's workload and waits for it to exit before it
+/// quiesces storage on shutdown.
+pub const GRACEFUL_WORKLOAD_STOP_CAPABILITY: &str = "graceful-workload-stop-v1";
+/// The agent forwards a detached workload's stdout and stderr to the host over
+/// [`ports::WORKLOAD_LOGS`].
+pub const WORKLOAD_LOGS_CAPABILITY: &str = "workload-logs-v1";
+
+/// Signal a machine's workload is sent when the machine stops, unless the
+/// machine names another one.
+pub const DEFAULT_STOP_SIGNAL: &str = "SIGTERM";
+/// Seconds a stopping machine waits for its workload to exit after the stop
+/// signal before killing it, unless the machine or the stop names another
+/// value.
+pub const DEFAULT_STOP_TIMEOUT_SECS: u64 = 10;
+/// Longest stop timeout a machine or a stop request may ask for.
+pub const MAX_STOP_TIMEOUT_SECS: u64 = 300;
+
+/// Linux signal numbers by name. The guest is always Linux, while the host
+/// that validates a stop signal may be macOS, where many numbers differ, so
+/// neither side may take them from its own libc.
+const LINUX_SIGNALS: &[(&str, i32)] = &[
+    ("HUP", 1),
+    ("INT", 2),
+    ("QUIT", 3),
+    ("ILL", 4),
+    ("TRAP", 5),
+    ("ABRT", 6),
+    ("BUS", 7),
+    ("FPE", 8),
+    ("KILL", 9),
+    ("USR1", 10),
+    ("SEGV", 11),
+    ("USR2", 12),
+    ("PIPE", 13),
+    ("ALRM", 14),
+    ("TERM", 15),
+    ("STKFLT", 16),
+    ("CHLD", 17),
+    ("CONT", 18),
+    ("STOP", 19),
+    ("TSTP", 20),
+    ("TTIN", 21),
+    ("TTOU", 22),
+    ("URG", 23),
+    ("XCPU", 24),
+    ("XFSZ", 25),
+    ("VTALRM", 26),
+    ("PROF", 27),
+    ("WINCH", 28),
+    ("IO", 29),
+    ("PWR", 30),
+    ("SYS", 31),
+];
+
+/// First real-time signal as glibc numbers it, which is what images'
+/// `STOPSIGNAL SIGRTMIN+3` (systemd) means.
+const LINUX_SIGRTMIN: i32 = 34;
+const LINUX_SIGRTMAX: i32 = 64;
+
+/// The Linux number of a stop signal written as a name (`SIGTERM`, `TERM`,
+/// any case), a real-time offset (`SIGRTMIN+3`), or a number (`15`).
+pub fn parse_stop_signal(signal: &str) -> Option<i32> {
+    let signal = signal.trim();
+    if let Ok(number) = signal.parse::<i32>() {
+        return (1..=LINUX_SIGRTMAX).contains(&number).then_some(number);
+    }
+    let upper = signal.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if let Some(offset) = name.strip_prefix("RTMIN") {
+        let offset = match offset.strip_prefix('+') {
+            Some(n) => n.parse::<i32>().ok()?,
+            None if offset.is_empty() => 0,
+            None => return None,
+        };
+        let number = LINUX_SIGRTMIN.checked_add(offset)?;
+        return (number <= LINUX_SIGRTMAX).then_some(number);
+    }
+    LINUX_SIGNALS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, number)| *number)
+}
 
 /// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
 /// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
@@ -275,6 +357,37 @@ fn shutdown_progress_disabled(progress: &bool) -> bool {
 mod shutdown_compat_tests {
     use super::*;
 
+    #[test]
+    fn stop_signals_parse_to_linux_numbers_whatever_the_spelling() {
+        for (spelling, number) in [
+            ("SIGTERM", 15),
+            ("TERM", 15),
+            ("sigterm", 15),
+            ("15", 15),
+            ("SIGINT", 2),
+            ("SIGUSR1", 10),
+            ("SIGQUIT", 3),
+            ("SIGKILL", 9),
+            ("SIGRTMIN", 34),
+            ("SIGRTMIN+3", 37),
+            (" SIGHUP ", 1),
+        ] {
+            assert_eq!(parse_stop_signal(spelling), Some(number), "{spelling}");
+        }
+        for bad in [
+            "",
+            "SIGNOPE",
+            "0",
+            "65",
+            "-1",
+            "SIGRTMIN+31",
+            "SIGRTMIN3",
+            "RTMIN+x",
+        ] {
+            assert_eq!(parse_stop_signal(bad), None, "{bad}");
+        }
+    }
+
     /// `stop_vm_on_exit` is additive: an older host never sends it (off), and
     /// when off it is omitted from the wire so an older agent sees the exact
     /// request it always did.
@@ -297,9 +410,13 @@ mod shutdown_compat_tests {
             background: false,
             s3_volumes: vec![],
             stop_vm_on_exit,
+            stop_signal: None,
+            stop_timeout_secs: None,
         };
         let off = serde_json::to_string(&run(false)).unwrap();
         assert!(!off.contains("stop_vm_on_exit"), "{off}");
+        assert!(!off.contains("stop_signal"), "{off}");
+        assert!(!off.contains("stop_timeout_secs"), "{off}");
         assert!(matches!(
             serde_json::from_str::<AgentRequest>(&off).unwrap(),
             AgentRequest::Run {
@@ -322,12 +439,51 @@ mod shutdown_compat_tests {
         let wire = r#"{"method":"shutdown"}"#;
         assert!(matches!(
             serde_json::from_str::<AgentRequest>(wire).unwrap(),
-            AgentRequest::Shutdown { progress: false }
+            AgentRequest::Shutdown {
+                progress: false,
+                stop_timeout_secs: None
+            }
         ));
         assert_eq!(
-            serde_json::to_string(&AgentRequest::Shutdown { progress: false }).unwrap(),
+            serde_json::to_string(&AgentRequest::Shutdown {
+                progress: false,
+                stop_timeout_secs: None
+            })
+            .unwrap(),
             wire
         );
+    }
+
+    /// A stop timeout override is additive: omitted when unset, so the wire
+    /// shape older agents know is unchanged, and ignored by agents that
+    /// predate it.
+    #[test]
+    fn shutdown_stop_timeout_is_omitted_when_unset_and_ignored_by_older_agents() {
+        #[derive(Deserialize)]
+        #[serde(tag = "method", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Shutdown {
+                #[serde(default)]
+                progress: bool,
+            },
+        }
+        let wire = serde_json::to_string(&AgentRequest::Shutdown {
+            progress: true,
+            stop_timeout_secs: Some(0),
+        })
+        .unwrap();
+        assert!(wire.contains("\"stop_timeout_secs\":0"), "{wire}");
+        assert!(matches!(
+            serde_json::from_str::<LegacyRequest>(&wire).unwrap(),
+            LegacyRequest::Shutdown { progress: true }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&wire).unwrap(),
+            AgentRequest::Shutdown {
+                progress: true,
+                stop_timeout_secs: Some(0)
+            }
+        ));
     }
 
     #[test]
@@ -337,7 +493,11 @@ mod shutdown_compat_tests {
         enum LegacyRequest {
             Shutdown,
         }
-        let wire = serde_json::to_string(&AgentRequest::Shutdown { progress: true }).unwrap();
+        let wire = serde_json::to_string(&AgentRequest::Shutdown {
+            progress: true,
+            stop_timeout_secs: None,
+        })
+        .unwrap();
         assert!(matches!(
             serde_json::from_str::<LegacyRequest>(&wire).unwrap(),
             LegacyRequest::Shutdown
@@ -347,14 +507,17 @@ mod shutdown_compat_tests {
     #[test]
     fn traced_shutdown_preserves_progress_opt_in() {
         let envelope = Envelope::with_trace_id(
-            AgentRequest::Shutdown { progress: true },
+            AgentRequest::Shutdown {
+                progress: true,
+                stop_timeout_secs: None,
+            },
             Some("shutdown-test".into()),
         );
         let decoded: Envelope<AgentRequest> =
             decode_message(&encode_message(&envelope).unwrap()).unwrap();
         assert!(matches!(
             decoded.body,
-            AgentRequest::Shutdown { progress: true }
+            AgentRequest::Shutdown { progress: true, .. }
         ));
         assert_eq!(decoded.trace_id.as_deref(), Some("shutdown-test"));
     }
@@ -524,6 +687,11 @@ pub enum AgentRequest {
         /// Opt into progress frames while storage is being synchronized.
         #[serde(default, skip_serializing_if = "shutdown_progress_disabled")]
         progress: bool,
+        /// Seconds to wait for the workload to exit after its stop signal,
+        /// overriding the timeout it was launched with; `0` kills it at once.
+        /// Older agents ignore it and do not signal the workload at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_timeout_secs: Option<u64>,
     },
 
     /// Export a layer as a tar archive.
@@ -712,6 +880,14 @@ pub enum AgentRequest {
         /// then powers off. Only honored for detached runs. Older agents ignore it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stop_vm_on_exit: bool,
+        /// Signal sent to this detached workload when the machine stops
+        /// (`SIGTERM` when unset). Only honored for detached runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_signal: Option<String>,
+        /// Seconds to wait for this detached workload to exit after its stop
+        /// signal before it is killed ([`DEFAULT_STOP_TIMEOUT_SECS`] when unset).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_timeout_secs: Option<u64>,
     },
 
     /// Send stdin data to a running interactive command.

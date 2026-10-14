@@ -106,7 +106,8 @@ smolvm machine shell [--name NAME]                # interactive shell (must be r
 smolvm machine create --name NAME [OPTIONS]              # create persistent
 smolvm machine create --name NAME --from FILE.smolmachine  # from packed artifact
 smolvm machine start [--name NAME]                # start (default: "default")
-smolvm machine stop [--name NAME]                 # stop
+smolvm machine stop [--name NAME] [--timeout SECS]  # stop (workload gets SIGTERM first)
+smolvm machine logs [--name NAME] [-f] [--tail N] # workload stdout/stderr, even when stopped
 smolvm machine delete --name NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
@@ -506,6 +507,8 @@ can create and run machines. Machines that ask for nested virtualization
 
 ## Important Behaviors
 
+- **`machine stop` stops the workload gracefully.** The workload (the image ENTRYPOINT/CMD or Smolfile command) is sent its stop signal (`SIGTERM` by default) and given its stop timeout (10 s by default) to save its state and exit before it is killed and the machine powers off. Set them with `machine create --stop-signal SIG --stop-timeout SECS` or Smolfile `stop_signal` / `stop_timeout`; `machine stop --timeout SECS` overrides the timeout for one stop (`0` kills at once). `machine delete` does not wait.
+- **`machine logs` shows the workload's output.** The workload's stdout and stderr are appended to `workload.log` in the machine's data directory, kept across restarts, rotated at 10 MiB (three old files kept), and readable while the machine is stopped. `-f` follows, `--tail N` shows the last N lines. Output of `machine exec` is not included. Over the API: `GET /api/v1/machines/{name}/logs?source=workload`.
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).

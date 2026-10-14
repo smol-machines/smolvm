@@ -721,6 +721,21 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         None
     };
 
+    // Workload logs: the guest streams a detached workload's stdout and
+    // stderr here for the machine's whole life, and this process appends them
+    // to the machine's workload.log.
+    let workload_log_socket: Option<std::path::PathBuf> =
+        config.workload_log.as_ref().and_then(|log| {
+            let socket = config.vsock_socket.with_extension("logs");
+            match crate::workload_log::start(&socket, log) {
+                Ok(()) => Some(socket),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to start the workload log listener");
+                    None
+                }
+            }
+        });
+
     proc_timing!("ready to launch");
 
     // Egress telemetry lands in the per-VM dir (the vsock socket's parent), the
@@ -742,6 +757,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         dns_filter_socket: dns_filter_socket_path.as_deref(),
         cuda_socket: cuda_socket.as_deref(),
         docker_socket: docker_socket.as_deref(),
+        workload_log_socket: workload_log_socket.as_deref(),
         published_sockets: &config.published_sockets,
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         packed_layers_dax_window: config.packed_layers_dax_window,

@@ -550,6 +550,16 @@ pub struct PullImageResponse {
 // Logs Types
 // ============================================================================
 
+/// Query parameters for the stop endpoint.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct StopQuery {
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed, instead of the machine's stop timeout; 0 kills it at once.
+    #[serde(default)]
+    #[schema(example = 30)]
+    pub timeout: Option<u64>,
+}
+
 /// Query parameters for logs endpoint.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LogsQuery {
@@ -563,6 +573,11 @@ pub struct LogsQuery {
     /// Output format: "raw" (default) or "json" (only emit valid JSON lines).
     #[serde(default)]
     pub format: Option<String>,
+    /// Which log: "console" (default), the machine's agent and kernel
+    /// console, or "workload", its workload's stdout and stderr, which is
+    /// kept across restarts and readable while the machine is stopped.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 // ============================================================================
@@ -765,6 +780,17 @@ pub struct CreateMachineRequest {
     /// Off by default.
     #[serde(default)]
     pub docker_socket: bool,
+    /// Signal sent to the workload when the machine stops, so it can save its
+    /// state and exit: a name such as `SIGINT` or `SIGRTMIN+3`, or a number.
+    /// Default `SIGTERM`.
+    #[serde(default)]
+    #[schema(example = "SIGINT")]
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed. Default 10, at most 300.
+    #[serde(default)]
+    #[schema(example = 30)]
+    pub stop_timeout_secs: Option<u64>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,

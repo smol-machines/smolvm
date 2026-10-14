@@ -111,6 +111,8 @@ mod storage;
 mod timesync;
 mod vsock;
 mod vulkan;
+#[cfg(target_os = "linux")]
+mod workload;
 
 // ============================================================================
 // Configuration Constants
@@ -2163,8 +2165,17 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // on the same connection is read.
         let _work = needs_work_slot(&request).then(|| WORK_SLOTS.acquire());
 
-        if let AgentRequest::Shutdown { progress } = request {
+        if let AgentRequest::Shutdown {
+            progress,
+            stop_timeout_secs,
+        } = request
+        {
             shutdown::respond(stream, progress, || {
+                // The workload saves its state before storage is frozen under it.
+                #[cfg(target_os = "linux")]
+                workload::stop_all(stop_timeout_secs.map(std::time::Duration::from_secs));
+                #[cfg(not(target_os = "linux"))]
+                let _ = stop_timeout_secs;
                 // Serialize shutdown requests without blocking progress for a
                 // second caller waiting for the first flush to finish.
                 static FLUSH: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2376,7 +2387,12 @@ fn handle_request(
                 smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_string(),
                 smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_string(),
+                smolvm_protocol::GRACEFUL_WORKLOAD_STOP_CAPABILITY.to_string(),
             ];
+            #[cfg(target_os = "linux")]
+            if workload::logs_enabled() {
+                capabilities.push(smolvm_protocol::WORKLOAD_LOGS_CAPABILITY.to_string());
+            }
             // The guest kernel publishes this parameter when its timer driver
             // follows a change of counter rate after a restore.
             if std::path::Path::new("/sys/module/arm_arch_timer/parameters/follows_counter_rate")
@@ -2611,6 +2627,8 @@ fn handle_request(
             background,
             s3_volumes,
             stop_vm_on_exit: _,
+            stop_signal: _,
+            stop_timeout_secs: _,
         } => {
             if background {
                 handle_run_background(
@@ -4005,6 +4023,8 @@ fn handle_run_detached(
         unprivileged,
         s3_volumes,
         stop_vm_on_exit,
+        stop_signal,
+        stop_timeout_secs,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -4017,6 +4037,8 @@ fn handle_run_detached(
             unprivileged,
             s3_volumes,
             stop_vm_on_exit,
+            stop_signal,
+            stop_timeout_secs,
             ..
         } => (
             image,
@@ -4029,6 +4051,8 @@ fn handle_run_detached(
             unprivileged,
             s3_volumes,
             stop_vm_on_exit,
+            stop_signal,
+            stop_timeout_secs,
         ),
         _ => {
             send_response(
@@ -4038,6 +4062,25 @@ fn handle_run_detached(
             return Ok(());
         }
     };
+
+    let stop_signal = stop_signal
+        .as_deref()
+        .unwrap_or(smolvm_protocol::DEFAULT_STOP_SIGNAL);
+    let Some(stop_signal) = smolvm_protocol::parse_stop_signal(stop_signal) else {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("unknown stop signal '{stop_signal}'"),
+                error_codes::INVALID_REQUEST,
+            ),
+        )?;
+        return Ok(());
+    };
+    let stop_timeout = std::time::Duration::from_secs(
+        stop_timeout_secs
+            .unwrap_or(smolvm_protocol::DEFAULT_STOP_TIMEOUT_SECS)
+            .min(smolvm_protocol::MAX_STOP_TIMEOUT_SECS),
+    );
 
     // An empty command is allowed here: it means "run the image's own
     // ENTRYPOINT/CMD". We resolve it from the image config below, after the
@@ -4198,7 +4241,15 @@ fn handle_run_detached(
     // `crun run --detach` which hangs in the smolvm VM environment. The
     // two-step approach registers the container state so `crun exec` can join
     // it, and `crun start` returns immediately once the container is running.
-    let create_output = crun::CrunCommand::create(&bundle_path, &container_id).output();
+    // A workload that is the container's init inherits create's stdio; the
+    // keep-alive init in front of any other workload has nothing to say.
+    let mut create = crun::CrunCommand::create(&bundle_path, &container_id);
+    if workload_is_pid1 {
+        if let Some(output) = workload::output_pipe() {
+            create = create.output_to(output);
+        }
+    }
+    let create_output = create.output();
     match create_output {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
@@ -4287,6 +4338,14 @@ fn handle_run_detached(
                     }
                 }
             };
+            workload::register(
+                match workload {
+                    Some(identity) => workload::StopTarget::Process(identity),
+                    None => workload::StopTarget::Container(container_id.clone()),
+                },
+                stop_signal,
+                stop_timeout,
+            );
             if stop_vm_on_exit {
                 match workload {
                     Some(workload) => stop_machine_when_exited(move || {
@@ -4369,7 +4428,7 @@ fn launch_workload(
     let log = crun::workload_log_path(container_id);
     let pid_file = log.with_extension("pid");
     let _ = std::fs::remove_file(&pid_file);
-    let status = crun::CrunCommand::exec_detached_with_log(
+    let crun = crun::CrunCommand::exec_detached_with_log(
         container_id,
         &env,
         &launch.command,
@@ -4378,8 +4437,11 @@ fn launch_workload(
         Some(&log),
     )
     .user(user.as_deref())
-    .stdin_null()
-    .discard_output()
+    .stdin_null();
+    let status = match workload::output_pipe() {
+        Some(output) => crun.output_to(output),
+        None => crun.discard_output(),
+    }
     .status()
     .map_err(|e| format!("run crun: {e}"))?;
     let reason = crun::take_log(&log);
@@ -4424,6 +4486,10 @@ fn stop_machine_when_exited(alive: impl Fn() -> Option<u32> + Send + 'static) {
                     // failed): the old poll interval is the fallback.
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
+            }
+            if workload::stopping() {
+                // A shutdown stopped it and quiesces storage itself.
+                return;
             }
             info!("workload exited; stopping the machine (stop_on_exit)");
             if let Err(e) = shutdown_freeze::freeze_internal_filesystems() {
@@ -7905,7 +7971,8 @@ mod work_slot_tests {
     fn only_pings_and_shutdown_skip_the_work_slots() {
         assert!(!needs_work_slot(&AgentRequest::Ping));
         assert!(!needs_work_slot(&AgentRequest::Shutdown {
-            progress: false
+            progress: false,
+            stop_timeout_secs: None,
         }));
         assert!(needs_work_slot(&AgentRequest::ListImages));
     }

@@ -577,6 +577,8 @@ pub struct LaunchConfig<'a> {
     /// path and the guest proxies connections to its in-guest dockerd socket,
     /// so a host client reaches the daemon at `DOCKER_HOST=unix://<this path>`.
     pub docker_socket: Option<&'a Path>,
+    /// Host socket the guest forwards the workload's stdout and stderr to.
+    pub workload_log_socket: Option<&'a Path>,
     /// User-published Unix-socket bridges. The launcher resolves each `expose`
     /// socket's host path against the per-VM dir (the vsock socket's parent),
     /// assigns a vsock port (`ports::PUBLISH_SOCKET_BASE + i`), wires libkrun,
@@ -660,6 +662,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         dns_filter_socket,
         cuda_socket,
         docker_socket,
+        workload_log_socket,
         published_sockets,
         packed_layers_dir,
         packed_layers_dax_window,
@@ -1777,6 +1780,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             dns_filter_socket: dns_filter_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),
             docker_socket: docker_socket.as_deref(),
+            workload_log_socket: workload_log_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()
             .iter()

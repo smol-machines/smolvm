@@ -669,6 +669,16 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stop_on_exit: bool,
 
+    /// Signal the workload is sent when the machine stops (`SIGTERM` when
+    /// unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed (10 when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_secs: Option<u64>,
+
     /// Planned number of runnable CUDA fork clones. Persisted so every clone
     /// receives the same pre-initialization VRAM policy as its golden.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -926,6 +936,8 @@ impl VmRecord {
             detached: false,
             keep_identity: false,
             stop_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
@@ -1019,6 +1031,8 @@ impl VmRecord {
             detached: false,
             keep_identity: false,
             stop_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
