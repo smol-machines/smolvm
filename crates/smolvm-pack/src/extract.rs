@@ -311,6 +311,11 @@ pub const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
 /// shared store, `smolvm pack prune --all` (plain `prune` keeps the newest five
 /// entries, so it may remove nothing) with no machine leasing the entry.
 const HOST_LAYERS_MARKER: &str = ".smolvm-host-layers";
+/// Written beside [`HOST_LAYERS_MARKER`] once every host-extracted layer file
+/// belongs to root on the host. Extractions before it chowned each file to its
+/// archived owner, which the per-VM idmapped mount cannot map; a cache hit
+/// without it repairs the entry once (see [`repair_host_layer_owners`]).
+const HOST_LAYER_OWNERS_MARKER: &str = ".smolvm-host-layer-owners";
 /// The xattr libkrun's virtiofs server reads ownership and mode from (the
 /// rootless-containers convention, `uid:gid:0mode`). Writing it lets an
 /// unprivileged host hand the guest an image's exact owners, setuid bits and
@@ -1236,6 +1241,14 @@ fn safe_unpack_skipping<R: Read>(
             entry.header().gid().unwrap_or(0)
         };
 
+        // The owner the host copy gets. When the archived owner travels in the
+        // override xattr, the host copy belongs to root: under the per-VM uid
+        // drop the layers reach the VMM through an idmapped mount that maps
+        // only on-disk id 0, so a file left with its archived owner (42, mode
+        // 0600) could not be opened, nor its xattr read, and the guest saw
+        // 65534 and EACCES even as root.
+        let (host_uid, host_gid) = if owner_xattr { (0, 0) } else { (uid, gid) };
+
         // GNU sparse entries already carry an exact extent map. Let the tar
         // reader seek over those holes directly instead of expanding them and
         // rediscovering zero chunks in `unpack_sparse`. This is especially
@@ -1253,7 +1266,7 @@ fn safe_unpack_skipping<R: Read>(
             // `Entry::unpack_in` handles the sparse extent stream, while these
             // final assignments retain safe_unpack's permission policy.
             set_mode(&full_path, entry.header().mode().unwrap_or(0o644) & 0o777);
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         // For large ordinary files use a sparse write: ftruncate creates the
         // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
         // prevents 10 GiB overlay disks from materialising as dense files on
@@ -1267,7 +1280,7 @@ fn safe_unpack_skipping<R: Read>(
                     format!("failed to unpack '{}': {}", entry_path.display(), e),
                 ));
             }
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         } else {
             if let Err(e) = entry.unpack_in(dest) {
                 // On macOS, certain entries fail to unpack due to platform
@@ -1298,7 +1311,7 @@ fn safe_unpack_skipping<R: Read>(
             // Ownership after the mode is in place: chown clears setuid/setgid,
             // and the deferred directory pass below only restores modes, never
             // owners, so doing it here is the single point that applies.
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         }
         if host_runtime && is_regular {
             set_mode(&full_path, 0o600);
@@ -2042,6 +2055,7 @@ fn extract_sidecar_capped(
         // still holds staged tars, and would hand them to the guest on every
         // start. Finish the job here, once, under the same lock.
         let upgraded = upgrade_staged_layers(sidecar_path, cache_dir, agent_version, debug)?;
+        repair_host_layer_owners(cache_dir, debug)?;
         if upgraded && cap_cache {
             if let Some(root) = cache_dir.parent() {
                 evict_cache_to_size_protecting(root, pack_cache_max_bytes(root), Some(cache_dir));
@@ -3199,6 +3213,54 @@ fn restrict_to_owner(dir: &Path) {
     let _ = dir;
 }
 
+/// Give root, on the host, every file of a host-extracted layer cache made
+/// before [`HOST_LAYER_OWNERS_MARKER`], once.
+///
+/// Those extractions chowned each file to its archived owner although the
+/// guest reads ownership from the override xattr. Under the per-VM uid drop the
+/// VMM sees the cache through an idmapped mount that maps only on-disk id 0, so
+/// a private file owned by anyone else could not be opened and the guest saw
+/// 65534 and EACCES, in every machine and branch built on the entry. The xattr
+/// already holds the true owner, so giving the host copy to root loses nothing
+/// (host copies never carry setuid bits; the xattr does). Only root can chown,
+/// and only a root extraction could have left another owner behind.
+fn repair_host_layer_owners(cache_dir: &Path, debug: bool) -> std::io::Result<()> {
+    if !cache_dir.join(HOST_LAYERS_MARKER).exists()
+        || cache_dir.join(HOST_LAYER_OWNERS_MARKER).exists()
+    {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::MetadataExt;
+        let mut repaired = 0u64;
+        let mut pending = vec![cache_dir.join("layers")];
+        while let Some(dir) = pending.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let path = entry?.path();
+                let meta = fs::symlink_metadata(&path)?;
+                if meta.uid() != 0 || meta.gid() != 0 {
+                    set_owner(&path, 0, 0);
+                    repaired += 1;
+                }
+                if meta.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        if debug && repaired > 0 {
+            eprintln!("debug: gave {repaired} host-extracted layer entries back to root");
+        }
+    }
+    let _ = debug;
+    fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")
+}
+
 /// Inner extraction logic (called under the lock).
 /// Unpack, on the host, the layer tars an earlier extraction left staged for
 /// the guest, when this host can now describe their ownership through the
@@ -4063,6 +4125,7 @@ fn post_process_extraction(
 
         if owner_xattr {
             fs::write(extract_dir.join(OPAQUE_XATTR_MARKER), "user\n")?;
+            fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")?;
             fs::write(cache_dir.join(HOST_LAYERS_MARKER), "")?;
         }
         // Record the manifest's layer order so the guest stacks overlayfs
@@ -7393,6 +7456,123 @@ mod tests {
         assert_eq!(xattr("etc/nested").as_deref(), Some("0:0:0755"));
         assert_eq!(xattr("etc/nested/conf").as_deref(), Some("0:0:0644"));
         assert_eq!(fs::read(dest.join("private/secret")).unwrap(), b"s");
+    }
+
+    /// The incident: as root, owner-xattr extraction chowned each host file to
+    /// its archived owner. Under the per-VM uid drop the idmapped mount maps
+    /// only on-disk id 0, so a private `42:0` directory reached the guest as
+    /// 65534 and refused even root. The host copy must belong to root, and the
+    /// archived owner live only in the xattr. Needs root to mean anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_xattr_extraction_leaves_host_copies_owned_by_root() {
+        use std::os::unix::fs::MetadataExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add =
+            |path: &str, kind: tar::EntryType, mode: u32, uid: u64, gid: u64, data: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(kind);
+                header.set_mode(mode);
+                header.set_uid(uid);
+                header.set_gid(gid);
+                header.set_size(data.len() as u64);
+                header.set_cksum();
+                builder.append_data(&mut header, path, data).unwrap();
+            };
+        add("data/", tar::EntryType::Directory, 0o700, 42, 0, b"");
+        add("data/secret", tar::EntryType::Regular, 0o600, 42, 0, b"s");
+        add(
+            "home/app/",
+            tar::EntryType::Directory,
+            0o755,
+            1000,
+            1000,
+            b"",
+        );
+        let tar_bytes = builder.into_inner().unwrap();
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        for rel in ["data", "data/secret", "home/app"] {
+            let meta = fs::symlink_metadata(dest.join(rel)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (0, 0), "{rel} host owner");
+        }
+        let xattr = |rel: &str| read_user_xattr(&dest.join(rel), OVERRIDE_STAT_XATTR);
+        assert_eq!(xattr("data").as_deref(), Some("42:0:0700"));
+        assert_eq!(xattr("data/secret").as_deref(), Some("42:0:0600"));
+        assert_eq!(xattr("home/app").as_deref(), Some("1000:1000:0755"));
+
+        // Without the xattr the host copy keeps the archived owner, as before.
+        let plain = root.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &plain,
+            &SafeUnpackLimits::from_env(),
+            false,
+            false,
+        )
+        .unwrap();
+        let meta = fs::symlink_metadata(plain.join("data/secret")).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (42, 0));
+    }
+
+    /// A cache extracted by an engine that chowned host copies to their
+    /// archived owners is repaired once on its next hit: every entry goes back
+    /// to root, the xattr is untouched, and the marker stops a second walk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_host_layer_cache_with_archived_host_owners_is_repaired_once() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("entry");
+        let dir = cache.join("layers").join("aaaa").join("data");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("secret"), b"s").unwrap();
+        std::os::unix::fs::symlink("secret", dir.join("link")).unwrap();
+        fs::write(cache.join(HOST_LAYERS_MARKER), "").unwrap();
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if is_root {
+            for path in [dir.clone(), dir.join("secret"), dir.join("link")] {
+                set_owner(&path, 42, 7);
+            }
+        }
+
+        repair_host_layer_owners(&cache, false).unwrap();
+        assert!(cache.join(HOST_LAYER_OWNERS_MARKER).exists());
+        if is_root {
+            for path in [dir.clone(), dir.join("secret"), dir.join("link")] {
+                let meta = fs::symlink_metadata(&path).unwrap();
+                assert_eq!((meta.uid(), meta.gid()), (0, 0), "{}", path.display());
+            }
+            // Once marked, the walk does not run again.
+            set_owner(&dir.join("secret"), 42, 7);
+            repair_host_layer_owners(&cache, false).unwrap();
+            assert_eq!(fs::metadata(dir.join("secret")).unwrap().uid(), 42);
+        }
+
+        // An entry that never used host layers is left alone and unmarked.
+        let staged = root.path().join("staged");
+        fs::create_dir_all(staged.join("layers")).unwrap();
+        repair_host_layer_owners(&staged, false).unwrap();
+        assert!(!staged.join(HOST_LAYER_OWNERS_MARKER).exists());
     }
 
     /// A symlink entry's archived owner reaches the guest through the override
