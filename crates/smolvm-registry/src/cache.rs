@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 /// [`BlobCache::manifest_by_digest`]); a directory, so the blob walks skip it.
 const MANIFEST_DIR: &str = "manifests";
 
+/// Subdirectory holding per-blob download locks (see
+/// [`BlobCache::download_lock_file`]); a directory, so the blob walks skip it.
+const LOCK_DIR: &str = "locks";
+
 /// `sha256:<hex>` of `bytes`.
 fn digest_of(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
@@ -264,6 +268,23 @@ impl BlobCache {
     /// then call [`adopt`] to finalize.
     pub fn blob_path_for(&self, digest: &str) -> PathBuf {
         self.blob_path(digest)
+    }
+
+    /// Open (creating if needed) the file a pull locks while it fetches this
+    /// blob. Every fetch of a blob streams into the same `<digest>.partial`, so
+    /// two at once write into one file and the second fails with ENOENT when
+    /// the first renames it into place. Holding an exclusive lock on this file
+    /// across the cache check and the fetch makes the later pull wait and then
+    /// find the blob cached. Lock files are never removed: a pull that opened a
+    /// removed one would lock an inode no one else can see.
+    pub fn download_lock_file(&self, digest: &str) -> io::Result<fs::File> {
+        let dir = self.root.join(LOCK_DIR);
+        fs::create_dir_all(&dir)?;
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{}.lock", digest.replace(':', "_"))))
     }
 
     /// Adopt an externally-written partial file into the cache.

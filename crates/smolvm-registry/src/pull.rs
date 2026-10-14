@@ -121,7 +121,10 @@ pub async fn pull_with_progress(
     // otherwise create a `.partial` file or touch atime outside the cache dir.
     crate::client::validate_digest(digest)?;
 
-    // 3. Check cache.
+    // 3. Wait out any other pull of this blob, then check the cache: a pull that
+    //    queued behind one fetching the same blob finds it cached here instead of
+    //    streaming into the partial file the first one is about to rename away.
+    let _download_lock = lock_blob_download(cache, digest).await?;
     if let Some(cached_path) = cache.get(digest) {
         tracing::info!(digest = %digest, "blob found in cache");
 
@@ -164,6 +167,32 @@ pub async fn pull_with_progress(
     tracing::info!(digest = %digest, size = result.size, "pull complete");
 
     Ok(result)
+}
+
+/// How often a pull waiting on another pull of the same blob checks again.
+const DOWNLOAD_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// Take the exclusive download lock for `digest`, waiting while another pull
+/// (in this process or another one sharing the cache) holds it. Polls
+/// `try_lock` rather than blocking so a waiting pull never parks a runtime
+/// thread. The lock is released when the returned file is dropped, including
+/// when the owning pull fails or is cancelled.
+async fn lock_blob_download(cache: &BlobCache, digest: &str) -> Result<std::fs::File> {
+    let file = cache.download_lock_file(digest)?;
+    let mut waited = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if !waited {
+                    tracing::info!(digest = %digest, "waiting for another pull of this blob");
+                    waited = true;
+                }
+                tokio::time::sleep(DOWNLOAD_LOCK_POLL).await;
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
 }
 
 /// Attempts allowed for one blob (first try plus retries).
@@ -565,6 +594,57 @@ mod tests {
             },
             "layers": [ { "mediaType": LAYER_MEDIA_TYPE, "digest": digest, "size": size } ],
         })
+    }
+
+    /// Two creates of one artifact at once on a node that has not cached it yet
+    /// both pull its blob. They used to stream into the same `.partial` file, so
+    /// whichever finished second failed with ENOENT once the first renamed it
+    /// into the cache. Now the second waits for the first and is served from
+    /// the cache, and the registry is asked for the blob once.
+    #[tokio::test]
+    async fn concurrent_pulls_of_one_blob_both_succeed_and_fetch_it_once() {
+        use sha2::{Digest, Sha256};
+
+        let data = vec![7u8; 256 * 1024];
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&manifest_for(&digest, data.len())).unwrap(),
+                MANIFEST_MEDIA_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        // Slow enough that both pulls are past the cache check while the first
+        // is still downloading.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(data.clone())
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 16 * 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+
+        let (a, b) = tokio::join!(
+            pull(&client, "myrepo", "latest", None, &cache, &[]),
+            pull(&client, "myrepo", "latest", None, &cache, &[]),
+        );
+        let (a, b) = (a.expect("first pull"), b.expect("second pull"));
+        assert_eq!(
+            [a.cached, b.cached].iter().filter(|c| **c).count(),
+            1,
+            "exactly one pull downloads; the other is served from the cache"
+        );
+        assert_eq!(tokio::fs::read(&a.path).await.unwrap(), data);
+        assert_eq!(a.path, b.path);
     }
 
     /// A download reports progress while it streams: every callback carries the
