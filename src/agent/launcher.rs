@@ -1738,6 +1738,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         }
 
         // Add vsock port for control channel (critical - host-guest communication)
+        if let Err(e) = super::launcher_dynamic::check_socket_path_len(vsock_socket) {
+            krun_free_ctx(ctx);
+            return Err(Error::agent("add vsock port", e));
+        }
         let socket_path = try_or_free_ctx!(
             path_to_cstring(vsock_socket),
             "add vsock port",
@@ -1790,6 +1794,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "{} would shadow the agent control channel",
                 svc.name
             );
+            if svc.listen {
+                if let Err(e) = super::launcher_dynamic::check_socket_path_len(svc.socket) {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent("add vsock port", format!("{}: {e}", svc.name)));
+                }
+            }
             let sock_path = try_or_free_ctx!(
                 path_to_cstring(svc.socket),
                 "add vsock port",
@@ -1842,6 +1852,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // For an expose socket libkrun *creates* the host listener, so
                 // clear any stale file first (mirrors the Docker bridge).
                 if spec.direction.host_listens() {
+                    if let Err(e) = super::launcher_dynamic::check_socket_path_len(&host_path) {
+                        tracing::warn!(guest_path = %spec.guest_path, "published socket skipped: {e}");
+                        return None;
+                    }
                     let _ = std::fs::remove_file(&host_path);
                 }
                 let host_c = match path_to_cstring(&host_path) {

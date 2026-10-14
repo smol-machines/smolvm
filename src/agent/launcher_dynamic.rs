@@ -671,6 +671,9 @@ pub fn launch_agent_vm_dynamic(
     }
 
     // Add vsock port for control channel
+    if let Err(e) = check_socket_path_len(config.vsock_socket) {
+        free_ctx_on_err!(e);
+    }
     let socket_path = try_or_free_ctx!(
         path_to_cstring(config.vsock_socket),
         "vsock socket path contains null byte"
@@ -712,6 +715,11 @@ pub fn launch_agent_vm_dynamic(
             "{} would shadow the agent control channel",
             svc.name
         );
+        if svc.listen {
+            if let Err(e) = check_socket_path_len(svc.socket) {
+                free_ctx_on_err!(format!("{}: {e}", svc.name));
+            }
+        }
         let service_socket = try_or_free_ctx!(
             path_to_cstring(svc.socket),
             "vsock service socket path contains null byte"
@@ -1170,7 +1178,8 @@ fn describe_start_error_with_probe(ret: i32, kvm_error: Option<&str>) -> String 
         22 => {
             "EINVAL — libkrun rejected the VM configuration; usually a disk/overlay \
                that could not be opened (still held by another VM that has not fully \
-               exited, or a corrupt/foreign-owned image) or an unsupported device option"
+               exited, or a corrupt/foreign-owned image), a Unix socket path too long \
+               for the host, or an unsupported device option"
         }
         5 => "EIO — a backing disk or overlay could not be read/created",
         13 => "EACCES — permission denied opening a VM resource (disk, socket, or rootfs)",
@@ -1207,6 +1216,27 @@ pub(crate) fn truncate_console_log(path: &Path) {
             tracing::debug!(path = %path.display(), error = %e, "could not truncate console log");
         }
     }
+}
+
+/// Longest Unix socket path the host accepts: `sockaddr_un.sun_path` holds 104
+/// bytes on macOS and 108 elsewhere, including the terminating NUL.
+const MAX_UNIX_SOCKET_PATH: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+/// libkrun binds the sockets it listens on inside `krun_start_enter` and
+/// reports a path that does not fit only as a bare EINVAL, which reads like a
+/// bad disk. Check the length before handing a socket to libkrun so the error
+/// names the path and the way out.
+pub(crate) fn check_socket_path_len(path: &Path) -> Result<(), String> {
+    let len = path.as_os_str().len();
+    if len <= MAX_UNIX_SOCKET_PATH {
+        return Ok(());
+    }
+    Err(format!(
+        "socket path is {len} bytes, over the {MAX_UNIX_SOCKET_PATH}-byte limit for Unix \
+         sockets on this host: {}. smolvm keeps machine sockets under your cache \
+         directory, so run it with a shorter HOME (or XDG_CACHE_HOME on Linux)",
+        path.display()
+    ))
 }
 
 /// Convert a Path to a CString.
@@ -1261,6 +1291,17 @@ mod tests {
             dynamic_block_error("storage", BlockIoEngine::Async, -libc::EPERM)
                 .contains("use --block-io sync")
         );
+    }
+
+    #[test]
+    fn socket_path_over_the_host_limit_is_named() {
+        let fits = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH - 1)));
+        assert!(check_socket_path_len(&fits).is_ok());
+        let long = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH)));
+        let err = check_socket_path_len(&long).unwrap_err();
+        assert!(err.contains(&format!("{} bytes", MAX_UNIX_SOCKET_PATH + 1)));
+        assert!(err.contains(&long.display().to_string()));
+        assert!(err.contains("HOME"));
     }
 
     #[test]
