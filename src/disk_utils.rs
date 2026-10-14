@@ -542,7 +542,7 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
             // Safety: both descriptors are live regular files owned by this
             // scope; FICLONE reads the source fd and clones into destination.
             let result =
-                unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+                unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
             if result != 0 {
                 return Err(std::io::Error::last_os_error());
             }

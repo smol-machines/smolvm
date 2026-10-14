@@ -2109,7 +2109,7 @@ fn mount_idmapped(
             c"".as_ptr(),
             libc::AT_FDCWD,
             target_c.as_ptr(),
-            libc::MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
+            MOVE_MOUNT_F_EMPTY_PATH,
         )
     };
     let result = if rc != 0 { Err(errno()) } else { Ok(()) };
@@ -2530,7 +2530,7 @@ pub fn open_kernel_userfaultfd() -> std::io::Result<OwnedFd> {
             ));
         }
     };
-    let device_fd = unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW, FLAGS) };
+    let device_fd = unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW as _, FLAGS) };
     if device_fd < 0 {
         let device_error = std::io::Error::last_os_error();
         return Err(std::io::Error::new(
@@ -3908,6 +3908,11 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
         libc::_exit(128 + libc::SIGINT);
     }
 }
+
+/// `MOVE_MOUNT_F_EMPTY_PATH` from <linux/mount.h>; the libc crate defines it
+/// for glibc only.
+#[cfg(target_os = "linux")]
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
 
 #[cfg(test)]
 mod tests {

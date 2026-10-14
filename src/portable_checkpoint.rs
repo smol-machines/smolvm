@@ -78,9 +78,7 @@ fn restore_tmpfs_root() -> Option<PathBuf> {
         return None;
     }
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut stat) } != 0
-        || stat.f_type != libc::TMPFS_MAGIC
-    {
+    if unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut stat) } != 0 || !is_tmpfs(&stat) {
         return None;
     }
     let root = PathBuf::from(RESTORE_TMPFS_ROOT);
@@ -1551,6 +1549,14 @@ fn runtime_capture_dir(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
 #[cfg(target_os = "linux")]
 const CAPTURE_TMPFS_ROOT: &str = "/dev/shm/smolvm-capture";
 
+/// Whether `stat` describes a tmpfs. The type of `f_type` differs between
+/// glibc and musl, so both sides are widened to one type.
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_cast)]
+fn is_tmpfs(stat: &libc::statfs) -> bool {
+    stat.f_type as i64 == libc::TMPFS_MAGIC as i64
+}
+
 /// The tmpfs capture root, created if needed, when it is usable: the caller
 /// runs as root, `/dev/shm` is tmpfs, and the directory is root-owned 0711.
 #[cfg(target_os = "linux")]
@@ -1560,7 +1566,7 @@ pub fn capture_tmpfs_root() -> Option<PathBuf> {
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     let usable = unsafe { libc::geteuid() } == 0
         && unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut stat) } == 0
-        && stat.f_type == libc::TMPFS_MAGIC
+        && is_tmpfs(&stat)
         && match std::fs::DirBuilder::new().mode(0o711).create(&root) {
             Ok(()) => true,
             Err(error) => error.kind() == std::io::ErrorKind::AlreadyExists,
