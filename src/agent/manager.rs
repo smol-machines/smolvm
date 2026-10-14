@@ -5,7 +5,7 @@
 
 use crate::data::validate_vm_name;
 use crate::error::{Error, Result};
-use crate::process::{self, ChildProcess};
+use crate::process::{self, ChildProcess, Pid};
 use crate::storage::{DiskFormat, OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
 use smolvm_protocol::AGENT_READY_MARKER;
@@ -20,11 +20,87 @@ use super::{HostMount, PortMapping, VmResources};
 // Configuration Constants
 // ============================================================================
 
-/// Timeout for the agent to become ready after starting.
+/// How long a cold boot may go without visible progress before it counts as
+/// wedged rather than slow.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest a cold boot may take, progress or not. A slow host disk can keep
+/// a progressing boot past [`AGENT_READY_TIMEOUT`]: an image disk's first
+/// flush waits for every byte the host has not yet written.
+const AGENT_READY_MAX: Duration = Duration::from_secs(180);
+/// How often the cold-boot wait looks for progress.
+const BOOT_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Restored CUDA clones resume an already-initialized agent accept loop. If it
 /// does not answer within this window, the restore is wedged rather than cold-booting.
 const CLONE_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Evidence that a cold boot is moving: the guest console log grows (the agent
+/// logs each boot stage), or a thread of the VMM waits on disk I/O, which is
+/// what a guest flush waiting for the host to write its disk looks like.
+struct BootProgress {
+    console: Option<PathBuf>,
+    pid: Option<Pid>,
+    console_len: u64,
+    last: Instant,
+}
+
+impl BootProgress {
+    fn new(console: Option<PathBuf>, pid: Option<Pid>, now: Instant) -> Self {
+        let console_len = console_len(console.as_deref());
+        Self {
+            console,
+            pid,
+            console_len,
+            last: now,
+        }
+    }
+
+    /// Record progress seen since the last look.
+    fn observe(&mut self, now: Instant) {
+        let len = console_len(self.console.as_deref());
+        let grew = len > self.console_len;
+        self.console_len = len;
+        if grew || self.pid.is_some_and(vmm_waits_on_io) {
+            self.last = now;
+        }
+    }
+
+    /// How long the boot has shown no progress.
+    fn idle_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last)
+    }
+}
+
+fn console_len(path: Option<&Path>) -> u64 {
+    path.and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |meta| meta.len())
+}
+
+/// Whether any thread of `pid` is in uninterruptible disk wait (`D`). Readable
+/// for a non-dumpable process: `/proc/<pid>/task/<tid>/stat` is world-readable.
+#[cfg(target_os = "linux")]
+fn vmm_waits_on_io(pid: Pid) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        std::fs::read_to_string(task.path().join("stat"))
+            .ok()
+            .and_then(|stat| task_state(&stat))
+            == Some('D')
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn vmm_waits_on_io(_pid: Pid) -> bool {
+    false
+}
+
+/// The state letter of a `/proc/.../stat` line: the first field after the
+/// command, which is parenthesized and may itself contain spaces or `)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn task_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
+}
 
 fn agent_ready_timeout(is_cuda_clone: bool) -> Duration {
     if is_cuda_clone {
@@ -3745,8 +3821,16 @@ impl AgentManager {
         // uses, and it costs at most ~20ms of the ~320ms boot.
         const SOCKET_PROBE_INTERVAL: Duration = Duration::from_millis(20);
         let mut next_socket_probe = Duration::ZERO;
+        let child_pid = self.inner.lock().child.as_ref().map(|child| child.pid());
+        let mut progress = BootProgress::new(self.console_log.clone(), child_pid, start);
+        let mut next_progress_check = Duration::ZERO;
 
-        while start.elapsed() < timeout {
+        // A boot fails when it shows no progress for `timeout`, or at the cap.
+        while start.elapsed() < AGENT_READY_MAX && progress.idle_for(Instant::now()) < timeout {
+            if start.elapsed() >= next_progress_check {
+                next_progress_check = start.elapsed() + BOOT_PROGRESS_INTERVAL;
+                progress.observe(Instant::now());
+            }
             // Check if child process is still alive
             {
                 let mut inner = self.inner.lock();
@@ -3847,13 +3931,20 @@ impl AgentManager {
             std::thread::sleep(Duration::from_millis(poll_ms));
         }
 
-        Err(Error::agent(
-            "wait for ready",
+        let elapsed = start.elapsed();
+        let reason = if elapsed >= AGENT_READY_MAX {
             format!(
                 "agent did not become ready within {} seconds",
+                AGENT_READY_MAX.as_secs()
+            )
+        } else {
+            format!(
+                "agent did not become ready within {} seconds: no boot progress for {} seconds",
+                elapsed.as_secs(),
                 timeout.as_secs()
-            ),
-        ))
+            )
+        };
+        Err(Error::agent("wait for ready", reason))
     }
 
     /// Wait for the agent to stop.
@@ -4487,6 +4578,63 @@ mod tests {
         let out2 = dir.path().join("out2");
         std::fs::create_dir_all(&out2).unwrap();
         assert!(AgentManager::extract_zstd_tar(&damaged, &out2).is_err());
+    }
+
+    // The state is the first field after the command, which is parenthesized
+    // and may contain spaces or a `)` of its own.
+    #[test]
+    fn task_state_reads_past_any_command_name() {
+        assert_eq!(task_state("123 (smol-vmm) D 1 2 3"), Some('D'));
+        assert_eq!(task_state("123 (fc_vcpu 0) S 1 2 3"), Some('S'));
+        assert_eq!(task_state("123 (a) b) R 1"), Some('R'));
+        assert_eq!(task_state("garbage"), None);
+    }
+
+    // Console growth is progress; a quiet console with no I/O wait is not, so
+    // a wedged boot still fails after the no-progress window.
+    #[test]
+    fn boot_progress_tracks_console_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let console = dir.path().join("console.log");
+        std::fs::write(&console, "boot agent_entry\n").unwrap();
+        let start = Instant::now();
+        let mut progress = BootProgress::new(Some(console.clone()), None, start);
+
+        let later = start + Duration::from_secs(20);
+        progress.observe(later);
+        assert_eq!(
+            progress.idle_for(later),
+            Duration::from_secs(20),
+            "no growth, no progress"
+        );
+
+        std::fs::write(&console, "boot agent_entry\nboot rootfs_done\n").unwrap();
+        progress.observe(later);
+        assert_eq!(
+            progress.idle_for(later),
+            Duration::ZERO,
+            "growth is progress"
+        );
+        assert_eq!(
+            progress.idle_for(later + Duration::from_secs(31)),
+            Duration::from_secs(31)
+        );
+    }
+
+    // A sleeping process is not waiting on disk I/O, and a gone one reads as
+    // no progress rather than an error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sleeping_process_is_not_in_io_wait() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!vmm_waits_on_io(child.id() as Pid));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!vmm_waits_on_io(Pid::MAX));
     }
 
     #[test]
