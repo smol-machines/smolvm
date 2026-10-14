@@ -1224,7 +1224,7 @@ async fn upload_checkpoint(
 ) -> Result<u64, ApiError> {
     let file = std::fs::File::open(artifact)
         .map_err(|error| ApiError::internal(format!("open checkpoint artifact: {error}")))?;
-    upload_checkpoint_file(file, urls).await
+    upload_checkpoint_file(file, urls, crate::api::progress::Progress::default()).await
 }
 
 /// Read `length` bytes at `offset` of `file` as a body stream, positionally, so
@@ -1234,44 +1234,50 @@ fn checkpoint_part_stream(
     file: Arc<std::fs::File>,
     offset: u64,
     length: u64,
+    progress: crate::api::progress::Progress,
 ) -> impl futures_util::Stream<Item = std::io::Result<axum::body::Bytes>> {
     const CHUNK: u64 = 1024 * 1024;
-    futures_util::stream::try_unfold((file, offset, length), |(file, offset, left)| async move {
-        if left == 0 {
-            return Ok(None);
-        }
-        let want = left.min(CHUNK) as usize;
-        let reader = file.clone();
-        let chunk = tokio::task::spawn_blocking(move || {
-            let mut buffer = vec![0_u8; want];
-            let mut filled = 0;
-            while filled < want {
-                #[cfg(unix)]
-                let read = std::os::unix::fs::FileExt::read_at(
-                    &*reader,
-                    &mut buffer[filled..],
-                    offset + filled as u64,
-                )?;
-                #[cfg(windows)]
-                let read = std::os::windows::fs::FileExt::seek_read(
-                    &*reader,
-                    &mut buffer[filled..],
-                    offset + filled as u64,
-                )?;
-                if read == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "checkpoint artifact shrank during upload",
-                    ));
-                }
-                filled += read;
+    futures_util::stream::try_unfold((file, offset, length), move |(file, offset, left)| {
+        let progress = progress.clone();
+        async move {
+            if left == 0 {
+                return Ok(None);
             }
-            Ok(axum::body::Bytes::from(buffer))
-        })
-        .await
-        .map_err(std::io::Error::other)??;
-        let read = chunk.len() as u64;
-        Ok(Some((chunk, (file, offset + read, left - read))))
+            let want = left.min(CHUNK) as usize;
+            let reader = file.clone();
+            let chunk = tokio::task::spawn_blocking(move || {
+                let mut buffer = vec![0_u8; want];
+                let mut filled = 0;
+                while filled < want {
+                    #[cfg(unix)]
+                    let read = std::os::unix::fs::FileExt::read_at(
+                        &*reader,
+                        &mut buffer[filled..],
+                        offset + filled as u64,
+                    )?;
+                    #[cfg(windows)]
+                    let read = std::os::windows::fs::FileExt::seek_read(
+                        &*reader,
+                        &mut buffer[filled..],
+                        offset + filled as u64,
+                    )?;
+                    if read == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "checkpoint artifact shrank during upload",
+                        ));
+                    }
+                    filled += read;
+                }
+                Ok(axum::body::Bytes::from(buffer))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            let read = chunk.len() as u64;
+            // The body asks for the next chunk only once the last one is sent.
+            progress.touch();
+            Ok(Some((chunk, (file, offset + read, left - read))))
+        }
     })
 }
 
@@ -1279,6 +1285,7 @@ fn checkpoint_part_stream(
 async fn upload_checkpoint_file(
     file: std::fs::File,
     urls: Vec<reqwest::Url>,
+    progress: crate::api::progress::Progress,
 ) -> Result<u64, ApiError> {
     let size = file
         .metadata()
@@ -1301,9 +1308,11 @@ async fn upload_checkpoint_file(
             .map(|(index, (url, (start, length)))| {
                 let client = client.clone();
                 let file = file.clone();
+                let progress = progress.clone();
                 async move {
-                    let body =
-                        reqwest::Body::wrap_stream(checkpoint_part_stream(file, start, length));
+                    let body = reqwest::Body::wrap_stream(checkpoint_part_stream(
+                        file, start, length, progress,
+                    ));
                     let response = client
                         .put(url)
                         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1428,13 +1437,16 @@ mod checkpoint_upload_tests {
         std::fs::remove_file(&path).unwrap();
         let ranges = upload_part_ranges(content.len() as u64, 4);
         let parts = futures_util::future::try_join_all(ranges.iter().map(|&(start, length)| {
-            checkpoint_part_stream(file.clone(), start, length).try_fold(
-                Vec::new(),
-                |mut acc, chunk| async move {
-                    acc.extend_from_slice(&chunk);
-                    Ok(acc)
-                },
+            checkpoint_part_stream(
+                file.clone(),
+                start,
+                length,
+                crate::api::progress::Progress::default(),
             )
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
         }))
         .await
         .unwrap();
@@ -5322,7 +5334,8 @@ pub async fn paused_checkpoint(
     if let Some(urls) = upload_urls {
         // Straight to the store, so the artifact never crosses the control
         // plane: relaying it there cost a full copy, an fsync and one stream.
-        let size = upload_checkpoint_file(file, urls).await?;
+        let size =
+            upload_checkpoint_file(file, urls, crate::api::progress::Progress::default()).await?;
         return Ok(axum::response::IntoResponse::into_response(Json(
             serde_json::json!({ "uploaded": true, "sizeBytes": size }),
         )));
@@ -6316,8 +6329,10 @@ pub async fn resize_machine(
 pub async fn publish_cache_disk(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    progress: Option<axum::Extension<crate::api::progress::Progress>>,
     Json(req): Json<crate::api::types::PublishCacheDiskRequest>,
 ) -> Result<Json<crate::api::types::PublishCacheDiskResponse>, ApiError> {
+    let progress = progress.map(|p| p.0).unwrap_or_default();
     let dir = state.cache_disk_dir()?;
     crate::data::disk::validate_base_name(&req.base).map_err(ApiError::BadRequest)?;
 
@@ -6364,6 +6379,7 @@ pub async fn publish_cache_disk(
     let layer = crate::data::disk::CacheDisk::layer_path(&vm_data_dir(&name));
     let flatten_dir = dir.clone();
     let base = req.base.clone();
+    let flattening = progress.clone();
     let (staged, sha256) =
         tokio::task::spawn_blocking(move || -> Result<(StagedBase, String), ApiError> {
             let _guard = guard;
@@ -6373,8 +6389,8 @@ pub async fn publish_cache_disk(
             } else {
                 cache.base.clone()
             };
-            let staged = flatten_staged(&top, &flatten_dir, &base)?;
-            let digest = file_sha256(staged.path())?;
+            let staged = flatten_staged(&top, &flatten_dir, &base, &flattening)?;
+            let digest = file_sha256(staged.path(), &flattening)?;
             Ok((staged, digest))
         })
         .await
@@ -6385,7 +6401,7 @@ pub async fn publish_cache_disk(
     if let Some(urls) = upload_urls {
         let file = std::fs::File::open(staged.path())
             .map_err(|e| ApiError::internal(format!("open {}: {e}", staged.path().display())))?;
-        upload_checkpoint_file(file, urls).await?;
+        upload_checkpoint_file(file, urls, progress).await?;
     }
     let base = req.base.clone();
     let digest = sha256.clone();
@@ -6454,14 +6470,27 @@ pub async fn delete_cache_base(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// The SHA-256 of a file, as lowercase hex.
-fn file_sha256(path: &std::path::Path) -> Result<String, ApiError> {
+/// The SHA-256 of a file, as lowercase hex, touching `progress` as it reads.
+fn file_sha256(
+    path: &std::path::Path,
+    progress: &crate::api::progress::Progress,
+) -> Result<String, ApiError> {
     use sha2::Digest;
+    use std::io::Read;
     let mut file = std::fs::File::open(path)
         .map_err(|e| ApiError::internal(format!("open {}: {e}", path.display())))?;
     let mut hasher = sha2::Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|e| ApiError::internal(format!("hash {}: {e}", path.display())))?;
+    let mut buffer = vec![0_u8; 8 << 20];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| ApiError::internal(format!("hash {}: {e}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        progress.touch();
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -6651,13 +6680,15 @@ fn flatten_staged(
     top: &std::path::Path,
     dir: &std::path::Path,
     base: &str,
+    progress: &crate::api::progress::Progress,
 ) -> Result<StagedBase, ApiError> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let staged = StagedBase(dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id())));
-    crate::agent::fork::flatten_standalone(top, staged.path()).map_err(ApiError::from)?;
+    crate::agent::fork::flatten_standalone(top, staged.path(), &|| progress.touch())
+        .map_err(ApiError::from)?;
     Ok(staged)
 }
 
@@ -6666,6 +6697,7 @@ fn flatten_staged(
     _top: &std::path::Path,
     _dir: &std::path::Path,
     _base: &str,
+    _progress: &crate::api::progress::Progress,
 ) -> Result<StagedBase, ApiError> {
     Err(ApiError::BadRequest(
         "cache disks are not supported on this host".into(),

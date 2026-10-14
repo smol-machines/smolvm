@@ -28,6 +28,7 @@ pub mod guest_rollout;
 pub mod handlers;
 pub mod inflight;
 pub mod pool_controller;
+pub mod progress;
 pub mod resize_controller;
 pub mod rollout;
 pub mod state;
@@ -383,10 +384,12 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/images/pull", post(handlers::images::pull_image))
         // Flattening and uploading a cache disk scales with its size: a 32 GB
         // publish ran past the five-minute timeout every time and answered 408
-        // while its upload was still going. The control plane bounds it.
+        // while its upload was still going. It gives up only once it stops
+        // making progress instead.
         .route(
             "/{id}/cache-disk/publish",
-            post(handlers::machines::publish_cache_disk),
+            post(handlers::machines::publish_cache_disk)
+                .layer(axum::middleware::from_fn(progress::idle_timeout)),
         );
 
     // Machine routes
