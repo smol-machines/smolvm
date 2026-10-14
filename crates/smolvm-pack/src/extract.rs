@@ -296,6 +296,17 @@ fn packed_agent_mounts_userxattr(version: &str) -> bool {
 /// live in the `user.overlay.*` namespace; the guest then mounts the overlay
 /// with `userxattr`. Read by the agent.
 pub const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+
+/// Whether the layers shared from `dir` carry their ownership in the override
+/// xattr, so the virtiofs server must present it. A machine shares the
+/// extraction's `layers/` dir, where the marker sits; the export helper shares
+/// the pack root above it, which only checked its own top level and so read
+/// every host-extracted layer with raw host owners: root as the VMM's uid and
+/// `_apt` as 65534, baked into the exported `.smolmachine`.
+pub fn shares_override_stat_layers(dir: &Path) -> bool {
+    dir.join(OPAQUE_XATTR_MARKER).is_file()
+        || dir.join("layers").join(OPAQUE_XATTR_MARKER).is_file()
+}
 /// Written beside the extraction marker once every staged layer tar has been
 /// unpacked on the host with its ownership recorded in the override xattr.
 /// A cache hit reads this instead of listing (and on macOS mounting) the

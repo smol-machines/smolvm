@@ -2125,9 +2125,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // Layers the host extracted itself carry their ownership in the
                 // override xattr; the Linux server presents it only when asked.
                 let override_stat = cfg!(target_os = "linux")
-                    && layers_dir
-                        .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
-                        .is_file();
+                    && smolvm_pack::extract::shares_override_stat_layers(layers_dir);
                 let added = if override_stat {
                     let Some(add_virtiofs4) = krun.add_virtiofs4 else {
                         krun_free_ctx(ctx);

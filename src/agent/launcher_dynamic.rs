@@ -877,10 +877,7 @@ pub fn launch_agent_vm_dynamic(
         // Layers the host extracted itself carry their ownership in the
         // override xattr; the Linux server presents it only when asked.
         let override_stat = cfg!(target_os = "linux")
-            && config
-                .layers_dir
-                .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
-                .is_file();
+            && smolvm_pack::extract::shares_override_stat_layers(config.layers_dir);
         // SAFETY: ctx is valid, tag and path are valid C strings
         let added = if override_stat {
             let Some(add_virtiofs4) = krun.add_virtiofs4 else {
