@@ -1013,6 +1013,7 @@ pub fn restore_from_path_at(
     // within the restore cache's bounds, as a server restore does.
     #[cfg(target_os = "linux")]
     crate::artifact_cache::trim_unleased_shared_packs_soon();
+    crate::usage::on_restore(name, db.get_vm(name).ok().flatten().as_ref());
     Ok(())
 }
 
@@ -2731,6 +2732,13 @@ fn capture_with_completion(
         );
     }
     set_checkpoint_head(name, &checkpoint_id);
+    crate::usage::on_checkpoint(
+        name,
+        crate::db::SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(name).ok().flatten())
+            .as_ref(),
+    );
     Ok(CaptureResult {
         reused_bytes: 0,
         size_bytes: info.total_size,

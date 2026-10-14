@@ -110,6 +110,7 @@ pub mod smolfile;
 pub mod staged_mount;
 pub mod storage;
 pub mod systemd_scope;
+pub mod usage;
 pub mod util;
 pub mod vm;
 /// Shared machine-workload launch used by every machine-start front-end.
