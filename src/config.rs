@@ -1551,7 +1551,7 @@ impl VmRecord {
         crate::network::plan_launch_network_with(
             &self.vm_resources(),
             self.dns_filter_hosts.as_deref(),
-            self.ports.len(),
+            self.ports.len() + self.udp_ports.len(),
             self.credential_policy.is_some(),
         )
     }
@@ -1809,6 +1809,17 @@ mod tests {
             let err = record.check_live_ports().unwrap_err().to_string();
             assert!(err.contains("stopped"), "{err}");
         }
+    }
+
+    #[test]
+    fn udp_only_ports_plan_virtio_net_as_the_launcher_does() {
+        let mut record = VmRecord::new("u".to_string(), 1, 512, vec![], vec![], true);
+        record.udp_ports = vec![(9000, 9000)];
+        assert_eq!(
+            record.launch_network_plan().backend,
+            crate::network::launch::EffectiveNetworkBackend::VirtioNet
+        );
+        record.check_live_ports().unwrap();
     }
 
     #[test]
