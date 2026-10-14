@@ -487,6 +487,12 @@ impl PortMapping {
         (self.host, self.guest)
     }
 
+    /// TCP mappings as `(host, guest)` tuples; use [`Self::split_tuples`]
+    /// to keep UDP mappings too.
+    pub fn to_tuples(ports: &[Self]) -> PortTuples {
+        Self::split_tuples(ports).0
+    }
+
     /// Split mappings into the stored `(TCP tuples, UDP tuples)`.
     pub fn split_tuples(ports: &[Self]) -> (PortTuples, PortTuples) {
         let of = |protocol| {
