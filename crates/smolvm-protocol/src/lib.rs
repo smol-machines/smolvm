@@ -102,6 +102,11 @@ pub const PREPARE_FILE_ACCESS_CAPABILITY: &str = "prepare-file-access-v1";
 /// guest agent's `mount -t virtiofs` source can't drift apart.
 pub const ROSETTA_TAG: &str = "rosetta";
 
+/// Phrase in a remote-volume error when the storage service answered and
+/// refused the volume (a bad key, a missing bucket). The host matches it to
+/// return the failure to the caller instead of as a server error.
+pub const REMOTE_VOLUME_REFUSED: &str = "refused the volume";
+
 /// Guest mount point for the Rosetta 2 Linux runtime. The ptrace wrapper execs
 /// `<ROSETTA_GUEST_PATH>/rosetta` (the translator), so this path is baked into
 /// both the wrapper and the `binfmt_misc` registration.

@@ -156,7 +156,9 @@ impl From<crate::error::Error> for ApiError {
                 crate::error::AgentErrorKind::NotFound => ApiError::NotFound(reason.clone()),
                 crate::error::AgentErrorKind::Conflict => ApiError::Conflict(reason.clone()),
                 crate::error::AgentErrorKind::Forbidden => ApiError::Forbidden(reason.clone()),
-                crate::error::AgentErrorKind::Other if is_invalid_image_archive(reason) => {
+                crate::error::AgentErrorKind::Other
+                    if is_invalid_image_archive(reason) || is_refused_remote_volume(reason) =>
+                {
                     ApiError::BadRequest(reason.clone())
                 }
                 crate::error::AgentErrorKind::Other => ApiError::Internal(reason.clone()),
@@ -164,6 +166,12 @@ impl From<crate::error::Error> for ApiError {
             _ => ApiError::Internal(err.to_string()),
         }
     }
+}
+
+/// Whether a failure says the storage service refused a remote volume (a bad
+/// key, a missing bucket). Only the caller can fix it, so it is a 400.
+pub(crate) fn is_refused_remote_volume(message: &str) -> bool {
+    message.contains(smolvm_protocol::REMOTE_VOLUME_REFUSED)
 }
 
 /// Whether a failure says the caller's image archive is not a container image:
@@ -218,6 +226,21 @@ mod tests {
         }
         let err =
             crate::error::Error::agent("pull image", "failed to spawn crane export: No such file");
+        assert!(matches!(ApiError::from(err), ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn a_remote_volume_the_storage_service_refused_is_the_callers_error() {
+        let refused = format!(
+            "mount remote volume: s3://bucket/native {}: http 403 InvalidAccessKeyId: The AWS Access Key Id you provided does not exist in our records. (check the bucket, prefix and credentials)",
+            smolvm_protocol::REMOTE_VOLUME_REFUSED
+        );
+        let err = crate::error::Error::agent("run container", refused);
+        assert!(matches!(ApiError::from(err), ApiError::BadRequest(_)));
+
+        let unreachable =
+            "mount remote volume: s3://bucket is not reachable: transport: connection refused";
+        let err = crate::error::Error::agent("run container", unreachable);
         assert!(matches!(ApiError::from(err), ApiError::Internal(_)));
     }
 

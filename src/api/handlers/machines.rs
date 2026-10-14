@@ -3498,7 +3498,9 @@ pub async fn get_machine_mediation_events(
 /// scoped to the virtio-net path so an unrelated AddrInUse can't be mistaken for
 /// it.
 fn classify_launch_error(e: String) -> ApiError {
-    if crate::api::error::is_invalid_image_archive(&e) {
+    if crate::api::error::is_invalid_image_archive(&e)
+        || crate::api::error::is_refused_remote_volume(&e)
+    {
         return ApiError::BadRequest(e);
     }
     let lc = e.to_ascii_lowercase();
