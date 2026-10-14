@@ -195,6 +195,7 @@ impl BoundPublishedPorts {
     }
 
     /// True when no host TCP port is published.
+    #[cfg(test)]
     pub(crate) fn tcp_is_empty(&self) -> bool {
         self.tcp.is_empty()
     }
@@ -487,6 +488,20 @@ mod tests {
     }
 
     #[test]
+    fn replace_refuses_udp_mappings() {
+        let (mut listeners, kept, _receiver) = listener_fixture(4);
+        let before = listeners.mappings();
+        let err = listeners
+            .replace(&[
+                PortMapping::new(kept, 8080),
+                PortMapping::with_protocol(free_port(), 27015, PortProtocol::Udp),
+            ])
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(listeners.mappings(), before, "nothing changed");
+    }
+
+    #[test]
     fn replace_refuses_a_host_port_twice_and_a_closed_set() {
         let (mut listeners, kept, _receiver) = listener_fixture(4);
         assert!(listeners
@@ -539,14 +554,8 @@ mod tests {
         let second = occupied.local_addr().unwrap().port();
         drop(available);
         let result = BoundPublishedPorts::bind(&[
-            PortMapping {
-                host: first,
-                guest: 8080,
-            },
-            PortMapping {
-                host: second,
-                guest: 8081,
-            },
+            PortMapping::new(first, 8080),
+            PortMapping::new(second, 8081),
         ]);
         assert!(result.is_err());
         assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, first)).is_ok());

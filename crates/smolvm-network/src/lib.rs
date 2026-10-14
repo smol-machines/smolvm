@@ -515,7 +515,10 @@ impl PublishedPorts {
     /// Make `next` the published TCP set. A UDP mapping is refused: a UDP port
     /// is bound for the runtime's life, so changing one needs a restart.
     pub fn replace(&self, next: &[PortMapping]) -> io::Result<()> {
-        if next.iter().any(|mapping| mapping.protocol == PortProtocol::Udp) {
+        if next
+            .iter()
+            .any(|mapping| mapping.protocol == PortProtocol::Udp)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "published UDP ports cannot change on a running machine; stop it first",
@@ -524,7 +527,6 @@ impl PublishedPorts {
         self.lock().replace(next)
     }
 }
-
 
 /// Start the host-side virtio-net runtime for one guest NIC.
 ///
