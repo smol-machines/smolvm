@@ -147,6 +147,7 @@ impl From<crate::error::Error> for ApiError {
             crate::error::Error::VmNotFound { name } => {
                 ApiError::NotFound(format!("machine not found: {}", name))
             }
+            crate::error::Error::Interrupted { .. } => ApiError::Conflict(err.to_string()),
             crate::error::Error::InvalidState { expected, actual } => ApiError::Conflict(format!(
                 "invalid state: expected {}, got {}",
                 expected, actual

@@ -81,6 +81,20 @@ pub enum Error {
     #[error("hypervisor not available: {0}")]
     HypervisorUnavailable(String),
 
+    /// A stop or delete of the machine cut off an operation still running on
+    /// it, such as a command or a file transfer.
+    #[error("{operation} failed: machine '{name}' was {by} while it ran ({reason})")]
+    Interrupted {
+        /// Machine the operation ran on.
+        name: String,
+        /// What was cut off ("exec", "write file", ...).
+        operation: String,
+        /// What happened to the machine: "stopped" or "deleted".
+        by: String,
+        /// The failure the operation itself saw.
+        reason: String,
+    },
+
     /// VM is in an invalid state for the requested operation.
     #[error("invalid vm state: expected {expected}, got {actual}")]
     InvalidState {

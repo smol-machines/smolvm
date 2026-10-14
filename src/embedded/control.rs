@@ -750,7 +750,14 @@ pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
 }
 
 /// Stop a persisted VM and update its DB state.
-pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
+///
+/// `stop_timeout` overrides how long the workload gets to exit after its stop
+/// signal; `None` keeps the timeout it was launched with.
+pub fn stop_vm_with_timeout(
+    db: &SmolvmDb,
+    name: &str,
+    stop_timeout: Option<std::time::Duration>,
+) -> Result<()> {
     let record = get_record(db, name)?;
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -759,7 +766,10 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
         crate::staged_mount::sync_staged_mounts(&record, &mut client)?;
     }
-    manager.stop()?;
+    match stop_timeout {
+        Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
+        None => manager.stop()?,
+    }
     // Detach the per-machine layers volume if a (possibly cross-tool) bundle start
     // left it mounted. Unconditional on purpose: the embedded record may carry no
     // source_smolmachine even when a CLI/API `machine create <bundle>` extracted and
