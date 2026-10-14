@@ -129,7 +129,9 @@ pub fn plan_launch_network_with(
     let has_ports = port_count > 0;
     // Some([]) is a deny-all policy, not an absent policy. Treating it as
     // absent would allow an explicit TSI launch to bypass enforcement.
-    let has_cidr_policy = resources.allowed_cidrs.is_some() || !resources.egress_rules.is_empty();
+    let has_cidr_policy = resources.allowed_cidrs.is_some()
+        || !resources.egress_rules.is_empty()
+        || resources.block_private.is_some();
     let has_dns_filter = dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
     let has_fabric = resources.network_name.is_some();
@@ -328,6 +330,7 @@ pub fn validate_requested_network_backend(
     // it through.
     let has_egress_policy = resources.allowed_cidrs.is_some()
         || !resources.egress_rules.is_empty()
+        || resources.block_private.is_some()
         || dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
 
@@ -391,7 +394,7 @@ pub fn validate_requested_network_backend(
     if has_egress_policy && backend != NetworkBackend::VirtioNet {
         return Err(crate::Error::config(
             "egress",
-            "egress policy (--allow-cidr/--allow-host/--outbound-localhost-only) requires the \
+            "egress policy (--allow-cidr/--allow-host/--outbound-localhost-only/--block-private) requires the \
              virtio-net backend; TSI does not enforce it. Remove --net-backend tsi or set it to virtio-net",
         ));
     }
@@ -400,7 +403,9 @@ pub fn validate_requested_network_backend(
         return Ok(());
     }
 
-    let has_cidr_policy = resources.allowed_cidrs.is_some() || !resources.egress_rules.is_empty();
+    let has_cidr_policy = resources.allowed_cidrs.is_some()
+        || !resources.egress_rules.is_empty()
+        || resources.block_private.is_some();
     let has_dns_filter = dns_filter_hosts.is_some();
     let wants_network = resources.network || port_count > 0 || has_cidr_policy || has_dns_filter;
 

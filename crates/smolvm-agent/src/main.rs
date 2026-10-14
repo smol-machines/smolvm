@@ -487,6 +487,11 @@ fn main() {
         error!("staged volume mount requires the guest storage disk");
         std::process::exit(1);
     }
+    // Disk volumes keep their data on the storage disk the same way.
+    if storage::disk_volumes_requested() && !ensure_storage_mounted() {
+        error!("disk volume requires the guest storage disk");
+        std::process::exit(1);
+    }
 
     // Initialize volume mounts from SMOLVM_MOUNT_* env vars.
     // MUST run before the /workspace symlink below — if the user passed
@@ -496,6 +501,10 @@ fn main() {
     let boot_mounts = storage::init_volume_mounts();
     if storage::staged_boot_mount_requested() && storage::boot_volume_mounts_failed() {
         error!("failed to initialize staged volume mount");
+        std::process::exit(1);
+    }
+    if storage::disk_volumes_failed() {
+        error!("failed to initialize disk volume");
         std::process::exit(1);
     }
     if !boot_mounts.is_empty() {

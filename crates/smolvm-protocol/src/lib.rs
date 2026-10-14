@@ -51,6 +51,7 @@ pub struct S3Volume {
 }
 
 pub mod credentials;
+pub mod disk_volume;
 pub mod egress_rule;
 pub mod forkpoint;
 pub mod guest_env;

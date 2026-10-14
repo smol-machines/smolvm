@@ -376,6 +376,8 @@ pub struct ResolvedEgressPolicy {
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostnames the guest DNS filter permits resolving.
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// `--block-private` and its `--allow-private` exceptions.
+    pub block_private: Option<Vec<String>>,
 }
 
 /// Outbound-network decision for a pack-run boot: a resolved policy's override
@@ -564,7 +566,13 @@ impl PackRunCmd {
         )?;
 
         // 8. Parse CLI args
-        let mounts = HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
+        let (volume_specs, disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&self.volume)?;
+        let mounts = HostMount::parse_with_system_mounts(&volume_specs, self.allow_system_mounts)?;
+        smolvm::data::storage::ensure_disk_volumes_distinct(
+            &disk_volumes,
+            mounts.iter().filter_map(|m| m.target.to_str()),
+        )?;
         let ports = PortMappingSpec::expand_all(&self.port)
             .map_err(|e| Error::config("pack run ports", e))?;
         let port_mappings = ports.clone();
@@ -592,6 +600,11 @@ impl PackRunCmd {
             disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: disk_volumes.clone(),
+            block_private: self
+                .egress
+                .as_ref()
+                .and_then(|policy| policy.block_private.clone()),
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: self
@@ -1840,7 +1853,13 @@ fn run_from_cache(
         args.overlay,
     )?;
 
-    let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
+    let (volume_specs, disk_volumes) =
+        smolvm::data::storage::split_disk_volume_specs(&args.volume)?;
+    let mounts = HostMount::parse_with_system_mounts(&volume_specs, args.allow_system_mounts)?;
+    smolvm::data::storage::ensure_disk_volumes_distinct(
+        &disk_volumes,
+        mounts.iter().filter_map(|m| m.target.to_str()),
+    )?;
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed run ports", e))?;
     let port_mappings = ports.clone();
@@ -1862,6 +1881,8 @@ fn run_from_cache(
         disk_durability: Default::default(),
         disks: Vec::new(),
         cache_disk: None,
+        disk_volumes: disk_volumes.clone(),
+        block_private: None,
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
@@ -2288,7 +2309,13 @@ fn daemon_start(
     let vsock_path = daemon.join("agent.sock");
 
     // Parse CLI args
-    let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
+    let (volume_specs, disk_volumes) =
+        smolvm::data::storage::split_disk_volume_specs(&args.volume)?;
+    let mounts = HostMount::parse_with_system_mounts(&volume_specs, args.allow_system_mounts)?;
+    smolvm::data::storage::ensure_disk_volumes_distinct(
+        &disk_volumes,
+        mounts.iter().filter_map(|m| m.target.to_str()),
+    )?;
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed start ports", e))?;
     let port_mappings = ports.clone();
@@ -2310,6 +2337,8 @@ fn daemon_start(
         disk_durability: Default::default(),
         disks: Vec::new(),
         cache_disk: None,
+        disk_volumes: disk_volumes.clone(),
+        block_private: None,
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
@@ -2664,6 +2693,7 @@ mod tests {
             network_override: Some(false),
             allowed_cidrs: None,
             dns_filter_hosts: None,
+            block_private: None,
         };
         assert!(!effective_network(Some(&closed), false, true, true));
 
@@ -2682,6 +2712,7 @@ mod tests {
             network_override: None,
             allowed_cidrs: Some(vec!["140.82.112.0/20".to_string()]),
             dns_filter_hosts: Some(vec!["github.com".to_string()]),
+            block_private: None,
         };
         assert!(effective_network(Some(&policy), false, true, false));
         assert!(!effective_network(Some(&policy), false, false, false));

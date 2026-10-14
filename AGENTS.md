@@ -177,13 +177,15 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--net` | | run, create, update, pack run | Enable outbound networking (off by default) |
 | `--gpu` | | run, create, update, pack create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
-| `--volume` | `-v` | run, create, update, pack run | Mount host dir: `HOST:GUEST[:ro]` |
+| `--volume` | `-v` | run, create, update, pack run | Mount host dir: `HOST:GUEST[:ro]`, or `GUEST` alone for a directory on the machine's own disk (`-v /var/lib/docker`) |
 | `--allow-system-mounts` | | run, create, update, pack run | Permit trusted read-only `/etc` and `/var/log` mounts below `/host` |
 | `--port` | `-p` | run, create, update, pack run | Port mapping: `HOST:GUEST`, or `HOST:GUEST/udp` for UDP |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
 | `--interactive` | `-i` | run, exec, pack run | Keep stdin open |
 | `--tty` | `-t` | run, exec, pack run | Allocate pseudo-TTY |
 | `--allow-cidr` | | run, create, update | CIDR egress filter (implies --net) |
+| `--block-private` | | run, create | Block private and internal destinations, keep the public internet (implies --net) |
+| `--allow-private` | | run, create | Re-open one private CIDR under `--block-private` |
 | `--allow-host` | | run, create, update | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create, update | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create, pack run | Forward host SSH agent (git/ssh without exposing keys) |
@@ -222,6 +224,12 @@ and `--guest-subnet`. `-p HOST:GUEST` publishes a TCP port and
 `-p HOST:GUEST/udp` a UDP one (each client gets its own session, answered from
 the same host port; datagrams up to 1472 bytes); the server inside must listen
 on `0.0.0.0`, and a published port alone gives no outbound access.
+`--block-private` keeps the public internet open but blocks the LAN, cloud
+metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
+`--allow-private CIDR` re-opens one private range, such as an internal
+registry. Metadata stays blocked either way. Both imply `--net` and use the
+virtio-net backend; the Smolfile form is `[network] block_private = true` and
+`allow_private = ["10.20.0.0/16"]`.
 Every rule, the Smolfile keys and `--guest-subnet`:
 `docs/throwaway-machine/README.md`.
 

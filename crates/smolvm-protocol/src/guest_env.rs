@@ -124,6 +124,11 @@ pub const PUBLISH_SOCKETS: &str = "SMOLVM_PUBLISH_SOCKETS";
 /// and exposes it to every workload at the guest path.
 pub const CACHE_DISK: &str = "SMOLVM_CACHE_DISK";
 
+/// Guest paths backed by the machine's storage disk, encoded by
+/// [`crate::disk_volume::encode`]. The agent binds a per-path directory on the
+/// disk at each one in every workload. Absent means none.
+pub const DISK_VOLUMES: &str = "SMOLVM_DISK_VOLUMES";
+
 /// Enables forwarding a detached workload's stdout and stderr to the host over
 /// the `ports::WORKLOAD_LOGS` vsock port, where the host appends them to the
 /// machine's `workload.log`. Absent means the output is discarded.

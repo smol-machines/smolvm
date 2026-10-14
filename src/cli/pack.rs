@@ -834,6 +834,8 @@ impl PackCreateCmd {
                 disk_durability: Default::default(),
                 disks: Vec::new(),
                 cache_disk: None,
+                disk_volumes: Vec::new(),
+                block_private: None,
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,

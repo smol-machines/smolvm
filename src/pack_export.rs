@@ -515,6 +515,8 @@ impl ExportVm {
                 disk_durability: Default::default(),
                 disks: Vec::new(),
                 cache_disk: None,
+                disk_volumes: Vec::new(),
+                block_private: None,
                 allowed_cidrs: None,
                 egress_rules: Vec::new(),
                 network_name: None,

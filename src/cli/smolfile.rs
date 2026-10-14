@@ -162,6 +162,7 @@ pub fn build_create_params(
                 block_io: cli_block_io.unwrap_or_default(),
                 disk_durability: DiskDurability::default(),
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
+                block_private: None,
                 restart_policy: None,
                 restart_max_retries: None,
                 restart_max_backoff_secs: None,
@@ -352,6 +353,9 @@ pub fn build_create_params(
         net
     };
     let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
+    let sf_block_private = (network.block_private || !network.allow_private.is_empty())
+        .then(|| network.allow_private.clone());
+    let net = net || sf_block_private.is_some();
 
     // Restart policy from [restart] section
     let restart_policy = sf
@@ -426,6 +430,7 @@ pub fn build_create_params(
         block_io,
         disk_durability,
         allowed_cidrs,
+        block_private: sf_block_private,
         restart_policy,
         restart_max_retries,
         restart_max_backoff_secs,

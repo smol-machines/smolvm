@@ -381,6 +381,13 @@ pub struct NetworkConfig {
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
+    /// Block private, internal and link-local destinations while the public
+    /// internet stays open. Cloud metadata is blocked either way.
+    #[serde(default)]
+    pub block_private: bool,
+    /// Private ranges to re-open under `block_private` (implies it).
+    #[serde(default)]
+    pub allow_private: Vec<String>,
     /// Credential bindings (`[[network.credentials]]`). The guest receives a
     /// placeholder in each `environment_variable`; the host substitutes the
     /// real value on HTTPS requests to the binding's `allowed_hosts` only.

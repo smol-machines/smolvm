@@ -463,6 +463,15 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<crate::data::disk::CacheDisk>,
 
+    /// Guest paths backed by the machine's storage disk (`-v /var/lib/docker`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
+
+    /// Private-range egress block and its exceptions (`--block-private`,
+    /// `--allow-private`). See `VmResources::block_private`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
+
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
@@ -897,6 +906,8 @@ impl VmRecord {
             disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             mounts,
             staged_mounts: Vec::new(),
             staged_mounts_detached_from: None,
@@ -993,6 +1004,8 @@ impl VmRecord {
             disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             mounts,
             staged_mounts: Vec::new(),
             staged_mounts_detached_from: None,
@@ -1574,6 +1587,8 @@ impl VmRecord {
             disk_durability: self.disk_durability,
             disks: self.disks.clone(),
             cache_disk: self.cache_disk.clone(),
+            disk_volumes: self.disk_volumes.clone(),
+            block_private: self.block_private.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
             egress_rules: self.egress_rules.clone(),
             dns: self.dns,

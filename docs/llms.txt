@@ -7,6 +7,7 @@
 - [branch-and-checkpoint](branch-and-checkpoint/SKILL.md): scheduled checkpoints with history, restores, pause and resume, and branches with their branch point kept
 - [credentials](credentials/SKILL.md): an API key a workload can use but never read, substituted on the way out
 - [dev-env](dev-env/SKILL.md): a machine you come back to, and what survives a stop and start
+- [coding-agent](coding-agent/SKILL.md): a coding agent with full permissions inside a machine, the project mounted
 - [docker-in-machine](docker-in-machine/SKILL.md): a Docker daemon inside a machine, for tools that call Docker themselves
 - [gpu-cuda](gpu-cuda/SKILL.md): CUDA Driver API calls remoted to the host NVIDIA GPU
 - [install](install/SKILL.md): installing smolvm and proving the host can boot a microVM

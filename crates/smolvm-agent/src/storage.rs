@@ -606,6 +606,13 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
         if let Some(cache) = mount_cache_disk() {
             mounts.push(cache);
         }
+        for volume in mount_disk_volumes() {
+            if mounts.iter().any(|(_, target, _)| target == &volume.1) {
+                warn!(target = %volume.1, "disk volume shadowed by a mount at the same path");
+                continue;
+            }
+            mounts.push(volume);
+        }
 
         // Mount using existing logic with empty rootfs prefix so bind mounts
         // go to absolute guest paths (e.g., "/data"), visible to VmExec.
@@ -623,6 +630,105 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
 /// The staging tag the cache disk's filesystem is mounted under, beside the
 /// virtiofs devices' staging paths.
 const CACHE_MOUNT_TAG: &str = "smolvm_cache";
+
+/// Staging-tag prefix for disk volumes. Each volume's directory on the storage
+/// disk is bound at its staging path, so boot-mount setup and every container's
+/// mount list expose it exactly like a virtiofs share, without a device.
+const DISK_VOLUME_TAG_PREFIX: &str = "smolvm_disk_";
+
+/// Where disk volumes keep their data on the storage disk.
+const DISK_VOLUME_ROOT: &str = "/storage/volumes";
+
+static DISK_VOLUMES_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a requested disk volume could not be prepared at boot.
+pub fn disk_volumes_failed() -> bool {
+    DISK_VOLUMES_FAILED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn is_disk_volume_tag(tag: &str) -> bool {
+    tag.starts_with(DISK_VOLUME_TAG_PREFIX)
+}
+
+/// The disk volumes the host requested, already validated.
+fn disk_volume_targets() -> Vec<String> {
+    std::env::var(guest_env::DISK_VOLUMES)
+        .map(|value| smolvm_protocol::disk_volume::decode(&value))
+        .unwrap_or_default()
+}
+
+/// Whether any disk volume was requested, so the storage disk must be mounted
+/// before boot mounts are set up.
+pub fn disk_volumes_requested() -> bool {
+    !disk_volume_targets().is_empty()
+}
+
+/// Prepare each requested disk volume: create its directory on the storage
+/// disk and bind it at its staging path. Returns the boot mounts that expose
+/// them. A volume that cannot be prepared fails the boot mounts rather than
+/// silently leaving its path on the overlay root, where nested overlayfs fails
+/// in ways that do not name the cause.
+#[cfg(target_os = "linux")]
+fn mount_disk_volumes() -> Vec<(String, String, bool)> {
+    let mut mounts = Vec::new();
+    for target in disk_volume_targets() {
+        let name = smolvm_protocol::disk_volume::storage_dir_name(&target);
+        let tag = format!("{DISK_VOLUME_TAG_PREFIX}{name}");
+        let data = Path::new(DISK_VOLUME_ROOT).join(&name);
+        let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(&tag);
+        let prepared = std::fs::create_dir_all(&data)
+            .and_then(|()| std::fs::create_dir_all(&staging))
+            .and_then(|()| {
+                if is_mountpoint(&staging) {
+                    Ok(())
+                } else {
+                    bind_dir(&data, &staging)
+                }
+            });
+        match prepared {
+            Ok(()) => {
+                info!(target = %target, data = %data.display(), "disk volume ready");
+                mounts.push((tag, target, false));
+            }
+            Err(error) => {
+                DISK_VOLUMES_FAILED.store(true, std::sync::atomic::Ordering::Release);
+                warn!(%error, target = %target, "failed to prepare disk volume");
+            }
+        }
+    }
+    mounts
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_disk_volumes() -> Vec<(String, String, bool)> {
+    Vec::new()
+}
+
+/// Bind `source` onto `target`.
+#[cfg(target_os = "linux")]
+fn bind_dir(source: &Path, target: &Path) -> std::io::Result<()> {
+    let to_c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (source, target) = (to_c(source)?, to_c(target)?);
+    // SAFETY: valid NUL-terminated paths, a plain bind with no data.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 /// The cache disk the host attached, from `SMOLVM_CACHE_DISK=<device>:<guest
 /// path>[:slot]`: its guest device, the path it is exposed at, and whether it
@@ -815,10 +921,13 @@ fn mount_cache_disk() -> Option<(String, String, bool)> {
 #[cfg(target_os = "linux")]
 pub fn repair_boot_volume_mounts() -> Result<()> {
     // A cache disk is a block device the branch pivoted under its mounted
-    // filesystem, not a virtiofs session that died with the source.
+    // filesystem, not a virtiofs session that died with the source. Disk
+    // volumes live on the storage disk, so they survive the same way.
     let missing = init_volume_mounts()
         .iter()
-        .filter(|(tag, target, _)| tag != CACHE_MOUNT_TAG && !is_mountpoint(Path::new(target)))
+        .filter(|(tag, target, _)| {
+            tag != CACHE_MOUNT_TAG && !is_disk_volume_tag(tag) && !is_mountpoint(Path::new(target))
+        })
         .cloned()
         .collect::<Vec<_>>();
     if missing.is_empty() {

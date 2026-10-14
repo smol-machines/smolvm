@@ -1967,6 +1967,8 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         disk_durability: spec.disk_durability.unwrap_or_default(),
         disks: Vec::new(),
         cache_disk: None,
+        disk_volumes: Vec::new(),
+        block_private: None,
         allowed_cidrs: spec.allowed_cidrs.clone(),
         egress_rules: spec.egress_rules.clone(),
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec

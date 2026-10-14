@@ -489,6 +489,8 @@ pub struct CreateVmParams {
     /// Shared cache disk (`--cache-disk`).
     pub cache_disk: Option<smolvm::data::disk::CacheDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
+    /// `--block-private` and its `--allow-private` exceptions.
+    pub block_private: Option<Vec<String>>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
     pub restart_max_backoff_secs: Option<u64>,
@@ -677,6 +679,23 @@ impl Drop for CreateVmReservation {
     }
 }
 
+impl CreateVmParams {
+    /// Merge `--block-private` / `--allow-private` into the Smolfile's
+    /// `[network]` setting; either flag turns the block on and implies --net.
+    pub(crate) fn apply_block_private(&mut self, block: bool, allow: Vec<String>) {
+        if !block && allow.is_empty() {
+            return;
+        }
+        let exceptions = self.block_private.get_or_insert_with(Vec::new);
+        for cidr in allow {
+            if !exceptions.contains(&cidr) {
+                exceptions.push(cidr);
+            }
+        }
+        self.net = true;
+    }
+}
+
 pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
     build_vm_record_for(params, false)
 }
@@ -697,7 +716,9 @@ pub(crate) fn build_vm_record_for(
 
     // Peel off remote volume specs (`s3://`) before the host-directory parse;
     // they mount inside the guest at start instead of through virtiofs.
-    let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
+    let (volume_specs, disk_volumes) =
+        smolvm::data::storage::split_disk_volume_specs(&params.volume)?;
+    let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&volume_specs)?;
 
     // Parse and validate volume mounts
     let parsed_mounts =
@@ -782,7 +803,22 @@ pub(crate) fn build_vm_record_for(
     record.udp_ports = udp_ports;
     record.staged_mounts = staged_mounts;
     record.init = params.init.clone();
+    smolvm::data::storage::ensure_disk_volumes_distinct(
+        &disk_volumes,
+        record
+            .mounts
+            .iter()
+            .map(|(_, target, _)| target.as_str())
+            .chain(
+                record
+                    .staged_mounts
+                    .iter()
+                    .map(|(_, _, target)| target.as_str()),
+            )
+            .chain(remote_volumes.iter().map(|v| v.target.as_str())),
+    )?;
     record.remote_volumes = remote_volumes;
+    record.disk_volumes = disk_volumes;
     record.env = env;
     record.secret_refs = params.secret_refs.clone();
     record.workdir = params.workdir.clone();
@@ -794,6 +830,7 @@ pub(crate) fn build_vm_record_for(
     record.disks = params.disks.clone();
     record.cache_disk = params.cache_disk.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
+    record.block_private = params.block_private.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.dns_options = params.dns_options.clone();
@@ -2159,6 +2196,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.disks = o.disks.clone();
     r.cache_disk = o.cache_disk.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
+    r.block_private = o.block_private.clone();
     r.init = o.init.clone();
     r.init_completed = false;
     r.env = o.env.clone();
@@ -2239,6 +2277,8 @@ pub struct DefaultVmOverrides {
     /// Shared cache disk (`--cache-disk`).
     pub cache_disk: Option<smolvm::data::disk::CacheDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
+    /// `--block-private` and its `--allow-private` exceptions.
+    pub block_private: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub secret_refs: BTreeMap<String, SecretRef>,
@@ -2292,6 +2332,7 @@ impl DefaultVmOverrides {
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
+            block_private: params.block_private.clone(),
             init: params.init.clone(),
             env: smolvm::util::parse_env_list(&params.env),
             workdir: params.workdir.clone(),

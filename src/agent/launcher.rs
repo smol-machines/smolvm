@@ -1357,6 +1357,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         egress_refresh_hosts.as_deref(),
                     )
                     .with_rules(&resources.egress_rules)
+                    .and_then(|policy| match &resources.block_private {
+                        Some(exceptions) => policy.with_private_floor(exceptions),
+                        None => Ok(policy),
+                    })
                     .map_err(|reason| Error::agent("egress rules", reason))?
                 } else {
                     // Networked only to serve published ports: inbound only,
@@ -2282,6 +2286,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         if let Some(env) = &cache_disk_env {
             env_strings.push(cstr(env));
+        }
+        if !resources.disk_volumes.is_empty() {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::DISK_VOLUMES,
+                smolvm_protocol::disk_volume::encode(&resources.disk_volumes)
+            )));
         }
 
         // Pass mount count

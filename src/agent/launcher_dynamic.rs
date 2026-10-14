@@ -463,6 +463,10 @@ pub fn launch_agent_vm_dynamic(
                     config.dns_filter_hosts.as_deref(),
                 )
                 .with_rules(&config.resources.egress_rules)
+                .and_then(|policy| match &config.resources.block_private {
+                    Some(exceptions) => policy.with_private_floor(exceptions),
+                    None => Ok(policy),
+                })
                 .map_err(|reason| format!("invalid egress rules: {reason}"))?
             } else {
                 // Networked only to serve published ports: inbound only,
@@ -792,6 +796,16 @@ pub fn launch_agent_vm_dynamic(
 
     if !config.mounts.is_empty() {
         if let Ok(cstr) = CString::new(format!("SMOLVM_MOUNT_COUNT={}", config.mounts.len())) {
+            env_strings.push(cstr);
+        }
+    }
+
+    if !config.resources.disk_volumes.is_empty() {
+        if let Ok(cstr) = CString::new(format!(
+            "{}={}",
+            smolvm_protocol::guest_env::DISK_VOLUMES,
+            smolvm_protocol::disk_volume::encode(&config.resources.disk_volumes)
+        )) {
             env_strings.push(cstr);
         }
     }

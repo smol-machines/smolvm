@@ -32,6 +32,7 @@ macOS arm64.
 | [branch-and-checkpoint](branch-and-checkpoint/README.md) | scheduled checkpoints with history, restores, pause and resume, and branches with their branch point kept | [SKILL.md](branch-and-checkpoint/SKILL.md) |
 | [credentials](credentials/README.md) | an API key a workload can use but never read, substituted on the way out | [SKILL.md](credentials/SKILL.md) |
 | [dev-env](dev-env/README.md) | a machine you come back to, and what survives a stop and start | [SKILL.md](dev-env/SKILL.md) |
+| [coding-agent](coding-agent/README.md) | a coding agent with full permissions inside a machine, the project mounted | [SKILL.md](coding-agent/SKILL.md) |
 | [docker-in-machine](docker-in-machine/README.md) | a Docker daemon inside a machine, for tools that call Docker themselves | [SKILL.md](docker-in-machine/SKILL.md) |
 | [gpu-cuda](gpu-cuda/README.md) | CUDA Driver API calls remoted to the host NVIDIA GPU | [SKILL.md](gpu-cuda/SKILL.md) |
 | [install](install/README.md) | installing smolvm and proving the host can boot a microVM | [SKILL.md](install/SKILL.md) |

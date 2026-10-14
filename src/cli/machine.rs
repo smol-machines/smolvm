@@ -612,6 +612,9 @@ pub struct RunCmd {
     /// image: the agent performs the mount itself. `:staged` runs from a
     /// guest-local copy for metadata-heavy workloads; `machine sync` and
     /// graceful stop copy it back, so do not modify its host source concurrently.
+    /// A container path alone (`-v /var/lib/docker`) is a directory on the
+    /// machine's own disk instead of its overlay root, which nested container
+    /// runtimes need; it persists across stop and start.
     #[arg(
         short = 'v',
         long = "volume",
@@ -709,6 +712,17 @@ pub struct RunCmd {
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
+
+    /// Block private, internal and link-local destinations (the LAN, cloud
+    /// metadata, CGNAT, the host's loopback) while the public internet stays
+    /// open. Implies --net.
+    #[arg(long, help_heading = "Network")]
+    pub block_private: bool,
+
+    /// Re-open one private range under --block-private, such as an internal
+    /// registry (implies --block-private). Can be used multiple times.
+    #[arg(long = "allow-private", value_name = "CIDR", value_parser = parse_cidr, help_heading = "Network")]
+    pub allow_private: Vec<String>,
 
     /// Let the guest reach services on the HOST's own loopback (127.0.0.1 / ::1);
     /// off by default so a sandbox can't reach host debuggers, Docker, or local
@@ -1419,7 +1433,7 @@ impl RunCmd {
             self.net || self.allow_host_loopback,
         )?;
 
-        let params = crate::cli::smolfile::build_create_params(
+        let mut params = crate::cli::smolfile::build_create_params(
             vm_name.clone(),
             self.image.clone(),
             None,
@@ -1445,7 +1459,7 @@ impl RunCmd {
             // `machine create` is the path an orchestrator labels.
             Default::default(),
         )?;
-        let mut params = params;
+        params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
@@ -1555,6 +1569,7 @@ impl RunCmd {
                         network_override: None,
                         allowed_cidrs: params.allowed_cidrs.clone(),
                         dns_filter_hosts: params.dns_filter_hosts.clone(),
+                        block_private: params.block_private.clone(),
                     }),
                     secret_refs: params.secret_refs.clone(),
                 }
@@ -1714,6 +1729,7 @@ impl RunCmd {
                     network_override: Some(params.net),
                     allowed_cidrs: params.allowed_cidrs.clone(),
                     dns_filter_hosts: params.dns_filter_hosts.clone(),
+                    block_private: params.block_private.clone(),
                 }),
                 secret_refs: params.secret_refs.clone(),
             }
@@ -1723,10 +1739,19 @@ impl RunCmd {
         // Remote volumes are mounted inside the guest by the agent, so peel them
         // off before the host-directory parse, which would reject an `s3://`
         // source as a missing directory.
+        let (volume_specs, disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&params.volume)?;
         let (host_volume_specs, remote_volumes) =
-            smolvm::remote_volume::split_specs(&params.volume)?;
+            smolvm::remote_volume::split_specs(&volume_specs)?;
         let mut mounts =
             HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?;
+        smolvm::data::storage::ensure_disk_volumes_distinct(
+            &disk_volumes,
+            mounts
+                .iter()
+                .filter_map(|m| m.target.to_str())
+                .chain(remote_volumes.iter().map(|v| v.target.as_str())),
+        )?;
         if !remote_volumes.is_empty() && !params.net {
             return Err(Error::config(
                 "machine run",
@@ -1837,6 +1862,8 @@ impl RunCmd {
             disk_durability: params.disk_durability,
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
+            disk_volumes: disk_volumes.clone(),
+            block_private: params.block_private.clone(),
         };
         validate_requested_network_backend(
             &resources,
@@ -4089,6 +4116,9 @@ pub struct CreateCmd {
     /// image: the agent performs the mount itself. `:staged` runs from a
     /// guest-local copy for metadata-heavy workloads; `machine sync` and
     /// graceful stop copy it back, so do not modify its host source concurrently.
+    /// A container path alone (`-v /var/lib/docker`) is a directory on the
+    /// machine's own disk instead of its overlay root, which nested container
+    /// runtimes need; it persists across stop and start.
     #[arg(
         short = 'v',
         long = "volume",
@@ -4177,6 +4207,17 @@ pub struct CreateCmd {
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long)]
     pub outbound_localhost_only: bool,
+
+    /// Block private, internal and link-local destinations (the LAN, cloud
+    /// metadata, CGNAT, the host's loopback) while the public internet stays
+    /// open. Implies --net.
+    #[arg(long)]
+    pub block_private: bool,
+
+    /// Re-open one private range under --block-private, such as an internal
+    /// registry (implies --block-private). Can be used multiple times.
+    #[arg(long = "allow-private", value_name = "CIDR", value_parser = parse_cidr)]
+    pub allow_private: Vec<String>,
 
     /// Enable GPU acceleration (Vulkan via virtio-gpu)
     #[arg(long)]
@@ -4428,7 +4469,7 @@ impl CreateCmd {
             .name
             .unwrap_or_else(smolvm::util::generate_machine_name);
 
-        let params = crate::cli::smolfile::build_create_params(
+        let mut params = crate::cli::smolfile::build_create_params(
             name,
             self.image,
             None,         // entrypoint: from Smolfile only
@@ -4452,7 +4493,7 @@ impl CreateCmd {
             cli_allow_cidrs,
             smolvm::util::parse_labels(&self.labels)?,
         )?;
-        let mut params = params;
+        params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
@@ -4526,6 +4567,8 @@ impl CreateCmd {
             disk_durability: params.disk_durability,
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: params.block_private.clone(),
         };
         // Reject zero-valued resources before the machine is persisted.
         // Without this, `machine create` succeeds and the failure only
@@ -4896,6 +4939,7 @@ impl CreateCmd {
             block_io: self.block_io.unwrap_or_default(),
             disk_durability: self.disk_durability.unwrap_or_default(),
             allowed_cidrs,
+            block_private: None,
             restart_policy: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.workload.as_ref())
@@ -4967,6 +5011,8 @@ impl CreateCmd {
             disk_durability: params.disk_durability,
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
+            disk_volumes: Vec::new(),
+            block_private: params.block_private.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
             egress_rules: Vec::new(),
         };
@@ -6071,7 +6117,8 @@ pub struct UpdateCmd {
     pub name: String,
 
     /// Add volume mount. A staged mount is guest-local until sync or graceful stop;
-    /// do not modify its host source concurrently.
+    /// do not modify its host source concurrently. A guest path alone adds a
+    /// directory on the machine's own disk.
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     pub volume: Vec<String>,
 
@@ -6472,8 +6519,10 @@ impl UpdateCmd {
 
         // Parse and validate new mounts (after state check so
         // "machine is running" takes priority over "directory not found")
+        let (volume_specs, new_disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&self.volume)?;
         let new_mounts =
-            HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
+            HostMount::parse_with_system_mounts(&volume_specs, self.allow_system_mounts)?;
         let add_ports = PortMappingSpec::expand_all(&self.port)
             .map_err(|e| smolvm::Error::config("update ports", e))?;
         let remove_ports = PortMappingSpec::expand_all(&self.remove_port)
@@ -6515,6 +6564,26 @@ impl UpdateCmd {
         let (final_live_mounts, final_staged_mounts) =
             HostMount::split_storage_tuples(&final_mounts);
 
+        // Disk volumes are removed by their guest path alone. Their data stays
+        // on the machine's disk, so adding the path back restores it.
+        let (_, removed_disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&self.remove_volume)?;
+        let mut final_disk_volumes: Vec<String> = record
+            .disk_volumes
+            .iter()
+            .filter(|target| !removed_disk_volumes.contains(target))
+            .cloned()
+            .collect();
+        for target in &new_disk_volumes {
+            if !final_disk_volumes.contains(target) {
+                final_disk_volumes.push(target.clone());
+            }
+        }
+        smolvm::data::storage::ensure_disk_volumes_distinct(
+            &final_disk_volumes,
+            final_mounts.iter().filter_map(|m| m.target.to_str()),
+        )?;
+
         // Expand physical disk files before the DB write. If expansion fails,
         // no DB changes are made — the record stays consistent.
         let mut changes: Vec<String> = Vec::new();
@@ -6554,6 +6623,12 @@ impl UpdateCmd {
                 }
                 r.mounts = final_live_mounts.clone();
                 r.staged_mounts = final_staged_mounts.clone();
+            }
+            if r.disk_volumes != final_disk_volumes {
+                for target in &new_disk_volumes {
+                    changes.push(format!("  added disk volume: {target}"));
+                }
+                r.disk_volumes = final_disk_volumes.clone();
             }
 
             // Ports: add new, remove specified

@@ -62,7 +62,7 @@ storage = 40                          # storage disk GiB (default: 20)
 overlay = 4                           # overlay disk GiB (default: 10)
 
 # Mounts, ports and provisioning ([dev] lists below replace these when set)
-volumes = ["./src:/app"]              # host bind mounts
+volumes = ["./src:/app"]              # host bind mounts; a guest path alone ("/var/lib/docker") is a directory on the machine's disk
 ports = ["8080:8080", "27015:27015/udp"]  # host:guest forwarding; /udp for UDP
 init = ["pip install -r requirements.txt"]  # run once, on the machine's first start
 
@@ -71,6 +71,8 @@ init = ["pip install -r requirements.txt"]  # run once, on the machine's first s
 allow_hosts = ["api.stripe.com"]      # resolved at VM start; the host and its subdomains (implies net)
 allow_host_patterns = ["api.example.com", "*.files.example.com"]  # exact name, or subdomains only
 allow_cidrs = ["10.0.0.0/8"]          # IP/CIDR ranges (implies net)
+block_private = true                  # public internet open; LAN, metadata, CGNAT, host loopback blocked
+allow_private = ["10.20.0.0/16"]      # private ranges re-opened under block_private (implies it)
 
 # Dev profile (used by `machine run` and `machine create`)
 [dev]

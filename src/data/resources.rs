@@ -131,6 +131,15 @@ pub struct VmResources {
     /// copy-on-write layer, attached after the managed disks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<crate::data::disk::CacheDisk>,
+    /// Guest paths backed by the machine's storage disk (`-v /var/lib/docker`),
+    /// normalized. See `smolvm_protocol::disk_volume`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
+    /// `Some(exceptions)` blocks private, internal and link-local destinations
+    /// (`--block-private`) while the public internet stays open; each exception
+    /// CIDR (`--allow-private`) re-opens its range. Cloud metadata stays closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -240,6 +249,8 @@ impl Default for VmResources {
             disk_durability: DiskDurability::Full,
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             allowed_cidrs: None,
             egress_rules: Vec::new(),
             dns: None,
