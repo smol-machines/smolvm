@@ -108,6 +108,7 @@ use state::ApiState;
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
         handlers::machines::publish_cache_disk,
+        handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
         handlers::machines::put_credential_values,
         handlers::machines::export_machine,
@@ -446,12 +447,18 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{name}/batches", post(handlers::rollouts::generate_batch))
         .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES));
 
+    // Cache bases this server holds: the control plane removes one a failed
+    // publish left behind, or one whose cache disk was deleted.
+    let cache_base_routes =
+        Router::new().route("/{base}", delete(handlers::machines::delete_cache_base));
+
     // API v1 routes
     let api_v1 = Router::new()
         .nest("/machines", machine_routes)
         .nest("/pools", pool_routes)
         .nest("/rollout-executors", rollout_routes)
-        .nest("/volumes", volume_routes);
+        .nest("/volumes", volume_routes)
+        .nest("/cache-bases", cache_base_routes);
 
     let cors = build_cors(cors_origins);
 

@@ -6345,10 +6345,10 @@ pub async fn publish_cache_disk(
         .transpose()?;
 
     let layer = crate::data::disk::CacheDisk::layer_path(&vm_data_dir(&name));
+    let flatten_dir = dir.clone();
     let base = req.base.clone();
-    let published = dir.join(&req.base);
-    let (size_bytes, sha256) =
-        tokio::task::spawn_blocking(move || -> Result<(u64, String), ApiError> {
+    let (staged, sha256) =
+        tokio::task::spawn_blocking(move || -> Result<(StagedBase, String), ApiError> {
             let _guard = guard;
             // A machine that never started has no layer yet: its cache is the base.
             let top = if layer.exists() {
@@ -6356,23 +6356,85 @@ pub async fn publish_cache_disk(
             } else {
                 cache.base.clone()
             };
-            let size = publish_flattened(&top, &dir, &base)?;
-            let digest = file_sha256(&dir.join(&base))?;
-            crate::data::disk::record_base_digest(&dir.join(&base), &digest);
-            Ok((size, digest))
+            let staged = flatten_staged(&top, &flatten_dir, &base)?;
+            let digest = file_sha256(staged.path())?;
+            Ok((staged, digest))
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    // The base takes its name only once the upload has landed. Named first, a
+    // failed upload left it behind under a version the control plane never
+    // recorded, and every later publish of that version collided with it.
     if let Some(urls) = upload_urls {
-        let file = std::fs::File::open(&published)
-            .map_err(|e| ApiError::internal(format!("open {}: {e}", published.display())))?;
+        let file = std::fs::File::open(staged.path())
+            .map_err(|e| ApiError::internal(format!("open {}: {e}", staged.path().display())))?;
         upload_checkpoint_file(file, urls).await?;
     }
+    let base = req.base.clone();
+    let digest = sha256.clone();
+    let size_bytes = tokio::task::spawn_blocking(move || staged.install(&dir, &base, &digest))
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
     Ok(Json(crate::api::types::PublishCacheDiskResponse {
         base: req.base,
         size_bytes,
         sha256,
     }))
+}
+
+/// Remove a cache base from this server: a base a failed publish left behind,
+/// or one whose cache disk was deleted. Refused while a machine here is
+/// attached to it. Removing a base that is not here succeeds, so a retry is
+/// safe; a base that is needed again is fetched from its source.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/cache-bases/{base}",
+    tag = "Machines",
+    params(
+        ("base" = String, Path, description = "Cache base file name")
+    ),
+    responses(
+        (status = 204, description = "Cache base removed, or was not here"),
+        (status = 400, description = "Invalid name, or cache disks disabled", body = ApiErrorResponse),
+        (status = 409, description = "A machine is attached to the base", body = ApiErrorResponse),
+    )
+)]
+pub async fn delete_cache_base(
+    State(state): State<Arc<ApiState>>,
+    Path(base): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let dir = state.cache_disk_dir()?;
+    crate::data::disk::validate_base_name(&base).map_err(ApiError::BadRequest)?;
+    // Held so a create fetching this base cannot have it removed underneath.
+    let fetch_lock = cache_base_fetch_lock(&base);
+    let _fetching = fetch_lock.lock().await;
+    let path = dir.join(&base);
+    let db = state.db().clone();
+    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        let attached = db
+            .list_vms()
+            .map_err(|e| ApiError::internal(format!("list machines: {e}")))?
+            .into_iter()
+            .find(|(_, record)| {
+                // Base names are unique per cache disk version, so the name
+                // alone identifies it however the path was spelled.
+                record
+                    .cache_disk
+                    .as_ref()
+                    .is_some_and(|cache| cache.base.file_name() == path.file_name())
+            });
+        if let Some((name, _)) = attached {
+            return Err(ApiError::Conflict(format!(
+                "cache base '{}' is attached to machine '{name}'",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
+        crate::data::disk::remove_base(&path)
+            .map_err(|e| ApiError::internal(format!("remove {}: {e}", path.display())))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// The SHA-256 of a file, as lowercase hex.
@@ -6528,24 +6590,20 @@ fn remove_abandoned_partials(dir: &std::path::Path, base: &str) {
     }
 }
 
-/// Flatten `top` into `dir/base`: written to a hidden partial file, then
-/// linked into place, which fails rather than replace a base that appeared
-/// meanwhile.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn publish_flattened(
-    top: &std::path::Path,
-    dir: &std::path::Path,
-    base: &str,
-) -> Result<u64, ApiError> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let partial = dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id()));
-    let target = dir.join(base);
-    let result = (|| {
-        crate::agent::fork::flatten_standalone(top, &partial).map_err(ApiError::from)?;
-        std::fs::hard_link(&partial, &target).map_err(|e| {
+/// A published base still under its hidden partial name: removed on drop
+/// unless [`StagedBase::install`] gave it its real name.
+struct StagedBase(std::path::PathBuf);
+
+impl StagedBase {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    /// Link the staged file to `dir/base`, which fails rather than replace a
+    /// base that appeared meanwhile, and record its digest. Returns its size.
+    fn install(self, dir: &std::path::Path, base: &str, digest: &str) -> Result<u64, ApiError> {
+        let target = dir.join(base);
+        std::fs::hard_link(&self.0, &target).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 ApiError::Conflict(format!(
                     "cache base '{base}' already exists; publish each version under a new name"
@@ -6554,23 +6612,44 @@ fn publish_flattened(
                 ApiError::internal(format!("publish {}: {e}", target.display()))
             }
         })?;
+        crate::data::disk::record_base_digest(&target, digest);
         std::fs::File::open(dir)
             .and_then(|d| d.sync_all())
             .map_err(|e| ApiError::internal(format!("sync {}: {e}", dir.display())))?;
         std::fs::metadata(&target)
             .map(|meta| meta.len())
             .map_err(|e| ApiError::internal(format!("stat {}: {e}", target.display())))
-    })();
-    let _ = std::fs::remove_file(&partial);
-    result
+    }
+}
+
+impl Drop for StagedBase {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Flatten `top` into a hidden partial file in `dir`, named for `base`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn flatten_staged(
+    top: &std::path::Path,
+    dir: &std::path::Path,
+    base: &str,
+) -> Result<StagedBase, ApiError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let staged = StagedBase(dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id())));
+    crate::agent::fork::flatten_standalone(top, staged.path()).map_err(ApiError::from)?;
+    Ok(staged)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn publish_flattened(
+fn flatten_staged(
     _top: &std::path::Path,
     _dir: &std::path::Path,
     _base: &str,
-) -> Result<u64, ApiError> {
+) -> Result<StagedBase, ApiError> {
     Err(ApiError::BadRequest(
         "cache disks are not supported on this host".into(),
     ))
@@ -7560,6 +7639,46 @@ mod tests {
             classify_launch_error("failed to start machine: kernel panic".to_string()),
             ApiError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn a_staged_base_that_is_never_installed_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join(".b-v1.qcow2.1.2.partial");
+        std::fs::write(&partial, b"base").unwrap();
+        drop(StagedBase(partial.clone()));
+        assert!(!partial.exists());
+        assert!(!dir.path().join("b-v1.qcow2").exists());
+    }
+
+    #[test]
+    fn installing_a_staged_base_names_it_and_refuses_a_taken_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = |n: u8| {
+            let partial = dir.path().join(format!(".b-v1.qcow2.{n}.1.partial"));
+            std::fs::write(&partial, [n; 4]).unwrap();
+            StagedBase(partial)
+        };
+        let first = stage(1);
+        let first_partial = first.path().to_path_buf();
+        assert_eq!(first.install(dir.path(), "b-v1.qcow2", "ab").unwrap(), 4);
+        assert!(!first_partial.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("b-v1.qcow2")).unwrap(),
+            [1; 4]
+        );
+
+        let second = stage(2);
+        let second_partial = second.path().to_path_buf();
+        assert!(matches!(
+            second.install(dir.path(), "b-v1.qcow2", "cd"),
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(!second_partial.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("b-v1.qcow2")).unwrap(),
+            [1; 4]
+        );
     }
 
     #[test]
