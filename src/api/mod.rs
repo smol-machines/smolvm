@@ -344,10 +344,6 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route(
-            "/{id}/cache-disk/publish",
-            post(handlers::machines::publish_cache_disk),
-        )
-        .route(
             "/{id}/egress",
             post(handlers::machines::update_machine_egress),
         )
@@ -384,7 +380,14 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/exec", post(handlers::exec::exec_command))
         .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
         .route("/{id}/run", post(handlers::exec::run_command))
-        .route("/{id}/images/pull", post(handlers::images::pull_image));
+        .route("/{id}/images/pull", post(handlers::images::pull_image))
+        // Flattening and uploading a cache disk scales with its size: a 32 GB
+        // publish ran past the five-minute timeout every time and answered 408
+        // while its upload was still going. The control plane bounds it.
+        .route(
+            "/{id}/cache-disk/publish",
+            post(handlers::machines::publish_cache_disk),
+        );
 
     // Machine routes
     let machine_routes = Router::new()
