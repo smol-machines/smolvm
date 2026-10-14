@@ -1171,6 +1171,16 @@ pub struct ResizeMachineRequest {
     pub overlay_gb: Option<u64>,
 }
 
+/// Request to replace a machine's published ports.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetPortsRequest {
+    /// The machine's published ports, the whole set; an empty list removes
+    /// them all. A running machine takes TCP changes now; its UDP ports stay
+    /// as they are until it stops.
+    pub ports: Vec<PortSpec>,
+}
+
 /// Query string for `POST /machines/{name}/start`.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct StartMachineQuery {

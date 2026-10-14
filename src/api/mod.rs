@@ -108,6 +108,7 @@ use state::ApiState;
         handlers::machines::sync_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
+        handlers::machines::set_machine_ports,
         handlers::machines::publish_cache_disk,
         handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
@@ -149,6 +150,7 @@ use state::ApiState;
         types::DeleteQuery,
         types::LogsQuery,
         types::ResizeMachineRequest,
+        types::SetPortsRequest,
         types::CacheDiskSpec,
         types::PublishCacheDiskRequest,
         types::PublishCacheDiskResponse,
@@ -344,6 +346,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/resume", post(handlers::machines::resume_machine))
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
+        .route("/{id}/ports", put(handlers::machines::set_machine_ports))
         .route(
             "/{id}/egress",
             post(handlers::machines::update_machine_egress),

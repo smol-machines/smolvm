@@ -13,6 +13,7 @@ pub mod input;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
+pub mod live_ports;
 pub mod live_resize;
 mod manager;
 pub mod pod_net;

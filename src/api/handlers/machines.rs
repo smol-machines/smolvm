@@ -45,7 +45,7 @@ use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialValuesRequest, DeleteQuery, DeleteResponse,
     EgressEventsResponse, ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest,
     ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
-    ResourceSpec, StartMachineQuery, UpdateEgressRequest,
+    ResourceSpec, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -6114,6 +6114,62 @@ pub async fn put_credential_values(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// Replace a machine's published ports, live when it runs.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/ports",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = SetPortsRequest,
+    responses(
+        (status = 200, description = "Ports set; a running machine is already serving them", body = MachineInfo),
+        (status = 400, description = "Invalid ports, or a running machine that cannot change them", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "A host port is already in use (PORT_IN_USE), or a UDP change on a running machine", body = ApiErrorResponse)
+    )
+)]
+pub async fn set_machine_ports(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetPortsRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    // Under the lifecycle lock so a start or stop cannot land between reading
+    // the state and applying the ports.
+    let lifecycle = state.lifecycle_lock(&name);
+    let guard = lifecycle.lock_owned().await;
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let running = record.actual_state() == RecordState::Running;
+    let ports: Vec<PortMapping> = req.ports.iter().map(PortMapping::from).collect();
+    let db = state.db().clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        crate::agent::live_ports::set_published_ports(&db, &record, running, &ports)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("set ports task failed: {error}")))?
+    .map_err(classify_set_ports_error)?;
+    Ok(Json(record_to_info(&name, &saved)))
+}
+
+/// A host port something else holds is `PortConflict`, which the control plane
+/// retries on another port; any other configuration refusal is the caller's.
+fn classify_set_ports_error(error: crate::Error) -> ApiError {
+    let message = error.to_string();
+    let lc = message.to_ascii_lowercase();
+    if lc.contains("address already in use") || lc.contains("os error 10048") {
+        return ApiError::PortConflict(message);
+    }
+    match error {
+        crate::Error::Config { .. } => ApiError::BadRequest(message),
+        other => ApiError::from(other),
+    }
+}
+
 /// Resize a machine's disk resources.
 #[utoipa::path(
     post,
@@ -8241,6 +8297,81 @@ mod tests {
         };
         let result = resize_machine(State(state), Path("nonexistent".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn set_ports_on_a_stopped_machine_saves_the_whole_set() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "ports-vm", Some(20), Some(5));
+        let port = |host, guest, protocol| PortSpec {
+            host,
+            guest,
+            protocol,
+        };
+        use crate::data::network::PortProtocol::{Tcp, Udp};
+
+        let req = SetPortsRequest {
+            ports: vec![port(18080, 80, Tcp), port(15353, 53, Udp)],
+        };
+        let info = set_machine_ports(State(state.clone()), Path("ports-vm".into()), Json(req))
+            .await
+            .unwrap();
+        assert_eq!(info.ports.len(), 2);
+        let saved = state.db().get_vm("ports-vm").unwrap().unwrap();
+        assert_eq!(saved.ports, vec![(18080, 80)]);
+        assert_eq!(saved.udp_ports, vec![(15353, 53)]);
+
+        // The whole set: an empty list removes them all.
+        let req = SetPortsRequest { ports: vec![] };
+        let info = set_machine_ports(State(state.clone()), Path("ports-vm".into()), Json(req))
+            .await
+            .unwrap();
+        assert!(info.ports.is_empty());
+        let saved = state.db().get_vm("ports-vm").unwrap().unwrap();
+        assert!(saved.ports.is_empty() && saved.udp_ports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_ports_refuses_a_host_port_twice_and_an_unknown_machine() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "ports-vm", Some(20), Some(5));
+        let tcp = |host, guest| PortSpec {
+            host,
+            guest,
+            protocol: crate::data::network::PortProtocol::Tcp,
+        };
+        let req = SetPortsRequest {
+            ports: vec![tcp(18080, 80), tcp(18080, 81)],
+        };
+        let result =
+            set_machine_ports(State(state.clone()), Path("ports-vm".into()), Json(req)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+
+        let req = SetPortsRequest { ports: vec![] };
+        let result = set_machine_ports(State(state), Path("nope".into()), Json(req)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[test]
+    fn a_taken_host_port_is_a_retryable_port_conflict() {
+        let taken = crate::Error::config(
+            "published ports",
+            "could not change machine 'm''s published ports while it runs: cannot publish \
+             host TCP 0.0.0.0:18080 to guest TCP 80: Address already in use (os error 98)",
+        );
+        assert!(matches!(
+            classify_set_ports_error(taken),
+            ApiError::PortConflict(_)
+        ));
+        let refused = crate::Error::config(
+            "published ports",
+            "machine 'm' is running without virtio-net networking, so its ports can only \
+             change while it is stopped",
+        );
+        assert!(matches!(
+            classify_set_ports_error(refused),
+            ApiError::BadRequest(_)
+        ));
     }
 
     /// Helper to create a VM record in the database.

@@ -1496,55 +1496,12 @@ impl EmbeddedRuntime {
     /// only a machine on virtio-net networking can change ports while running.
     /// A host port already taken fails the call and changes nothing.
     pub fn set_ports(&self, name: &str, ports: &[crate::data::network::PortMapping]) -> Result<()> {
-        use crate::data::network::{PortMapping, PortProtocol, MAX_PORT_MAPPINGS};
-        if ports.len() > MAX_PORT_MAPPINGS {
-            return Err(Error::config(
-                "published ports",
-                format!(
-                    "{} mappings; the maximum per machine is {MAX_PORT_MAPPINGS}",
-                    ports.len()
-                ),
-            ));
-        }
-        PortMapping::check_duplicates(ports).map_err(|e| Error::config("published ports", e))?;
-        let split = |ports: &[PortMapping], protocol: PortProtocol| {
-            let mut set: Vec<(u16, u16)> = ports
-                .iter()
-                .filter(|p| p.protocol == protocol)
-                .map(PortMapping::to_tuple)
-                .collect();
-            set.sort_unstable();
-            set
-        };
-        let tcp = split(ports, PortProtocol::Tcp);
-        let udp = split(ports, PortProtocol::Udp);
         self.with_name_lock(name, || {
             let record = control::get_record(&self.db, name)?;
             let running =
                 crate::agent::state_probe::resolve_state(name, &record) == RecordState::Running;
-            if running {
-                if udp != split(&record.port_mappings(), PortProtocol::Udp) {
-                    return Err(Error::agent_conflict(
-                        "published ports",
-                        "published UDP ports cannot change on a running machine; stop it first",
-                    ));
-                }
-                record.check_live_ports()?;
-                crate::agent::apply_live_published_ports(name, &tcp)?;
-            }
-            let saved = self.db.update_vm(name, |r| {
-                r.ports = tcp.clone();
-                r.udp_ports = udp.clone();
-            });
-            if !matches!(saved, Ok(Some(_))) {
-                if running {
-                    // The record keeps the old set, so the machine must too.
-                    let _ = crate::agent::apply_live_published_ports(name, &record.ports);
-                }
-                saved?;
-                return Err(Error::vm_not_found(name));
-            }
-            Ok(())
+            crate::agent::live_ports::set_published_ports(&self.db, &record, running, ports)
+                .map(|_| ())
         })
     }
 
