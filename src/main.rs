@@ -17,8 +17,19 @@ mod cli;
 )]
 #[command(version)]
 struct Cli {
+    /// How a failure is reported on stderr: `text`, or `json` for
+    /// `{"error":{"code":"NOT_FOUND","message":"…"}}` with a stable code
+    #[arg(long, global = true, value_enum, default_value_t = ErrorFormat::Text)]
+    error_format: ErrorFormat,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -185,6 +196,7 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    let error_format = cli.error_format;
 
     // Initialize logging based on RUST_LOG or default to warn
     init_logging();
@@ -250,7 +262,13 @@ fn main() {
     // Handle errors
     if let Err(e) = result {
         tracing::debug!(error = %e, "command failed");
-        eprintln!("Error: {}", e);
+        match error_format {
+            ErrorFormat::Text => eprintln!("Error: {}", e),
+            ErrorFormat::Json => eprintln!(
+                "{}",
+                serde_json::json!({ "error": { "code": e.code(), "message": e.to_string() } })
+            ),
+        }
         std::process::exit(1);
     }
 }

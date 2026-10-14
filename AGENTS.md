@@ -123,6 +123,7 @@ smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
 smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
 smolvm config registries edit                     # registry auth
 smolvm completion bash|zsh|fish|powershell|elvish # print a shell completion script
+smolvm <any command> --error-format json        # failures as {"error":{"code":"NOT_FOUND","message":…}}
 
 # Secrets are references to host env vars / files, resolved at launch — no
 # built-in store. Attach them on the command line or in a Smolfile [secrets].
@@ -507,6 +508,8 @@ can create and run machines. Machines that ask for nested virtualization
 
 ## Important Behaviors
 
+- **Failures carry stable codes.** `--error-format json` prints a failure as `{"error":{"code":…,"message":…}}` on stderr (exit status unchanged). Codes match the SDKs' `SmolError.code`: `NOT_FOUND` (machine, file, image), `CONFLICT`, `INTERRUPTED` (a stop or delete cut the command off), `CONFIG_ERROR`, `INVALID_STATE`, `STORAGE_ERROR`, `MOUNT_ERROR`, `KVM_UNAVAILABLE`, `HYPERVISOR_UNAVAILABLE`, `COMMAND_FAILED`, `SMOLVM_ERROR`. Branch on the code, not the message.
+- **Disks smaller than 20 GiB need no host tools.** `--storage 8` makes an 8 GiB disk without `resize2fs`, and image machines of that size get an image seed of their own, so creating the next one does not pull the image again.
 - **`machine stop` stops the workload gracefully.** The workload (the image ENTRYPOINT/CMD or Smolfile command) is sent its stop signal (`SIGTERM` by default) and given its stop timeout (10 s by default) to save its state and exit before it is killed and the machine powers off. Set them with `machine create --stop-signal SIG --stop-timeout SECS` or Smolfile `stop_signal` / `stop_timeout`; `machine stop --timeout SECS` overrides the timeout for one stop (`0` kills at once). `machine delete` does not wait.
 - **`machine logs` shows the workload's output.** The workload's stdout and stderr are appended to `workload.log` in the machine's data directory, kept across restarts, rotated at 10 MiB (three old files kept), and readable while the machine is stopped. `-f` follows, `--tail N` shows the last N lines. Output of `machine exec` is not included. Over the API: `GET /api/v1/machines/{name}/logs?source=workload`.
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
