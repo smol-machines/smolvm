@@ -79,8 +79,24 @@ pub async fn pull_with_progress(
 ) -> Result<PullResult> {
     // 1. Fetch the manifest, resolving a multi-platform index to this machine's
     //    host-platform entry (Docker-style fan-out). Shared with `inspect`.
-    tracing::info!(repo = %repo, reference = %reference, "fetching manifest...");
-    let manifest_bytes = client.get_manifest_resolved(repo, reference).await?;
+    //    A manifest already fetched from this repo by digest cannot have changed,
+    //    so it is reused without a registry round trip.
+    let manifest_bytes = match cache.manifest_by_digest(client.base_url(), repo, reference) {
+        Some(bytes) => {
+            tracing::info!(repo = %repo, reference = %reference, "manifest found in cache");
+            bytes
+        }
+        None => {
+            tracing::info!(repo = %repo, reference = %reference, "fetching manifest...");
+            let bytes = client.get_manifest_resolved(repo, reference).await?;
+            if let Err(error) =
+                cache.put_manifest_by_digest(client.base_url(), repo, reference, &bytes)
+            {
+                tracing::debug!(%error, "could not cache manifest");
+            }
+            bytes
+        }
+    };
 
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
 
@@ -105,7 +121,12 @@ pub async fn pull_with_progress(
     // otherwise create a `.partial` file or touch atime outside the cache dir.
     crate::client::validate_digest(digest)?;
 
-    // 3. Check cache.
+    sweep_abandoned_partials_now_and_then(cache);
+
+    // 3. Wait out any other pull of this blob, then check the cache: a pull that
+    //    queued behind one fetching the same blob finds it cached here instead of
+    //    streaming into the partial file the first one is about to rename away.
+    let _download_lock = lock_blob_download(cache, digest).await?;
     if let Some(cached_path) = cache.get(digest) {
         tracing::info!(digest = %digest, "blob found in cache");
 
@@ -150,6 +171,61 @@ pub async fn pull_with_progress(
     Ok(result)
 }
 
+/// How long an abandoned partial download is kept for a retry to resume.
+const ABANDONED_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often a process sweeps abandoned partial downloads.
+const PARTIAL_SWEEP_INTERVAL_SECS: u64 = 60 * 60;
+
+/// Sweep the cache's abandoned partial downloads, at most once per interval
+/// per process, from the pull path, so a long-running serve keeps its cache
+/// clean without a separate timer. A failed sweep only logs.
+fn sweep_abandoned_partials_now_and_then(cache: &BlobCache) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_SWEEP: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_SWEEP.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < PARTIAL_SWEEP_INTERVAL_SECS
+        || LAST_SWEEP
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    if let Err(error) = cache.sweep_abandoned_partials(ABANDONED_PARTIAL_AGE) {
+        tracing::warn!(%error, "could not sweep abandoned partial downloads");
+    }
+}
+
+/// How often a pull waiting on another pull of the same blob checks again.
+const DOWNLOAD_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// Take the exclusive download lock for `digest`, waiting while another pull
+/// (in this process or another one sharing the cache) holds it. Polls
+/// `try_lock` rather than blocking so a waiting pull never parks a runtime
+/// thread. The lock is released when the returned file is dropped, including
+/// when the owning pull fails or is cancelled.
+async fn lock_blob_download(cache: &BlobCache, digest: &str) -> Result<std::fs::File> {
+    let file = cache.download_lock_file(digest)?;
+    let mut waited = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if !waited {
+                    tracing::info!(digest = %digest, "waiting for another pull of this blob");
+                    waited = true;
+                }
+                tokio::time::sleep(DOWNLOAD_LOCK_POLL).await;
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+}
+
 /// Attempts allowed for one blob (first try plus retries).
 const MAX_ATTEMPTS: u32 = 5;
 
@@ -184,10 +260,24 @@ async fn download_with_resume(
         // Resume from whatever a previous attempt left behind. A stale partial
         // from an earlier pull is fine: the digest check at the end rejects it,
         // and a mismatch clears it so the next pull starts clean.
-        let have = tokio::fs::metadata(&partial_path)
+        let mut have = tokio::fs::metadata(&partial_path)
             .await
             .map(|m| m.len())
             .unwrap_or(0);
+
+        // A pull cancelled after its last byte landed but before it verified and
+        // adopted the blob (its machine deleted mid-create) leaves a partial that
+        // already holds the whole blob. Asking the registry for bytes past the
+        // end gets a 416 on every later pull, so finish from disk instead: adopt
+        // it when it is the blob, and start over when it is not.
+        if expected_size > 0 && have >= expected_size {
+            if have == expected_size && hash_file(&partial_path).await? == *digest {
+                tracing::info!(digest = %digest, "adopting a complete partial left by an earlier pull");
+                return finish_download(digest, have, output, cache).await;
+            }
+            discard_partial(&partial_path).await;
+            have = 0;
+        }
 
         match fetch_into_partial(
             client,
@@ -219,19 +309,19 @@ async fn download_with_resume(
                     });
                 }
 
-                let cached_path = cache.adopt(digest, written)?;
-                let result_path = if let Some(out) = output {
-                    tokio::fs::copy(&cached_path, out).await?;
-                    PathBuf::from(out)
-                } else {
-                    cached_path
-                };
-                return Ok(PullResult {
-                    path: result_path,
-                    digest: digest.to_string(),
-                    size: written,
-                    cached: false,
-                });
+                return finish_download(digest, written, output, cache).await;
+            }
+            // The registry refused the resume offset, so the partial does not
+            // line up with the blob it serves: drop it and fetch from the start.
+            Err(RegistryError::ApiError { status: 416, .. })
+                if have > 0 && attempt < MAX_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    digest = %digest,
+                    resumed_from = have,
+                    "registry refused the resume offset; restarting the blob download"
+                );
+                discard_partial(&partial_path).await;
             }
             Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
                 let backoff = RETRY_BACKOFF * 2u32.pow(attempt - 1);
@@ -261,6 +351,37 @@ async fn download_with_resume(
     }
 
     unreachable!("loop returns on the final attempt")
+}
+
+/// Adopt a verified download into the cache and copy it to `output` if asked.
+async fn finish_download(
+    digest: &str,
+    size: u64,
+    output: Option<&Path>,
+    cache: &BlobCache,
+) -> Result<PullResult> {
+    let cached_path = cache.adopt(digest, size)?;
+    let path = if let Some(out) = output {
+        tokio::fs::copy(&cached_path, out).await?;
+        PathBuf::from(out)
+    } else {
+        cached_path
+    };
+    Ok(PullResult {
+        path,
+        digest: digest.to_string(),
+        size,
+        cached: false,
+    })
+}
+
+/// Remove a partial download so the next attempt starts from zero.
+async fn discard_partial(partial_path: &Path) {
+    if let Err(e) = tokio::fs::remove_file(partial_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(error = %e, path = %partial_path.display(), "failed to remove partial blob");
+        }
+    }
 }
 
 /// One download attempt: append the blob to `partial_path` starting at `have`.
@@ -477,6 +598,66 @@ mod tests {
         // MockServer drop asserts the blob endpoint's expect(1) was satisfied.
     }
 
+    /// A second pull of the same repo by digest is served from the cache without
+    /// asking the registry for the manifest again; a tag is always re-fetched, and
+    /// the same digest under another repo still goes to the registry.
+    #[tokio::test]
+    async fn a_digest_pull_reuses_its_manifest_and_a_tag_pull_does_not() {
+        use sha2::{Digest, Sha256};
+
+        let data = b"digest-pinned-layer".to_vec();
+        let layer = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+        let manifest = serde_json::to_vec(&manifest_for(&layer, data.len())).unwrap();
+        let pinned = format!("sha256:{}", hex::encode(Sha256::digest(&manifest)));
+
+        let server = MockServer::start().await;
+        for reference in [pinned.as_str(), "v1"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/myrepo/manifests/{reference}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(manifest.clone(), MANIFEST_MEDIA_TYPE),
+                )
+                .expect(if reference == "v1" { 2 } else { 1 })
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/other/manifests/{pinned}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(manifest.clone(), MANIFEST_MEDIA_TYPE),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{layer}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(data.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+
+        for _ in 0..3 {
+            let result = pull(&client, "myrepo", &pinned, None, &cache, &[])
+                .await
+                .unwrap();
+            assert_eq!(result.digest, layer);
+        }
+        for _ in 0..2 {
+            pull(&client, "myrepo", "v1", None, &cache, &[])
+                .await
+                .unwrap();
+        }
+        let other = pull(&client, "other", &pinned, None, &cache, &[])
+            .await
+            .unwrap();
+        assert!(other.cached, "the layer blob itself is shared by digest");
+        // MockServer drop asserts each manifest endpoint's expected hit count.
+    }
+
     /// Build a manifest whose single layer declares `digest`/`size`.
     fn manifest_for(digest: &str, size: usize) -> serde_json::Value {
         serde_json::json!({
@@ -489,6 +670,57 @@ mod tests {
             },
             "layers": [ { "mediaType": LAYER_MEDIA_TYPE, "digest": digest, "size": size } ],
         })
+    }
+
+    /// Two creates of one artifact at once on a node that has not cached it yet
+    /// both pull its blob. They used to stream into the same `.partial` file, so
+    /// whichever finished second failed with ENOENT once the first renamed it
+    /// into the cache. Now the second waits for the first and is served from
+    /// the cache, and the registry is asked for the blob once.
+    #[tokio::test]
+    async fn concurrent_pulls_of_one_blob_both_succeed_and_fetch_it_once() {
+        use sha2::{Digest, Sha256};
+
+        let data = vec![7u8; 256 * 1024];
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&manifest_for(&digest, data.len())).unwrap(),
+                MANIFEST_MEDIA_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        // Slow enough that both pulls are past the cache check while the first
+        // is still downloading.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(data.clone())
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 16 * 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+
+        let (a, b) = tokio::join!(
+            pull(&client, "myrepo", "latest", None, &cache, &[]),
+            pull(&client, "myrepo", "latest", None, &cache, &[]),
+        );
+        let (a, b) = (a.expect("first pull"), b.expect("second pull"));
+        assert_eq!(
+            [a.cached, b.cached].iter().filter(|c| **c).count(),
+            1,
+            "exactly one pull downloads; the other is served from the cache"
+        );
+        assert_eq!(tokio::fs::read(&a.path).await.unwrap(), data);
+        assert_eq!(a.path, b.path);
     }
 
     /// A download reports progress while it streams: every callback carries the
@@ -615,6 +847,108 @@ mod tests {
         );
         // Each expect(1) asserts the resume happened exactly once: one truncated
         // attempt, one ranged continuation.
+    }
+
+    /// Serve `data` under `myrepo:latest`; the blob endpoint answers 416 to a
+    /// ranged request and the whole blob otherwise, each `expect`ed as given.
+    async fn registry_refusing_ranges(
+        data: &[u8],
+        digest: &str,
+        ranged: u64,
+        whole: u64,
+    ) -> MockServer {
+        use wiremock::matchers::header_exists;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&manifest_for(digest, data.len())).unwrap(),
+                MANIFEST_MEDIA_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .and(header_exists("range"))
+            .respond_with(ResponseTemplate::new(416))
+            .expect(ranged)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(data.to_vec()))
+            .expect(whole)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn test_blob() -> (Vec<u8>, String) {
+        use sha2::{Digest, Sha256};
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 249) as u8).collect();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+        (data, digest)
+    }
+
+    /// The incident: a pull cancelled after its last byte landed left a complete
+    /// `.partial`, and every later pull of that blob asked for bytes past the
+    /// end and failed with the registry's 416. The next pull must adopt it.
+    #[tokio::test]
+    async fn a_complete_partial_left_by_a_cancelled_pull_is_adopted() {
+        let (data, digest) = test_blob();
+        let server = registry_refusing_ranges(&data, &digest, 0, 0).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let partial = cache.blob_path_for(&digest).with_extension("partial");
+        std::fs::write(&partial, &data).unwrap();
+
+        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[])
+            .await
+            .expect("a complete partial must be adopted, not resumed past its end");
+        assert_eq!(result.size, data.len() as u64);
+        assert_eq!(
+            tokio::fs::read(cache.get(&digest).unwrap()).await.unwrap(),
+            data
+        );
+        assert!(!partial.exists(), "the partial is renamed into the cache");
+    }
+
+    /// A full-size partial holding the wrong bytes is thrown away and the blob
+    /// downloaded again from the start, rather than failing the pull.
+    #[tokio::test]
+    async fn a_full_size_partial_with_wrong_bytes_is_downloaded_again() {
+        let (data, digest) = test_blob();
+        let server = registry_refusing_ranges(&data, &digest, 0, 1).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let partial = cache.blob_path_for(&digest).with_extension("partial");
+        std::fs::write(&partial, vec![0u8; data.len()]).unwrap();
+
+        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[])
+            .await
+            .expect("a wrong full-size partial must be replaced");
+        assert_eq!(tokio::fs::read(&result.path).await.unwrap(), data);
+    }
+
+    /// A registry that refuses the resume offset gets asked for the whole blob
+    /// on the next attempt instead of failing the pull.
+    #[tokio::test]
+    async fn a_refused_resume_restarts_the_download() {
+        let (data, digest) = test_blob();
+        let server = registry_refusing_ranges(&data, &digest, 1, 1).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let partial = cache.blob_path_for(&digest).with_extension("partial");
+        std::fs::write(&partial, &data[..100]).unwrap();
+
+        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[])
+            .await
+            .expect("a 416 on resume must restart from zero");
+        assert_eq!(tokio::fs::read(&result.path).await.unwrap(), data);
+    }
+
+    fn client_for(server: &MockServer) -> RegistryClient {
+        RegistryClient::new(server.uri())
     }
 
     /// A terminal failure must NOT be retried. A missing blob is the same answer

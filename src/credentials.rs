@@ -307,11 +307,16 @@ impl CredentialResolver for SecretRefResolver {
     }
 }
 
-/// Parse a `--credential NAME=ENV_VAR@HOST[,HOST...]` flag.
+/// Parse a `--credential NAME=ENV_VAR@HOST[,HOST...][:body]` flag.
 pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBinding, String> {
-    let usage = "expected NAME=ENV_VAR@HOST[,HOST...] (e.g. notion=NOTION_API_KEY@api.notion.com)";
+    let usage =
+        "expected NAME=ENV_VAR@HOST[,HOST...][:body] (e.g. notion=NOTION_API_KEY@api.notion.com)";
     let (name, rest) = spec.split_once('=').ok_or(usage)?;
     let (env_var, hosts) = rest.split_once('@').ok_or(usage)?;
+    let (hosts, body) = match hosts.strip_suffix(":body") {
+        Some(hosts) => (hosts, true),
+        None => (hosts, false),
+    };
     let allowed_hosts: Vec<String> = hosts
         .split(',')
         .map(|h| h.trim().to_ascii_lowercase())
@@ -324,7 +329,10 @@ pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBindin
         name: name.trim().to_string(),
         environment_variable: env_var.trim().to_string(),
         allowed_hosts,
-        injection_location: Default::default(),
+        injection_location: smolvm_protocol::credentials::InjectionLocation {
+            body,
+            ..Default::default()
+        },
         methods: smolvm_protocol::credentials::DEFAULT_METHODS
             .iter()
             .map(|m| m.to_string())
@@ -344,8 +352,31 @@ mod tests {
         assert_eq!(b.name, "notion");
         assert_eq!(b.environment_variable, "NOTION_API_KEY");
         assert_eq!(b.allowed_hosts, vec!["api.notion.com", "files.notion.com"]);
+        let b = parse_credential_flag("oauth=REFRESH@auth.example.com:body").unwrap();
+        assert!(b.injection_location.body);
+        assert_eq!(b.allowed_hosts, vec!["auth.example.com"]);
         assert!(parse_credential_flag("notion=NOTION_API_KEY").is_err());
         assert!(parse_credential_flag("=X@h").is_err());
+    }
+
+    #[test]
+    fn file_backed_credential_uses_the_latest_host_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refresh-token");
+        let source = crate::secrets::file_ref(path.clone());
+        let resolver = SecretRefResolver([("refresh".into(), source)].into());
+        let request = CredentialRequest {
+            machine: "oauth-test".into(),
+            binding: "refresh".into(),
+            host: "auth.example.com".into(),
+            port: 443,
+            method: "POST".into(),
+            path: "/token".into(),
+        };
+        std::fs::write(&path, "first").unwrap();
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "first");
+        std::fs::write(&path, "second").unwrap();
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "second");
     }
 
     fn launch(machine: &str, supplied_only: bool) -> CredentialLaunch {

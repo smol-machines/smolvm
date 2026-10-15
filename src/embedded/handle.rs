@@ -127,8 +127,17 @@ impl VmHandle {
 
     /// Stop the VM and drop the cached agent client.
     pub fn stop(&mut self) -> Result<()> {
+        self.stop_with_timeout(None)
+    }
+
+    /// [`stop`](Self::stop), giving the workload `stop_timeout` to exit after
+    /// its stop signal instead of the timeout it was launched with.
+    pub fn stop_with_timeout(&mut self, stop_timeout: Option<std::time::Duration>) -> Result<()> {
         self.client = None;
-        self.manager.stop()
+        match stop_timeout {
+            Some(stop_timeout) => self.manager.stop_with_timeout(stop_timeout),
+            None => self.manager.stop(),
+        }
     }
 
     /// Let a CLI-started VM outlive the process that launched it.

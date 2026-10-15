@@ -78,6 +78,14 @@ pub struct PortSpec {
     /// Port inside the machine.
     #[schema(example = 80)]
     pub guest: u16,
+    /// Transport to forward: `tcp` (the default) or `udp`. A UDP port is
+    /// forwarded per remote client, and the machine answers each client
+    /// through the same host port.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::data::network::PortProtocol::is_tcp"
+    )]
+    pub protocol: crate::data::network::PortProtocol,
 }
 
 /// A shared cache disk: a read-only base image the machine reads through its
@@ -314,6 +322,12 @@ pub struct UpdateEgressRequest {
     /// host. Mirrors `--net` on `machine update`.
     #[serde(default)]
     pub allow_all: bool,
+    /// Start from an empty allow list before applying this request's
+    /// additions, so the machine ends up with exactly what the request names.
+    /// A reset that names nothing needs `allowAll` to open egress. Cannot be
+    /// combined with removals. Mirrors `--reset-allow-list` on `machine update`.
+    #[serde(default)]
+    pub reset_allow_list: bool,
 }
 
 /// Environment variable.
@@ -536,6 +550,16 @@ pub struct PullImageResponse {
 // Logs Types
 // ============================================================================
 
+/// Query parameters for the stop endpoint.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct StopQuery {
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed, instead of the machine's stop timeout; 0 kills it at once.
+    #[serde(default)]
+    #[schema(example = 30)]
+    pub timeout: Option<u64>,
+}
+
 /// Query parameters for logs endpoint.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LogsQuery {
@@ -549,6 +573,11 @@ pub struct LogsQuery {
     /// Output format: "raw" (default) or "json" (only emit valid JSON lines).
     #[serde(default)]
     pub format: Option<String>,
+    /// Which log: "console" (default), the machine's agent and kernel
+    /// console, or "workload", its workload's stdout and stderr, which is
+    /// kept across restarts and readable while the machine is stopped.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 // ============================================================================
@@ -751,6 +780,17 @@ pub struct CreateMachineRequest {
     /// Off by default.
     #[serde(default)]
     pub docker_socket: bool,
+    /// Signal sent to the workload when the machine stops, so it can save its
+    /// state and exit: a name such as `SIGINT` or `SIGRTMIN+3`, or a number.
+    /// Default `SIGTERM`.
+    #[serde(default)]
+    #[schema(example = "SIGINT")]
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed. Default 10, at most 300.
+    #[serde(default)]
+    #[schema(example = 30)]
+    pub stop_timeout_secs: Option<u64>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,
@@ -807,7 +847,9 @@ pub struct CreateMachineRequest {
     /// Restart policy configuration.
     #[serde(default)]
     pub restart: Option<RestartSpec>,
-    /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
+    /// OCI image reference (e.g., "alpine:latest"), or a `docker save` / OCI
+    /// archive or rootfs directory under the server's `--local-image-dir`.
+    /// Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
     /// Path to a `.smolmachine` or `.checkpoint` artifact. Creates from
@@ -1129,6 +1171,16 @@ pub struct ResizeMachineRequest {
     pub overlay_gb: Option<u64>,
 }
 
+/// Request to replace a machine's published ports.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetPortsRequest {
+    /// The machine's published ports, the whole set; an empty list removes
+    /// them all. A running machine takes TCP changes now; its UDP ports stay
+    /// as they are until it stops.
+    pub ports: Vec<PortSpec>,
+}
+
 /// Query string for `POST /machines/{name}/start`.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct StartMachineQuery {
@@ -1146,6 +1198,19 @@ pub struct StartMachineQuery {
     /// Explicit logical VRAM limit per source/child session, in MiB.
     #[serde(default, rename = "cudaVramLimitMib")]
     pub cuda_vram_limit_mib: Option<u64>,
+}
+
+impl StartMachineQuery {
+    /// Take the start options a caller put in the JSON body as well as the
+    /// query string. Either may ask for a branchable start; a value set in
+    /// the query string wins over the body's.
+    pub fn with_body(self, body: &StartMachineRequest) -> Self {
+        Self {
+            forkable: self.forkable || body.branchable,
+            fork_pool_size: self.fork_pool_size.or(body.branch_pool_size),
+            cuda_vram_limit_mib: self.cuda_vram_limit_mib.or(body.cuda_vram_limit_mib),
+        }
+    }
 }
 
 /// Credentials for the registry a machine's image lives in.
@@ -1209,6 +1274,19 @@ pub struct StartMachineRequest {
     /// the API server only and is never written to the machine record.
     #[serde(default)]
     pub egress_interceptor: Option<ExternalInterceptorSpec>,
+
+    /// Start as a branch source; the same as the `branchable` query parameter,
+    /// so a caller that puts its start options in the body is not ignored.
+    #[serde(default, alias = "forkable")]
+    pub branchable: bool,
+
+    /// The `branchPoolSize` query parameter, accepted in the body too.
+    #[serde(default, alias = "forkPoolSize")]
+    pub branch_pool_size: Option<u32>,
+
+    /// The `cudaVramLimitMib` query parameter, accepted in the body too.
+    #[serde(default)]
+    pub cuda_vram_limit_mib: Option<u64>,
 }
 
 /// Host interceptor binding supplied in a machine start request.
@@ -1318,6 +1396,9 @@ pub struct ForkRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
+    /// Labels set on the child over the ones inherited from the source.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// Preferred public name for [`ForkRequest`].
@@ -1766,7 +1847,7 @@ mod registry_auth_tests {
         // And it must stay redacted when nested in the request struct.
         let req = StartMachineRequest {
             registry_auth: Some(spec),
-            egress_interceptor: None,
+            ..Default::default()
         };
         assert!(!format!("{req:?}").contains("ghp_super_secret_value"));
     }

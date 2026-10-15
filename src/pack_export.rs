@@ -503,6 +503,7 @@ impl ExportVm {
                 network,
                 network_backend: None,
                 dns,
+                dns_options: Vec::new(),
                 gpu: false,
                 cuda: false,
                 gpu_vram_mib: None,
@@ -514,6 +515,8 @@ impl ExportVm {
                 disk_durability: Default::default(),
                 disks: Vec::new(),
                 cache_disk: None,
+                disk_volumes: Vec::new(),
+                block_private: None,
                 allowed_cidrs: None,
                 egress_rules: Vec::new(),
                 network_name: None,
@@ -962,7 +965,9 @@ mod cached_export_tests {
         let launched = std::process::Command::new("sh")
             .args([
                 "-c",
-                "sh -c 'sleep 60' \"$0\" </dev/null >/dev/null 2>&1 & echo $!",
+                // A loop, so the shell never execs away and its command line
+                // keeps naming the scratch directory.
+                "sh -c 'while :; do sleep 1; done' \"$0\" </dev/null >/dev/null 2>&1 & echo $!",
                 &format!("{}/boot-config.json", orphan_dir.display()),
             ])
             .output()
@@ -1597,6 +1602,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             network: false,
             network_backend: None,
             dns: None,
+            dns_options: Vec::new(),
             gpu: false,
             cuda: false,
             gpu_vram_mib: None,
@@ -1608,6 +1614,8 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             allowed_cidrs: None,
             egress_rules: Vec::new(),
             network_name: None,

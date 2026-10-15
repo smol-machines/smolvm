@@ -557,6 +557,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if 1.0.4",
+ "cpufeatures 0.3.1",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -711,6 +722,15 @@ name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "cpufeatures"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
 ]
@@ -1313,11 +1333,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if 1.0.4",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -1327,10 +1345,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if 1.0.4",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2041,7 +2062,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "metrics",
  "quanta",
- "rand",
+ "rand 0.9.4",
  "rand_xoshiro",
  "sketches-ddsketch",
 ]
@@ -2644,14 +2665,15 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.15"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "lru-slab",
- "rand",
+ "rand 0.10.3",
+ "rand_pcg",
  "ring",
  "rustc-hash",
  "rustls",
@@ -2705,7 +2727,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
  "rand_chacha",
- "rand_core",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.2",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2715,7 +2748,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -2728,12 +2761,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_xoshiro"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
 dependencies = [
- "rand_core",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -2972,9 +3020,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -3037,9 +3085,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "ruzstd"
-version = "0.7.3"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 dependencies = [
  "twox-hash",
 ]
@@ -3218,7 +3266,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
 dependencies = [
  "cfg-if 1.0.4",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest",
 ]
 
@@ -3229,7 +3277,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if 1.0.4",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest",
 ]
 
@@ -3294,7 +3342,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smolfile"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "serde",
  "smolvm-protocol",
@@ -3320,7 +3368,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -3391,7 +3439,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-agent"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "flate2",
  "lazy_static",
@@ -3402,6 +3450,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "sha2",
  "smolvm-oci-layer",
  "smolvm-protocol",
  "smolvm-s3fs",
@@ -3414,7 +3463,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-checkpoint"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "hex",
  "libc",
@@ -3430,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-credentials"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3450,12 +3499,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "x509-parser",
  "zeroize",
 ]
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -3464,11 +3514,11 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.25.4"
+version = "1.28.1"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -3476,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3485,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3494,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "crossbeam-queue",
  "getrandom 0.3.4",
@@ -3512,14 +3562,14 @@ dependencies = [
 
 [[package]]
 name = "smolvm-nvml-shim"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "smolvm-oci-layer"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "flate2",
  "libc",
@@ -3532,7 +3582,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-pack"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "crc32fast",
  "dirs",
@@ -3552,7 +3602,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-protocol"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "base64",
  "serde",
@@ -3562,7 +3612,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-registry"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "bytes",
  "dirs",
@@ -3571,6 +3621,8 @@ dependencies = [
  "hex",
  "rcgen",
  "reqwest",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",
@@ -3586,7 +3638,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-s3fs"
-version = "1.25.4"
+version = "1.28.1"
 dependencies = [
  "hmac",
  "libc",
@@ -3627,12 +3679,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strsim"
@@ -4193,20 +4239,16 @@ dependencies = [
  "http",
  "httparse",
  "log",
- "rand",
+ "rand 0.9.4",
  "sha1",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "twox-hash"
-version = "1.6.3"
+version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
-dependencies = [
- "cfg-if 1.0.4",
- "static_assertions",
-]
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

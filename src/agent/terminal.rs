@@ -170,7 +170,11 @@ mod unix_impl {
             // POLLHUP: the pipe's write end was closed (e.g., `echo | smolvm exec -i`).
             // Without this, piped stdin EOF is never detected and the host hangs
             // forever waiting for more input.
-            stdin_ready: fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0,
+            // POLLNVAL: macOS poll() reports /dev/null this way instead of POLLIN
+            // (`smolvm machine run -i -- cat < /dev/null`); the read then sees EOF.
+            stdin_ready: fds[0].revents
+                & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                != 0,
             socket_ready: fds[1].revents & libc::POLLIN != 0,
             socket_hangup: fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0,
         })
@@ -620,5 +624,19 @@ mod tests {
     fn test_get_terminal_size_returns_option() {
         // Just verify it doesn't panic
         let _ = get_terminal_size();
+    }
+
+    #[test]
+    fn test_poll_io_reports_dev_null_stdin_ready() {
+        // macOS poll() reports /dev/null as POLLNVAL only. Stdin must still be
+        // ready so the next read returns EOF instead of the loop spinning (#1803).
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let stdin = std::fs::File::open("/dev/null").unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let result = poll_io(stdin.as_raw_fd(), socket.as_raw_fd(), 0).unwrap();
+        assert!(result.stdin_ready);
+        assert!(!result.socket_ready);
     }
 }

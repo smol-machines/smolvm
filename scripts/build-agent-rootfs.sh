@@ -103,7 +103,9 @@ tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd"
+# GNU tar replaces busybox tar, which never sets a symlink's owner when it
+# unpacks image layers.
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd tar"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"

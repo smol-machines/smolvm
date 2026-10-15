@@ -205,6 +205,13 @@ impl MachineCa {
         params.distinguished_name = dn;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        // Name the issuer's key and this leaf's own key. OpenSSL's strict
+        // verification (Python's default context) rejects a non-self-signed
+        // certificate without an Authority Key Identifier, and RFC 5280
+        // requires one; marking the leaf explicitly as not a CA is what makes
+        // rcgen write its Subject Key Identifier.
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.use_authority_key_identifier_extension = true;
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
         params.not_after = rcgen::date_time_ymd(2099, 1, 1);
         let leaf = params
@@ -316,5 +323,46 @@ mod tests {
             "the CA key must not be able to vouch for any other domain"
         );
         assert!(MachineCa::generate("demo", &[]).is_err());
+    }
+
+    /// A leaf names its own key and its issuer's: the Authority Key
+    /// Identifier equals the CA certificate's Subject Key Identifier, also for
+    /// a CA reloaded from disk, whose issuer is re-derived rather than parsed.
+    #[test]
+    fn leaves_carry_key_identifiers_that_chain_to_the_ca() {
+        use x509_parser::extensions::ParsedExtension;
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        fn identifiers(der: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+            let (_, cert) = X509Certificate::from_der(der).unwrap();
+            let (mut subject, mut authority) = (None, None);
+            for ext in cert.extensions() {
+                match ext.parsed_extension() {
+                    ParsedExtension::SubjectKeyIdentifier(id) => subject = Some(id.0.to_vec()),
+                    ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                        authority = aki.key_identifier.as_ref().map(|id| id.0.to_vec())
+                    }
+                    _ => {}
+                }
+            }
+            (subject, authority)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = MachineCa::generate("demo", &["api.example.com".to_string()]).unwrap();
+        ca.save(dir.path()).unwrap();
+        let (ca_subject, _) = identifiers(&ca.cert_der);
+        let ca_subject = ca_subject.expect("the CA names its own key");
+        for issuer in [&ca, &MachineCa::load(dir.path(), "demo").unwrap()] {
+            let (chain, _key) = issuer.issue_leaf("api.example.com").unwrap();
+            let (leaf_subject, leaf_authority) = identifiers(&chain[0]);
+            assert!(leaf_subject.is_some(), "the leaf names its own key");
+            assert_ne!(leaf_subject.as_deref(), Some(ca_subject.as_slice()));
+            assert_eq!(
+                leaf_authority.as_deref(),
+                Some(ca_subject.as_slice()),
+                "the leaf's authority key identifier is the CA's subject key identifier"
+            );
+        }
     }
 }
