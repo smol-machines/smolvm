@@ -278,9 +278,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(uid);
-            if let Err(e) =
-                crate::process::setup_private_idmap_mounts(pack, &seed_dirs, uid, gid)
-            {
+            if let Err(e) = crate::process::setup_private_idmap_mounts(pack, &seed_dirs, uid, gid) {
                 eprintln!("[idmap] failed to mount private backing store, refusing to boot: {e}");
                 if e.raw_os_error() == Some(libc::EINVAL) {
                     eprintln!(
