@@ -46,6 +46,30 @@ test_machine_status_stopped() {
     [[ $exit_code -ne 0 ]] || [[ "$status" == *"not running"* ]] || [[ "$status" == *"stopped"* ]]
 }
 
+test_machine_stats_reports_cpu_and_memory() {
+    ensure_machine_running
+    $SMOLVM machine exec -- sh -c 'end=$(($(date +%s) + 4)); while [ "$(date +%s)" -lt "$end" ]; do :; done' >/dev/null 2>&1 &
+    local busy=$!
+    sleep 1
+    local stats
+    stats=$($SMOLVM machine stats --json 2>&1)
+    wait "$busy" 2>/dev/null || true
+    echo "$stats" | python3 -c "
+import sys, json
+stats = json.load(sys.stdin)
+assert stats['cpu_percent'] > 50, stats
+memory = stats['memory']
+assert 0 < memory['used_bytes'] < memory['total_bytes'], stats
+" 2>&1 || { echo "$stats"; return 1; }
+}
+
+test_machine_stats_when_stopped() {
+    cleanup_machine
+    local exit_code=0
+    $SMOLVM machine stats 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]]
+}
+
 test_machine_start_stop_cycle() {
     cleanup_machine
 
@@ -734,6 +758,8 @@ run_test "Machine start" test_machine_start || true
 run_test "Machine stop" test_machine_stop || true
 run_test "Machine status (running)" test_machine_status_running || true
 run_test "Machine status (stopped)" test_machine_status_stopped || true
+run_test "Machine stats: CPU and memory of a busy machine" test_machine_stats_reports_cpu_and_memory || true
+run_test "Machine stats: stopped machine fails" test_machine_stats_when_stopped || true
 run_test "Machine start/stop cycle" test_machine_start_stop_cycle || true
 run_test "Machine exec" test_machine_exec || true
 run_test "Machine exec: echo" test_machine_exec_echo || true

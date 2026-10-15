@@ -3201,6 +3201,97 @@ mod status_output_tests {
     }
 }
 
+#[cfg(test)]
+mod stats_tests {
+    use super::{cpu_percent, machine_stats_json, machine_stats_text};
+    use smolvm::process::ProcessStats;
+    use smolvm_protocol::MemoryStatus;
+    use std::time::Duration;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn cpu(cpu_time_ns: u64) -> ProcessStats {
+        ProcessStats {
+            cpu_time_ns,
+            rss_bytes: 0,
+        }
+    }
+
+    fn memory() -> MemoryStatus {
+        MemoryStatus {
+            total_bytes: 2 * GIB,
+            available_bytes: GIB + GIB / 2,
+            free_bytes: GIB,
+            cached_bytes: GIB / 4,
+            swap_total_bytes: 0,
+            swap_used_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn cpu_percent_counts_one_busy_cpu_as_a_hundred() {
+        let window = Duration::from_millis(500);
+        assert_eq!(
+            cpu_percent(cpu(1_000_000_000), cpu(1_500_000_000), window),
+            Some(100.0)
+        );
+        assert_eq!(cpu_percent(cpu(0), cpu(750_000_000), window), Some(150.0));
+        assert_eq!(cpu_percent(cpu(5), cpu(5), window), Some(0.0));
+    }
+
+    #[test]
+    fn cpu_percent_needs_a_window_and_a_clock_that_moves_forward() {
+        assert_eq!(cpu_percent(cpu(0), cpu(10), Duration::ZERO), None);
+        assert_eq!(
+            cpu_percent(cpu(10), cpu(0), Duration::from_millis(500)),
+            None
+        );
+    }
+
+    #[test]
+    fn json_reports_cpu_and_guest_memory_in_bytes() {
+        let json = machine_stats_json("web", 2, Some(37.5), Some(memory()));
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "web",
+                "cpus": 2,
+                "cpu_percent": 37.5,
+                "memory": {
+                    "total_bytes": 2 * GIB,
+                    "used_bytes": GIB / 2,
+                    "available_bytes": GIB + GIB / 2,
+                    "free_bytes": GIB,
+                    "cached_bytes": GIB / 4,
+                    "swap_total_bytes": 0,
+                    "swap_used_bytes": 0,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn json_keeps_the_keys_when_a_figure_is_unavailable() {
+        let json = machine_stats_json("web", 1, None, None);
+        assert!(json["cpu_percent"].is_null());
+        assert!(json["memory"].is_null());
+    }
+
+    #[test]
+    fn text_reads_like_status() {
+        assert_eq!(
+            machine_stats_text("web", 2, Some(37.5), Some(memory())),
+            "Machine 'web': running\n  \
+             cpu: 37.5% of 200% (2 CPUs)\n  \
+             memory: 0.50 GiB of 2.00 GiB used (25%), 1.50 GiB available\n"
+        );
+        assert_eq!(
+            machine_stats_text("web", 1, None, None),
+            "Machine 'web': running\n  cpu: unavailable\n  memory: unavailable\n"
+        );
+    }
+}
+
 /// Print what the machine is actually using, asked of the guest.
 ///
 /// Deliberately not taken from the host: macOS charges the VMM's
@@ -3216,21 +3307,133 @@ fn memory_usage_line(manager: &AgentManager) -> Option<String> {
     else {
         return None;
     };
-    let Ok(status) = client.memory_status() else {
-        return None;
-    };
-    if status.total_bytes == 0 {
-        return None;
-    }
+    guest_memory(&mut client).map(|status| format_memory_line(&status))
+}
+
+/// The guest's memory, or `None` when its agent predates the request or the
+/// kernel reported no total.
+fn guest_memory(client: &mut smolvm::agent::AgentClient) -> Option<smolvm_protocol::MemoryStatus> {
+    client
+        .memory_status()
+        .ok()
+        .filter(|status| status.total_bytes > 0)
+}
+
+fn format_memory_line(status: &smolvm_protocol::MemoryStatus) -> String {
     let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let percent = status.used_bytes() as f64 * 100.0 / status.total_bytes as f64;
-    Some(format!(
+    format!(
         "  memory: {:.2} GiB of {:.2} GiB used ({:.0}%), {:.2} GiB available\n",
         gib(status.used_bytes()),
         gib(status.total_bytes),
         percent,
         gib(status.available_bytes),
-    ))
+    )
+}
+
+/// How long `machine stats` watches the machine's process to rate its CPU.
+const CPU_SAMPLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Sample a running machine's CPU and memory and print them.
+///
+/// CPU comes from the host: the VMM process's CPU time over
+/// [`CPU_SAMPLE_WINDOW`], which counts every vCPU and needs nothing from the
+/// guest. Memory comes from the guest, for the reasons given on
+/// [`memory_usage_line`]. Either is reported as unavailable rather than failing
+/// the command: a missing PID or an agent too old for `MemoryStatus` should not
+/// hide the other figure.
+pub fn stats_vm(name: &Option<String>, json: bool) -> smolvm::Result<()> {
+    let label = vm_label(name);
+    let (manager, mut client) = ensure_running_and_connect(name)?;
+    manager.detach();
+    let cpus = SmolvmDb::open()
+        .ok()
+        .and_then(|db| db.get_vm(&label).ok().flatten())
+        .map(|record| record.cpus)
+        .unwrap_or(DEFAULT_MICROVM_CPU_COUNT);
+    let memory = guest_memory(&mut client);
+    let cpu = manager.child_pid().and_then(sample_cpu_percent);
+
+    let output = if json {
+        let value = machine_stats_json(&label, cpus, cpu, memory);
+        let text = serde_json::to_string_pretty(&value)
+            .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+        format!("{text}\n")
+    } else {
+        machine_stats_text(&label, cpus, cpu, memory)
+    };
+    write_status_output(&output)
+}
+
+fn sample_cpu_percent(pid: smolvm::process::Pid) -> Option<f64> {
+    let before = smolvm::process::process_stats(pid)?;
+    let started = std::time::Instant::now();
+    std::thread::sleep(CPU_SAMPLE_WINDOW);
+    let after = smolvm::process::process_stats(pid)?;
+    cpu_percent(before, after, started.elapsed())
+}
+
+/// CPU used between two samples of one process, where 100 is one busy CPU.
+///
+/// `None` when no time passed or the CPU time went backwards, which means the
+/// PID was reused by another process between the samples.
+fn cpu_percent(
+    before: smolvm::process::ProcessStats,
+    after: smolvm::process::ProcessStats,
+    elapsed: std::time::Duration,
+) -> Option<f64> {
+    if elapsed.is_zero() || after.cpu_time_ns < before.cpu_time_ns {
+        return None;
+    }
+    let used_ns = (after.cpu_time_ns - before.cpu_time_ns) as f64;
+    Some(used_ns * 100.0 / elapsed.as_nanos() as f64)
+}
+
+fn machine_stats_json(
+    name: &str,
+    cpus: u8,
+    cpu_percent: Option<f64>,
+    memory: Option<smolvm_protocol::MemoryStatus>,
+) -> serde_json::Value {
+    let memory = memory.map(|status| {
+        serde_json::json!({
+            "total_bytes": status.total_bytes,
+            "used_bytes": status.used_bytes(),
+            "available_bytes": status.available_bytes,
+            "free_bytes": status.free_bytes,
+            "cached_bytes": status.cached_bytes,
+            "swap_total_bytes": status.swap_total_bytes,
+            "swap_used_bytes": status.swap_used_bytes,
+        })
+    });
+    serde_json::json!({
+        "name": name,
+        "cpus": cpus,
+        "cpu_percent": cpu_percent,
+        "memory": memory,
+    })
+}
+
+fn machine_stats_text(
+    name: &str,
+    cpus: u8,
+    cpu_percent: Option<f64>,
+    memory: Option<smolvm_protocol::MemoryStatus>,
+) -> String {
+    let mut output = format!("Machine '{name}': running\n");
+    match cpu_percent {
+        Some(percent) => output.push_str(&format!(
+            "  cpu: {percent:.1}% of {}% ({cpus} {})\n",
+            u32::from(cpus) * 100,
+            if cpus == 1 { "CPU" } else { "CPUs" }
+        )),
+        None => output.push_str("  cpu: unavailable\n"),
+    }
+    match memory {
+        Some(status) => output.push_str(&format_memory_line(&status)),
+        None => output.push_str("  memory: unavailable\n"),
+    }
+    output
 }
 
 /// Guest-side listening state of each published port of a running machine.

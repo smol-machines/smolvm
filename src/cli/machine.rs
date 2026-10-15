@@ -407,6 +407,9 @@ pub enum MachineCmd {
     /// Show machine status
     Status(StatusCmd),
 
+    /// Show a running machine's CPU and memory usage
+    Stats(StatsCmd),
+
     /// Show the workload's output (stdout and stderr), even while stopped
     Logs(LogsCmd),
 
@@ -485,6 +488,7 @@ impl MachineCmd {
             MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
+            MachineCmd::Stats(cmd) => cmd.run(),
             MachineCmd::Logs(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
@@ -2924,6 +2928,18 @@ mod tests {
             "65",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn stats_takes_a_machine_name_and_json() {
+        let Ok(MachineCmd::Stats(stats)) =
+            TestMachineCli::try_parse_from(["machine", "stats", "--name", "web", "--json"])
+                .map(|cli| cli.command)
+        else {
+            panic!("expected machine stats");
+        };
+        assert_eq!(stats.name.as_deref(), Some("web"));
+        assert!(stats.json);
     }
 
     #[test]
@@ -5908,6 +5924,31 @@ impl StatusCmd {
             return vm_common::status_vm_json(&self.name);
         }
         vm_common::status_vm(&self.name)
+    }
+}
+
+// ============================================================================
+// Stats Command
+// ============================================================================
+
+/// Show a running machine's CPU and memory usage.
+///
+/// CPU is the machine's process on the host, sampled over half a second, where
+/// 100% is one busy CPU. Memory is the guest's own account, as in `status`.
+#[derive(Args, Debug)]
+pub struct StatsCmd {
+    /// Machine to sample (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl StatsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        vm_common::stats_vm(&self.name, self.json)
     }
 }
 
