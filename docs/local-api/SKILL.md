@@ -126,8 +126,8 @@ Full detail in `references/traps.md` and `references/api-fields.md`.
   a `memory` for `memoryMb` got no diagnostic at all and the machine took the default.
 - **A second `serve start` on the same host fails** with `bind guest rollout ingress:
   127.0.0.1:10081: Address already in use`, whatever `--listen` says: every server binds that port
-  for the branch-pool rollout routes. Set `SMOLVM_GUEST_ROLLOUT_HOST_PORT` to another port for the
-  second one.
+  for the branch-pool rollout routes. Give the second one `--guest-rollout-port` (v1.28.2+) or
+  `SMOLVM_GUEST_ROLLOUT_HOST_PORT` with another port.
 - **Stopping the server leaves machines running.**
 - **The spec's `info.version` is not the binary's.** It says `0.5.2` on v1.14.2 while `/health`
   says `1.14.2`, and still `0.5.2` on v1.22.2. Take the version from `/health`.

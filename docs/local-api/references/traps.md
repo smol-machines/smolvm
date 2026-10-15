@@ -113,7 +113,8 @@ Error: config operation failed: bind guest rollout ingress: 127.0.0.1:10081: Add
 ```
 
 Measured on macOS arm64 on v1.22.2 with another server already holding the port. With
-`SMOLVM_GUEST_ROLLOUT_HOST_PORT=10091` the second server started and answered on `/health`.
+`SMOLVM_GUEST_ROLLOUT_HOST_PORT=10091` the second server started and answered on `/health`. From
+v1.28.2 the same setting is the `--guest-rollout-port` flag; the variable still works.
 
 ## Field names, versions and error bodies
 

@@ -98,6 +98,18 @@ pub struct ServeStartCmd {
     #[arg(long = "allow-nested-virt")]
     allow_nested_virt: bool,
 
+    /// Loopback port for the guest rollout routes. Every server binds it,
+    /// whatever --listen says, so give each its own to run several on one
+    /// host. Running machines keep the port they started with.
+    #[arg(
+        long = "guest-rollout-port",
+        value_name = "PORT",
+        env = "SMOLVM_GUEST_ROLLOUT_HOST_PORT",
+        default_value_t = smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    guest_rollout_port: u16,
+
     /// Directory of cache disk bases the API may attach (`cacheDisk` on
     /// create) and publish into. A request names a base by file name in this
     /// directory, never by path. Unset: the API refuses cache disks.
@@ -331,26 +343,7 @@ impl ServeStartCmd {
         // VMM subprocesses may route exactly one gateway port to the
         // lease-authenticated rollout listener started below. This is internal
         // node configuration, never a guest-supplied egress exception.
-        let guest_rollout_host_port =
-            std::env::var(smolvm::api::guest_rollout::GUEST_ROLLOUT_HOST_PORT_ENV)
-                .ok()
-                .map(|value| {
-                    value
-                        .parse::<u16>()
-                        .ok()
-                        .filter(|port| *port != 0)
-                        .ok_or_else(|| {
-                            smolvm::error::Error::config(
-                                "configure guest rollout ingress",
-                                format!(
-                                    "{} must be an integer between 1 and 65535",
-                                    smolvm::api::guest_rollout::GUEST_ROLLOUT_HOST_PORT_ENV
-                                ),
-                            )
-                        })
-                })
-                .transpose()?
-                .unwrap_or(smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT);
+        let guest_rollout_host_port = self.guest_rollout_port;
         smolvm::network::launch::configure_guest_host_service(
             smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT,
             guest_rollout_host_port,
@@ -1166,6 +1159,29 @@ mod tests {
             super::ServeStartCmd::try_parse_from(["serve", "--restore-cache-entries", "2000"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_guest_rollout_port_defaults_to_the_guest_port_and_can_move() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            super::ServeStartCmd::try_parse_from(
+                std::iter::once("serve").chain(args.iter().copied()),
+            )
+        };
+        if std::env::var_os("SMOLVM_GUEST_ROLLOUT_HOST_PORT").is_none() {
+            assert_eq!(
+                parse(&[]).unwrap().guest_rollout_port,
+                smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT
+            );
+        }
+        assert_eq!(
+            parse(&["--guest-rollout-port", "10091"])
+                .unwrap()
+                .guest_rollout_port,
+            10091
+        );
+        assert!(parse(&["--guest-rollout-port", "0"]).is_err());
     }
 
     #[test]
