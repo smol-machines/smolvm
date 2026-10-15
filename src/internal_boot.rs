@@ -250,8 +250,11 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     {
         // The seed belongs to the launcher uid. A mount is needed only when
         // this VMM will drop to a different, per-VM uid.
-        let seed_dir = std::env::var_os("SMOLVM_VM_UID")
-            .and_then(|_| seed_dir_for_disk(&config.storage_disk_path));
+        let seed_dirs = if std::env::var_os("SMOLVM_VM_UID").is_some() {
+            boot_seed_dirs(&config)
+        } else {
+            Vec::new()
+        };
         let pack = config.pack_idmap_source.as_ref().map(|shared| {
             let target = config.packed_layers_dir.as_ref().unwrap_or_else(|| {
                 eprintln!("[pack-idmap] idmap source set without a mountpoint; refusing to boot");
@@ -259,7 +262,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
             });
             (shared.as_path(), target.as_path())
         });
-        if pack.is_none() && seed_dir.is_none() {
+        if pack.is_none() && seed_dirs.is_empty() {
             // No private mount needed for this boot.
         } else {
             let uid: u32 = std::env::var("SMOLVM_VM_UID")
@@ -276,7 +279,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(uid);
             if let Err(e) =
-                crate::process::setup_private_idmap_mounts(pack, seed_dir.as_deref(), uid, gid)
+                crate::process::setup_private_idmap_mounts(pack, &seed_dirs, uid, gid)
             {
                 eprintln!("[idmap] failed to mount private backing store, refusing to boot: {e}");
                 if e.raw_os_error() == Some(libc::EINVAL) {
@@ -808,6 +811,24 @@ fn cache_disk_layer(config: &crate::agent::boot_config::BootConfig) -> Option<Pa
     config.resources.cache_disk.as_ref()?;
     let dir = config.storage_disk_path.parent()?;
     Some(dir.join(Path::new(crate::data::storage::CACHE_DISK_FILENAME).with_extension("qcow2")))
+}
+
+/// The seeds behind every disk this boot attaches. An export helper boots on a
+/// fresh disk of its own and attaches the source machine's seeded storage as an
+/// extra disk, so looking only at the boot's own storage left that seed
+/// root-only and the dropped VMM could not open the source.
+#[cfg(target_os = "linux")]
+fn boot_seed_dirs(config: &crate::agent::boot_config::BootConfig) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let disks = [&config.storage_disk_path, &config.overlay_disk_path]
+        .into_iter()
+        .chain(config.extra_disks.iter().map(|(path, _, _)| path));
+    for dir in disks.filter_map(|disk| seed_dir_for_disk(disk)) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Find a seed in the storage backing chain, including a fork's intermediate

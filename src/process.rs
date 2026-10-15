@@ -1983,7 +1983,7 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
 #[cfg(target_os = "linux")]
 pub fn setup_private_idmap_mounts(
     pack: Option<(&std::path::Path, &std::path::Path)>,
-    seed_dir: Option<&std::path::Path>,
+    seed_dirs: &[std::path::PathBuf],
     uid: u32,
     gid: u32,
 ) -> std::io::Result<()> {
@@ -2020,7 +2020,7 @@ pub fn setup_private_idmap_mounts(
         if let Some((shared, target)) = pack {
             mount_idmapped(shared, target, userns_fd, true)?;
         }
-        if let Some(seed_dir) = seed_dir {
+        for seed_dir in seed_dirs {
             mount_idmapped(seed_dir, seed_dir, userns_fd, true)?;
         }
         Ok(())
@@ -2038,7 +2038,7 @@ pub fn setup_pack_idmap_mount(
     uid: u32,
     gid: u32,
 ) -> std::io::Result<()> {
-    setup_private_idmap_mounts(Some((shared, target)), None, uid, gid)
+    setup_private_idmap_mounts(Some((shared, target)), &[], uid, gid)
 }
 
 #[cfg(target_os = "linux")]
