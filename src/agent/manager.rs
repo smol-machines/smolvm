@@ -1271,7 +1271,11 @@ impl AgentManager {
             if dir.is_dir() {
                 return Ok(dir);
             }
-            for name in ["agent-rootfs.tar.gz", "agent-rootfs.tar"] {
+            for name in [
+                "agent-rootfs.tar.zst",
+                "agent-rootfs.tar.gz",
+                "agent-rootfs.tar",
+            ] {
                 let tar = exe_dir.join(name);
                 if tar.is_file() {
                     return Self::ensure_extracted_rootfs(&tar);
@@ -1370,13 +1374,24 @@ impl AgentManager {
         // Use the system `tar` — it preserves symlinks (e.g. /sbin/init) and modes
         // (the executable agent), which the tar crate handling here would not need
         // to reimplement. Extraction runs on the host before VM boot (unsandboxed).
-        let status = std::process::Command::new("tar")
-            .arg("-xpf")
-            .arg(tar)
-            .arg("-C")
-            .arg(&tmp)
-            .status()
-            .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))?;
+        let status = if tar.extension().is_some_and(|ext| ext == "zst") {
+            Self::extract_zstd_tar(tar, &tmp)
+        } else {
+            std::process::Command::new("tar")
+                .arg("-xpf")
+                .arg(tar)
+                .arg("-C")
+                .arg(&tmp)
+                .status()
+                .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+        };
         // tar's exit status cannot decide this on its own: a healthy Windows
         // extraction also exits non-zero, on the extended-attribute warning.
         if let Err(e) = Self::accept_extraction(&tmp, status) {
@@ -1401,6 +1416,31 @@ impl AgentManager {
             }
         }
         Ok(dest)
+    }
+
+    /// Extract a zstd-compressed rootfs tarball into `dest`: decompressed here
+    /// and streamed into the system `tar`, which then needs no `zstd` program
+    /// of its own (GNU tar shells out to one for `.zst`, and hosts often lack it).
+    fn extract_zstd_tar(tar: &Path, dest: &Path) -> Result<std::process::ExitStatus> {
+        let fail = |e: std::io::Error| Error::storage("extract rootfs tar", e.to_string());
+        let mut decoder = zstd::stream::read::Decoder::new(std::fs::File::open(tar).map_err(fail)?)
+            .map_err(fail)?;
+        let mut child = std::process::Command::new("tar")
+            .arg("-xpf")
+            .arg("-")
+            .arg("-C")
+            .arg(dest)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(fail)?;
+        let copied = {
+            let mut stdin = child.stdin.take().expect("tar stdin is piped");
+            std::io::copy(&mut decoder, &mut stdin)
+        };
+        let status = child.wait().map_err(fail)?;
+        // A decode error means a damaged tarball, whatever tar made of the rest.
+        copied.map_err(fail)?;
+        Ok(status)
     }
 
     /// Get the current state of the agent.
@@ -4397,6 +4437,56 @@ mod tests {
     fn restored_cuda_clones_fail_faster_than_other_boots() {
         assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
         assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
+    }
+
+    // A zstd rootfs tarball extracts through the system tar without a `zstd`
+    // program: modes and symlinks survive, and a damaged one is an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_zstd_rootfs_tarball_extracts_with_modes_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("sbin")).unwrap();
+        std::fs::create_dir_all(src.join("usr/local/bin")).unwrap();
+        let agent = src.join("usr/local/bin/smolvm-agent");
+        std::fs::write(&agent, b"agent").unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", src.join("sbin/init")).unwrap();
+        let tar = dir.path().join("rootfs.tar");
+        assert!(std::process::Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success());
+        let zst = dir.path().join("agent-rootfs.tar.zst");
+        let compressed = zstd::stream::encode_all(std::fs::File::open(&tar).unwrap(), 3).unwrap();
+        std::fs::write(&zst, &compressed).unwrap();
+
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        assert!(AgentManager::extract_zstd_tar(&zst, &out)
+            .unwrap()
+            .success());
+        let mode = std::fs::metadata(out.join("usr/local/bin/smolvm-agent"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read_link(out.join("sbin/init")).unwrap(),
+            std::path::PathBuf::from("/usr/local/bin/smolvm-agent")
+        );
+
+        let damaged = dir.path().join("damaged.tar.zst");
+        std::fs::write(&damaged, &compressed[..compressed.len() / 2]).unwrap();
+        let out2 = dir.path().join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        assert!(AgentManager::extract_zstd_tar(&damaged, &out2).is_err());
     }
 
     #[test]
