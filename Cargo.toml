@@ -23,7 +23,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.26.0"
+version = "1.28.1"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
@@ -40,14 +40,14 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-credentials = { path = "crates/smolvm-credentials", version = "1.26.0" }
-smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.26.0" }
-smolvm-network = { path = "crates/smolvm-network", version = "1.26.0" }
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.26.0" }
-smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.26.0" }
-smolvm-pack = { path = "crates/smolvm-pack", version = "1.26.0" }
-smolvm-registry = { path = "crates/smolvm-registry", version = "1.26.0" }
-smolfile = { path = "crates/smolvm-smolfile", version = "1.26.0" }
+smolvm-credentials = { path = "crates/smolvm-credentials", version = "1.28.1" }
+smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.28.1" }
+smolvm-network = { path = "crates/smolvm-network", version = "1.28.1" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.28.1" }
+smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.28.1" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "1.28.1" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "1.28.1" }
+smolfile = { path = "crates/smolvm-smolfile", version = "1.28.1" }
 thiserror = "1"
 # `string` lets `smolvm completion` rebuild the command tree from owned
 # names so hidden internal commands can be left out of the script.
@@ -133,7 +133,8 @@ landlock = "0.4"
 
 # Windows process management (OpenProcess / TerminateProcess / Wait) and
 # DLL-search-path control (SetDllDirectoryW). Used to replace the Unix
-# kill/waitpid/dlopen primitives on the Windows host build.
+# kill/waitpid/dlopen primitives on the Windows host build. IpHelper reads the
+# host's DNS servers (GetNetworkParams), which Windows keeps in place of resolv.conf.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
@@ -144,6 +145,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
     "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
 ] }
 
 [dev-dependencies]
@@ -151,7 +153,7 @@ tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # WebSocket client for the interactive exec tests (already locked through axum).
 tokio-tungstenite = "0.29"
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.26.0" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.28.1" }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

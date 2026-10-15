@@ -572,11 +572,11 @@ impl LaunchFeatures {
             .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
         self.packed_layers_dir = Some(layers_lease.path.clone());
         // Leak the lease so the case-sensitive layers volume stays mounted for
-        // the VM's lifetime (macOS only; a no-op on Linux). Unlike the previous
-        // shared-cache design, this volume is owned 1:1 by the machine: the stop
-        // and delete handlers detach it unconditionally via
-        // `force_detach_layers_volume`, so no co-tenant can be relying on it and
-        // no lease outlives the machine.
+        // the VM's lifetime (macOS only; a no-op on Linux). Named-machine caches
+        // are excluded from process-lease orphan sweeping: this CLI can exit
+        // while the VMM remains alive. Stop/delete reclaim the volume via
+        // `force_detach_layers_volume`, which also preserves a source volume
+        // while fork children still reference it through their pack symlinks.
         std::mem::forget(layers_lease);
 
         Ok(self)
@@ -613,6 +613,8 @@ pub struct LaunchConfig<'a> {
     /// path and the guest proxies connections to its in-guest dockerd socket,
     /// so a host client reaches the daemon at `DOCKER_HOST=unix://<this path>`.
     pub docker_socket: Option<&'a Path>,
+    /// Host socket the guest forwards the workload's stdout and stderr to.
+    pub workload_log_socket: Option<&'a Path>,
     /// User-published Unix-socket bridges. The launcher resolves each `expose`
     /// socket's host path against the per-VM dir (the vsock socket's parent),
     /// assigns a vsock port (`ports::PUBLISH_SOCKET_BASE + i`), wires libkrun,
@@ -696,6 +698,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         dns_filter_socket,
         cuda_socket,
         docker_socket,
+        workload_log_socket,
         published_sockets,
         packed_layers_dir,
         packed_layers_dax_window,
@@ -1199,13 +1202,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     ));
                 }
 
-                let port_cstrings: Vec<CString> = port_mappings
-                    .iter()
-                    .map(|p| {
-                        CString::new(format!("{}:{}", p.host, p.guest))
-                            .expect("port mapping format cannot contain null bytes")
-                    })
-                    .collect();
+                let port_cstrings = match tsi_port_map(port_mappings) {
+                    Ok(ports) => ports,
+                    Err(error) => {
+                        krun_free_ctx(ctx);
+                        return Err(error);
+                    }
+                };
                 let mut port_ptrs: Vec<*const libc::c_char> =
                     port_cstrings.iter().map(|s| s.as_ptr()).collect();
                 port_ptrs.push(std::ptr::null());
@@ -1376,10 +1379,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     guest_mac = pod.mac;
                 }
 
-                let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
-                    .iter()
-                    .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
-                    .collect();
+                let virtio_port_mappings: Vec<VirtioPortMapping> =
+                    port_mappings.iter().map(virtio_port_mapping).collect();
                 // The denial sink lives beside the vsock socket — the same
                 // per-VM dir the host resolves via `vm_data_dir`, where
                 // `read_egress_denials` looks for it.
@@ -1392,6 +1393,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         egress_refresh_hosts.as_deref(),
                     )
                     .with_rules(&resources.egress_rules)
+                    .and_then(|policy| match &resources.block_private {
+                        Some(exceptions) => policy.with_private_floor(exceptions),
+                        None => Ok(policy),
+                    })
                     .map_err(|reason| Error::agent("egress rules", reason))?
                 } else {
                     // Networked only to serve published ports: inbound only,
@@ -1517,6 +1522,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 crate::agent::manager::spawn_egress_flush(
                                     path,
                                     runtime.egress_counter(),
+                                );
+                            }
+                            if let Some(dir) = vsock_socket.parent() {
+                                crate::network::launch::serve_ports_control(
+                                    runtime.published_ports(),
+                                    dir,
                                 );
                             }
                             virtio_network_runtime = Some(runtime);
@@ -1776,6 +1787,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         }
 
         // Add vsock port for control channel (critical - host-guest communication)
+        if let Err(e) = super::launcher_dynamic::check_socket_path_len(vsock_socket) {
+            krun_free_ctx(ctx);
+            return Err(Error::agent("add vsock port", e));
+        }
         let socket_path = try_or_free_ctx!(
             path_to_cstring(vsock_socket),
             "add vsock port",
@@ -1815,6 +1830,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             dns_filter_socket: dns_filter_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),
             docker_socket: docker_socket.as_deref(),
+            workload_log_socket: workload_log_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()
             .iter()
@@ -1828,6 +1844,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "{} would shadow the agent control channel",
                 svc.name
             );
+            if svc.listen {
+                if let Err(e) = super::launcher_dynamic::check_socket_path_len(svc.socket) {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent("add vsock port", format!("{}: {e}", svc.name)));
+                }
+            }
             let sock_path = try_or_free_ctx!(
                 path_to_cstring(svc.socket),
                 "add vsock port",
@@ -1880,6 +1902,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // For an expose socket libkrun *creates* the host listener, so
                 // clear any stale file first (mirrors the Docker bridge).
                 if spec.direction.host_listens() {
+                    if let Err(e) = super::launcher_dynamic::check_socket_path_len(&host_path) {
+                        tracing::warn!(guest_path = %spec.guest_path, "published socket skipped: {e}");
+                        return None;
+                    }
                     let _ = std::fs::remove_file(&host_path);
                 }
                 let host_c = match path_to_cstring(&host_path) {
@@ -2139,9 +2165,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // Layers the host extracted itself carry their ownership in the
                 // override xattr; the Linux server presents it only when asked.
                 let override_stat = cfg!(target_os = "linux")
-                    && layers_dir
-                        .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
-                        .is_file();
+                    && smolvm_pack::extract::shares_override_stat_layers(layers_dir);
                 let added = if override_stat {
                     let Some(add_virtiofs4) = krun.add_virtiofs4 else {
                         krun_free_ctx(ctx);
@@ -2297,6 +2321,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if let Some(env) = &cache_disk_env {
             env_strings.push(cstr(env));
         }
+        if !resources.disk_volumes.is_empty() {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::DISK_VOLUMES,
+                smolvm_protocol::disk_volume::encode(&resources.disk_volumes)
+            )));
+        }
 
         // Pass mount count
         if !mounts.is_empty() {
@@ -2377,6 +2408,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         env_strings.extend(crate::agent::guest_network_env(
             guest_network,
             resources.dns,
+            &resources.dns_options,
+            pod_net.as_ref().and_then(|p| p.gateway_mac),
         ));
 
         // Tell the agent about pre-extracted packed layers
@@ -2871,7 +2904,34 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
             let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1000);
             Some(tv(ru.ru_utime) + tv(ru.ru_stime))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+            let zero = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+            // SAFETY: pseudo-handle for this process and four valid out-params.
+            let ok = unsafe {
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut created,
+                    &mut exited,
+                    &mut kernel,
+                    &mut user,
+                )
+            };
+            if ok == 0 {
+                return None;
+            }
+            // FILETIME counts 100 ns intervals.
+            let ticks =
+                |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+            Some(Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             None
         }
@@ -2961,6 +3021,39 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                         .map(|stats| stats.rss_bytes);
             }
         });
+}
+
+/// The virtio gateway's form of a published port mapping.
+pub(crate) fn virtio_port_mapping(mapping: &PortMapping) -> VirtioPortMapping {
+    let protocol = match mapping.protocol {
+        crate::data::network::PortProtocol::Tcp => smolvm_network::PortProtocol::Tcp,
+        crate::data::network::PortProtocol::Udp => smolvm_network::PortProtocol::Udp,
+    };
+    VirtioPortMapping::with_protocol(mapping.host, mapping.guest, protocol)
+}
+
+/// libkrun's TSI port map as `HOST:GUEST` strings. TSI publishes only TCP, so a
+/// UDP mapping refuses the launch instead of being dropped without a word.
+pub(crate) fn tsi_port_map(mappings: &[PortMapping]) -> Result<Vec<CString>> {
+    if let Some(udp) = mappings
+        .iter()
+        .find(|m| m.protocol == crate::data::network::PortProtocol::Udp)
+    {
+        return Err(Error::config(
+            "publish port",
+            format!(
+                "{} needs the virtio-net network backend; TSI publishes only TCP ports",
+                udp.label()
+            ),
+        ));
+    }
+    Ok(mappings
+        .iter()
+        .map(|p| {
+            CString::new(format!("{}:{}", p.host, p.guest))
+                .expect("port mapping format cannot contain null bytes")
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -3134,7 +3227,11 @@ mod tests {
         f.allow_image_pull_egress(Some("ghcr.io/acme/app:1"), false);
         assert_eq!(
             f.dns_filter_hosts.unwrap(),
-            vec!["api.anthropic.com".to_string(), "ghcr.io".to_string()]
+            vec![
+                "api.anthropic.com".to_string(),
+                "ghcr.io".to_string(),
+                "githubusercontent.com".to_string()
+            ]
         );
     }
 

@@ -126,6 +126,10 @@ pub struct ApiState {
     /// --cache-disk-dir`). `None` refuses cache disks on the API: a remote
     /// caller names a base by file name, so the server must choose where.
     cache_disk_dir: RwLock<Option<std::path::PathBuf>>,
+    /// Directory API callers may name local image archives and rootfs
+    /// directories under (`smolvm serve --local-image-dir`). `None` refuses
+    /// local images on the API: a path names the server's own files.
+    local_image_dir: RwLock<Option<std::path::PathBuf>>,
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
@@ -215,6 +219,10 @@ pub struct MachineRegistration {
     pub init_completed: bool,
     /// Whether to expose the guest Docker daemon socket to the host.
     pub docker_socket: bool,
+    /// Signal the workload is sent when the machine stops.
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal.
+    pub stop_timeout_secs: Option<u64>,
     /// OCI image reference (e.g., "alpine:latest").
     pub image: Option<String>,
     /// Path to .smolmachine sidecar this machine was created from.
@@ -346,6 +354,7 @@ impl ApiState {
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             cache_disk_dir: RwLock::new(None),
+            local_image_dir: RwLock::new(None),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -368,6 +377,7 @@ impl ApiState {
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             cache_disk_dir: RwLock::new(None),
+            local_image_dir: RwLock::new(None),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -386,6 +396,20 @@ impl ApiState {
     /// --cache-disk-dir`.
     pub fn set_cache_disk_dir(&self, dir: Option<std::path::PathBuf>) {
         *self.cache_disk_dir.write() = dir;
+    }
+
+    /// Accept local images under `dir` (canonical). Set once from `smolvm serve
+    /// --local-image-dir`.
+    pub fn set_local_image_dir(&self, dir: Option<std::path::PathBuf>) {
+        *self.local_image_dir.write() = dir;
+    }
+
+    /// The directory local images must live in, or a 400 naming the flag.
+    pub fn local_image_dir(&self) -> Result<std::path::PathBuf, ApiError> {
+        self.local_image_dir
+            .read()
+            .clone()
+            .ok_or_else(|| ApiError::BadRequest(LOCAL_IMAGES_DISABLED.to_string()))
     }
 
     /// The directory cache disk bases live in, or a 400 naming the flag.
@@ -581,14 +605,7 @@ impl ApiState {
             // Convert VmRecord to MachineEntry
             let mounts: Vec<MountSpec> = record.host_mounts().iter().map(MountSpec::from).collect();
 
-            let ports: Vec<PortSpec> = record
-                .ports
-                .iter()
-                .map(|(host, guest)| PortSpec {
-                    host: *host,
-                    guest: *guest,
-                })
-                .collect();
+            let ports: Vec<PortSpec> = record.port_mappings().iter().map(PortSpec::from).collect();
 
             let resources = ResourceSpec {
                 cpus: Some(record.cpus),
@@ -1175,10 +1192,11 @@ impl ApiState {
                 .memory_mb
                 .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
             mounts,
-            reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
+            Vec::new(),
             reg.network,
             reg.restart.clone(),
         );
+        record.set_port_mappings(&reg.ports.iter().map(PortMapping::from).collect::<Vec<_>>());
         record.staged_mounts = staged_mounts;
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
@@ -1221,6 +1239,8 @@ impl ApiState {
         record.forkable = reg.forkable;
         record.init_completed = reg.init_completed;
         record.docker_socket = reg.docker_socket;
+        record.stop_signal = reg.stop_signal;
+        record.stop_timeout_secs = reg.stop_timeout_secs;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
         record.source_registry_ref = reg.source_registry_ref.clone();
@@ -1690,14 +1710,7 @@ pub async fn ensure_running_and_persist(
         refuse_implicit_start_of_paused(record)?;
         let mut e = entry.lock();
         e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
-        e.ports = record
-            .ports
-            .iter()
-            .map(|(host, guest)| PortSpec {
-                host: *host,
-                guest: *guest,
-            })
-            .collect();
+        e.ports = record.port_mappings().iter().map(PortSpec::from).collect();
         e.resources.cpus = Some(record.cpus);
         e.resources.memory_mb = Some(record.mem);
         e.network = record.network;
@@ -1831,6 +1844,8 @@ async fn relaunch_image_workload(
     .await
     .map_err(|e| crate::Error::agent("pull image for workload", format!("{e:?}")))?;
 
+    let stop_on_exit = record.stop_on_exit;
+    let (stop_signal, stop_timeout) = (record.stop_signal.clone(), record.stop_timeout_secs);
     with_machine_client_traced(entry, None, move |c| {
         let config = crate::agent::RunConfig::new(image, command)
             .with_env(env)
@@ -1838,7 +1853,9 @@ async fn relaunch_image_workload(
             .with_user(user)
             .with_mounts(mounts_config)
             .with_persistent_overlay(Some(overlay_id))
-            .with_s3_volumes(s3_volumes);
+            .with_s3_volumes(s3_volumes)
+            .with_stop_vm_on_exit(stop_on_exit)
+            .with_stop(stop_signal, stop_timeout);
         c.run_container_detached(config).map(|_| ())
     })
     .await
@@ -1891,7 +1908,7 @@ impl From<&HostMount> for MountSpec {
 
 impl From<&PortSpec> for PortMapping {
     fn from(spec: &PortSpec) -> Self {
-        PortMapping::new(spec.host, spec.guest)
+        PortMapping::with_protocol(spec.host, spec.guest, spec.protocol)
     }
 }
 
@@ -1900,6 +1917,7 @@ impl From<&PortMapping> for PortSpec {
         PortSpec {
             host: mapping.host,
             guest: mapping.guest,
+            protocol: mapping.protocol,
         }
     }
 }
@@ -1913,6 +1931,11 @@ pub fn mounts_to_host_mounts(specs: &[MountSpec]) -> Result<Vec<HostMount>, ApiE
         .map(|s| HostMount::try_from(s).map_err(|e| ApiError::BadRequest(e.to_string())))
         .collect()
 }
+
+/// The refusal for a machine created from a local image path on a server
+/// without a local image directory.
+pub const LOCAL_IMAGES_DISABLED: &str = "local images are disabled on this server; \
+start `smolvm serve` with --local-image-dir to accept archives and rootfs directories under it";
 
 /// The refusal for a machine that asks for a cache disk on a server without
 /// a cache disk directory.
@@ -1945,11 +1968,14 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         disk_durability: spec.disk_durability.unwrap_or_default(),
         disks: Vec::new(),
         cache_disk: None,
+        disk_volumes: Vec::new(),
+        block_private: None,
         allowed_cidrs: spec.allowed_cidrs.clone(),
         egress_rules: spec.egress_rules.clone(),
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
         dns: None,
+        dns_options: Vec::new(),
         network_name: None,
         guest_subnet: spec.guest_subnet.clone(),
     }

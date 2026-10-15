@@ -11,6 +11,27 @@ longer commented version, with the kernel requirements, a TCP
 endpoint recipe, a K3d cluster and the managed-cloud variant where each exec has its own mount
 namespace.
 
+## The short version: two disk volumes
+
+From the release after v1.27.4, give Docker its data directories as disk volumes, a guest path with
+no host side:
+
+```bash
+smolvm machine create --name dind --net --image docker:dind \
+  -v /var/lib/docker -v /var/lib/containerd
+smolvm machine start --name dind
+smolvm machine exec --name dind -- docker run --rm alpine echo ok
+```
+
+Each path is a directory on the machine's ext4 disk, bound into the workload on every start, so
+there are no bind mounts to re-apply and no `start-dockerd.sh` step after a stop and start. In a
+Smolfile it is `volumes = ["/var/lib/docker", "/var/lib/containerd"]`. On Linux x86_64 with a
+build of that change, `df /var/lib/docker` read `/dev/vda` on the first boot and after a stop and
+start, the `alpine` image survived the restart, and a nested `docker run` succeeded both times. The
+same machine without the volumes had `/var/lib/docker` on the overlay root and `docker run` failed.
+
+The rest of this packet is the procedure for v1.27.4 and earlier, which have no disk volumes.
+
 ## Docker's data has to live on `/storage`
 
 The machine's root filesystem is already an overlay, and Docker's `overlay2` driver cannot put its

@@ -22,8 +22,6 @@ use crate::pool::{ForkLeaseRecord, ForkLeaseState};
 
 /// Dedicated loopback port reachable only through a VM's virtio gateway.
 pub const GUEST_ROLLOUT_PORT: u16 = 10_081;
-/// Operator override for the rollout listener's host loopback port.
-pub const GUEST_ROLLOUT_HOST_PORT_ENV: &str = "SMOLVM_GUEST_ROLLOUT_HOST_PORT";
 /// Host-only gateway mapping inherited by VMM subprocesses.
 pub const GUEST_HOST_SERVICE_ENV: &str = "SMOLVM_GUEST_HOST_SERVICE";
 /// Bearer credential injected into the claimed worker.

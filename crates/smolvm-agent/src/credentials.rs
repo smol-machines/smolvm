@@ -39,7 +39,7 @@ pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(Strin
             return;
         }
     };
-    let bundle = assemble_bundle(rootfs, &ca);
+    let bundle = assemble_bundle(rootfs, Path::new("/"), &ca);
     if let Err(e) = write_bundle(&bundle) {
         tracing::warn!(error = %e, "could not write credential trust bundle");
         return;
@@ -51,13 +51,21 @@ pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(Strin
     spec.add_bind_mount(AGENT_BUNDLE, GUEST_CA_BUNDLE, true);
 }
 
-/// The image's first available system bundle followed by the machine CA. An
-/// image without system roots gets the machine CA alone, which is exactly the
-/// trust it had before plus the interceptor.
-fn assemble_bundle(rootfs: &Path, ca: &[u8]) -> Vec<u8> {
-    let mut bundle = SYSTEM_BUNDLES
-        .iter()
-        .find_map(|candidate| std::fs::read(rootfs.join(candidate)).ok())
+/// Prefer the image's own trust roots. Minimal images without roots still need
+/// public HTTPS trust: use the agent's bundled public roots in that case, then
+/// append the machine CA for intercepted hosts. Never use host-specific roots
+/// here; a host-specific root would silently widen the machine's trust.
+fn assemble_bundle(rootfs: &Path, agent_rootfs: &Path, ca: &[u8]) -> Vec<u8> {
+    let read_roots = |root: &Path| {
+        SYSTEM_BUNDLES.iter().find_map(|candidate| {
+            std::fs::read(root.join(candidate)).ok().filter(|pem| {
+                pem.windows(b"-----BEGIN CERTIFICATE-----".len())
+                    .any(|window| window == b"-----BEGIN CERTIFICATE-----")
+            })
+        })
+    };
+    let mut bundle = read_roots(rootfs)
+        .or_else(|| read_roots(agent_rootfs))
         .unwrap_or_default();
     if !bundle.is_empty() && !bundle.ends_with(b"\n") {
         bundle.push(b'\n');
@@ -91,13 +99,29 @@ mod tests {
         )
         .unwrap();
         let ca = b"-----BEGIN CERTIFICATE-----\nmachine\n-----END CERTIFICATE-----\n";
-        let bundle = assemble_bundle(root.path(), ca);
+        let agent = tempfile::tempdir().unwrap();
+        let bundle = assemble_bundle(root.path(), agent.path(), ca);
         let text = String::from_utf8(bundle).unwrap();
         assert!(text.starts_with("-----BEGIN CERTIFICATE-----\nsystem"));
         assert!(text.ends_with("machine\n-----END CERTIFICATE-----\n"));
         assert_eq!(text.matches("BEGIN CERTIFICATE").count(), 2);
 
         let empty = tempfile::tempdir().unwrap();
-        assert_eq!(assemble_bundle(empty.path(), ca), ca.to_vec());
+        std::fs::create_dir_all(agent.path().join("etc/ssl/certs")).unwrap();
+        std::fs::write(
+            agent.path().join("etc/ssl/certs/ca-certificates.crt"),
+            b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let fallback = String::from_utf8(assemble_bundle(empty.path(), agent.path(), ca)).unwrap();
+        assert!(fallback.starts_with("-----BEGIN CERTIFICATE-----\npublic"));
+        assert!(fallback.ends_with("machine\n-----END CERTIFICATE-----\n"));
+        assert_eq!(fallback.matches("BEGIN CERTIFICATE").count(), 2);
+
+        let no_roots = tempfile::tempdir().unwrap();
+        assert_eq!(
+            assemble_bundle(empty.path(), no_roots.path(), ca),
+            ca.to_vec()
+        );
     }
 }

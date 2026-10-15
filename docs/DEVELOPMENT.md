@@ -110,8 +110,10 @@ The pre-built library binaries in `lib/` cover most development workflows. If yo
 need to rebuild them (after submodule updates, kernel config changes, or enabling
 new features), see:
 
-- [Building libkrun](building-libkrun.md) — rebuild `lib/libkrun.dylib` (GPU support, blk, net)
-- [Building libkrunfw](building-libkrunfw-macos.md) — rebuild `lib/libkrunfw.5.dylib` (kernel blob)
+- Linux: [`scripts/build-libkrun-linux.sh`](../scripts/build-libkrun-linux.sh) builds `libkrunfw`
+  and `libkrun` from the patched `libkrun/` and `libkrunfw/` submodules into `lib/linux-<arch>/`,
+  on a native host of that architecture.
+- macOS: no page covers rebuilding `lib/libkrun.dylib` or `lib/libkrunfw.5.dylib` yet.
 
 ## Troubleshooting
 

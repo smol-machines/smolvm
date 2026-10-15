@@ -62,8 +62,8 @@ pub struct PackedLaunchConfig<'a> {
     pub layers_dir: &'a Path,
     /// Volume mounts.
     pub mounts: &'a [PackedMount],
-    /// Port mappings (host, guest).
-    pub port_mappings: &'a [(u16, u16)],
+    /// Published port mappings.
+    pub port_mappings: &'a [crate::data::network::PortMapping],
     /// VM resources.
     pub resources: VmResources,
     /// Debug logging.
@@ -404,14 +404,10 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_add_vsock with TSI failed");
             }
 
-            let port_cstrings: Vec<CString> = config
-                .port_mappings
-                .iter()
-                .map(|(host, guest)| {
-                    CString::new(format!("{}:{}", host, guest))
-                        .expect("port mapping cannot contain null bytes")
-                })
-                .collect();
+            let port_cstrings = match crate::agent::launcher::tsi_port_map(config.port_mappings) {
+                Ok(ports) => ports,
+                Err(error) => free_ctx_on_err!(error),
+            };
             let mut port_ptrs: Vec<*const libc::c_char> =
                 port_cstrings.iter().map(|s| s.as_ptr()).collect();
             port_ptrs.push(std::ptr::null());
@@ -458,7 +454,7 @@ pub fn launch_agent_vm_dynamic(
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings
                 .iter()
-                .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
+                .map(crate::agent::launcher::virtio_port_mapping)
                 .collect();
             // Denial sink beside the vsock socket, mirroring the static launcher.
             let mut egress = if network_plan.outbound {
@@ -467,6 +463,10 @@ pub fn launch_agent_vm_dynamic(
                     config.dns_filter_hosts.as_deref(),
                 )
                 .with_rules(&config.resources.egress_rules)
+                .and_then(|policy| match &config.resources.block_private {
+                    Some(exceptions) => policy.with_private_floor(exceptions),
+                    None => Ok(policy),
+                })
                 .map_err(|reason| format!("invalid egress rules: {reason}"))?
             } else {
                 // Networked only to serve published ports: inbound only,
@@ -518,6 +518,9 @@ pub fn launch_agent_vm_dynamic(
                     free_ctx_on_err!("krun_add_net_unixstream failed");
                 }
 
+                if let Some(dir) = config.vsock_socket.parent() {
+                    crate::network::launch::serve_ports_control(runtime.published_ports(), dir);
+                }
                 virtio_network_runtime = Some(runtime);
             }
             #[cfg(windows)]
@@ -675,6 +678,9 @@ pub fn launch_agent_vm_dynamic(
     }
 
     // Add vsock port for control channel
+    if let Err(e) = check_socket_path_len(config.vsock_socket) {
+        free_ctx_on_err!(e);
+    }
     let socket_path = try_or_free_ctx!(
         path_to_cstring(config.vsock_socket),
         "vsock socket path contains null byte"
@@ -685,6 +691,17 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_add_vsock_port2 failed");
     }
 
+    // Readiness doorbell, as in `launcher.rs`: the guest dials it at the end of
+    // init and the host accepts. Best-effort, but without it the guest's dial
+    // goes unanswered until the vsock connect timeout, two seconds, before it
+    // falls back to the marker.
+    if let Ok(ready) = path_to_cstring(&config.vsock_socket.with_extension("ready")) {
+        // SAFETY: ctx is valid, ready is a valid C string
+        if unsafe { (krun.add_vsock_port2)(ctx, ports::AGENT_READY, ready.as_ptr(), false) } < 0 {
+            tracing::warn!("readiness-doorbell vsock port failed to add; using ping");
+        }
+    }
+
     // Guest↔host vsock services. The registry owns both sides of each bridge:
     // the host port registration below and the guest activation env injected
     // while building the init environment.
@@ -693,6 +710,7 @@ pub fn launch_agent_vm_dynamic(
         dns_filter_socket: None,
         cuda_socket: config.cuda_socket,
         docker_socket: None,
+        workload_log_socket: None,
     };
     let active_vsock: Vec<_> = vsock_service::registry()
         .iter()
@@ -705,6 +723,11 @@ pub fn launch_agent_vm_dynamic(
             "{} would shadow the agent control channel",
             svc.name
         );
+        if svc.listen {
+            if let Err(e) = check_socket_path_len(svc.socket) {
+                free_ctx_on_err!(format!("{}: {e}", svc.name));
+            }
+        }
         let service_socket = try_or_free_ctx!(
             path_to_cstring(svc.socket),
             "vsock service socket path contains null byte"
@@ -777,6 +800,16 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    if !config.resources.disk_volumes.is_empty() {
+        if let Ok(cstr) = CString::new(format!(
+            "{}={}",
+            smolvm_protocol::guest_env::DISK_VOLUMES,
+            smolvm_protocol::disk_volume::encode(&config.resources.disk_volumes)
+        )) {
+            env_strings.push(cstr);
+        }
+    }
+
     // Tell the agent GPU was requested so it creates /dev/dri nodes and starts
     // seatd after pivot_root. Keep this in sync with the normal launcher.
     if config.resources.gpu {
@@ -829,6 +862,8 @@ pub fn launch_agent_vm_dynamic(
     env_strings.extend(crate::agent::guest_network_env(
         guest_network,
         config.resources.dns,
+        &config.resources.dns_options,
+        None,
     ));
 
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
@@ -857,10 +892,7 @@ pub fn launch_agent_vm_dynamic(
         // Layers the host extracted itself carry their ownership in the
         // override xattr; the Linux server presents it only when asked.
         let override_stat = cfg!(target_os = "linux")
-            && config
-                .layers_dir
-                .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
-                .is_file();
+            && smolvm_pack::extract::shares_override_stat_layers(config.layers_dir);
         // SAFETY: ctx is valid, tag and path are valid C strings
         let added = if override_stat {
             let Some(add_virtiofs4) = krun.add_virtiofs4 else {
@@ -1163,7 +1195,8 @@ fn describe_start_error_with_probe(ret: i32, kvm_error: Option<&str>) -> String 
         22 => {
             "EINVAL — libkrun rejected the VM configuration; usually a disk/overlay \
                that could not be opened (still held by another VM that has not fully \
-               exited, or a corrupt/foreign-owned image) or an unsupported device option"
+               exited, or a corrupt/foreign-owned image), a Unix socket path too long \
+               for the host, or an unsupported device option"
         }
         5 => "EIO — a backing disk or overlay could not be read/created",
         13 => "EACCES — permission denied opening a VM resource (disk, socket, or rootfs)",
@@ -1200,6 +1233,27 @@ pub(crate) fn truncate_console_log(path: &Path) {
             tracing::debug!(path = %path.display(), error = %e, "could not truncate console log");
         }
     }
+}
+
+/// Longest Unix socket path the host accepts: `sockaddr_un.sun_path` holds 104
+/// bytes on macOS and 108 elsewhere, including the terminating NUL.
+const MAX_UNIX_SOCKET_PATH: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+/// libkrun binds the sockets it listens on inside `krun_start_enter` and
+/// reports a path that does not fit only as a bare EINVAL, which reads like a
+/// bad disk. Check the length before handing a socket to libkrun so the error
+/// names the path and the way out.
+pub(crate) fn check_socket_path_len(path: &Path) -> Result<(), String> {
+    let len = path.as_os_str().len();
+    if len <= MAX_UNIX_SOCKET_PATH {
+        return Ok(());
+    }
+    Err(format!(
+        "socket path is {len} bytes, over the {MAX_UNIX_SOCKET_PATH}-byte limit for Unix \
+         sockets on this host: {}. smolvm keeps machine sockets under your cache \
+         directory, so run it with a shorter HOME (or XDG_CACHE_HOME on Linux)",
+        path.display()
+    ))
 }
 
 /// Convert a Path to a CString.
@@ -1254,6 +1308,17 @@ mod tests {
             dynamic_block_error("storage", BlockIoEngine::Async, -libc::EPERM)
                 .contains("use --block-io sync")
         );
+    }
+
+    #[test]
+    fn socket_path_over_the_host_limit_is_named() {
+        let fits = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH - 1)));
+        assert!(check_socket_path_len(&fits).is_ok());
+        let long = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH)));
+        let err = check_socket_path_len(&long).unwrap_err();
+        assert!(err.contains(&format!("{} bytes", MAX_UNIX_SOCKET_PATH + 1)));
+        assert!(err.contains(&long.display().to_string()));
+        assert!(err.contains("HOME"));
     }
 
     #[test]
