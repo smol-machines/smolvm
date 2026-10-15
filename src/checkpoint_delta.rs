@@ -54,10 +54,14 @@ pub struct IncrementalCapture {
 
 /// Capture `name` into the node store and export it to `artifact`: a delta
 /// against the checkpoint the machine continues from when this node holds it,
-/// otherwise a complete chunked file.
+/// otherwise a complete chunked file. `force_full` exports a complete file
+/// even when a base is held, so a caller can bound how long a chain of deltas
+/// a restore must import; the capture still lands in the store and the next
+/// one can be a delta of it.
 pub fn capture(
     name: &str,
     artifact: &Path,
+    force_full: bool,
     release_source: impl FnOnce(),
 ) -> Result<IncrementalCapture> {
     let store = node_store();
@@ -79,8 +83,8 @@ pub fn capture(
         .and_then(|checkpoint| checkpoint.lineage.clone())
         .ok_or_else(|| Error::agent("incremental checkpoint", "capture recorded no lineage"))?;
     let base = match lineage.parent.as_deref() {
-        Some(parent) => held_checkpoint(&store, parent)?,
-        None => None,
+        Some(parent) if !force_full => held_checkpoint(&store, parent)?,
+        _ => None,
     };
     let started = std::time::Instant::now();
     let export = store::export_chunked(&output, base.as_deref(), artifact, |manifest| {
