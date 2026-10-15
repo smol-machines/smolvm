@@ -418,7 +418,7 @@ impl SmolvmDb {
 
     /// Get the default database path.
     pub fn default_path() -> Result<PathBuf> {
-        let data_dir = dirs::data_local_dir().ok_or_else(|| {
+        let data_dir = crate::process::state_data_local_dir().ok_or_else(|| {
             Error::database_unavailable("could not determine local data directory")
         })?;
         Ok(data_dir.join("smolvm").join("server").join("smolvm.db"))

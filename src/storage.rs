@@ -521,8 +521,8 @@ pub struct VmDisk<K> {
 impl<K: DiskType> VmDisk<K> {
     /// Get the default path for the disk.
     pub fn default_path() -> Result<PathBuf> {
-        let data_dir = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
+        let data_dir = crate::process::state_data_local_dir()
+            .or_else(crate::process::state_data_dir)
             .ok_or_else(|| {
                 Error::storage(
                     format!("resolve {} path", K::NAME),
