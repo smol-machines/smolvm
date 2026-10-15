@@ -292,10 +292,15 @@ impl EmbeddedRuntime {
                 "pause-{}.smolcheckpoint",
                 crate::db::SmolvmDb::create_reservation_token()
             ));
+            // A paused machine resumes on this host, so its host mounts come along.
+            let pause_options = crate::portable_checkpoint::CaptureOptions {
+                host_mounts: true,
+                ..Default::default()
+            };
             let result = crate::portable_checkpoint::capture_and_stop_to_path(
                 name,
                 &output,
-                &Default::default(),
+                &pause_options,
                 |stage| {
                     self.db
                         .update_vm_durable(name, |record| {

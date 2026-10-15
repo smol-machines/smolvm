@@ -4817,6 +4817,19 @@ impl CreateCmd {
             )?;
         }
 
+        // A checkpoint captured with --host-mounts re-attaches the same host
+        // directories; --volume is already refused as a topology override.
+        let volumes = match checkpoint.as_ref() {
+            Some(checkpoint) if !checkpoint.host_mounts.is_empty() => {
+                smolvm::portable_checkpoint::restored_host_mounts(checkpoint)?
+                    .into_iter()
+                    .map(|(host, guest, read_only)| {
+                        format!("{host}:{guest}:{}", if read_only { "ro" } else { "rw" })
+                    })
+                    .collect()
+            }
+            _ => self.volume.clone(),
+        };
         let ports = if checkpoint.is_some() && self.port.is_empty() {
             checkpoint_network
                 .into_iter()
@@ -4905,7 +4918,7 @@ impl CreateCmd {
             },
             cpus,
             mem,
-            volume: self.volume.clone(),
+            volume: volumes,
             allow_system_mounts: self.allow_system_mounts,
             port: ports,
             net: network,

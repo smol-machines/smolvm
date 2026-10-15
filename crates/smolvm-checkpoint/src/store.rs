@@ -3654,6 +3654,7 @@ mod tests {
             sha256: String::new(),
         };
         manifest.checkpoint = Some(PortableCheckpointManifest {
+            host_mounts: Vec::new(),
             version: 1,
             runtime_abi: "test".into(),
             host_platform: "linux/amd64".into(),

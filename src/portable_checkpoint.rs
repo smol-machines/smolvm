@@ -724,6 +724,11 @@ pub fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
 pub struct CaptureOptions {
     /// Maximum unreferenced prepared-checkpoint bytes to retain on this node.
     pub prepared_cache_budget_bytes: Option<u64>,
+    /// Keep host directory mounts in the capture. The artifact then restores
+    /// only where the same host paths exist; each is re-attached at its guest
+    /// path. Pause uses this (it resumes on the same host); portable
+    /// checkpoints opt in with `--host-mounts`.
+    pub host_mounts: bool,
     /// Reuse content-addressed objects in this directory and publish a
     /// self-contained checkpoint directory instead of a compressed file.
     pub store_dir: Option<PathBuf>,
@@ -929,6 +934,7 @@ pub fn restore_from_path_at(
         committed: false,
     };
 
+    restored_host_mounts(checkpoint)?;
     let mut record = restored_record(name, &manifest, checkpoint)?;
     let vm_data = crate::agent::vm_data_dir(name);
     let cache_dir = crate::agent::machine_layers_cache_dir(name);
@@ -1384,7 +1390,17 @@ fn restored_record(
         name.to_string(),
         checkpoint.cpus,
         checkpoint.memory_mib,
-        Vec::new(),
+        checkpoint
+            .host_mounts
+            .iter()
+            .map(|mount| {
+                (
+                    mount.host_path.clone(),
+                    mount.guest_path.clone(),
+                    mount.read_only,
+                )
+            })
+            .collect(),
         network
             .into_iter()
             .flat_map(|network| network.ports.iter())
@@ -1677,7 +1693,7 @@ fn checkpoint_rootfs_dir(options: &CaptureOptions) -> Result<PathBuf> {
     )
 }
 
-fn validated_capture_source(name: &str) -> Result<SmolvmConfig> {
+fn validated_capture_source(name: &str, host_mounts: bool) -> Result<SmolvmConfig> {
     let config = SmolvmConfig::load()?;
     config.db().require_completed_resize(name)?;
     let vm = config
@@ -1690,7 +1706,7 @@ fn validated_capture_source(name: &str) -> Result<SmolvmConfig> {
             format!("machine '{name}' must be running"),
         ));
     }
-    validate_capture_profile(vm)?;
+    validate_capture_profile(vm, host_mounts)?;
 
     let control = crate::agent::fork::control_socket_path(name);
     let status = crate::agent::fork::control_socket_cmd(&control, "STATUS").map_err(|error| {
@@ -1933,7 +1949,7 @@ fn capture_with_completion(
     // be ineligible. The source is revalidated under the cross-process lock
     // immediately before capture so this fast preflight is never trusted for
     // the consistency boundary.
-    let _ = validated_capture_source(name)?;
+    let _ = validated_capture_source(name, options.host_mounts)?;
     if options.store_dir.is_some() {
         let reply = crate::agent::fork::control_socket_cmd(
             &crate::agent::fork::control_socket_path(name),
@@ -2036,7 +2052,7 @@ fn capture_with_completion(
     // fork resizing the same scope. Release before packaging and compression.
     let mut source_lock = Some(crate::agent::fork::lock_fork_source(name)?);
     let mut release_source = Some(release_source);
-    let config = validated_capture_source(name)?;
+    let config = validated_capture_source(name, options.host_mounts)?;
     let vm = config
         .vms
         .get(name)
@@ -2482,6 +2498,11 @@ fn capture_with_completion(
         disks: checkpoint_disks,
         workload: checkpoint_workload(name, vm),
         network: Some(checkpoint_network(vm)),
+        host_mounts: if options.host_mounts {
+            checkpoint_host_mounts(vm)
+        } else {
+            Vec::new()
+        },
         packed_layers,
         host_image,
         lineage: Some(smolvm_pack::format::CheckpointLineage {
@@ -3589,9 +3610,13 @@ pub fn attach_cached_checkpoint_pack(
 }
 
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
-pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
+///
+/// `host_mounts` admits host directory mounts: the capture records them and a
+/// restore re-attaches the same host paths, so the artifact is bound to hosts
+/// where they exist. Staged mounts stay unsupported either way.
+pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> {
     let mut unsupported = Vec::new();
-    if !vm.mounts.is_empty() || !vm.staged_mounts.is_empty() {
+    if (!vm.mounts.is_empty() && !host_mounts) || !vm.staged_mounts.is_empty() {
         unsupported.push("host mounts");
     }
     if !vm.published_sockets.is_empty() {
@@ -3648,6 +3673,49 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
             unsupported.join(", ")
         ),
     ))
+}
+
+/// The host directory mounts a checkpoint restores, as `(host, guest, read_only)`
+/// volume tuples, after checking that every host directory exists here. A
+/// checkpoint captured with host mounts is bound to hosts that have them.
+pub fn restored_host_mounts(
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<Vec<(String, String, bool)>> {
+    checkpoint
+        .host_mounts
+        .iter()
+        .map(|mount| {
+            if !Path::new(&mount.host_path).is_dir() {
+                return Err(Error::config(
+                    "restore checkpoint",
+                    format!(
+                        "this checkpoint mounts host directory {} at {}, which does not exist on \
+                         this host; create it or restore where it exists",
+                        mount.host_path, mount.guest_path
+                    ),
+                ));
+            }
+            Ok((
+                mount.host_path.clone(),
+                mount.guest_path.clone(),
+                mount.read_only,
+            ))
+        })
+        .collect()
+}
+
+/// Host directory mounts of `vm` as the checkpoint records them.
+fn checkpoint_host_mounts(vm: &VmRecord) -> Vec<smolvm_pack::format::CheckpointHostMount> {
+    vm.mounts
+        .iter()
+        .map(
+            |(host, guest, read_only)| smolvm_pack::format::CheckpointHostMount {
+                host_path: host.clone(),
+                guest_path: guest.clone(),
+                read_only: *read_only,
+            },
+        )
+        .collect()
 }
 
 /// Parse the effective network backend persisted by a version-two checkpoint.
@@ -6887,6 +6955,7 @@ mod tests {
             }],
         };
         let metadata = PortableCheckpointManifest {
+            host_mounts: Vec::new(),
             version: FORMAT_VERSION,
             runtime_abi: RUNTIME_ABI.to_string(),
             host_platform: crate::platform::Platform::current()
@@ -7852,7 +7921,7 @@ mod tests {
         record.restart.max_backoff_secs = 19;
         record.guest_subnet = Some("10.200.0.0/30".to_string());
 
-        validate_capture_profile(&record).expect("image + network + ports must be portable");
+        validate_capture_profile(&record, false).expect("image + network + ports must be portable");
         let workload = checkpoint_workload(&record.name, &record).unwrap();
         assert_eq!(workload.image, "python:3.12-alpine");
         assert_eq!(workload.overlay_owner, "image-service");
@@ -7917,13 +7986,58 @@ mod tests {
             false,
         );
         record.image = Some("alpine:3.20".to_string());
-        let error = validate_capture_profile(&record).unwrap_err().to_string();
+        let error = validate_capture_profile(&record, false)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("host mounts"), "{error}");
+
+        // Opting in keeps the mounts: they are recorded and re-attached on
+        // restore, which binds the artifact to hosts that have the paths.
+        validate_capture_profile(&record, true).expect("host mounts are admitted on request");
+        assert_eq!(
+            checkpoint_host_mounts(&record),
+            vec![smolvm_pack::format::CheckpointHostMount {
+                host_path: "/host".to_string(),
+                guest_path: "/guest".to_string(),
+                read_only: true,
+            }]
+        );
+        // Staged mounts are copies the restore cannot reproduce, with or without.
+        record.staged_mounts = vec![(0, "/host".to_string(), "/staged".to_string())];
+        let error = validate_capture_profile(&record, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("host mounts"), "{error}");
+        record.staged_mounts.clear();
 
         // A pack source is recorded in the checkpoint and reattached on restore.
         record.mounts.clear();
+        validate_capture_profile(&record, false).unwrap();
         record.source_smolmachine = Some("/tmp/source.smolmachine".to_string());
-        validate_capture_profile(&record).unwrap();
+        validate_capture_profile(&record, false).unwrap();
+    }
+
+    #[test]
+    fn restored_host_mounts_require_the_directories_to_exist() {
+        let present = tempfile::tempdir().unwrap();
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.host_mounts = vec![smolvm_pack::format::CheckpointHostMount {
+            host_path: present.path().display().to_string(),
+            guest_path: "/workspace".to_string(),
+            read_only: false,
+        }];
+        assert_eq!(
+            restored_host_mounts(&checkpoint).unwrap(),
+            vec![(
+                present.path().display().to_string(),
+                "/workspace".to_string(),
+                false
+            )]
+        );
+        checkpoint.host_mounts[0].host_path = present.path().join("missing").display().to_string();
+        let error = restored_host_mounts(&checkpoint).unwrap_err().to_string();
+        assert!(error.contains("does not exist on this host"), "{error}");
+        assert!(error.contains("/workspace"), "{error}");
     }
 
     fn no_network_machine(image: &str) -> VmRecord {
@@ -7943,7 +8057,8 @@ mod tests {
     fn a_host_fetched_registry_image_can_be_captured() {
         let mut record = no_network_machine("python:3.12-slim-bookworm");
         record.pin_host_fetched_image("local:abc".to_string(), "sha256:feedface".to_string());
-        validate_capture_profile(&record).expect("a host-fetched registry image is portable");
+        validate_capture_profile(&record, false)
+            .expect("a host-fetched registry image is portable");
         assert!(mounts_image_layers(&record));
         // The checkpoint names the registry image at the fetched digest, never
         // this host's archive.
@@ -7955,7 +8070,9 @@ mod tests {
     fn a_users_own_local_image_still_cannot_be_captured() {
         for image in ["local:abc", "local-dir:/srv/rootfs"] {
             let record = no_network_machine(image);
-            let error = validate_capture_profile(&record).unwrap_err().to_string();
+            let error = validate_capture_profile(&record, false)
+                .unwrap_err()
+                .to_string();
             assert!(
                 error.contains(
                     "the initial portable checkpoint profile does not support host-backed image layers"
@@ -7966,7 +8083,9 @@ mod tests {
         // An origin that is itself a local source is not a registry origin.
         let mut record = no_network_machine("./saved.tar");
         record.pin_host_fetched_image("local:abc".to_string(), "sha256:aa".to_string());
-        let error = validate_capture_profile(&record).unwrap_err().to_string();
+        let error = validate_capture_profile(&record, false)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("host-backed image layers"), "{error}");
     }
 
@@ -8043,7 +8162,7 @@ mod tests {
             Some("python:3.12-slim-bookworm@sha256:feedface")
         );
         // A restored machine can be captured again under the same reference.
-        validate_capture_profile(&record).unwrap();
+        validate_capture_profile(&record, false).unwrap();
         assert_eq!(
             checkpoint_workload(&record.name, &record).unwrap().image,
             "python:3.12-slim-bookworm@sha256:feedface"
@@ -8316,6 +8435,7 @@ mod tests {
     /// The smallest manifest this host accepts, for tests of the validator.
     fn minimal_checkpoint_manifest() -> PortableCheckpointManifest {
         PortableCheckpointManifest {
+            host_mounts: Vec::new(),
             version: FORMAT_VERSION,
             runtime_abi: RUNTIME_ABI.to_string(),
             host_platform: crate::platform::Platform::current()
