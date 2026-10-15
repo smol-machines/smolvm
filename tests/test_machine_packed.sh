@@ -181,6 +181,58 @@ test_cp_preserves_state_on_packed_vm() {
 }
 
 
+# Symlinks in a machine made from a --from-vm pack keep their owners, and can be
+# re-owned. Both broke on host-extracted packs: Linux showed every link as the
+# host user (links cannot carry the owner xattr), and macOS refused `chown -h`
+# on an absolute link with ENOENT, because the overlay copy-up read the link's
+# xattrs through a server call that followed the link to a host path.
+test_packed_symlinks_keep_owners_and_rechown() {
+    local src="symown-src-$$" vm_name="symown-$$" pack_dir
+    pack_dir=$(mktemp -d)
+    finish() {
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$src" -f 2>/dev/null
+        rm -rf "$pack_dir"
+    }
+
+    $SMOLVM machine create --name "$src" --image alpine:latest 2>&1 || { finish; return 1; }
+    $SMOLVM machine start --name "$src" 2>&1 || { finish; return 1; }
+    $SMOLVM machine exec --name "$src" -- sh -c '
+        adduser -D -u 1000 amika && touch /home/amika/f &&
+        ln -s /home/amika/f /home/amika/abs && ln -s f /home/amika/rel &&
+        chown -h 1000:1000 /home/amika/f /home/amika/abs /home/amika/rel' 2>&1 || { finish; return 1; }
+    $SMOLVM machine stop --name "$src" 2>&1
+    $SMOLVM pack create --from-vm "$src" -o "$pack_dir/packed" 2>&1 || { finish; return 1; }
+
+    $SMOLVM machine create --name "$vm_name" --from "$pack_dir/packed.smolmachine" 2>&1 || { finish; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { finish; return 1; }
+
+    local owners
+    owners=$($SMOLVM machine exec --name "$vm_name" -- stat -c '%n %u:%g' /home/amika/abs /home/amika/rel 2>&1)
+    [[ "$owners" == *"/home/amika/abs 1000:1000"* && "$owners" == *"/home/amika/rel 1000:1000"* ]] || {
+        echo "FAIL: packed symlinks lost their owners: $owners"; finish; return 1
+    }
+
+    local rechowned
+    rechowned=$($SMOLVM machine exec --name "$vm_name" -- sh -c '
+        chown -h 2000:2000 /home/amika/abs /home/amika/rel &&
+        stat -c "%n %u:%g" /home/amika/abs /home/amika/rel &&
+        readlink /home/amika/abs && readlink /home/amika/rel' 2>&1)
+    [[ "$rechowned" == *"/home/amika/abs 2000:2000"* && "$rechowned" == *"/home/amika/rel 2000:2000"* \
+        && "$rechowned" == *"/home/amika/f"* ]] || {
+        echo "FAIL: chown -h on packed symlinks: $rechowned"; finish; return 1
+    }
+
+    $SMOLVM machine stop --name "$vm_name" 2>&1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { finish; return 1; }
+    owners=$($SMOLVM machine exec --name "$vm_name" -- stat -c '%n %u:%g' /home/amika/abs /home/amika/rel 2>&1)
+    [[ "$owners" == *"/home/amika/abs 2000:2000"* && "$owners" == *"/home/amika/rel 2000:2000"* ]] || {
+        echo "FAIL: re-owned symlinks reverted after restart: $owners"; finish; return 1
+    }
+    finish
+}
+
 # The same at/below-/workspace volume matrix as the --image suite, against a
 # packed machine. Packed layers only change where the rootfs comes from, not how
 # the container spec's mounts are assembled, so the matrix must come out
@@ -210,5 +262,6 @@ test_packed_volume_targets_resolve_inside_guest() {
 run_test "Create from .smolmachine" test_create_from_smolmachine || true
 run_test "File cp preserves state on packed VM" test_cp_preserves_state_on_packed_vm || true
 run_test "Packed: volume targets at/below /workspace resolve in guest" test_packed_volume_targets_resolve_inside_guest || true
+run_test "Packed: symlinks keep owners and can be re-owned" test_packed_symlinks_keep_owners_and_rechown || true
 
 print_summary "Packed Machine Tests"
