@@ -985,6 +985,9 @@ pub struct CaptureCheckpointQuery {
     /// chunked file, and a delta of the checkpoint the machine continues from
     /// when this node holds it.
     pub incremental: Option<bool>,
+    /// With `incremental`: export a complete file even when a base is held,
+    /// so a caller can cap the chain of deltas a restore imports.
+    pub force_full: Option<bool>,
     /// With a `cache_key`: reply as soon as the artifact is captured and held
     /// on this node, and leave its upload to `POST /checkpoints/{key}/upload`.
     /// Uploading a multi-gigabyte artifact took most of a checkpoint's time
@@ -1050,12 +1053,16 @@ pub async fn capture_portable_checkpoint(
             .unwrap_or_else(crate::portable_checkpoint::prepared_checkpoint_budget)
     });
     let incremental = capture_options.incremental.unwrap_or(false);
+    let force_full = capture_options.force_full.unwrap_or(false);
     // Keep staging alive until the background capture finishes, even on disconnect.
     let (transfer, result) = with_owned_transfer(transfer, move |_dir| {
         if incremental {
-            return crate::checkpoint_delta::capture(&capture_name, &capture_path, move || {
-                drop(guard)
-            })
+            return crate::checkpoint_delta::capture(
+                &capture_name,
+                &capture_path,
+                force_full,
+                move || drop(guard),
+            )
             .map(|capture| (capture.result.clone(), None, Some(capture)));
         }
         crate::portable_checkpoint::capture_to_path_deferring_retention(
@@ -1144,11 +1151,14 @@ pub async fn capture_portable_checkpoint(
             };
             finish(transfer);
             return Ok(axum::response::IntoResponse::into_response(Json(
-                serde_json::json!({
-                    "captured": true,
-                    "sizeBytes": size,
-                    "pauseMs": result.source_pause.as_millis() as u64,
-                }),
+                with_lineage(
+                    serde_json::json!({
+                        "captured": true,
+                        "sizeBytes": size,
+                        "pauseMs": result.source_pause.as_millis() as u64,
+                    }),
+                    incremental.as_ref(),
+                ),
             )));
         }
     }
@@ -1156,11 +1166,14 @@ pub async fn capture_portable_checkpoint(
         let size = upload_checkpoint(&artifact, urls).await?;
         finish(transfer);
         return Ok(axum::response::IntoResponse::into_response(Json(
-            serde_json::json!({
-                "uploaded": true,
-                "sizeBytes": size,
-                "pauseMs": result.source_pause.as_millis() as u64,
-            }),
+            with_lineage(
+                serde_json::json!({
+                    "uploaded": true,
+                    "sizeBytes": size,
+                    "pauseMs": result.source_pause.as_millis() as u64,
+                }),
+                incremental.as_ref(),
+            ),
         )));
     }
     #[cfg(target_os = "linux")]
@@ -1330,6 +1343,32 @@ pub async fn upload_held_checkpoint(
     Ok(Json(
         serde_json::json!({ "uploaded": true, "sizeBytes": size }),
     ))
+}
+
+/// An incremental capture's lineage in a JSON reply, which the streamed reply
+/// carries as `x-smolvm-checkpoint-*` headers: whether the artifact is a delta,
+/// the checkpoint's lineage id, and the base a delta needs imported first.
+fn with_lineage(
+    mut reply: serde_json::Value,
+    capture: Option<&crate::checkpoint_delta::IncrementalCapture>,
+) -> serde_json::Value {
+    if let (Some(capture), Some(fields)) = (capture, reply.as_object_mut()) {
+        fields.insert(
+            "checkpointKind".into(),
+            if capture.base.is_some() {
+                "delta"
+            } else {
+                "full"
+            }
+            .into(),
+        );
+        fields.insert("lineageId".into(), capture.id.clone().into());
+        if let Some(base) = &capture.base {
+            fields.insert("baseLineageId".into(), base.clone().into());
+        }
+        fields.insert("reusedBytes".into(), capture.result.reused_bytes.into());
+    }
+    reply
 }
 
 fn checked_upload_urls(raw: &str) -> Result<Vec<reqwest::Url>, ApiError> {
