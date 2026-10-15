@@ -12,8 +12,9 @@ the repo is unchanged, the workload could not reach the network, and nothing is 
 The Linux runs used the scripts of their date; this version's preflight, run and cleanup scripts
 ran on Linux aarch64 on v1.22.2 on 2026-10-03.
 
-**The cancel is `scripts/cleanup.sh --cancel`, never Ctrl-C**: on `run.sh` Ctrl-C leaves the CLI
-and its VM running on v1.20.2 too, as "Cancelling" below measures.
+**Ctrl-C on `run.sh` ends the run from v1.20.2**: the script forwards an interrupt or a `SIGTERM`
+to the CLI, which ends its VM. Before v1.20.2 the cancel is `scripts/cleanup.sh --cancel`, as
+"Cancelling" below measures.
 
 Two issues shaped this packet and **v1.20.2 fixed both on macOS and Linux**; older releases still
 have them:
@@ -144,13 +145,15 @@ smolvm machine run -it --image alpine -v "$PWD/repo:/workspace:ro" -- /bin/sh
 `touch /workspace/x` gave `Read-only file system` and `wget` gave `bad address 'example.com'`; after
 `exit`, `machine list` printed `No machines found` and no smolvm process was left.
 
-## Cancelling, and why Ctrl-C is not it
+## Cancelling
 
 On v1.20.2, Ctrl-C or `SIGKILL` on the CLI itself ends the VM within a second on both routes, on
-macOS arm64 and Linux aarch64. **Interrupting `run.sh` is not a cancel**: the CLI it backgrounds
-ignores `SIGINT`, so Ctrl-C on the script left the CLI and its VM running on the offline route on both
-hosts, and killing the script alone left them on either route. For code that hangs or loops that is
-unbounded exposure.
+macOS arm64 and Linux aarch64. `run.sh` starts the CLI in the background, which starts it with
+`SIGINT` ignored, so before the script forwarded signals Ctrl-C on it left the CLI and its VM
+running on the offline route on both hosts, and killing the script alone left them on either route.
+It now forwards `SIGINT` and `SIGTERM` to the CLI: on macOS arm64 on v1.27.3, on the network-on
+route, Ctrl-C to the script's process group and `SIGTERM` to the script alone each ended the CLI and
+its VM, with `cli_exit=130` and `cli_exit=143`. The offline route was not run again.
 
 Before v1.20.2 the offline route is worse: interrupting the CLI itself leaves the VM running with no
 CLI route to it, roughly 230 MB held per survivor (#1193). `references/traps.md` has the

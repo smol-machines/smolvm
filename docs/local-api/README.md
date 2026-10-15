@@ -26,19 +26,21 @@ plain loopback listener beside it; `references/traps.md` has both.
 
 ## The endpoints
 
-The HTTP API section of [`AGENTS.md`](../../AGENTS.md#http-api) lists the key endpoints; pause and
-resume are added here.
+The key endpoints; `smolvm serve openapi` has the rest.
 
 ```
 POST   /api/v1/machines                    create           GET    /api/v1/machines            list
 GET    /api/v1/machines/:name              get              DELETE /api/v1/machines/:name       delete
 POST   /api/v1/machines/:name/start        start            POST   /api/v1/machines/:name/stop  stop
 POST   /api/v1/machines/:name/exec         exec             POST   /api/v1/machines/:name/exec/stream  exec, SSE
+GET    /api/v1/machines/:name/exec/interactive  exec, WebSocket
 PUT    /api/v1/machines/:name/files/*path  upload           GET    /api/v1/machines/:name/files/*path  download
 GET    /api/v1/machines/:name/logs         logs, SSE        POST   /api/v1/machines/:name/images/pull   pull
 POST   /api/v1/machines/:name/pause        pause            POST   /api/v1/machines/:name/resume  resume
 ```
 
+Machines that ask for nested virtualization (`nestedVirt`) are refused unless the server is started
+with `--allow-nested-virt`; turning it off again also keeps existing nested machines from starting.
 A `GET` on the files route for a directory returns a listing, `{"entries":[{"kind":..., "name":...,
 "size":...}]}`. Pause on macOS before v1.20.0 needs a machine started with `?branchable=true` on the start call,
 and this packet's pause steps always start it that way.

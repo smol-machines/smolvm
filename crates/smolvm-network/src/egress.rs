@@ -229,6 +229,10 @@ enum FloorMode {
     /// gateway CGNAT range — so a guest can't steal host credentials, pivot to
     /// the control plane / worker API, or reach co-resident tenants.
     Strict,
+    /// A machine that asked for `--block-private`: the same ranges as
+    /// `Strict`, except that an explicit allow rule (`--allow-private`) may
+    /// re-open one. Cloud metadata stays closed to every rule.
+    Private,
 }
 
 /// Parse an explicit `SMOLVM_EGRESS_FLOOR` value into a mode. Returns `None`
@@ -329,7 +333,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
         FloorMode::Off => false,
         FloorMode::MetadataOnly => is_link_local(ip),
         FloorMode::MetadataAndLoopback => is_link_local(ip) || is_host_loopback(ip),
-        FloorMode::Strict => match ip {
+        FloorMode::Strict | FloorMode::Private => match ip {
             IpAddr::V4(v4) => is_reserved_v4(v4),
             IpAddr::V6(v6) => {
                 v6.is_loopback()
@@ -513,6 +517,29 @@ impl EgressPolicy {
         Ok(self)
     }
 
+    /// Block private, internal and link-local destinations for this machine,
+    /// keeping the public internet open, except the `exceptions` CIDRs, which
+    /// become allow rules after any existing ones. A host already on the strict
+    /// floor keeps it, so exceptions never re-open a fleet node's internal ranges.
+    pub fn with_private_floor(mut self, exceptions: &[String]) -> Result<Self, String> {
+        let mut rules = self.rules.as_ref().clone();
+        for spec in exceptions {
+            let cidr = Cidr::parse(spec)
+                .ok_or_else(|| format!("--allow-private: invalid CIDR '{spec}'"))?;
+            rules.push(CompiledRule {
+                transport: None,
+                cidr: Some(cidr),
+                ports: None,
+                action: RuleAction::Allow,
+            });
+        }
+        self.rules = Arc::new(rules);
+        if self.floor != FloorMode::Strict {
+            self.floor = FloorMode::Private;
+        }
+        Ok(self)
+    }
+
     /// First matching rule after the platform floor. The strict floor is
     /// absolute; local loopback needs an explicit matching static allow.
     pub fn rule_action(
@@ -534,6 +561,12 @@ impl EgressPolicy {
             .map(|rule| rule.action);
         action?;
         if !is_floored(ip, self.floor) {
+            return action;
+        }
+        if self.floor == FloorMode::Private
+            && action == Some(RuleAction::Allow)
+            && !is_link_local(ip)
+        {
             return action;
         }
         if self.floor != FloorMode::Strict
@@ -960,6 +993,39 @@ mod tests {
         assert!(!policy.allows_flow(FlowTransport::Tcp, target, Some(123)));
         assert!(policy.allows_flow(FlowTransport::Udp, target, Some(123)));
         assert!(!policy.allows_flow(FlowTransport::Icmp, target, None));
+    }
+
+    #[test]
+    fn private_floor_keeps_public_open_and_honors_only_explicit_exceptions() {
+        use smolvm_protocol::FlowTransport;
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let mut policy = EgressPolicy::unrestricted();
+        policy.floor = FloorMode::MetadataAndLoopback;
+        let policy = policy
+            .with_private_floor(&["10.20.0.0/16".to_string(), "169.254.0.0/16".to_string()])
+            .unwrap();
+        let tcp = |addr: &str| policy.allows_flow(FlowTransport::Tcp, ip(addr), Some(443));
+        assert!(tcp("1.1.1.1"));
+        assert!(tcp("10.20.3.4"), "an explicit exception re-opens its range");
+        assert!(!tcp("10.21.0.1"));
+        assert!(!tcp("192.168.1.5"));
+        assert!(!tcp("100.100.100.100"));
+        assert!(!tcp("127.0.0.1"));
+        assert!(!tcp("fd00::1"));
+        assert!(
+            !tcp("169.254.169.254"),
+            "metadata stays closed to every rule"
+        );
+
+        let mut strict = EgressPolicy::unrestricted();
+        strict.floor = FloorMode::Strict;
+        let strict = strict
+            .with_private_floor(&["10.20.0.0/16".to_string()])
+            .unwrap();
+        assert!(!strict.allows_flow(FlowTransport::Tcp, ip("10.20.3.4"), Some(443)));
+        assert!(EgressPolicy::unrestricted()
+            .with_private_floor(&["nope".to_string()])
+            .is_err());
     }
 
     #[test]

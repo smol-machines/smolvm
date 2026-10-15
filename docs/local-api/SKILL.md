@@ -5,7 +5,7 @@ description: "Drives smolvm programmatically over its local HTTP API (smolvm ser
 
 # Driving smolvm over HTTP
 
-Verified on **smolvm v1.23.0** on macOS arm64, 2026-10-04, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a machine went through
+Verified on **smolvm v1.27.3** on macOS arm64, 2026-10-12, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a machine went through
 its whole lifecycle over HTTP and `GET /api/v1/machines/<name>` answers `NOT_FOUND` at the end.
 The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
@@ -126,8 +126,8 @@ Full detail in `references/traps.md` and `references/api-fields.md`.
   a `memory` for `memoryMb` got no diagnostic at all and the machine took the default.
 - **A second `serve start` on the same host fails** with `bind guest rollout ingress:
   127.0.0.1:10081: Address already in use`, whatever `--listen` says: every server binds that port
-  for the branch-pool rollout routes. Set `SMOLVM_GUEST_ROLLOUT_HOST_PORT` to another port for the
-  second one.
+  for the branch-pool rollout routes. Give the second one `--guest-rollout-port` (v1.28.2+) or
+  `SMOLVM_GUEST_ROLLOUT_HOST_PORT` with another port.
 - **Stopping the server leaves machines running.**
 - **The spec's `info.version` is not the binary's.** It says `0.5.2` on v1.14.2 while `/health`
   says `1.14.2`, and still `0.5.2` on v1.22.2. Take the version from `/health`.
@@ -174,7 +174,7 @@ messages, and `branch-and-checkpoint` covers pause alongside checkpoints.
 
 ## Platform arms
 
-- **macOS arm64**: v1.23.0, over loopback TCP, and v1.22.2 over the Unix socket as well.
+- **macOS arm64**: v1.27.3 over the Unix socket, v1.23.0 over loopback TCP, and v1.22.2 over both.
 - **Linux aarch64**: v1.18.2 over the Unix socket, 2026-09-24, `result=lifecycle_ok` with all
   eleven checks. The single v1.22.2 run failed only at `machines_empty`, the check that then
   required an empty machine list, on `image-seed-*` helpers an interrupted run had left listed. On
@@ -215,6 +215,14 @@ POST /api/v1/machines {"name":"...","image":"alpine","network":true,"memory":102
 ```
 
 A 404 returns `{"error":"machine 'nope-does-not-exist' not found","code":"NOT_FOUND"}`.
+
+## Re-verified on v1.27.3
+
+Run 2026-10-12 PT against v1.27.3 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.0.1 arm64, once: `preflight.sh` `result=ready`, `serve-start.sh`
+`result=serving` on the Unix socket, `lifecycle-check.sh` `result=lifecycle_ok` with all eleven
+checks, and `cleanup.sh --purge` `machines=clean`. The local image refusals in `references/traps.md`
+were measured the same evening. Linux was not run.
 
 ## Re-verified on v1.23.0
 

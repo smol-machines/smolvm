@@ -18,8 +18,9 @@ smolvm machine exec --name notes -- sh -c \
 # {"object":"user", …}                <- Notion received the real key
 ```
 
-The same placeholder sent anywhere else — another host, a query string, a
-request body — is refused or travels as the literal placeholder string.
+The same placeholder sent anywhere else — another host, a query string, or a
+request body without an explicit form-body binding — is refused or travels as
+the literal placeholder string.
 
 A binding can instead set a header outright, so the guest needs no
 placeholder at all (see [Setting a header](#setting-a-header)).
@@ -32,7 +33,7 @@ placeholder, and the exact hosts it may be sent to. It never carries the value.
 Command line (repeatable, implies `--net`):
 
 ```sh
---credential NAME=ENV_VAR@HOST[,HOST...]
+--credential NAME=ENV_VAR@HOST[,HOST...][:body]
 ```
 
 Smolfile:
@@ -53,8 +54,28 @@ allowed_hosts = ["api.github.com"]
 methods = ["GET", "HEAD"]        # optional; default is every method
 ```
 
+For an OAuth refresh token sent in a form body, add `:body` to the CLI
+binding or set `injection_location = { header = true, body = true }` in a
+Smolfile. The host substitutes placeholders only in
+`application/x-www-form-urlencoded` request bodies to the binding's hosts and
+methods. The default remains header substitution only. For example:
+
+```sh
+smolvm machine create --name oauth --image curlimages/curl:8.11.1 \
+  --allow-host auth.example.com \
+  --secret-file REFRESH_TOKEN=/path/to/refresh-token \
+  --credential refresh=REFRESH_TOKEN@auth.example.com:body
+```
+
+Inside the VM, `curl -d "grant_type=refresh_token&refresh_token=$REFRESH_TOKEN"
+https://auth.example.com/token` sends the host's current file value as one
+percent-encoded form field. Rotating the host file takes effect on the next
+request, without restarting the machine. The same placeholder in a header and
+the form body of one request is allowed; two different placeholders are refused.
+
 API (`POST /v1/machines`): the same object under `credentials`, with
-`injection_location: { "header": true }` accepted for compatibility.
+`injection_location: { "header": true, "body": true }` for form-body
+substitution (omit `body` to keep the default).
 
 Rules checked at create:
 
@@ -211,8 +232,8 @@ Those inject the plaintext into the guest environment: convenient, but a
 compromised workload can read and exfiltrate it. A credential binding gives
 the workload the *ability to use* the value at named hosts and nothing else.
 Use secrets injection for values a program must read (a database URL it
-parses); use credential bindings for bearer tokens and API keys that only ever
-appear in a request header.
+parses); use credential bindings for bearer tokens and API keys sent in headers
+or form bodies to explicit hosts.
 
 ## External host interceptor
 

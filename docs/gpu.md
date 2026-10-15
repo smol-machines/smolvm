@@ -1,6 +1,6 @@
 # GPU Acceleration
 
-smolvm exposes the host GPU to guests via **virtio-gpu / Venus** (Vulkan-over-virtio). Guest workloads see a real Vulkan device; on Linux + Intel this renders as:
+smolvm exposes the host GPU to guests via **virtio-gpu / Venus** (Vulkan-over-virtio). Enable it with `--gpu` on `machine run` or `machine create`, or `gpu = true` in a Smolfile. Guest workloads see a real Vulkan device, which ANGLE can use as its WebGL and OpenGL ES backend; on Linux + Intel this renders as:
 
 ```
 ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
@@ -20,6 +20,8 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 > virglrenderer depends on libEGL and libdrm from the host GPU driver stack. These are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
 
+**Windows**: not available (WHP); `--gpu` has no effect there.
+
 ## Usage
 
 ```bash
@@ -29,6 +31,13 @@ smolvm machine run --net --gpu --image alpine -- sh -c '
   vulkaninfo --summary | grep deviceName
 '
 # → deviceName = Virtio-GPU Venus (Apple M1 Pro)
+
+# Persistent GPU machine
+smolvm machine create --name browser --gpu --gpu-vram 2048
+smolvm machine start --name browser
+smolvm machine exec --name browser -- \
+  chromium --headless=new --no-sandbox --use-gl=angle --use-angle=vulkan \
+    --screenshot=/tmp/out.png --window-size=1280,800 https://example.com
 
 # Smolfile
 # gpu = true
@@ -50,7 +59,40 @@ See [`examples/headless-browser/`](../examples/headless-browser/) for a working 
 
 `--gpu` and `--cuda` provide different interfaces. `--gpu` exposes Vulkan through virtio-gpu / Venus; it does not provide CUDA. `--cuda` enables CUDA API remoting: driverless guest shims forward CUDA calls over vsock to a host process, which executes them through the host's NVIDIA driver.
 
-CUDA remoting requires an NVIDIA GPU and a working NVIDIA driver on the host. It is not GPU passthrough: the guest receives neither the physical device nor an NVIDIA driver.
+CUDA remoting requires an NVIDIA GPU and a working NVIDIA driver on the host (`libcuda.so.1` and a loaded kernel module); no CUDA toolkit is required on the host or in the guest. Enable it with `--cuda` on `machine run` or `machine create`, or `cuda = true` in a Smolfile. It is not GPU passthrough: the guest receives neither the physical device nor an NVIDIA driver.
+
+Guest programs reach the GPU through drop-in libraries the release's agent
+rootfs bundles. With `--cuda` the guest agent bind-mounts them read-only at
+`/opt/smolvm-cuda` in the workload container and appends that directory to
+`LD_LIBRARY_PATH`, so `libcuda.so.1` resolves to the driver shim built from
+[`crates/smolvm-cuda-shim`](../crates/smolvm-cuda-shim) and unmodified
+Driver-API programs work with no code changes. The shim is glibc, so use a
+glibc image.
+
+Covered surface: init/device queries (name, attributes, uuid, total/free mem),
+contexts (incl. the primary-context flow the CUDA runtime uses), module
+load/unload (PTX, cubin, fatbin), mem alloc/free/HtoD/DtoH/DtoD/memset,
+kernel launch (param sizes come from the host via `cuFuncGetParamInfo`,
+CUDA 12.4+ drivers), streams, events, `cuGetProcAddress`. All work executes
+synchronously host-side; `*Async` calls complete before returning (permitted
+by the CUDA contract).
+
+**The Runtime API goes through a second shim.** NVIDIA's own `libcudart`
+bootstraps through a private driver interface (`cuGetExportTable`) that a
+`libcuda` shim cannot provide, so
+[`crates/smolvm-cudart-shim`](../crates/smolvm-cudart-shim) replaces `libcudart`
+instead: it lowers each Runtime-API call to the public Driver API and remotes
+that. The bundled copy sits in the same directory under the `libcudart`,
+`libcublas`, `libcublasLt` and `libcudnn` sonames of CUDA 11, 12 and 13, and
+is bind-mounted over those libraries where a pip wheel installed them under
+`site-packages/nvidia/`, since programs such as PyTorch find them by RPATH
+ahead of `LD_LIBRARY_PATH`. Set `SMOLVM_CUDA_SHIM_TRACE=1` to log which
+driver entry points a program resolves through the shim.
+
+Without an NVIDIA driver the host serves a CPU-emulation backend (test-only:
+it knows the `vecadd` test kernel), so the transport stays testable anywhere.
+The [gpu-cuda packet](gpu-cuda/README.md) has the procedure and what tells that
+backend apart from a real GPU.
 
 Fork-heavy Linux hosts should use a kernel containing upstream KVM fix
 [`916b7f4`](https://github.com/torvalds/linux/commit/916b7f42b3b3b539a71c204a9b49fdc4ca92cd82).

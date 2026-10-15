@@ -10,7 +10,7 @@ is decided on the host; **the substitution arriving at a real API was not observ
 for the reason under "What was not run". Done means the guest's variable is a placeholder, the value
 is nowhere in the guest, the machine's record or smolvm's database, TLS to the bound host goes
 through the machine's own CA, and a placeholder anywhere but a request header is refused before it
-leaves the host.
+leaves the host (from v1.27.0 a binding with `:body` also substitutes into a form body).
 The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
@@ -51,7 +51,8 @@ result=ready
 `tsi_stream_intercept` is read from the symbols of the bundled libkrun: a binding selects virtio-net
 by default, and `--net-backend tsi` carries a credential only when libkrun exports
 `krun_set_stream_intercept`, which both v1.18.2 release libraries do. `host_form=rejected` means the
-host is not an exact lowercase DNS name; `create` would refuse it anyway, with a clearer message.
+host is neither a lowercase DNS name nor, from v1.26.0, a wildcard such as `*.example.com`; `create`
+would refuse it anyway, with a clearer message.
 
 **2. Create the machine.** The value is read from the environment of this command's `machine
 start`, and that is the value the machine uses until its next start.
@@ -148,8 +149,8 @@ Full detail in `references/traps.md`.
   planted it in `agent-console.log` and failed itself. `verify-containment.sh` hands the value to
   `grep` on standard input, in the guest and on the host, for that reason.
 - **A 403 from smolvm is a refusal, not the API.** The body says which rule: a placeholder in the
-  path, query or body; in a routing or framing header such as `Cookie`; more than one in a request;
-  or one the machine did not mint. A `403` with `this credential is not allowed for this host`
+  path or query, or in a body without `:body`; in a routing or framing header such as `Cookie`;
+  more than one in a request; or one the machine did not mint. A `403` with `this credential is not allowed for this host`
   means the placeholder belongs to a binding for another host; a `405` means the binding does not
   allow the method.
 - **On v1.18.2 a machine created from a pack ignores `--credential`**, silently; on v1.22.2 it
@@ -164,10 +165,13 @@ Full detail in `references/traps.md`.
 
 - **A binding is narrower than a secret.** `--secret-env` puts the plaintext in the workload's
   environment, where any code in the guest can read and send it anywhere the network allows. A
-  binding lets the workload use the key only in a header, only toward the hosts named.
-- **Bind to the exact host and nothing wider.** Hosts are exact names with no wildcards, and when
-  the machine also has `--allow-host`, every credential host has to sit inside that list; a create
-  that breaks either rule is refused.
+  binding lets the workload use the key only in a header, or a form body when you add `:body`, only
+  toward the hosts named.
+- **Bind to the narrowest hosts that work.** A host is an exact name or, from v1.26.0, a whole-label
+  wildcard such as `*.example.com`, which matches its subdomains and not `example.com` itself; a
+  one-label parent such as `*.com` is refused. When the machine also has `--allow-host`, every
+  credential host has to sit inside that list, and a wildcard only when the list admits its whole
+  subtree; a create that breaks either rule is refused.
 - **Substitution is not data-loss prevention.** An API that echoes your key back in a response
   body hands it to the guest. Bind keys only to APIs you trust with them.
 - **The scripts never print the value** or its length, and the preflight reports only whether the
@@ -219,9 +223,15 @@ a forged SMOL_PLACEHOLDER_DEMO_...        -> 403 unknown placeholder
 Cookie: a=<placeholder>                   -> 403 placeholders are not substituted in routing or framing headers
 ```
 
-Create-time rules, both hosts: `*.example.com` and an IP address are refused with `must be an exact
-lowercase DNS name`, and a credential host outside the machine's `--allow-host` with `is not
-reachable under the machine's network allow_hosts`.
+From v1.27.0 the body case reads `403 smolvm credentials: body substitution is disabled for this
+binding`, and a binding created with `:body` substitutes into an `application/x-www-form-urlencoded`
+body instead; that is read from the source, not run here.
+
+Create-time rules, both hosts, on v1.22.2: `*.example.com` and an IP address are refused with
+`must be an exact lowercase DNS name`, and a credential host outside the machine's `--allow-host`
+with `is not reachable under the machine's network allow_hosts`. From v1.26.0 `*.example.com` is
+accepted, and an IP address is refused with `must be a lowercase DNS name, optionally` followed by
+the wildcard form.
 
 ## Re-verified on v1.22.2
 

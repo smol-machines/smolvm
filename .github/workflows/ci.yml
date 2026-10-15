@@ -50,10 +50,10 @@ jobs:
           sudo apt-get install -y binutils binutils-mingw-w64-x86-64 llvm
       - name: Bundled libkrun exports every symbol smolvm requires
         run: ./scripts/check-krun-exports.sh
-      # A libkrun built on a newer distro (glibc > 2.35) loads there but fails on
-      # ubuntu-22.04 / Debian 12 with "GLIBC_x.y not found" before the VM boots
+      # A libkrun linked against a newer glibc (> 2.31) loads there but fails on
+      # Ubuntu 20.04 / Debian 11 with "GLIBC_x.y not found" before the VM boots
       # (issue #636). Gate every push so a wrong-host lib can't ship again.
-      - name: Bundled libkrun keeps a glibc floor <= 2.35
+      - name: Bundled libkrun keeps a glibc floor <= 2.31
         run: ./scripts/check-libkrun-glibc-floor.sh
       # The guest has no dynamic loader: a libkrun embedding a glibc-linked
       # krun-init boots no VM at all, exiting before the agent with an empty
@@ -281,6 +281,23 @@ jobs:
   # ==========================================================================
   # Windows Build & Lint (cross-compiled from Linux, mingw-w64 / GNU target)
   # ==========================================================================
+  # musl hosts (Alpine): the engine builds against musl as a dynamic binary,
+  # which it needs to load libkrun. Compile-only, so a glibc-only libc API
+  # cannot slip back in unnoticed.
+  linux-musl:
+    name: Linux musl (Alpine)
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache build-base curl git bash clang-dev linux-headers pkgconf perl
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        env:
+          RUSTFLAGS: "-C target-feature=-crt-static"
+        run: cargo build --bin smolvm
+
   windows:
     name: Windows (x86_64, cross)
     runs-on: ubuntu-latest
@@ -493,7 +510,7 @@ jobs:
   # ==========================================================================
   ci-success:
     name: CI Success
-    needs: [fmt, macos, linux, windows, agent, smol-compat]
+    needs: [fmt, macos, linux, linux-musl, windows, agent, smol-compat]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -502,6 +519,7 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.macos.result }}" != "success" ]] || \
              [[ "${{ needs.linux.result }}" != "success" ]] || \
+             [[ "${{ needs.linux-musl.result }}" != "success" ]] || \
              [[ "${{ needs.windows.result }}" != "success" ]] || \
              [[ "${{ needs.agent.result }}" != "success" ]] || \
              [[ "${{ needs.smol-compat.result }}" != "success" ]]; then

@@ -37,8 +37,8 @@ Running `scripts/start-dockerd.sh` afterwards restored everything, and `docker i
 listed `alpine:latest`, because the images are on `/storage`. **The failure mode is a daemon that
 will not start, or one running on the wrong filesystem, not lost data.**
 
-`smolvm machine create --help` describes `--init` as "Run command on every VM start" at v1.22.2;
-`init` runs on the first start only, as [`smolfile.md`](../smolfile.md) says. More in
+`smolvm machine create --help` describes `--init` as "Run command on every VM start" at v1.22.2,
+and as running once from v1.23.7; `init` runs on the first start only, as [`smolfile.md`](../smolfile.md) says. More in
 `references/traps.md`.
 
 ## Procedure

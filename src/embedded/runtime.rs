@@ -66,11 +66,26 @@ impl ResizeSpec {
     }
 }
 
+/// How [`EmbeddedRuntime::stop_machine_with`] and
+/// [`EmbeddedRuntime::delete_machine_with`] treat work still running on the
+/// machine.
+#[derive(Debug, Clone, Default)]
+pub struct StopOptions {
+    /// Wait up to this long for running commands and file transfers to finish
+    /// before stopping. Whatever is still running then is cut off and fails
+    /// with [`Error::Interrupted`]. `None` stops at once.
+    pub drain: Option<Duration>,
+    /// Seconds the workload gets to exit after its stop signal, instead of
+    /// the timeout it was launched with. Ignored by delete, which kills it.
+    pub stop_timeout: Option<Duration>,
+}
+
 /// Stateful runtime shared by all embedded machine objects in this process.
 pub struct EmbeddedRuntime {
     db: SmolvmDb,
     registry: RwLock<HashMap<String, SharedHandle>>,
     name_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    inflight: super::inflight::Inflight,
 }
 
 impl EmbeddedRuntime {
@@ -85,6 +100,7 @@ impl EmbeddedRuntime {
             db,
             registry: RwLock::new(HashMap::new()),
             name_locks: RwLock::new(HashMap::new()),
+            inflight: Default::default(),
         }
     }
 
@@ -276,10 +292,15 @@ impl EmbeddedRuntime {
                 "pause-{}.smolcheckpoint",
                 crate::db::SmolvmDb::create_reservation_token()
             ));
+            // A paused machine resumes on this host, so its host mounts come along.
+            let pause_options = crate::portable_checkpoint::CaptureOptions {
+                host_mounts: true,
+                ..Default::default()
+            };
             let result = crate::portable_checkpoint::capture_and_stop_to_path(
                 name,
                 &output,
-                &Default::default(),
+                &pause_options,
                 |stage| {
                     self.db
                         .update_vm_durable(name, |record| {
@@ -853,8 +874,17 @@ impl EmbeddedRuntime {
         })
     }
 
-    /// Stop a machine and persist stopped state.
+    /// Stop a machine and persist stopped state. A command or file transfer
+    /// still running on it is cut off and fails with [`Error::Interrupted`].
     pub fn stop_machine(&self, name: &str) -> Result<()> {
+        self.stop_machine_with(name, &StopOptions::default())
+    }
+
+    /// [`stop_machine`](Self::stop_machine), optionally letting running
+    /// commands and transfers finish first and overriding the workload's stop
+    /// timeout. New commands are refused while the stop runs.
+    pub fn stop_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
+        let _fence = self.inflight.fence(name, "stopped", options.drain);
         self.with_name_lock(name, || {
             let _source_lock = crate::agent::fork::lock_fork_source(name)?;
             let record = control::get_record(&self.db, name)?;
@@ -879,17 +909,26 @@ impl EmbeddedRuntime {
                 if !record.staged_mounts.is_empty() {
                     handle.sync_staged_mounts(&record)?;
                 }
-                handle.stop()?;
+                handle.stop_with_timeout(options.stop_timeout)?;
                 control::mark_stopped(&self.db, name)?;
                 return Ok(());
             }
 
-            control::stop_vm(&self.db, name)
+            control::stop_vm_with_timeout(&self.db, name, options.stop_timeout)
         })
     }
 
     /// Stop best-effort, remove from the registry and DB, and delete storage.
+    /// Works on a stopped machine without booting it. A command or file
+    /// transfer still running on it fails with [`Error::Interrupted`].
     pub fn delete_machine(&self, name: &str) -> Result<()> {
+        self.delete_machine_with(name, &StopOptions::default())
+    }
+
+    /// [`delete_machine`](Self::delete_machine), optionally letting running
+    /// commands and transfers finish first.
+    pub fn delete_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
+        let _fence = self.inflight.fence(name, "deleted", options.drain);
         let result = self.delete_machine_inner(name);
         if result.is_ok() {
             crate::credentials::forget_values(name);
@@ -943,9 +982,10 @@ impl EmbeddedRuntime {
                 if !record.staged_mounts.is_empty() {
                     handle.sync_staged_mounts(&record)?;
                 }
-                handle.stop()?;
+                // The machine is going away: its workload has nothing to save.
+                handle.stop_with_timeout(Some(Duration::ZERO))?;
             } else {
-                control::stop_vm(&self.db, name)?;
+                control::stop_vm_with_timeout(&self.db, name, Some(Duration::ZERO))?;
             }
 
             // Idempotent: deleting an already-deleted machine is a no-op success
@@ -989,6 +1029,7 @@ impl EmbeddedRuntime {
             workdir,
             timeout,
             user: None,
+            stdin: None,
         };
         self.exec_with_options(name, command, options)
     }
@@ -1004,14 +1045,24 @@ impl EmbeddedRuntime {
         command: Vec<String>,
         options: ExecOptions,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        let options = self.with_machine_context(name, options)?;
-        let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
-        let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
-        let mut client = self.command_client(name)?;
-        match config {
-            Some(config) => client.run_non_interactive(config),
-            None => client.vm_exec(command, options.env, options.workdir, options.timeout, None),
-        }
+        let op = self.inflight.begin(name, "exec")?;
+        let result = (|| {
+            let options = self.with_machine_context(name, options)?;
+            let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+            let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
+            let mut client = self.command_client(name)?;
+            match config {
+                Some(config) => client.run_non_interactive(config),
+                None => client.vm_exec(
+                    command,
+                    options.env,
+                    options.workdir,
+                    options.timeout,
+                    options.stdin,
+                ),
+            }
+        })();
+        op.finish(result)
     }
 
     /// The [`RunConfig`] for a command on an image machine, or `None` for a
@@ -1045,6 +1096,7 @@ impl EmbeddedRuntime {
                 .with_workdir(options.workdir.clone())
                 .with_timeout(options.timeout)
                 .with_user(options.user.clone())
+                .with_stdin(options.stdin.clone())
                 .with_mounts(self.mount_bindings_for(name)?)
                 .with_s3_volumes(self.s3_volumes_for(name)?)
                 .with_persistent_overlay(Some(overlay_owner)),
@@ -1136,22 +1188,30 @@ impl EmbeddedRuntime {
         data: Vec<u8>,
         mode: Option<u32>,
     ) -> Result<()> {
-        let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
-        let mount_bindings = self.mount_bindings_for(name)?;
-        let handle = self.started_handle(name)?;
-        let mut handle = lock_handle(&handle)?;
-        Self::activate_image_overlay(&mut handle, image, overlay_owner, mount_bindings)?;
-        handle.write_file(path, &data, mode)
+        let op = self.inflight.begin(name, "write file")?;
+        let result = (|| {
+            let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+            let mount_bindings = self.mount_bindings_for(name)?;
+            let handle = self.started_handle(name)?;
+            let mut handle = lock_handle(&handle)?;
+            Self::activate_image_overlay(&mut handle, image, overlay_owner, mount_bindings)?;
+            handle.write_file(path, &data, mode)
+        })();
+        op.finish(result)
     }
 
     /// Read a file from the machine.
     pub fn read_file(&self, name: &str, path: &str) -> Result<Vec<u8>> {
-        let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
-        let mount_bindings = self.mount_bindings_for(name)?;
-        let handle = self.started_handle(name)?;
-        let mut handle = lock_handle(&handle)?;
-        Self::activate_image_overlay(&mut handle, image, overlay_owner, mount_bindings)?;
-        handle.read_file(path)
+        let op = self.inflight.begin(name, "read file")?;
+        let result = (|| {
+            let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+            let mount_bindings = self.mount_bindings_for(name)?;
+            let handle = self.started_handle(name)?;
+            let mut handle = lock_handle(&handle)?;
+            Self::activate_image_overlay(&mut handle, image, overlay_owner, mount_bindings)?;
+            handle.read_file(path)
+        })();
+        op.finish(result)
     }
 
     /// Make an image machine's persistent container rootfs the active target
@@ -1313,6 +1373,7 @@ impl EmbeddedRuntime {
             workdir,
             timeout,
             user: None,
+            stdin: None,
         };
         self.exec_streaming_with_options(name, command, options, &ExecCancel::new(), on_event)
     }
@@ -1325,6 +1386,19 @@ impl EmbeddedRuntime {
     /// events. An image machine streams inside its persistent container overlay
     /// so streamed installs and writes persist like non-streaming ones.
     pub fn exec_streaming_with_options<F: FnMut(ExecEvent)>(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        options: ExecOptions,
+        cancel: &ExecCancel,
+        on_event: F,
+    ) -> Result<()> {
+        let op = self.inflight.begin(name, "exec")?;
+        let result = self.exec_streaming_inner(name, command, options, cancel, on_event);
+        op.finish(result)
+    }
+
+    fn exec_streaming_inner<F: FnMut(ExecEvent)>(
         &self,
         name: &str,
         command: Vec<String>,
@@ -1374,9 +1448,13 @@ impl EmbeddedRuntime {
     }
 
     /// Get the child PID if the machine is running.
+    ///
+    /// Like [`Self::is_running`] and [`Self::state`] this never waits on the
+    /// machine: a file transfer holds its handle for the whole copy, so a busy
+    /// handle is skipped and the persisted record answers instead.
     pub fn pid(&self, name: &str) -> Option<i32> {
         if let Ok(Some(handle)) = self.cached_handle(name) {
-            if let Ok(handle) = handle.lock() {
+            if let Ok(handle) = handle.try_lock() {
                 if let Some(pid) = handle.child_pid() {
                     return Some(pid);
                 }
@@ -1402,7 +1480,7 @@ impl EmbeddedRuntime {
             return false;
         }
         if let Ok(Some(handle)) = self.cached_handle(name) {
-            if let Ok(handle) = handle.lock() {
+            if let Ok(handle) = handle.try_lock() {
                 return handle.is_process_alive();
             }
         }
@@ -1414,6 +1492,77 @@ impl EmbeddedRuntime {
             .is_some_and(|record| record.actual_state() == RecordState::Running)
     }
 
+    /// Make `ports` the machine's published ports, the whole set.
+    ///
+    /// A stopped machine gets them at its next start. A running one changes
+    /// its TCP ports now: new host ports start accepting, removed ones stop
+    /// (connections they already accepted carry on). Its UDP ports are bound
+    /// for the life of the VM, so a running machine refuses a UDP change, and
+    /// only a machine on virtio-net networking can change ports while running.
+    /// A host port already taken fails the call and changes nothing.
+    pub fn set_ports(&self, name: &str, ports: &[crate::data::network::PortMapping]) -> Result<()> {
+        self.with_name_lock(name, || {
+            let record = control::get_record(&self.db, name)?;
+            let running =
+                crate::agent::state_probe::resolve_state(name, &record) == RecordState::Running;
+            crate::agent::live_ports::set_published_ports(&self.db, &record, running, ports)
+                .map(|_| ())
+        })
+    }
+
+    /// Pack the stopped machine `name` into a `.smolmachine` at `output`
+    /// (a `.smolmachine` extension is added when missing): its disks and
+    /// configuration flattened into an artifact new machines boot from with
+    /// [`Self::create_machine_from_pack`]. The same export `smolvm pack create
+    /// --from-vm` runs, done by the smolvm binary the embedder bundles.
+    pub fn pack_machine(&self, name: &str, output: &std::path::Path) -> Result<std::path::PathBuf> {
+        control::get_record(&self.db, name)?;
+        let sidecar = if output.extension().is_some_and(|e| e == "smolmachine") {
+            output.to_path_buf()
+        } else {
+            let mut path = output.as_os_str().to_owned();
+            path.push(".smolmachine");
+            std::path::PathBuf::from(path)
+        };
+        // `pack create -o X` writes the runnable binary X beside X.smolmachine.
+        let stub = sidecar.with_extension("");
+        self.with_name_lock(name, || {
+            run_bundled_cli(&[
+                "pack".as_ref(),
+                "create".as_ref(),
+                "--from-vm".as_ref(),
+                name.as_ref(),
+                "-o".as_ref(),
+                stub.as_os_str(),
+            ])
+        })?;
+        Ok(sidecar)
+    }
+
+    /// Create the stopped machine `name` from a `.smolmachine` artifact, as
+    /// `smolvm machine create --from` does. Start it with
+    /// [`Self::start_machine`].
+    pub fn create_machine_from_pack(&self, name: &str, pack: &std::path::Path) -> Result<()> {
+        self.with_name_lock(name, || {
+            run_bundled_cli(&[
+                "machine".as_ref(),
+                "create".as_ref(),
+                "--name".as_ref(),
+                name.as_ref(),
+                "--from".as_ref(),
+                pack.as_os_str(),
+            ])
+        })
+    }
+
+    /// The persisted record of `name`, without starting or connecting to it,
+    /// or `None` when no such machine exists. SDKs open a handle to a stopped
+    /// machine from this (to read its state, resize or delete it) without the
+    /// boot `connect` performs.
+    pub fn machine_record(&self, name: &str) -> Result<Option<crate::config::VmRecord>> {
+        self.db.get_vm(name)
+    }
+
     /// Get the current machine state as a string.
     pub fn state(&self, name: &str) -> String {
         if let Ok(Some(record)) = self.db.get_vm(name) {
@@ -1422,7 +1571,7 @@ impl EmbeddedRuntime {
             }
         }
         if let Ok(Some(handle)) = self.cached_handle(name) {
-            if let Ok(handle) = handle.lock() {
+            if let Ok(handle) = handle.try_lock() {
                 return handle.state();
             }
         }
@@ -1532,6 +1681,45 @@ impl EmbeddedRuntime {
 fn lock_name(lock: &Arc<Mutex<()>>) -> Result<MutexGuard<'_, ()>> {
     lock.lock()
         .map_err(|e| Error::agent("runtime name lock", e.to_string()))
+}
+
+/// Run the smolvm binary the embedder bundles (see
+/// [`crate::embedded::bundle::boot_binary`]) with `args`, for the operations
+/// that live in the CLI. Fails, with the CLI's own message, when it does.
+fn run_bundled_cli(args: &[&std::ffi::OsStr]) -> Result<()> {
+    let exe = super::bundle::boot_binary().ok_or_else(|| {
+        Error::config(
+            "smolvm binary",
+            "this needs the smolvm binary; the SDK bundles it, or set SMOLVM_BOOT_BINARY",
+        )
+    })?;
+    let mut command = std::process::Command::new(&exe);
+    command.args(args).stdin(std::process::Stdio::null());
+    if let Some(lib_dir) = super::bundle::lib_dir() {
+        command.env(crate::data::consts::ENV_SMOLVM_LIB_DIR, lib_dir);
+    }
+    let output = command
+        .output()
+        .map_err(|e| Error::agent("run smolvm", format!("{}: {e}", exe.display())))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("exited without a message")
+        .trim()
+        .trim_start_matches("Error: ")
+        .to_string();
+    let operation = args
+        .iter()
+        .take(2)
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(Error::agent(operation, reason))
 }
 
 fn lock_handle(handle: &SharedHandle) -> Result<MutexGuard<'_, VmHandle>> {
@@ -1710,6 +1898,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(options.workdir.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn set_ports_on_a_stopped_machine_saves_tcp_and_udp_and_refuses_duplicates() {
+        use crate::data::network::{PortMapping, PortProtocol};
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let record =
+            crate::config::VmRecord::new("ports-stopped".into(), 1, 512, vec![], vec![], false);
+        runtime.db.insert_vm("ports-stopped", &record).unwrap();
+        runtime
+            .set_ports(
+                "ports-stopped",
+                &[
+                    PortMapping::new(18080, 3000),
+                    PortMapping::with_protocol(17777, 7777, PortProtocol::Udp),
+                ],
+            )
+            .unwrap();
+        let saved = runtime.machine_record("ports-stopped").unwrap().unwrap();
+        assert_eq!(saved.ports, vec![(18080, 3000)]);
+        assert_eq!(saved.udp_ports, vec![(17777, 7777)]);
+
+        let err = runtime
+            .set_ports(
+                "ports-stopped",
+                &[PortMapping::new(18080, 3000), PortMapping::new(18080, 3001)],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("18080"), "{err}");
+        let unchanged = runtime.machine_record("ports-stopped").unwrap().unwrap();
+        assert_eq!(
+            unchanged.ports,
+            vec![(18080, 3000)],
+            "a refused set changes nothing"
+        );
+
+        runtime.set_ports("ports-stopped", &[]).unwrap();
+        let cleared = runtime.machine_record("ports-stopped").unwrap().unwrap();
+        assert!(cleared.ports.is_empty() && cleared.udp_ports.is_empty());
+        assert!(runtime.set_ports("no-such-machine", &[]).is_err());
     }
 
     #[test]

@@ -267,6 +267,7 @@ pub async fn exec_stream(
     let command = req.command.clone();
     let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
+    let stdin_data = req.stdin.map(String::into_bytes);
 
     // Image-based machines stream from a container in their image (persistent
     // overlay keyed by machine name); plain machines stream from the VM
@@ -280,16 +281,10 @@ pub async fn exec_stream(
     let machine_for_run = machine_rec.clone();
     let machine_image = machine_rec.and_then(|r| r.image);
 
-    // Bridge the blocking, synchronous vsock streaming exec to an async SSE
-    // stream: a spawned blocking task runs the exec and pushes each ExecEvent
-    // into an unbounded channel AS IT ARRIVES; the SSE stream below yields
-    // them live. Previously this collected every event into a Vec and only
-    // built the SSE stream AFTER the command completed, so the "stream"
-    // delivered nothing until exit — defeating streaming exec (F-16). The
-    // per-session output cap is still enforced inside the agent client's
-    // streaming collector (MAX_STREAMING_EXEC_OUTPUT), which emits a
-    // truncation Error event and stops relaying.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::agent::ExecEvent>();
+    // Bridge blocking vsock exec to a bounded async SSE channel. The callback
+    // runs inside spawn_blocking, so backpressure does not block the reactor;
+    // preserve the existing stdin forwarding and UTF-8 decoding paths.
+    let (tx, rx) = tokio::sync::mpsc::channel::<crate::agent::ExecEvent>(EXEC_STREAM_QUEUE_SIZE);
     let err_tx = tx.clone();
     let entry_exec = entry.clone();
     let start = std::time::Instant::now();
@@ -317,15 +312,15 @@ pub async fn exec_stream(
                     .with_mounts(mounts_config)
                     .with_timeout(timeout)
                     .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes);
-                c.run_streaming_with(config, |e| {
-                    let _ = tx.send(e);
+                c.run_streaming_with_stdin(config, stdin_data, |e| {
+                    forward_exec_event(&tx, e);
                 })
             })
             .await
         } else {
             with_machine_client_traced(&entry_exec, tid, move |c| {
-                c.vm_exec_streaming_with(command, env, workdir, timeout, |e| {
-                    let _ = tx.send(e);
+                c.vm_exec_streaming_with_stdin(command, env, workdir, timeout, stdin_data, |e| {
+                    forward_exec_event(&tx, e);
                 })
             })
             .await
@@ -335,19 +330,117 @@ pub async fn exec_stream(
         // status once the SSE has begun, so surface them as a terminal error
         // event instead of silently ending the stream.
         if let Err(e) = result {
-            let _ = err_tx.send(crate::agent::ExecEvent::Error(format!("{e:?}")));
+            let _ = err_tx
+                .send(crate::agent::ExecEvent::Error(format!("{e:?}")))
+                .await;
         }
     });
 
     // Yield each event as an SSE frame the instant it lands in the channel.
-    let stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            let sse_event = exec_event_to_sse(event);
-            yield Ok::<_, Infallible>(sse_event);
-        }
-    };
+    Ok(Sse::new(exec_event_stream(rx)).keep_alive(KeepAlive::default()))
+}
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+fn exec_event_stream(
+    mut rx: tokio::sync::mpsc::Receiver<crate::agent::ExecEvent>,
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        let mut stdout = Utf8ExecOutput::default();
+        let mut stderr = Utf8ExecOutput::default();
+        while let Some(event) = rx.recv().await {
+            match event {
+                crate::agent::ExecEvent::Stdout(bytes) => {
+                    if let Some(text) = stdout.decode(&bytes) {
+                        yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+                    }
+                }
+                crate::agent::ExecEvent::Stderr(bytes) => {
+                    if let Some(text) = stderr.decode(&bytes) {
+                        yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+                    }
+                }
+                terminal => {
+                    // A stream can end in the middle of a UTF-8 character. Emit
+                    // the replacement before exit/error, while keeping complete
+                    // characters intact across guest output chunks.
+                    if let Some(text) = stdout.finish() {
+                        yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+                    }
+                    if let Some(text) = stderr.finish() {
+                        yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+                    }
+                    yield Ok::<_, Infallible>(exec_event_to_sse(terminal));
+                }
+            }
+        }
+        if let Some(text) = stdout.finish() {
+            yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+        }
+        if let Some(text) = stderr.finish() {
+            yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+        }
+    }
+}
+
+/// Decode one output stream without replacing a valid code point split across
+/// two agent frames. Only an incomplete trailing character is retained.
+#[derive(Default)]
+struct Utf8ExecOutput {
+    partial: Vec<u8>,
+}
+
+impl Utf8ExecOutput {
+    fn decode(&mut self, bytes: &[u8]) -> Option<String> {
+        if self.partial.is_empty() {
+            if let Ok(valid) = std::str::from_utf8(bytes) {
+                return (!valid.is_empty()).then(|| valid.to_owned());
+            }
+        }
+        let mut buffer = std::mem::take(&mut self.partial);
+        buffer.extend_from_slice(bytes);
+        let mut result = String::new();
+        let mut cursor = 0;
+        while cursor < buffer.len() {
+            match std::str::from_utf8(&buffer[cursor..]) {
+                Ok(valid) => {
+                    result.push_str(valid);
+                    break;
+                }
+                Err(err) => {
+                    let valid_end = cursor + err.valid_up_to();
+                    result.push_str(std::str::from_utf8(&buffer[cursor..valid_end]).unwrap());
+                    cursor = valid_end;
+                    match err.error_len() {
+                        Some(len) => {
+                            result.push('\u{fffd}');
+                            cursor += len;
+                        }
+                        None => {
+                            self.partial.extend_from_slice(&buffer[cursor..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        (!result.is_empty()).then_some(result)
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        let partial = std::mem::take(&mut self.partial);
+        (!partial.is_empty()).then(|| String::from_utf8_lossy(&partial).into_owned())
+    }
+}
+
+/// Maximum number of guest events waiting for a slow HTTP reader.
+const EXEC_STREAM_QUEUE_SIZE: usize = 8;
+
+fn forward_exec_event(
+    tx: &tokio::sync::mpsc::Sender<crate::agent::ExecEvent>,
+    event: crate::agent::ExecEvent,
+) {
+    // Called only from the spawn_blocking agent callback. A closed HTTP stream
+    // drops its receiver, which releases a blocked sender immediately.
+    let _ = tx.blocking_send(event);
 }
 
 /// Encode a guest exec event as an SSE frame. Errors can include arbitrary
@@ -772,7 +865,8 @@ static LOG_FOLLOW_SEMAPHORE: std::sync::LazyLock<Semaphore> =
     params(
         ("id" = String, Path, description = "Machine name"),
         ("follow" = Option<bool>, Query, description = "Follow the logs (like tail -f)"),
-        ("tail" = Option<usize>, Query, description = "Number of lines to show from the end")
+        ("tail" = Option<usize>, Query, description = "Number of lines to show from the end"),
+        ("source" = Option<String>, Query, description = "\"console\" (default) for the agent and kernel console, or \"workload\" for the workload's stdout and stderr, readable while the machine is stopped")
     ),
     responses(
         (status = 200, description = "Log stream (SSE)", content_type = "text/event-stream"),
@@ -784,14 +878,43 @@ pub async fn stream_logs(
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    let log_path = match query.source.as_deref() {
+        None | Some("console") => console_log_path(&state, &id)?,
+        Some("workload") => workload_log_path(&state, &id).await?,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown log source '{other}': use \"console\" or \"workload\""
+            )))
+        }
+    };
+    stream_log_file(&id, log_path, query).await
+}
+
+/// A machine's workload log. It lives in the machine's data directory and is
+/// kept across restarts, so it is served whether or not the machine runs.
+async fn workload_log_path(state: &ApiState, id: &str) -> Result<PathBuf, ApiError> {
+    let db = state.db().clone();
+    let name = id.to_string();
+    let known = tokio::task::spawn_blocking(move || matches!(db.get_vm(&name), Ok(Some(_))))
+        .await
+        .map_err(ApiError::internal)?;
+    if !known {
+        return Err(ApiError::NotFound(format!("machine '{id}' not found")));
+    }
+    Ok(crate::workload_log::workload_log_path(
+        &crate::agent::vm_data_dir(id),
+    ))
+}
+
+fn console_log_path(state: &ApiState, id: &str) -> Result<PathBuf, ApiError> {
     // get_machine only knows machines in the running map. Distinguish a real
     // typo (absent from the DB too) from a machine that exists but was never
     // started (present in the DB, no console log yet) so clients don't read a
     // created machine as "not found".
-    let entry = match state.get_machine(&id) {
+    let entry = match state.get_machine(id) {
         Ok(e) => e,
         Err(_) => {
-            let known = matches!(state.db().get_vm(&id), Ok(Some(_)));
+            let known = matches!(state.db().get_vm(id), Ok(Some(_)));
             return Err(if known {
                 ApiError::NotFound(format!(
                     "machine '{id}' has not been started yet — no logs available"
@@ -802,16 +925,19 @@ pub async fn stream_logs(
         }
     };
 
-    // Get console log path
-    let log_path: PathBuf = {
-        let entry = entry.lock();
-        entry
-            .manager
-            .console_log()
-            .ok_or_else(|| ApiError::NotFound("console log not configured".into()))?
-            .to_path_buf()
-    };
+    let entry = entry.lock();
+    Ok(entry
+        .manager
+        .console_log()
+        .ok_or_else(|| ApiError::NotFound("console log not configured".into()))?
+        .to_path_buf())
+}
 
+async fn stream_log_file(
+    id: &str,
+    log_path: PathBuf,
+    query: LogsQuery,
+) -> Result<axum::response::Response, ApiError> {
     // Check if file exists (blocking check is acceptable here since it's fast)
     let path_check = log_path.clone();
     let exists = tokio::task::spawn_blocking(move || path_check.exists())
@@ -1410,9 +1536,73 @@ mod interactive_tests {
 }
 
 #[cfg(test)]
+mod exec_stream_queue_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_sse_reader_applies_backpressure_without_losing_events() {
+        use crate::agent::ExecEvent;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(EXEC_STREAM_QUEUE_SIZE);
+        let (filled_tx, filled_rx) = tokio::sync::oneshot::channel();
+        let mut sender = tokio::task::spawn_blocking(move || {
+            for n in 0..EXEC_STREAM_QUEUE_SIZE {
+                forward_exec_event(&tx, ExecEvent::Stdout(vec![n as u8]));
+            }
+            let _ = filled_tx.send(());
+            forward_exec_event(&tx, ExecEvent::Exit(7));
+        });
+        filled_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut sender)
+                .await
+                .is_err(),
+            "sender must wait until the HTTP reader consumes an event"
+        );
+        for n in 0..EXEC_STREAM_QUEUE_SIZE {
+            assert!(matches!(rx.recv().await, Some(ExecEvent::Stdout(data)) if data == [n as u8]));
+        }
+        assert!(matches!(rx.recv().await, Some(ExecEvent::Exit(7))));
+        sender.await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod log_stream_tests {
     use super::*;
     use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn streamed_exec_keeps_split_utf8_intact_and_flushes_incomplete_output_before_exit() {
+        use crate::agent::ExecEvent;
+        use axum::response::IntoResponse as _;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(EXEC_STREAM_QUEUE_SIZE);
+        tx.try_send(ExecEvent::Stdout(vec![b'h', b'i', b' ', 0xf0]))
+            .unwrap();
+        tx.try_send(ExecEvent::Stderr(vec![0xe2])).unwrap();
+        tx.try_send(ExecEvent::Stdout(vec![0x9f])).unwrap();
+        tx.try_send(ExecEvent::Stderr(vec![0x82, 0xac])).unwrap();
+        tx.try_send(ExecEvent::Stdout(vec![0x90, 0xb1, 0xff, b'!', 0xe2]))
+            .unwrap();
+        tx.try_send(ExecEvent::Exit(0)).unwrap();
+        drop(tx);
+
+        let response = Sse::new(exec_event_stream(rx)).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            body,
+            concat!(
+                "event: stdout\ndata: hi \n\n",
+                "event: stderr\ndata: €\n\n",
+                "event: stdout\ndata: 🐱�!\n\n",
+                "event: stdout\ndata: �\n\n",
+                "event: exit\ndata: {\"exitCode\":0}\n\n",
+            )
+        );
+    }
 
     /// What axum's `Sse` writes for these lines, one `Event::default().data(line)` each.
     async fn axum_sse_bytes(lines: &[&str]) -> Vec<u8> {

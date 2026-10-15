@@ -360,6 +360,18 @@ pub fn record_base_digest(base: &std::path::Path, digest: &str) {
     }
 }
 
+/// Remove `base` and its recorded digest. A base that is already gone is not
+/// an error.
+pub fn remove_base(base: &std::path::Path) -> std::io::Result<()> {
+    if let Some(digest) = base_digest_path(base) {
+        let _ = std::fs::remove_file(digest);
+    }
+    match std::fs::remove_file(base) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// Check that `name` names a cache base as a remote caller must: one file name
 /// in the cache disk directory, never a path.
 pub fn validate_base_name(name: &str) -> Result<(), String> {
@@ -497,6 +509,19 @@ impl DiskType for Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_a_base_takes_its_digest_and_tolerates_a_missing_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("b-v1.qcow2");
+        std::fs::write(&base, b"base").unwrap();
+        record_base_digest(&base, &"a".repeat(64));
+        let digest = base_digest_path(&base).unwrap();
+        assert!(digest.exists());
+        remove_base(&base).unwrap();
+        assert!(!base.exists() && !digest.exists());
+        remove_base(&base).unwrap();
+    }
 
     fn qcow2_header(backing: bool, external_data: bool) -> Vec<u8> {
         let mut h = vec![0u8; 104];

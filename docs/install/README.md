@@ -22,8 +22,9 @@ pages; `SKILL.md` records the version each claim was last verified on.
 
 ## Where it puts things
 
-Under `$HOME`: the binary in `~/.smolvm` and the launcher in `~/.local/bin`. `references/layout.md`
-has the full tree, including what an uninstall leaves behind on purpose.
+Under `$HOME`: the binary in `~/.smolvm` and the launcher in `~/.local/bin`. Run as root on Linux,
+the installer puts the binary in `/opt/smolvm` and the launcher in `/usr/local/bin` instead.
+`references/layout.md` has the full tree, including what an uninstall leaves behind on purpose.
 
 **To install without touching an existing copy**, point `HOME` at a scratch directory: every path
 above moves with it on macOS, and on Linux once `XDG_DATA_HOME` and `XDG_CACHE_HOME` are unset,

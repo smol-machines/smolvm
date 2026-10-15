@@ -2,7 +2,7 @@
 
 ## Contents
 
-- Ctrl-C does not stop the machine, and which release and route that applies to
+- What Ctrl-C stops, by release, route and wrapper
 - Assert no machines left only after a wait
 - A network-off run that dies on the manifest means the bake was skipped
 - A blocked host looks like a DNS bug, not a policy denial
@@ -13,7 +13,7 @@
 - What is cache and what is residue
 - There is no way to list what has been baked
 
-## Ctrl-C does not stop the machine, and which release and route that applies to
+## What Ctrl-C stops, by release, route and wrapper
 
 **On v1.20.2, interrupting the CLI ends the VM; interrupting `run.sh` does not.** Measured
 2026-09-29 on macOS 27.0.1 arm64 and Ubuntu 24.04 aarch64, a `sleep 600` workload, watching the VM
@@ -32,6 +32,11 @@ pid itself:
 command with `SIGINT` ignored. On macOS the same cached run backgrounded by `bash -c '... & wait'`
 kept its CLI and VM after `SIGINT`, and with `SIGINT` reset to the default before the exec both were
 gone.
+
+`run.sh` now forwards `SIGINT` and `SIGTERM` to the CLI. On macOS arm64 on v1.27.3, network-on
+route, `sleep 600`: before the change `SIGTERM` to `run.sh` alone left the CLI and its VM running,
+reparented to pid 1, while Ctrl-C to the group ended both; after it, both signals ended both and the
+script printed the run's log with `cli_exit=143` and `cli_exit=130`.
 
 **Before v1.20.2, on the offline route the CLI itself is no better, and this is the reason the
 packet has a cancel script.**

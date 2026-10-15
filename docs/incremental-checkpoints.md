@@ -58,6 +58,15 @@ from a continuing source can add backing layers even when the resulting children
 siblings. Stop and pack the desired state into a new root before continuing
 from a chain at the limit.
 
+## Host mounts
+
+A checkpoint leaves a machine's host directory mounts out unless you ask for
+them, because they bind the artifact to a host where the same paths exist.
+`--host-mounts` records each mount (host path, guest path, read-only) and a
+restore attaches them again at the same guest paths; it refuses on a host where
+a recorded directory is missing. `machine pause` always keeps host mounts: a
+paused machine resumes on the host that paused it.
+
 ## History
 
 Every checkpoint records its *lineage*: a unique id, the machine it came from,
