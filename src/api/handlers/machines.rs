@@ -989,7 +989,10 @@ pub struct CaptureCheckpointQuery {
     /// on this node, and leave its upload to `POST /checkpoints/{key}/upload`.
     /// Uploading a multi-gigabyte artifact took most of a checkpoint's time
     /// while the caller only needed the capture, which a restore on this node
-    /// already serves from the node's copy.
+    /// already serves from the node's copy. A caller may pass `upload_urls`
+    /// as well: this node ignores them, and a node that predates
+    /// `defer_upload` ignores it instead and uploads inline, so one request
+    /// works on both and the reply (`captured` or `uploaded`) says which ran.
     pub defer_upload: Option<bool>,
 }
 
@@ -1024,11 +1027,6 @@ pub async fn capture_portable_checkpoint(
                 "defer_upload needs a cache_key to upload the artifact by later".into(),
             ));
         };
-        if upload_urls.is_some() {
-            return Err(ApiError::BadRequest(
-                "defer_upload and upload_urls are exclusive".into(),
-            ));
-        }
         pending_checkpoint_upload_path(key)?;
     }
 
