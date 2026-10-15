@@ -1206,7 +1206,8 @@ fn staged_tars_signature(tars: &[PathBuf]) -> Result<String> {
 ///
 /// `tar` restores the archived uid/gid when it runs as root, which the agent
 /// always does — that is the whole point of unpacking here rather than on the
-/// host.
+/// host. `--numeric-owner` keeps the image's ids: by name they would resolve
+/// through the agent's Alpine users (a Debian `www-data` group 33 becomes 82).
 fn extract_layer_tar(tar: &Path, dir: &Path) -> Result<()> {
     extract_layer_tar_with_progress(tar, dir, || {})
 }
@@ -1215,6 +1216,7 @@ fn extract_layer_tar_with_progress(tar: &Path, dir: &Path, progress: impl FnMut(
     let mut command = Command::new("tar");
     command
         .arg("-x")
+        .arg("--numeric-owner")
         .arg("-f")
         .arg(tar)
         .arg("-C")
@@ -1770,6 +1772,7 @@ where
 
     let mut tar_child = Command::new("tar")
         .arg("-x")
+        .arg("--numeric-owner")
         .arg("-C")
         .arg(rootfs)
         .stdin(Stdio::piped())
@@ -4962,7 +4965,7 @@ fn ensure_staged_working_copy(tag: &str, source: &Path) -> Result<PathBuf> {
         .take()
         .ok_or_else(|| StorageError::new("staged mount archive stdout was not captured"))?;
     let consumer_status = Command::new("tar")
-        .args(["-xf", "-", "-C"])
+        .args(["-x", "--numeric-owner", "-f", "-", "-C"])
         .arg(&temporary)
         .stdin(Stdio::from(producer_stdout))
         .status()
@@ -4970,7 +4973,7 @@ fn ensure_staged_working_copy(tag: &str, source: &Path) -> Result<PathBuf> {
     let producer_status = producer
         .wait()
         .map_err(|error| StorageError::new(format!("wait for staged mount archive: {error}")))?;
-    if !producer_status.success() || !consumer_status.success() {
+    if !tar_create_succeeded(producer_status) || !consumer_status.success() {
         let _ = std::fs::remove_dir_all(&temporary);
         return Err(StorageError::new(format!(
             "staged mount seed failed (archive={producer_status}, extract={consumer_status})"
@@ -5559,6 +5562,13 @@ fn unique_lowerdirs(lowerdirs: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Whether a `tar -c` run produced a complete archive. GNU tar exits 1 when a
+/// file changed while it was read (a live directory), and the archive is still
+/// whole; only 2 and up are fatal.
+pub(crate) fn tar_create_succeeded(status: std::process::ExitStatus) -> bool {
+    status.success() || status.code() == Some(1)
+}
+
 /// Tar `dir`'s contents (not the directory itself) into `output`.
 fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
     let status = std::process::Command::new("tar")
@@ -5569,7 +5579,7 @@ fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
         .arg(".")
         .status()
         .map_err(|e| StorageError::new(format!("spawning tar failed: {e}")))?;
-    if !status.success() {
+    if !tar_create_succeeded(status) {
         return Err(StorageError::new(format!(
             "tar of {} failed: {status}",
             dir.display()

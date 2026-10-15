@@ -3662,7 +3662,7 @@ fn handle_streaming_archive_directory(
     }
     result?;
     match child.wait() {
-        Ok(status) if status.success() => send_response(
+        Ok(status) if storage::tar_create_succeeded(status) => send_response(
             stream,
             &AgentResponse::DataChunk {
                 data: Vec::new(),
@@ -7219,7 +7219,7 @@ fn handle_streaming_flatten_layers(
     }
     result?;
     match child.wait() {
-        Ok(status) if status.success() => send_response(
+        Ok(status) if storage::tar_create_succeeded(status) => send_response(
             stream,
             &AgentResponse::DataChunk {
                 data: Vec::new(),
