@@ -6664,34 +6664,60 @@ pub async fn publish_cache_disk(
     let flatten_dir = dir.clone();
     let base = req.base.clone();
     let flattening = progress.clone();
-    let (staged, sha256) =
-        tokio::task::spawn_blocking(move || -> Result<(StagedBase, String), ApiError> {
-            let _guard = guard;
-            // A machine that never started has no layer yet: its cache is the base.
-            let top = if layer.exists() {
-                layer
-            } else {
-                cache.base.clone()
-            };
-            let staged = flatten_staged(&top, &flatten_dir, &base, &flattening)?;
-            let digest = file_sha256(staged.path(), &flattening)?;
-            Ok((staged, digest))
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    let flatten_started = std::time::Instant::now();
+    let staged = tokio::task::spawn_blocking(move || -> Result<StagedBase, ApiError> {
+        let _guard = guard;
+        // A machine that never started has no layer yet: its cache is the base.
+        let top = if layer.exists() {
+            layer
+        } else {
+            cache.base.clone()
+        };
+        flatten_staged(&top, &flatten_dir, &base, &flattening)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    let flatten_elapsed = flatten_started.elapsed();
+
+    // The hash reads the staged copy alongside the upload instead of before it,
+    // so a large disk pays for one read of itself, not a full hash and then the
+    // upload. Both finish before `staged` can be dropped and its file removed.
     // The base takes its name only once the upload has landed. Named first, a
     // failed upload left it behind under a version the control plane never
     // recorded, and every later publish of that version collided with it.
-    if let Some(urls) = upload_urls {
+    let transfer_started = std::time::Instant::now();
+    let hash_path = staged.path().to_path_buf();
+    let hashing = progress.clone();
+    let hash = tokio::task::spawn_blocking(move || file_sha256(&hash_path, &hashing));
+    let uploaded = upload_urls.is_some();
+    let upload = async {
+        let Some(urls) = upload_urls else {
+            return Ok(());
+        };
         let file = std::fs::File::open(staged.path())
             .map_err(|e| ApiError::internal(format!("open {}: {e}", staged.path().display())))?;
-        upload_checkpoint_file(file, urls, progress).await?;
-    }
+        upload_checkpoint_file(file, urls, progress).await.map(drop)
+    };
+    let (hashed, upload) = tokio::join!(hash, upload);
+    upload?;
+    let sha256 = hashed.map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    let transfer_elapsed = transfer_started.elapsed();
+
+    let install_started = std::time::Instant::now();
     let base = req.base.clone();
     let digest = sha256.clone();
     let size_bytes = tokio::task::spawn_blocking(move || staged.install(&dir, &base, &digest))
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    tracing::info!(
+        base = %req.base,
+        size_bytes,
+        uploaded,
+        flatten_ms = flatten_elapsed.as_millis() as u64,
+        hash_and_upload_ms = transfer_elapsed.as_millis() as u64,
+        install_ms = install_started.elapsed().as_millis() as u64,
+        "published cache disk"
+    );
     Ok(Json(crate::api::types::PublishCacheDiskResponse {
         base: req.base,
         size_bytes,
