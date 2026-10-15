@@ -4,12 +4,13 @@ pub mod bundle;
 mod control;
 mod exec;
 mod handle;
+mod inflight;
 mod runtime;
 
 pub use crate::agent::fork::ForkSourcePolicy;
 pub use control::MachineSpec;
 pub use exec::{ExecCancel, ExecOptions};
-pub use runtime::{runtime, EmbeddedRuntime, ResizeSpec, RestoreOptions};
+pub use runtime::{runtime, EmbeddedRuntime, ResizeSpec, RestoreOptions, StopOptions};
 
 /// Parse the trusted loopback interceptor binding supplied by an SDK caller.
 /// The token is per launch and is never written to a machine record.

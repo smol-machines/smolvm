@@ -54,6 +54,7 @@ case "$kernel" in
         cache_dir="$HOME/Library/Caches/smolvm"
         pack_dir="$HOME/Library/Caches/smolvm-pack"
         libs_dir="$HOME/Library/Caches/smolvm-libs"
+        archives_dir="$HOME/Library/Caches/smolvm-image-archives"
         emit unsupported "cuda"
         # There is no SMOLVM_DATA_DIR on macOS (it is Linux-only), but every path
         # below is derived from HOME, so an install under a scratch HOME is
@@ -72,6 +73,7 @@ case "$kernel" in
         cache_dir="$cache_root/smolvm"
         pack_dir="$cache_root/smolvm-pack"
         libs_dir="$cache_root/smolvm-libs"
+        archives_dir="$cache_root/smolvm-image-archives"
         emit state_relocatable via_home_or_data_dir
         ;;
     *)
@@ -102,6 +104,7 @@ report_dir agent_rootfs   "$data_dir"
 report_dir vm_state       "$cache_dir"
 report_dir pack_cache     "$pack_dir"
 report_dir packed_libs    "$libs_dir"
+report_dir image_archives "$archives_dir"
 report_dir credentials    "$HOME/.config/smolvm"
 
 if [ -L "$HOME/.local/bin/smolvm" ]; then emit launcher_symlink present; else emit launcher_symlink absent; fi

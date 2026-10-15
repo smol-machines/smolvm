@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-agent"
-version = "1.26.1"
+version = "1.28.1"
 edition = "2021"
 description = "Guest agent for smolvm VMs (handles OCI operations and command execution)"
 license = "Apache-2.0"
@@ -19,6 +19,7 @@ smolvm-s3fs = { path = "../smolvm-s3fs", version = "1.10.0" }
 smolvm-oci-layer = { path = "../smolvm-oci-layer", version = "1.7.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 tracing = { workspace = true }
 lazy_static = "1.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -35,7 +36,7 @@ tar = "0.4"
 # against musl (its zstd-sys references glibc's `__memcpy_chk`) and the agent is
 # a static-musl binary, so runtime decompression must be pure Rust.
 flate2 = "1"
-ruzstd = "0.7"
+ruzstd = "0.9.1"
 
 # `zstd` (C-backed) is used ONLY to encode fixtures in unit tests; dev-deps are
 # excluded from the musl release binary, so it never hits the link issue above.

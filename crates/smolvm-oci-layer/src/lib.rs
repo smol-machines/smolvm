@@ -190,7 +190,7 @@ pub fn decompress_layer_reader<'a>(
         Ok(Box::new(flate2::read::MultiGzDecoder::new(stream)))
     } else if n >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
         // Pure-Rust zstd decoder — the C `zstd` crate can't link against musl.
-        let dec = ruzstd::StreamingDecoder::new(stream)
+        let dec = ruzstd::decoding::StreamingDecoder::new(stream)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(Box::new(dec))
     } else {

@@ -13,7 +13,7 @@ use reqwest::header::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::token_store;
@@ -76,6 +76,13 @@ fn registry_tls_with_bundle(
     mut builder: reqwest::ClientBuilder,
     bundle: Option<&std::path::Path>,
 ) -> reqwest::ClientBuilder {
+    let roots = native_roots();
+    if !roots.is_empty() {
+        builder = builder.tls_built_in_native_certs(false);
+        for cert in roots {
+            builder = builder.add_root_certificate(cert.clone());
+        }
+    }
     if let Some(path) = bundle {
         match std::fs::read(path)
             .map_err(|e| e.to_string())
@@ -94,6 +101,26 @@ fn registry_tls_with_bundle(
         }
     }
     builder
+}
+
+/// The host's native root certificates, loaded once per process.
+///
+/// reqwest reloads the native store for every client it builds, and on macOS
+/// that goes through the keychain and takes 120 to 150 ms. A `RegistryClient`
+/// builds two clients, so every run that talks to a registry paid for two
+/// loads. Certificates rustls cannot parse are dropped, as reqwest's own loader
+/// does. An empty result leaves reqwest to load the store itself.
+fn native_roots() -> &'static [reqwest::Certificate] {
+    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut store = rustls::RootCertStore::empty();
+        rustls_native_certs::load_native_certs()
+            .certs
+            .into_iter()
+            .filter(|cert| store.add(cert.clone()).is_ok())
+            .filter_map(|cert| reqwest::Certificate::from_der(cert.as_ref()).ok())
+            .collect()
+    })
 }
 
 /// The shared HTTP client for every registry request, with the deadlines above.

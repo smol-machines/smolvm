@@ -27,6 +27,8 @@ curl -sSL https://smolmachines.com/install.sh | bash   # macOS + Linux
 
 Windows: unzip the `windows-x86_64` [release](https://github.com/smol-machines/smolvm/releases) and run `smolvm.exe` (needs the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/)). Coding agents: run `smolvm --help` after installing to discover every command.
 
+The documentation for humans and agents is in [`docs/`](docs/README.md), one folder per task: a `README.md` with the facts and a `SKILL.md` an agent can follow, with its scripts, beside the reference page for each feature.
+
 Quick Start
 -----------
 
@@ -117,7 +119,8 @@ See [credential substitution](docs/credential-substitution.md) and the [security
 Use `--allow-host-pattern '*.example.com'` to allow subdomains only. The older
 `--allow-host example.com` continues to allow both the apex and subdomains.
 A machine's allow list can be changed with `smolvm machine update`
-(`--allow-host`, `--allow-host-pattern`, `--allow-cidr` and their `--remove-` forms),
+(`--allow-host`, `--allow-host-pattern` and `--allow-cidr` add; `--remove-allow-host` removes a host
+or a pattern as it was added, and `--remove-allow-cidr` a range),
 also while it runs when it was started with an allow list: a grant applies to the
 next connection or lookup, and a removed host's learned addresses go with it.
 

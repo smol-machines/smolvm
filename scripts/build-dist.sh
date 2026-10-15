@@ -246,15 +246,32 @@ if [[ ! -f "$WORK_LIB_DIR/libkrunfw.5.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkru
     exit 1
 fi
 
+# Build a release binary. On Linux, LINUX_GLIBC=2.31 links it against that
+# glibc with zig and cargo-zigbuild instead of the build host's, so it runs on
+# hosts that old; the binary still lands in target/release for the steps below.
+cargo_release() { # $1 = binary name, rest = cargo args
+    local bin="$1"
+    shift
+    if [[ "$(uname -s)" == "Linux" && -n "${LINUX_GLIBC:-}" ]]; then
+        local triple
+        triple="$(uname -m)-unknown-linux-gnu"
+        cargo zigbuild --release --target "${triple}.${LINUX_GLIBC}" "$@"
+        mkdir -p target/release
+        cp "target/${triple}/release/${bin}" "target/release/${bin}"
+    else
+        cargo build --release "$@"
+    fi
+}
+
 # Build release binaries
 echo "Building release binaries..."
-LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
+LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo_release smolvm --bin smolvm
 
 # The containerd shim, so a release can run pods as microVMs under Kubernetes
 # without a source checkout. Linux only: containerd is the only consumer, and
 # there is nothing to register it with on macOS or Windows.
 if [[ "$(uname -s)" == "Linux" ]]; then
-    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release -p smolvm-shim --bin containerd-shim-smolvm-v2
+    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo_release containerd-shim-smolvm-v2 -p smolvm-shim --bin containerd-shim-smolvm-v2
 fi
 
 # Build the unified `smol` CLI if its source is present (it lives in a sibling
@@ -265,7 +282,7 @@ BUILD_SMOL=0
 if [[ -f "./smol/Cargo.toml" ]]; then
     echo "Building unified smol CLI..."
     _ABS_LIB_BUNDLE="$(cd "$WORK_LIB_DIR" && pwd)"
-    ( cd ./smol && LIBKRUN_BUNDLE="$_ABS_LIB_BUNDLE" cargo build --release --bin smol )
+    ( cd ./smol && LIBKRUN_BUNDLE="$_ABS_LIB_BUNDLE" cargo_release smol --bin smol )
     BUILD_SMOL=1
 else
     echo "smol CLI source (./smol) not found — building engine-only distribution"
@@ -708,6 +725,15 @@ fi
 # tarball of the old release left in dist/, and ./install-local.sh may pick up the wrong tarball
 echo "Cleaning up existing tarball..."
 rm -f "smolvm-*.tar.gz"
+
+# Everything shipped must load on the glibc floor the build asked for.
+if [[ "$(uname -s)" == "Linux" && -n "${LINUX_GLIBC:-}" ]]; then
+    floor_files=("$DIST_DIR/smolvm-bin")
+    for f in "$DIST_DIR/containerd-shim-smolvm-v2" "$DIST_DIR/smol-bin" "$DIST_DIR"/lib/libkrun.so*; do
+        [[ -f "$f" && ! -L "$f" ]] && floor_files+=("$f")
+    done
+    ./scripts/check-glibc-floor.sh "$LINUX_GLIBC" "${floor_files[@]}"
+fi
 
 # Create tarball. Preserve sparseness so the 20/10 GiB-virtual disk templates
 # (a few hundred KiB physical) don't balloon to full size on extraction. GNU tar

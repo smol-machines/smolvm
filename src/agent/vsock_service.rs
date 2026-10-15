@@ -29,6 +29,9 @@ pub struct VsockServiceInputs<'a> {
     /// forwards each host connection to the guest, which proxies it to the
     /// in-guest dockerd socket. When set, the Docker bridge is enabled.
     pub docker_socket: Option<&'a Path>,
+    /// Host socket the workload's output is appended from. When set, the
+    /// guest agent forwards a detached workload's stdout and stderr to it.
+    pub workload_log_socket: Option<&'a Path>,
 }
 
 /// A service resolved to "on" for a launch: the concrete wiring the launcher
@@ -124,6 +127,22 @@ impl VsockService for DockerSocketService {
     }
 }
 
+/// Workload logs: the guest agent connects out and streams a detached
+/// workload's stdout and stderr to a host listener that appends them to the
+/// machine's `workload.log`.
+struct WorkloadLogService;
+impl VsockService for WorkloadLogService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.workload_log_socket.map(|socket| ActiveVsockService {
+            name: "workload logs",
+            port: ports::WORKLOAD_LOGS,
+            listen: false,
+            socket,
+            guest_env: &[(guest_env::WORKLOAD_LOGS, guest_env::VALUE_ON)],
+        })
+    }
+}
+
 /// All known vsock services. Add a capability by appending one entry.
 pub fn registry() -> &'static [&'static dyn VsockService] {
     &[
@@ -131,6 +150,7 @@ pub fn registry() -> &'static [&'static dyn VsockService] {
         &DnsFilterService,
         &CudaService,
         &DockerSocketService,
+        &WorkloadLogService,
     ]
 }
 
@@ -146,6 +166,7 @@ mod tests {
             dns_filter_socket: None,
             cuda_socket: None,
             docker_socket: None,
+            workload_log_socket: None,
         };
 
         let active = registry()

@@ -1,11 +1,13 @@
-# smolvm skill packets
+# smolvm documentation
 
-> Tested procedures, one task each, with their scripts. The flat pages in this directory are
-> the reference for each feature.
+> Tested procedures, one task each, with their scripts, and the reference page for each feature.
+
+## Skill packets
 
 - [branch-and-checkpoint](branch-and-checkpoint/SKILL.md): scheduled checkpoints with history, restores, pause and resume, and branches with their branch point kept
 - [credentials](credentials/SKILL.md): an API key a workload can use but never read, substituted on the way out
 - [dev-env](dev-env/SKILL.md): a machine you come back to, and what survives a stop and start
+- [coding-agent](coding-agent/SKILL.md): a coding agent with full permissions inside a machine, the project mounted
 - [docker-in-machine](docker-in-machine/SKILL.md): a Docker daemon inside a machine, for tools that call Docker themselves
 - [gpu-cuda](gpu-cuda/SKILL.md): CUDA Driver API calls remoted to the host NVIDIA GPU
 - [install](install/SKILL.md): installing smolvm and proving the host can boot a microVM
@@ -13,3 +15,20 @@
 - [pack](pack/SKILL.md): packing an image or a machine into a portable artifact
 - [teardown](teardown/SKILL.md): what state exists, where it lives, and how to leave nothing running
 - [throwaway-machine](throwaway-machine/SKILL.md): running untrusted code in a throwaway machine, with egress granted one host at a time
+
+## Reference pages
+
+- [smolfile.md](smolfile.md): the Smolfile format: keys, tables and `stop_on_exit`
+- [security-model.md](security-model.md): what the VM boundary protects, and what each forwarded capability gives the workload
+- [limitations.md](limitations.md): known limitations, host mount behaviour and the relay limit
+- [credential-substitution.md](credential-substitution.md): credentials a workload can use and never read, and the external interceptor
+- [mediated-egress.md](mediated-egress.md): a host decider for each guest TCP flow, and its protocol
+- [branching.md](branching.md): live branches, frozen sources and batch branches
+- [pause-resume.md](pause-resume.md): pausing a running machine and resuming it under the same name
+- [incremental-checkpoints.md](incremental-checkpoints.md): checkpoint stores, history, export and pruning
+- [mac-to-linux.md](mac-to-linux.md): moving a running machine from an arm64 Mac to arm64 Linux
+- [pack-layer-ownership.md](pack-layer-ownership.md): why a pack built before 1.8.1 loses its files' owners
+- [gpu.md](gpu.md): Vulkan through virtio-gpu, and CUDA API remoting
+- [hardware-video.md](hardware-video.md): H.264 streaming of a machine's browser display
+- [kubernetes.md](kubernetes.md): pods as microVMs through a `RuntimeClass`
+- [install-arch.md](install-arch.md), [install-debian.md](install-debian.md), [install-fedora.md](install-fedora.md), [install-nix.md](install-nix.md): the packaged installs

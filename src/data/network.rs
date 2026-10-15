@@ -8,29 +8,65 @@ pub const FALLBACK_DNS: &str = "1.1.1.1";
 /// Fallback DNS server as `IpAddr`.
 pub const FALLBACK_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
-/// Detect the host's primary DNS server from /etc/resolv.conf.
+/// Detect the host's primary DNS server, skipping loopback (a local stub such as
+/// systemd-resolved or dnsmasq is not reachable from inside the VM).
 /// Falls back to Cloudflare (1.1.1.1) if detection fails.
 pub fn host_dns() -> IpAddr {
-    host_dns_from_resolv("/etc/resolv.conf").unwrap_or(FALLBACK_DNS_ADDR)
+    host_nameservers()
+        .into_iter()
+        .find(|ip| !ip.is_loopback())
+        .unwrap_or(FALLBACK_DNS_ADDR)
 }
 
-/// Parse the first nameserver from a resolv.conf file.
-fn host_dns_from_resolv(path: &str) -> Option<IpAddr> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    for line in contents.lines() {
-        let line = line.trim();
-        if let Some(addr_str) = line.strip_prefix("nameserver") {
-            let addr_str = addr_str.trim();
-            // Skip loopback — it's typically a local resolver (systemd-resolved,
-            // dnsmasq) that isn't reachable from inside the VM.
-            if let Ok(ip) = addr_str.parse::<IpAddr>() {
-                if !ip.is_loopback() {
-                    return Some(ip);
-                }
-            }
-        }
+/// Where [`host_nameservers`] reads the host's resolver list.
+#[cfg(not(windows))]
+const HOST_RESOLVERS: &str = "/etc/resolv.conf";
+#[cfg(windows)]
+const HOST_RESOLVERS: &str = "GetNetworkParams";
+
+/// The host's nameservers in order, from [`HOST_RESOLVERS`].
+#[cfg(not(windows))]
+fn host_nameservers() -> Vec<IpAddr> {
+    resolv_conf_nameservers(&std::fs::read_to_string(HOST_RESOLVERS).unwrap_or_default())
+}
+
+/// The host's nameservers in order: the system's IPv4 resolver list, which is
+/// what Windows has in place of `/etc/resolv.conf`.
+#[cfg(windows)]
+fn host_nameservers() -> Vec<IpAddr> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetNetworkParams, FIXED_INFO_W2KSP1};
+
+    let mut len = 0u32;
+    // SAFETY: a null buffer with a zero length only asks for the size needed.
+    let rc = unsafe { GetNetworkParams(std::ptr::null_mut(), &mut len) };
+    if rc != ERROR_BUFFER_OVERFLOW {
+        tracing::debug!(rc, "GetNetworkParams size query failed");
+        return Vec::new();
     }
-    None
+    // u64 words keep the buffer aligned for the pointers inside FIXED_INFO.
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    let info = buf.as_mut_ptr().cast::<FIXED_INFO_W2KSP1>();
+    // SAFETY: `buf` is at least `len` bytes and aligned for FIXED_INFO.
+    let rc = unsafe { GetNetworkParams(info, &mut len) };
+    if rc != ERROR_SUCCESS {
+        tracing::debug!(rc, "GetNetworkParams failed");
+        return Vec::new();
+    }
+    // SAFETY: the list's nodes live inside `buf`, which outlives the walk.
+    let head = unsafe { &(*info).DnsServerList };
+    std::iter::successors(Some(head), |entry| unsafe { entry.Next.as_ref() })
+        // An empty head entry (no resolver configured) does not parse and is skipped.
+        .filter_map(|entry| {
+            let text = entry.IpAddress.String.map(|c| c as u8);
+            std::ffi::CStr::from_bytes_until_nul(&text)
+                .ok()?
+                .to_str()
+                .ok()?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 /// Default DNS as string — prefers host's resolver, falls back to 1.1.1.1.
@@ -87,36 +123,39 @@ pub fn effective_dns(
     dns_override: Option<Ipv4Addr>,
     backend: crate::network::EffectiveNetworkBackend,
 ) -> EffectiveDns {
-    let resolv_conf = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-    let uplink = std::fs::read_to_string(SYSTEMD_RESOLVED_UPLINK).unwrap_or_default();
+    let host = host_nameservers();
+    let uplink = resolv_conf_nameservers(
+        &std::fs::read_to_string(SYSTEMD_RESOLVED_UPLINK).unwrap_or_default(),
+    );
     // A TSI guest dials its resolver itself, so the egress floor applies to it:
     // on a cloud VM the host resolver is the metadata address, and under the
     // strict floor a CGNAT resolver (Tailscale's 100.100.100.100) is blocked too.
     let floor = smolvm_network::EgressPolicy::unrestricted();
-    let effective = select_dns(dns_override, backend, &resolv_conf, &uplink, &|addr| {
+    let effective = select_dns(dns_override, backend, &host, &uplink, &|addr| {
         floor.allows_v4(addr)
     });
     if effective.source == DnsSource::BackendDefault
         && backend != crate::network::EffectiveNetworkBackend::None
     {
-        // Names the one case operators hit and cannot otherwise see: a host whose
-        // only nameservers are IPv6, which `--dns <IP>` (an `Ipv4Addr`) cannot express.
-        tracing::debug!(
-            "no IPv4 host resolver this backend can reach; guest keeps the public resolvers"
+        // A network that blocks the public resolvers then fails every lookup in
+        // the guest, so say what was read and how to choose one.
+        tracing::warn!(
+            looked_at = HOST_RESOLVERS,
+            "no IPv4 host resolver this backend can reach; guest keeps the public resolvers, pass --dns to choose one"
         );
     }
     effective
 }
 
-/// The pure half of [`effective_dns`], with both files supplied. `reachable`
+/// The pure half of [`effective_dns`], with both resolver lists supplied. `reachable`
 /// says whether a TSI guest may connect to an address; a host resolver it may
 /// not reach is skipped, and with none left the guest keeps the public
 /// resolvers.
 fn select_dns(
     dns_override: Option<Ipv4Addr>,
     backend: crate::network::EffectiveNetworkBackend,
-    resolv_conf: &str,
-    systemd_uplink: &str,
+    host: &[IpAddr],
+    systemd_uplink: &[IpAddr],
     reachable: &dyn Fn(Ipv4Addr) -> bool,
 ) -> EffectiveDns {
     use crate::network::EffectiveNetworkBackend;
@@ -131,16 +170,16 @@ fn select_dns(
         EffectiveNetworkBackend::None => None,
         // The gateway forwards guest queries from a host UDP socket, so a host
         // loopback stub is reachable and is taken as-is.
-        EffectiveNetworkBackend::VirtioNet => nameservers_v4(resolv_conf)
+        EffectiveNetworkBackend::VirtioNet => v4(host)
             .next()
             .map(|addr| (addr, DnsSource::HostResolvConf)),
         // TSI does not translate a guest loopback destination to the host's
         // loopback, so a stub address would leave the guest talking to itself.
-        EffectiveNetworkBackend::Tsi => nameservers_v4(resolv_conf)
+        EffectiveNetworkBackend::Tsi => v4(host)
             .find(|addr| !addr.is_loopback() && reachable(*addr))
             .map(|addr| (addr, DnsSource::HostResolvConf))
             .or_else(|| {
-                nameservers_v4(systemd_uplink)
+                v4(systemd_uplink)
                     .find(|addr| !addr.is_loopback() && reachable(*addr))
                     .map(|addr| (addr, DnsSource::SystemdUplink))
             }),
@@ -157,28 +196,88 @@ fn select_dns(
     }
 }
 
-/// Every IPv4 nameserver in a resolv.conf, in file order.
+/// Every nameserver in a resolv.conf, in file order.
+fn resolv_conf_nameservers(contents: &str) -> Vec<IpAddr> {
+    contents
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver")?.trim().parse().ok())
+        .collect()
+}
+
+/// The IPv4 entries of a resolver list, in order.
 ///
 /// IPv6 entries are skipped: the resolver is carried as an `Ipv4Addr` all the
 /// way to `--dns` and the virtio gateway's upstream.
-fn nameservers_v4(contents: &str) -> impl Iterator<Item = Ipv4Addr> + '_ {
-    contents.lines().filter_map(|line| {
-        let line = line.trim();
-        let addr = line.strip_prefix("nameserver")?.trim();
-        match addr.parse::<IpAddr>().ok()? {
-            IpAddr::V4(v4) => Some(v4),
-            IpAddr::V6(_) => None,
-        }
+fn v4(addrs: &[IpAddr]) -> impl Iterator<Item = Ipv4Addr> + '_ {
+    addrs.iter().filter_map(|addr| match addr {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(_) => None,
     })
 }
 
-/// TCP port mapping from host to guest.
+/// Transport a published port forwards.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    /// TCP (the default).
+    #[default]
+    Tcp,
+    /// UDP, forwarded per remote client.
+    Udp,
+}
+
+impl PortProtocol {
+    /// Whether this is the default, TCP. Lets serialization omit the field, so
+    /// a TCP mapping keeps the shape older readers expect.
+    pub fn is_tcp(&self) -> bool {
+        *self == Self::Tcp
+    }
+
+    /// Lowercase label, as written after a port spec (`8080:80/udp`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+
+    /// Split an optional `/tcp` or `/udp` suffix off a port spec.
+    fn split_suffix(spec: &str) -> Result<(&str, Self), String> {
+        match spec.rsplit_once('/') {
+            None => Ok((spec, Self::Tcp)),
+            Some((ports, "tcp")) => Ok((ports, Self::Tcp)),
+            Some((ports, "udp")) => Ok((ports, Self::Udp)),
+            Some((_, other)) => Err(format!(
+                "unsupported port protocol '{other}': use tcp or udp, as in 8080:80/udp"
+            )),
+        }
+    }
+}
+
+/// Stored `(host, guest)` port pairs of one protocol.
+pub type PortTuples = Vec<(u16, u16)>;
+
+/// Port mapping from host to guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
     /// Port on the host.
     pub host: u16,
     /// Port inside the guest.
     pub guest: u16,
+    /// Transport forwarded; omitted for TCP.
+    #[serde(default, skip_serializing_if = "PortProtocol::is_tcp")]
+    pub protocol: PortProtocol,
 }
 
 /// Maximum concrete mappings permitted for one machine.
@@ -193,9 +292,10 @@ pub const MAX_PORT_MAPPINGS: usize = 64;
 pub struct PortMappingSpec {
     host: PortRange,
     guest: PortRange,
+    protocol: PortProtocol,
 }
 
-/// An inclusive range of TCP ports.
+/// An inclusive range of ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PortRange {
     start: u16,
@@ -260,13 +360,16 @@ impl From<PortMapping> for PortMappingSpec {
                 start: mapping.guest,
                 end: mapping.guest,
             },
+            protocol: mapping.protocol,
         }
     }
 }
 
 impl PortMappingSpec {
-    /// Parse a port mapping specification (`HOST:GUEST`, `PORT`, or equal-length ranges).
-    pub fn parse(spec: &str) -> Result<Self, String> {
+    /// Parse a port mapping specification (`HOST:GUEST`, `PORT`, or equal-length
+    /// ranges), optionally ending in `/tcp` or `/udp`.
+    pub fn parse(full: &str) -> Result<Self, String> {
+        let (spec, protocol) = PortProtocol::split_suffix(full)?;
         let (host, guest) = match spec.split_once(':') {
             Some((host, guest)) => (
                 PortRange::parse(host, "host")?,
@@ -284,7 +387,11 @@ impl PortMappingSpec {
             ));
         }
 
-        Ok(Self { host, guest })
+        Ok(Self {
+            host,
+            guest,
+            protocol,
+        })
     }
 
     /// Expand all user-supplied specs while enforcing the per-machine mapping cap.
@@ -301,7 +408,7 @@ impl PortMappingSpec {
             ports.extend(
                 (spec.host.start..=spec.host.end)
                     .zip(spec.guest.start..=spec.guest.end)
-                    .map(|(host, guest)| PortMapping::new(host, guest)),
+                    .map(|(host, guest)| PortMapping::with_protocol(host, guest, spec.protocol)),
             );
         }
         Ok(ports)
@@ -348,16 +455,30 @@ fn parse_port(spec: &str, kind: &str) -> Result<u16, String> {
 }
 
 impl PortMapping {
-    /// Create a new port mapping.
+    /// Create a new TCP port mapping.
     pub fn new(host: u16, guest: u16) -> Self {
-        Self { host, guest }
+        Self::with_protocol(host, guest, PortProtocol::Tcp)
     }
 
-    /// Create a port mapping where host and guest ports are the same.
-    pub fn same(port: u16) -> Self {
+    /// Create a new port mapping for `protocol`.
+    pub fn with_protocol(host: u16, guest: u16, protocol: PortProtocol) -> Self {
         Self {
-            host: port,
-            guest: port,
+            host,
+            guest,
+            protocol,
+        }
+    }
+
+    /// Create a TCP port mapping where host and guest ports are the same.
+    pub fn same(port: u16) -> Self {
+        Self::new(port, port)
+    }
+
+    /// `HOST:GUEST`, with `/udp` appended for a UDP mapping.
+    pub fn label(&self) -> String {
+        match self.protocol {
+            PortProtocol::Tcp => format!("{}:{}", self.host, self.guest),
+            PortProtocol::Udp => format!("{}:{}/udp", self.host, self.guest),
         }
     }
 
@@ -366,18 +487,36 @@ impl PortMapping {
         (self.host, self.guest)
     }
 
-    /// Batch convert port mappings to tuple format.
-    pub fn to_tuples(ports: &[Self]) -> Vec<(u16, u16)> {
-        ports.iter().map(|p| p.to_tuple()).collect()
+    /// TCP mappings as `(host, guest)` tuples; use [`Self::split_tuples`]
+    /// to keep UDP mappings too.
+    pub fn to_tuples(ports: &[Self]) -> PortTuples {
+        Self::split_tuples(ports).0
     }
 
-    /// Check for duplicate host ports in a list of mappings.
+    /// Split mappings into the stored `(TCP tuples, UDP tuples)`.
+    pub fn split_tuples(ports: &[Self]) -> (PortTuples, PortTuples) {
+        let of = |protocol| {
+            ports
+                .iter()
+                .filter(|p| p.protocol == protocol)
+                .map(|p| p.to_tuple())
+                .collect()
+        };
+        (of(PortProtocol::Tcp), of(PortProtocol::Udp))
+    }
+
+    /// Check for duplicate host ports in a list of mappings. TCP and UDP have
+    /// separate port spaces, so `8080` and `8080/udp` may both be published.
     pub fn check_duplicates(ports: &[Self]) -> Result<(), String> {
         let mut seen = std::collections::HashSet::new();
         for p in ports {
-            if !seen.insert(p.host) {
+            if !seen.insert((p.host, p.protocol)) {
+                let suffix = match p.protocol {
+                    PortProtocol::Tcp => "",
+                    PortProtocol::Udp => "/udp",
+                };
                 return Err(format!(
-                    "duplicate host port {}: each host port can only be mapped once",
+                    "duplicate host port {}{suffix}: each host port can only be mapped once",
                     p.host
                 ));
             }
@@ -385,8 +524,17 @@ impl PortMapping {
         Ok(())
     }
 
-    /// Parse a port mapping specification (`HOST:GUEST` or `PORT`).
-    pub fn parse(spec: &str) -> Result<Self, String> {
+    /// Parse a port mapping specification (`HOST:GUEST` or `PORT`), optionally
+    /// ending in `/tcp` or `/udp`.
+    pub fn parse(full: &str) -> Result<Self, String> {
+        let (spec, protocol) = PortProtocol::split_suffix(full)?;
+        Self::parse_ports(spec).map(|mapping| Self {
+            protocol,
+            ..mapping
+        })
+    }
+
+    fn parse_ports(spec: &str) -> Result<Self, String> {
         if let Some((host, guest)) = spec.split_once(':') {
             let host: u16 = host
                 .parse()
@@ -429,6 +577,40 @@ mod tests {
     const CAMPUS: &str = "nameserver 128.112.128.12\nnameserver 128.112.128.79\n";
     const STUB: &str = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
     const UPLINK: &str = "nameserver 192.168.5.2\nsearch mynetworksettings.com\n";
+
+    /// [`super::select_dns`] over resolv.conf text, as a Unix host supplies it.
+    fn select_dns(
+        dns_override: Option<Ipv4Addr>,
+        backend: EffectiveNetworkBackend,
+        resolv_conf: &str,
+        systemd_uplink: &str,
+        reachable: &dyn Fn(Ipv4Addr) -> bool,
+    ) -> EffectiveDns {
+        let host = resolv_conf_nameservers(resolv_conf);
+        let uplink = resolv_conf_nameservers(systemd_uplink);
+        super::select_dns(dns_override, backend, &host, &uplink, reachable)
+    }
+
+    #[test]
+    fn a_host_resolver_list_from_the_platform_is_selected_like_resolv_conf() {
+        // Windows hands over addresses, not file text: the same list must pick
+        // the same resolver.
+        let corp = Ipv4Addr::new(10, 20, 0, 53);
+        let list = [
+            "fec0:0:0:ffff::1".parse().unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(corp),
+        ];
+        let text = "nameserver fec0:0:0:ffff::1\nnameserver 127.0.0.1\nnameserver 10.20.0.53\n";
+        for (backend, picked) in [
+            (EffectiveNetworkBackend::Tsi, corp),
+            (EffectiveNetworkBackend::VirtioNet, Ipv4Addr::LOCALHOST),
+        ] {
+            let chosen = super::select_dns(None, backend, &list, &[], &|_| true);
+            assert_eq!(chosen.addr, Some(picked));
+            assert_eq!(chosen, select_dns(None, backend, text, "", &|_| true));
+        }
+    }
 
     #[test]
     fn explicit_dns_wins_on_both_backends() {
@@ -669,6 +851,63 @@ mod tests {
     #[test]
     fn port_mapping_spec_rejects_malformed_ranges() {
         assert!(PortMappingSpec::parse("5173--5175").is_err());
+    }
+
+    #[test]
+    fn a_udp_suffix_publishes_udp_and_tcp_stays_the_default() {
+        let tcp = PortMappingSpec::expand_all(&[PortMappingSpec::parse("8080:80").unwrap()]);
+        assert_eq!(tcp.unwrap(), vec![PortMapping::new(8080, 80)]);
+        let udp = PortMappingSpec::parse("27015-27016:27015-27016/udp").unwrap();
+        assert_eq!(
+            PortMappingSpec::expand_all(&[udp]).unwrap(),
+            vec![
+                PortMapping::with_protocol(27015, 27015, PortProtocol::Udp),
+                PortMapping::with_protocol(27016, 27016, PortProtocol::Udp),
+            ]
+        );
+        assert_eq!(
+            PortMapping::parse("53/udp").unwrap(),
+            PortMapping::with_protocol(53, 53, PortProtocol::Udp)
+        );
+        assert_eq!(
+            PortMapping::parse("80/tcp").unwrap(),
+            PortMapping::new(80, 80)
+        );
+        let err = PortMappingSpec::parse("80:80/sctp").unwrap_err();
+        assert!(err.contains("unsupported port protocol 'sctp'"), "{err}");
+    }
+
+    #[test]
+    fn tcp_and_udp_may_share_a_host_port_but_not_repeat_it() {
+        let both = [
+            PortMapping::new(27015, 27015),
+            PortMapping::with_protocol(27015, 27015, PortProtocol::Udp),
+        ];
+        PortMapping::check_duplicates(&both).unwrap();
+        let twice = [
+            PortMapping::with_protocol(27015, 1, PortProtocol::Udp),
+            PortMapping::with_protocol(27015, 2, PortProtocol::Udp),
+        ];
+        let err = PortMapping::check_duplicates(&twice).unwrap_err();
+        assert!(err.contains("27015/udp"), "{err}");
+    }
+
+    /// A TCP mapping keeps the JSON shape older SDKs and records use.
+    #[test]
+    fn a_tcp_mapping_serializes_without_a_protocol() {
+        let tcp = serde_json::to_value(PortMapping::new(8080, 80)).unwrap();
+        assert_eq!(tcp, serde_json::json!({"host": 8080, "guest": 80}));
+        let udp = PortMapping::with_protocol(27015, 27015, PortProtocol::Udp);
+        assert_eq!(
+            serde_json::to_value(udp).unwrap(),
+            serde_json::json!({"host": 27015, "guest": 27015, "protocol": "udp"})
+        );
+        let old: PortMapping = serde_json::from_str(r#"{"host": 1, "guest": 2}"#).unwrap();
+        assert_eq!(old, PortMapping::new(1, 2));
+        assert_eq!(
+            PortMapping::split_tuples(&[udp, PortMapping::new(1, 2)]),
+            (vec![(1, 2)], vec![(27015, 27015)])
+        );
     }
 
     #[test]

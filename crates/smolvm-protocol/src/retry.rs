@@ -242,6 +242,23 @@ pub fn is_transient_network_error(error_msg: &str) -> bool {
         return true;
     }
 
+    // A transfer cut or stalled partway, as Go's net/http (crane) reports it:
+    // the body ended early, a read or the TLS handshake timed out, or an
+    // HTTP/2 connection or stream was torn down. Each blob is verified by
+    // digest, so a retry can only fetch it again, never accept a short copy.
+    if error_lower.contains("unexpected eof")
+        || error_lower.contains("i/o timeout")
+        || error_lower.contains("tls handshake timeout")
+        || error_lower.contains("client connection lost")
+        || error_lower.contains("goaway")
+        || error_lower.contains("stream error")
+        || error_lower.contains("use of closed network connection")
+        || error_lower.contains("server closed idle connection")
+        || error_lower.contains("connection aborted")
+    {
+        return true;
+    }
+
     // I/O errors that may be transient
     if error_lower.contains("broken pipe")
         || error_lower.contains("interrupted")
@@ -386,6 +403,34 @@ mod tests {
         assert!(is_transient_network_error("rate limit exceeded"));
         assert!(!is_transient_network_error("404 not found"));
         assert!(!is_transient_network_error("some random error"));
+    }
+
+    #[test]
+    fn a_transfer_cut_partway_is_transient() {
+        // What crane printed when a layer download was cut mid-stream.
+        assert!(is_transient_network_error(
+            "crane pull failed: Error: error writing layer: unexpected EOF"
+        ));
+        assert!(is_transient_network_error(
+            "crane blob failed for layer sha256:ab: read tcp 10.0.2.15:50432->104.16.1.1:443: i/o timeout"
+        ));
+        assert!(is_transient_network_error(
+            "net/http: TLS handshake timeout"
+        ));
+        assert!(is_transient_network_error("http2: client connection lost"));
+        assert!(is_transient_network_error(
+            "http2: server sent GOAWAY and closed the connection; LastStreamID=1"
+        ));
+        assert!(is_transient_network_error(
+            "stream error: stream ID 3; INTERNAL_ERROR; received from peer"
+        ));
+        assert!(is_transient_network_error(
+            "read tcp 10.0.2.15:443: use of closed network connection"
+        ));
+        // A missing or unauthorized image still fails at once.
+        let denied = "crane pull failed: GET https://r/v2/x/blobs/sha256:ab: 401 Unauthorized: unexpected EOF";
+        assert!(is_permanent_error(denied));
+        assert!(!is_transient_network_error("gzip: invalid header"));
     }
 
     #[test]

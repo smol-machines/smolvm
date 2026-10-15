@@ -470,6 +470,7 @@ pub struct CreateVmParams {
     pub net: bool,
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
+    pub dns_options: Vec<String>,
     pub network_name: Option<String>,
     /// Canonical `--guest-subnet` CIDR, when set.
     pub guest_subnet: Option<String>,
@@ -488,6 +489,8 @@ pub struct CreateVmParams {
     /// Shared cache disk (`--cache-disk`).
     pub cache_disk: Option<smolvm::data::disk::CacheDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
+    /// `--block-private` and its `--allow-private` exceptions.
+    pub block_private: Option<Vec<String>>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
     pub restart_max_backoff_secs: Option<u64>,
@@ -503,6 +506,10 @@ pub struct CreateVmParams {
     pub forkable: bool,
     /// Stop the machine once its workload exits.
     pub stop_on_exit: bool,
+    /// Signal the workload is sent when the machine stops.
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal.
+    pub stop_timeout_secs: Option<u64>,
     /// Planned number of runnable CUDA fork clones.
     pub cuda_fork_pool_size: Option<u32>,
     /// Explicit logical VRAM limit for each golden/clone CUDA session.
@@ -672,6 +679,23 @@ impl Drop for CreateVmReservation {
     }
 }
 
+impl CreateVmParams {
+    /// Merge `--block-private` / `--allow-private` into the Smolfile's
+    /// `[network]` setting; either flag turns the block on and implies --net.
+    pub(crate) fn apply_block_private(&mut self, block: bool, allow: Vec<String>) {
+        if !block && allow.is_empty() {
+            return;
+        }
+        let exceptions = self.block_private.get_or_insert_with(Vec::new);
+        for cidr in allow {
+            if !exceptions.contains(&cidr) {
+                exceptions.push(cidr);
+            }
+        }
+        self.net = true;
+    }
+}
+
 pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
     build_vm_record_for(params, false)
 }
@@ -692,7 +716,9 @@ pub(crate) fn build_vm_record_for(
 
     // Peel off remote volume specs (`s3://`) before the host-directory parse;
     // they mount inside the guest at start instead of through virtiofs.
-    let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
+    let (volume_specs, disk_volumes) =
+        smolvm::data::storage::split_disk_volume_specs(&params.volume)?;
+    let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&volume_specs)?;
 
     // Parse and validate volume mounts
     let parsed_mounts =
@@ -714,8 +740,8 @@ pub(crate) fn build_vm_record_for(
         }
     }
 
-    // Convert port mappings to tuple format for storage
-    let ports = PortMapping::to_tuples(&params.port);
+    // Convert port mappings to tuple format for storage, TCP and UDP apart.
+    let (ports, udp_ports) = PortMapping::split_tuples(&params.port);
 
     // Parse environment variables for init
     let env = smolvm::util::parse_env_list(&params.env);
@@ -774,9 +800,25 @@ pub(crate) fn build_vm_record_for(
         params.net,
         restart,
     );
+    record.udp_ports = udp_ports;
     record.staged_mounts = staged_mounts;
     record.init = params.init.clone();
+    smolvm::data::storage::ensure_disk_volumes_distinct(
+        &disk_volumes,
+        record
+            .mounts
+            .iter()
+            .map(|(_, target, _)| target.as_str())
+            .chain(
+                record
+                    .staged_mounts
+                    .iter()
+                    .map(|(_, _, target)| target.as_str()),
+            )
+            .chain(remote_volumes.iter().map(|v| v.target.as_str())),
+    )?;
     record.remote_volumes = remote_volumes;
+    record.disk_volumes = disk_volumes;
     record.env = env;
     record.secret_refs = params.secret_refs.clone();
     record.workdir = params.workdir.clone();
@@ -788,8 +830,10 @@ pub(crate) fn build_vm_record_for(
     record.disks = params.disks.clone();
     record.cache_disk = params.cache_disk.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
+    record.block_private = params.block_private.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
+    record.dns_options = params.dns_options.clone();
     record.network_name = params.network_name.clone();
     record.guest_subnet = params.guest_subnet.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
@@ -815,6 +859,8 @@ pub(crate) fn build_vm_record_for(
     record.cuda = params.cuda;
     record.forkable = params.forkable || params.cuda_fork_pool_size.is_some();
     record.stop_on_exit = params.stop_on_exit;
+    record.stop_signal = params.stop_signal.clone();
+    record.stop_timeout_secs = params.stop_timeout_secs;
     record.cuda_fork_pool_size = params.cuda_fork_pool_size;
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
@@ -925,6 +971,8 @@ pub struct ForkVmOptions<'a> {
     pub hold: bool,
     pub freeze_source: bool,
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// Labels set on the child over the ones inherited from the source.
+    pub labels: &'a [(String, String)],
 }
 
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
@@ -978,6 +1026,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.pinned_ports,
             options.fork_env,
             options.fork_secrets,
+            options.labels,
             source_policy,
         )?
     } else {
@@ -989,6 +1038,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.clone_forkable,
             options.fork_env,
             options.fork_secrets,
+            options.labels,
             source_policy,
         )?
     };
@@ -1000,6 +1050,11 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         } else {
             eprintln!("  port {clone_host}->{guest} (pinned)");
         }
+    }
+    for (golden_host, guest, clone_host) in &prep.udp_port_remaps {
+        eprintln!(
+            "  port {golden_host}->{guest}/udp (source) remapped to {clone_host}->{guest}/udp (child)"
+        );
     }
 
     let prep_source_continues = prep.source_continues;
@@ -1054,6 +1109,8 @@ pub struct ForkBatchOptions<'a> {
     /// tearing the batch down if one never does.
     pub worker_ready: Option<std::time::Duration>,
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// Labels set on every child over the ones inherited from the source.
+    pub labels: &'a [(String, String)],
 }
 
 pub fn fork_vm_batch(
@@ -1070,6 +1127,7 @@ pub fn fork_vm_batch(
         freeze_source,
         worker_ready,
         external_interceptor,
+        labels,
     } = options;
     let source_policy = if freeze_source {
         smolvm::agent::fork::ForkSourcePolicy::Freeze
@@ -1118,6 +1176,7 @@ pub fn fork_vm_batch(
             fork_env: env,
             fork_secrets,
             hold,
+            labels,
         })
         .collect();
     eprintln!(
@@ -1693,13 +1752,13 @@ fn start_vm_named_with_db(
             cli_recover_if_unreachable(name)?;
         }
         RecordState::Frozen => {
-            let clones = db.dependent_clones(name).unwrap_or_default();
+            let clones = smolvm::agent::fork::restart_blocking_dependent_clones(db, name)?;
             let reason = if clones.is_empty() {
                 "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
                     .to_string()
             } else {
                 format!(
-                    "it is the branch source for {} live child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
+                    "it is the branch source for {} dependent child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
                     clones.len(),
                     clones.join(", ")
                 )
@@ -2131,10 +2190,11 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.mem = o.mem;
     r.mounts = o.mounts.clone();
     r.staged_mounts = o.staged_mounts.clone();
-    r.ports = o.ports.clone();
+    r.set_port_mappings(&o.ports);
     r.network = o.network;
     r.network_backend = o.network_backend;
     r.dns = o.dns;
+    r.dns_options = o.dns_options.clone();
     r.network_name = o.network_name.clone();
     r.guest_subnet = o.guest_subnet.clone();
     r.storage_gb = o.storage_gb;
@@ -2144,6 +2204,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.disks = o.disks.clone();
     r.cache_disk = o.cache_disk.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
+    r.block_private = o.block_private.clone();
     r.init = o.init.clone();
     r.init_completed = false;
     r.env = o.env.clone();
@@ -2207,10 +2268,11 @@ pub struct DefaultVmOverrides {
     pub mem: u32,
     pub mounts: Vec<(String, String, bool)>,
     pub staged_mounts: Vec<(usize, String, String)>,
-    pub ports: Vec<(u16, u16)>,
+    pub ports: Vec<PortMapping>,
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
+    pub dns_options: Vec<String>,
     pub network_name: Option<String>,
     pub guest_subnet: Option<String>,
     pub storage_gb: Option<u64>,
@@ -2223,6 +2285,8 @@ pub struct DefaultVmOverrides {
     /// Shared cache disk (`--cache-disk`).
     pub cache_disk: Option<smolvm::data::disk::CacheDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
+    /// `--block-private` and its `--allow-private` exceptions.
+    pub block_private: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub secret_refs: BTreeMap<String, SecretRef>,
@@ -2254,7 +2318,7 @@ impl DefaultVmOverrides {
         params: &CreateVmParams,
         mounts: Vec<(String, String, bool)>,
         staged_mounts: Vec<(usize, String, String)>,
-        ports: Vec<(u16, u16)>,
+        ports: Vec<PortMapping>,
     ) -> Self {
         Self {
             secret_refs: params.secret_refs.clone(),
@@ -2266,6 +2330,7 @@ impl DefaultVmOverrides {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             storage_gb: params.storage_gb,
@@ -2275,6 +2340,7 @@ impl DefaultVmOverrides {
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
+            block_private: params.block_private.clone(),
             init: params.init.clone(),
             env: smolvm::util::parse_env_list(&params.env),
             workdir: params.workdir.clone(),
@@ -2305,7 +2371,8 @@ fn check_port_conflicts(
     ports: &[PortMapping],
     db: &SmolvmDb,
 ) -> smolvm::Result<()> {
-    let host_ports: std::collections::HashSet<u16> = ports.iter().map(|p| p.host).collect();
+    let host_ports: std::collections::HashSet<_> =
+        ports.iter().map(|p| (p.host, p.protocol)).collect();
     if host_ports.is_empty() {
         return Ok(());
     }
@@ -2319,13 +2386,18 @@ fn check_port_conflicts(
         if record.actual_state() != smolvm::config::RecordState::Running {
             continue;
         }
-        for (host, _guest) in &record.ports {
-            if host_ports.contains(host) {
+        for mapping in record.port_mappings() {
+            if host_ports.contains(&(mapping.host, mapping.protocol)) {
                 return Err(smolvm::Error::config(
                     "start machine",
                     format!(
-                        "host port {} is already in use by running machine '{}'",
-                        host, name
+                        "host port {}{} is already in use by running machine '{}'",
+                        mapping.host,
+                        match mapping.protocol {
+                            smolvm::data::network::PortProtocol::Udp => "/udp",
+                            smolvm::data::network::PortProtocol::Tcp => "",
+                        },
+                        name
                     ),
                 ));
             }
@@ -2427,6 +2499,15 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
 /// Stop a named machine that has a config record (or fall back to
 /// agent-only stop if the name is not in config).
 pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
+    stop_vm_named_with_timeout(name, None)
+}
+
+/// [`stop_vm_named`], giving the workload `stop_timeout` to exit after its
+/// stop signal instead of the machine's own stop timeout.
+pub fn stop_vm_named_with_timeout(
+    name: &str,
+    stop_timeout: Option<std::time::Duration>,
+) -> smolvm::Result<()> {
     // Serialize against fork capture in this or another process. Stopping the
     // VMM between snapshot preparation and clone registration can otherwise
     // strand an ambiguous generation.
@@ -2470,8 +2551,8 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // failure we return the error without claiming the machine
             // stopped and without detaching its volumes.
             cli_recover_if_unreachable(name)?;
-            // Process is gone — detach the layers volume so a non-running
-            // machine never holds a mount (invariant: mounted iff running).
+            // Process is gone — detach the layers volume unless fork children
+            // still reference it. Their pack links also pin a stopped source.
             // macOS hdiutil detach; a no-op on Linux.
             if record.source_smolmachine.is_some() {
                 smolvm_pack::extract::force_detach_layers_volume(
@@ -2485,15 +2566,16 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // fall through to the normal stop path
         }
         RecordState::Frozen => {
-            let clones = SmolvmDb::open()?.dependent_clones(name).unwrap_or_default();
+            let clones =
+                smolvm::agent::fork::restart_blocking_dependent_clones(&SmolvmDb::open()?, name)?;
             if !clones.is_empty() {
                 // A snapshot-frozen fork base must outlive its clones: their
                 // disks CoW-back onto its disks and their RAM maps its memfd.
                 return Err(smolvm::Error::agent(
                     "stop",
                     format!(
-                        "machine '{name}' is the fork base for {} live clone(s) ({}); \
-                         stop or delete the clones first",
+                        "machine '{name}' is the fork base for {} dependent clone(s) ({}); \
+                         delete those clones first",
                         clones.len(),
                         clones.join(", ")
                     ),
@@ -2540,13 +2622,15 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     }
     if frozen {
         manager.stop_paused()?;
+    } else if let Some(stop_timeout) = stop_timeout {
+        manager.stop_with_timeout(stop_timeout)?;
     } else {
         manager.stop()?;
     }
 
     // Detach the machine's case-sensitive layers volume now that its process is
-    // gone (macOS hdiutil mount; no-op on Linux). The volume is owned 1:1 by this
-    // machine, so the detach is safe and re-acquired on the next start.
+    // gone (macOS hdiutil mount; no-op on Linux). A continuing source's volume
+    // stays mounted while child pack symlinks still reference it.
     if record.source_smolmachine.is_some() {
         smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
             name,
@@ -2616,7 +2700,7 @@ fn kill_orphaned_boot_process(name: &str) {
 }
 
 /// Stop the default machine.
-pub fn stop_vm_default() -> smolvm::Result<()> {
+pub fn stop_vm_default(stop_timeout: Option<std::time::Duration>) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     let record = SmolvmConfig::load()
@@ -2634,14 +2718,17 @@ pub fn stop_vm_default() -> smolvm::Result<()> {
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
         smolvm::staged_mount::sync_staged_mounts(record, &mut client)?;
     }
-    manager.stop()?;
+    match stop_timeout {
+        Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
+        None => manager.stop()?,
+    }
 
     // Update database record if it exists
     if let Ok(mut config) = SmolvmConfig::load() {
-        // Detach the per-machine layers volume now that the process is gone, so a
-        // bundle-sourced default machine never holds a mount while stopped (macOS
-        // hdiutil; no-op on Linux). Gated on the record so non-bundle machines are
-        // untouched; the volume is owned 1:1 by "default" and re-acquired on start.
+        // Detach the per-machine layers volume now that the process is gone,
+        // unless fork children still reference it (macOS hdiutil; no-op on Linux).
+        // Gated on the record so non-bundle machines are untouched; the volume
+        // belongs to "default" and its linked children.
         let is_bundle = config
             .get_vm("default")
             .map(|r| r.source_smolmachine.is_some())
@@ -2866,7 +2953,9 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                         smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
                     smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
                 }
-                manager.stop()?;
+                // The machine is being deleted, so its workload has nothing
+                // to save: kill it at once rather than wait out its timeout.
+                manager.stop_with_timeout(std::time::Duration::ZERO)?;
                 if record.pid.is_some_and(smolvm::process::is_alive) {
                     return Err(smolvm::Error::agent(
                         "delete machine",
@@ -2926,8 +3015,8 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // data dir below — otherwise the `rm -rf` fails with "Resource busy". The
     // lease was intentionally leaked with `std::mem::forget` at start time so the
     // volume stayed mounted while the VM ran. The volume lives under this
-    // machine's own data dir and is owned 1:1 by it, so the detach is
-    // unconditional and cannot affect any other machine.
+    // machine's own data dir. Dependent children block source deletion above;
+    // the detach helper also preserves any remaining child pack references.
     if record.source_smolmachine.is_some() {
         smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
             name,
@@ -3189,7 +3278,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "memory_mib": record.mem,
         "pid": record.pid,
         "mounts": record.mounts.len() + record.staged_mounts.len(),
-        "ports": record.ports.len(),
+        "ports": record.ports.len() + record.udp_ports.len(),
         "created_at": record.created_at,
         "storage_gb": record.storage_gb,
         "overlay_gb": record.overlay_gb,
@@ -3222,9 +3311,34 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "health_retries": record.health_retries,
         "health_startup_grace_secs": record.health_startup_grace_secs,
     });
-    obj.as_object_mut()
-        .unwrap()
-        .insert("network".into(), serde_json::json!(record.network));
+    let fields = obj.as_object_mut().unwrap();
+    fields.insert("network".into(), serde_json::json!(record.network));
+    // The egress allow list, present only when one is set, in the stored form
+    // `machine update` accepts back: `=host` exact, `*.domain` wildcard, bare
+    // `host` for a name and its subdomains, plus CIDRs. Lets a client read the
+    // policy it set with `--reset-allow-list` instead of remembering it.
+    if let Some(hosts) = &record.dns_filter_hosts {
+        fields.insert("allowed_hosts".into(), serde_json::json!(hosts));
+    }
+    if let Some(cidrs) = &record.allowed_cidrs {
+        fields.insert("allowed_cidrs".into(), serde_json::json!(cidrs));
+    }
+    // The guest resolver and its options, present only when set (`--dns`,
+    // `--dns-option`), so tooling can see what the guest resolv.conf gets.
+    if let Some(dns) = record.dns {
+        fields.insert("dns".into(), serde_json::json!(dns.to_string()));
+    }
+    if !record.dns_options.is_empty() {
+        fields.insert("dns_options".into(), serde_json::json!(record.dns_options));
+    }
+    // A branch keeps its staged working copies but never writes them back;
+    // name the machine that does, so tooling can send the user there.
+    if let Some(source) = &record.staged_mounts_detached_from {
+        fields.insert(
+            "staged_mounts_detached_from".into(),
+            serde_json::json!(source),
+        );
+    }
     obj
 }
 
@@ -3365,7 +3479,7 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
                 record.cpus,
                 format!("{} MiB", record.mem),
                 record.mounts.len() + record.staged_mounts.len(),
-                record.ports.len(),
+                record.ports.len() + record.udp_ports.len(),
                 format!("{} GiB", storage_gb),
                 format!("{} GiB", overlay_gb),
                 branched_from,
@@ -3379,8 +3493,12 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
                     let ro_str = if *ro { " (ro)" } else { "" };
                     println!("  Mount: {} -> {}{}", host, guest, ro_str);
                 }
-                for (host, guest) in &record.ports {
-                    println!("  Port: {} -> {}", host, guest);
+                for mapping in record.port_mappings() {
+                    let udp = match mapping.protocol {
+                        smolvm::data::network::PortProtocol::Udp => "/udp",
+                        smolvm::data::network::PortProtocol::Tcp => "",
+                    };
+                    println!("  Port: {} -> {}{udp}", mapping.host, mapping.guest);
                 }
                 if record.network {
                     println!("  Network: enabled");
@@ -4562,5 +4680,29 @@ mod mount_socket_placeholder_tests {
             vec![mount_sock("/run/control/engine.sock")],
         );
         remove_placeholders(&record); // nothing present: no failure
+    }
+}
+
+#[cfg(test)]
+mod status_dns_tests {
+    use super::machine_status_json;
+    use smolvm::config::VmRecord;
+
+    // `--dns` and `--dns-option` show up in status JSON only when set, so the
+    // object other machines produce is unchanged.
+    #[test]
+    fn status_json_reports_resolver_and_options_only_when_set() {
+        let mut record = VmRecord::new("d".to_string(), 1, 512, vec![], vec![], true);
+        let plain = machine_status_json("d", &record);
+        assert!(plain.get("dns").is_none() && plain.get("dns_options").is_none());
+
+        record.dns = Some("9.9.9.9".parse().unwrap());
+        record.dns_options = vec!["timeout:1".into(), "use-vc".into()];
+        let status = machine_status_json("d", &record);
+        assert_eq!(status["dns"], "9.9.9.9");
+        assert_eq!(
+            status["dns_options"],
+            serde_json::json!(["timeout:1", "use-vc"])
+        );
     }
 }

@@ -668,7 +668,7 @@ pub(crate) fn retained_snapshot_source_continues(snapshot: &RetainedForkSnapshot
     snapshot.path.join("source-continues-v1").is_file()
 }
 
-fn restart_blocking_dependent_clones_in(
+pub(super) fn restart_blocking_dependent_clones_in(
     db: &SmolvmDb,
     golden: &str,
     snapshot_root: &Path,
@@ -1826,6 +1826,10 @@ pub fn collect_parent_generations_after_child_delete(db: &SmolvmDb, parent: &str
     if record.is_none() {
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if let Err(error) = release_shared_layers_after_child_delete(db, parent) {
+        tracing::warn!(%parent, %error, "could not release shared layers volume");
+    }
     let snapshot_root = vm_data_dir(parent).join("s");
     let retained = db.retained_fork_snapshot(parent)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1854,6 +1858,36 @@ pub fn collect_parent_generations_after_child_delete(db: &SmolvmDb, parent: &str
 #[doc(hidden)]
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn collect_parent_generations_after_child_delete(_db: &SmolvmDb, _parent: &str) -> Result<()> {
+    Ok(())
+}
+
+/// A deleted child linked its `pack` dir to the macOS layers volume of the
+/// machine at the root of its fork chain. Stopping that machine kept the volume
+/// mounted for its children, so once the last one is gone and the owner is not
+/// running, nothing else would unmount it until the owner's next stop/delete.
+#[cfg(target_os = "macos")]
+fn release_shared_layers_after_child_delete(db: &SmolvmDb, parent: &str) -> Result<()> {
+    let mut owner = parent.to_string();
+    let mut seen = HashSet::new();
+    while seen.insert(owner.clone()) {
+        let Some(record) = db.get_vm(&owner)? else {
+            return Ok(());
+        };
+        let layers = crate::agent::machine_layers_cache_dir(&owner);
+        let linked = layers
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if !linked {
+            if record.source_smolmachine.is_some() && !record.is_process_alive() {
+                smolvm_pack::extract::release_unused_machine_layers_volume(&layers);
+            }
+            return Ok(());
+        }
+        let Some(golden) = record.golden else {
+            return Ok(());
+        };
+        owner = golden;
+    }
     Ok(())
 }
 
@@ -1957,6 +1991,26 @@ fn read_generation_fork_disks(snapshot_dir: &Path) -> Result<Option<Vec<ForkDisk
 /// have succeeded, so the limit only catches a guest whose disk is wedged.
 const SYNC_FORK_SOURCE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Keep a source's staged mounts on its branch without their host binding.
+///
+/// The branch's cloned storage disk already holds the working copies; keeping
+/// the mounts recorded makes a restart find and keep them instead of pruning
+/// them as stale. What a branch must not do is synchronize them back: the host
+/// directories are the source's, and two descendants writing one tree would
+/// interleave their changes. `staged_mounts_detached_from` names the machine
+/// that still may, through every generation of branches.
+pub(crate) fn detach_staged_mounts(clone_rec: &mut VmRecord, golden: &str, golden_rec: &VmRecord) {
+    if golden_rec.staged_mounts.is_empty() {
+        return;
+    }
+    clone_rec.staged_mounts_detached_from = Some(
+        golden_rec
+            .staged_mounts_detached_from
+            .clone()
+            .unwrap_or_else(|| golden.to_string()),
+    );
+}
+
 /// Flush guest filesystems before capturing a new live checkpoint.
 ///
 /// A branch sees dirty guest page-cache state through the RAM snapshot, but a
@@ -1987,6 +2041,27 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
         )),
         Err(error) => Err(Error::agent("sync fork source", error.to_string())),
     }
+}
+
+/// Join the guest's scattered free pages into the large blocks free page
+/// hinting can hand over. Best effort: an older agent or a kernel without
+/// compaction just leaves memory as it is.
+pub fn compact_guest_memory(name: &str) {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
+        return;
+    };
+    let _ = client.vm_exec(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo 1 > /proc/sys/vm/compact_memory".to_string(),
+        ],
+        Vec::new(),
+        None,
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
+        None,
+    );
 }
 
 /// Release the workload restored in `clone` after its identity and per-fork
@@ -2095,6 +2170,8 @@ pub struct PreparedFork {
     /// caller to log. Empty when the golden has no forwards. When ports were
     /// pinned, `golden_host == clone_host`.
     pub port_remaps: Vec<(u16, u16, u16)>,
+    /// The same for UDP forwards, which are always remapped.
+    pub udp_port_remaps: Vec<(u16, u16, u16)>,
     /// Whether the source resumed after this checkpoint.
     pub source_continues: bool,
 }
@@ -2136,6 +2213,8 @@ pub struct ForkSpec<'a> {
     /// Keep the restored workload parked at its inherited forkpoint until a
     /// later assignment explicitly releases it.
     pub hold: bool,
+    /// Labels set on the clone over the ones it inherits from the golden.
+    pub labels: &'a [(String, String)],
 }
 
 /// Freeze a running, forkable `golden`, snapshot it, register `clone` in the DB
@@ -2156,6 +2235,7 @@ pub fn prepare_fork(
     clone_forkable: bool,
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    labels: &[(String, String)],
     source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
@@ -2168,6 +2248,7 @@ pub fn prepare_fork(
             fork_env,
             fork_secrets,
             hold: false,
+            labels,
         }],
         source_policy,
     )?;
@@ -2176,6 +2257,7 @@ pub fn prepare_fork(
 
 /// Prepare one clean clone that remains parked at the inherited forkpoint.
 /// Held slots are deliberately non-forkable and one-shot.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_held_fork(
     db: &SmolvmDb,
     golden: &str,
@@ -2183,6 +2265,7 @@ pub fn prepare_held_fork(
     pinned_ports: &[(u16, u16)],
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    labels: &[(String, String)],
     source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
@@ -2195,10 +2278,22 @@ pub fn prepare_held_fork(
             fork_env,
             fork_secrets,
             hold: true,
+            labels,
         }],
         source_policy,
     )?;
     Ok(prepared.remove(0))
+}
+
+/// A clone starts with the golden's labels; a label given at branch time
+/// replaces the inherited value of the same key.
+pub(crate) fn apply_clone_labels(
+    labels: &mut std::collections::BTreeMap<String, String>,
+    overrides: &[(String, String)],
+) {
+    for (key, value) in overrides {
+        labels.insert(key.clone(), value.clone());
+    }
 }
 
 /// Capture one golden generation and prepare every requested clone from it.
@@ -2256,7 +2351,7 @@ pub(crate) fn prepare_forks_reusing(
     }
 
     let mut names = HashSet::with_capacity(specs.len());
-    let mut reserved_ports = HashSet::new();
+    let mut reserved_ports = ReservedPorts::default();
     for spec in specs {
         validate_vm_name(spec.clone, "clone name").map_err(|e| Error::config("clone name", e))?;
         validate_fork_env(spec.fork_env)?;
@@ -2279,7 +2374,7 @@ pub(crate) fn prepare_forks_reusing(
             ));
         }
         for (host, _) in spec.pinned_ports {
-            if !reserved_ports.insert(*host) {
+            if !reserved_ports.tcp.insert(*host) {
                 return Err(Error::config(
                     "fork",
                     format!("host port {host} is assigned to more than one clone"),
@@ -2297,7 +2392,13 @@ pub(crate) fn prepare_forks_reusing(
     let recorded = db.list_vms()?;
     reserve_recorded_host_ports(
         recorded.iter().map(|(_, record)| record.ports.as_slice()),
-        &mut reserved_ports,
+        &mut reserved_ports.tcp,
+    );
+    reserve_recorded_host_ports(
+        recorded
+            .iter()
+            .map(|(_, record)| record.udp_ports.as_slice()),
+        &mut reserved_ports.udp,
     );
 
     let golden_rec = db
@@ -2307,12 +2408,6 @@ pub(crate) fn prepare_forks_reusing(
     let mut golden_rec = golden_rec;
     for spec in specs {
         check_pinned_ports_keep_network_backend(golden, &golden_rec, spec.pinned_ports)?;
-    }
-    if !golden_rec.staged_mounts.is_empty() {
-        return Err(Error::config(
-            "fork",
-            "staged mounts cannot be branched yet because multiple descendants would synchronize into the same host directory; use a live rw mount or remove the staged mount first",
-        ));
     }
     let child_depth = db
         .fork_lineage_depth(golden)?
@@ -2850,7 +2945,7 @@ fn prepare_clone_from_snapshot(
     golden_dir: &Path,
     snapshot_dir: &Path,
     spec: &ForkSpec<'_>,
-    reserved_ports: &mut HashSet<u16>,
+    reserved_ports: &mut ReservedPorts,
 ) -> Result<PreparedFork> {
     let clone = spec.clone;
     let clone_dir = vm_data_dir(clone);
@@ -2905,6 +3000,7 @@ fn prepare_clone_from_snapshot(
         for (key, secret) in spec.fork_secrets {
             clone_rec.secret_refs.insert(key.clone(), secret.clone());
         }
+        apply_clone_labels(&mut clone_rec.labels, spec.labels);
 
         let mut port_remaps = Vec::new();
         if !spec.pinned_ports.is_empty() {
@@ -2915,7 +3011,7 @@ fn prepare_clone_from_snapshot(
         } else if !clone_rec.ports.is_empty() {
             let mut remapped = Vec::with_capacity(clone_rec.ports.len());
             for (golden_host, guest) in &clone_rec.ports {
-                match alloc_free_host_port_excluding(reserved_ports) {
+                match alloc_free_host_port_excluding(&mut reserved_ports.tcp) {
                     Some(host) => {
                         port_remaps.push((*golden_host, *guest, host));
                         remapped.push((host, *guest));
@@ -2928,6 +3024,25 @@ fn prepare_clone_from_snapshot(
             }
             clone_rec.ports = remapped;
         }
+        // The source keeps its UDP host ports, so a child always gets fresh ones
+        // (branch pins name TCP ports only).
+        let mut udp_port_remaps = Vec::new();
+        if !clone_rec.udp_ports.is_empty() {
+            let mut remapped = Vec::with_capacity(clone_rec.udp_ports.len());
+            for (golden_host, guest) in &clone_rec.udp_ports {
+                match alloc_free_udp_host_port_excluding(&mut reserved_ports.udp) {
+                    Some(host) => {
+                        udp_port_remaps.push((*golden_host, *guest, host));
+                        remapped.push((host, *guest));
+                    }
+                    None => tracing::warn!(
+                        guest,
+                        "could not allocate a host UDP port for fork clone; dropping forward"
+                    ),
+                }
+            }
+            clone_rec.udp_ports = remapped;
+        }
         clone_rec.fork_overlay_owner = Some(
             golden_rec
                 .fork_overlay_owner
@@ -2937,6 +3052,7 @@ fn prepare_clone_from_snapshot(
                 .to_string(),
         );
         clone_rec.golden = Some(golden.to_string());
+        detach_staged_mounts(&mut clone_rec, golden, golden_rec);
         clone_rec.fork_generation = snapshot_generation_id(snapshot_dir).map(str::to_string);
         clone_rec.fork_lineage_pid_start_time = None;
         // Forkability is explicit per clone. Either way the clone is a
@@ -2959,6 +3075,7 @@ fn prepare_clone_from_snapshot(
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,
+            udp_port_remaps,
             source_continues: fork_continue_snapshot(snapshot_dir),
         })
     })();
@@ -3940,17 +4057,32 @@ const CLONE_PORT_CEILING: u16 = 32_000;
 /// already in use". Allocating below the ephemeral range instead means only
 /// another deliberate bind can collide, which the free check below catches.
 fn alloc_free_host_port() -> Option<u16> {
+    alloc_free_port_where(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+}
+
+fn alloc_free_udp_host_port() -> Option<u16> {
+    alloc_free_port_where(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok())
+}
+
+fn alloc_free_port_where(free: impl Fn(u16) -> bool) -> Option<u16> {
     let span = u32::from(CLONE_PORT_CEILING - CLONE_PORT_FLOOR);
     for _ in 0..256 {
         let offset = host_random_u16()? % span as u16;
         let port = CLONE_PORT_FLOOR + offset;
         // Binding confirms the port is free; dropping it immediately is safe
         // here because nothing else will be *assigned* this number.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if free(port) {
             return Some(port);
         }
     }
     None
+}
+
+/// Host ports a batch of branches must not hand out, TCP and UDP apart.
+#[derive(Default)]
+struct ReservedPorts {
+    tcp: HashSet<u16>,
+    udp: HashSet<u16>,
 }
 
 /// Two random bytes from the host RNG, for choosing a clone's host port.
@@ -4015,6 +4147,16 @@ fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
     None
 }
 
+fn alloc_free_udp_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
+    for _ in 0..128 {
+        let port = alloc_free_udp_host_port()?;
+        if reserved.insert(port) {
+            return Some(port);
+        }
+    }
+    None
+}
+
 /// Read `hex_len/2` random bytes from the host RNG, hex-encoded. Used to seed
 /// each clone's RNG with distinct host entropy.
 fn host_random_hex(hex_len: usize) -> Result<String> {
@@ -4067,7 +4209,51 @@ fn check_pinned_ports_keep_network_backend(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clone_labels_override_inherited_ones_and_keep_the_rest() {
+        let mut labels = std::collections::BTreeMap::from([
+            ("owner".to_string(), "source".to_string()),
+            ("tier".to_string(), "gold".to_string()),
+        ]);
+        super::apply_clone_labels(
+            &mut labels,
+            &[
+                ("owner".to_string(), "child".to_string()),
+                ("job".to_string(), "7".to_string()),
+            ],
+        );
+        assert_eq!(labels["owner"], "child");
+        assert_eq!(labels["tier"], "gold");
+        assert_eq!(labels["job"], "7");
+        super::apply_clone_labels(&mut labels, &[]);
+        assert_eq!(labels.len(), 3);
+    }
+
     use super::*;
+
+    #[test]
+    fn a_branch_keeps_staged_mounts_but_not_their_host_binding() {
+        let mut source = VmRecord::new("src".into(), 1, 512, vec![], vec![], false);
+        source.staged_mounts = vec![(0, "/home/me/project".into(), "/workspace".into())];
+        let mut child = source.clone();
+        detach_staged_mounts(&mut child, "src", &source);
+        assert_eq!(child.staged_mounts, source.staged_mounts);
+        assert_eq!(child.staged_mounts_detached_from.as_deref(), Some("src"));
+        assert!(source.staged_mounts_sync_to_host());
+        assert!(!child.staged_mounts_sync_to_host());
+        // A branch of the branch still names the original owner.
+        let mut grandchild = child.clone();
+        detach_staged_mounts(&mut grandchild, "child", &child);
+        assert_eq!(
+            grandchild.staged_mounts_detached_from.as_deref(),
+            Some("src")
+        );
+        // No staged mounts: nothing to detach.
+        let plain = VmRecord::new("p".into(), 1, 512, vec![], vec![], false);
+        let mut plain_child = plain.clone();
+        detach_staged_mounts(&mut plain_child, "p", &plain);
+        assert!(plain_child.staged_mounts_detached_from.is_none());
+    }
 
     #[test]
     fn pinned_ports_need_a_golden_already_on_the_port_capable_backend() {

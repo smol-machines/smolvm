@@ -111,6 +111,8 @@ mod storage;
 mod timesync;
 mod vsock;
 mod vulkan;
+#[cfg(target_os = "linux")]
+mod workload;
 
 // ============================================================================
 // Configuration Constants
@@ -203,14 +205,39 @@ fn boottime_ms() -> u64 {
 /// clobber a valid nameserver the host already wrote. The old code wrote the
 /// hardcoded public resolvers unconditionally, which both dropped `--dns` and
 /// overwrote `setup_dns`'s value, so `--dns` never took effect on TSI.
-fn tsi_resolv_conf(dns_override: Option<&str>, current: &str) -> Option<String> {
+///
+/// `options` (from `--dns-option`) are appended as one `options` line to
+/// whatever this writes; with options set, a host-written file that lacks
+/// them gets its `options` line replaced and every other line (search
+/// domains included) kept, so the options always reach the guest's resolver.
+fn tsi_resolv_conf(
+    dns_override: Option<&str>,
+    current: &str,
+    options: &[String],
+) -> Option<String> {
     match dns_override.map(str::trim) {
-        Some(dns) if !dns.is_empty() => Some(format!("nameserver {dns}\n")),
-        _ if current.contains("127.0.0.1") || current.trim().is_empty() => {
-            Some("nameserver 1.1.1.1\nnameserver 8.8.8.8\n".to_string())
+        Some(dns) if !dns.is_empty() => Some(smolvm_protocol::resolv::render(&[dns], options)),
+        _ if current.contains("127.0.0.1") || current.trim().is_empty() => Some(
+            smolvm_protocol::resolv::render(&smolvm_protocol::resolv::DEFAULT_NAMESERVERS, options),
+        ),
+        _ if !options.is_empty() => {
+            let wanted = smolvm_protocol::resolv::with_options(current, options);
+            (wanted != current).then_some(wanted)
         }
         _ => None,
     }
+}
+
+/// The resolver options the host asked for (`guest_env::DNS_OPTIONS`).
+/// Invalid tokens are dropped and logged, never written. Every writer of
+/// resolv.conf takes its options from here.
+pub(crate) fn resolv_options() -> Vec<String> {
+    let value = std::env::var(guest_env::DNS_OPTIONS).unwrap_or_default();
+    let (accepted, rejected) = smolvm_protocol::resolv::parse_options(&value);
+    for reason in rejected {
+        warn!(%reason, "ignoring resolver option");
+    }
+    accepted
 }
 
 /// Seed the guest wall clock from `SMOLVM_HOST_TIME_NS` (the host's launch time),
@@ -429,7 +456,9 @@ fn main() {
             if !dns_proxy::is_enabled() {
                 let dns_override = std::env::var(guest_env::DNS).ok();
                 let current = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-                if let Some(new) = tsi_resolv_conf(dns_override.as_deref(), &current) {
+                if let Some(new) =
+                    tsi_resolv_conf(dns_override.as_deref(), &current, &resolv_options())
+                {
                     let _ = std::fs::write("/etc/resolv.conf", new);
                 }
             }
@@ -458,6 +487,11 @@ fn main() {
         error!("staged volume mount requires the guest storage disk");
         std::process::exit(1);
     }
+    // Disk volumes keep their data on the storage disk the same way.
+    if storage::disk_volumes_requested() && !ensure_storage_mounted() {
+        error!("disk volume requires the guest storage disk");
+        std::process::exit(1);
+    }
 
     // Initialize volume mounts from SMOLVM_MOUNT_* env vars.
     // MUST run before the /workspace symlink below — if the user passed
@@ -467,6 +501,10 @@ fn main() {
     let boot_mounts = storage::init_volume_mounts();
     if storage::staged_boot_mount_requested() && storage::boot_volume_mounts_failed() {
         error!("failed to initialize staged volume mount");
+        std::process::exit(1);
+    }
+    if storage::disk_volumes_failed() {
+        error!("failed to initialize disk volume");
         std::process::exit(1);
     }
     if !boot_mounts.is_empty() {
@@ -2184,8 +2222,17 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // on the same connection is read.
         let _work = needs_work_slot(&request).then(|| WORK_SLOTS.acquire());
 
-        if let AgentRequest::Shutdown { progress } = request {
+        if let AgentRequest::Shutdown {
+            progress,
+            stop_timeout_secs,
+        } = request
+        {
             shutdown::respond(stream, progress, || {
+                // The workload saves its state before storage is frozen under it.
+                #[cfg(target_os = "linux")]
+                workload::stop_all(stop_timeout_secs.map(std::time::Duration::from_secs));
+                #[cfg(not(target_os = "linux"))]
+                let _ = stop_timeout_secs;
                 // Serialize shutdown requests without blocking progress for a
                 // second caller waiting for the first flush to finish.
                 static FLUSH: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2236,6 +2283,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // Handle Pull with progress streaming
         if let AgentRequest::Pull {
             ref image,
+            ref cache_as,
             ref oci_platform,
             ref auth,
             ref proxy,
@@ -2245,6 +2293,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             handle_streaming_pull(
                 stream,
                 image,
+                cache_as.as_deref(),
                 oci_platform.as_deref(),
                 auth.as_ref(),
                 proxy.as_deref(),
@@ -2390,11 +2439,17 @@ fn handle_request(
             let mut capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
+                smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_string(),
                 smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_string(),
+                smolvm_protocol::GRACEFUL_WORKLOAD_STOP_CAPABILITY.to_string(),
             ];
+            #[cfg(target_os = "linux")]
+            if workload::logs_enabled() {
+                capabilities.push(smolvm_protocol::WORKLOAD_LOGS_CAPABILITY.to_string());
+            }
             // The guest kernel publishes this parameter when its timer driver
             // follows a change of counter rate after a restore.
             if std::path::Path::new("/sys/module/arm_arch_timer/parameters/follows_counter_rate")
@@ -2421,6 +2476,10 @@ fn handle_request(
 
         AgentRequest::PrepareOverlay { image, workload_id } => {
             handle_prepare_overlay(&image, &workload_id)
+        }
+
+        AgentRequest::PrepareFileAccess { image, workload_id } => {
+            handle_prepare_file_access(&image, &workload_id)
         }
 
         AgentRequest::CleanupOverlay { workload_id } => handle_cleanup_overlay(&workload_id),
@@ -2625,6 +2684,8 @@ fn handle_request(
             background,
             s3_volumes,
             stop_vm_on_exit: _,
+            stop_signal: _,
+            stop_timeout_secs: _,
         } => {
             if background {
                 handle_run_background(
@@ -3493,7 +3554,7 @@ fn handle_streaming_file_read(
             return Ok(());
         }
     };
-    let mut file = match std::fs::File::open(&resolved) {
+    let mut file = match nsfile::open_file_for_read(&resolved) {
         Ok(f) => f,
         Err(e) => {
             send_response(
@@ -3510,11 +3571,10 @@ fn handle_streaming_file_read(
             return Ok(());
         }
     };
-    // Only stream regular files. Directories and special files (e.g. /dev/zero,
-    // FIFOs) `open()` successfully but misbehave on read — a directory fails with
-    // EISDIR *after* the chunk stream has started (desyncing the wire and bricking
-    // the connection), and an unbounded device never EOFs (hangs the caller). We
-    // must reject them with a clean error BEFORE the first DataChunk frame.
+    // Only stream regular files. Opening with O_NONBLOCK above prevents a FIFO
+    // from hanging before this check. Directories fail on read only after the
+    // first chunk (desyncing the wire), and devices may never reach EOF. Reject
+    // them with a clean error BEFORE the first DataChunk frame.
     let metadata = match file.metadata() {
         Ok(m) => m,
         Err(e) => {
@@ -3623,7 +3683,7 @@ fn handle_streaming_archive_directory(
     }
     result?;
     match child.wait() {
-        Ok(status) if status.success() => send_response(
+        Ok(status) if storage::tar_create_succeeded(status) => send_response(
             stream,
             &AgentResponse::DataChunk {
                 data: Vec::new(),
@@ -4020,6 +4080,8 @@ fn handle_run_detached(
         unprivileged,
         s3_volumes,
         stop_vm_on_exit,
+        stop_signal,
+        stop_timeout_secs,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -4032,6 +4094,8 @@ fn handle_run_detached(
             unprivileged,
             s3_volumes,
             stop_vm_on_exit,
+            stop_signal,
+            stop_timeout_secs,
             ..
         } => (
             image,
@@ -4044,6 +4108,8 @@ fn handle_run_detached(
             unprivileged,
             s3_volumes,
             stop_vm_on_exit,
+            stop_signal,
+            stop_timeout_secs,
         ),
         _ => {
             send_response(
@@ -4053,6 +4119,25 @@ fn handle_run_detached(
             return Ok(());
         }
     };
+
+    let stop_signal = stop_signal
+        .as_deref()
+        .unwrap_or(smolvm_protocol::DEFAULT_STOP_SIGNAL);
+    let Some(stop_signal) = smolvm_protocol::parse_stop_signal(stop_signal) else {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("unknown stop signal '{stop_signal}'"),
+                error_codes::INVALID_REQUEST,
+            ),
+        )?;
+        return Ok(());
+    };
+    let stop_timeout = std::time::Duration::from_secs(
+        stop_timeout_secs
+            .unwrap_or(smolvm_protocol::DEFAULT_STOP_TIMEOUT_SECS)
+            .min(smolvm_protocol::MAX_STOP_TIMEOUT_SECS),
+    );
 
     // An empty command is allowed here: it means "run the image's own
     // ENTRYPOINT/CMD". We resolve it from the image config below, after the
@@ -4213,7 +4298,15 @@ fn handle_run_detached(
     // `crun run --detach` which hangs in the smolvm VM environment. The
     // two-step approach registers the container state so `crun exec` can join
     // it, and `crun start` returns immediately once the container is running.
-    let create_output = crun::CrunCommand::create(&bundle_path, &container_id).output();
+    // A workload that is the container's init inherits create's stdio; the
+    // keep-alive init in front of any other workload has nothing to say.
+    let mut create = crun::CrunCommand::create(&bundle_path, &container_id);
+    if workload_is_pid1 {
+        if let Some(output) = workload::output_pipe() {
+            create = create.output_to(output);
+        }
+    }
+    let create_output = create.output();
     match create_output {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
@@ -4302,6 +4395,14 @@ fn handle_run_detached(
                     }
                 }
             };
+            workload::register(
+                match workload {
+                    Some(identity) => workload::StopTarget::Process(identity),
+                    None => workload::StopTarget::Container(container_id.clone()),
+                },
+                stop_signal,
+                stop_timeout,
+            );
             if stop_vm_on_exit {
                 match workload {
                     Some(workload) => stop_machine_when_exited(move || {
@@ -4384,7 +4485,7 @@ fn launch_workload(
     let log = crun::workload_log_path(container_id);
     let pid_file = log.with_extension("pid");
     let _ = std::fs::remove_file(&pid_file);
-    let status = crun::CrunCommand::exec_detached_with_log(
+    let crun = crun::CrunCommand::exec_detached_with_log(
         container_id,
         &env,
         &launch.command,
@@ -4393,8 +4494,11 @@ fn launch_workload(
         Some(&log),
     )
     .user(user.as_deref())
-    .stdin_null()
-    .discard_output()
+    .stdin_null();
+    let status = match workload::output_pipe() {
+        Some(output) => crun.output_to(output),
+        None => crun.discard_output(),
+    }
     .status()
     .map_err(|e| format!("run crun: {e}"))?;
     let reason = crun::take_log(&log);
@@ -4439,6 +4543,10 @@ fn stop_machine_when_exited(alive: impl Fn() -> Option<u32> + Send + 'static) {
                     // failed): the old poll interval is the fallback.
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
+            }
+            if workload::stopping() {
+                // A shutdown stopped it and quiesces storage itself.
+                return;
             }
             info!("workload exited; stopping the machine (stop_on_exit)");
             if let Err(e) = shutdown_freeze::freeze_internal_filesystems() {
@@ -5470,6 +5578,74 @@ fn kill_child_on_disconnect(child: &mut Child) -> i32 {
     124
 }
 
+/// Assemble a host stdin/control frame without blocking the command I/O loop.
+/// A readable socket may hold only one byte of a length prefix or payload;
+/// waiting for the rest would prevent output draining and timeout handling.
+#[derive(Default)]
+struct InteractiveFrame {
+    header: [u8; 4],
+    header_len: usize,
+    body: Vec<u8>,
+    body_len: usize,
+}
+
+impl InteractiveFrame {
+    fn read_next(&mut self, fd: libc::c_int) -> std::io::Result<Option<AgentRequest>> {
+        loop {
+            let (buf, received) = if self.header_len < self.header.len() {
+                (&mut self.header[..], &mut self.header_len)
+            } else {
+                (&mut self.body[..], &mut self.body_len)
+            };
+            if *received == buf.len() {
+                if self.header_len < self.header.len() {
+                    unreachable!();
+                }
+                if self.body.is_empty() {
+                    let len = u32::from_be_bytes(self.header) as usize;
+                    if len == 0 || len > MAX_MESSAGE_SIZE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid interactive frame size: {len} bytes"),
+                        ));
+                    }
+                    self.body.resize(len, 0);
+                    continue;
+                }
+                let request = serde_json::from_slice(&self.body)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                *self = Self::default();
+                return Ok(Some(request));
+            }
+            // MSG_DONTWAIT applies only to this read. Setting O_NONBLOCK on a
+            // duplicated socket would also change the concurrent writer's fd.
+            let n = unsafe {
+                libc::recv(
+                    fd,
+                    buf[*received..].as_mut_ptr().cast(),
+                    buf.len() - *received,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n > 0 {
+                *received += n as usize;
+            } else if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "host disconnected during interactive exec",
+                ));
+            } else {
+                let error = std::io::Error::last_os_error();
+                match error.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => return Ok(None),
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+}
+
 fn run_interactive_loop(
     stream: &mut impl ReadWrite,
     child: &mut Child,
@@ -5485,6 +5661,17 @@ fn run_interactive_loop(
     let mut child_stdout = child.stdout.take();
     let mut child_stderr = child.stderr.take();
     let mut child_stdin = child.stdin.take();
+
+    // Never block the I/O loop writing into a child that may itself be
+    // blocked writing stdout. Keep draining both directions while stdin waits.
+    if let Some(ref stdin) = child_stdin {
+        if !set_nonblocking(stdin.as_raw_fd()) {
+            warn!("failed to set stdin to non-blocking mode");
+        }
+    }
+    let mut pending_stdin = Vec::new();
+    let mut stdin_offset = 0;
+    let mut input_frame = InteractiveFrame::default();
 
     // Set non-blocking mode on stdout/stderr
     if let Some(ref stdout) = child_stdout {
@@ -5519,12 +5706,18 @@ fn run_interactive_loop(
         }
 
         // Check timeout
-        if let Some(deadline) = deadline {
+        if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
             if Instant::now() >= deadline {
                 warn!("interactive command timed out, killing process");
                 // The whole tree: in an image container the command is a
                 // grandchild. Also reaps the child, avoiding a zombie.
                 process::kill_child_tree(child);
+                send_response(
+                    stream,
+                    &AgentResponse::Stderr {
+                        data: format!("\ncommand timed out after {}ms", timeout_ms).into_bytes(),
+                    },
+                )?;
                 return Ok(124); // Timeout exit code
             }
         }
@@ -5559,7 +5752,13 @@ fn run_interactive_loop(
             },
             libc::pollfd {
                 fd: stream_fd,
-                events: libc::POLLIN,
+                // Finish writing a pending frame before reading another one.
+                // This keeps guest memory bounded to a single stdin frame.
+                events: if pending_stdin.is_empty() {
+                    libc::POLLIN
+                } else {
+                    0
+                },
                 revents: 0,
             },
             libc::pollfd {
@@ -5567,10 +5766,19 @@ fn run_interactive_loop(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: if pending_stdin.is_empty() {
+                    -1
+                } else {
+                    child_stdin.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1)
+                },
+                events: libc::POLLOUT,
+                revents: 0,
+            },
         ];
 
         // Wait for I/O or timeout using poll()
-        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 4, poll_timeout_ms) };
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 5, poll_timeout_ms) };
 
         if poll_result < 0 {
             let err = std::io::Error::last_os_error();
@@ -5578,6 +5786,17 @@ fn run_interactive_loop(
                 debug!(error = %err, "poll error");
             }
             continue;
+        }
+
+        // POLLHUP/POLLERR are reported even when POLLIN is disabled while a
+        // stdin frame waits for the child pipe. Without this check a client
+        // disconnect can leave a child that never reads stdin running until
+        // its timeout (or forever if there is no timeout).
+        if !pending_stdin.is_empty()
+            && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        {
+            debug!("host disconnected with pending stdin");
+            return Ok(kill_child_on_disconnect(child));
         }
 
         // Read available stdout. If send_response fails (host disconnected),
@@ -5663,44 +5882,65 @@ fn run_interactive_loop(
             child_stderr = None;
         }
 
-        // Read incoming request from host (stdin data, resize) — only when
-        // poll confirms data is available, then use blocking read_exact which
-        // is safe because the data is already in the kernel buffer.
-        //
-        // If the host disconnects (client killed, timeout), read_exact returns
-        // an error. In that case, kill the child and return gracefully — the
-        // agent must survive client disconnections.
-        if poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let mut header = [0u8; 4];
-            if let Err(e) = stream.read_exact(&mut header) {
-                debug!(error = %e, "host disconnected during interactive exec");
-                return Ok(kill_child_on_disconnect(child));
-            }
-            let len = u32::from_be_bytes(header) as usize;
-            if len > MAX_MESSAGE_SIZE {
-                return Err(format!("message too large: {} bytes", len).into());
-            }
-            let mut buf = vec![0u8; len];
-            if let Err(e) = stream.read_exact(&mut buf) {
-                debug!(error = %e, "host disconnected during interactive exec payload");
-                return Ok(kill_child_on_disconnect(child));
-            }
-            let request: AgentRequest = serde_json::from_slice(&buf)?;
-
-            match request {
-                AgentRequest::Stdin { data } => {
-                    if data.is_empty() {
-                        drop(child_stdin.take());
-                    } else if let Some(ref mut stdin) = child_stdin {
-                        let _ = stdin.write_all(&data);
-                        let _ = stdin.flush();
-                    }
+        // Read only bytes currently available; a partial frame must leave the
+        // loop free to drain child output and enforce the command deadline.
+        if pending_stdin.is_empty() && poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let request = match input_frame.read_next(stream_fd) {
+                Ok(request) => request,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    // Keep the existing protocol-error behavior while also
+                    // reaping the workload before returning the error.
+                    process::kill_child_tree(child);
+                    return Err(error.into());
                 }
-                AgentRequest::Resize { cols, rows } => {
+                Err(error) => {
+                    debug!(%error, "host disconnected during interactive exec");
+                    return Ok(kill_child_on_disconnect(child));
+                }
+            };
+            match request {
+                Some(AgentRequest::Stdin { data }) if data.is_empty() => {
+                    drop(child_stdin.take());
+                }
+                Some(AgentRequest::Stdin { data }) if child_stdin.is_some() => {
+                    pending_stdin = data;
+                    stdin_offset = 0;
+                }
+                Some(AgentRequest::Resize { cols, rows }) => {
                     debug!(cols, rows, "resize requested (no PTY in pipe mode)");
                 }
-                _ => {
-                    warn!("unexpected request during interactive session");
+                Some(_) => warn!("unexpected request during interactive session"),
+                None => {}
+            }
+        }
+        // The child may close its stdin while continuing to run. A closed
+        // pipe reports POLLERR even when only POLLOUT was requested; discard
+        // the frame so the next poll can read host disconnects and controls.
+        if !pending_stdin.is_empty()
+            && poll_fds[4].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        {
+            pending_stdin.clear();
+            child_stdin = None;
+        }
+        if !pending_stdin.is_empty() && poll_fds[4].revents & libc::POLLOUT != 0 {
+            if let Some(ref mut stdin) = child_stdin {
+                match stdin.write(&pending_stdin[stdin_offset..]) {
+                    Ok(0) => {
+                        pending_stdin.clear();
+                        child_stdin = None;
+                    }
+                    Ok(n) => {
+                        stdin_offset += n;
+                        if stdin_offset == pending_stdin.len() {
+                            pending_stdin.clear();
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        debug!(error = %e, "child stdin closed");
+                        pending_stdin.clear();
+                        child_stdin = None;
+                    }
                 }
             }
         }
@@ -5759,10 +5999,16 @@ fn run_interactive_loop_pty(
         }
 
         // Check timeout.
-        if let Some(deadline) = deadline {
+        if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
             if Instant::now() >= deadline {
                 warn!("interactive PTY command timed out, killing process");
                 process::kill_child_tree(child);
+                send_response(
+                    stream,
+                    &AgentResponse::Stdout {
+                        data: format!("\ncommand timed out after {}ms", timeout_ms).into_bytes(),
+                    },
+                )?;
                 return Ok(124);
             }
         }
@@ -6779,6 +7025,7 @@ fn handle_run(
 fn handle_streaming_pull<S: Read + Write>(
     stream: &mut S,
     image: &str,
+    cache_as: Option<&str>,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
     proxy: Option<&str>,
@@ -6812,6 +7059,7 @@ fn handle_streaming_pull<S: Read + Write>(
     let response = AgentResponse::from_result(
         storage::pull_image_with_progress_and_auth(
             image,
+            cache_as,
             oci_platform,
             auth,
             proxy,
@@ -6864,6 +7112,48 @@ fn handle_prepare_overlay(image: &str, workload_id: &str) -> AgentResponse {
         storage::prepare_overlay(image, workload_id),
         error_codes::OVERLAY_FAILED,
     )
+}
+
+/// Establish the image-independent keepalive for file I/O. An HTTP file
+/// request must not run `/bin/true` from the image: that path can be a slow
+/// program, have side effects, or not exist at all in a minimal image.
+fn handle_prepare_file_access(image: &str, workload_id: &str) -> AgentResponse {
+    #[cfg(target_os = "linux")]
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        if resolve_main_container(Some(workload_id)).is_some() {
+            return Ok(());
+        }
+        let launch = ResolvedLaunch::resolve(
+            image,
+            vec!["/run/smolvm/init".to_string()], // Resolved only; never executed.
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        )?;
+        let prepared = storage::prepare_for_run_persistent(image, workload_id)?;
+        // Match normal exec: host-injected boot mounts (including the CUDA
+        // ring and workspace volume) must be present even after the previous
+        // keepalive died and file I/O is the first operation to recreate it.
+        let mounts = storage::merged_with_boot_mounts(&[]);
+        storage::setup_mounts(&prepared.rootfs_path, &mounts)?;
+        ensure_main_container(
+            &prepared.rootfs_path,
+            Some(workload_id),
+            &mounts,
+            false,
+            &launch,
+            &[],
+        )?;
+        Ok(())
+    })();
+    #[cfg(not(target_os = "linux"))]
+    let result: Result<(), Box<dyn std::error::Error>> =
+        Err("file access containers require Linux".into());
+    match result {
+        Ok(()) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::OVERLAY_FAILED),
+    }
 }
 
 /// Handle overlay cleanup request.
@@ -6950,7 +7240,7 @@ fn handle_streaming_flatten_layers(
     }
     result?;
     match child.wait() {
-        Ok(status) if status.success() => send_response(
+        Ok(status) if storage::tar_create_succeeded(status) => send_response(
             stream,
             &AgentResponse::DataChunk {
                 data: Vec::new(),
@@ -7425,6 +7715,7 @@ fn handle_vm_exec(
     // Wakes the loop the moment the child exits, rather than at the next tick.
     let exit_signal = process::ExitSignal::open(&child);
 
+    let mut timed_out_ms = None;
     let exit_code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break process::exit_code_from_status(&status),
@@ -7460,6 +7751,7 @@ fn handle_vm_exec(
                         }
                         let _ = child.kill();
                         let _ = child.wait();
+                        timed_out_ms = timeout_ms;
                         break 124; // Standard timeout exit code
                     }
                 }
@@ -7485,7 +7777,7 @@ fn handle_vm_exec(
         .and_then(|h| h.ok())
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
-    let stderr = stderr_handle
+    let mut stderr = stderr_handle
         .and_then(|h| h.ok())
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
@@ -7514,6 +7806,9 @@ fn handle_vm_exec(
             ),
             error_codes::EXEC_FAILED,
         );
+    }
+    if let Some(timeout_ms) = timed_out_ms {
+        stderr.extend_from_slice(format!("\ncommand timed out after {}ms", timeout_ms).as_bytes());
     }
     AgentResponse::Completed {
         exit_code,
@@ -7733,7 +8028,8 @@ mod work_slot_tests {
     fn only_pings_and_shutdown_skip_the_work_slots() {
         assert!(!needs_work_slot(&AgentRequest::Ping));
         assert!(!needs_work_slot(&AgentRequest::Shutdown {
-            progress: false
+            progress: false,
+            stop_timeout_secs: None,
         }));
         assert!(needs_work_slot(&AgentRequest::ListImages));
     }
@@ -8165,12 +8461,12 @@ mod tests {
     #[test]
     fn tsi_resolv_conf_override_wins_over_current() {
         assert_eq!(
-            tsi_resolv_conf(Some("9.9.9.9"), "nameserver 8.8.8.8\n").as_deref(),
+            tsi_resolv_conf(Some("9.9.9.9"), "nameserver 8.8.8.8\n", &[]).as_deref(),
             Some("nameserver 9.9.9.9\n")
         );
         // Surrounding whitespace is trimmed rather than written into resolv.conf.
         assert_eq!(
-            tsi_resolv_conf(Some(" 10.0.0.2 "), "").as_deref(),
+            tsi_resolv_conf(Some(" 10.0.0.2 "), "", &[]).as_deref(),
             Some("nameserver 10.0.0.2\n")
         );
     }
@@ -8180,9 +8476,12 @@ mod tests {
     // half of the same bug.
     #[test]
     fn tsi_resolv_conf_preserves_valid_host_written_file() {
-        assert_eq!(tsi_resolv_conf(None, "nameserver 9.9.9.9\n"), None);
+        assert_eq!(tsi_resolv_conf(None, "nameserver 9.9.9.9\n", &[]), None);
         // A blank override is treated as "no override", so preservation applies.
-        assert_eq!(tsi_resolv_conf(Some("  "), "nameserver 10.0.0.2\n"), None);
+        assert_eq!(
+            tsi_resolv_conf(Some("  "), "nameserver 10.0.0.2\n", &[]),
+            None
+        );
     }
 
     // The host's own resolver now arrives through the same env var as `--dns`
@@ -8195,15 +8494,55 @@ mod tests {
         assert_eq!(
             tsi_resolv_conf(
                 Some("128.112.128.12"),
-                "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+                "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+                &[]
             )
             .as_deref(),
             Some("nameserver 128.112.128.12\n")
         );
         // A private-range host resolver is the common VPN and corporate case.
         assert_eq!(
-            tsi_resolv_conf(Some("192.168.5.2"), "nameserver 127.0.0.1\n").as_deref(),
+            tsi_resolv_conf(Some("192.168.5.2"), "nameserver 127.0.0.1\n", &[]).as_deref(),
             Some("nameserver 192.168.5.2\n")
+        );
+    }
+
+    // `--dns-option` reaches the file on every TSI path: with an override, on a
+    // repair, and on a host-written file that lacks the options (its servers
+    // are kept in order). A file that already matches is left untouched.
+    #[test]
+    fn tsi_resolv_conf_appends_resolver_options_on_every_path() {
+        let options = vec!["timeout:1".to_string(), "use-vc".to_string()];
+        assert_eq!(
+            tsi_resolv_conf(Some("9.9.9.9"), "", &options).as_deref(),
+            Some("nameserver 9.9.9.9\noptions timeout:1 use-vc\n")
+        );
+        assert_eq!(
+            tsi_resolv_conf(None, "", &options).as_deref(),
+            Some("nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 use-vc\n")
+        );
+        assert_eq!(
+            tsi_resolv_conf(None, "nameserver 10.0.0.2\nnameserver 10.0.0.3\n", &options)
+                .as_deref(),
+            Some("nameserver 10.0.0.2\nnameserver 10.0.0.3\noptions timeout:1 use-vc\n")
+        );
+        assert_eq!(
+            tsi_resolv_conf(
+                None,
+                "nameserver 10.0.0.2\noptions timeout:1 use-vc\n",
+                &options
+            ),
+            None
+        );
+        // A host file's search domains survive; only its options are replaced.
+        assert_eq!(
+            tsi_resolv_conf(
+                None,
+                "search corp.example\nnameserver 10.0.0.2\noptions ndots:5\n",
+                &options
+            )
+            .as_deref(),
+            Some("search corp.example\nnameserver 10.0.0.2\noptions timeout:1 use-vc\n")
         );
     }
 
@@ -8213,11 +8552,11 @@ mod tests {
     fn tsi_resolv_conf_repairs_stale_loopback_or_empty() {
         let public = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
         assert_eq!(
-            tsi_resolv_conf(None, "nameserver 127.0.0.1\n").as_deref(),
+            tsi_resolv_conf(None, "nameserver 127.0.0.1\n", &[]).as_deref(),
             Some(public)
         );
-        assert_eq!(tsi_resolv_conf(None, "").as_deref(), Some(public));
-        assert_eq!(tsi_resolv_conf(None, "   \n").as_deref(), Some(public));
+        assert_eq!(tsi_resolv_conf(None, "", &[]).as_deref(), Some(public));
+        assert_eq!(tsi_resolv_conf(None, "   \n", &[]).as_deref(), Some(public));
     }
 
     #[test]
@@ -8235,14 +8574,342 @@ mod tests {
             Some(&stdin_data),
         );
 
-        let AgentResponse::Completed { exit_code, .. } = response else {
+        let AgentResponse::Completed {
+            exit_code, stderr, ..
+        } = response
+        else {
             panic!("expected completed response");
         };
         assert_eq!(exit_code, 124);
+        assert!(String::from_utf8_lossy(&stderr).contains("command timed out after 100ms"));
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "blocked stdin must not prevent timeout handling"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streamed_exec_timeout_survives_partial_stdin_frame() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+            data: b"hello".to_vec(),
+        })
+        .unwrap();
+        // A frame can stall inside its length prefix or its JSON payload.
+        for fragment in [&frame[..1], &frame[..5]] {
+            let (mut agent, mut client) = UnixStream::pair().unwrap();
+            let (finished, done) = std::sync::mpsc::channel();
+            let guest = std::thread::spawn(move || {
+                let (mut child, pty) = spawn_direct_interactive_command(
+                    &["sleep".to_string(), "5".to_string()],
+                    &[],
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert!(pty.is_none());
+                send_response(&mut agent, &AgentResponse::Started).unwrap();
+                let code = run_interactive_loop(&mut agent, &mut child, Some(500)).unwrap();
+                finished.send(code).unwrap();
+            });
+
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut response = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut response).unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<AgentResponse>(&response).unwrap(),
+                AgentResponse::Started
+            ));
+
+            client.write_all(fragment).unwrap();
+            let result = done.recv_timeout(std::time::Duration::from_secs(2));
+            drop(client);
+            guest.join().unwrap();
+            assert_eq!(result.unwrap(), 124);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interactive_vm_exec_timeout_sends_reason_before_exit() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let (mut child, pty) = spawn_direct_interactive_command(
+            &["sh".to_string(), "-c".to_string(), "sleep 5".to_string()],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(pty.is_none());
+        assert_eq!(
+            run_interactive_loop(&mut agent, &mut child, Some(100)).unwrap(),
+            124
+        );
+
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut body).unwrap();
+        let response: AgentResponse = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            response,
+            AgentResponse::Stderr { data }
+                if data == b"\ncommand timed out after 100ms"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn interactive_pty_timeout_writes_reason_to_terminal() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let (mut child, pty) = spawn_direct_interactive_command(
+            &["sh".to_string(), "-c".to_string(), "sleep 5".to_string()],
+            &[],
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100)).unwrap(),
+            124
+        );
+
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut body).unwrap();
+        let response: AgentResponse = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            response,
+            AgentResponse::Stdout { data }
+                if data == b"\ncommand timed out after 100ms"
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streamed_cat_drains_stdout_while_writing_large_stdin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut child, pty) =
+                spawn_direct_interactive_command(&["cat".to_string()], &[], None, false).unwrap();
+            assert!(pty.is_none());
+            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            let code = run_interactive_loop(&mut agent, &mut child, Some(5000)).unwrap();
+            send_response(
+                &mut agent,
+                &AgentResponse::Exited {
+                    exit_code: code,
+                    oom: false,
+                },
+            )
+            .unwrap();
+        });
+
+        let input = vec![b'x'; 512 * 1024];
+        let mut writer = client.try_clone().unwrap();
+        let payload = input.clone();
+        let sender = std::thread::spawn(move || {
+            for chunk in payload.chunks(32 * 1024) {
+                let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                    data: chunk.to_vec(),
+                })
+                .unwrap();
+                if chunk.as_ptr() == payload.as_ptr() {
+                    // Fragments across both the prefix and payload must be
+                    // assembled without losing the command's streamed output.
+                    writer.write_all(&frame[..1]).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    writer.write_all(&frame[1..5]).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    writer.write_all(&frame[5..]).unwrap();
+                } else {
+                    writer.write_all(&frame).unwrap();
+                }
+            }
+            writer
+                .write_all(
+                    &smolvm_protocol::encode_message(&AgentRequest::Stdin { data: Vec::new() })
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+
+        let mut stdout = Vec::new();
+        loop {
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut body).unwrap();
+            match serde_json::from_slice::<AgentResponse>(&body).unwrap() {
+                AgentResponse::Started => {}
+                AgentResponse::Stdout { data } => stdout.extend(data),
+                AgentResponse::Exited { exit_code, .. } => {
+                    assert_eq!(exit_code, 0);
+                    break;
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        assert_eq!(stdout, input);
+        sender.join().unwrap();
+        guest.join().unwrap();
+    }
+
+    // The shipped agent runs in a Linux guest on every host. macOS poll() does
+    // not report this socket hangup with POLLIN disabled, unlike guest Linux.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn streamed_exec_reaps_child_on_disconnect_with_pending_stdin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut child, pty) = spawn_direct_interactive_command(
+                &["sleep".to_string(), "5".to_string()],
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+            assert!(pty.is_none());
+            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            let started = std::time::Instant::now();
+            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            (code, started.elapsed())
+        });
+
+        let mut header = [0; 4];
+        client.read_exact(&mut header).unwrap();
+        let mut response = vec![0; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut response).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<AgentResponse>(&response).unwrap(),
+            AgentResponse::Started
+        ));
+        client
+            .write_all(
+                &smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                    data: vec![b'x'; 512 * 1024],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        drop(client);
+
+        let (code, elapsed) = guest.join().unwrap();
+        assert_eq!(code, 124);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "disconnected host must not leave the guest waiting for its exec timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn streamed_exec_detects_disconnect_after_child_closes_stdin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut child, pty) = spawn_direct_interactive_command(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "exec 0<&-; printf ready; sleep 5".to_string(),
+                ],
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+            assert!(pty.is_none());
+            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            let started = std::time::Instant::now();
+            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            (code, started.elapsed())
+        });
+
+        let mut saw_ready = false;
+        while !saw_ready {
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut response = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut response).unwrap();
+            match serde_json::from_slice::<AgentResponse>(&response).unwrap() {
+                AgentResponse::Started => client
+                    .write_all(
+                        &smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                            data: vec![b'x'; 512 * 1024],
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                AgentResponse::Stdout { data } if data == b"ready" => saw_ready = true,
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        // The host is gone, but the guest can only notice if it resumes
+        // polling the socket after the child has closed its input pipe.
+        drop(client);
+        let (code, elapsed) = guest.join().unwrap();
+        assert_eq!(code, 124);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "closed child stdin must not hide a host disconnect: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vm_exec_exit_124_is_not_reported_as_timeout() {
+        let response = handle_vm_exec(
+            &["sh".to_string(), "-c".to_string(), "exit 124".to_string()],
+            &[],
+            None,
+            Some(5000),
+            None,
+            None,
+        );
+        let AgentResponse::Completed {
+            exit_code, stderr, ..
+        } = response
+        else {
+            panic!("expected completed response");
+        };
+        assert_eq!(exit_code, 124);
+        assert!(stderr.is_empty());
     }
 
     // ========================================================================
