@@ -27,7 +27,10 @@ set -euo pipefail
 # unpacked release, where it sits beside the runtime artifacts one level up
 # from this script, and a source checkout, where cargo leaves it in target/.
 _HERE="$(cd "$(dirname "$0")" && pwd)"
-if [ -x "$_HERE/../containerd-shim-smolvm-v2" ]; then
+if [ -x "$_HERE/../bin/containerd-shim-smolvm-v2" ]; then
+    # 1.15+ releases keep executables in bin/ at the dist root.
+    SHIM_SRC="$_HERE/../bin/containerd-shim-smolvm-v2"
+elif [ -x "$_HERE/../containerd-shim-smolvm-v2" ]; then
     SHIM_SRC="$_HERE/../containerd-shim-smolvm-v2"
 else
     SHIM_SRC="target/release/containerd-shim-smolvm-v2"
@@ -63,6 +66,11 @@ if [ -n "$RUNTIME_SRC" ]; then
             echo "    warning: $a not found in $RUNTIME_SRC — leaving existing" >&2
         fi
     done
+    # 1.15+ dists carry init.krun inside lib/ (it arrives with the lib copy
+    # above); keep the root-of-DATA_DIR location older artifacts used.
+    if [ ! -e "$DATA_DIR/init.krun" ] && [ -e "$DATA_DIR/lib/init.krun" ]; then
+        cp -a "$DATA_DIR/lib/init.krun" "$DATA_DIR/init.krun"
+    fi
 else
     echo "    (no --runtime-dir; keeping existing artifacts)"
 fi
