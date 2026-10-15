@@ -18,7 +18,7 @@ use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{builder::TypedValueParser, Args, Subcommand};
 use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
-use smolvm::data::network::{PortMapping, PortMappingSpec, MAX_PORT_MAPPINGS};
+use smolvm::data::network::{PortMapping, PortMappingSpec, PortProtocol, MAX_PORT_MAPPINGS};
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
@@ -407,6 +407,9 @@ pub enum MachineCmd {
     /// Show machine status
     Status(StatusCmd),
 
+    /// Show the workload's output (stdout and stderr), even while stopped
+    Logs(LogsCmd),
+
     /// Show egress denials — outbound connections the machine's egress policy refused
     EgressEvents(EgressEventsCmd),
 
@@ -482,6 +485,7 @@ impl MachineCmd {
             MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
+            MachineCmd::Logs(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
             MachineCmd::Resize(cmd) => cmd.run(),
@@ -608,6 +612,9 @@ pub struct RunCmd {
     /// image: the agent performs the mount itself. `:staged` runs from a
     /// guest-local copy for metadata-heavy workloads; `machine sync` and
     /// graceful stop copy it back, so do not modify its host source concurrently.
+    /// A container path alone (`-v /var/lib/docker`) is a directory on the
+    /// machine's own disk instead of its overlay root, which nested container
+    /// runtimes need; it persists across stop and start.
     #[arg(
         short = 'v',
         long = "volume",
@@ -622,8 +629,8 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Container")]
     pub allow_system_mounts: bool,
 
-    /// Expose port from container to host (single port or one-to-one range, repeatable)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]", help_heading = "Network")]
+    /// Expose port from container to host (single port or one-to-one range, repeatable; append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]", help_heading = "Network")]
     pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -638,6 +645,14 @@ pub struct RunCmd {
     /// own resolver, so this is only needed when that is not the one to use.
     #[arg(long, value_name = "IP", help_heading = "Network")]
     pub dns: Option<std::net::Ipv4Addr>,
+
+    /// Resolver option for the guest resolv.conf (repeatable, in order), e.g.
+    /// `--dns-option timeout:1 --dns-option use-vc`. Written as one `options`
+    /// line by every guest writer of resolv.conf (see `resolv.conf(5)`).
+    /// glibc honors every accepted option; musl (Alpine) honors only
+    /// `ndots`, `timeout` and `attempts` and ignores the rest.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, help_heading = "Network")]
+    pub dns_option: Vec<String>,
 
     /// IPv4 subnet for the guest link, e.g. 10.200.0.0/30 (implies --net,
     /// virtio-net). The gateway and resolver take the first address, the guest
@@ -682,13 +697,14 @@ pub struct RunCmd {
     pub trust_host_certs: bool,
 
     /// Bind a credential the workload may use without ever seeing it:
-    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// NAME=ENV_VAR@HOST[,HOST...][:body]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
     /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
-    /// requests to the listed hosts. Can be used multiple times; implies --net.
+    /// requests to the listed hosts. Add :body for OAuth form-body tokens.
+    /// Can be used multiple times; implies --net.
     #[arg(
         long = "credential",
-        value_name = "NAME=ENV_VAR@HOST",
+        value_name = "NAME=ENV_VAR@HOST[:body]",
         help_heading = "Network"
     )]
     pub credential: Vec<String>,
@@ -696,6 +712,17 @@ pub struct RunCmd {
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
+
+    /// Block private, internal and link-local destinations (the LAN, cloud
+    /// metadata, CGNAT, the host's loopback) while the public internet stays
+    /// open. Implies --net.
+    #[arg(long, help_heading = "Network")]
+    pub block_private: bool,
+
+    /// Re-open one private range under --block-private, such as an internal
+    /// registry (implies --block-private). Can be used multiple times.
+    #[arg(long = "allow-private", value_name = "CIDR", value_parser = parse_cidr, help_heading = "Network")]
+    pub allow_private: Vec<String>,
 
     /// Let the guest reach services on the HOST's own loopback (127.0.0.1 / ::1);
     /// off by default so a sandbox can't reach host debuggers, Docker, or local
@@ -1164,6 +1191,10 @@ fn ensure_init_layer(
             create.push("--dns".into());
             create.push(dns.to_string());
         }
+        for option in &params.dns_options {
+            create.push("--dns-option".into());
+            create.push(option.clone());
+        }
         if let Some(subnet) = &params.guest_subnet {
             create.push("--guest-subnet".into());
             create.push(subnet.clone());
@@ -1344,6 +1375,7 @@ impl RunCmd {
                 net_backend: self.net_backend,
                 ssh_agent: self.ssh_agent,
                 dns: self.dns,
+                dns_option: self.dns_option.clone(),
                 cpus: self.cpus,
                 mem: self.mem,
                 storage: self.storage,
@@ -1401,7 +1433,7 @@ impl RunCmd {
             self.net || self.allow_host_loopback,
         )?;
 
-        let params = crate::cli::smolfile::build_create_params(
+        let mut params = crate::cli::smolfile::build_create_params(
             vm_name.clone(),
             self.image.clone(),
             None,
@@ -1427,8 +1459,9 @@ impl RunCmd {
             // `machine create` is the path an orchestrator labels.
             Default::default(),
         )?;
-
-        let mut params = params;
+        params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
+        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
+        params.dns_options = self.dns_option.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -1518,6 +1551,7 @@ impl RunCmd {
                     net_backend: params.network_backend,
                     ssh_agent: self.ssh_agent || params.ssh_agent,
                     dns: params.dns,
+                    dns_option: params.dns_options.clone(),
                     cpus: Some(params.cpus),
                     mem: Some(params.mem),
                     storage: params.storage_gb,
@@ -1535,6 +1569,7 @@ impl RunCmd {
                         network_override: None,
                         allowed_cidrs: params.allowed_cidrs.clone(),
                         dns_filter_hosts: params.dns_filter_hosts.clone(),
+                        block_private: params.block_private.clone(),
                     }),
                     secret_refs: params.secret_refs.clone(),
                 }
@@ -1674,6 +1709,7 @@ impl RunCmd {
                 net_backend: params.network_backend,
                 ssh_agent: self.ssh_agent || params.ssh_agent,
                 dns: params.dns,
+                dns_option: params.dns_options.clone(),
                 cpus: Some(params.cpus),
                 mem: Some(params.mem),
                 storage: params.storage_gb,
@@ -1693,6 +1729,7 @@ impl RunCmd {
                     network_override: Some(params.net),
                     allowed_cidrs: params.allowed_cidrs.clone(),
                     dns_filter_hosts: params.dns_filter_hosts.clone(),
+                    block_private: params.block_private.clone(),
                 }),
                 secret_refs: params.secret_refs.clone(),
             }
@@ -1702,10 +1739,19 @@ impl RunCmd {
         // Remote volumes are mounted inside the guest by the agent, so peel them
         // off before the host-directory parse, which would reject an `s3://`
         // source as a missing directory.
+        let (volume_specs, disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&params.volume)?;
         let (host_volume_specs, remote_volumes) =
-            smolvm::remote_volume::split_specs(&params.volume)?;
+            smolvm::remote_volume::split_specs(&volume_specs)?;
         let mut mounts =
             HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?;
+        smolvm::data::storage::ensure_disk_volumes_distinct(
+            &disk_volumes,
+            mounts
+                .iter()
+                .filter_map(|m| m.target.to_str())
+                .chain(remote_volumes.iter().map(|v| v.target.as_str())),
+        )?;
         if !remote_volumes.is_empty() && !params.net {
             return Err(Error::config(
                 "machine run",
@@ -1799,6 +1845,7 @@ impl RunCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
@@ -1815,6 +1862,8 @@ impl RunCmd {
             disk_durability: params.disk_durability,
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
+            disk_volumes: disk_volumes.clone(),
+            block_private: params.block_private.clone(),
         };
         validate_requested_network_backend(
             &resources,
@@ -2148,8 +2197,7 @@ impl RunCmd {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
                     let (mount_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
-                    let port_tuples: Vec<(u16, u16)> =
-                        params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    let port_tuples = params.port.clone();
                     let persist_result = SmolvmConfig::load().and_then(|mut config| {
                         vm_common::persist_named_running(
                             &mut config,
@@ -2313,8 +2361,7 @@ impl RunCmd {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
                     let (mount_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
-                    let port_tuples: Vec<(u16, u16)> =
-                        params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    let port_tuples = params.port.clone();
                     let mut config = SmolvmConfig::load()?;
                     vm_common::persist_named_running(
                         &mut config,
@@ -2778,6 +2825,46 @@ mod tests {
     }
 
     #[test]
+    fn create_takes_repeatable_dns_options_in_order_and_refuses_unknown_ones() {
+        let cli = TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "dns-1",
+            "--dns-option",
+            "timeout:1",
+            "--dns-option",
+            "attempts:3",
+            "--dns-option",
+            "rotate",
+            "--dns-option",
+            "use-vc",
+        ])
+        .unwrap();
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create");
+        };
+        assert_eq!(
+            cmd.dns_option,
+            ["timeout:1", "attempts:3", "rotate", "use-vc"]
+        );
+        for bad in ["bogus", "timeout:0", "rotate:1", "options timeout:1"] {
+            assert!(
+                TestMachineCli::try_parse_from([
+                    "machine",
+                    "create",
+                    "--name",
+                    "dns-2",
+                    "--dns-option",
+                    bad
+                ])
+                .is_err(),
+                "{bad:?} must be refused at the command line"
+            );
+        }
+    }
+
+    #[test]
     fn create_accepts_keep_identity() {
         let cli = TestMachineCli::try_parse_from([
             "machine",
@@ -3142,6 +3229,58 @@ mod tests {
     }
 
     #[test]
+    fn create_and_stop_accept_stop_settings_and_reject_bad_ones() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "worker",
+            "--stop-signal",
+            "SIGINT",
+            "--stop-timeout",
+            "45",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.stop_signal.as_deref(), Some("SIGINT"));
+        assert_eq!(cmd.stop_timeout, Some(45));
+
+        let cli = TestMachineCli::parse_from(["machine", "stop", "--name", "worker", "-t", "0"]);
+        let MachineCmd::Stop(cmd) = cli.command else {
+            panic!("expected machine stop command");
+        };
+        assert_eq!(cmd.timeout, Some(0));
+
+        for bad in [
+            vec![
+                "machine",
+                "create",
+                "--name",
+                "w",
+                "--stop-signal",
+                "SIGNOPE",
+            ],
+            vec!["machine", "create", "--name", "w", "--stop-timeout", "301"],
+            vec!["machine", "stop", "--name", "w", "--timeout", "soon"],
+        ] {
+            assert!(TestMachineCli::try_parse_from(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn logs_accepts_follow_and_tail() {
+        let cli = TestMachineCli::parse_from([
+            "machine", "logs", "--name", "worker", "-f", "--tail", "20",
+        ]);
+        let MachineCmd::Logs(cmd) = cli.command else {
+            panic!("expected machine logs command");
+        };
+        assert!(cmd.follow);
+        assert_eq!(cmd.tail, Some(20));
+    }
+
+    #[test]
     fn create_accepts_auto_graph_flag() {
         let cli =
             TestMachineCli::parse_from(["machine", "create", "--name", "golden", "--auto-graph"]);
@@ -3174,6 +3313,34 @@ mod tests {
         let parsed = parse_attached_disks(&cmd.disk)
             .expect_err("validation runs at create, so absent paths are refused up front");
         assert!(format!("{parsed}").contains("/dev/nvme1n1"));
+    }
+
+    #[test]
+    fn update_changes_ports_alone_on_a_running_machine() {
+        use smolvm::config::VmRecord;
+
+        let parse_update = |argv: &[&str]| {
+            let cli = TestMachineCli::parse_from(argv);
+            let MachineCmd::Update(cmd) = cli.command else {
+                panic!("expected machine update command");
+            };
+            cmd
+        };
+        let base = ["machine", "update", "--name", "p"];
+        let with = |extra: &[&'static str]| parse_update(&[&base[..], extra].concat());
+
+        assert!(with(&["-p", "3000:3000"]).changes_only_ports());
+        assert!(with(&["--remove-port", "3000:3000"]).changes_only_ports());
+        assert!(!with(&["-p", "3000:3000", "--cpus", "2"]).changes_only_ports());
+        assert!(!with(&["-p", "3000:3000", "--allow-host", "pypi.org"]).changes_only_ports());
+        assert!(!with(&["-p", "3000:3000", "--allow-host", "pypi.org"]).changes_only_egress());
+
+        let record = VmRecord::new("p".to_string(), 1, 512, vec![], vec![(3000, 3000)], true);
+        let next = with(&["-p", "8080:80", "--remove-port", "3000:3000"])
+            .next_ports(&record)
+            .unwrap();
+        assert_eq!(next, vec![PortMapping::new(8080, 80)]);
+        assert!(with(&["-p", "3000:4000"]).next_ports(&record).is_err());
     }
 
     #[test]
@@ -3949,6 +4116,9 @@ pub struct CreateCmd {
     /// image: the agent performs the mount itself. `:staged` runs from a
     /// guest-local copy for metadata-heavy workloads; `machine sync` and
     /// graceful stop copy it back, so do not modify its host source concurrently.
+    /// A container path alone (`-v /var/lib/docker`) is a directory on the
+    /// machine's own disk instead of its overlay root, which nested container
+    /// runtimes need; it persists across stop and start.
     #[arg(
         short = 'v',
         long = "volume",
@@ -3962,8 +4132,8 @@ pub struct CreateCmd {
     #[arg(long)]
     pub allow_system_mounts: bool,
 
-    /// Expose port from VM to host (single port or one-to-one range, repeatable)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    /// Expose port from VM to host (single port or one-to-one range, repeatable; append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]")]
     pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -3978,6 +4148,14 @@ pub struct CreateCmd {
     /// own resolver, so this is only needed when that is not the one to use.
     #[arg(long, value_name = "IP")]
     pub dns: Option<std::net::Ipv4Addr>,
+
+    /// Resolver option for the guest resolv.conf (repeatable, in order), e.g.
+    /// `--dns-option timeout:1 --dns-option use-vc`. Written as one `options`
+    /// line by every guest writer of resolv.conf (see `resolv.conf(5)`).
+    /// glibc honors every accepted option; musl (Alpine) honors only
+    /// `ndots`, `timeout` and `attempts` and ignores the rest.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option)]
+    pub dns_option: Vec<String>,
 
     /// IPv4 subnet for the guest link, e.g. 10.200.0.0/30 (implies --net,
     /// virtio-net). The gateway and resolver take the first address, the guest
@@ -4018,16 +4196,28 @@ pub struct CreateCmd {
     pub trust_host_certs: bool,
 
     /// Bind a credential the workload may use without ever seeing it:
-    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// NAME=ENV_VAR@HOST[,HOST...][:body]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
     /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
-    /// requests to the listed hosts. Can be used multiple times; implies --net.
-    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST")]
+    /// requests to the listed hosts. Add :body for OAuth form-body tokens.
+    /// Can be used multiple times; implies --net.
+    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST[:body]")]
     pub credential: Vec<String>,
 
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long)]
     pub outbound_localhost_only: bool,
+
+    /// Block private, internal and link-local destinations (the LAN, cloud
+    /// metadata, CGNAT, the host's loopback) while the public internet stays
+    /// open. Implies --net.
+    #[arg(long)]
+    pub block_private: bool,
+
+    /// Re-open one private range under --block-private, such as an internal
+    /// registry (implies --block-private). Can be used multiple times.
+    #[arg(long = "allow-private", value_name = "CIDR", value_parser = parse_cidr)]
+    pub allow_private: Vec<String>,
 
     /// Enable GPU acceleration (Vulkan via virtio-gpu)
     #[arg(long)]
@@ -4091,6 +4281,16 @@ pub struct CreateCmd {
     #[arg(long)]
     pub stop_on_exit: bool,
 
+    /// Signal sent to the workload when the machine stops, so it can save its
+    /// state and exit (e.g. SIGINT, SIGRTMIN+3; default SIGTERM)
+    #[arg(long, value_name = "SIGNAL", value_parser = parse_stop_signal_arg)]
+    pub stop_signal: Option<String>,
+
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed (default 10, at most 300)
+    #[arg(long, value_name = "SECONDS", value_parser = parse_stop_timeout_arg)]
+    pub stop_timeout: Option<u64>,
+
     /// Remote guest CUDA Driver-API calls to the host NVIDIA GPU over vsock
     #[arg(long)]
     pub cuda: bool,
@@ -4149,6 +4349,19 @@ pub struct CreateCmd {
 /// recorded against an unreadable device would otherwise fail every start with
 /// a virtio-blk error that names neither the disk nor the reason.
 /// Clap value parser for `--guest-subnet`: validate, and store the canonical form.
+fn parse_stop_signal_arg(value: &str) -> Result<String, String> {
+    smolvm::workload::validate_stop_settings(Some(value), None)?;
+    Ok(value.to_string())
+}
+
+fn parse_stop_timeout_arg(value: &str) -> Result<u64, String> {
+    let secs = value
+        .parse::<u64>()
+        .map_err(|_| format!("'{value}' is not a whole number of seconds"))?;
+    smolvm::workload::validate_stop_settings(None, Some(secs))?;
+    Ok(secs)
+}
+
 fn parse_guest_subnet(value: &str) -> Result<String, String> {
     value
         .parse::<smolvm_network::GuestSubnet>()
@@ -4256,7 +4469,7 @@ impl CreateCmd {
             .name
             .unwrap_or_else(smolvm::util::generate_machine_name);
 
-        let params = crate::cli::smolfile::build_create_params(
+        let mut params = crate::cli::smolfile::build_create_params(
             name,
             self.image,
             None,         // entrypoint: from Smolfile only
@@ -4280,7 +4493,9 @@ impl CreateCmd {
             cli_allow_cidrs,
             smolvm::util::parse_labels(&self.labels)?,
         )?;
-        let mut params = params;
+        params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
+        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
+        params.dns_options = self.dns_option.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -4336,6 +4551,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             gpu: params.gpu,
@@ -4351,6 +4567,8 @@ impl CreateCmd {
             disk_durability: params.disk_durability,
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: params.block_private.clone(),
         };
         // Reject zero-valued resources before the machine is persisted.
         // Without this, `machine create` succeeds and the failure only
@@ -4366,6 +4584,12 @@ impl CreateCmd {
         }
         if self.stop_on_exit {
             params.stop_on_exit = true;
+        }
+        if self.stop_signal.is_some() {
+            params.stop_signal = self.stop_signal.clone();
+        }
+        if self.stop_timeout.is_some() {
+            params.stop_timeout_secs = self.stop_timeout;
         }
         if self.cuda {
             params.cuda = true;
@@ -4593,6 +4817,19 @@ impl CreateCmd {
             )?;
         }
 
+        // A checkpoint captured with --host-mounts re-attaches the same host
+        // directories; --volume is already refused as a topology override.
+        let volumes = match checkpoint.as_ref() {
+            Some(checkpoint) if !checkpoint.host_mounts.is_empty() => {
+                smolvm::portable_checkpoint::restored_host_mounts(checkpoint)?
+                    .into_iter()
+                    .map(|(host, guest, read_only)| {
+                        format!("{host}:{guest}:{}", if read_only { "ro" } else { "rw" })
+                    })
+                    .collect()
+            }
+            _ => self.volume.clone(),
+        };
         let ports = if checkpoint.is_some() && self.port.is_empty() {
             checkpoint_network
                 .into_iter()
@@ -4681,12 +4918,13 @@ impl CreateCmd {
             },
             cpus,
             mem,
-            volume: self.volume.clone(),
+            volume: volumes,
             allow_system_mounts: self.allow_system_mounts,
             port: ports,
             net: network,
             network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
+            dns_options: self.dns_option.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: checkpoint_subnet.or_else(|| self.guest_subnet.clone()),
             init: self.init.clone(),
@@ -4714,6 +4952,7 @@ impl CreateCmd {
             block_io: self.block_io.unwrap_or_default(),
             disk_durability: self.disk_durability.unwrap_or_default(),
             allowed_cidrs,
+            block_private: None,
             restart_policy: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.workload.as_ref())
@@ -4742,6 +4981,8 @@ impl CreateCmd {
             // fork/checkpoint source without a topology-changing restart.
             forkable: checkpoint.is_some(),
             stop_on_exit: self.stop_on_exit,
+            stop_signal: self.stop_signal.clone(),
+            stop_timeout_secs: self.stop_timeout,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
@@ -4769,6 +5010,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             gpu: params.gpu,
@@ -4782,6 +5024,8 @@ impl CreateCmd {
             disk_durability: params.disk_durability,
             disks: params.disks.clone(),
             cache_disk: params.cache_disk.clone(),
+            disk_volumes: Vec::new(),
+            block_private: params.block_private.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
             egress_rules: Vec::new(),
         };
@@ -5206,6 +5450,11 @@ pub struct ForkCmd {
     #[arg(long)]
     pub share_weights: bool,
 
+    /// Label the child (repeatable, KEY=VALUE). A child inherits the source's
+    /// labels; a key given here replaces the inherited value.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
     /// Per-branch parameter (repeatable, KEY=VALUE). Reaches the child through
     /// `smolvm-branch-ready`: the program it runs (`-- prog`) gets it in its
     /// environment, a shell gets it from `eval "$(smolvm-branch-ready)"`, and
@@ -5256,14 +5505,29 @@ impl ForkCmd {
             self.egress_interceptor,
             self.egress_interceptor_token.as_ref(),
         )?;
-        let ports: Vec<(u16, u16)> = PortMappingSpec::expand_all(&self.port)
-            .map_err(|e| smolvm::Error::config("branch ports", e))?
-            .into_iter()
-            .map(|port| port.to_tuple())
-            .collect();
+        let ports = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("branch ports", e))?;
+        // A branch gets fresh host ports for the source's UDP forwards on its
+        // own; pins name TCP ports.
+        if let Some(udp) = ports
+            .iter()
+            .find(|port| port.protocol == smolvm::data::network::PortProtocol::Udp)
+        {
+            return Err(smolvm::Error::config(
+                "branch ports",
+                format!(
+                    "{} cannot be pinned: a branch pins TCP ports, and gets fresh host ports for UDP forwards automatically",
+                    udp.label()
+                ),
+            ));
+        }
+        let ports: Vec<(u16, u16)> = ports.into_iter().map(|port| port.to_tuple()).collect();
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
+        let labels: Vec<(String, String)> = smolvm::util::parse_labels(&self.labels)?
+            .into_iter()
+            .collect();
         let count = self.count.get();
         let wait_ready = forkpoint_timeout(
             is_plain_branch(count, self.name_prefix.is_some(), self.hold),
@@ -5314,6 +5578,7 @@ impl ForkCmd {
                     hold: self.hold,
                     freeze_source: self.freeze_source,
                     external_interceptor,
+                    labels: &labels,
                 },
             );
         }
@@ -5387,6 +5652,7 @@ impl ForkCmd {
                 freeze_source: self.freeze_source,
                 worker_ready,
                 external_interceptor,
+                labels: &labels,
             },
         )
     }
@@ -5528,6 +5794,11 @@ pub struct StopCmd {
     /// Machine to stop (default: "default")
     #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
+
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed, instead of the machine's stop timeout (0 kills it at once)
+    #[arg(short = 't', long, value_name = "SECONDS", value_parser = parse_stop_timeout_arg)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -5561,9 +5832,10 @@ impl ResumeCmd {
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = vm_common::resolve_vm_name(self.name)?;
+        let timeout = self.timeout.map(std::time::Duration::from_secs);
         match &name {
-            Some(name) => vm_common::stop_vm_named(name),
-            None => vm_common::stop_vm_default(),
+            Some(name) => vm_common::stop_vm_named_with_timeout(name, timeout),
+            None => vm_common::stop_vm_default(timeout),
         }
     }
 }
@@ -5636,6 +5908,62 @@ impl StatusCmd {
             return vm_common::status_vm_json(&self.name);
         }
         vm_common::status_vm(&self.name)
+    }
+}
+
+// ============================================================================
+// Logs Command
+// ============================================================================
+
+/// Show a machine's workload output.
+///
+/// A machine's workload (its image ENTRYPOINT/CMD or Smolfile command) writes
+/// stdout and stderr to `workload.log` in the machine's data directory. The
+/// log is kept across restarts, rotated by size, and readable while the
+/// machine is stopped.
+#[derive(Args, Debug)]
+pub struct LogsCmd {
+    /// Machine whose workload output to show (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Keep printing output as the workload writes it
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+
+    /// Show only the last N lines
+    #[arg(long, value_name = "N")]
+    pub tail: Option<usize>,
+}
+
+impl LogsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        use std::io::Write;
+        let name = vm_common::resolve_vm_name(self.name)?.unwrap_or_else(|| "default".into());
+        if smolvm::db::SmolvmDb::open()?.get_vm(&name)?.is_none() {
+            return Err(smolvm::Error::vm_not_found(&name));
+        }
+        let log = smolvm::workload_log::workload_log_path(&smolvm::agent::vm_data_dir(&name));
+        let read_err = |e: std::io::Error| smolvm::Error::agent("read workload log", e.to_string());
+        let shown = match self.tail {
+            Some(lines) => smolvm::workload_log::tail(&log, lines).map_err(read_err)?,
+            None => smolvm::workload_log::read_all(&log).map_err(read_err)?,
+        };
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&shown).map_err(read_err)?;
+        stdout.flush().map_err(read_err)?;
+        if self.follow {
+            let offset = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+            smolvm::workload_log::follow(
+                &log,
+                offset,
+                &mut stdout,
+                std::time::Duration::from_millis(200),
+                || false,
+            )
+            .map_err(read_err)?;
+        }
+        Ok(())
     }
 }
 
@@ -5812,7 +6140,8 @@ pub struct UpdateCmd {
     pub name: String,
 
     /// Add volume mount. A staged mount is guest-local until sync or graceful stop;
-    /// do not modify its host source concurrently.
+    /// do not modify its host source concurrently. A guest path alone adds a
+    /// directory on the machine's own disk.
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     pub volume: Vec<String>,
 
@@ -5825,8 +6154,8 @@ pub struct UpdateCmd {
     #[arg(long, value_name = "HOST:GUEST")]
     pub remove_volume: Vec<String>,
 
-    /// Add port mapping or one-to-one range
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    /// Add port mapping or one-to-one range (append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]")]
     pub port: Vec<PortMappingSpec>,
 
     /// Remove port mapping or one-to-one range
@@ -5889,6 +6218,16 @@ pub struct UpdateCmd {
     #[arg(long = "remove-allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub remove_allow_cidr: Vec<String>,
 
+    /// Start from an empty allow list before applying this update's
+    /// --allow-host, --allow-host-pattern and --allow-cidr entries, so the
+    /// machine ends up with exactly those and nothing it allowed before. With
+    /// --net and no entries the machine may reach every host.
+    #[arg(
+        long = "reset-allow-list",
+        conflicts_with_all = ["remove_allow_host", "remove_allow_cidr"]
+    )]
+    pub reset_allow_list: bool,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -5947,12 +6286,23 @@ impl UpdateCmd {
             remove_allow_cidrs: self.remove_allow_cidr.clone(),
             outbound_localhost_only: self.outbound_localhost_only,
             allow_all: self.net,
+            reset_allow_list: self.reset_allow_list,
         })
     }
 
-    /// Whether this update changes the allow list and nothing else, the one
-    /// change a running machine takes.
+    /// Whether this update changes the allow list and nothing else, one of the
+    /// changes a running machine takes.
     fn changes_only_egress(&self) -> bool {
+        let (egress, ports, other) = self.changed_settings();
+        egress && !ports && !other
+    }
+
+    fn changes_only_ports(&self) -> bool {
+        let (egress, ports, other) = self.changed_settings();
+        ports && !egress && !other
+    }
+
+    fn changed_settings(&self) -> (bool, bool, bool) {
         let Self {
             name: _,
             volume,
@@ -5971,6 +6321,7 @@ impl UpdateCmd {
             outbound_localhost_only,
             remove_allow_host,
             remove_allow_cidr,
+            reset_allow_list,
             env,
             remove_env,
             workdir,
@@ -5988,11 +6339,11 @@ impl UpdateCmd {
             || !allow_host_pattern.is_empty()
             || !allow_cidr.is_empty()
             || !remove_allow_host.is_empty()
-            || !remove_allow_cidr.is_empty();
+            || !remove_allow_cidr.is_empty()
+            || *reset_allow_list;
+        let ports = !port.is_empty() || !remove_port.is_empty();
         let other = !volume.is_empty()
             || !remove_volume.is_empty()
-            || !port.is_empty()
-            || !remove_port.is_empty()
             || cpus.is_some()
             || mem.is_some()
             || *no_net
@@ -6007,7 +6358,88 @@ impl UpdateCmd {
             || storage.is_some()
             || overlay.is_some()
             || block_io.is_some();
-        egress && !other
+        (egress, ports, other)
+    }
+
+    fn next_ports(&self, record: &smolvm::config::VmRecord) -> smolvm::Result<Vec<PortMapping>> {
+        let add_ports = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("update ports", e))?;
+        let remove_ports = PortMappingSpec::expand_all(&self.remove_port)
+            .map_err(|e| smolvm::Error::config("update remove ports", e))?;
+        let mut final_ports: Vec<PortMapping> = record
+            .port_mappings()
+            .into_iter()
+            .filter(|existing| !remove_ports.contains(existing))
+            .collect();
+        for p in &add_ports {
+            if !final_ports.contains(p) {
+                final_ports.push(*p);
+            }
+        }
+        if final_ports.len() > MAX_PORT_MAPPINGS {
+            return Err(smolvm::Error::config(
+                "update",
+                format!(
+                    "port mappings expand to {} entries; the maximum per machine is {MAX_PORT_MAPPINGS}",
+                    final_ports.len()
+                ),
+            ));
+        }
+        PortMapping::check_duplicates(&final_ports)
+            .map_err(|e| smolvm::Error::config("update", e))?;
+        Ok(final_ports)
+    }
+
+    fn update_running_ports(
+        &self,
+        db: &smolvm::db::SmolvmDb,
+        record: &smolvm::config::VmRecord,
+    ) -> smolvm::Result<()> {
+        record.check_live_ports()?;
+        let all = self.next_ports(record)?;
+        // A UDP port is bound for the runtime's life; only TCP ones change live.
+        let udp = |ports: &[PortMapping]| {
+            let mut udp: Vec<PortMapping> = ports
+                .iter()
+                .filter(|p| p.protocol == PortProtocol::Udp)
+                .copied()
+                .collect();
+            udp.sort_by_key(|p| (p.host, p.guest));
+            udp
+        };
+        if udp(&all) != udp(&record.port_mappings()) {
+            return Err(smolvm::Error::config(
+                "update",
+                "published UDP ports cannot change on a running machine; stop it first",
+            ));
+        }
+        let next: Vec<(u16, u16)> = all
+            .iter()
+            .filter(|p| p.protocol == PortProtocol::Tcp)
+            .map(PortMapping::to_tuple)
+            .collect();
+        smolvm::agent::apply_live_published_ports(&self.name, &next)?;
+        let saved = db.update_vm(&self.name, |r| r.ports = next.clone());
+        if !matches!(saved, Ok(Some(_))) {
+            let _ = smolvm::agent::apply_live_published_ports(&self.name, &record.ports);
+            saved?;
+            return Err(smolvm::Error::config(
+                "update",
+                format!("machine '{}' disappeared during update", self.name),
+            ));
+        }
+        println!("Updated machine '{}' (running; applies now):", self.name);
+        for &(host, guest) in &record.ports {
+            if !next.contains(&(host, guest)) {
+                println!("  removed port: {host}:{guest}");
+            }
+        }
+        for &(host, guest) in &next {
+            if !record.ports.contains(&(host, guest)) {
+                println!("  added port: {host}:{guest}");
+            }
+        }
+        Ok(())
     }
 
     /// Change a running machine's allow list: the record, and the policy its
@@ -6065,6 +6497,9 @@ impl UpdateCmd {
         if state == RecordState::Running && self.changes_only_egress() {
             return self.update_running_egress(&db, &record);
         }
+        if state == RecordState::Running && self.changes_only_ports() {
+            return self.update_running_ports(&db, &record);
+        }
 
         // Must be stopped (same check as resize)
         match state {
@@ -6107,41 +6542,16 @@ impl UpdateCmd {
 
         // Parse and validate new mounts (after state check so
         // "machine is running" takes priority over "directory not found")
+        let (volume_specs, new_disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&self.volume)?;
         let new_mounts =
-            HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
+            HostMount::parse_with_system_mounts(&volume_specs, self.allow_system_mounts)?;
         let add_ports = PortMappingSpec::expand_all(&self.port)
             .map_err(|e| smolvm::Error::config("update ports", e))?;
         let remove_ports = PortMappingSpec::expand_all(&self.remove_port)
             .map_err(|e| smolvm::Error::config("update remove ports", e))?;
 
-        // Validate no duplicate host ports after proposed changes
-        {
-            let mut final_ports: Vec<PortMapping> = record
-                .ports
-                .iter()
-                .filter(|&&(h, g)| !remove_ports.iter().any(|rm| rm.host == h && rm.guest == g))
-                .map(|&(h, g)| PortMapping::new(h, g))
-                .collect();
-            for p in &add_ports {
-                if !final_ports
-                    .iter()
-                    .any(|existing| existing.host == p.host && existing.guest == p.guest)
-                {
-                    final_ports.push(*p);
-                }
-            }
-            if final_ports.len() > MAX_PORT_MAPPINGS {
-                return Err(smolvm::Error::config(
-                    "update",
-                    format!(
-                        "port mappings expand to {} entries; the maximum per machine is {MAX_PORT_MAPPINGS}",
-                        final_ports.len()
-                    ),
-                ));
-            }
-            PortMapping::check_duplicates(&final_ports)
-                .map_err(|e| smolvm::Error::config("update", e))?;
-        }
+        self.next_ports(&record)?;
 
         // Compute the complete mount set in its rich form so changing a stopped
         // machine cannot lose the staged/live distinction or mount order.
@@ -6176,6 +6586,26 @@ impl UpdateCmd {
         HostMount::ensure_unique_targets(&final_mounts)?;
         let (final_live_mounts, final_staged_mounts) =
             HostMount::split_storage_tuples(&final_mounts);
+
+        // Disk volumes are removed by their guest path alone. Their data stays
+        // on the machine's disk, so adding the path back restores it.
+        let (_, removed_disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&self.remove_volume)?;
+        let mut final_disk_volumes: Vec<String> = record
+            .disk_volumes
+            .iter()
+            .filter(|target| !removed_disk_volumes.contains(target))
+            .cloned()
+            .collect();
+        for target in &new_disk_volumes {
+            if !final_disk_volumes.contains(target) {
+                final_disk_volumes.push(target.clone());
+            }
+        }
+        smolvm::data::storage::ensure_disk_volumes_distinct(
+            &final_disk_volumes,
+            final_mounts.iter().filter_map(|m| m.target.to_str()),
+        )?;
 
         // Expand physical disk files before the DB write. If expansion fails,
         // no DB changes are made — the record stays consistent.
@@ -6217,22 +6647,29 @@ impl UpdateCmd {
                 r.mounts = final_live_mounts.clone();
                 r.staged_mounts = final_staged_mounts.clone();
             }
+            if r.disk_volumes != final_disk_volumes {
+                for target in &new_disk_volumes {
+                    changes.push(format!("  added disk volume: {target}"));
+                }
+                r.disk_volumes = final_disk_volumes.clone();
+            }
 
             // Ports: add new, remove specified
+            let mut ports = r.port_mappings();
             for rm in &remove_ports {
-                let before = r.ports.len();
-                r.ports.retain(|&(h, g)| h != rm.host || g != rm.guest);
-                if r.ports.len() < before {
-                    changes.push(format!("  removed port: {}:{}", rm.host, rm.guest));
+                let before = ports.len();
+                ports.retain(|existing| existing != rm);
+                if ports.len() < before {
+                    changes.push(format!("  removed port: {}", rm.label()));
                 }
             }
             for p in &add_ports {
-                let tuple = p.to_tuple();
-                if !r.ports.contains(&tuple) {
-                    changes.push(format!("  added port: {}:{}", tuple.0, tuple.1));
-                    r.ports.push(tuple);
+                if !ports.contains(p) {
+                    changes.push(format!("  added port: {}", p.label()));
+                    ports.push(*p);
                 }
             }
+            r.set_port_mappings(&ports);
 
             // Resources
             if let Some(cpus) = self.cpus {
@@ -6278,7 +6715,7 @@ impl UpdateCmd {
                 // virtio-net without networking or published ports is rejected
                 // at launch, so a machine that keeps the backend could never
                 // start again. Published ports still need it.
-                if r.ports.is_empty() && r.network_backend.is_some() {
+                if r.ports.is_empty() && r.udp_ports.is_empty() && r.network_backend.is_some() {
                     changes.push("  cleared network backend".to_string());
                     r.network_backend = None;
                 }
@@ -6848,6 +7285,9 @@ impl SyncCmd {
             println!("Machine '{name}' has no staged mounts");
             return Ok(());
         }
+        if let Some(error) = smolvm::staged_mount::refuse_detached_sync(&record, &name) {
+            return Err(error);
+        }
 
         let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
         let (manager, mut client) = vm_common::ensure_running_and_connect(&Some(name.clone()))?;
@@ -7224,4 +7664,10 @@ impl MonitorCmd {
         );
         Ok(())
     }
+}
+
+/// clap value parser for `--dns-option`: the same validation the guest agent
+/// applies, so an option the agent would drop is refused at the command line.
+pub(crate) fn parse_dns_option(value: &str) -> Result<String, String> {
+    smolvm_protocol::resolv::validate_option(value).map(|()| value.to_string())
 }

@@ -112,11 +112,24 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
     } else if current_size > size_bytes {
         // A request below the template's size is a promise about an upper
         // bound (a quota, a dense host), so it is honored rather than rounded
-        // up. Shrinking has to happen here, before the first boot: the guest
-        // grows the filesystem to its block device at every boot, so a file
-        // left at the template size would simply grow back. It is a one-time
-        // cost on this machine's first start, about half a second.
-        shrink_ext4_image::<D>(disk_path, size_bytes)?;
+        // up. The disk has to be cut down here, before the first boot: the
+        // guest grows the filesystem to its block device at every boot, so a
+        // file left at the template size would simply grow back.
+        //
+        // The shipped template is a small filesystem at the front of a large
+        // sparse file, so the filesystem usually fits already and cutting the
+        // file is enough; the guest grows it to the disk. Only a filesystem
+        // that really is larger than the request needs resize2fs.
+        let fits = ext4_filesystem_bytes(disk_path).is_some_and(|fs| fs <= size_bytes);
+        if fits {
+            OpenOptions::new()
+                .write(true)
+                .open(disk_path)
+                .and_then(|file| file.set_len(size_bytes))
+                .map_err(|e| Error::storage("truncate disk", e.to_string()))?;
+        } else {
+            shrink_ext4_image::<D>(disk_path, size_bytes)?;
+        }
     }
 
     tracing::info!(
@@ -126,6 +139,34 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
         D::NAME
     );
     Ok(())
+}
+
+/// Size in bytes of the ext4 filesystem at the start of `disk_path`, read from
+/// its superblock, or `None` when there is no ext4 filesystem there.
+pub(crate) fn ext4_filesystem_bytes(disk_path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    const SUPERBLOCK_OFFSET: u64 = 1024;
+    const EXT4_MAGIC: u16 = 0xEF53;
+    const INCOMPAT_64BIT: u32 = 0x80;
+    let mut sb = [0u8; 1024];
+    let mut file = std::fs::File::open(disk_path).ok()?;
+    file.seek(SeekFrom::Start(SUPERBLOCK_OFFSET)).ok()?;
+    file.read_exact(&mut sb).ok()?;
+    let u16_at = |o: usize| u16::from_le_bytes([sb[o], sb[o + 1]]);
+    let u32_at = |o: usize| u32::from_le_bytes(sb[o..o + 4].try_into().expect("4 bytes"));
+    if u16_at(0x38) != EXT4_MAGIC {
+        return None;
+    }
+    let log_block_size = u32_at(0x18);
+    if log_block_size > 6 {
+        return None;
+    }
+    let block_size = 1024u64 << log_block_size;
+    let mut blocks = u64::from(u32_at(0x04));
+    if u32_at(0x60) & INCOMPAT_64BIT != 0 {
+        blocks |= u64::from(u32_at(0x150)) << 32;
+    }
+    blocks.checked_mul(block_size)
 }
 
 /// Shrink the ext4 filesystem in `disk_path` to `size_bytes` and truncate
@@ -501,7 +542,7 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
             // Safety: both descriptors are live regular files owned by this
             // scope; FICLONE reads the source fd and clones into destination.
             let result =
-                unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+                unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
             if result != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -979,6 +1020,61 @@ mod tests {
             err.contains("cannot hold") || err.contains("resize2fs failed"),
             "{err}"
         );
+    }
+
+    /// The shipped template is a small filesystem in a large sparse file. A
+    /// smaller disk only needs the file cut down, since the filesystem already
+    /// fits; resize2fs is not run (it would have grown the filesystem to the
+    /// disk), so hosts without e2fsprogs can create small disks.
+    #[test]
+    fn a_smaller_disk_from_a_small_filesystem_template_needs_no_resize() {
+        let Some(mkfs) = find_e2fsprogs_tool("mkfs.ext4") else {
+            eprintln!("skipping: mkfs.ext4 not found");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template.ext4");
+        let fs_bytes: u64 = 8 * 1024 * 1024;
+        std::fs::File::create(&template)
+            .unwrap()
+            .set_len(fs_bytes)
+            .unwrap();
+        let status = std::process::Command::new(mkfs)
+            .args(["-q", "-F", "-b", "4096"])
+            .arg(&template)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(ext4_filesystem_bytes(&template), Some(fs_bytes));
+        // Like the shipped template: the file is far larger than its filesystem.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&template)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+
+        let disk = temp.path().join("storage.raw");
+        let want = 32 * 1024 * 1024;
+        copy_disk_from_template::<crate::storage::Storage>(&disk, want, &template).unwrap();
+        assert_eq!(std::fs::metadata(&disk).unwrap().len(), want);
+        assert_eq!(
+            ext4_filesystem_bytes(&disk),
+            Some(fs_bytes),
+            "the filesystem is left for the guest to grow"
+        );
+    }
+
+    #[test]
+    fn ext4_size_is_none_for_a_disk_without_ext4() {
+        let temp = tempfile::tempdir().unwrap();
+        let blank = temp.path().join("blank.raw");
+        std::fs::File::create(&blank)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        assert_eq!(ext4_filesystem_bytes(&blank), None);
+        assert_eq!(ext4_filesystem_bytes(&temp.path().join("missing")), None);
     }
 
     /// A qcow2 disk grows by its header's virtual size; its file (and so every

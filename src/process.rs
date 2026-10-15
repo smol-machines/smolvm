@@ -1989,7 +1989,7 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
 #[cfg(target_os = "linux")]
 pub fn setup_private_idmap_mounts(
     pack: Option<(&std::path::Path, &std::path::Path)>,
-    seed_dir: Option<&std::path::Path>,
+    seed_dirs: &[std::path::PathBuf],
     uid: u32,
     gid: u32,
 ) -> std::io::Result<()> {
@@ -2026,7 +2026,7 @@ pub fn setup_private_idmap_mounts(
         if let Some((shared, target)) = pack {
             mount_idmapped(shared, target, userns_fd, true)?;
         }
-        if let Some(seed_dir) = seed_dir {
+        for seed_dir in seed_dirs {
             mount_idmapped(seed_dir, seed_dir, userns_fd, true)?;
         }
         Ok(())
@@ -2044,7 +2044,7 @@ pub fn setup_pack_idmap_mount(
     uid: u32,
     gid: u32,
 ) -> std::io::Result<()> {
-    setup_private_idmap_mounts(Some((shared, target)), None, uid, gid)
+    setup_private_idmap_mounts(Some((shared, target)), &[], uid, gid)
 }
 
 #[cfg(target_os = "linux")]
@@ -2115,7 +2115,7 @@ fn mount_idmapped(
             c"".as_ptr(),
             libc::AT_FDCWD,
             target_c.as_ptr(),
-            libc::MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
+            MOVE_MOUNT_F_EMPTY_PATH,
         )
     };
     let result = if rc != 0 { Err(errno()) } else { Ok(()) };
@@ -2536,7 +2536,7 @@ pub fn open_kernel_userfaultfd() -> std::io::Result<OwnedFd> {
             ));
         }
     };
-    let device_fd = unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW, FLAGS) };
+    let device_fd = unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW as _, FLAGS) };
     if device_fd < 0 {
         let device_error = std::io::Error::last_os_error();
         return Err(std::io::Error::new(
@@ -2914,14 +2914,20 @@ pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
             buffer: *mut libc::c_void,
             buffersize: libc::c_int,
         ) -> libc::c_int;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+    }
+
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
     }
 
     const PROC_PIDTASKINFO: libc::c_int = 4;
 
     /// Subset of `struct proc_taskinfo` from <libproc.h>. CPU times are in
-    /// mach_absolute_time units, which on Apple Silicon equal 1 nanosecond.
-    /// (For full portability we'd convert via mach_timebase_info; on arm64
-    /// macOS the ratio is 1:1, and smolvm targets Apple Silicon.)
+    /// mach_absolute_time units, which are not nanoseconds on Apple Silicon:
+    /// its 24 MHz timebase makes one tick 125/3 ns.
     #[repr(C)]
     struct ProcTaskInfo {
         pti_virtual_size: u64,
@@ -2957,10 +2963,22 @@ pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
     if ret <= 0 {
         return None;
     }
+    let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+    if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
+        return None;
+    }
+    let ticks = info.pti_total_user.saturating_add(info.pti_total_system);
     Some(ProcessStats {
-        cpu_time_ns: info.pti_total_user.saturating_add(info.pti_total_system),
+        cpu_time_ns: mach_ticks_to_ns(ticks, timebase.numer, timebase.denom),
         rss_bytes: info.pti_resident_size,
     })
+}
+
+/// Convert mach_absolute_time ticks to nanoseconds with the host's timebase.
+#[cfg(target_os = "macos")]
+fn mach_ticks_to_ns(ticks: u64, numer: u32, denom: u32) -> u64 {
+    let ns = u128::from(ticks) * u128::from(numer) / u128::from(denom);
+    u64::try_from(ns).unwrap_or(u64::MAX)
 }
 
 /// Sample CPU time and RSS for a single process on Linux via /proc/<pid>/{stat,statm}.
@@ -3275,7 +3293,18 @@ pub fn stop_vm_process(
 
     // Phase 1: SIGTERM + poll
     if !terminate(pid) {
-        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+        // A failed signal is not evidence of exit: EPERM leaves the VMM alive.
+        // Only return success when the child has exited or the PID is gone.
+        if let Some(code) = try_wait(pid) {
+            return Ok(code);
+        }
+        if !is_alive(pid) {
+            return Ok(UNKNOWN_EXIT_CODE);
+        }
+        return Err(Error::agent(
+            "stop vm process",
+            format!("process {pid} is still alive after SIGTERM failed"),
+        ));
     }
 
     if let Some(code) = poll_for_exit(pid, sigterm_timeout) {
@@ -3351,6 +3380,14 @@ fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
     }
 }
 
+/// kqueue can report EV_ERROR as an event; only NOTE_EXIT confirms death.
+#[cfg(target_os = "macos")]
+fn mac_process_exit_event(event: &libc::kevent) -> bool {
+    event.filter == libc::EVFILT_PROC
+        && event.flags & libc::EV_ERROR == 0
+        && event.fflags & libc::NOTE_EXIT != 0
+}
+
 /// [`wait_for_exit_event`] through kqueue's `NOTE_EXIT`.
 #[cfg(target_os = "macos")]
 fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
@@ -3389,7 +3426,11 @@ fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
         // SAFETY: waits for at most one event into `event`, with a valid timeout.
         let rc = unsafe { libc::kevent(kq_fd, std::ptr::null(), 0, &mut event, 1, &wait) };
         if rc > 0 {
-            return ExitEvent::Exited;
+            return if mac_process_exit_event(&event) {
+                ExitEvent::Exited
+            } else {
+                ExitEvent::Unavailable
+            };
         }
         if rc == 0 {
             if Instant::now() < deadline {
@@ -3672,13 +3713,22 @@ pub fn detach_stdio_to_stderr_file(path: &std::path::Path) -> std::io::Result<()
 /// is still caught. Uses only `getppid` and `nanosleep`.
 #[cfg(unix)]
 pub fn exit_when_parent_is_not(parent: Pid) {
+    exit_when_parent_is_not_with(parent, || {});
+}
+
+/// [`exit_when_parent_is_not`], running `before_exit` once the parent is gone
+/// and before this process exits, such as shutting a guest down cleanly so its
+/// writes reach disk. `before_exit` must bound its own time.
+#[cfg(unix)]
+pub fn exit_when_parent_is_not_with(parent: Pid, before_exit: impl FnOnce() + Send + 'static) {
     let _ = std::thread::Builder::new()
         .name("parent-death-watch".into())
-        .spawn(move || loop {
-            if unsafe { libc::getppid() } != parent {
-                exit_child(0);
+        .spawn(move || {
+            while unsafe { libc::getppid() } == parent {
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            before_exit();
+            exit_child(0);
         });
 }
 
@@ -3883,8 +3933,27 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
     }
 }
 
+/// `MOVE_MOUNT_F_EMPTY_PATH` from <linux/mount.h>; the libc crate defines it
+/// for glibc only.
+#[cfg(target_os = "linux")]
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kqueue_errors_are_not_process_exit_events() {
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        event.filter = libc::EVFILT_PROC;
+        event.fflags = libc::NOTE_EXIT;
+        assert!(super::mac_process_exit_event(&event));
+        event.flags = libc::EV_ERROR;
+        assert!(!super::mac_process_exit_event(&event));
+        event.flags = 0;
+        event.fflags = 0;
+        assert!(!super::mac_process_exit_event(&event));
+    }
+
     #[cfg(unix)]
     #[test]
     fn poll_for_exit_reads_a_child_exit_code() {
@@ -5113,6 +5182,36 @@ mod tests {
             "a live process must have non-zero RSS, got {}",
             stats.rss_bytes
         );
+    }
+
+    /// CPU time is reported in nanoseconds on every host. On Apple Silicon
+    /// `proc_pidinfo` counts in mach ticks of about 41.7 ns, so an unconverted
+    /// value reads some forty times too low.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn process_stats_cpu_time_is_in_nanoseconds() {
+        let me = std::process::id() as Pid;
+        let before = process_stats(me).expect("sample before").cpu_time_ns;
+        let spin = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let mut sink = 0u64;
+        while started.elapsed() < spin {
+            sink = std::hint::black_box(sink.wrapping_add(1));
+        }
+        let after = process_stats(me).expect("sample after").cpu_time_ns;
+        let spent = after.saturating_sub(before);
+        assert!(
+            spent >= 150_000_000,
+            "300 ms of busy wall time must count at least 150 ms of CPU, got {spent} ns"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mach_ticks_scale_by_the_timebase() {
+        assert_eq!(mach_ticks_to_ns(24_000_000, 125, 3), 1_000_000_000);
+        assert_eq!(mach_ticks_to_ns(1_000, 1, 1), 1_000);
+        assert_eq!(mach_ticks_to_ns(u64::MAX, 125, 3), u64::MAX);
     }
 
     #[cfg(target_os = "linux")]

@@ -4,6 +4,9 @@
 //! them before the `SMOLVM_BOOT_BINARY`, `SMOLVM_LIB_DIR` and `SMOLVM_AGENT_ROOTFS_TAR`
 //! environment variables, which remain the CLI-facing overrides.
 //!
+//! Disk templates (`storage-template.ext4[.zst]`, `overlay-template.ext4[.zst]`) are found
+//! beside the agent rootfs tarball: [`set_bundle`] registers that directory as a template root.
+//!
 //! They are kept out of the process environment on purpose. When an SDK exported them as
 //! environment variables, every `smolvm` CLI the embedding program spawned inherited them, so a
 //! branch made from a Python script booted with the SDK's helper, which arms a parent-death
@@ -30,7 +33,17 @@ static BUNDLE: OnceLock<Bundle> = OnceLock::new();
 /// different bundle returns it as the error so the caller can report the conflict.
 pub fn set_bundle(bundle: Bundle) -> Result<(), Bundle> {
     match BUNDLE.set(bundle.clone()) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // An SDK ships its disk templates beside the rootfs tarball.
+            if let Some(dir) = bundle
+                .agent_rootfs_tar
+                .as_deref()
+                .and_then(std::path::Path::parent)
+            {
+                smolvm_pack::assets::add_template_root(dir.to_path_buf());
+            }
+            Ok(())
+        }
         Err(_) if BUNDLE.get() == Some(&bundle) => Ok(()),
         Err(rejected) => Err(rejected),
     }

@@ -14,7 +14,7 @@ use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
-use smolvm::data::network::{PortMapping, PortMappingSpec};
+use smolvm::data::network::PortMappingSpec;
 use smolvm::data::resources::BlockIoEngine;
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
@@ -285,6 +285,11 @@ pub struct PackRunCmd {
     #[arg(long, value_name = "IP", help_heading = "Network")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver option for the guest resolv.conf (repeatable, in order); see
+    /// `machine create --dns-option`.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = crate::cli::machine::parse_dns_option, help_heading = "Network")]
+    pub dns_option: Vec<String>,
+
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
@@ -371,6 +376,8 @@ pub struct ResolvedEgressPolicy {
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostnames the guest DNS filter permits resolving.
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// `--block-private` and its `--allow-private` exceptions.
+    pub block_private: Option<Vec<String>>,
 }
 
 /// Outbound-network decision for a pack-run boot: a resolved policy's override
@@ -559,10 +566,16 @@ impl PackRunCmd {
         )?;
 
         // 8. Parse CLI args
-        let mounts = HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
+        let (volume_specs, disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&self.volume)?;
+        let mounts = HostMount::parse_with_system_mounts(&volume_specs, self.allow_system_mounts)?;
+        smolvm::data::storage::ensure_disk_volumes_distinct(
+            &disk_volumes,
+            mounts.iter().filter_map(|m| m.target.to_str()),
+        )?;
         let ports = PortMappingSpec::expand_all(&self.port)
             .map_err(|e| Error::config("pack run ports", e))?;
-        let port_mappings = PortMapping::to_tuples(&ports);
+        let port_mappings = ports.clone();
 
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
@@ -575,6 +588,7 @@ impl PackRunCmd {
             ),
             network_backend: self.net_backend,
             dns: self.dns,
+            dns_options: self.dns_option.clone(),
             network_name: None,
             guest_subnet: None,
             gpu: manifest.gpu,
@@ -586,6 +600,11 @@ impl PackRunCmd {
             disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: disk_volumes.clone(),
+            block_private: self
+                .egress
+                .as_ref()
+                .and_then(|policy| policy.block_private.clone()),
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: self
@@ -624,6 +643,7 @@ impl PackRunCmd {
         // executable as `current_exe _boot-vm <config.json>`, which loads libkrun
         // from `SMOLVM_LIB_DIR` and boots the VM. See `src/agent/manager.rs`.
         smolvm::process::install_sigchld_handler();
+        let ready_doorbell = bind_ready_doorbell(&vsock_path);
 
         let console_log_path = runtime_dir.path().join("console.log");
 
@@ -736,6 +756,7 @@ impl PackRunCmd {
                 pack_idmap_source: None,
                 extra_disks: vec![],
                 pod_netns: None,
+                workload_log: None,
                 credentials: None,
                 external_interceptor: None,
                 mediated_egress: false,
@@ -859,7 +880,7 @@ impl PackRunCmd {
         };
 
         // 10. Parent: wait for agent, connect, execute command
-        let mut client = wait_for_agent(&vsock_path, self.debug)?;
+        let mut client = wait_for_agent(&vsock_path, self.debug, ready_doorbell.as_ref())?;
 
         let exit_code = execute_command(&mut client, &manifest, &self, &mounts)?;
 
@@ -1011,14 +1032,32 @@ fn setup_vm_overlay(
     Ok(Some(dest.to_path_buf()))
 }
 
+/// Listen for the guest's readiness doorbell, which the launcher registers
+/// beside the control socket. Bound before the VM is forked so the guest's
+/// dial at the end of init is always answered.
+fn bind_ready_doorbell(vsock_path: &Path) -> Option<socket2::Socket> {
+    smolvm::agent::bind_ready_listener(&vsock_path.with_extension("ready"))
+}
+
 /// Wait for the agent to become ready on the vsock socket.
-fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient> {
+///
+/// The doorbell rings when the guest finishes init, so the agent is pinged
+/// right away instead of on the next poll. Without a doorbell the socket is
+/// pinged every 100 ms as before.
+fn wait_for_agent(
+    vsock_path: &Path,
+    debug: bool,
+    ready_doorbell: Option<&socket2::Socket>,
+) -> smolvm::Result<AgentClient> {
     use std::thread;
     use std::time::Instant;
 
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
+    let doorbell_interval = Duration::from_millis(5);
     let timeout = agent_ready_timeout();
+    let mut rung = false;
+    let mut next_probe = start;
 
     loop {
         if start.elapsed() > timeout {
@@ -1031,7 +1070,11 @@ fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient>
             ));
         }
 
-        if vsock_path.exists() {
+        if !rung {
+            rung = ready_doorbell.is_some_and(|listener| listener.accept().is_ok());
+        }
+        if (rung || Instant::now() >= next_probe) && vsock_path.exists() {
+            next_probe = Instant::now() + poll_interval;
             // Connect opens the Unix socket to the muxer, but the guest agent
             // may not be listening on vsock port 6000 yet. We must ping to
             // verify end-to-end connectivity before declaring the agent ready.
@@ -1056,7 +1099,11 @@ fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient>
             }
         }
 
-        thread::sleep(poll_interval);
+        thread::sleep(if ready_doorbell.is_some() {
+            doorbell_interval
+        } else {
+            poll_interval
+        });
     }
 }
 
@@ -1408,8 +1455,8 @@ struct PackedRunArgs {
     #[arg(long)]
     allow_system_mounts: bool,
 
-    /// Expose port from container to host (single port or one-to-one range)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    /// Expose port from container to host (single port or one-to-one range; append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]")]
     port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -1428,6 +1475,11 @@ struct PackedRunArgs {
     /// host's own resolver; use this when that is not the resolver to use.
     #[arg(long, value_name = "IP")]
     dns: Option<std::net::Ipv4Addr>,
+
+    /// Resolver option for the guest resolv.conf (repeatable, in order); see
+    /// `machine create --dns-option`.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = crate::cli::machine::parse_dns_option)]
+    dns_option: Vec<String>,
 
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
@@ -1488,8 +1540,8 @@ struct PackedStartArgs {
     #[arg(long)]
     allow_system_mounts: bool,
 
-    /// Expose port from container to host (single port or one-to-one range)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
+    /// Expose port from container to host (single port or one-to-one range; append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END][/udp]")]
     port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -1508,6 +1560,11 @@ struct PackedStartArgs {
     /// host's own resolver; use this when that is not the resolver to use.
     #[arg(long, value_name = "IP")]
     dns: Option<std::net::Ipv4Addr>,
+
+    /// Resolver option for the guest resolv.conf (repeatable, in order); see
+    /// `machine create --dns-option`.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = crate::cli::machine::parse_dns_option)]
+    dns_option: Vec<String>,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1660,6 +1717,7 @@ fn run_ephemeral(
                 net_backend: args.net_backend,
                 ssh_agent: args.ssh_agent,
                 dns: args.dns,
+                dns_option: args.dns_option.clone(),
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1795,16 +1853,23 @@ fn run_from_cache(
         args.overlay,
     )?;
 
-    let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
+    let (volume_specs, disk_volumes) =
+        smolvm::data::storage::split_disk_volume_specs(&args.volume)?;
+    let mounts = HostMount::parse_with_system_mounts(&volume_specs, args.allow_system_mounts)?;
+    smolvm::data::storage::ensure_disk_volumes_distinct(
+        &disk_volumes,
+        mounts.iter().filter_map(|m| m.target.to_str()),
+    )?;
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed run ports", e))?;
-    let port_mappings = PortMapping::to_tuples(&ports);
+    let port_mappings = ports.clone();
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
         dns: args.dns,
+        dns_options: args.dns_option.clone(),
         network_name: None,
         guest_subnet: None,
         gpu: manifest.gpu,
@@ -1816,6 +1881,8 @@ fn run_from_cache(
         disk_durability: Default::default(),
         disks: Vec::new(),
         cache_disk: None,
+        disk_volumes: disk_volumes.clone(),
+        block_private: None,
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
@@ -1826,6 +1893,7 @@ fn run_from_cache(
     let packed_mounts = mounts_to_packed(&mounts);
 
     smolvm::process::install_sigchld_handler();
+    let ready_doorbell = bind_ready_doorbell(&vsock_path);
 
     let console_log_path = runtime_dir.path().join("console.log");
     let vsock_path_clone = vsock_path.clone();
@@ -1915,6 +1983,7 @@ fn run_from_cache(
             pack_idmap_source: None,
             extra_disks: vec![],
             pod_netns: None,
+            workload_log: None,
             credentials: None,
             external_interceptor: None,
             mediated_egress: false,
@@ -1987,7 +2056,7 @@ fn run_from_cache(
         runtime_dir,
     };
 
-    let mut client = wait_for_agent(&vsock_path, debug)?;
+    let mut client = wait_for_agent(&vsock_path, debug, ready_doorbell.as_ref())?;
 
     let params = ExecParams {
         launch: resolve_packed_launch(
@@ -2240,16 +2309,23 @@ fn daemon_start(
     let vsock_path = daemon.join("agent.sock");
 
     // Parse CLI args
-    let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
+    let (volume_specs, disk_volumes) =
+        smolvm::data::storage::split_disk_volume_specs(&args.volume)?;
+    let mounts = HostMount::parse_with_system_mounts(&volume_specs, args.allow_system_mounts)?;
+    smolvm::data::storage::ensure_disk_volumes_distinct(
+        &disk_volumes,
+        mounts.iter().filter_map(|m| m.target.to_str()),
+    )?;
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed start ports", e))?;
-    let port_mappings = PortMapping::to_tuples(&ports);
+    let port_mappings = ports.clone();
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
         dns: args.dns,
+        dns_options: args.dns_option.clone(),
         network_name: None,
         guest_subnet: None,
         gpu: manifest.gpu,
@@ -2261,6 +2337,8 @@ fn daemon_start(
         disk_durability: Default::default(),
         disks: Vec::new(),
         cache_disk: None,
+        disk_volumes: disk_volumes.clone(),
+        block_private: None,
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
@@ -2295,6 +2373,7 @@ fn daemon_start(
 
     // Fork child → launch VM
     smolvm::process::install_sigchld_handler();
+    let ready_doorbell = bind_ready_doorbell(&vsock_path);
 
     let console_log_path = daemon.join("console.log");
     let vsock_path_clone = vsock_path.clone();
@@ -2389,7 +2468,7 @@ fn daemon_start(
 
     // Wait for agent to become ready
     println!("Starting daemon...");
-    let _client = wait_for_agent(&vsock_path, debug)?;
+    let _client = wait_for_agent(&vsock_path, debug, ready_doorbell.as_ref())?;
 
     println!("Daemon started (PID: {})", child_pid);
     Ok(())
@@ -2614,6 +2693,7 @@ mod tests {
             network_override: Some(false),
             allowed_cidrs: None,
             dns_filter_hosts: None,
+            block_private: None,
         };
         assert!(!effective_network(Some(&closed), false, true, true));
 
@@ -2632,6 +2712,7 @@ mod tests {
             network_override: None,
             allowed_cidrs: Some(vec!["140.82.112.0/20".to_string()]),
             dns_filter_hosts: Some(vec!["github.com".to_string()]),
+            block_private: None,
         };
         assert!(effective_network(Some(&policy), false, true, false));
         assert!(!effective_network(Some(&policy), false, false, false));

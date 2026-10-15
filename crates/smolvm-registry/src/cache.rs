@@ -10,6 +10,19 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Subdirectory holding manifests fetched by digest (see
+/// [`BlobCache::manifest_by_digest`]); a directory, so the blob walks skip it.
+const MANIFEST_DIR: &str = "manifests";
+
+/// Subdirectory holding per-blob download locks (see
+/// [`BlobCache::download_lock_file`]); a directory, so the blob walks skip it.
+const LOCK_DIR: &str = "locks";
+
+/// `sha256:<hex>` of `bytes`.
+fn digest_of(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
 /// Default maximum blob-cache size when `SMOLVM_BLOB_CACHE_MAX_BYTES` is unset: 5 GB.
 const DEFAULT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
@@ -209,6 +222,7 @@ impl BlobCache {
                     fs::remove_file(entry.path())?;
                 }
             }
+            let _ = fs::remove_dir_all(self.root.join(MANIFEST_DIR));
         }
         Ok(freed)
     }
@@ -248,12 +262,81 @@ impl BlobCache {
         Ok(())
     }
 
+    /// Remove `.partial` files untouched for `max_age` that no pull is writing,
+    /// returning the bytes freed.
+    ///
+    /// A pull that is cancelled or crashes leaves its partial behind, and
+    /// nothing else ever removed one: eviction skips partials because an active
+    /// pull may be writing them, so workers kept abandoned downloads from months
+    /// earlier. A resumable `<digest>.partial` is in use exactly while its
+    /// blob's download lock is held, so one whose lock this sweep can take is
+    /// abandoned; a recent one is kept so a retry can still resume it. Other
+    /// partials are temp files that live only within one call.
+    pub fn sweep_abandoned_partials(&self, max_age: std::time::Duration) -> io::Result<u64> {
+        let now = std::time::SystemTime::now();
+        let mut freed = 0u64;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() || !is_partial(&path) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            let age = now.duration_since(meta.modified()?).unwrap_or_default();
+            if age < max_age {
+                continue;
+            }
+            let digest = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| stem.starts_with("sha256_"))
+                .map(|stem| stem.replacen('_', ":", 1));
+            let _lock = match digest {
+                Some(digest) => {
+                    let lock = self.download_lock_file(&digest)?;
+                    match lock.try_lock() {
+                        Ok(()) => Some(lock),
+                        Err(fs::TryLockError::WouldBlock) => continue,
+                        Err(fs::TryLockError::Error(e)) => return Err(e),
+                    }
+                }
+                None => None,
+            };
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), bytes = meta.len(), "removed an abandoned partial download");
+                    freed += meta.len();
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(freed)
+    }
+
     /// Return the cache path for a blob with this digest.
     ///
     /// Used by the pull flow to write directly to `path.with_extension("partial")`,
     /// then call [`adopt`] to finalize.
     pub fn blob_path_for(&self, digest: &str) -> PathBuf {
         self.blob_path(digest)
+    }
+
+    /// Open (creating if needed) the file a pull locks while it fetches this
+    /// blob. Every fetch of a blob streams into the same `<digest>.partial`, so
+    /// two at once write into one file and the second fails with ENOENT when
+    /// the first renames it into place. Holding an exclusive lock on this file
+    /// across the cache check and the fetch makes the later pull wait and then
+    /// find the blob cached. Lock files are never removed: a pull that opened a
+    /// removed one would lock an inode no one else can see.
+    pub fn download_lock_file(&self, digest: &str) -> io::Result<fs::File> {
+        let dir = self.root.join(LOCK_DIR);
+        fs::create_dir_all(&dir)?;
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{}.lock", digest.replace(':', "_"))))
     }
 
     /// Adopt an externally-written partial file into the cache.
@@ -278,6 +361,62 @@ impl BlobCache {
 
         fs::rename(&partial, &path)?;
         Ok(path)
+    }
+
+    /// A manifest previously fetched from `registry`/`repo` by `digest`.
+    ///
+    /// A digest names exact content, so a manifest fetched by one never changes
+    /// and need not be fetched again. It is keyed by registry and repo as well
+    /// as digest because the registry fetch is what authorizes the caller for
+    /// that repo: a hit only reuses what was already fetched for the same repo.
+    /// The bytes are returned only while they still hash to `digest`.
+    pub fn manifest_by_digest(&self, registry: &str, repo: &str, digest: &str) -> Option<Vec<u8>> {
+        let path = self.manifest_path(registry, repo, digest)?;
+        let bytes = fs::read(&path).ok()?;
+        (digest_of(&bytes) == digest).then_some(bytes)
+    }
+
+    /// Record a manifest fetched from `registry`/`repo` by `digest`. Bytes that
+    /// do not hash to `digest` (an index resolved to one of its entries) are not
+    /// stored and `Ok(false)` is returned.
+    pub fn put_manifest_by_digest(
+        &self,
+        registry: &str,
+        repo: &str,
+        digest: &str,
+        bytes: &[u8],
+    ) -> io::Result<bool> {
+        let Some(path) = self.manifest_path(registry, repo, digest) else {
+            return Ok(false);
+        };
+        if digest_of(bytes) != digest {
+            return Ok(false);
+        }
+        let dir = self.root.join(MANIFEST_DIR);
+        fs::create_dir_all(&dir)?;
+        let mut staged = tempfile::Builder::new()
+            .suffix(".partial")
+            .tempfile_in(&dir)?;
+        staged.write_all(bytes)?;
+        staged.persist(&path).map_err(|error| error.error)?;
+        Ok(true)
+    }
+
+    /// Where a digest-addressed manifest lives, or `None` for a malformed digest.
+    fn manifest_path(&self, registry: &str, repo: &str, digest: &str) -> Option<PathBuf> {
+        let hex = digest.strip_prefix("sha256:")?;
+        if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut scope = Sha256::new();
+        scope.update(registry.as_bytes());
+        scope.update([0]);
+        scope.update(repo.as_bytes());
+        Some(self.root.join(MANIFEST_DIR).join(format!(
+            "{:x}-{}",
+            scope.finalize(),
+            hex.to_ascii_lowercase()
+        )))
     }
 
     /// Path for a blob with the given digest.
@@ -398,6 +537,60 @@ mod tests {
             victim_partial.exists(),
             "eviction deleted another concurrent pull's in-flight .partial (the ENOENT bug)"
         );
+    }
+
+    /// Workers kept abandoned partial downloads for months: nothing removed a
+    /// partial a cancelled pull left behind. A sweep removes an old one no pull
+    /// holds, and keeps a recent one (a retry may resume it), one whose pull is
+    /// running, and every finished blob.
+    #[test]
+    fn a_sweep_removes_only_old_partials_no_pull_is_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), u64::MAX).unwrap();
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let age = |path: &Path, by: std::time::Duration| {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - by)
+                .unwrap();
+        };
+        let partial = |digest: &str| cache.blob_path_for(digest).with_extension("partial");
+        let abandoned = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let recent = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let pulling = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        for digest in [abandoned, recent, pulling] {
+            fs::write(partial(digest), [0u8; 64]).unwrap();
+        }
+        age(&partial(abandoned), 2 * day);
+        age(&partial(pulling), 2 * day);
+        let temp = tmp.path().join(".tmpAbC123.partial");
+        fs::write(&temp, [0u8; 8]).unwrap();
+        age(&temp, 2 * day);
+        let finished = cache.put("sha256:abc", b"blob").unwrap();
+        age(&finished, 2 * day);
+
+        let held = cache.download_lock_file(pulling).unwrap();
+        held.lock().unwrap();
+        let freed = cache.sweep_abandoned_partials(day).unwrap();
+
+        assert_eq!(freed, 64 + 8);
+        assert!(
+            !partial(abandoned).exists(),
+            "an old partial no pull holds is removed"
+        );
+        assert!(!temp.exists(), "an old temp partial is removed");
+        assert!(
+            partial(recent).exists(),
+            "a recent partial stays for a resume"
+        );
+        assert!(
+            partial(pulling).exists(),
+            "a partial an active pull holds stays"
+        );
+        assert!(finished.exists(), "finished blobs are never swept");
+        drop(held);
     }
 
     #[test]
@@ -553,6 +746,78 @@ mod tests {
             "the genuinely least recently used blob is the one evicted"
         );
         assert!(cache.get(fresh).is_some());
+    }
+
+    #[test]
+    fn a_manifest_is_reused_only_for_its_registry_repo_and_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let bytes = br#"{"schemaVersion":2}"#;
+        let digest = digest_of(bytes);
+
+        assert!(cache
+            .manifest_by_digest("https://r", "a/app", &digest)
+            .is_none());
+        assert!(cache
+            .put_manifest_by_digest("https://r", "a/app", &digest, bytes)
+            .unwrap());
+        assert_eq!(
+            cache
+                .manifest_by_digest("https://r", "a/app", &digest)
+                .as_deref(),
+            Some(&bytes[..])
+        );
+        assert!(cache
+            .manifest_by_digest("https://r", "b/app", &digest)
+            .is_none());
+        assert!(cache
+            .manifest_by_digest("https://other", "a/app", &digest)
+            .is_none());
+        // A manifest is not a blob: it takes no space in the blob budget.
+        assert_eq!(cache.total_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_hash_to_its_digest_is_neither_stored_nor_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let bytes = br#"{"schemaVersion":2}"#;
+        let digest = digest_of(bytes);
+
+        // An index resolved to one entry hashes to the entry, not the index.
+        assert!(!cache
+            .put_manifest_by_digest("https://r", "a", &digest, b"other")
+            .unwrap());
+        assert!(!cache
+            .put_manifest_by_digest("https://r", "a", "v1", bytes)
+            .unwrap());
+        assert!(!cache
+            .put_manifest_by_digest("https://r", "a", "sha256:../x", bytes)
+            .unwrap());
+
+        cache
+            .put_manifest_by_digest("https://r", "a", &digest, bytes)
+            .unwrap();
+        let path = cache.manifest_path("https://r", "a", &digest).unwrap();
+        fs::write(&path, b"tampered").unwrap();
+        assert!(cache
+            .manifest_by_digest("https://r", "a", &digest)
+            .is_none());
+    }
+
+    #[test]
+    fn prune_all_drops_cached_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let bytes = br#"{"schemaVersion":2}"#;
+        let digest = digest_of(bytes);
+        cache
+            .put_manifest_by_digest("https://r", "a", &digest, bytes)
+            .unwrap();
+        cache.prune_all().unwrap();
+        assert!(cache
+            .manifest_by_digest("https://r", "a", &digest)
+            .is_none());
     }
 
     #[test]

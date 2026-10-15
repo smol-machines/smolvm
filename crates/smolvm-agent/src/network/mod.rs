@@ -63,6 +63,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// - `SMOLVM_NETWORK_GATEWAY`
 /// - `SMOLVM_NETWORK_PREFIX_LEN`
 /// - `SMOLVM_NETWORK_GUEST_MAC`
+/// - `SMOLVM_NETWORK_GATEWAY_MAC` (optional, pod networking: install the
+///   gateway as a static neighbor entry)
 /// - `SMOLVM_NETWORK_DNS`
 /// - `SMOLVM_NETWORK_GUEST_IP6` / `SMOLVM_NETWORK_GATEWAY6` /
 ///   `SMOLVM_NETWORK_PREFIX_LEN6` (optional trio — absent means IPv4-only)
@@ -115,11 +117,20 @@ pub fn configure_from_env() -> Result<bool, String> {
     let gateway = env_ipv4(guest_env::GATEWAY)?;
     let prefix_len = env_u8(guest_env::PREFIX_LEN)?;
     let guest_mac = env_mac(guest_env::GUEST_MAC)?;
+    let gateway_mac = env_optional_mac(guest_env::GATEWAY_MAC)?;
     let dns_server = env_ipv4(guest_env::DNS)?;
     let ipv6 = env_ipv6_config()?;
 
     linux::configure_interface(
-        "eth0", guest_mac, 1500, guest_ip, prefix_len, gateway, ipv6, dns_server,
+        "eth0",
+        guest_mac,
+        1500,
+        guest_ip,
+        prefix_len,
+        gateway,
+        gateway_mac,
+        ipv6,
+        dns_server,
     )?;
     Ok(true)
 }
@@ -179,6 +190,14 @@ fn env_mac(name: &str) -> Result<[u8; 6], String> {
     parse_mac(&value)
 }
 
+/// Absent or empty means "not provided"; a present value must parse.
+fn env_optional_mac(name: &str) -> Result<Option<[u8; 6]>, String> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => parse_mac(&value).map(Some),
+        _ => Ok(None),
+    }
+}
+
 /// Parse a colon-separated MAC address into six raw octets.
 ///
 /// The guest kernel APIs do not consume the string form directly. They expect
@@ -223,6 +242,7 @@ mod linux {
         _address: Ipv4Addr,
         _prefix_len: u8,
         _gateway: Ipv4Addr,
+        _gateway_mac: Option<[u8; 6]>,
         _ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
         _dns_server: Ipv4Addr,
     ) -> Result<(), String> {

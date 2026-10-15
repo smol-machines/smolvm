@@ -105,4 +105,9 @@ pub struct BootConfig {
     /// Host-only identity of a branch source's launch.
     #[serde(default)]
     pub mediated_parent_id: [u8; 16],
+    /// File the workload's stdout and stderr are appended to. Set for named
+    /// machines; the boot process listens for the guest's output while the
+    /// machine runs.
+    #[serde(default)]
+    pub workload_log: Option<PathBuf>,
 }

@@ -404,15 +404,19 @@ fn publish_agent_rootfs_tar(built: &Path, cached: &Path) {
 /// Find a pre-formatted disk template by filename.
 ///
 /// Searches in order:
-/// 1. `~/.smolvm/{filename}` (installed location)
-/// 2. Next to the current executable (development)
+/// 1. Directories registered with [`add_template_root`] (an embedder's bundle)
+/// 2. `~/.smolvm/{filename}` (installed location)
+/// 3. Next to the current executable (development)
 ///
 /// Each location is checked for the plain file first and then for a `.zst`
 /// sibling, which is expanded on demand by [`materialize_template`]. Releases
 /// ship only the compressed form; the plain file is still honored so existing
 /// installs and development trees keep working untouched.
 pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<PathBuf> = TEMPLATE_ROOTS
+        .lock()
+        .map(|roots| roots.clone())
+        .unwrap_or_default();
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".smolvm"));
     }
@@ -443,6 +447,21 @@ pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Directories searched for templates before the default locations.
+static TEMPLATE_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Also look for templates in `dir`, ahead of `~/.smolvm` and the executable's
+/// directory. An embedder (the Python or Node SDK) ships them beside its other
+/// assets; without them a Linux host with no reflink copies a whole image seed
+/// into every new machine instead of layering a qcow2 overlay on it.
+pub fn add_template_root(dir: PathBuf) {
+    if let Ok(mut roots) = TEMPLATE_ROOTS.lock() {
+        if !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    }
 }
 
 /// Expand `compressed` into a sparse file and return the expanded path.
@@ -1816,6 +1835,19 @@ pub fn crc32_reader_range<R: std::io::Read + std::io::Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An embedder's registered directory is searched first, so an SDK that
+    // ships templates beside its assets gets them without touching ~/.smolvm.
+    #[test]
+    fn a_registered_template_root_is_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "registered-root-test-template.ext4";
+        std::fs::write(dir.path().join(name), b"template").unwrap();
+        assert_eq!(find_existing_template(name), None);
+        add_template_root(dir.path().to_path_buf());
+        add_template_root(dir.path().to_path_buf());
+        assert_eq!(find_existing_template(name), Some(dir.path().join(name)));
+    }
 
     #[test]
     fn digest_to_filename_rejects_path_traversal() {

@@ -12,6 +12,7 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths::{self, STORAGE_ROOT};
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use smolvm_oci_layer::extract_oci_layer;
 use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer_with_size};
@@ -19,7 +20,8 @@ use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
 };
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -604,6 +606,13 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
         if let Some(cache) = mount_cache_disk() {
             mounts.push(cache);
         }
+        for volume in mount_disk_volumes() {
+            if mounts.iter().any(|(_, target, _)| target == &volume.1) {
+                warn!(target = %volume.1, "disk volume shadowed by a mount at the same path");
+                continue;
+            }
+            mounts.push(volume);
+        }
 
         // Mount using existing logic with empty rootfs prefix so bind mounts
         // go to absolute guest paths (e.g., "/data"), visible to VmExec.
@@ -621,6 +630,105 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
 /// The staging tag the cache disk's filesystem is mounted under, beside the
 /// virtiofs devices' staging paths.
 const CACHE_MOUNT_TAG: &str = "smolvm_cache";
+
+/// Staging-tag prefix for disk volumes. Each volume's directory on the storage
+/// disk is bound at its staging path, so boot-mount setup and every container's
+/// mount list expose it exactly like a virtiofs share, without a device.
+const DISK_VOLUME_TAG_PREFIX: &str = "smolvm_disk_";
+
+/// Where disk volumes keep their data on the storage disk.
+const DISK_VOLUME_ROOT: &str = "/storage/volumes";
+
+static DISK_VOLUMES_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a requested disk volume could not be prepared at boot.
+pub fn disk_volumes_failed() -> bool {
+    DISK_VOLUMES_FAILED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn is_disk_volume_tag(tag: &str) -> bool {
+    tag.starts_with(DISK_VOLUME_TAG_PREFIX)
+}
+
+/// The disk volumes the host requested, already validated.
+fn disk_volume_targets() -> Vec<String> {
+    std::env::var(guest_env::DISK_VOLUMES)
+        .map(|value| smolvm_protocol::disk_volume::decode(&value))
+        .unwrap_or_default()
+}
+
+/// Whether any disk volume was requested, so the storage disk must be mounted
+/// before boot mounts are set up.
+pub fn disk_volumes_requested() -> bool {
+    !disk_volume_targets().is_empty()
+}
+
+/// Prepare each requested disk volume: create its directory on the storage
+/// disk and bind it at its staging path. Returns the boot mounts that expose
+/// them. A volume that cannot be prepared fails the boot mounts rather than
+/// silently leaving its path on the overlay root, where nested overlayfs fails
+/// in ways that do not name the cause.
+#[cfg(target_os = "linux")]
+fn mount_disk_volumes() -> Vec<(String, String, bool)> {
+    let mut mounts = Vec::new();
+    for target in disk_volume_targets() {
+        let name = smolvm_protocol::disk_volume::storage_dir_name(&target);
+        let tag = format!("{DISK_VOLUME_TAG_PREFIX}{name}");
+        let data = Path::new(DISK_VOLUME_ROOT).join(&name);
+        let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(&tag);
+        let prepared = std::fs::create_dir_all(&data)
+            .and_then(|()| std::fs::create_dir_all(&staging))
+            .and_then(|()| {
+                if is_mountpoint(&staging) {
+                    Ok(())
+                } else {
+                    bind_dir(&data, &staging)
+                }
+            });
+        match prepared {
+            Ok(()) => {
+                info!(target = %target, data = %data.display(), "disk volume ready");
+                mounts.push((tag, target, false));
+            }
+            Err(error) => {
+                DISK_VOLUMES_FAILED.store(true, std::sync::atomic::Ordering::Release);
+                warn!(%error, target = %target, "failed to prepare disk volume");
+            }
+        }
+    }
+    mounts
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_disk_volumes() -> Vec<(String, String, bool)> {
+    Vec::new()
+}
+
+/// Bind `source` onto `target`.
+#[cfg(target_os = "linux")]
+fn bind_dir(source: &Path, target: &Path) -> std::io::Result<()> {
+    let to_c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (source, target) = (to_c(source)?, to_c(target)?);
+    // SAFETY: valid NUL-terminated paths, a plain bind with no data.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 /// The cache disk the host attached, from `SMOLVM_CACHE_DISK=<device>:<guest
 /// path>[:slot]`: its guest device, the path it is exposed at, and whether it
@@ -813,10 +921,13 @@ fn mount_cache_disk() -> Option<(String, String, bool)> {
 #[cfg(target_os = "linux")]
 pub fn repair_boot_volume_mounts() -> Result<()> {
     // A cache disk is a block device the branch pivoted under its mounted
-    // filesystem, not a virtiofs session that died with the source.
+    // filesystem, not a virtiofs session that died with the source. Disk
+    // volumes live on the storage disk, so they survive the same way.
     let missing = init_volume_mounts()
         .iter()
-        .filter(|(tag, target, _)| tag != CACHE_MOUNT_TAG && !is_mountpoint(Path::new(target)))
+        .filter(|(tag, target, _)| {
+            tag != CACHE_MOUNT_TAG && !is_disk_volume_tag(tag) && !is_mountpoint(Path::new(target))
+        })
         .cloned()
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -1095,7 +1206,8 @@ fn staged_tars_signature(tars: &[PathBuf]) -> Result<String> {
 ///
 /// `tar` restores the archived uid/gid when it runs as root, which the agent
 /// always does — that is the whole point of unpacking here rather than on the
-/// host.
+/// host. `--numeric-owner` keeps the image's ids instead of resolving the
+/// archived names through the agent's Alpine users, whose ids differ.
 fn extract_layer_tar(tar: &Path, dir: &Path) -> Result<()> {
     extract_layer_tar_with_progress(tar, dir, || {})
 }
@@ -1104,6 +1216,7 @@ fn extract_layer_tar_with_progress(tar: &Path, dir: &Path, progress: impl FnMut(
     let mut command = Command::new("tar");
     command
         .arg("-x")
+        .arg("--numeric-owner")
         .arg("-f")
         .arg(tar)
         .arg("-C")
@@ -1275,7 +1388,7 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
 }
 
 // =============================================================================
-// Local image archives (`docker save` / `podman save`)
+// Local image archives (`docker save`, `podman save`, and OCI layouts)
 // =============================================================================
 //
 // smolvm delegates turning a saved-image archive into a rootfs to the bundled
@@ -1365,12 +1478,16 @@ where
     std::fs::create_dir_all(&rootfs)?;
     info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
     progress("flattening local image archive", 0);
-    flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
+    let oci_config = flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
     // Recover the image config before writing the marker, so a later reuse can
     // rely on config.json being present. A docker/podman `save` always carries
     // one.
     progress("recovering image configuration", 0);
-    recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
+    if let Some(config) = oci_config {
+        std::fs::write(out_base.join(ARCHIVE_CONFIG_FILE), config)?;
+    } else {
+        recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
+    }
     std::fs::write(&marker, signature)?;
     Ok(Some(out_base))
 }
@@ -1600,10 +1717,14 @@ where
     result
 }
 
-/// Flatten a `docker save` archive into `rootfs`, delegating to the bundled
+/// Flatten a local image archive into `rootfs`, delegating to the bundled
 /// `crane export`. The flattened tar is a single layer with no whiteouts, so
 /// plain `tar -x` is sufficient (no per-layer handling needed).
-fn flatten_archive_with_progress<F>(archive: &Path, rootfs: &Path, progress: &mut F) -> Result<()>
+fn flatten_archive_with_progress<F>(
+    archive: &Path,
+    rootfs: &Path,
+    progress: &mut F,
+) -> Result<Option<Vec<u8>>>
 where
     F: FnMut(&str, u64),
 {
@@ -1623,7 +1744,9 @@ where
         // truncated archive — instead of a misleading guess.
         .stderr(Stdio::piped());
     // Held alive until crane has consumed it (the decompressed input, if any).
-    let (archive_input, _archive_tmp) = prepare_archive_input_with_progress(archive, progress)?;
+    let (mut archive_input, _archive_tmp) = prepare_archive_input_with_progress(archive, progress)?;
+    let oci = oci_archive_compatibility(&mut archive_input)?;
+    archive_input.seek(SeekFrom::Start(0))?;
 
     let mut crane_child = crane
         .spawn()
@@ -1632,8 +1755,12 @@ where
         .stdin
         .take()
         .ok_or_else(|| StorageError::new("failed to open crane stdin".to_string()))?;
-    let (input_copy_thread, input_progress) =
-        spawn_copy_with_progress(archive_input, crane_in, "reading image archive");
+    let oci_config = oci.as_ref().map(|(_, config)| config.clone());
+    let (input_copy_thread, input_progress) = if let Some((manifest, _)) = oci {
+        spawn_oci_archive_copy(archive_input, crane_in, manifest)
+    } else {
+        spawn_copy_with_progress(archive_input, crane_in, "reading image archive")
+    };
     let crane_out = crane_child
         .stdout
         .take()
@@ -1645,6 +1772,7 @@ where
 
     let mut tar_child = Command::new("tar")
         .arg("-x")
+        .arg("--numeric-owner")
         .arg("-C")
         .arg(rootfs)
         .stdin(Stdio::piped())
@@ -1710,7 +1838,176 @@ where
         .map_err(|e| StorageError::new(format!("streaming image archive failed: {e}")))?;
     copy_result
         .map_err(|e| StorageError::new(format!("streaming flattened rootfs failed: {e}")))?;
-    Ok(())
+    Ok(oci_config)
+}
+
+// A pure OCI archive has no docker-save manifest.json, which `crane export -`
+// requires. Add only that small compatibility entry while streaming the archive
+// into crane; leave the user's archive and every layer blob untouched.
+fn spawn_oci_archive_copy(
+    input: std::fs::File,
+    output: impl Write + Send + 'static,
+    manifest: Vec<u8>,
+) -> (
+    std::thread::JoinHandle<std::io::Result<u64>>,
+    std::sync::mpsc::Receiver<(&'static str, u64)>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut archive = tar::Archive::new(input);
+        let mut builder = tar::Builder::new(output);
+        let mut bytes = 0;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let header = entry.header().clone();
+            bytes += header.size()?;
+            builder.append(&header, &mut entry)?;
+            let _ = tx.send(("reading image archive", bytes));
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder.append_data(&mut header, "manifest.json", manifest.as_slice())?;
+        builder.finish()?;
+        Ok(bytes)
+    });
+    (handle, rx)
+}
+
+// Locate the small OCI metadata blobs using tar's seekable iterator. Skipping
+// layers by seeking avoids buffering or decompressing them into guest memory.
+fn oci_archive_compatibility(file: &mut std::fs::File) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    const MAX_METADATA: u64 = 4 * 1024 * 1024;
+    let mut positions: HashMap<String, (u64, u64)> = HashMap::new();
+    {
+        let mut archive = tar::Archive::new(&mut *file);
+        for entry in archive.entries_with_seek()? {
+            let entry = entry?;
+            let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+            if name == "manifest.json" {
+                return Ok(None); // Existing docker-save path, including hybrid archives.
+            }
+            if !entry.header().entry_type().is_file()
+                || (name != "index.json" && !name.starts_with("blobs/sha256/"))
+            {
+                continue;
+            }
+            if positions
+                .insert(name, (entry.raw_file_position(), entry.size()))
+                .is_some()
+            {
+                return Err(StorageError::new("duplicate OCI archive metadata path"));
+            }
+            if positions.len() > 16_384 {
+                return Err(StorageError::new("OCI archive contains too many blobs"));
+            }
+        }
+    }
+    if !positions.contains_key("index.json") {
+        return Ok(None); // Let crane report its ordinary invalid archive error.
+    }
+    let mut read_metadata = |name: &str| -> Result<Vec<u8>> {
+        let (position, size) = positions
+            .get(name)
+            .ok_or_else(|| StorageError::new(format!("missing OCI archive member {name}")))?;
+        if *size == 0 || *size > MAX_METADATA {
+            return Err(StorageError::new("OCI archive metadata exceeds 4 MiB"));
+        }
+        file.seek(SeekFrom::Start(*position))?;
+        let mut data = vec![0; *size as usize];
+        file.read_exact(&mut data)?;
+        Ok(data)
+    };
+    let index: serde_json::Value = serde_json::from_slice(&read_metadata("index.json")?)
+        .map_err(|e| StorageError::parse_error("OCI archive index", e))?;
+    let mut get_blob = |digest: &str| -> Result<Vec<u8>> {
+        let hex = digest.strip_prefix("sha256:").unwrap_or("");
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StorageError::new("invalid OCI archive blob digest"));
+        }
+        let data = read_metadata(&format!("blobs/sha256/{hex}"))?;
+        if format!("{:x}", Sha256::digest(&data)) != hex.to_ascii_lowercase() {
+            return Err(StorageError::new("OCI archive metadata digest mismatch"));
+        }
+        Ok(data)
+    };
+    let mut descriptors = index["manifests"]
+        .as_array()
+        .ok_or_else(|| StorageError::new("OCI archive has no image manifests"))?
+        .clone();
+    let mut manifest = None;
+    for _ in 0..2 {
+        let guest_arch = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        let chosen = descriptors
+            .iter()
+            .find(|d| d["platform"]["os"] == "linux" && d["platform"]["architecture"] == guest_arch)
+            .or_else(|| {
+                if descriptors.len() == 1 {
+                    descriptors.first()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| StorageError::new("OCI archive has no image for this platform"))?;
+        let digest = chosen["digest"]
+            .as_str()
+            .ok_or_else(|| StorageError::new("OCI archive descriptor has no digest"))?;
+        let body: serde_json::Value = serde_json::from_slice(&get_blob(digest)?)
+            .map_err(|e| StorageError::parse_error("OCI archive manifest", e))?;
+        if body.get("config").is_some() {
+            manifest = Some(body);
+            break;
+        }
+        descriptors = body["manifests"]
+            .as_array()
+            .ok_or_else(|| StorageError::new("OCI archive index has no platform"))?
+            .clone();
+    }
+    let image = manifest.ok_or_else(|| StorageError::new("OCI archive has no image manifest"))?;
+    let config_digest = image["config"]["digest"]
+        .as_str()
+        .ok_or_else(|| StorageError::new("OCI image has no config digest"))?;
+    let config = get_blob(config_digest)?;
+    let parsed: serde_json::Value = serde_json::from_slice(&config)
+        .map_err(|e| StorageError::parse_error("OCI archive config", e))?;
+    if let Some(arch) = parsed["architecture"].as_str() {
+        ensure_archive_arch_compatible(arch)?;
+    }
+    let layers = image["layers"]
+        .as_array()
+        .ok_or_else(|| StorageError::new("OCI image has no layers"))?;
+    let mut paths = Vec::with_capacity(layers.len());
+    let mut sources = serde_json::Map::new();
+    for layer in layers {
+        let digest = layer["digest"]
+            .as_str()
+            .ok_or_else(|| StorageError::new("OCI layer has no digest"))?;
+        let hex = digest.strip_prefix("sha256:").unwrap_or("");
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StorageError::new("invalid OCI layer digest"));
+        }
+        let path = format!("blobs/sha256/{hex}");
+        if !positions.contains_key(&path) {
+            return Err(StorageError::new(format!(
+                "missing OCI archive member {path}"
+            )));
+        }
+        paths.push(path);
+        sources.insert(digest.to_string(), layer.clone());
+    }
+    let synthetic = serde_json::to_vec(&serde_json::json!([{
+        "Config": format!("blobs/sha256/{}", &config_digest[7..]),
+        "RepoTags": null,
+        "Layers": paths,
+        "LayerSources": sources,
+    }]))
+    .map_err(|e| StorageError::new(format!("serialize OCI archive compatibility manifest: {e}")))?;
+    Ok(Some((synthetic, config)))
 }
 
 /// Recover the image config (Entrypoint/Cmd/Env/…) from a `docker save` archive
@@ -2790,6 +3087,7 @@ fn extract_layer_from_file(
 
 pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
+    cache_as: Option<&str>,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
     proxy: Option<&str>,
@@ -2799,17 +3097,28 @@ pub fn pull_image_with_progress_and_auth<F>(
 where
     F: FnMut(usize, usize, &str),
 {
-    // Validate image reference before any operations
+    // Validate the fetch reference and the stable cache key before any operations.
     crate::oci::validate_image_reference(image).map_err(|e| {
         StorageError::InvalidImageReference {
             reference: image.to_string(),
             reason: e,
         }
     })?;
+    if let Some(cache_as) = cache_as {
+        crate::oci::validate_image_reference(cache_as).map_err(|e| {
+            StorageError::InvalidImageReference {
+                reference: cache_as.to_string(),
+                reason: e,
+            }
+        })?;
+    }
 
-    // Canonicalize so all equivalent refs share the same on-disk cache key.
-    let image = normalize_image_ref(image);
-    let image = image.as_str();
+    // Fetch from the effective (possibly mirrored) reference, but cache under
+    // the user's canonical reference so subsequent Query/Run requests find it.
+    let fetch_image = normalize_image_ref(image);
+    let cache_image = normalize_image_ref(cache_as.unwrap_or(image));
+    let image = fetch_image.as_str();
+    let cache_image = cache_image.as_str();
 
     // If packed layers are available, return synthetic image info
     if let Some(packed_dir) = get_packed_layers_dir() {
@@ -2819,7 +3128,7 @@ where
         let effective = effective_packed_dir_with_progress(packed_dir, |phase, _| {
             progress(0, 0, phase);
         })?;
-        return create_packed_image_info(image, &effective);
+        return create_packed_image_info(cache_image, &effective);
     }
 
     // Determine OCI platform - default to current architecture
@@ -2840,7 +3149,7 @@ where
     });
 
     // Check if already cached with correct architecture
-    if let Ok(Some(info)) = query_image(image) {
+    if let Ok(Some(info)) = query_image(cache_image) {
         // Verify cached image architecture matches requested OCI platform
         let cached_arch = &info.architecture;
         let requested_arch = oci_platform
@@ -2866,9 +3175,9 @@ where
             let root = Path::new(STORAGE_ROOT);
             let manifest_path = root
                 .join(MANIFESTS_DIR)
-                .join(sanitize_image_name(image) + ".json");
+                .join(sanitize_image_name(cache_image) + ".json");
             let _ = std::fs::remove_file(&manifest_path);
-            let _ = std::fs::remove_file(image_size_cache_path(root, image));
+            let _ = std::fs::remove_file(image_size_cache_path(root, cache_image));
         }
     }
 
@@ -2922,7 +3231,7 @@ where
     // Save manifest
     let manifest_path = root
         .join(MANIFESTS_DIR)
-        .join(sanitize_image_name(image) + ".json");
+        .join(sanitize_image_name(cache_image) + ".json");
     std::fs::write(&manifest_path, &manifest)?;
 
     // Extract layers with progress updates.
@@ -3170,7 +3479,7 @@ where
     // metadata is consulted on every persistent exec. Compute the physical
     // size once after the verified pull and keep it out of the command hot path.
     let total_size = calculate_image_size(root, &layers);
-    cache_image_size(root, image, total_size);
+    cache_image_size(root, cache_image, total_size);
 
     // Build ImageInfo
     let architecture = config_json["architecture"]
@@ -3195,7 +3504,7 @@ where
         .map(String::from);
 
     Ok(ImageInfo {
-        reference: image.to_string(),
+        reference: cache_image.to_string(),
         digest: config_digest.to_string(),
         size: total_size,
         created,
@@ -3916,8 +4225,11 @@ fn refresh_overlay_resolver(root: &Path) -> Result<()> {
 }
 
 fn overlay_resolv_conf_contents() -> String {
+    // Resolver options (`--dns-option`) ride on every file, the filter proxy's
+    // included: it answers on both UDP and TCP, so even `use-vc` works there.
+    let options = crate::resolv_options();
     if std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1") {
-        return "nameserver 127.0.0.1\n".to_string();
+        return smolvm_protocol::resolv::render(&["127.0.0.1"], &options);
     }
 
     // A nameserver supplied by the host (SMOLVM_NETWORK_DNS) wins for either
@@ -3925,12 +4237,14 @@ fn overlay_resolv_conf_contents() -> String {
     // custom resolver (--dns) the guest queries directly. Only fall back to
     // public resolvers when the host didn't specify one.
     if let Ok(dns_server) = std::env::var(guest_env::DNS) {
-        if !dns_server.is_empty() {
-            return format!("nameserver {}\n", dns_server);
+        if !dns_server.trim().is_empty() {
+            return smolvm_protocol::resolv::render(&[dns_server.trim()], &options);
         }
     }
 
-    "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
+    // Same order as the TSI boot path (`tsi_resolv_conf`): the two writers
+    // used to disagree (8.8.8.8 first here, 1.1.1.1 first at boot).
+    smolvm_protocol::resolv::render(&smolvm_protocol::resolv::DEFAULT_NAMESERVERS, &options)
 }
 
 /// Default /etc/hosts for images that ship without one, mirroring the file
@@ -4651,7 +4965,7 @@ fn ensure_staged_working_copy(tag: &str, source: &Path) -> Result<PathBuf> {
         .take()
         .ok_or_else(|| StorageError::new("staged mount archive stdout was not captured"))?;
     let consumer_status = Command::new("tar")
-        .args(["-xf", "-", "-C"])
+        .args(["-x", "--numeric-owner", "-f", "-", "-C"])
         .arg(&temporary)
         .stdin(Stdio::from(producer_stdout))
         .status()
@@ -4659,7 +4973,7 @@ fn ensure_staged_working_copy(tag: &str, source: &Path) -> Result<PathBuf> {
     let producer_status = producer
         .wait()
         .map_err(|error| StorageError::new(format!("wait for staged mount archive: {error}")))?;
-    if !producer_status.success() || !consumer_status.success() {
+    if !tar_create_succeeded(producer_status) || !consumer_status.success() {
         let _ = std::fs::remove_dir_all(&temporary);
         return Err(StorageError::new(format!(
             "staged mount seed failed (archive={producer_status}, extract={consumer_status})"
@@ -5248,6 +5562,13 @@ fn unique_lowerdirs(lowerdirs: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Whether a `tar -c` run produced a complete archive. GNU tar exits 1 when a
+/// file changed while it was read (a live directory), and the archive is still
+/// whole; only 2 and up are fatal.
+pub(crate) fn tar_create_succeeded(status: std::process::ExitStatus) -> bool {
+    status.success() || status.code() == Some(1)
+}
+
 /// Tar `dir`'s contents (not the directory itself) into `output`.
 fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
     let status = std::process::Command::new("tar")
@@ -5258,7 +5579,7 @@ fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
         .arg(".")
         .status()
         .map_err(|e| StorageError::new(format!("spawning tar failed: {e}")))?;
-    if !status.success() {
+    if !tar_create_succeeded(status) {
         return Err(StorageError::new(format!(
             "tar of {} failed: {status}",
             dir.display()
@@ -5880,6 +6201,114 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pure_oci_archive_streams_with_docker_compatibility_manifest() {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, SeekFrom};
+
+        fn digest(bytes: &[u8]) -> String {
+            format!("sha256:{:x}", Sha256::digest(bytes))
+        }
+        fn append(builder: &mut tar::Builder<&mut std::fs::File>, name: &str, data: &[u8]) {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o600);
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, name, data).unwrap();
+        }
+        for nested in [false, true] {
+            let mut original = tempfile::tempfile().unwrap();
+            let arch = if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "amd64"
+            };
+            let config =
+                serde_json::to_vec(&serde_json::json!({"os":"linux", "architecture":arch}))
+                    .unwrap();
+            let config_digest = digest(&config);
+            let layer = b"a small layer";
+            let layer_digest = digest(layer);
+            let image = serde_json::to_vec(&serde_json::json!({
+                "config":{"digest":config_digest},
+                "layers":[{"digest":layer_digest,"mediaType":"application/vnd.oci.image.layer.v1.tar","size":layer.len()}],
+            })).unwrap();
+            let image_digest = digest(&image);
+            let wrapper = serde_json::to_vec(&serde_json::json!({
+                "manifests":[{"digest":image_digest,"mediaType":"application/vnd.oci.image.manifest.v1+json"}],
+            })).unwrap();
+            let top_digest = if nested {
+                digest(&wrapper)
+            } else {
+                image_digest.clone()
+            };
+            let index = serde_json::to_vec(&serde_json::json!({
+                "manifests":[{"digest":top_digest,"mediaType":if nested {"application/vnd.oci.image.index.v1+json"} else {"application/vnd.oci.image.manifest.v1+json"}}],
+            })).unwrap();
+            {
+                let mut builder = tar::Builder::new(&mut original);
+                append(
+                    &mut builder,
+                    &format!("blobs/sha256/{}", &layer_digest[7..]),
+                    layer,
+                );
+                append(
+                    &mut builder,
+                    &format!("blobs/sha256/{}", &image_digest[7..]),
+                    &image,
+                );
+                append(
+                    &mut builder,
+                    &format!("blobs/sha256/{}", &config_digest[7..]),
+                    &config,
+                );
+                if nested {
+                    append(
+                        &mut builder,
+                        &format!("blobs/sha256/{}", &top_digest[7..]),
+                        &wrapper,
+                    );
+                }
+                append(&mut builder, "index.json", &index); // Blob order must not matter.
+                builder.finish().unwrap();
+            }
+            original.seek(SeekFrom::Start(0)).unwrap();
+            let (synthetic, recovered) = super::oci_archive_compatibility(&mut original)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered, config);
+            let manifest: serde_json::Value = serde_json::from_slice(&synthetic).unwrap();
+            assert_eq!(
+                manifest[0]["Config"],
+                format!("blobs/sha256/{}", &config_digest[7..])
+            );
+            assert_eq!(
+                manifest[0]["Layers"][0],
+                format!("blobs/sha256/{}", &layer_digest[7..])
+            );
+
+            original.seek(SeekFrom::Start(0)).unwrap();
+            let mut result = tempfile::tempfile().unwrap();
+            let (worker, _) =
+                super::spawn_oci_archive_copy(original, result.try_clone().unwrap(), synthetic);
+            worker.join().unwrap().unwrap();
+            result.seek(SeekFrom::Start(0)).unwrap();
+            let mut output = tar::Archive::new(result);
+            let mut member = output
+                .entries()
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| entry.path().unwrap() == std::path::Path::new("manifest.json"))
+                .unwrap();
+            let mut raw = Vec::new();
+            member.read_to_end(&mut raw).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+                manifest
+            );
+        }
+    }
+
     #[test]
     fn cold_layout_is_bounded_by_manifest_and_available_disk() {
         use super::{cold_layout_fits, COLD_LAYOUT_FREE_RESERVE_BYTES, MAX_COLD_LAYOUT_BYTES};
@@ -7000,11 +7429,45 @@ mod tests {
         std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::BACKEND);
         std::env::remove_var(guest_env::DNS);
+        std::env::remove_var(guest_env::DNS_OPTIONS);
+
+        // Same order as the TSI boot repair (`tsi_resolv_conf`).
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+        );
+    }
+
+    #[test]
+    fn overlay_resolv_conf_carries_resolver_options_on_every_path() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::DNS);
+        std::env::set_var(
+            guest_env::DNS_OPTIONS,
+            "timeout:1 attempts:3 rotate use-vc bogus",
+        );
 
         assert_eq!(
             overlay_resolv_conf_contents(),
-            "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:3 rotate use-vc\n"
         );
+        std::env::set_var(guest_env::DNS, "100.100.100.100");
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 100.100.100.100\noptions timeout:1 attempts:3 rotate use-vc\n"
+        );
+        // The filter proxy answers on UDP and TCP, so it gets the options too.
+        std::env::set_var(guest_env::DNS_FILTER, "1");
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 127.0.0.1\noptions timeout:1 attempts:3 rotate use-vc\n"
+        );
+
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::DNS);
+        std::env::remove_var(guest_env::DNS_OPTIONS);
     }
 
     #[test]

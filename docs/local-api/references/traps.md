@@ -89,6 +89,20 @@ moves it, to a loopback address only). It has no authentication and answers only
 `/readyz`, `/capacity` and `/metrics`; the machine, exec and file routes are on the TLS port. Only
 `/health` was requested here.
 
+## Local image archives can be OCI layouts
+
+`POST /api/v1/machines` accepts a server-local `image` path to a `docker save` archive, an OCI
+layout tar (optionally gzipped) or an unpacked rootfs directory. For an OCI archive without Docker's
+`manifest.json`, the guest streams a small compatibility manifest into its image flattener; the
+input archive is unchanged. Choose an archive containing a Linux image for the guest's architecture.
+
+**From v1.27.1 the server takes a local path only under `serve start --local-image-dir <DIR>`.**
+Measured on macOS arm64 on v1.27.3, each a `400`: without the flag a create naming a path answers
+``local images are disabled on this server; start `smolvm serve` with --local-image-dir ...``; with
+it, a path that does not resolve inside the directory, symlinks followed, answers `local image
+'<path>' is outside this server's local image directory`; and `"image":"-"` answers `image '-'
+requires CLI stdin`, with or without the flag.
+
 ## Only one server per host, unless you move its rollout port
 
 Every `serve start` binds `127.0.0.1:10081` for the branch-pool rollout routes, whatever `--listen`
@@ -99,7 +113,8 @@ Error: config operation failed: bind guest rollout ingress: 127.0.0.1:10081: Add
 ```
 
 Measured on macOS arm64 on v1.22.2 with another server already holding the port. With
-`SMOLVM_GUEST_ROLLOUT_HOST_PORT=10091` the second server started and answered on `/health`.
+`SMOLVM_GUEST_ROLLOUT_HOST_PORT=10091` the second server started and answered on `/health`. From
+v1.28.2 the same setting is the `--guest-rollout-port` flag; the variable still works.
 
 ## Field names, versions and error bodies
 

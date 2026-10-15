@@ -42,7 +42,8 @@ const MAX_DNS_TCP_PACKET: usize = 65535;
 /// from guest applications go through this proxy.
 pub fn start() {
     // Rewrite resolv.conf to route DNS through our proxy
-    if let Err(e) = std::fs::write("/etc/resolv.conf", "nameserver 127.0.0.1\n") {
+    let contents = smolvm_protocol::resolv::render(&["127.0.0.1"], &crate::resolv_options());
+    if let Err(e) = std::fs::write("/etc/resolv.conf", contents) {
         tracing::warn!(error = %e, "failed to rewrite /etc/resolv.conf for DNS filtering");
         return;
     }

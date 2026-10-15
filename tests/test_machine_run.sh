@@ -648,13 +648,25 @@ run_test "Init: skipped on restart after first successful run" test_init_skipped
 
 test_piped_stdin_cat() {
     local out exit_code=0
-    out=$(echo "hello" | run_with_timeout 15 "$SMOLVM" machine run -i -- cat 2>/dev/null) \
+    # Build the pipe inside the timed command: run_with_timeout backgrounds it,
+    # and a background job's stdin is /dev/null, not the caller's pipe.
+    out=$(run_with_timeout 15 sh -c 'echo hello | "$@"' sh \
+        "$SMOLVM" machine run -i -- cat 2>/dev/null) \
         || exit_code=$?
     [[ $exit_code -eq 0 ]] || { echo "FAIL: exit $exit_code (expected 0)"; return 1; }
     [[ "$out" == *"hello"* ]] || { echo "FAIL: expected 'hello', got: $out"; return 1; }
 }
 
+test_dev_null_stdin_cat() {
+    local exit_code=0
+    # macOS poll() reports /dev/null as POLLNVAL; the host must still see EOF (#1803).
+    run_with_timeout 15 "$SMOLVM" machine run -i -- cat </dev/null >/dev/null 2>&1 \
+        || exit_code=$?
+    [[ $exit_code -eq 0 ]] || { echo "FAIL: exit $exit_code (expected 0)"; return 1; }
+}
+
 run_test "Stdin: piped 'echo hello | run -i cat' returns data" test_piped_stdin_cat || true
+run_test "Stdin: 'run -i cat < /dev/null' exits" test_dev_null_stdin_cat || true
 
 # =============================================================================
 # Status messages go to stderr, not stdout

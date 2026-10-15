@@ -22,7 +22,11 @@ the two rows marked v1.23.0 did.
 | registry credentials | `$HOME/.config/smolvm` | `$HOME/.config/smolvm` |
 | `PATH` block | your shell profile | your shell profile |
 
-The last three are the ones people miss. `smolvm-libs` appears only once a packed `.smolmachine`
+Run as root on Linux without `--prefix`, the installer puts the install prefix and the agent rootfs
+together in `/opt/smolvm` and the launcher in `/usr/local/bin`, and leaves the shell profile alone;
+that is the installer's source at v1.27.3, not a run recorded here.
+
+The last three rows of the table are the ones people miss. `smolvm-libs` appears only once a packed `.smolmachine`
 stub has run, and the last two are deliberately not removed by the uninstaller.
 
 Disk: about 120 MB for the install itself. The first VM then creates sparse disks with 20 GiB

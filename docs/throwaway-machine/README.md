@@ -85,8 +85,11 @@ then take it away before the run that matters (`references/macos.md`, first choi
 `--allow-host <HOSTNAME>` resolves the name at VM start and permits that name **and its
 subdomains**; `--allow-host-pattern <HOSTNAME>` permits the exact name only, and `'*.domain'` the
 subdomains without the apex. `--allow-cidr <CIDR>` permits an address range. All three imply
-`--net`. There is no
-deny-list: a job that needs broad access needs host or fleet controls as well.
+`--net`, and can be combined and used more than once. `--net` alone opens full outbound TCP, UDP and
+DNS, and `--outbound-localhost-only` limits egress to `127.0.0.0/8` and `::1`, also implying `--net`.
+In a Smolfile, `[network] allow_host_patterns` takes the exact and wildcard forms and `allow_hosts`
+the `--allow-host` one. `machine run` has no deny-list flag: a job that needs broad access needs
+host or fleet controls as well.
 
 ```console
 $ smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- \
@@ -99,12 +102,29 @@ wget: bad address 'google.com'                # not in the allow list
 
 A guest that runs Tailscale or another carrier NAT VPN claims `100.64.0.0/10`, which contains the
 link a grant puts it on, `100.96.0.0/30`, and loses its gateway and resolver. `--guest-subnet
-10.200.0.0/30` moves the link. It implies `--net`, so it is a grant in its own right.
+10.200.0.0/30` moves the link: the gateway and resolver take `.1` and the guest `.2`, on virtio-net.
+It implies `--net`, so it is a grant in its own right. Over the API it is `guestSubnet` on create,
+and it cannot be combined with `--network`, since a named network assigns member addresses itself.
 
 `--allow-host-loopback` is a separate grant, off by default, that lets the guest reach services on
 the host's own loopback. Leave it off for untrusted code: it is what stands between an isolated
 run and your local database, your Docker socket and your debuggers. Cloud metadata stays blocked
 either way.
+
+## Publishing ports
+
+`-p HOST:GUEST` forwards a host TCP port to the machine. The server inside must listen on
+`0.0.0.0`, not `127.0.0.1`: a server bound only to the guest's loopback is unreachable from the
+host, and connections are reset. `machine status` shows each published port's listening state.
+Publishing a port gives no outbound access: without `--net` or an allow list the machine serves
+inbound connections only.
+
+`-p HOST:GUEST/udp` forwards a UDP port, for game servers, voice and other datagram services.
+Each remote client gets its own session: the guest sees it as a distinct gateway address and
+port, and its replies reach that client from the published host port. A session ends after two
+minutes of silence. Datagrams up to 1472 bytes pass; larger ones are dropped, since the gateway
+does not fragment. TCP and UDP may publish the same host port number. A branch gets fresh host
+ports for its source's UDP forwards and prints them; `--port` on a branch pins TCP ports only.
 
 ## Mounts are authority
 
@@ -123,12 +143,13 @@ process in the guest can ask the agent to sign with it: with a dummy key loaded,
 `smolvm machine run --net --ssh-agent --image alpine -- sh -c 'apk add -q openssh-client && ssh-add -l'`
 listed its fingerprint from inside the guest.
 
-## Stopping a run is not Ctrl-C
+## Stopping a run
 
-From v1.20.2 interrupting the CLI ends its VM. Interrupting a script that runs the CLI in the
-background, as the packet's own `run.sh` does, or the CLI of a cached run on an older release, can
-leave the VM alive with its workload still running. The packet's `scripts/cleanup.sh --cancel` is
-the cancel; `SKILL.md` and `references/traps.md` carry the measurements and what each host does.
+From v1.20.2 interrupting the CLI ends its VM, and the packet's `run.sh` forwards Ctrl-C and
+`SIGTERM` to the CLI it runs in the background. A script that backgrounds the CLI without
+forwarding, or the CLI of a cached run on an older release, can leave the VM alive with its
+workload still running; the packet's `scripts/cleanup.sh --cancel` is the cancel there. `SKILL.md`
+and `references/traps.md` carry the measurements and what each host does.
 
 ## Platforms
 

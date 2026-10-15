@@ -18,8 +18,11 @@ const IFA_F_NODAD: u8 = 0x02;
 /// 3. set MTU                             (SIOCSIFMTU)
 /// 4. add IPv4 address/prefix             (RTM_NEWADDR via NETLINK_ROUTE)
 /// 5. mark the interface UP               (SIOCGIFFLAGS + SIOCSIFFLAGS)
-/// 6. add the default route               (RTM_NEWROUTE via NETLINK_ROUTE)
-/// 7. write /etc/resolv.conf              (plain file write)
+/// 6. install the gateway neighbor entry  (RTM_NEWNEIGH, when the MAC is
+///    supplied) and its on-link route     (RTM_NEWROUTE scope link)
+/// 7. add the default route               (RTM_NEWROUTE via NETLINK_ROUTE)
+///    with the egress interface attached  (RTA_OIF)
+/// 8. write /etc/resolv.conf              (plain file write)
 /// ```
 ///
 /// Read these functions as:
@@ -29,7 +32,7 @@ const IFA_F_NODAD: u8 = 0x02;
 /// set_mtu()           ~= ip link set dev eth0 mtu ...
 /// add_address_v4()    ~= ip addr add ...
 /// bring_interface_up()~= ip link set dev eth0 up
-/// add_default_route() ~= ip route add default via ...
+/// add_default_route() ~= ip route add default via ... dev ...
 /// ```
 ///
 /// Outcome:
@@ -46,6 +49,9 @@ const IFA_F_NODAD: u8 = 0x02;
 ///   requested virtio-net path
 /// - the address is installed before the route so the kernel already knows the
 ///   guest's on-link subnet when the default gateway is added
+/// - the route names its egress interface (`RTA_OIF`) so the gateway resolves
+///   as on-link even when no connected prefix covers it, as on CNIs that hand
+///   out /32 pod addresses with a link-local gateway
 ///
 /// The Linux kernel interfaces used here are all C ABI calls:
 ///
@@ -66,6 +72,7 @@ pub fn configure_interface(
     address: Ipv4Addr,
     prefix_len: u8,
     gateway: Ipv4Addr,
+    gateway_mac: Option<[u8; 6]>,
     ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
     dns_server: Ipv4Addr,
 ) -> Result<(), String> {
@@ -74,10 +81,14 @@ pub fn configure_interface(
     set_mtu(ifname, mtu)?;
     add_address_v4(ifindex, address, prefix_len)?;
     bring_interface_up(ifname)?;
-    add_default_route_v4(gateway)?;
+    if let Some(gateway_mac) = gateway_mac {
+        add_neigh_static_v4(gateway, gateway_mac, ifindex)?;
+        add_onlink_route_v4(gateway, ifindex)?;
+    }
+    add_default_route_v4(gateway, ifindex)?;
     if let Some((address6, prefix_len6, gateway6)) = ipv6 {
         add_address_v6(ifindex, address6, prefix_len6)?;
-        add_default_route_v6(gateway6)?;
+        add_default_route_v6(gateway6, ifindex)?;
     }
     write_resolv_conf(dns_server)?;
     Ok(())
@@ -272,33 +283,61 @@ fn add_address_v6(ifindex: u32, address: Ipv6Addr, prefix_len: u8) -> Result<(),
     })
 }
 
+/// Install a PERMANENT neighbor entry for the gateway
+/// (`ip neigh replace <gateway> lladdr <mac> dev <ifname> nud permanent`).
+///
+/// CNIs that pre-program the gateway as a static neighbor entry answer no
+/// ARP on the link, so without this entry the guest's ARP for the gateway
+/// stays INCOMPLETE forever and no traffic leaves the VM. The
+/// launcher copies the entry's MAC out of the pod netns and passes it in.
+fn add_neigh_static_v4(gateway: Ipv4Addr, mac: [u8; 6], ifindex: u32) -> Result<(), String> {
+    netlink_newneigh(libc::AF_INET as u8, &gateway.octets(), &mac, ifindex)
+        .map_err(|err| format!("failed to add static neighbor for {}: {}", gateway, err))
+}
+
+/// Install an on-link host route for the gateway
+/// (`ip route add <gateway>/32 dev <ifname> scope link`).
+///
+/// With only `RTA_GATEWAY` on the default route, this kernel refuses the add
+/// with `ENETUNREACH` unless a connected route already covers the gateway.
+/// /32-with-link-local-gateway CNIs have no such prefix, and the pod netns
+/// carries an explicit `gateway/32 scope link` route instead, so mirror it
+/// before the default route goes in.
+fn add_onlink_route_v4(gateway: Ipv4Addr, ifindex: u32) -> Result<(), String> {
+    netlink_newroute_onlink(libc::AF_INET as u8, &gateway.octets(), ifindex)
+        .map_err(|err| format!("failed to add on-link route for {}: {}", gateway, err))
+}
+
 /// Install the default IPv4 route through the provided gateway.
 ///
 /// This is the programmatic equivalent of:
 ///
 /// ```text
-/// ip route add default via <gateway>
+/// ip route add default via <gateway> dev <ifname>
 /// ```
 ///
 /// Outcome:
 /// - traffic for non-local destinations is sent to `gateway`
 ///
-/// Why only a gateway attribute is needed here:
-/// - the default route says "for destinations not matched by a more specific
-///   route, send to this next hop"
-/// - because the guest interface address was installed first, the kernel can
-///   resolve that gateway as reachable on the connected subnet
-fn add_default_route_v4(gateway: Ipv4Addr) -> Result<(), String> {
+/// Why the egress interface is attached (`RTA_OIF`):
+/// - with only `RTA_GATEWAY`, the kernel resolves the next hop through the
+///   connected routes, so the add fails with `ENETUNREACH` when no connected
+///   prefix covers the gateway
+/// - CNIs that hand out a /32 pod address with a link-local gateway have no
+///   such prefix; on the host side those same CNIs program the pod's route as
+///   `via <gateway> dev eth0`, and naming the device makes the kernel treat
+///   the next hop as on-link on that link
+fn add_default_route_v4(gateway: Ipv4Addr, ifindex: u32) -> Result<(), String> {
     let gateway_bytes = gateway.octets();
-    netlink_newroute(libc::AF_INET as u8, &gateway_bytes)
+    netlink_newroute(libc::AF_INET as u8, &gateway_bytes, ifindex)
         .map_err(|err| format!("failed to add default route via {}: {}", gateway, err))
 }
 
 /// Install the default IPv6 route through the provided gateway
-/// (`ip -6 route add default via ...`).
-fn add_default_route_v6(gateway: Ipv6Addr) -> Result<(), String> {
+/// (`ip -6 route add default via ... dev ...`).
+fn add_default_route_v6(gateway: Ipv6Addr, ifindex: u32) -> Result<(), String> {
     let gateway_bytes = gateway.octets();
-    netlink_newroute(libc::AF_INET6 as u8, &gateway_bytes)
+    netlink_newroute(libc::AF_INET6 as u8, &gateway_bytes, ifindex)
         .map_err(|err| format!("failed to add default IPv6 route via {}: {}", gateway, err))
 }
 
@@ -312,7 +351,10 @@ fn add_default_route_v6(gateway: Ipv6Addr) -> Result<(), String> {
 /// DNS configuration in a minimal Linux guest is usually conveyed through
 /// `/etc/resolv.conf`, and that is enough for the MVP.
 fn write_resolv_conf(dns_server: Ipv4Addr) -> Result<(), String> {
-    let contents = format!("nameserver {}\n", dns_server);
+    // `--dns-option` resolver options ride on this file too (one renderer for
+    // every writer, see `smolvm_protocol::resolv`).
+    let options = crate::resolv_options();
+    let contents = smolvm_protocol::resolv::render(&[dns_server.to_string()], &options);
     let direct_err = match std::fs::write("/etc/resolv.conf", &contents) {
         Ok(()) => return Ok(()),
         Err(err) => err,
@@ -530,6 +572,8 @@ fn netlink_newaddr(
 /// C ABI context:
 /// - `rtm_dst_len = 0` means "default route"
 /// - `RTA_GATEWAY` carries the next-hop IPv4 address
+/// - `RTA_OIF` carries the egress interface index, which pins the next-hop
+///   resolution to that link
 ///
 /// Outcome:
 /// - asks the kernel to install a unicast route in the main table
@@ -548,13 +592,16 @@ fn netlink_newaddr(
 ///   scope    = RT_SCOPE_UNIVERSE
 ///   type     = RTN_UNICAST
 /// rtattr RTA_GATEWAY = <gateway address bytes>
+/// rtattr RTA_OIF     = <u32 ifindex>
 /// ```
 ///
 /// `family` selects IPv4 (`AF_INET`, 4-byte gateway) or IPv6 (`AF_INET6`,
 /// 16-byte gateway).
-fn netlink_newroute(family: u8, gateway: &[u8]) -> std::io::Result<()> {
+fn netlink_newroute(family: u8, gateway: &[u8], ifindex: u32) -> std::io::Result<()> {
     let rta_len = rta_space(gateway.len());
-    let msg_len = NLMSG_HDRLEN + RTMSG_LEN + rta_len;
+    let oif = ifindex.to_ne_bytes();
+    let oif_len = rta_space(oif.len());
+    let msg_len = NLMSG_HDRLEN + RTMSG_LEN + rta_len + oif_len;
     let mut buf = vec![0u8; nlmsg_align(msg_len)];
 
     let nlh = buf.as_mut_ptr().cast::<libc::nlmsghdr>();
@@ -581,8 +628,122 @@ fn netlink_newroute(family: u8, gateway: &[u8]) -> std::io::Result<()> {
         (*rtm).rtm_flags = 0;
     }
 
-    let offset = NLMSG_HDRLEN + RTMSG_LEN;
+    let mut offset = NLMSG_HDRLEN + RTMSG_LEN;
     write_rta(&mut buf[offset..], libc::RTA_GATEWAY, gateway);
+    offset += rta_len;
+    write_rta(&mut buf[offset..], libc::RTA_OIF, &oif);
+    netlink_send(&buf)
+}
+
+/// Build and send an `RTM_NEWROUTE` message for an on-link host route.
+///
+/// Same shape as [`netlink_newroute`] except the destination is the explicit
+/// `/32` prefix carried in `RTA_DST` (`rtm_dst_len = 32`), the scope is
+/// `RT_SCOPE_LINK`, and no gateway attribute is present — the kernel routes
+/// the prefix straight out the device. `NLM_F_REPLACE` makes re-runs
+/// idempotent.
+fn netlink_newroute_onlink(family: u8, dst: &[u8], ifindex: u32) -> std::io::Result<()> {
+    let dst_len = rta_space(dst.len());
+    let oif = ifindex.to_ne_bytes();
+    let oif_len = rta_space(oif.len());
+    let msg_len = NLMSG_HDRLEN + RTMSG_LEN + dst_len + oif_len;
+    let mut buf = vec![0u8; nlmsg_align(msg_len)];
+
+    let nlh = buf.as_mut_ptr().cast::<libc::nlmsghdr>();
+    // SAFETY: `buf` is large enough for `nlmsghdr`.
+    unsafe {
+        (*nlh).nlmsg_len = msg_len as u32;
+        (*nlh).nlmsg_type = libc::RTM_NEWROUTE;
+        (*nlh).nlmsg_flags =
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_REPLACE)
+                as u16;
+        (*nlh).nlmsg_seq = 3;
+    }
+
+    let rtm = unsafe { buf.as_mut_ptr().add(NLMSG_HDRLEN).cast::<RtMsg>() };
+    // SAFETY: `buf` is large enough for `RtMsg`.
+    unsafe {
+        (*rtm).rtm_family = family;
+        (*rtm).rtm_dst_len = (dst.len() * 8) as u8;
+        (*rtm).rtm_src_len = 0;
+        (*rtm).rtm_tos = 0;
+        (*rtm).rtm_table = libc::RT_TABLE_MAIN;
+        (*rtm).rtm_protocol = libc::RTPROT_BOOT;
+        (*rtm).rtm_scope = libc::RT_SCOPE_LINK;
+        (*rtm).rtm_type = libc::RTN_UNICAST;
+        (*rtm).rtm_flags = 0;
+    }
+
+    let mut offset = NLMSG_HDRLEN + RTMSG_LEN;
+    write_rta(&mut buf[offset..], libc::RTA_DST, dst);
+    offset += dst_len;
+    write_rta(&mut buf[offset..], libc::RTA_OIF, &oif);
+    netlink_send(&buf)
+}
+
+/// Minimal Linux `ndmsg` layout used by `RTM_NEWNEIGH`.
+#[repr(C)]
+struct NdMsg {
+    ndm_family: u8,
+    ndm_pad1: u8,
+    ndm_pad2: u16,
+    ndm_ifindex: i32,
+    ndm_state: u16,
+    ndm_flags: u8,
+    ndm_type: u8,
+}
+
+const NDMSG_LEN: usize = 12;
+const _: () = assert!(std::mem::size_of::<NdMsg>() == NDMSG_LEN);
+
+/// Build and send an `RTM_NEWNEIGH` message installing a PERMANENT entry.
+///
+/// Message shape:
+///
+/// ```text
+/// nlmsghdr
+///   type  = RTM_NEWNEIGH
+///   flags = REQUEST | ACK | CREATE | REPLACE
+/// ndmsg
+///   family   = AF_INET
+///   ifindex  = <ifindex>
+///   state    = NUD_PERMANENT
+/// rtattr NDA_DST    = <gateway address bytes>
+/// rtattr NDA_LLADDR = <6 MAC bytes>
+/// ```
+fn netlink_newneigh(family: u8, dst: &[u8], lladdr: &[u8], ifindex: u32) -> std::io::Result<()> {
+    let dst_len = rta_space(dst.len());
+    let ll_len = rta_space(lladdr.len());
+    let msg_len = NLMSG_HDRLEN + NDMSG_LEN + dst_len + ll_len;
+    let mut buf = vec![0u8; nlmsg_align(msg_len)];
+
+    let nlh = buf.as_mut_ptr().cast::<libc::nlmsghdr>();
+    // SAFETY: `buf` is large enough for `nlmsghdr`.
+    unsafe {
+        (*nlh).nlmsg_len = msg_len as u32;
+        (*nlh).nlmsg_type = libc::RTM_NEWNEIGH;
+        (*nlh).nlmsg_flags =
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_REPLACE)
+                as u16;
+        (*nlh).nlmsg_seq = 4;
+    }
+
+    let ndm = unsafe { buf.as_mut_ptr().add(NLMSG_HDRLEN).cast::<NdMsg>() };
+    // SAFETY: `buf` is large enough for `NdMsg`.
+    unsafe {
+        (*ndm).ndm_family = family;
+        (*ndm).ndm_pad1 = 0;
+        (*ndm).ndm_pad2 = 0;
+        (*ndm).ndm_ifindex = ifindex as i32;
+        (*ndm).ndm_state = libc::NUD_PERMANENT;
+        (*ndm).ndm_flags = 0;
+        (*ndm).ndm_type = libc::RTN_UNICAST;
+    }
+
+    let mut offset = NLMSG_HDRLEN + NDMSG_LEN;
+    write_rta(&mut buf[offset..], libc::NDA_DST, dst);
+    offset += dst_len;
+    write_rta(&mut buf[offset..], libc::NDA_LLADDR, lladdr);
     netlink_send(&buf)
 }
 

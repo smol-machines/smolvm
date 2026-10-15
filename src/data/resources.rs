@@ -131,6 +131,15 @@ pub struct VmResources {
     /// copy-on-write layer, attached after the managed disks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<crate::data::disk::CacheDisk>,
+    /// Guest paths backed by the machine's storage disk (`-v /var/lib/docker`),
+    /// normalized. See `smolvm_protocol::disk_volume`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
+    /// `Some(exceptions)` blocks private, internal and link-local destinations
+    /// (`--block-private`) while the public internet stays open; each exception
+    /// CIDR (`--allow-private`) re-opens its range. Cloud metadata stays closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -145,6 +154,10 @@ pub struct VmResources {
     /// blocks the default resolver (e.g. 8.8.8.8) still resolve names.
     #[serde(default)]
     pub dns: Option<std::net::Ipv4Addr>,
+    /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
+    /// Empty = none. Validated with `smolvm_protocol::resolv::validate_option`.
+    #[serde(default)]
+    pub dns_options: Vec<String>,
     /// Named inter-VM network to join (virtio-net only). Members lease
     /// distinct guest addresses and route IP packets to each other through
     /// the host-side fabric; VMs on different networks (or none) stay fully
@@ -236,9 +249,12 @@ impl Default for VmResources {
             disk_durability: DiskDurability::Full,
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             allowed_cidrs: None,
             egress_rules: Vec::new(),
             dns: None,
+            dns_options: Vec::new(),
             network_name: None,
             guest_subnet: None,
         }
