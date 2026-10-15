@@ -121,6 +121,27 @@ are `net_backend`, `rosetta`, `cuda`, `auto_graph`, `docker_socket`,
 `block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
 tables; `machine create --help` describes the flag each one mirrors.
 
+## Workspace
+
+A machine captured as a workspace carries, in its checkpoint, what an agent
+needs to use it: the command that serves tools over stdio (MCP), the command
+that checks work, and what was run before the capture so the first call finds
+everything resident.
+
+```toml
+[workspace]
+name = "kicad"
+description = "KiCad 9 with the full libraries, tools for schematic and board work, and a reviewer"
+tools = ["kicad-mcp"]                 # MCP server over stdio, reached with `machine exec -i`
+check = ["kicad-validate", "--json"]  # exits 0 only when the output is valid
+warm = ["python3 -c 'import pcbnew'"] # run before the checkpoint is captured
+homepage = "https://github.com/smol-machines/workspaces"
+```
+
+`machine checkpoint --smolfile <PATH>` writes the table into the artifact's
+manifest, and `pack push` adds it to the OCI manifest annotations so a registry
+can list the workspace by name and description.
+
 ## Merge precedence
 
 CLI flags override Smolfile values. For `machine run` and `machine create`:

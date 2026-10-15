@@ -725,6 +725,29 @@ pub struct CheckpointHostImage {
     pub archive_mtime: u64,
 }
 
+/// What an agent finds in a workspace artifact: the tool server to reach,
+/// the check that judges its output, and how the capture was warmed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceManifest {
+    /// Short name, as the catalog shows it.
+    pub name: String,
+    /// One or two sentences.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Command inside the machine that serves tools over stdio (MCP).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Command inside the machine that validates work; exits 0 only on success.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check: Vec<String>,
+    /// Commands run before capture so the first tool call finds everything resident.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warm: Vec<String>,
+    /// Where to read more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+}
+
 /// Manifest describing the packed image and configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackManifest {
@@ -818,6 +841,11 @@ pub struct PackManifest {
     /// Live execution state when this artifact is a checkpoint (`.checkpoint`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<PortableCheckpointManifest>,
+
+    /// Present when the artifact is a workspace: a prepared machine with a tool
+    /// server and a check an agent can call. Absent on ordinary packs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceManifest>,
 }
 
 /// Inventory of assets included in the packed binary.
@@ -931,6 +959,7 @@ impl PackManifest {
                 workspace_seed: None,
             },
             checkpoint: None,
+            workspace: None,
         }
     }
 

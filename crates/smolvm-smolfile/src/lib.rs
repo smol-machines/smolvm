@@ -366,6 +366,31 @@ pub struct Smolfile {
     pub auth: Option<AuthConfig>,
     /// Service metadata for deployment.
     pub service: Option<ServiceConfig>,
+    /// What this machine offers an agent once captured as a workspace.
+    pub workspace: Option<WorkspaceConfig>,
+}
+
+/// A workspace: the tool server an agent reaches, the check that judges its
+/// output, and what to run before the warm capture.
+#[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    /// Short name, as the catalog shows it.
+    pub name: String,
+    /// One or two sentences.
+    #[serde(default)]
+    pub description: String,
+    /// Command inside the machine that serves tools over stdio (MCP).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Command inside the machine that validates work; exits 0 only on success.
+    #[serde(default)]
+    pub check: Vec<String>,
+    /// Commands run before capture.
+    #[serde(default)]
+    pub warm: Vec<String>,
+    /// Where to read more.
+    pub homepage: Option<String>,
 }
 
 /// Network policy — egress filtering by hostname and/or CIDR.
@@ -697,6 +722,28 @@ protocol = "http"
 
         assert_eq!(sf.auth.unwrap().ssh_agent, Some(true));
         assert_eq!(sf.service.unwrap().port, Some(8080));
+    }
+
+    #[test]
+    fn parse_workspace_table() {
+        let content = r#"
+image = "docker.io/kicad/kicad:9.0.9-full"
+
+[workspace]
+name = "kicad"
+description = "KiCad 9 with tools and a reviewer"
+tools = ["kicad-mcp"]
+check = ["kicad-validate", "--json"]
+warm = ["python3 -c 'import pcbnew'"]
+"#;
+        let sf = parse(content).unwrap();
+        let ws = sf.workspace.unwrap();
+        assert_eq!(ws.name, "kicad");
+        assert_eq!(ws.tools, vec!["kicad-mcp"]);
+        assert_eq!(ws.check, vec!["kicad-validate", "--json"]);
+        assert_eq!(ws.warm.len(), 1);
+        assert!(ws.homepage.is_none());
+        assert!(parse("[workspace]\nname = \"x\"\nbogus = 1\n").is_err());
     }
 
     #[test]

@@ -96,7 +96,7 @@ pub async fn push(
     // manifest a well-behaved OCI 1.1 artifact: any generic client (oras,
     // crane) can pull and classify it, while container runtimes still refuse
     // to run it because the layer media type is not an image layer.
-    let annotations = std::collections::BTreeMap::from([
+    let mut annotations = std::collections::BTreeMap::from([
         (
             "org.opencontainers.image.title".to_string(),
             format!("{repo}:{reference}"),
@@ -106,6 +106,36 @@ pub async fn push(
             format!("{:?}", manifest.mode).to_lowercase(),
         ),
     ]);
+    if manifest.checkpoint.is_some() {
+        annotations.insert(
+            "com.smolmachines.pack.checkpoint".to_string(),
+            "true".to_string(),
+        );
+    }
+    if let Some(ws) = &manifest.workspace {
+        annotations.insert(
+            "com.smolmachines.workspace.name".to_string(),
+            ws.name.clone(),
+        );
+        if !ws.description.is_empty() {
+            annotations.insert(
+                "org.opencontainers.image.description".to_string(),
+                ws.description.clone(),
+            );
+        }
+        if !ws.tools.is_empty() {
+            annotations.insert(
+                "com.smolmachines.workspace.tools".to_string(),
+                ws.tools.join(" "),
+            );
+        }
+        if !ws.check.is_empty() {
+            annotations.insert(
+                "com.smolmachines.workspace.check".to_string(),
+                ws.check.join(" "),
+            );
+        }
+    }
     let oci_manifest = OciManifest {
         schema_version: 2,
         media_type: MANIFEST_MEDIA_TYPE.to_string(),

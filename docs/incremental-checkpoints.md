@@ -62,6 +62,10 @@ from a chain at the limit.
 
 A checkpoint leaves a machine's host directory mounts out unless you ask for
 them, because they bind the artifact to a host where the same paths exist.
+`--smolfile <PATH>` stamps the checkpoint as a workspace from that Smolfile's
+`[workspace]` table (name, description, tools, check, warm). See
+[smolfile.md](smolfile.md#workspace).
+
 `--host-mounts` records each mount (host path, guest path, read-only) and a
 restore attaches them again at the same guest paths; it refuses on a host where
 a recorded directory is missing. `machine pause` always keeps host mounts: a

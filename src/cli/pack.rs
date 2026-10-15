@@ -126,8 +126,41 @@ pub struct CheckpointCmd {
     #[arg(long, value_name = "DIR", hide = true)]
     pub rootfs_dir: Option<PathBuf>,
 
+    /// Stamp the checkpoint as a workspace, described by the `[workspace]`
+    /// table of this Smolfile (name, tools, check, warm)
+    #[arg(long, value_name = "PATH")]
+    pub smolfile: Option<PathBuf>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
+}
+
+/// The `[workspace]` table of a Smolfile as it is written into an artifact.
+pub fn workspace_from_smolfile(
+    path: &std::path::Path,
+) -> smolvm::Result<smolvm_pack::format::WorkspaceManifest> {
+    let smolfile = smolvm::smolfile::load(path)
+        .map_err(|e| smolvm::Error::config("read Smolfile", e.to_string()))?;
+    let ws = smolfile.workspace.ok_or_else(|| {
+        smolvm::Error::config(
+            "checkpoint --smolfile",
+            format!("{} has no [workspace] table", path.display()),
+        )
+    })?;
+    if ws.name.trim().is_empty() {
+        return Err(smolvm::Error::config(
+            "checkpoint --smolfile",
+            "[workspace] name is empty",
+        ));
+    }
+    Ok(smolvm_pack::format::WorkspaceManifest {
+        name: ws.name,
+        description: ws.description,
+        tools: ws.tools,
+        check: ws.check,
+        warm: ws.warm,
+        homepage: ws.homepage,
+    })
 }
 
 impl CheckpointCmd {
@@ -155,6 +188,11 @@ impl CheckpointCmd {
         let name = self
             .name
             .ok_or_else(|| smolvm::Error::config("checkpoint", "--name is required"))?;
+        let workspace = self
+            .smolfile
+            .as_deref()
+            .map(workspace_from_smolfile)
+            .transpose()?;
         let result = smolvm::portable_checkpoint::capture_to_path_with_history(
             &name,
             &self.output,
@@ -165,6 +203,7 @@ impl CheckpointCmd {
                 staging_dir: self.staging_dir,
                 lib_dir: self.lib_dir,
                 rootfs_dir: self.rootfs_dir,
+                workspace,
             },
             self.history,
         )?;

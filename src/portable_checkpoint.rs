@@ -738,6 +738,8 @@ pub struct CaptureOptions {
     pub lib_dir: Option<PathBuf>,
     /// Directory containing the guest agent root filesystem.
     pub rootfs_dir: Option<PathBuf>,
+    /// Stamp the artifact as a workspace with this description.
+    pub workspace: Option<smolvm_pack::format::WorkspaceManifest>,
 }
 
 /// Timings and size returned by a completed portable checkpoint capture.
@@ -2439,6 +2441,7 @@ fn capture_with_completion(
     manifest.entrypoint = vm.entrypoint.clone();
     manifest.cpus = vm.cpus;
     manifest.mem = vm.mem;
+    manifest.workspace = options.workspace.clone();
     let packed_layers = checkpoint_packed_layers(name, vm)?;
     let host_image = checkpoint_host_image(vm)?;
     let credential_ca = checkpoint_credential_ca(name, vm, &snapshot_dir)?;
