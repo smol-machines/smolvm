@@ -318,20 +318,20 @@ pub fn shares_override_stat_layers(dir: &Path) -> bool {
 /// layers to learn that nothing is left to upgrade.
 ///
 /// The marker speaks for the extraction as a whole and carries no vintage: an
-/// entry unpacked before symlink owners were recorded keeps it, and those links
-/// keep showing the host's stat. Re-stamping them here is not cheap — an owner
-/// lives in the layer tar, not on the tree, so it would mean streaming every
-/// staged tar again, under the cache lock, on a boot path. Such a cache is
-/// refreshed by removing the extraction and making it again: on macOS it is the
-/// machine's own directory, so `machine delete` and a fresh create; in the
-/// shared store, `smolvm pack prune --all` (plain `prune` keeps the newest five
-/// entries, so it may remove nothing) with no machine leasing the entry.
+/// entry unpacked before symlink owners were recorded keeps it. On Linux,
+/// [`HOST_LAYER_SYMLINKS_MARKER`] tracks that vintage instead. On macOS such
+/// a cache is refreshed by removing the extraction and making it again: it is
+/// the machine's own directory, so `machine delete` and a fresh create.
 const HOST_LAYERS_MARKER: &str = ".smolvm-host-layers";
 /// Written beside [`HOST_LAYERS_MARKER`] once every host-extracted layer file
 /// belongs to root on the host. Extractions before it chowned each file to its
 /// archived owner, which the per-VM idmapped mount cannot map; a cache hit
 /// without it repairs the entry once (see [`repair_host_layer_owners`]).
 const HOST_LAYER_OWNERS_MARKER: &str = ".smolvm-host-layer-owners";
+/// Written beside [`HOST_LAYERS_MARKER`] once the layers' symlink owners are
+/// recorded on their directories ([`SYMLINK_OWNERS_XATTR`]). A Linux cache hit
+/// without it records them once (see [`repair_host_layer_symlink_owners`]).
+const HOST_LAYER_SYMLINKS_MARKER: &str = ".smolvm-host-layer-symlinks";
 /// The xattr libkrun's virtiofs server reads ownership and mode from (the
 /// rootless-containers convention, `uid:gid:0mode`). Writing it lets an
 /// unprivileged host hand the guest an image's exact owners, setuid bits and
@@ -478,24 +478,82 @@ fn record_override_stat(path: &Path, uid: u64, gid: u64, mode: u32) -> std::io::
 /// same layer inside the guest produces, and what the guest sees when the
 /// layers are read through virtiofs or through the packed image's own unpack.
 ///
-/// Failure is ignored on purpose. Linux's `user.*` namespace does not cover
-/// symlinks at all (`EPERM`), and there the server reads the host's stat as it
-/// always did — the extraction, the link and the rest of the tree are
-/// unaffected. Where the filesystem does store user xattrs on links (APFS does)
-/// the guest gets the archived owner.
+/// Returns whether the link now carries its record. Linux's `user.*` namespace
+/// does not cover symlinks at all (`EPERM`); there the owner goes in the parent
+/// directory's [`SYMLINK_OWNERS_XATTR`] instead. Where the filesystem does
+/// store user xattrs on links (APFS does) the record sits on the link.
 ///
 /// Unix only: `set_user_xattr`'s Windows arm writes an alternate data stream,
 /// and on a reparse point that write lands on the *target*, which would give
 /// the target its link's owner whenever the link is extracted after it.
-fn record_symlink_override_stat(path: &Path, uid: u64, gid: u64) {
+fn record_symlink_override_stat(path: &Path, uid: u64, gid: u64) -> bool {
     #[cfg(unix)]
     {
-        let _ = record_override_stat(path, uid, gid, 0o777);
+        record_override_stat(path, uid, gid, 0o777).is_ok()
     }
     #[cfg(not(unix))]
     {
         let _ = (path, uid, gid);
+        false
     }
+}
+
+/// Where Linux keeps the owners of a directory's symlinks, which cannot carry
+/// user xattrs themselves: `name\0uid:gid\0` pairs on the directory. libkrun's
+/// Linux virtiofs server reads it, and presents an unrecorded link as root's,
+/// so only links owned by someone else need an entry.
+const SYMLINK_OWNERS_XATTR: &str = "user.krun.symlink_owners";
+
+/// Symlink owners that could not be recorded on the links, by directory.
+#[derive(Default)]
+struct PendingSymlinkOwners(
+    std::collections::BTreeMap<PathBuf, std::collections::BTreeMap<std::ffi::OsString, (u64, u64)>>,
+);
+
+impl PendingSymlinkOwners {
+    /// Set (or, for root's, clear) the owner of the link at `path`. A later
+    /// entry at the same path replaces an earlier one, as on disk.
+    fn set(&mut self, path: &Path, owner: (u64, u64)) {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        let dir = normalize_path(dir);
+        if owner == (0, 0) {
+            if let Some(names) = self.0.get_mut(&dir) {
+                names.remove(name);
+            }
+        } else {
+            self.0
+                .entry(dir)
+                .or_default()
+                .insert(name.to_os_string(), owner);
+        }
+    }
+
+    /// Write each directory's record. Best effort, like the per-link record:
+    /// a directory whose record outgrows the filesystem's xattr space (a few
+    /// hundred non-root links in one ext4 directory) keeps its links root's.
+    fn write(self) {
+        for (dir, names) in self.0 {
+            if names.is_empty() {
+                continue;
+            }
+            let _ = set_user_xattr(&dir, SYMLINK_OWNERS_XATTR, &symlink_owners_record(&names));
+        }
+    }
+}
+
+fn symlink_owners_record(
+    names: &std::collections::BTreeMap<std::ffi::OsString, (u64, u64)>,
+) -> Vec<u8> {
+    let mut record = Vec::new();
+    for (name, (uid, gid)) in names {
+        record.extend_from_slice(name.as_encoded_bytes());
+        record.push(0);
+        record.extend_from_slice(format!("{uid}:{gid}").as_bytes());
+        record.push(0);
+    }
+    record
 }
 
 fn packed_agent_unpacks_staged_layers(version: &str) -> bool {
@@ -960,6 +1018,7 @@ fn safe_unpack_skipping<R: Read>(
     // before its children in the tar stream (e.g., Fedora's mode-555
     // /usr/lib64/pm-utils/*.d directories).
     let mut deferred_dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+    let mut symlink_owners = PendingSymlinkOwners::default();
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
@@ -1340,8 +1399,12 @@ fn safe_unpack_skipping<R: Read>(
         // `/bin/sh` included, while the regular files beside it were right.
         if owner_xattr && entry_type != tar::EntryType::Link {
             if entry_type == tar::EntryType::Symlink {
-                record_symlink_override_stat(&full_path, uid, gid);
+                let on_link = record_symlink_override_stat(&full_path, uid, gid);
+                // Only Linux's server reads the directory record.
+                let in_dir = !on_link && cfg!(target_os = "linux");
+                symlink_owners.set(&full_path, if in_dir { (uid, gid) } else { (0, 0) });
             } else {
+                symlink_owners.set(&full_path, (0, 0));
                 // The archived owner and mode (setuid bits included) go in the
                 // xattr the guest sees; the host copy stays readable so the VMM
                 // serving the files can open them.
@@ -1376,6 +1439,10 @@ fn safe_unpack_skipping<R: Read>(
             "checkpoint archive is missing required assets",
         ));
     }
+
+    // Before the directory modes below: setting a directory's xattr needs
+    // write permission on it, which the extraction still guarantees here.
+    symlink_owners.write();
 
     // Apply deferred directory permissions now that all children are written.
     //
@@ -2072,6 +2139,7 @@ fn extract_sidecar_capped(
         // start. Finish the job here, once, under the same lock.
         let upgraded = upgrade_staged_layers(sidecar_path, cache_dir, agent_version, debug)?;
         repair_host_layer_owners(cache_dir, debug)?;
+        repair_host_layer_symlink_owners(cache_dir)?;
         if upgraded && cap_cache {
             if let Some(root) = cache_dir.parent() {
                 evict_cache_to_size_protecting(root, pack_cache_max_bytes(root), Some(cache_dir));
@@ -3277,6 +3345,57 @@ fn repair_host_layer_owners(cache_dir: &Path, debug: bool) -> std::io::Result<()
     fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")
 }
 
+/// Record the symlink owners of a Linux host-extracted layer cache made before
+/// [`HOST_LAYER_SYMLINKS_MARKER`], once.
+///
+/// Those extractions could not record a link's owner (no user xattrs on Linux
+/// symlinks), so every image symlink reached the guest as the host's: root on
+/// a root host, the VMM's user otherwise. The layer tars stay beside their
+/// unpacked trees, and only their headers are needed, so this seeks past every
+/// file body instead of re-reading the image.
+fn repair_host_layer_symlink_owners(cache_dir: &Path) -> std::io::Result<()> {
+    if !cache_dir.join(HOST_LAYERS_MARKER).exists()
+        || cache_dir.join(HOST_LAYER_SYMLINKS_MARKER).exists()
+    {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let layers = cache_dir.join("layers");
+        for entry in fs::read_dir(&layers)? {
+            let tar = entry?.path();
+            if !tar.extension().is_some_and(|ext| ext == "tar") {
+                continue;
+            }
+            let layer_dir = layers.join(tar.file_stem().unwrap_or_default());
+            if !layer_dir.is_dir() {
+                continue;
+            }
+            let canonical = normalize_path(&layer_dir);
+            let mut owners = PendingSymlinkOwners::default();
+            let mut archive = tar::Archive::new(File::open(&tar)?);
+            for entry in archive.entries_with_seek()? {
+                let entry = entry?;
+                let header = entry.header();
+                let path = normalize_path(&layer_dir.join(entry.path()?));
+                // The same containment the extraction enforced.
+                if !path.starts_with(&canonical) {
+                    continue;
+                }
+                // A later entry at a link's path replaces it, as on disk.
+                let owner = if header.entry_type() == tar::EntryType::Symlink {
+                    (header.uid().unwrap_or(0), header.gid().unwrap_or(0))
+                } else {
+                    (0, 0)
+                };
+                owners.set(&path, owner);
+            }
+            owners.write();
+        }
+    }
+    fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")
+}
+
 /// Inner extraction logic (called under the lock).
 /// Unpack, on the host, the layer tars an earlier extraction left staged for
 /// the guest, when this host can now describe their ownership through the
@@ -4142,6 +4261,7 @@ fn post_process_extraction(
         if owner_xattr {
             fs::write(extract_dir.join(OPAQUE_XATTR_MARKER), "user\n")?;
             fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")?;
+            fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")?;
             fs::write(cache_dir.join(HOST_LAYERS_MARKER), "")?;
         }
         // Record the manifest's layer order so the guest stacks overlayfs
@@ -7422,6 +7542,105 @@ mod tests {
         assert_eq!(xattr("ro/old").as_deref(), Some("0:0:020000"));
         assert_eq!(host_mode("ro") & 0o700, 0o700);
         assert_eq!(host_mode("ro/readme") & 0o600, 0o600);
+    }
+
+    /// A tar of symlinks in `usr/bin/`: `a` owned 1234, `b` root's, and `x`
+    /// owned 33 until a later regular file replaces it.
+    #[cfg(target_os = "linux")]
+    fn symlink_owner_layer() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, uid: u64, link: Option<&str>| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(if kind == tar::EntryType::Directory {
+                0o755
+            } else {
+                0o777
+            });
+            header.set_uid(uid);
+            header.set_gid(uid);
+            header.set_size(0);
+            if let Some(link) = link {
+                header.set_link_name(link).unwrap();
+            }
+            header.set_cksum();
+            builder.append_data(&mut header, path, &b""[..]).unwrap();
+        };
+        add("usr/bin/", tar::EntryType::Directory, 0, None);
+        add("usr/bin/a", tar::EntryType::Symlink, 1234, Some("t"));
+        add("usr/bin/b", tar::EntryType::Symlink, 0, Some("t"));
+        add("usr/bin/x", tar::EntryType::Symlink, 33, Some("t"));
+        add("usr/bin/x", tar::EntryType::Regular, 0, None);
+        builder.into_inner().unwrap()
+    }
+
+    /// Linux symlinks cannot carry user xattrs, so a host extraction records
+    /// their non-root owners on the parent directory for libkrun to present.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_xattr_extraction_records_symlink_owners_on_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let layer = symlink_owner_layer();
+        let mut archive = tar::Archive::new(layer.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            read_user_xattr(&dest.join("usr/bin"), SYMLINK_OWNERS_XATTR).as_deref(),
+            Some("a\u{0}1234:1234\u{0}")
+        );
+    }
+
+    /// A Linux cache extracted before symlink owners were recorded gets them
+    /// once from its kept layer tars, then is left alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_layer_cache_gains_symlink_owners_once() {
+        let cache = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(cache.path()) {
+            return;
+        }
+        let layers = cache.path().join("layers");
+        let tree = layers.join("abcd");
+        fs::create_dir_all(&tree).unwrap();
+        let layer = symlink_owner_layer();
+        fs::write(layers.join("abcd.tar"), &layer).unwrap();
+        // An old extraction: the tree, but no directory record.
+        let mut archive = tar::Archive::new(layer.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &tree,
+            &SafeUnpackLimits::from_env(),
+            false,
+            false,
+        )
+        .unwrap();
+        let record = || read_user_xattr(&tree.join("usr/bin"), SYMLINK_OWNERS_XATTR);
+        assert_eq!(record(), None);
+
+        // Not a host-layers cache: untouched.
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record(), None);
+
+        fs::write(cache.path().join(HOST_LAYERS_MARKER), "").unwrap();
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record().as_deref(), Some("a\u{0}1234:1234\u{0}"));
+        assert!(cache.path().join(HOST_LAYER_SYMLINKS_MARKER).exists());
+
+        // Once: a later hit does not rewrite it.
+        set_user_xattr(&tree.join("usr/bin"), SYMLINK_OWNERS_XATTR, b"kept").unwrap();
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record().as_deref(), Some("kept"));
     }
 
     /// A directory entry is spelled with a trailing separator in a tar (`etc/`),
