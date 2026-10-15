@@ -19,6 +19,7 @@
 //! ```
 
 pub mod admission;
+pub(crate) mod cache_base_fetch;
 #[cfg(target_os = "linux")]
 pub(crate) mod device_handoff;
 #[path = "errors.rs"]
@@ -27,6 +28,7 @@ pub mod guest_rollout;
 pub mod handlers;
 pub mod inflight;
 pub mod pool_controller;
+pub mod progress;
 pub mod resize_controller;
 pub mod rollout;
 pub mod state;
@@ -106,7 +108,9 @@ use state::ApiState;
         handlers::machines::sync_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
+        handlers::machines::set_machine_ports,
         handlers::machines::publish_cache_disk,
+        handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
         handlers::machines::put_credential_values,
         handlers::machines::export_machine,
@@ -146,6 +150,7 @@ use state::ApiState;
         types::DeleteQuery,
         types::LogsQuery,
         types::ResizeMachineRequest,
+        types::SetPortsRequest,
         types::CacheDiskSpec,
         types::PublishCacheDiskRequest,
         types::PublishCacheDiskResponse,
@@ -292,6 +297,12 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // above. No request timeout: the transfer is as large as a blob pull, and
     // it runs off the critical path where slowness costs nothing.
     let warm_route = Router::new().route("/artifacts/warm", post(handlers::prewarm::warm_artifact));
+    // Upload of a checkpoint captured with `defer_upload`: no request timeout,
+    // as large as the capture it follows, and mTLS-gated like the routes above.
+    let held_checkpoint_route = Router::new().route(
+        "/checkpoints/{key}/upload",
+        post(handlers::machines::upload_held_checkpoint),
+    );
 
     // Long-lived streaming routes (no request timeout): SSE logs and the
     // interactive PTY WebSocket both outlive the 5-minute API timeout.
@@ -341,10 +352,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/resume", post(handlers::machines::resume_machine))
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
-        .route(
-            "/{id}/cache-disk/publish",
-            post(handlers::machines::publish_cache_disk),
-        )
+        .route("/{id}/ports", put(handlers::machines::set_machine_ports))
         .route(
             "/{id}/egress",
             post(handlers::machines::update_machine_egress),
@@ -382,7 +390,16 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/exec", post(handlers::exec::exec_command))
         .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
         .route("/{id}/run", post(handlers::exec::run_command))
-        .route("/{id}/images/pull", post(handlers::images::pull_image));
+        .route("/{id}/images/pull", post(handlers::images::pull_image))
+        // Flattening and uploading a cache disk scales with its size: a 32 GB
+        // publish ran past the five-minute timeout every time and answered 408
+        // while its upload was still going. It gives up only once it stops
+        // making progress instead.
+        .route(
+            "/{id}/cache-disk/publish",
+            post(handlers::machines::publish_cache_disk)
+                .layer(axum::middleware::from_fn(progress::idle_timeout)),
+        );
 
     // Machine routes
     let machine_routes = Router::new()
@@ -445,12 +462,18 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{name}/batches", post(handlers::rollouts::generate_batch))
         .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES));
 
+    // Cache bases this server holds: the control plane removes one a failed
+    // publish left behind, or one whose cache disk was deleted.
+    let cache_base_routes =
+        Router::new().route("/{base}", delete(handlers::machines::delete_cache_base));
+
     // API v1 routes
     let api_v1 = Router::new()
         .nest("/machines", machine_routes)
         .nest("/pools", pool_routes)
         .nest("/rollout-executors", rollout_routes)
-        .nest("/volumes", volume_routes);
+        .nest("/volumes", volume_routes)
+        .nest("/cache-bases", cache_base_routes);
 
     let cors = build_cors(cors_origins);
 
@@ -464,6 +487,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(drain_route)
         .merge(p2p_route)
         .merge(warm_route)
+        .merge(held_checkpoint_route)
         .merge(metrics_route)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))

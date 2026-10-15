@@ -397,8 +397,9 @@ pub fn resolve_disk_image(dir: &Path, raw_filename: &str) -> (PathBuf, DiskForma
 /// this lives *under* the machine's own [`vm_data_dir`], which means:
 /// - it is reclaimed for free when the data dir is removed on delete;
 /// - it is outside `pack prune`'s scope (never reaped while the machine exists);
-/// - the macOS case-sensitive layers volume is owned 1:1 by the machine, so the
-///   stop/delete paths can detach it unconditionally with no co-tenant risk.
+/// - the macOS case-sensitive volume is owned by this machine and any fork
+///   children linking to it. Stop/delete detach it once those references are
+///   removed; standalone process-lease orphan sweeping never reclaims it.
 ///
 /// The subdir is `pack` (deliberately not `layers`) so it cannot collide with
 /// the `layers/` subtree that `extract_sidecar` creates *inside* this directory.
@@ -462,40 +463,55 @@ pub fn egress_denials_log_file(name: &str) -> PathBuf {
 /// control socket its network runtime serves. Returns once the runtime has the
 /// new list in force.
 pub fn apply_live_egress_policy(name: &str, record: &crate::config::VmRecord) -> Result<()> {
-    use std::io::{Read, Write};
-    let fail = |reason: String| {
-        Error::config(
-            "egress policy",
-            format!("could not change machine '{name}''s allow list while it runs: {reason}"),
-        )
-    };
-    let path = vm_data_dir(name).join(smolvm_network::EGRESS_SOCKET);
-    let mut stream =
-        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2)).map_err(
-            |e| {
-                fail(format!(
-                    "{e}; a machine started before live changes were supported needs a restart"
-                ))
-            },
-        )?;
     let rendered = smolvm_network::egress::render_live_policy(
         record.allowed_cidrs.as_deref().unwrap_or(&[]),
         record.dns_filter_hosts.as_deref().unwrap_or(&[]),
     );
+    send_live_change(name, smolvm_network::EGRESS_SOCKET, &rendered).map_err(|reason| {
+        Error::config(
+            "egress policy",
+            format!("could not change machine '{name}''s allow list while it runs: {reason}"),
+        )
+    })
+}
+
+/// Publish exactly `ports` on a running machine through the ports control
+/// socket its network runtime serves. Returns once the listeners match.
+pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()> {
+    let mappings: Vec<smolvm_network::PortMapping> = ports
+        .iter()
+        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
+        .collect();
+    let rendered = smolvm_network::render_port_mappings(&mappings);
+    send_live_change(name, smolvm_network::PORTS_SOCKET, &rendered).map_err(|reason| {
+        Error::config(
+            "published ports",
+            format!("could not change machine '{name}''s published ports while it runs: {reason}"),
+        )
+    })
+}
+
+fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    use std::io::{Read, Write};
+    let path = vm_data_dir(name).join(socket);
+    let mut stream =
+        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2)).map_err(
+            |e| {
+                format!("{e}; a machine started before live changes were supported needs a restart")
+            },
+        )?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .and_then(|()| stream.write_all(rendered.as_bytes()))
         .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
-        .map_err(|e| fail(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     let mut reply = String::new();
     stream
         .read_to_string(&mut reply)
-        .map_err(|e| fail(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     match reply.trim() {
         "ok" => Ok(()),
-        other => Err(fail(
-            other.strip_prefix("error: ").unwrap_or(other).to_string(),
-        )),
+        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
     }
 }
 
@@ -829,7 +845,7 @@ fn ready_marker_unwritable(_marker: &Path) -> bool {
 /// signal. socket2's `Domain::UNIX` works on unix AND Windows (Win10+), unlike
 /// std's unix-only `UnixListener`, so this builds on every host. Returns None on
 /// any error — readiness then falls back to the marker/ping.
-fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
+pub fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
     let _ = std::fs::remove_file(path);
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).ok()?;
     sock.bind(&socket2::SockAddr::unix(path).ok()?).ok()?;
@@ -1255,7 +1271,11 @@ impl AgentManager {
             if dir.is_dir() {
                 return Ok(dir);
             }
-            for name in ["agent-rootfs.tar.gz", "agent-rootfs.tar"] {
+            for name in [
+                "agent-rootfs.tar.zst",
+                "agent-rootfs.tar.gz",
+                "agent-rootfs.tar",
+            ] {
                 let tar = exe_dir.join(name);
                 if tar.is_file() {
                     return Self::ensure_extracted_rootfs(&tar);
@@ -1354,13 +1374,24 @@ impl AgentManager {
         // Use the system `tar` — it preserves symlinks (e.g. /sbin/init) and modes
         // (the executable agent), which the tar crate handling here would not need
         // to reimplement. Extraction runs on the host before VM boot (unsandboxed).
-        let status = std::process::Command::new("tar")
-            .arg("-xpf")
-            .arg(tar)
-            .arg("-C")
-            .arg(&tmp)
-            .status()
-            .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))?;
+        let status = if tar.extension().is_some_and(|ext| ext == "zst") {
+            Self::extract_zstd_tar(tar, &tmp)
+        } else {
+            std::process::Command::new("tar")
+                .arg("-xpf")
+                .arg(tar)
+                .arg("-C")
+                .arg(&tmp)
+                .status()
+                .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+        };
         // tar's exit status cannot decide this on its own: a healthy Windows
         // extraction also exits non-zero, on the extended-attribute warning.
         if let Err(e) = Self::accept_extraction(&tmp, status) {
@@ -1385,6 +1416,31 @@ impl AgentManager {
             }
         }
         Ok(dest)
+    }
+
+    /// Extract a zstd-compressed rootfs tarball into `dest`: decompressed here
+    /// and streamed into the system `tar`, which then needs no `zstd` program
+    /// of its own (GNU tar shells out to one for `.zst`, and hosts often lack it).
+    fn extract_zstd_tar(tar: &Path, dest: &Path) -> Result<std::process::ExitStatus> {
+        let fail = |e: std::io::Error| Error::storage("extract rootfs tar", e.to_string());
+        let mut decoder = zstd::stream::read::Decoder::new(std::fs::File::open(tar).map_err(fail)?)
+            .map_err(fail)?;
+        let mut child = std::process::Command::new("tar")
+            .arg("-xpf")
+            .arg("-")
+            .arg("-C")
+            .arg(dest)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(fail)?;
+        let copied = {
+            let mut stdin = child.stdin.take().expect("tar stdin is piped");
+            std::io::copy(&mut decoder, &mut stdin)
+        };
+        let status = child.wait().map_err(fail)?;
+        // A decode error means a damaged tarball, whatever tar made of the rest.
+        copied.map_err(fail)?;
+        Ok(status)
     }
 
     /// Get the current state of the agent.
@@ -1813,10 +1869,11 @@ impl AgentManager {
             return Ok(());
         }
         // This runs only on the relaunch path, after stop()/reset_stale_running_state,
-        // so no live VM is using the volume. The original start leaked a lease to keep
-        // it mounted; drop that stale mount (and its lease files) before acquiring a
-        // fresh one, so a config-change restart doesn't stack a second lease/mount on
-        // the first. Gated by the same conditions as the re-acquire below, so the
+        // so this VM is no longer using the volume. The original start leaked a lease
+        // to keep it mounted; drop that stale mount before acquiring a fresh one.
+        // force_detach preserves the mount if fork children still reference it; the
+        // acquisition then reuses it without disturbing their host handles.
+        // Gated by the same conditions as the re-acquire below, so the
         // explicit-start paths (features already `Some`, mount still live) return
         // early above and never detach. macOS hdiutil detach; a no-op on Linux.
         smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
@@ -2753,6 +2810,7 @@ impl AgentManager {
         let packed_layers_dax_window =
             super::virtiofs::packed_layers_window_for_launch(features.snapshot_dir.as_deref());
         let records_window = features.packed_layers_dir.is_some();
+        let leased_layers = features.packed_layers_dir.clone();
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
@@ -2811,6 +2869,13 @@ impl AgentManager {
                 __d
             },
             pod_netns: features.pod_netns,
+            // Ephemeral machines share one runtime directory, so only a named
+            // machine keeps a workload log of its own.
+            workload_log: self.name.as_ref().and_then(|_| {
+                self.vsock_socket
+                    .parent()
+                    .map(crate::workload_log::workload_log_path)
+            }),
         };
         // The operator's egress watchlist, copied beside the vsock socket where
         // the network runtime looks for it (or a stale copy removed when none).
@@ -3001,6 +3066,11 @@ impl AgentManager {
         // the sweep is only driven from serve.) The `child` handle drops without
         // waiting (Rust `Child::drop` is a no-op), leaving the PID for the sweep.
         crate::process::register_vm_child(child_pid);
+        // The layers lease names this launcher; hand it to the VMM so it ends
+        // with the VM rather than with a long-lived `serve`. macOS only.
+        if let Some(layers) = leased_layers.as_deref() {
+            smolvm_pack::extract::hand_machine_layers_lease_to(layers, child_pid);
+        }
         // Captures of this machine record the window its guest booted with.
         if let (Some(name), true) = (self.name(), records_window) {
             if let Some(start) = crate::process::process_start_time(child_pid) {
@@ -3175,6 +3245,7 @@ impl AgentManager {
         pid: crate::process::Pid,
         start_time: Option<u64>,
         guest_is_paused: bool,
+        stop_timeout: Option<Duration>,
     ) -> Result<()> {
         // A paused guest has no vCPU to service the request and nothing left to
         // flush, so skip the handshake rather than wait out its deadline and
@@ -3197,7 +3268,10 @@ impl AgentManager {
                 connected = connection.is_ok(),
                 "shutdown agent connect finished"
             );
-            let shutdown = connection.and_then(|mut client| client.shutdown());
+            let shutdown = connection.and_then(|mut client| match stop_timeout {
+                Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
+                None => client.shutdown(),
+            });
             let acked = shutdown.is_ok();
 
             // Process identity is not proof that guest writes reached disk. A slow
@@ -3238,17 +3312,23 @@ impl AgentManager {
             || process::is_our_process_strict(pid, start_time)
             || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
 
-        if identity_ok {
+        let exit_confirmed = if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
                     "PID start-time not verified, identity confirmed via vsock"
                 );
             }
-            let _ = process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT);
-        }
+            // The stop helper observes the kernel's exit event or reaps our
+            // child. On macOS kill(pid, 0) can still see an exited child until
+            // it is reaped, so a second liveness probe must not override that
+            // confirmed exit (or mistake a recycled PID for this VM).
+            process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT).is_ok()
+        } else {
+            false
+        };
 
-        if process::is_alive(pid) {
+        if !exit_confirmed && process::is_alive(pid) {
             if !identity_ok {
                 // Kill was skipped (no vsock ack, start-time unverifiable) AND the
                 // process is genuinely still alive — a real orphan/leak risk.
@@ -3284,11 +3364,14 @@ impl AgentManager {
         // Include the per-VM readiness marker so the shared rootfs doesn't
         // accumulate one stale marker per VM ever booted.
         let ready_marker = self.ready_marker_path();
+        // The workload log listener's socket; the log itself is kept.
+        let workload_log_socket = self.vsock_socket.with_extension("logs");
         for path in [
             &self.pid_file,
             &self.config_file,
             &self.vsock_socket,
             &ready_marker,
+            &workload_log_socket,
         ] {
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -3436,7 +3519,13 @@ impl AgentManager {
 
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
-        self.stop_inner(false)
+        self.stop_inner(false, None)
+    }
+
+    /// [`stop`](Self::stop), giving the workload `stop_timeout` to exit after
+    /// its stop signal instead of the timeout it was launched with.
+    pub fn stop_with_timeout(&self, stop_timeout: Duration) -> Result<()> {
+        self.stop_inner(false, Some(stop_timeout))
     }
 
     /// Stop a machine whose guest is paused and already quiesced.
@@ -3449,10 +3538,10 @@ impl AgentManager {
     /// burns the deadline and then refuses to stop a machine that is safe to
     /// terminate — leaving it running, and billing, with no way out but delete.
     pub fn stop_paused(&self) -> Result<()> {
-        self.stop_inner(true)
+        self.stop_inner(true, None)
     }
 
-    fn stop_inner(&self, guest_is_paused: bool) -> Result<()> {
+    fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
         let state = {
             let inner = self.inner.lock();
             inner.state
@@ -3462,7 +3551,8 @@ impl AgentManager {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
             if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
-                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused) {
+                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused, stop_timeout)
+                {
                     tracing::warn!(
                         pid,
                         "orphan process still alive, preserving PID/socket files"
@@ -3501,7 +3591,8 @@ impl AgentManager {
         };
 
         if let Some(pid) = child_pid {
-            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused) {
+            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused, stop_timeout)
+            {
                 // Revert to Running — don't lie about state or delete markers
                 {
                     let mut inner = self.inner.lock();
@@ -4042,26 +4133,65 @@ mod tests {
         let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
         // No agent listening, exactly as for a paused guest.
         manager.vsock_socket = temp.path().join("missing-agent.sock");
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id() as crate::process::Pid;
+        // Repeat under CI load to catch intermittent process identity races.
+        for attempt in 0..512 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = child.id() as crate::process::Pid;
 
-        let started = std::time::Instant::now();
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), true);
-        let elapsed = started.elapsed();
-        let survived = matches!(child.try_wait(), Ok(None));
-        let _ = child.kill();
-        let _ = child.wait();
+            // A freshly spawned child can briefly have no macOS proc_pidinfo
+            // start time. Wait for an identity before testing the strict stop path;
+            // without one the stop correctly refuses to signal an unknown PID.
+            let identity_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let start_time = loop {
+                if let Some(start_time) = process::process_start_time(pid) {
+                    break start_time;
+                }
+                if std::time::Instant::now() >= identity_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("spawned test child never acquired a verifiable start time");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
 
-        assert!(result.is_ok(), "a paused guest must stop: {result:?}");
-        assert!(!survived, "the paused VM's process must be gone");
-        // The handshake was skipped, not merely fast: its own deadline is 5s.
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?}, so the shutdown handshake was still attempted"
-        );
+            let before_start = process::process_start_time(pid);
+            let identity_verified = process::is_our_process_strict(pid, Some(start_time));
+            let started = std::time::Instant::now();
+            let result = manager.stop_vm_process(pid, Some(start_time), true, None);
+            let elapsed = started.elapsed();
+            let after_start = process::process_start_time(pid);
+            // NOTE_EXIT can arrive just before a child becomes waitable on
+            // macOS. Give the kernel a bounded interval to finish the exit.
+            let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let survived = loop {
+                match child.try_wait() {
+                    Ok(None) if std::time::Instant::now() < reap_deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(None) => break true,
+                    _ => break false,
+                }
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert!(
+                result.is_ok(),
+                "iteration={attempt}, a paused guest must stop: {result:?}; start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, survived={survived}, elapsed={elapsed:?}"
+            );
+            assert!(
+                !survived,
+                "iteration={attempt}, the paused VM's process must be gone: result={result:?}, start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, elapsed={elapsed:?}"
+            );
+            // The handshake was skipped, not merely fast: its own deadline is 5s.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "took {elapsed:?}, so the shutdown handshake was still attempted"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -4077,7 +4207,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as crate::process::Pid;
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false);
+        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false, None);
         let survived = matches!(child.try_wait(), Ok(None));
         let _ = child.kill();
         let _ = child.wait();
@@ -4307,6 +4437,56 @@ mod tests {
     fn restored_cuda_clones_fail_faster_than_other_boots() {
         assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
         assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
+    }
+
+    // A zstd rootfs tarball extracts through the system tar without a `zstd`
+    // program: modes and symlinks survive, and a damaged one is an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_zstd_rootfs_tarball_extracts_with_modes_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("sbin")).unwrap();
+        std::fs::create_dir_all(src.join("usr/local/bin")).unwrap();
+        let agent = src.join("usr/local/bin/smolvm-agent");
+        std::fs::write(&agent, b"agent").unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", src.join("sbin/init")).unwrap();
+        let tar = dir.path().join("rootfs.tar");
+        assert!(std::process::Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success());
+        let zst = dir.path().join("agent-rootfs.tar.zst");
+        let compressed = zstd::stream::encode_all(std::fs::File::open(&tar).unwrap(), 3).unwrap();
+        std::fs::write(&zst, &compressed).unwrap();
+
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        assert!(AgentManager::extract_zstd_tar(&zst, &out)
+            .unwrap()
+            .success());
+        let mode = std::fs::metadata(out.join("usr/local/bin/smolvm-agent"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read_link(out.join("sbin/init")).unwrap(),
+            std::path::PathBuf::from("/usr/local/bin/smolvm-agent")
+        );
+
+        let damaged = dir.path().join("damaged.tar.zst");
+        std::fs::write(&damaged, &compressed[..compressed.len() / 2]).unwrap();
+        let out2 = dir.path().join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        assert!(AgentManager::extract_zstd_tar(&damaged, &out2).is_err());
     }
 
     #[test]

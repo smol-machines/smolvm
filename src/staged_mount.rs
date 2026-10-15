@@ -18,7 +18,31 @@ use std::path::{Path, PathBuf};
 /// Live `rw` and `ro` mounts are ignored. The caller must hold the machine's
 /// lifecycle lock (or otherwise serialize agent operations) while this runs.
 pub fn sync_staged_mounts(record: &VmRecord, client: &mut AgentClient) -> Result<()> {
+    if !record.staged_mounts_sync_to_host() {
+        // A branch's working copies are its own; the host directories belong
+        // to the machine it was branched from. Not an error here: stop and
+        // delete call this for every machine with staged mounts, and must not
+        // be blocked by a branch that has nothing to write back.
+        return Ok(());
+    }
     sync_mounts(&record.host_mounts(), client)
+}
+
+/// Why an explicit synchronization request for `record` cannot be honored, or
+/// `None` when it can. `machine sync` and the API's sync endpoint ask before
+/// touching the agent, so a branch gets this explanation instead of a silent
+/// no-op.
+pub fn refuse_detached_sync(record: &VmRecord, name: &str) -> Option<Error> {
+    let source = record.staged_mounts_detached_from.as_deref()?;
+    Some(Error::config(
+        "sync",
+        format!(
+            "machine '{name}' is a branch: its staged working copies were seeded from \
+             '{source}' and do not synchronize back to the host, because two branches \
+             would write the same directory. Copy files out with `smolvm machine cp`, or \
+             synchronize '{source}'."
+        ),
+    ))
 }
 
 /// Synchronize staged mounts from a launch configuration that has not yet been
@@ -217,6 +241,17 @@ fn remove_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_branch_is_refused_an_explicit_sync_and_told_who_owns_the_host_tree() {
+        let mut record = VmRecord::new("b1".into(), 1, 512, vec![], vec![], false);
+        record.staged_mounts = vec![(0, "/home/me/project".into(), "/workspace".into())];
+        assert!(refuse_detached_sync(&record, "b1").is_none());
+        record.staged_mounts_detached_from = Some("src".into());
+        let message = refuse_detached_sync(&record, "b1").unwrap().to_string();
+        assert!(message.contains("'b1' is a branch"), "{message}");
+        assert!(message.contains("'src'"), "{message}");
+    }
 
     #[test]
     fn mirror_updates_creates_and_deletes_without_following_symlinks() {

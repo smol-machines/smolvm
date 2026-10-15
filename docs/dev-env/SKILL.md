@@ -13,8 +13,9 @@ on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 The whole use case turns on one fact: **`init` runs once, not on every start**, as
 [`smolfile.md`](../smolfile.md) says, and as the docs site (smolmachines.com/docs) says under "When
-init runs". `smolvm machine create --help` reads "Run command on every VM start" at v1.22.2;
-provisioning that relies on that line is missing on the second boot.
+init runs". `smolvm machine create --help` reads "Run command on every VM start" at v1.22.2, and
+"Run command once, on the machine's first start" from v1.23.7; provisioning that relies on the old
+line is missing on the second boot.
 
 ## Procedure
 
@@ -137,7 +138,7 @@ writes to `/` persist while `tmpfs` mounts do not.
 Full detail in `references/traps.md`. The ones that cost the most:
 
 - **`init` runs once.** `machine create --help` reads "Run command on every VM start" at
-  v1.22.2. Anything that must hold on every boot, a bind mount above all, runs
+  v1.22.2, and says once from v1.23.7. Anything that must hold on every boot, a bind mount above all, runs
   in the command that needs it.
 - **Give a machine you `exec` into a long-lived workload.** Without one, an `exec` right after
   `start` can answer ``the container `smolvm-<hash>` is not running`` instead of running.

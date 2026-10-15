@@ -94,6 +94,11 @@ pub const GATEWAY: &str = "SMOLVM_NETWORK_GATEWAY";
 pub const PREFIX_LEN: &str = "SMOLVM_NETWORK_PREFIX_LEN";
 /// Guest MAC address in colon-separated string form.
 pub const GUEST_MAC: &str = "SMOLVM_NETWORK_GUEST_MAC";
+/// Gateway MAC address in colon-separated string form. Optional: set when the
+/// CNI pre-programs the gateway as a static neighbor entry
+/// so nothing answers ARP on the link, and the guest must install the entry
+/// itself rather than resolve it.
+pub const GATEWAY_MAC: &str = "SMOLVM_NETWORK_GATEWAY_MAC";
 /// Guest IPv6 (ULA) address. Optional: absent means IPv4-only guest config.
 pub const GUEST_IP6: &str = "SMOLVM_NETWORK_GUEST_IP6";
 /// Guest-visible default gateway IPv6 address.
@@ -102,6 +107,10 @@ pub const GATEWAY6: &str = "SMOLVM_NETWORK_GATEWAY6";
 pub const PREFIX_LEN6: &str = "SMOLVM_NETWORK_PREFIX_LEN6";
 /// Guest-visible DNS server IPv4 address.
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
+/// Resolver `options` for the guest's `/etc/resolv.conf`, space-separated
+/// (`--dns-option`, repeatable), e.g. `timeout:1 attempts:3 rotate use-vc`.
+/// Every writer of resolv.conf appends them as one `options` line.
+pub const DNS_OPTIONS: &str = "SMOLVM_NETWORK_DNS_OPTIONS";
 /// Enables the guest-side DNS filtering proxy.
 pub const DNS_FILTER: &str = "SMOLVM_DNS_FILTER";
 /// Enables the guest-side Docker socket bridge: the agent listens on the
@@ -119,3 +128,13 @@ pub const PUBLISH_SOCKETS: &str = "SMOLVM_PUBLISH_SOCKETS";
 /// base. The agent mounts its ext4 filesystem, making one on a blank base,
 /// and exposes it to every workload at the guest path.
 pub const CACHE_DISK: &str = "SMOLVM_CACHE_DISK";
+
+/// Guest paths backed by the machine's storage disk, encoded by
+/// [`crate::disk_volume::encode`]. The agent binds a per-path directory on the
+/// disk at each one in every workload. Absent means none.
+pub const DISK_VOLUMES: &str = "SMOLVM_DISK_VOLUMES";
+
+/// Enables forwarding a detached workload's stdout and stderr to the host over
+/// the `ports::WORKLOAD_LOGS` vsock port, where the host appends them to the
+/// machine's `workload.log`. Absent means the output is discarded.
+pub const WORKLOAD_LOGS: &str = "SMOLVM_WORKLOAD_LOGS";

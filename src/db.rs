@@ -438,6 +438,7 @@ impl SmolvmDb {
     /// Insert or update a VM record.
     pub fn insert_vm(&self, name: &str, record: &VmRecord) -> Result<()> {
         let json = serde_json::to_vec(record).db_err("serialize vm record")?;
+        let existed = self.get_vm(name)?.is_some();
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO vms (name, data) VALUES (?1, ?2)
@@ -446,7 +447,23 @@ impl SmolvmDb {
             )
             .db_err(format!("insert vm '{}'", name))?;
             Ok(())
-        })
+        })?;
+        if !existed {
+            self.journal_insert(name, record);
+        }
+        Ok(())
+    }
+
+    /// Parent lookup for the usage journal's branch-depth walk.
+    fn journal_parent_of(&self, name: &str) -> Option<String> {
+        self.get_vm(name)
+            .ok()
+            .flatten()
+            .and_then(|record| record.golden)
+    }
+
+    fn journal_insert(&self, name: &str, record: &VmRecord) {
+        crate::usage::on_insert(name, record, &|parent| self.journal_parent_of(parent));
     }
 
     /// Insert a VM record only if it doesn't already exist.
@@ -470,6 +487,11 @@ impl SmolvmDb {
                 )
                 .db_err(format!("insert vm '{}'", name))?;
             Ok(changed == 1)
+        })
+        .inspect(|inserted| {
+            if *inserted {
+                self.journal_insert(name, record);
+            }
         })
     }
 
@@ -594,6 +616,11 @@ impl SmolvmDb {
             tx.commit().db_err("commit reserved vm")?;
             Ok(changed == 1)
         })
+        .inspect(|inserted| {
+            if *inserted {
+                self.journal_insert(name, record);
+            }
+        })
     }
 
     /// Release a create reservation if it is still owned by `owner_token`.
@@ -692,6 +719,11 @@ impl SmolvmDb {
 
             tx.commit().db_err("commit vm removal")?;
             Ok(record)
+        })
+        .inspect(|removed| {
+            if let Some(record) = removed {
+                crate::usage::on_remove(name, record);
+            }
         })
     }
 
@@ -900,6 +932,7 @@ impl SmolvmDb {
                 conn.execute_batch("PRAGMA synchronous=FULL;")
                     .db_err("enable durable VM update")?;
             }
+            let mut transition: Option<(VmRecord, VmRecord)> = None;
             let result = (|| {
                 // Reserve the writer before reading. A deferred transaction can
                 // fail with SQLITE_BUSY_SNAPSHOT when it upgrades to a write.
@@ -920,7 +953,9 @@ impl SmolvmDb {
                     Some(bytes) => {
                         let mut record: VmRecord = serde_json::from_slice(&bytes)
                             .db_err(format!("deserialize vm record '{}'", name))?;
+                        let before = record.clone();
                         f(&mut record);
+                        transition = Some((before, record.clone()));
                         if finish_pause {
                             tx.execute(
                                 "UPDATE vm_pause_operations SET consumed = 1 WHERE name = ?1 AND consumed = 0",
@@ -945,6 +980,11 @@ impl SmolvmDb {
             if durable {
                 conn.execute_batch("PRAGMA synchronous=NORMAL;")
                     .db_err("restore VM update policy")?;
+            }
+            if result.is_ok() {
+                if let Some((before, after)) = transition {
+                    crate::usage::on_update(name, &before, &after);
+                }
             }
             result
         })

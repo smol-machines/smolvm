@@ -12,7 +12,7 @@ use std::path::Path;
 const MAX_LOG_SIZE: u64 = 10 * BYTES_PER_MIB;
 
 /// Maximum number of rotated log files to keep.
-const MAX_LOG_FILES: usize = 3;
+pub(crate) const MAX_LOG_FILES: usize = 3;
 
 /// Rotate a log file if it exceeds the size limit.
 ///

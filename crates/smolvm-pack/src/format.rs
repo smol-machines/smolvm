@@ -444,6 +444,21 @@ pub struct CheckpointWorkload {
     pub restart_max_backoff_secs: u64,
 }
 
+/// A host directory the captured machine had mounted. Recorded only when the
+/// capture opted in (`host_mounts`), because it binds the artifact to a host
+/// where the same paths exist; a restore re-attaches each one at its guest path
+/// so the saved VM finds the device topology it was captured with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointHostMount {
+    /// Host directory, as given at `machine create`.
+    pub host_path: String,
+    /// Guest mount point.
+    pub guest_path: String,
+    /// Whether the guest sees it read-only.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// One host-to-guest TCP forward restored around a live VM.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointPort {
@@ -585,6 +600,10 @@ pub struct PortableCheckpointManifest {
     /// Host networking reconstructed around the restored VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<CheckpointNetwork>,
+    /// Host directories mounted into the captured machine, re-attached on
+    /// restore. Empty unless the capture opted in to host-bound mounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_mounts: Vec<CheckpointHostMount>,
     /// The `.smolmachine` whose image layers the captured machine mounted from
     /// the host. They are not in the artifact, so a restore must attach the same
     /// pack again to reproduce the captured device topology.

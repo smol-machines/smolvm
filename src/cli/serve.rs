@@ -38,7 +38,8 @@ EXAMPLES:
   smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
   smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
   smolvm serve start -v                             Enable verbose logging")]
-    Start(ServeStartCmd),
+    // Boxed: the server flags dwarf the other variant.
+    Start(Box<ServeStartCmd>),
 
     /// Export OpenAPI specification for SDK generation
     Openapi(OpenapiCmd),
@@ -47,7 +48,7 @@ EXAMPLES:
 impl ServeCmd {
     pub fn run(self) -> Result<()> {
         match self {
-            ServeCmd::Start(cmd) => cmd.run(),
+            ServeCmd::Start(cmd) => (*cmd).run(),
             ServeCmd::Openapi(cmd) => cmd.run(),
         }
     }
@@ -97,11 +98,29 @@ pub struct ServeStartCmd {
     #[arg(long = "allow-nested-virt")]
     allow_nested_virt: bool,
 
+    /// Loopback port for the guest rollout routes. Every server binds it,
+    /// whatever --listen says, so give each its own to run several on one
+    /// host. Running machines keep the port they started with.
+    #[arg(
+        long = "guest-rollout-port",
+        value_name = "PORT",
+        env = "SMOLVM_GUEST_ROLLOUT_HOST_PORT",
+        default_value_t = smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    guest_rollout_port: u16,
+
     /// Directory of cache disk bases the API may attach (`cacheDisk` on
     /// create) and publish into. A request names a base by file name in this
     /// directory, never by path. Unset: the API refuses cache disks.
     #[arg(long = "cache-disk-dir", value_name = "DIR")]
     cache_disk_dir: Option<std::path::PathBuf>,
+
+    /// Directory of local images the API may create machines from: `docker
+    /// save` / OCI archives and unpacked rootfs directories. A request's `image`
+    /// path must resolve inside it. Unset: the API accepts registry images only.
+    #[arg(long = "local-image-dir", value_name = "DIR")]
+    local_image_dir: Option<std::path::PathBuf>,
 
     /// Flag, or block, guest traffic to destinations on this watchlist. Each line
     /// is `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
@@ -179,6 +198,17 @@ fn server_restore_cache(entries: u16, gib: u64) -> smolvm::portable_checkpoint::
     smolvm::portable_checkpoint::RestoreCache {
         entries: usize::from(entries),
         max_bytes: gib.saturating_mul(1024 * 1024 * 1024),
+    }
+}
+
+/// A failed `serve start` must leave VMs loaded from the database running.
+/// Their managers adopt the live child on reconnect, and would stop it on Drop
+/// unless detached before the last API state reference goes away.
+struct DetachMachinesOnExit(Arc<ApiState>);
+
+impl Drop for DetachMachinesOnExit {
+    fn drop(&mut self) {
+        self.0.detach_all();
     }
 }
 
@@ -313,26 +343,7 @@ impl ServeStartCmd {
         // VMM subprocesses may route exactly one gateway port to the
         // lease-authenticated rollout listener started below. This is internal
         // node configuration, never a guest-supplied egress exception.
-        let guest_rollout_host_port =
-            std::env::var(smolvm::api::guest_rollout::GUEST_ROLLOUT_HOST_PORT_ENV)
-                .ok()
-                .map(|value| {
-                    value
-                        .parse::<u16>()
-                        .ok()
-                        .filter(|port| *port != 0)
-                        .ok_or_else(|| {
-                            smolvm::error::Error::config(
-                                "configure guest rollout ingress",
-                                format!(
-                                    "{} must be an integer between 1 and 65535",
-                                    smolvm::api::guest_rollout::GUEST_ROLLOUT_HOST_PORT_ENV
-                                ),
-                            )
-                        })
-                })
-                .transpose()?
-                .unwrap_or(smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT);
+        let guest_rollout_host_port = self.guest_rollout_port;
         smolvm::network::launch::configure_guest_host_service(
             smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT,
             guest_rollout_host_port,
@@ -430,6 +441,10 @@ impl ServeStartCmd {
         let state = Arc::new(ApiState::new().map_err(|e| {
             smolvm::error::Error::config("initialize api state", format!("{:?}", e))
         })?);
+        // Startup can fail after reconnecting persisted VMs (a port collision,
+        // invalid TLS config, etc.). Disarm adopted managers on every exit path,
+        // including errors before the server reaches its normal shutdown path.
+        let _detach_machines = DetachMachinesOnExit(state.clone());
         state.set_allow_nested_virt(self.allow_nested_virt);
         if let Some(dir) = &self.cache_disk_dir {
             std::fs::create_dir_all(dir).map_err(|e| {
@@ -446,6 +461,16 @@ impl ServeStartCmd {
             })?;
             println!("Cache disks enabled from {}", dir.display());
             state.set_cache_disk_dir(Some(dir));
+        }
+        if let Some(dir) = &self.local_image_dir {
+            let dir = dir.canonicalize().map_err(|e| {
+                smolvm::error::Error::config(
+                    "local image directory",
+                    format!("{}: {e}", dir.display()),
+                )
+            })?;
+            println!("Local images enabled from {}", dir.display());
+            state.set_local_image_dir(Some(dir));
         }
         if let Some(path) = &self.egress_watchlist {
             smolvm::agent::egress_watchlist::enable(path.clone())
@@ -513,6 +538,18 @@ impl ServeStartCmd {
             result
         });
 
+        // Resolve the serve API's TLS posture before binding. In fleet mode this
+        // is fail-closed: a missing/partial mTLS config aborts startup rather
+        // than silently serving plain HTTP (control↔node mTLS, increment 3).
+        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
+            client_cn: self.mtls_client_cn.clone(),
+            allow_peer_blobs: self.mtls_allow_peer_blobs,
+        })
+        .map_err(|e| smolvm::error::Error::Config {
+            operation: "serve tls".to_string(),
+            reason: e.to_string(),
+        })?;
+
         // Spawn supervisor task
         let supervisor_state = state.clone();
         let supervisor_shutdown = shutdown_rx.clone();
@@ -566,18 +603,6 @@ impl ServeStartCmd {
         let local_app = smolvm::api::create_local_router(state.clone(), self.cors_origins.clone());
         let app = smolvm::api::create_router(state, self.cors_origins.clone());
 
-        // Resolve the serve API's TLS posture before binding. In fleet mode this
-        // is fail-closed: a missing/partial mTLS config aborts startup rather
-        // than silently serving plain HTTP (control↔node mTLS, increment 3).
-        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
-            client_cn: self.mtls_client_cn.clone(),
-            allow_peer_blobs: self.mtls_allow_peer_blobs,
-        })
-        .map_err(|e| smolvm::error::Error::Config {
-            operation: "serve tls".to_string(),
-            reason: e.to_string(),
-        })?;
-
         // Listen server on TCP or Unix socket
         let grace = resolve_shutdown_grace(
             self.shutdown_grace,
@@ -601,16 +626,25 @@ impl ServeStartCmd {
         // particular, a pool fill must not register a newly booted worker after
         // `detach_all` has already walked the registry.
         let _ = shutdown_tx.send(true);
-        let guest_rollout_result = guest_rollout_handle.await.map_err(|error| {
-            smolvm::error::Error::config("guest rollout ingress task", error.to_string())
-        })?;
-        if let Err(error) = guest_rollout_result {
-            tracing::error!(%error, "guest rollout ingress stopped unexpectedly");
-            if server_result.is_ok() {
-                return Err(smolvm::error::Error::Io(error));
+        let mut server_result = server_result;
+        match guest_rollout_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "guest rollout ingress stopped unexpectedly");
+                if server_result.is_ok() {
+                    server_result = Err(smolvm::error::Error::Io(error));
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "guest rollout ingress task failed");
+                if server_result.is_ok() {
+                    server_result = Err(smolvm::error::Error::config(
+                        "guest rollout ingress task",
+                        error.to_string(),
+                    ));
+                }
             }
         }
-        server_result?;
         // A blocking resize retains lifecycle ownership until its bounded
         // runtime/agent calls finish. Do not drain/detach underneath that work.
         if let Err(error) = resize_controller_handle.await {
@@ -646,21 +680,15 @@ impl ServeStartCmd {
         let drain = std::env::var("SMOLVM_DRAIN_ON_SHUTDOWN")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
-        if drain {
-            if !smolvm::api::handlers::machines::drain_machines(&drain_state).await {
-                tracing::warn!("drain incomplete; preserving remaining VMs for retry");
-            }
-            drain_state.detach_all();
-        } else {
-            // Non-draining shutdown (a binary-upgrade restart): VMs must survive
-            // for the next `serve` process to reconnect to. Skipping drain isn't
-            // enough — `AgentManager::drop` stops any VM it owns, so tearing down
-            // `ApiState` would kill every running VM. Disarm each manager's Drop
-            // first, mirroring the CLI's detach-before-exit.
-            drain_state.detach_all();
+        if drain
+            && server_result.is_ok()
+            && !smolvm::api::handlers::machines::drain_machines(&drain_state).await
+        {
+            tracing::warn!("drain incomplete; preserving remaining VMs for retry");
         }
-
-        Ok(())
+        // `_detach_machines` disarms every manager after the controllers have
+        // stopped, whether shutdown was graceful or an HTTP listener failed.
+        server_result
     }
 
     async fn serve_tcp(
@@ -1183,6 +1211,29 @@ mod tests {
             super::ServeStartCmd::try_parse_from(["serve", "--restore-cache-entries", "2000"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_guest_rollout_port_defaults_to_the_guest_port_and_can_move() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            super::ServeStartCmd::try_parse_from(
+                std::iter::once("serve").chain(args.iter().copied()),
+            )
+        };
+        if std::env::var_os("SMOLVM_GUEST_ROLLOUT_HOST_PORT").is_none() {
+            assert_eq!(
+                parse(&[]).unwrap().guest_rollout_port,
+                smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT
+            );
+        }
+        assert_eq!(
+            parse(&["--guest-rollout-port", "10091"])
+                .unwrap()
+                .guest_rollout_port,
+            10091
+        );
+        assert!(parse(&["--guest-rollout-port", "0"]).is_err());
     }
 
     #[test]

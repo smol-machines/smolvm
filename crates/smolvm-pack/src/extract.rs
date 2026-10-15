@@ -90,8 +90,9 @@ pub(crate) fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Set a Unix file mode on `path`, ignoring errors. No-op on non-Unix targets
-/// (Windows has no POSIX mode bits).
+/// Set a Unix file mode on `path`, ignoring errors. Windows has no POSIX mode
+/// bits, so there only the owner-write bit applies, as the read-only attribute
+/// tar sets on an entry archived without it.
 #[inline]
 fn set_mode(path: &Path, mode: u32) {
     #[cfg(unix)]
@@ -100,7 +101,11 @@ fn set_mode(path: &Path, mode: u32) {
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, mode);
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(mode & 0o200 == 0);
+            let _ = std::fs::set_permissions(path, perms);
+        }
     }
 }
 
@@ -296,21 +301,37 @@ fn packed_agent_mounts_userxattr(version: &str) -> bool {
 /// live in the `user.overlay.*` namespace; the guest then mounts the overlay
 /// with `userxattr`. Read by the agent.
 pub const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+
+/// Whether the layers shared from `dir` carry their ownership in the override
+/// xattr, so the virtiofs server must present it. A machine shares the
+/// extraction's `layers/` dir, where the marker sits; the export helper shares
+/// the pack root above it, which only checked its own top level and so read
+/// every host-extracted layer with raw host owners: root as the VMM's uid and
+/// `_apt` as 65534, baked into the exported `.smolmachine`.
+pub fn shares_override_stat_layers(dir: &Path) -> bool {
+    dir.join(OPAQUE_XATTR_MARKER).is_file()
+        || dir.join("layers").join(OPAQUE_XATTR_MARKER).is_file()
+}
 /// Written beside the extraction marker once every staged layer tar has been
 /// unpacked on the host with its ownership recorded in the override xattr.
 /// A cache hit reads this instead of listing (and on macOS mounting) the
 /// layers to learn that nothing is left to upgrade.
 ///
 /// The marker speaks for the extraction as a whole and carries no vintage: an
-/// entry unpacked before symlink owners were recorded keeps it, and those links
-/// keep showing the host's stat. Re-stamping them here is not cheap — an owner
-/// lives in the layer tar, not on the tree, so it would mean streaming every
-/// staged tar again, under the cache lock, on a boot path. Such a cache is
-/// refreshed by removing the extraction and making it again: on macOS it is the
-/// machine's own directory, so `machine delete` and a fresh create; in the
-/// shared store, `smolvm pack prune --all` (plain `prune` keeps the newest five
-/// entries, so it may remove nothing) with no machine leasing the entry.
+/// entry unpacked before symlink owners were recorded keeps it. On Linux,
+/// [`HOST_LAYER_SYMLINKS_MARKER`] tracks that vintage instead. On macOS such
+/// a cache is refreshed by removing the extraction and making it again: it is
+/// the machine's own directory, so `machine delete` and a fresh create.
 const HOST_LAYERS_MARKER: &str = ".smolvm-host-layers";
+/// Written beside [`HOST_LAYERS_MARKER`] once every host-extracted layer file
+/// belongs to root on the host. Extractions before it chowned each file to its
+/// archived owner, which the per-VM idmapped mount cannot map; a cache hit
+/// without it repairs the entry once (see [`repair_host_layer_owners`]).
+const HOST_LAYER_OWNERS_MARKER: &str = ".smolvm-host-layer-owners";
+/// Written beside [`HOST_LAYERS_MARKER`] once the layers' symlink owners are
+/// recorded on their directories ([`SYMLINK_OWNERS_XATTR`]). A Linux cache hit
+/// without it records them once (see [`repair_host_layer_symlink_owners`]).
+const HOST_LAYER_SYMLINKS_MARKER: &str = ".smolvm-host-layer-symlinks";
 /// The xattr libkrun's virtiofs server reads ownership and mode from (the
 /// rootless-containers convention, `uid:gid:0mode`). Writing it lets an
 /// unprivileged host hand the guest an image's exact owners, setuid bits and
@@ -457,24 +478,82 @@ fn record_override_stat(path: &Path, uid: u64, gid: u64, mode: u32) -> std::io::
 /// same layer inside the guest produces, and what the guest sees when the
 /// layers are read through virtiofs or through the packed image's own unpack.
 ///
-/// Failure is ignored on purpose. Linux's `user.*` namespace does not cover
-/// symlinks at all (`EPERM`), and there the server reads the host's stat as it
-/// always did — the extraction, the link and the rest of the tree are
-/// unaffected. Where the filesystem does store user xattrs on links (APFS does)
-/// the guest gets the archived owner.
+/// Returns whether the link now carries its record. Linux's `user.*` namespace
+/// does not cover symlinks at all (`EPERM`); there the owner goes in the parent
+/// directory's [`SYMLINK_OWNERS_XATTR`] instead. Where the filesystem does
+/// store user xattrs on links (APFS does) the record sits on the link.
 ///
 /// Unix only: `set_user_xattr`'s Windows arm writes an alternate data stream,
 /// and on a reparse point that write lands on the *target*, which would give
 /// the target its link's owner whenever the link is extracted after it.
-fn record_symlink_override_stat(path: &Path, uid: u64, gid: u64) {
+fn record_symlink_override_stat(path: &Path, uid: u64, gid: u64) -> bool {
     #[cfg(unix)]
     {
-        let _ = record_override_stat(path, uid, gid, 0o777);
+        record_override_stat(path, uid, gid, 0o777).is_ok()
     }
     #[cfg(not(unix))]
     {
         let _ = (path, uid, gid);
+        false
     }
+}
+
+/// Where Linux keeps the owners of a directory's symlinks, which cannot carry
+/// user xattrs themselves: `name\0uid:gid\0` pairs on the directory. libkrun's
+/// Linux virtiofs server reads it, and presents an unrecorded link as root's,
+/// so only links owned by someone else need an entry.
+const SYMLINK_OWNERS_XATTR: &str = "user.krun.symlink_owners";
+
+/// Symlink owners that could not be recorded on the links, by directory.
+#[derive(Default)]
+struct PendingSymlinkOwners(
+    std::collections::BTreeMap<PathBuf, std::collections::BTreeMap<std::ffi::OsString, (u64, u64)>>,
+);
+
+impl PendingSymlinkOwners {
+    /// Set (or, for root's, clear) the owner of the link at `path`. A later
+    /// entry at the same path replaces an earlier one, as on disk.
+    fn set(&mut self, path: &Path, owner: (u64, u64)) {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        let dir = normalize_path(dir);
+        if owner == (0, 0) {
+            if let Some(names) = self.0.get_mut(&dir) {
+                names.remove(name);
+            }
+        } else {
+            self.0
+                .entry(dir)
+                .or_default()
+                .insert(name.to_os_string(), owner);
+        }
+    }
+
+    /// Write each directory's record. Best effort, like the per-link record:
+    /// a directory whose record outgrows the filesystem's xattr space (a few
+    /// hundred non-root links in one ext4 directory) keeps its links root's.
+    fn write(self) {
+        for (dir, names) in self.0 {
+            if names.is_empty() {
+                continue;
+            }
+            let _ = set_user_xattr(&dir, SYMLINK_OWNERS_XATTR, &symlink_owners_record(&names));
+        }
+    }
+}
+
+fn symlink_owners_record(
+    names: &std::collections::BTreeMap<std::ffi::OsString, (u64, u64)>,
+) -> Vec<u8> {
+    let mut record = Vec::new();
+    for (name, (uid, gid)) in names {
+        record.extend_from_slice(name.as_encoded_bytes());
+        record.push(0);
+        record.extend_from_slice(format!("{uid}:{gid}").as_bytes());
+        record.push(0);
+    }
+    record
 }
 
 fn packed_agent_unpacks_staged_layers(version: &str) -> bool {
@@ -939,6 +1018,7 @@ fn safe_unpack_skipping<R: Read>(
     // before its children in the tar stream (e.g., Fedora's mode-555
     // /usr/lib64/pm-utils/*.d directories).
     let mut deferred_dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+    let mut symlink_owners = PendingSymlinkOwners::default();
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
@@ -1236,6 +1316,14 @@ fn safe_unpack_skipping<R: Read>(
             entry.header().gid().unwrap_or(0)
         };
 
+        // The owner the host copy gets. When the archived owner travels in the
+        // override xattr, the host copy belongs to root: under the per-VM uid
+        // drop the layers reach the VMM through an idmapped mount that maps
+        // only on-disk id 0, so a file left with its archived owner (42, mode
+        // 0600) could not be opened, nor its xattr read, and the guest saw
+        // 65534 and EACCES even as root.
+        let (host_uid, host_gid) = if owner_xattr { (0, 0) } else { (uid, gid) };
+
         // GNU sparse entries already carry an exact extent map. Let the tar
         // reader seek over those holes directly instead of expanding them and
         // rediscovering zero chunks in `unpack_sparse`. This is especially
@@ -1253,7 +1341,7 @@ fn safe_unpack_skipping<R: Read>(
             // `Entry::unpack_in` handles the sparse extent stream, while these
             // final assignments retain safe_unpack's permission policy.
             set_mode(&full_path, entry.header().mode().unwrap_or(0o644) & 0o777);
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         // For large ordinary files use a sparse write: ftruncate creates the
         // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
         // prevents 10 GiB overlay disks from materialising as dense files on
@@ -1267,7 +1355,7 @@ fn safe_unpack_skipping<R: Read>(
                     format!("failed to unpack '{}': {}", entry_path.display(), e),
                 ));
             }
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         } else {
             if let Err(e) = entry.unpack_in(dest) {
                 // On macOS, certain entries fail to unpack due to platform
@@ -1298,7 +1386,7 @@ fn safe_unpack_skipping<R: Read>(
             // Ownership after the mode is in place: chown clears setuid/setgid,
             // and the deferred directory pass below only restores modes, never
             // owners, so doing it here is the single point that applies.
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         }
         if host_runtime && is_regular {
             set_mode(&full_path, 0o600);
@@ -1311,8 +1399,12 @@ fn safe_unpack_skipping<R: Read>(
         // `/bin/sh` included, while the regular files beside it were right.
         if owner_xattr && entry_type != tar::EntryType::Link {
             if entry_type == tar::EntryType::Symlink {
-                record_symlink_override_stat(&full_path, uid, gid);
+                let on_link = record_symlink_override_stat(&full_path, uid, gid);
+                // Only Linux's server reads the directory record.
+                let in_dir = !on_link && cfg!(target_os = "linux");
+                symlink_owners.set(&full_path, if in_dir { (uid, gid) } else { (0, 0) });
             } else {
+                symlink_owners.set(&full_path, (0, 0));
                 // The archived owner and mode (setuid bits included) go in the
                 // xattr the guest sees; the host copy stays readable so the VMM
                 // serving the files can open them.
@@ -1347,6 +1439,10 @@ fn safe_unpack_skipping<R: Read>(
             "checkpoint archive is missing required assets",
         ));
     }
+
+    // Before the directory modes below: setting a directory's xattr needs
+    // write permission on it, which the extraction still guarantees here.
+    symlink_owners.write();
 
     // Apply deferred directory permissions now that all children are written.
     //
@@ -2042,6 +2138,8 @@ fn extract_sidecar_capped(
         // still holds staged tars, and would hand them to the guest on every
         // start. Finish the job here, once, under the same lock.
         let upgraded = upgrade_staged_layers(sidecar_path, cache_dir, agent_version, debug)?;
+        repair_host_layer_owners(cache_dir, debug)?;
+        repair_host_layer_symlink_owners(cache_dir)?;
         if upgraded && cap_cache {
             if let Some(root) = cache_dir.parent() {
                 evict_cache_to_size_protecting(root, pack_cache_max_bytes(root), Some(cache_dir));
@@ -3199,6 +3297,105 @@ fn restrict_to_owner(dir: &Path) {
     let _ = dir;
 }
 
+/// Give root, on the host, every file of a host-extracted layer cache made
+/// before [`HOST_LAYER_OWNERS_MARKER`], once.
+///
+/// Those extractions chowned each file to its archived owner although the
+/// guest reads ownership from the override xattr. Under the per-VM uid drop the
+/// VMM sees the cache through an idmapped mount that maps only on-disk id 0, so
+/// a private file owned by anyone else could not be opened and the guest saw
+/// 65534 and EACCES, in every machine and branch built on the entry. The xattr
+/// already holds the true owner, so giving the host copy to root loses nothing
+/// (host copies never carry setuid bits; the xattr does). Only root can chown,
+/// and only a root extraction could have left another owner behind.
+fn repair_host_layer_owners(cache_dir: &Path, debug: bool) -> std::io::Result<()> {
+    if !cache_dir.join(HOST_LAYERS_MARKER).exists()
+        || cache_dir.join(HOST_LAYER_OWNERS_MARKER).exists()
+    {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::MetadataExt;
+        let mut repaired = 0u64;
+        let mut pending = vec![cache_dir.join("layers")];
+        while let Some(dir) = pending.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let path = entry?.path();
+                let meta = fs::symlink_metadata(&path)?;
+                if meta.uid() != 0 || meta.gid() != 0 {
+                    set_owner(&path, 0, 0);
+                    repaired += 1;
+                }
+                if meta.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        if debug && repaired > 0 {
+            eprintln!("debug: gave {repaired} host-extracted layer entries back to root");
+        }
+    }
+    let _ = debug;
+    fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")
+}
+
+/// Record the symlink owners of a Linux host-extracted layer cache made before
+/// [`HOST_LAYER_SYMLINKS_MARKER`], once.
+///
+/// Those extractions could not record a link's owner (no user xattrs on Linux
+/// symlinks), so every image symlink reached the guest as the host's: root on
+/// a root host, the VMM's user otherwise. The layer tars stay beside their
+/// unpacked trees, and only their headers are needed, so this seeks past every
+/// file body instead of re-reading the image.
+fn repair_host_layer_symlink_owners(cache_dir: &Path) -> std::io::Result<()> {
+    if !cache_dir.join(HOST_LAYERS_MARKER).exists()
+        || cache_dir.join(HOST_LAYER_SYMLINKS_MARKER).exists()
+    {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let layers = cache_dir.join("layers");
+        for entry in fs::read_dir(&layers)? {
+            let tar = entry?.path();
+            if !tar.extension().is_some_and(|ext| ext == "tar") {
+                continue;
+            }
+            let layer_dir = layers.join(tar.file_stem().unwrap_or_default());
+            if !layer_dir.is_dir() {
+                continue;
+            }
+            let canonical = normalize_path(&layer_dir);
+            let mut owners = PendingSymlinkOwners::default();
+            let mut archive = tar::Archive::new(File::open(&tar)?);
+            for entry in archive.entries_with_seek()? {
+                let entry = entry?;
+                let header = entry.header();
+                let path = normalize_path(&layer_dir.join(entry.path()?));
+                // The same containment the extraction enforced.
+                if !path.starts_with(&canonical) {
+                    continue;
+                }
+                // A later entry at a link's path replaces it, as on disk.
+                let owner = if header.entry_type() == tar::EntryType::Symlink {
+                    (header.uid().unwrap_or(0), header.gid().unwrap_or(0))
+                } else {
+                    (0, 0)
+                };
+                owners.set(&path, owner);
+            }
+            owners.write();
+        }
+    }
+    fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")
+}
+
 /// Inner extraction logic (called under the lock).
 /// Unpack, on the host, the layer tars an earlier extraction left staged for
 /// the guest, when this host can now describe their ownership through the
@@ -4063,6 +4260,8 @@ fn post_process_extraction(
 
         if owner_xattr {
             fs::write(extract_dir.join(OPAQUE_XATTR_MARKER), "user\n")?;
+            fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")?;
+            fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")?;
             fs::write(cache_dir.join(HOST_LAYERS_MARKER), "")?;
         }
         // Record the manifest's layer order so the guest stacks overlayfs
@@ -4298,11 +4497,78 @@ pub fn has_active_leases(cache_dir: &Path) -> bool {
     }
 }
 
+/// Move this process's lease on a named machine's layers volume (`mount` is
+/// the path [`acquire_layers_lease`] returned) to the VMM that uses it, so the
+/// lease ends with the VM. A long-lived launcher such as `smolvm serve` would
+/// otherwise keep it live forever, and [`release_unused_machine_layers_volume`]
+/// would never see the volume as free. Standalone packs keep their own leases.
+pub fn hand_machine_layers_lease_to(mount: &Path, pid: i32) {
+    #[cfg(target_os = "macos")]
+    {
+        if mount.file_name().is_none_or(|name| name != CS_MOUNT_DIR) {
+            return;
+        }
+        let Some(cache_dir) = mount.parent() else {
+            return;
+        };
+        if !is_machine_layers_cache(cache_dir) {
+            return;
+        }
+        let Ok(lock) = lock_leases(cache_dir) else {
+            return;
+        };
+        let leases_dir = cache_dir.join(LEASES_DIR);
+        if fs::write(leases_dir.join(pid.to_string()), "").is_ok() {
+            let _ = fs::remove_file(leases_dir.join(std::process::id().to_string()));
+        }
+        drop(lock);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (mount, pid);
+    }
+}
+
+/// Detach a stopped named machine's layers volume once its last fork child is
+/// gone. The caller has checked that the owning VMM is not alive; this keeps
+/// the volume when a live process holds a lease (a start is mid-launch) or a
+/// child still links to it. Holding the lease lock across the check and the
+/// detach keeps a concurrent acquire from mounting in between.
+pub fn release_unused_machine_layers_volume(cache_dir: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        if !cache_dir.join(LEASES_LOCK).exists() {
+            return;
+        }
+        let Ok(lock) = lock_leases(cache_dir) else {
+            return;
+        };
+        let leases_dir = cache_dir.join(LEASES_DIR);
+        gc_stale_leases(&leases_dir);
+        if count_leases(&leases_dir) == 0 {
+            force_detach_layers_volume(cache_dir);
+        }
+        drop(lock);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cache_dir;
+    }
+}
+
 /// Force-detach and clean up all leases for a cache directory.
 ///
 /// Used by `--force-extract` before clearing the cache. NOT used by normal
 /// `pack prune` — prune should check `has_active_leases` first and skip
 /// active caches.
+///
+/// A named machine's volume is also shared by its fork children. Their pack
+/// symlinks pin it until the children are deleted, even if the source stops.
+/// Once those references are gone, stopping/deleting the source reclaims it,
+/// and so does deleting the last child of a stopped source
+/// ([`release_unused_machine_layers_volume`]).
 pub fn force_detach_layers_volume(cache_dir: &Path) {
     // A fork clone's cache dir is a symlink to its golden's — the clone doesn't
     // own the volume or the leases behind it, so detaching through the link
@@ -4318,6 +4584,19 @@ pub fn force_detach_layers_volume(cache_dir: &Path) {
     {
         let mount_point = cache_dir.join(CS_MOUNT_DIR);
         if mount_point.exists() && is_mount_point(&mount_point) {
+            match machine_layers_have_dependents(cache_dir) {
+                Ok(true) => return,
+                Err(error) => {
+                    // An unreadable ownership inventory is not permission to
+                    // tear a filesystem out from under a possible live child.
+                    eprintln!(
+                        "warning: retaining layers volume {}: {error}",
+                        cache_dir.display()
+                    );
+                    return;
+                }
+                Ok(false) => {}
+            }
             let _ = std::process::Command::new("hdiutil")
                 .args(["detach", "-quiet", "-force"])
                 .arg(&mount_point)
@@ -4490,20 +4769,79 @@ fn detach_if_unused(cache_dir: &Path) {
     }
 }
 
-/// The sibling cache directories that may hold a stranded volume.
-///
-/// Two layouts use this protocol: `<root>/<hash>` (standalone packs) and
-/// `<root>/<hash>/pack` (VM-backed packs). Both are handled by walking up to the
-/// directory that *contains the hashes* and re-applying our own suffix, so we
-/// only ever look at peers of the same shape.
-#[cfg(target_os = "macos")]
+/// Named machines use `<vm-root>/<hash>/pack`; standalone packs use
+/// `<pack-root>/<checksum>`. Named volumes outlive the process that mounts them
+/// and are reclaimed by machine stop/delete, never by process-lease GC.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn is_machine_layers_cache(cache_dir: &Path) -> bool {
+    cache_dir.file_name().is_some_and(|name| name == "pack")
+}
+
+/// Fork children link their pack directory to the source (possibly through
+/// another child). Keep that immutable volume while any such reference exists.
+/// Stopped children count too: liveness lives in machine records, which this
+/// crate cannot see, so a link is treated as a possible user. Deleting the last
+/// child of a stopped source releases the volume
+/// ([`release_unused_machine_layers_volume`]).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn machine_layers_have_dependents(cache_dir: &Path) -> std::io::Result<bool> {
+    if !is_machine_layers_cache(cache_dir) {
+        return Ok(false);
+    }
+    let Some(root) = cache_dir.parent().and_then(Path::parent) else {
+        return Ok(false);
+    };
+    let source = fs::canonicalize(cache_dir)?;
+    for entry in fs::read_dir(root)? {
+        let peer = entry?.path().join("pack");
+        let metadata = match peer.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: ignoring unreadable sibling layers reference {}: {error}",
+                    peer.display()
+                );
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            match fs::canonicalize(&peer) {
+                Ok(target) if target == source => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    // A malformed peer or a chain exceeding the OS symlink
+                    // limit must not pin every unrelated machine's volume.
+                    // Valid fork trees retain their direct child reference:
+                    // deleting an ancestor while it has children is refused.
+                    eprintln!(
+                        "warning: ignoring unresolved sibling layers reference {}: {error}",
+                        peer.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Standalone sibling caches that may hold a stranded process-owned volume.
+/// The start CLI's exit says nothing about a named VMM's liveness. In particular,
+/// walking `<vm-root>/<hash>/pack` peers would detach running sibling machines.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn sibling_cache_dirs(cache_dir: &Path) -> Vec<PathBuf> {
-    let nested = cache_dir.file_name().is_some_and(|n| n == "pack");
-    let Some(root) = (if nested {
-        cache_dir.parent().and_then(Path::parent)
-    } else {
-        cache_dir.parent()
-    }) else {
+    if is_machine_layers_cache(cache_dir) {
+        return Vec::new();
+    }
+    let Some(root) = cache_dir.parent() else {
         return Vec::new();
     };
     let Ok(entries) = fs::read_dir(root) else {
@@ -4511,14 +4849,8 @@ fn sibling_cache_dirs(cache_dir: &Path) -> Vec<PathBuf> {
     };
     entries
         .filter_map(|e| e.ok())
-        .map(|e| {
-            if nested {
-                e.path().join("pack")
-            } else {
-                e.path()
-            }
-        })
-        .filter(|p| p != cache_dir && p.is_dir())
+        .map(|e| e.path())
+        .filter(|p| p != cache_dir && p.is_dir() && !p.is_symlink())
         .collect()
 }
 
@@ -7212,11 +7544,111 @@ mod tests {
         assert_eq!(host_mode("ro/readme") & 0o600, 0o600);
     }
 
+    /// A tar of symlinks in `usr/bin/`: `a` owned 1234, `b` root's, and `x`
+    /// owned 33 until a later regular file replaces it.
+    #[cfg(target_os = "linux")]
+    fn symlink_owner_layer() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, uid: u64, link: Option<&str>| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(if kind == tar::EntryType::Directory {
+                0o755
+            } else {
+                0o777
+            });
+            header.set_uid(uid);
+            header.set_gid(uid);
+            header.set_size(0);
+            if let Some(link) = link {
+                header.set_link_name(link).unwrap();
+            }
+            header.set_cksum();
+            builder.append_data(&mut header, path, &b""[..]).unwrap();
+        };
+        add("usr/bin/", tar::EntryType::Directory, 0, None);
+        add("usr/bin/a", tar::EntryType::Symlink, 1234, Some("t"));
+        add("usr/bin/b", tar::EntryType::Symlink, 0, Some("t"));
+        add("usr/bin/x", tar::EntryType::Symlink, 33, Some("t"));
+        add("usr/bin/x", tar::EntryType::Regular, 0, None);
+        builder.into_inner().unwrap()
+    }
+
+    /// Linux symlinks cannot carry user xattrs, so a host extraction records
+    /// their non-root owners on the parent directory for libkrun to present.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_xattr_extraction_records_symlink_owners_on_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let layer = symlink_owner_layer();
+        let mut archive = tar::Archive::new(layer.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            read_user_xattr(&dest.join("usr/bin"), SYMLINK_OWNERS_XATTR).as_deref(),
+            Some("a\u{0}1234:1234\u{0}")
+        );
+    }
+
+    /// A Linux cache extracted before symlink owners were recorded gets them
+    /// once from its kept layer tars, then is left alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_layer_cache_gains_symlink_owners_once() {
+        let cache = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(cache.path()) {
+            return;
+        }
+        let layers = cache.path().join("layers");
+        let tree = layers.join("abcd");
+        fs::create_dir_all(&tree).unwrap();
+        let layer = symlink_owner_layer();
+        fs::write(layers.join("abcd.tar"), &layer).unwrap();
+        // An old extraction: the tree, but no directory record.
+        let mut archive = tar::Archive::new(layer.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &tree,
+            &SafeUnpackLimits::from_env(),
+            false,
+            false,
+        )
+        .unwrap();
+        let record = || read_user_xattr(&tree.join("usr/bin"), SYMLINK_OWNERS_XATTR);
+        assert_eq!(record(), None);
+
+        // Not a host-layers cache: untouched.
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record(), None);
+
+        fs::write(cache.path().join(HOST_LAYERS_MARKER), "").unwrap();
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record().as_deref(), Some("a\u{0}1234:1234\u{0}"));
+        assert!(cache.path().join(HOST_LAYER_SYMLINKS_MARKER).exists());
+
+        // Once: a later hit does not rewrite it.
+        set_user_xattr(&tree.join("usr/bin"), SYMLINK_OWNERS_XATTR, b"kept").unwrap();
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record().as_deref(), Some("kept"));
+    }
+
     /// A directory entry is spelled with a trailing separator in a tar (`etc/`),
     /// and its owner record still has to land on the directory. On Windows the
     /// record is an alternate data stream, and `...\etc/:name` is not a valid
     /// stream path: every layer holding a directory failed to extract with
-    /// os error 123, so no packed image could run.
+    /// os error 123, so no packed image could run. A stream is also refused on
+    /// a read-only entry (os error 5), which every image's `0555` `proc/` is.
     #[test]
     fn owner_xattr_extraction_records_owners_of_directory_entries() {
         let root = tempfile::tempdir().unwrap();
@@ -7239,6 +7671,8 @@ mod tests {
         add("etc/", tar::EntryType::Directory, 0o755, 0, b"");
         add("etc/nested/", tar::EntryType::Directory, 0o755, 0, b"");
         add("etc/nested/conf", tar::EntryType::Regular, 0o644, 0, b"c");
+        add("proc/", tar::EntryType::Directory, 0o555, 0, b"");
+        add("etc/readonly", tar::EntryType::Regular, 0o444, 0, b"r");
         let tar_bytes = builder.into_inner().unwrap();
 
         let dest = root.path().join("layer");
@@ -7259,7 +7693,126 @@ mod tests {
         assert_eq!(xattr("etc").as_deref(), Some("0:0:0755"));
         assert_eq!(xattr("etc/nested").as_deref(), Some("0:0:0755"));
         assert_eq!(xattr("etc/nested/conf").as_deref(), Some("0:0:0644"));
+        assert_eq!(xattr("proc").as_deref(), Some("0:0:0555"));
+        assert_eq!(xattr("etc/readonly").as_deref(), Some("0:0:0444"));
         assert_eq!(fs::read(dest.join("private/secret")).unwrap(), b"s");
+    }
+
+    /// The incident: as root, owner-xattr extraction chowned each host file to
+    /// its archived owner. Under the per-VM uid drop the idmapped mount maps
+    /// only on-disk id 0, so a private `42:0` directory reached the guest as
+    /// 65534 and refused even root. The host copy must belong to root, and the
+    /// archived owner live only in the xattr. Needs root to mean anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_xattr_extraction_leaves_host_copies_owned_by_root() {
+        use std::os::unix::fs::MetadataExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add =
+            |path: &str, kind: tar::EntryType, mode: u32, uid: u64, gid: u64, data: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(kind);
+                header.set_mode(mode);
+                header.set_uid(uid);
+                header.set_gid(gid);
+                header.set_size(data.len() as u64);
+                header.set_cksum();
+                builder.append_data(&mut header, path, data).unwrap();
+            };
+        add("data/", tar::EntryType::Directory, 0o700, 42, 0, b"");
+        add("data/secret", tar::EntryType::Regular, 0o600, 42, 0, b"s");
+        add(
+            "home/app/",
+            tar::EntryType::Directory,
+            0o755,
+            1000,
+            1000,
+            b"",
+        );
+        let tar_bytes = builder.into_inner().unwrap();
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        for rel in ["data", "data/secret", "home/app"] {
+            let meta = fs::symlink_metadata(dest.join(rel)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (0, 0), "{rel} host owner");
+        }
+        let xattr = |rel: &str| read_user_xattr(&dest.join(rel), OVERRIDE_STAT_XATTR);
+        assert_eq!(xattr("data").as_deref(), Some("42:0:0700"));
+        assert_eq!(xattr("data/secret").as_deref(), Some("42:0:0600"));
+        assert_eq!(xattr("home/app").as_deref(), Some("1000:1000:0755"));
+
+        // Without the xattr the host copy keeps the archived owner, as before.
+        let plain = root.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &plain,
+            &SafeUnpackLimits::from_env(),
+            false,
+            false,
+        )
+        .unwrap();
+        let meta = fs::symlink_metadata(plain.join("data/secret")).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (42, 0));
+    }
+
+    /// A cache extracted by an engine that chowned host copies to their
+    /// archived owners is repaired once on its next hit: every entry goes back
+    /// to root, the xattr is untouched, and the marker stops a second walk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_host_layer_cache_with_archived_host_owners_is_repaired_once() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("entry");
+        let dir = cache.join("layers").join("aaaa").join("data");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("secret"), b"s").unwrap();
+        std::os::unix::fs::symlink("secret", dir.join("link")).unwrap();
+        fs::write(cache.join(HOST_LAYERS_MARKER), "").unwrap();
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if is_root {
+            for path in [dir.clone(), dir.join("secret"), dir.join("link")] {
+                set_owner(&path, 42, 7);
+            }
+        }
+
+        repair_host_layer_owners(&cache, false).unwrap();
+        assert!(cache.join(HOST_LAYER_OWNERS_MARKER).exists());
+        if is_root {
+            for path in [dir.clone(), dir.join("secret"), dir.join("link")] {
+                let meta = fs::symlink_metadata(&path).unwrap();
+                assert_eq!((meta.uid(), meta.gid()), (0, 0), "{}", path.display());
+            }
+            // Once marked, the walk does not run again.
+            set_owner(&dir.join("secret"), 42, 7);
+            repair_host_layer_owners(&cache, false).unwrap();
+            assert_eq!(fs::metadata(dir.join("secret")).unwrap().uid(), 42);
+        }
+
+        // An entry that never used host layers is left alone and unmarked.
+        let staged = root.path().join("staged");
+        fs::create_dir_all(staged.join("layers")).unwrap();
+        repair_host_layer_owners(&staged, false).unwrap();
+        assert!(!staged.join(HOST_LAYER_OWNERS_MARKER).exists());
     }
 
     /// A symlink entry's archived owner reaches the guest through the override
@@ -8209,8 +8762,8 @@ mod tests {
     }
 }
 
-/// Reaping stranded case-sensitive volumes (macOS-only lease protocol).
-#[cfg(all(test, target_os = "macos"))]
+/// Ownership selection is portable; actual volume operations are macOS-only.
+#[cfg(all(test, unix))]
 mod orphan_reap_tests {
     use super::*;
 
@@ -8230,10 +8783,10 @@ mod orphan_reap_tests {
         assert!(!peers.contains(&root.join("aaa")));
     }
 
-    /// VM-backed packs live at `<root>/<hash>/pack` — a peer is another hash's
-    /// `pack` subdir, not the hash directory itself.
+    /// Named machines outlive the CLI that acquired their layers. Its dead PID
+    /// is not evidence that a sibling machine's volume can be detached.
     #[test]
-    fn nested_layout_keeps_the_pack_suffix() {
+    fn machine_layout_is_not_subject_to_process_orphan_reaping() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         for h in ["aaa", "bbb"] {
@@ -8241,7 +8794,7 @@ mod orphan_reap_tests {
         }
         let peers = sibling_cache_dirs(&root.join("aaa").join("pack"));
 
-        assert_eq!(peers, vec![root.join("bbb").join("pack")]);
+        assert!(peers.is_empty());
     }
 
     /// A hash directory with no `pack` subdir is simply skipped, rather than
@@ -8256,9 +8809,116 @@ mod orphan_reap_tests {
         assert!(sibling_cache_dirs(&root.join("aaa").join("pack")).is_empty());
     }
 
+    #[test]
+    fn standalone_reaper_does_not_follow_cache_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("aaa")).unwrap();
+        fs::create_dir(root.join("bbb")).unwrap();
+        std::os::unix::fs::symlink(root.join("bbb"), root.join("alias")).unwrap();
+        assert_eq!(
+            sibling_cache_dirs(&root.join("aaa")),
+            vec![root.join("bbb")]
+        );
+    }
+
+    #[test]
+    fn machine_references_include_relative_and_transitive_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(root.join("unrelated/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+        fs::create_dir(root.join("child")).unwrap();
+        std::os::unix::fs::symlink("../source/pack", root.join("child/pack")).unwrap();
+        fs::create_dir(root.join("grandchild")).unwrap();
+        std::os::unix::fs::symlink("../child/pack", root.join("grandchild/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        fs::remove_file(root.join("grandchild/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        fs::remove_file(root.join("child/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn unrelated_and_dangling_references_do_not_pin_a_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        for name in ["source/pack", "other/pack", "child", "dangling"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        std::os::unix::fs::symlink("../other/pack", root.join("child/pack")).unwrap();
+        std::os::unix::fs::symlink("../missing/pack", root.join("dangling/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn broken_sibling_reference_does_not_pin_unrelated_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(root.join("loop")).unwrap();
+        std::os::unix::fs::symlink("pack", root.join("loop/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+        fs::create_dir(root.join("child")).unwrap();
+        std::os::unix::fs::symlink("../source/pack", root.join("child/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn long_fork_chain_pins_its_source_without_pinning_unrelated_machines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        let unrelated = root.join("unrelated/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        let mut parent = source.clone();
+        // Exceed OS path-resolution limits. The direct child still proves
+        // ownership, regardless of whether deeper descendants resolve.
+        for index in 0..64 {
+            let child = root.join(format!("child-{index}/pack"));
+            fs::create_dir(child.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&parent, &child).unwrap();
+            parent = child;
+        }
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        assert!(!machine_layers_have_dependents(&unrelated).unwrap());
+    }
+
+    /// The launcher's lease moves to the VMM for named machines only; a
+    /// standalone pack's lease stays with the process that took it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn named_machine_lease_moves_to_the_vmm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = std::process::id().to_string();
+        let machine = tmp.path().join("vms/aaa/pack");
+        let standalone = tmp.path().join("packs/aaa");
+        for dir in [&machine, &standalone] {
+            fs::create_dir_all(dir.join(LEASES_DIR)).unwrap();
+            fs::write(dir.join(LEASES_DIR).join(&own), "").unwrap();
+            hand_machine_layers_lease_to(&dir.join(CS_MOUNT_DIR), 4242);
+        }
+        assert!(machine.join(LEASES_DIR).join("4242").exists());
+        assert!(!machine.join(LEASES_DIR).join(&own).exists());
+        assert!(standalone.join(LEASES_DIR).join(&own).exists());
+        assert!(!standalone.join(LEASES_DIR).join("4242").exists());
+    }
+
+    #[test]
+    fn unreadable_source_state_still_rejects_detach() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(machine_layers_have_dependents(&tmp.path().join("missing/pack")).is_err());
+    }
+
     /// The reaper must never block: a peer mid-acquire holds its lock, and
     /// waiting on it would stall an unrelated artifact's run.
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_held_lock_is_skipped_not_waited_on() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
@@ -8276,6 +8936,7 @@ mod orphan_reap_tests {
     /// Reaping is a no-op when nothing is mounted — the common case, and it must
     /// not disturb a peer's directory contents.
     #[test]
+    #[cfg(target_os = "macos")]
     fn unmounted_peers_are_left_alone() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
@@ -8288,6 +8949,94 @@ mod orphan_reap_tests {
         reap_orphan_volumes(&root.join("aaa"));
 
         assert!(peer.exists(), "peer directory must survive");
+    }
+
+    /// Real hdiutil control: dead standalone leases are reclaimed, while the
+    /// same dead CLI lease in a named-machine layout must not be reclaimed.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "creates disposable APFS sparse images with hdiutil"]
+    fn native_orphan_sweep_respects_machine_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let machine = root.join("vms/aaa/pack");
+        let peer = root.join("vms/bbb/pack");
+        let standalone = root.join("packs/aaa");
+        let standalone_peer = root.join("packs/bbb");
+        let paths = [&machine, &peer, &standalone, &standalone_peer];
+        for path in paths {
+            fs::create_dir_all(path.join(LEASES_DIR)).unwrap();
+        }
+        struct Cleanup(Vec<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    force_detach_layers_volume(path);
+                }
+            }
+        }
+        let _cleanup = Cleanup(paths.iter().map(|p| p.to_path_buf()).collect());
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let exited_pid = child.id();
+        child.wait().unwrap();
+        for path in [&machine, &standalone] {
+            ensure_cs_volume_mounted(path, false).unwrap();
+            fs::write(path.join(LEASES_DIR).join(exited_pid.to_string()), "").unwrap();
+        }
+        ensure_cs_volume_mounted(&peer, false).unwrap();
+        let lease = acquire_layers_lease(&peer, false).unwrap();
+        assert!(is_mount_point(&lease.path));
+        assert!(is_mount_point(&machine.join(CS_MOUNT_DIR)));
+        reap_orphan_volumes(&standalone_peer);
+        assert!(!is_mount_point(&standalone.join(CS_MOUNT_DIR)));
+        assert!(is_mount_point(&machine.join(CS_MOUNT_DIR)));
+        drop(lease);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "creates a disposable APFS sparse image with hdiutil"]
+    fn native_source_volume_is_pinned_by_child_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let source = root.join("source/pack");
+        let child = root.join("child/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.1);
+                force_detach_layers_volume(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(source.clone(), child.clone());
+        ensure_cs_volume_mounted(&source, false).unwrap();
+        fs::write(source.join(CS_MOUNT_DIR).join("marker"), "source").unwrap();
+        std::os::unix::fs::symlink(&source, &child).unwrap();
+        // A broken, unrelated machine must neither release this live source
+        // early nor prevent its eventual detach after the child is removed.
+        fs::create_dir(root.join("broken")).unwrap();
+        std::os::unix::fs::symlink("pack", root.join("broken/pack")).unwrap();
+        force_detach_layers_volume(&source);
+        force_detach_layers_volume(&child);
+        assert!(is_mount_point(&source.join(CS_MOUNT_DIR)));
+        assert_eq!(
+            fs::read_to_string(child.join(CS_MOUNT_DIR).join("marker")).unwrap(),
+            "source"
+        );
+        fs::remove_file(&child).unwrap();
+        // Deleting the last child releases a stopped source, unless a live
+        // process holds a lease because the source is mid-start.
+        drop(lock_leases(&source).unwrap());
+        fs::create_dir_all(source.join(LEASES_DIR)).unwrap();
+        let live_lease = source.join(LEASES_DIR).join(std::process::id().to_string());
+        fs::write(&live_lease, "").unwrap();
+        release_unused_machine_layers_volume(&source);
+        assert!(is_mount_point(&source.join(CS_MOUNT_DIR)));
+        fs::remove_file(&live_lease).unwrap();
+        release_unused_machine_layers_volume(&source);
+        assert!(!is_mount_point(&source.join(CS_MOUNT_DIR)));
     }
 }
 
