@@ -1206,8 +1206,8 @@ fn staged_tars_signature(tars: &[PathBuf]) -> Result<String> {
 ///
 /// `tar` restores the archived uid/gid when it runs as root, which the agent
 /// always does — that is the whole point of unpacking here rather than on the
-/// host. `--numeric-owner` keeps the image's ids: by name they would resolve
-/// through the agent's Alpine users (a Debian `www-data` group 33 becomes 82).
+/// host. `--numeric-owner` keeps the image's ids instead of resolving the
+/// archived names through the agent's Alpine users, whose ids differ.
 fn extract_layer_tar(tar: &Path, dir: &Path) -> Result<()> {
     extract_layer_tar_with_progress(tar, dir, || {})
 }
