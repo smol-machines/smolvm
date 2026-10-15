@@ -83,9 +83,10 @@ impl MachineSpec {
             self.resources.cpus,
             self.resources.memory_mib,
             mounts,
-            self.ports.iter().map(PortMapping::to_tuple).collect(),
+            Vec::new(),
             self.resources.network,
         );
+        record.set_port_mappings(&self.ports);
         record.staged_mounts = staged_mounts;
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
@@ -486,6 +487,7 @@ pub(crate) fn fork_vm_with_options(
         clone_forkable,
         &[],
         &std::collections::BTreeMap::new(),
+        &[],
         source_policy,
     )?;
 
@@ -621,6 +623,7 @@ pub fn fork_vm_batch(
             fork_env: &[],
             fork_secrets: &empty_secrets,
             hold: false,
+            labels: &[],
         })
         .collect();
     let prepared = crate::agent::fork::prepare_forks(db, golden, &specs, source_policy)?;
@@ -749,7 +752,14 @@ pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
 }
 
 /// Stop a persisted VM and update its DB state.
-pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
+///
+/// `stop_timeout` overrides how long the workload gets to exit after its stop
+/// signal; `None` keeps the timeout it was launched with.
+pub fn stop_vm_with_timeout(
+    db: &SmolvmDb,
+    name: &str,
+    stop_timeout: Option<std::time::Duration>,
+) -> Result<()> {
     let record = get_record(db, name)?;
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -758,7 +768,10 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
         crate::staged_mount::sync_staged_mounts(&record, &mut client)?;
     }
-    manager.stop()?;
+    match stop_timeout {
+        Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
+        None => manager.stop()?,
+    }
     // Detach the per-machine layers volume if a (possibly cross-tool) bundle start
     // left it mounted. Unconditional on purpose: the embedded record may carry no
     // source_smolmachine even when a CLI/API `machine create <bundle>` extracted and
@@ -787,12 +800,21 @@ pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
             ),
         ));
     }
-    let removed = db.remove_vm(name)?;
-    if removed.is_none() {
+    if db.get_vm(name)?.is_none() {
         return Err(Error::vm_not_found(name));
     }
+    // A stopped or crashed branch source can still own the processes holding
+    // its forked RAM. Stop them while the record and their manifests exist, as
+    // the CLI and API deletes do; removing the data dir first leaks the RAM.
+    crate::agent::cleanup_dead_vm_runtime_in_db(name, db)?;
+    let Some(removed) = db.remove_vm(name)? else {
+        return Err(Error::vm_not_found(name));
+    };
 
     let data_dir = crate::agent::vm_data_dir(name);
+    // Release this machine's per-VM uid (root launches only) before the dir
+    // holding its record is removed.
+    crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
     // Detach the per-machine layers volume before removing the data dir, else on
     // macOS the live mountpoint under it makes remove_dir_all fail with "Resource
     // busy", stranding both the mount and the data dir. Unconditional on purpose:
@@ -807,6 +829,16 @@ pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
                 format!("{}: {}", data_dir.display(), e),
             )
         })?;
+    }
+
+    // With the child gone, its parent may hold a RAM generation, disk layers
+    // and a macOS layers mount that nothing references any more.
+    if let Some(parent) = removed.golden.as_deref() {
+        if let Err(error) =
+            crate::agent::fork::collect_parent_generations_after_child_delete(db, parent)
+        {
+            tracing::warn!(%parent, %error, "could not collect unreferenced fork generation");
+        }
     }
 
     Ok(())
@@ -886,14 +918,17 @@ mod tests {
     }
 
     fn test_db() -> SmolvmDb {
+        // The clock alone is not unique: macOS reports microseconds, so tests
+        // running in parallel can read the same instant and share one file.
+        static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "smolvm-embedded-control-{}-{}.db",
+            "smolvm-embedded-control-{}-{unique}-{sequence}.db",
             std::process::id(),
-            unique
         ));
         SmolvmDb::open_at(&path).unwrap()
     }
@@ -1225,7 +1260,11 @@ mod tests {
         let features = merge_record_launch_features(&record, LaunchFeatures::default());
         assert_eq!(
             features.dns_filter_hosts,
-            Some(vec!["api.example.com".into(), "ghcr.io".into()])
+            Some(vec![
+                "api.example.com".into(),
+                "ghcr.io".into(),
+                "githubusercontent.com".into()
+            ])
         );
 
         record.init_completed = true;

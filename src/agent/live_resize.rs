@@ -430,6 +430,11 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
     let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Memory(target_mib))?;
     #[cfg(target_os = "linux")]
     if !crate::process::raise_managed_vmm_memory_budget(name, pid, started, budget)? {
+        // Refused before anything changed, and every earlier attempt on this
+        // VMM stopped at this same check, so no RAM was registered under the
+        // intent. Clear it: left behind, it refused every later checkpoint,
+        // pause and branch of the machine.
+        db.finish_resize(name, &intent)?;
         // Do not silently resize a guest beyond an external/shared cgroup's
         // allowance. External capacity negotiation is a separate integration.
         return Err(Error::agent_conflict("RAM resize", "live RAM growth currently requires a runtime-managed VM memory scope; external limits were not changed"));

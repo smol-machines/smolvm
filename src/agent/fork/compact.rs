@@ -264,8 +264,10 @@ fn raw_data_ranges(path: &Path, size: u64, into: &mut Vec<(u64, u64)>) -> Result
 /// Write `out` as one self-contained qcow2 that reads exactly as `top` does:
 /// no backing file, so it can serve as a new base on its own. Only ranges some
 /// layer of the chain holds are copied, and all-zero chunks are left
-/// unallocated, so the result is no larger than the data it carries.
-pub(crate) fn flatten_standalone(top: &Path, out: &Path) -> Result<()> {
+/// unallocated, so the result is no larger than the data it carries. Calls
+/// `copied` after each chunk, so a caller can tell a long flatten from a
+/// stuck one.
+pub(crate) fn flatten_standalone(top: &Path, out: &Path, copied: &dyn Fn()) -> Result<()> {
     let ChainData { view, size, ranges } = chain_data(top)?;
     runtime()?
         .block_on(async {
@@ -299,6 +301,7 @@ pub(crate) fn flatten_standalone(top: &Path, out: &Path) -> Result<()> {
                         .map_err(|e| compact_err("write data", e))?;
                 }
                 offset += length;
+                copied();
             }
         }
         writer

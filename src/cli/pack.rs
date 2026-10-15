@@ -112,6 +112,11 @@ pub struct CheckpointCmd {
     /// Directory under which large temporary checkpoint assets are staged.
     #[arg(long = "staging-dir", value_name = "DIR", conflicts_with = "store")]
     pub staging_dir: Option<PathBuf>,
+    /// Keep the machine's host directory mounts in the checkpoint. It then
+    /// restores only on a host where the same paths exist; each is attached
+    /// again at its guest path.
+    #[arg(long = "host-mounts")]
+    pub host_mounts: bool,
 
     /// Path to library directory containing libkrun and libkrunfw.
     #[arg(long, value_name = "DIR", hide = true)]
@@ -155,6 +160,7 @@ impl CheckpointCmd {
             &self.output,
             &smolvm::portable_checkpoint::CaptureOptions {
                 prepared_cache_budget_bytes: None,
+                host_mounts: self.host_mounts,
                 store_dir: self.store.clone(),
                 staging_dir: self.staging_dir,
                 lib_dir: self.lib_dir,
@@ -822,6 +828,7 @@ impl PackCreateCmd {
                 network: true,
                 network_backend: None,
                 dns: self.dns,
+                dns_options: Vec::new(),
                 network_name: None,
                 guest_subnet: None,
                 gpu: false,
@@ -833,6 +840,8 @@ impl PackCreateCmd {
                 disk_durability: Default::default(),
                 disks: Vec::new(),
                 cache_disk: None,
+                disk_volumes: Vec::new(),
+                block_private: None,
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,

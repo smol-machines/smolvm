@@ -46,7 +46,7 @@ Measured refusals, each decided on the host before anything was forwarded:
 | request from the guest | answer |
 |---|---|
 | placeholder in the query string | `403 smolvm credentials: placeholders are substituted in request headers only` |
-| placeholder in a form body | the same |
+| placeholder in a form body | the same; from v1.27.0 `403 smolvm credentials: body substitution is disabled for this binding`, unless the binding has `:body` |
 | the placeholder in two headers | `403 smolvm credentials: a request may carry one placeholder` |
 | a made-up `SMOL_PLACEHOLDER_DEMO_...` | `403 smolvm credentials: unknown placeholder` |
 | placeholder in `Cookie` | `403 smolvm credentials: placeholders are not substituted in routing or framing headers` |
@@ -60,6 +60,8 @@ answered normally.
 
 ## The create-time rules
 
+Measured on v1.22.2:
+
 ```
 credential "t" host "*.example.com" must be an exact lowercase DNS name (no wildcard, scheme, port or IP)
 credential "t" host "93.184.215.14" must be an exact lowercase DNS name (no wildcard, scheme, port or IP)
@@ -68,6 +70,12 @@ credential "t" host "example.com" is not reachable under the machine's network a
 
 The last is a machine with `--allow-host example.org` and a credential for `example.com`: a
 credential never widens what the machine may reach.
+
+From v1.26.0 a host may be a whole-label wildcard, `*.example.com`, matching every subdomain and not
+the apex; `*.com` and other one-label parents are refused. Under `--allow-host`, a wildcard binding
+needs an entry that admits the whole subtree (`example.com` or `*.example.com`, not
+`api.example.com`). The IP refusal now reads `must be a lowercase DNS name, optionally` followed by
+the wildcard form. Read from the source at v1.27.3, not run here.
 
 ## Port 80 and other ports are not intercepted
 

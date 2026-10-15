@@ -19,13 +19,13 @@
 #                       (smol-machines/smolvm#1192), and any host that cannot give
 #                       the bake helper its 8192 MiB.
 #
-# The VM's pid is recorded before the workload finishes, because Ctrl-C on this
-# script does not stop the machine. The CLI runs in the background below, and a
-# background command in a script ignores SIGINT, so the CLI and its VM keep
-# running. Before v1.20.2 an interrupted CLI also leaves a cached run's VM
-# behind, invisible to `machine list` (smol-machines/smolvm#1193). Cancel with
-# `scripts/cleanup.sh --cancel`, never with Ctrl-C. Image seeding is off for the
-# run, so the first VM process is the workload's.
+# The CLI runs in the background below so the script can record the VM's pid
+# before the workload finishes. A background command in a script starts with
+# SIGINT ignored and never sees a TERM sent to the script, so the script forwards
+# INT and TERM to the CLI, which ends its VM as it exits. Before v1.20.2 an
+# interrupted CLI leaves a cached run's VM behind, invisible to `machine list`
+# (smol-machines/smolvm#1193); `scripts/cleanup.sh --cancel` ends that one. Image
+# seeding is off for the run, so the first VM process is the workload's.
 
 set -uo pipefail
 
@@ -168,6 +168,7 @@ SMOLVM_IMAGE_SEEDS=0 "$SMOLVM" machine run --mem 2048 ${cache[@]+"${cache[@]}"} 
     ${allow[@]+"${allow[@]}"} \
     -- "$@" > "$logfile" 2>&1 &
 cli_pid=$!
+trap 'kill -TERM "$cli_pid" 2>/dev/null' INT TERM
 
 # Record the VM before waiting on it. If the caller kills this script, the pid
 # in that file is the only route back to the machine.
@@ -207,6 +208,8 @@ fi
 
 wait "$cli_pid"
 rc=$?
+# A forwarded signal ends the first wait before the CLI has exited.
+if kill -0 "$cli_pid" 2>/dev/null; then wait "$cli_pid"; rc=$?; fi
 sed 's/^/  /' "$logfile"
 
 # On the offline route the cache-hit line is the assertion that the bake worked

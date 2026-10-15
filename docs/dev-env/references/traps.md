@@ -29,7 +29,8 @@ it in the same command that needs it. The `docker-in-machine` packet is built ar
 the workload ... the same as `init` in a Smolfile". [`smolfile.md`](../../smolfile.md) says `init`
 "runs once as root, like a Dockerfile `RUN`", and the docs site's `introduction/concepts/smolfile.md`
 (smolmachines.com/docs) says under "When init runs" that it runs once, on the first start. Observed:
-once, on the first start.
+once, on the first start. From v1.23.7 `machine create --help` says the same: "Run command once, on
+the machine's first start".
 
 `init` also runs **as root**, even with `user` set: `/init-ran-as.txt` contained `root` while
 `exec` and `shell` ran as `app`. There is no `machine start --init` to force a re-run.
@@ -112,8 +113,8 @@ regression until the two were compared side by side.
 
 ## `machine shell` does not start a stopped machine
 
-`smolvm machine --help` describes `shell` as "Open an interactive shell in a machine (starts it if
-stopped)". It does not:
+Before v1.23.7 `smolvm machine --help` described `shell` as "Open an interactive shell in a machine
+(starts it if stopped)"; from v1.23.7 it says "in a running machine". It does not start one:
 
 ```
 $ smolvm machine stop --name dev

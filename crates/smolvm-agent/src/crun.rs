@@ -616,6 +616,21 @@ impl CrunCommand {
         self.stdout_piped().stderr_piped()
     }
 
+    /// Send both stdout and stderr to `output` (a workload's log pipe).
+    pub fn output_to(mut self, output: std::os::fd::OwnedFd) -> Self {
+        match output.try_clone() {
+            Ok(stderr) => {
+                self.cmd.stdout(Stdio::from(output));
+                self.cmd.stderr(Stdio::from(stderr));
+            }
+            Err(_) => {
+                self.cmd.stdout(Stdio::from(output));
+                self.cmd.stderr(Stdio::null());
+            }
+        }
+        self
+    }
+
     /// Discard both stdout and stderr.
     pub fn discard_output(mut self) -> Self {
         self.cmd.stdout(Stdio::null());

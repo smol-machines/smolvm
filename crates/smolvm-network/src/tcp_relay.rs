@@ -1345,6 +1345,22 @@ fn relay_stream(
             poller.modify(stream, interest)?;
             events.clear();
             poller.wait(&mut events, Some(RELAY_WAIT_BACKSTOP))?;
+            if host_read_closed && pending_guest_data.is_none() {
+                // Nothing reads or writes the host socket from here on, so
+                // nothing would notice it failing. epoll reports EPOLLERR and
+                // EPOLLHUP whatever the interest, so once the host resets, every
+                // wait returns at once and this loop spins until the guest
+                // closes. kqueue reports nothing, so the error is read as well.
+                if let Some(err) = stream.take_error()? {
+                    return Err(err);
+                }
+                if events.iter().any(|event| event.key == HOST_STREAM_KEY) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "host TCP socket hung up",
+                    ));
+                }
+            }
         } else {
             last_activity = Instant::now();
         }
@@ -1648,6 +1664,79 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// A host server for one connection that half-closes, then hands the
+    /// accepted socket to `then`.
+    fn half_closing_server(then: impl FnOnce(TcpStream) + Send + 'static) -> SocketAddr {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            then(stream);
+        });
+        address
+    }
+
+    fn wait_for_exit_mode(exit_state: &RelayExitState, mode: RelayExitMode, within: Duration) {
+        let started = Instant::now();
+        while exit_state.load() != mode {
+            assert!(
+                started.elapsed() < within,
+                "relay is {:?} after {:?}, expected {mode:?}",
+                exit_state.load(),
+                started.elapsed()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_host_reset_after_its_half_close_ends_a_relay_whose_guest_is_silent() {
+        let (reset_tx, reset_rx) = mpsc::channel::<()>();
+        let destination = half_closing_server(move |stream| {
+            reset_rx.recv().unwrap();
+            socket2::SockRef::from(&stream)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+        });
+        // The guest side stays open and sends nothing.
+        let (_to_proxy, _from_proxy, exit_state) = spawn_test_relay(destination);
+        wait_for_exit_mode(
+            &exit_state,
+            RelayExitMode::HalfClosed,
+            Duration::from_secs(2),
+        );
+        reset_tx.send(()).unwrap();
+        // On epoll the relay used to spin here until the guest closed.
+        wait_for_exit_mode(&exit_state, RelayExitMode::Abort, RELAY_WAIT_BACKSTOP * 5);
+    }
+
+    #[test]
+    fn a_host_half_close_keeps_relaying_guest_bytes() {
+        let (received_tx, received_rx) = mpsc::channel();
+        let destination = half_closing_server(move |mut stream| {
+            let mut buffer = [0u8; 4];
+            stream.read_exact(&mut buffer).unwrap();
+            received_tx.send(buffer).unwrap();
+            // Keep the socket open until the relay is checked.
+            thread::sleep(Duration::from_secs(1));
+        });
+        let (to_proxy, _from_proxy, exit_state) = spawn_test_relay(destination);
+        wait_for_exit_mode(
+            &exit_state,
+            RelayExitMode::HalfClosed,
+            Duration::from_secs(2),
+        );
+        // Idle for a few backstop waits before the guest sends.
+        thread::sleep(RELAY_WAIT_BACKSTOP * 3);
+        to_proxy.try_send(b"ping".to_vec()).unwrap();
+        assert_eq!(
+            received_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            *b"ping"
+        );
+        assert_eq!(exit_state.load(), RelayExitMode::HalfClosed);
     }
 
     #[test]

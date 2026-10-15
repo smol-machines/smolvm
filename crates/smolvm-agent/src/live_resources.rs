@@ -55,13 +55,22 @@ fn memory_online_plan(
     Ok(plan)
 }
 
-fn wait_memory_online_plan(
+/// Online `blocks` as the guest publishes them, until all are online.
+///
+/// virtio-mem adds only a bounded amount of offline memory (its
+/// `offline_threshold`, 1 GiB by default) and adds the next part once that is
+/// online. Waiting for the whole range before onlining any of it therefore
+/// never finished for growth past the threshold: the guest waited for the
+/// agent and the agent for the guest. Each round validates every published
+/// block before writing any, and gives up after `stall` without progress.
+fn online_memory_as_published(
     blocks: std::ops::Range<u64>,
-    timeout: Duration,
+    stall: Duration,
     mut read_state: impl FnMut(u64) -> io::Result<String>,
+    mut online: impl FnMut(&[u64]) -> io::Result<()>,
     mut cancelled: impl FnMut() -> bool,
-) -> io::Result<Vec<u64>> {
-    let deadline = Instant::now() + timeout;
+) -> io::Result<()> {
+    let mut deadline = Instant::now() + stall;
     loop {
         if cancelled() {
             return Err(io::Error::new(
@@ -69,11 +78,32 @@ fn wait_memory_online_plan(
                 "RAM caller disconnected before onlining",
             ));
         }
-        match memory_online_plan(blocks.clone(), &mut read_state) {
-            // Only publication lag is retryable. Permission failures or an
-            // unexpected existing state must not turn into blind retries.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            result => return result,
+        let mut offline = Vec::new();
+        let mut unpublished = false;
+        for block in blocks.clone() {
+            match read_state(block) {
+                Ok(state) => match state.trim() {
+                    "online" => {}
+                    "offline" => offline.push(block),
+                    state => {
+                        return Err(io::Error::other(format!(
+                            "memory{block} has unsettled state {state}"
+                        )))
+                    }
+                },
+                // Only publication lag is retryable. Permission failures must
+                // not turn into blind retries.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => unpublished = true,
+                Err(error) => return Err(error),
+            }
+        }
+        if !offline.is_empty() {
+            online(&offline)?;
+            deadline = Instant::now() + stall;
+            continue;
+        }
+        if !unpublished {
+            return Ok(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -97,19 +127,51 @@ pub(crate) fn online_memory(start: u64, length: u64, client_fd: Option<RawFd>) -
     let read_state = |block: u64| {
         std::fs::read_to_string(format!("/sys/devices/system/memory/memory{block}/state"))
     };
-    let preflight = (|| -> io::Result<_> {
+    let write_failed = std::cell::Cell::new(false);
+    let onlined = (|| -> io::Result<_> {
         let size = std::fs::read_to_string("/sys/devices/system/memory/block_size_bytes")?;
         let size = u64::from_str_radix(size.trim().trim_start_matches("0x"), 16)
             .map_err(|_| io::Error::other("invalid guest memory block size"))?;
         let blocks = memory_blocks(start, length, size)?;
-        let plan =
-            wait_memory_online_plan(blocks.clone(), Duration::from_secs(30), read_state, || {
-                client_fd.is_some_and(crate::process::is_peer_closed)
-            })?;
-        Ok((blocks, plan))
+        online_memory_as_published(
+            blocks.clone(),
+            Duration::from_secs(30),
+            read_state,
+            |plan| {
+                // Only validated numeric block IDs reach the shell. The existing
+                // exec supervisor bounds a slow kernel write and handles client
+                // disconnect.
+                let script = plan
+                    .iter()
+                    .map(|block| {
+                        format!("printf online > /sys/devices/system/memory/memory{block}/state")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let response = crate::handle_vm_exec(
+                    &["/bin/sh".into(), "-ec".into(), script],
+                    &[],
+                    None,
+                    Some(120_000u64.saturating_sub(started.elapsed().as_millis() as u64)),
+                    client_fd,
+                    None,
+                );
+                if matches!(response, AgentResponse::Completed { exit_code: 0, .. }) {
+                    Ok(())
+                } else {
+                    write_failed.set(true);
+                    Err(io::Error::other("RAM onlining incomplete"))
+                }
+            },
+            || client_fd.is_some_and(crate::process::is_peer_closed),
+        )?;
+        Ok(blocks)
     })();
-    let (blocks, plan) = match preflight {
-        Ok(value) => value,
+    let blocks = match onlined {
+        Ok(blocks) => blocks,
+        Err(_) if write_failed.get() => {
+            return AgentResponse::error("RAM onlining incomplete; some blocks may be online, retry the same range without shrinking", error_codes::INTERNAL_ERROR);
+        }
         Err(error) => {
             return AgentResponse::error(
                 format!(
@@ -119,26 +181,6 @@ pub(crate) fn online_memory(start: u64, length: u64, client_fd: Option<RawFd>) -
             )
         }
     };
-    if !plan.is_empty() {
-        // Only validated numeric block IDs reach the shell. The existing exec
-        // supervisor bounds a slow kernel write and handles client disconnect.
-        let script = plan
-            .iter()
-            .map(|block| format!("printf online > /sys/devices/system/memory/memory{block}/state"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let response = crate::handle_vm_exec(
-            &["/bin/sh".into(), "-ec".into(), script],
-            &[],
-            None,
-            Some(120_000u64.saturating_sub(started.elapsed().as_millis() as u64)),
-            client_fd,
-            None,
-        );
-        if !matches!(response, AgentResponse::Completed { exit_code: 0, .. }) {
-            return AgentResponse::error("RAM onlining incomplete; some blocks may be online, retry the same range without shrinking", error_codes::INTERNAL_ERROR);
-        }
-    }
     match memory_online_plan(blocks, read_state) {
         Ok(remaining) if remaining.is_empty() => AgentResponse::Ok {
             data: Some(serde_json::json!({"start_address": start, "online_bytes": length})),
@@ -611,30 +653,56 @@ mod tests {
         }
     }
 
+    /// virtio-mem publishes the next part of a growth only once the previous
+    /// part is online. Model a 1 GiB offline threshold (8 blocks of 128 MiB)
+    /// over a 16-block growth: the agent must online the first 8 for the next 8
+    /// to appear, which waiting for all 16 first never did.
     #[test]
-    fn memory_onlining_waits_for_publication_but_not_other_errors() {
-        let mut attempts = 0;
-        let plan = wait_memory_online_plan(
-            8..9,
+    fn memory_onlining_brings_blocks_online_as_the_guest_publishes_them() {
+        use std::cell::RefCell;
+        let states: RefCell<std::collections::BTreeMap<u64, &str>> =
+            RefCell::new((36..44).map(|block| (block, "offline")).collect());
+        let mut rounds = Vec::new();
+        online_memory_as_published(
+            36..52,
             Duration::from_secs(1),
-            |_| {
-                attempts += 1;
-                if attempts < 3 {
-                    Err(io::ErrorKind::NotFound.into())
-                } else {
-                    Ok("offline".into())
+            |block| {
+                states
+                    .borrow()
+                    .get(&block)
+                    .map(|state| state.to_string())
+                    .ok_or_else(|| io::ErrorKind::NotFound.into())
+            },
+            |plan| {
+                rounds.push(plan.to_vec());
+                let mut states = states.borrow_mut();
+                for block in plan {
+                    states.insert(*block, "online");
                 }
+                if states.len() == 8 {
+                    states.extend((44..52).map(|block| (block, "offline")));
+                }
+                Ok(())
             },
             || false,
         )
         .unwrap();
-        assert_eq!(plan, vec![8]);
-        assert_eq!(attempts, 3);
         assert_eq!(
-            wait_memory_online_plan(
+            rounds,
+            vec![(36..44).collect::<Vec<_>>(), (44..52).collect()]
+        );
+        assert!(states.borrow().values().all(|state| *state == "online"));
+    }
+
+    #[test]
+    fn memory_onlining_stops_on_stalls_and_on_errors_other_than_publication_lag() {
+        let never_online = |_: &[u64]| -> io::Result<()> { panic!("nothing to online") };
+        assert_eq!(
+            online_memory_as_published(
                 8..9,
                 Duration::ZERO,
                 |_| Err(io::ErrorKind::NotFound.into()),
+                never_online,
                 || false
             )
             .unwrap_err()
@@ -642,27 +710,55 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         assert_eq!(
-            wait_memory_online_plan(
+            online_memory_as_published(
                 8..9,
                 Duration::from_secs(1),
                 |_| Err(io::ErrorKind::PermissionDenied.into()),
+                never_online,
                 || false
             )
             .unwrap_err()
             .kind(),
             io::ErrorKind::PermissionDenied
         );
+        assert!(online_memory_as_published(
+            8..10,
+            Duration::from_secs(1),
+            |block| Ok(if block == 8 {
+                "offline"
+            } else {
+                "going-offline"
+            }
+            .into()),
+            never_online,
+            || false
+        )
+        .is_err());
         assert_eq!(
-            wait_memory_online_plan(
+            online_memory_as_published(
                 8..9,
                 Duration::from_secs(1),
                 |_| panic!("cancelled request must not inspect memory"),
+                never_online,
                 || true
             )
             .unwrap_err()
             .kind(),
             io::ErrorKind::Interrupted
         );
+        let mut writes = 0;
+        assert!(online_memory_as_published(
+            8..9,
+            Duration::from_secs(1),
+            |_| Ok("offline".into()),
+            |_| {
+                writes += 1;
+                Err(io::Error::other("write failed"))
+            },
+            || false
+        )
+        .is_err());
+        assert_eq!(writes, 1, "a failed write is not retried");
     }
 
     #[test]

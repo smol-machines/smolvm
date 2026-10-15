@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::platform::uds::UdsStream;
-use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
+use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
@@ -413,6 +413,9 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// Maximum silence between complete shutdown progress frames.
 /// A timeout is not permission to terminate a guest with unflushed storage.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
+/// Overall limit on a shutdown's storage flush, on top of the time the
+/// workload is given to exit.
+const SHUTDOWN_FLUSH_LIMIT_SECS: u64 = 120;
 
 struct ShutdownDeadlines {
     idle: Instant,
@@ -806,6 +809,10 @@ pub struct RunConfig {
     /// Power the machine off once this detached workload exits. Only the
     /// workload launcher sets it; exec sessions never do.
     pub stop_vm_on_exit: bool,
+    /// Signal the detached workload is sent when the machine stops.
+    pub stop_signal: Option<String>,
+    /// Seconds the detached workload gets to exit after its stop signal.
+    pub stop_timeout_secs: Option<u64>,
 }
 
 impl RunConfig {
@@ -829,6 +836,8 @@ impl RunConfig {
             unprivileged: false,
             s3_volumes: Vec::new(),
             stop_vm_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
         }
     }
 
@@ -942,6 +951,13 @@ impl RunConfig {
     /// Power the machine off once this detached workload exits.
     pub fn with_stop_vm_on_exit(mut self, stop: bool) -> Self {
         self.stop_vm_on_exit = stop;
+        self
+    }
+
+    /// How the detached workload is stopped when the machine stops.
+    pub fn with_stop(mut self, signal: Option<String>, timeout_secs: Option<u64>) -> Self {
+        self.stop_signal = signal;
+        self.stop_timeout_secs = timeout_secs;
         self
     }
 }
@@ -1078,6 +1094,35 @@ fn is_benign_shutdown_error(error_str: &str) -> bool {
         || error_str.contains("temporarily unavailable")
         || error_str.contains("Connection reset")
         || error_str.contains("connection reset")
+}
+
+/// Resolve credentials for the registry that will actually receive the pull.
+fn registry_pull_credentials(
+    config: &RegistryConfig,
+    effective_image: &str,
+    explicit: Option<RegistryAuth>,
+) -> Option<RegistryAuth> {
+    // A local archive or directory never reaches a registry. Asking the Docker
+    // credential helper anyway costs its whole timeout when the helper hangs.
+    if crate::data::image_source::is_local_ref(effective_image) {
+        return None;
+    }
+    let registry = extract_registry(effective_image);
+    explicit
+        .or_else(|| {
+            config.get_credentials(&registry).inspect(|creds| {
+                tracing::debug!(registry = %registry, username = %creds.username, "using configured registry credentials");
+            })
+        })
+        .or_else(|| {
+            crate::docker_config::credential_for(&registry).map(|cred| {
+                tracing::debug!(registry = %registry, username = %cred.username, "using host docker credentials");
+                RegistryAuth {
+                    username: cred.username,
+                    password: cred.secret,
+                }
+            })
+        })
 }
 
 /// Client for communicating with the smolvm-agent.
@@ -1473,39 +1518,11 @@ impl AgentClient {
         image: &str,
         options: PullOptions<F>,
     ) -> Result<ImageInfo> {
+        let original_image = normalize_image_ref(image);
         // Resolve effective image and auth based on options
         let (effective_image, effective_auth) = if options.use_registry_config {
             let registry_config = SmolSettings::load().unwrap_or_default().images;
             let registry = extract_registry(image);
-
-            // Get credentials from config if not explicitly provided, then from
-            // what `docker login` stored on the host (inline or in a credential
-            // helper). The guest's crane accepts a username/secret pair and an
-            // identity token alike, so both forms are forwarded.
-            let auth = options
-                .auth
-                .or_else(|| {
-                    registry_config.get_credentials(&registry).inspect(|creds| {
-                        tracing::debug!(
-                            registry = %registry,
-                            username = %creds.username,
-                            "using configured registry credentials"
-                        );
-                    })
-                })
-                .or_else(|| {
-                    crate::docker_config::credential_for(&registry).map(|cred| {
-                        tracing::debug!(
-                            registry = %registry,
-                            username = %cred.username,
-                            "using host docker credentials"
-                        );
-                        RegistryAuth {
-                            username: cred.username,
-                            password: cred.secret,
-                        }
-                    })
-                });
 
             // Apply mirror if configured
             let img = if let Some(mirror) = registry_config.get_mirror(&registry) {
@@ -1521,47 +1538,41 @@ impl AgentClient {
                 image.to_string()
             };
 
+            // Credentials must be scoped to the registry that receives the
+            // request. A mirror is a different host and cannot inherit the
+            // upstream registry's saved token or Docker login credentials.
+            let auth = registry_pull_credentials(&registry_config, &img, options.auth);
             (img, auth)
         } else {
             (image.to_string(), options.auth)
         };
 
-        self.pull_image_internal(
-            &effective_image,
-            options.oci_platform.as_deref(),
-            effective_auth.as_ref(),
-            options.proxy.as_deref(),
-            options.no_proxy.as_deref(),
-            options.progress,
-        )
+        let effective_image = normalize_image_ref(&effective_image);
+        let cache_as = (effective_image != original_image).then_some(original_image);
+        let request = AgentRequest::Pull {
+            image: effective_image,
+            cache_as,
+            oci_platform: options.oci_platform,
+            auth: effective_auth,
+            proxy: options.proxy,
+            no_proxy: options.no_proxy,
+        };
+        self.pull_image_internal(request, options.progress)
     }
 
     /// Internal implementation of image pull.
     fn pull_image_internal<F: FnMut(usize, usize, &str)>(
         &mut self,
-        image: &str,
-        oci_platform: Option<&str>,
-        auth: Option<&RegistryAuth>,
-        proxy: Option<&str>,
-        no_proxy: Option<&str>,
+        request: AgentRequest,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
-        let image = normalize_image_ref(image);
-        let image = image.as_str();
-
         // Use a long timeout for pull - large images can take minutes to download/extract.
         // The guard resets the timeout on drop (including error paths).
         self.set_read_timeout(Duration::from_secs(IMAGE_PULL_TIMEOUT_SECS))?;
         let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
 
         // Send the pull request
-        let data = self.encode_traced(&AgentRequest::Pull {
-            image: image.to_string(),
-            oci_platform: oci_platform.map(String::from),
-            auth: auth.cloned(),
-            proxy: proxy.map(String::from),
-            no_proxy: no_proxy.map(String::from),
-        })?;
+        let data = self.encode_traced(&request)?;
 
         self.stream
             .write_all(&data)
@@ -1695,6 +1706,25 @@ impl AgentClient {
             workload_id: workload_id.to_string(),
         })?;
         expect_data(resp, "prepare overlay")
+    }
+
+    /// Make the persistent image filesystem available to file operations
+    /// without executing a command from the image.
+    pub fn prepare_file_access(&mut self, image: &str, workload_id: &str) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY)? {
+            // Older guests do not understand the new request. Preserve their
+            // existing file API behavior until their rootfs is upgraded.
+            self.run_non_interactive(
+                RunConfig::new(image.to_string(), vec!["/bin/true".to_string()])
+                    .with_persistent_overlay(Some(workload_id.to_string())),
+            )?;
+            return Ok(());
+        }
+        let resp = self.request(&AgentRequest::PrepareFileAccess {
+            image: image.to_string(),
+            workload_id: workload_id.to_string(),
+        })?;
+        expect_ok(resp, "prepare file access")
     }
 
     /// Clean up an overlay filesystem.
@@ -2013,19 +2043,54 @@ impl AgentClient {
     /// Waits for the agent to acknowledge the shutdown request before returning.
     /// The agent must advertise safe shutdown before receiving a mutating
     /// request, then confirm internal filesystems are frozen before termination.
+    ///
+    /// The workload is first sent its stop signal and given the stop timeout
+    /// it was launched with to exit; the agent reports progress meanwhile, and
+    /// the overall limit leaves room for the longest timeout a machine may set.
     pub fn shutdown(&mut self) -> Result<()> {
         self.shutdown_with_timeouts(
             Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS),
-            Duration::from_secs(120),
+            Duration::from_secs(SHUTDOWN_FLUSH_LIMIT_SECS + smolvm_protocol::MAX_STOP_TIMEOUT_SECS),
+            None,
+        )
+    }
+
+    /// [`shutdown`](Self::shutdown) giving the workload `stop_timeout` to exit
+    /// after its stop signal instead of the timeout it was launched with; zero
+    /// kills it at once.
+    pub fn shutdown_with_stop_timeout(&mut self, stop_timeout: Duration) -> Result<()> {
+        let stop_timeout = stop_timeout
+            .as_secs()
+            .min(smolvm_protocol::MAX_STOP_TIMEOUT_SECS);
+        self.shutdown_with_timeouts(
+            Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS),
+            Duration::from_secs(SHUTDOWN_FLUSH_LIMIT_SECS + stop_timeout),
+            Some(stop_timeout),
+        )
+    }
+
+    /// [`shutdown`](Self::shutdown) that gives up after `maximum`, for a caller
+    /// that must exit soon whatever the guest does. The workload gets half of
+    /// it to exit, so the storage flush still fits in the rest.
+    pub fn shutdown_within(&mut self, maximum: Duration) -> Result<()> {
+        self.shutdown_with_timeouts(
+            Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS).min(maximum),
+            maximum,
+            Some((maximum / 2).as_secs()),
         )
     }
 
     #[cfg(test)]
     fn shutdown_with_deadline(&mut self, timeout: Duration) -> Result<()> {
-        self.shutdown_with_timeouts(timeout, timeout)
+        self.shutdown_with_timeouts(timeout, timeout, None)
     }
 
-    fn shutdown_with_timeouts(&mut self, idle: Duration, maximum: Duration) -> Result<()> {
+    fn shutdown_with_timeouts(
+        &mut self,
+        idle: Duration,
+        maximum: Duration,
+        stop_timeout_secs: Option<u64>,
+    ) -> Result<()> {
         let started = Instant::now();
         let mut deadlines = ShutdownDeadlines::new(started, idle, maximum);
         self.stream.as_socket().set_nonblocking(true)?;
@@ -2042,7 +2107,10 @@ impl AgentClient {
                 )),
                 _ => return Err(Error::agent("shutdown capability", "unexpected ping response")),
             }
-            let data = self.encode_traced(&AgentRequest::Shutdown { progress: true })?;
+            let data = self.encode_traced(&AgentRequest::Shutdown {
+                progress: true,
+                stop_timeout_secs,
+            })?;
             let mut sent = 0;
             while sent < data.len() {
                 sent += shutdown_io_until(deadlines.next(), || self.stream.write(&data[sent..]))?;
@@ -2450,6 +2518,8 @@ impl AgentClient {
             background: false,
             s3_volumes: config.s3_volumes.clone(),
             stop_vm_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
         })?;
 
         expect_completed(resp, "run command")
@@ -2478,6 +2548,8 @@ impl AgentClient {
             background: true,
             s3_volumes: config.s3_volumes.clone(),
             stop_vm_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -2496,6 +2568,19 @@ impl AgentClient {
     /// Unlike `run_interactive`, this does not forward stdin. It is the
     /// image-backed counterpart to `vm_exec_streaming_with`.
     pub fn run_streaming_with<F>(&mut self, config: RunConfig, on_event: F) -> Result<()>
+    where
+        F: FnMut(ExecEvent),
+    {
+        self.run_streaming_with_stdin(config, None, on_event)
+    }
+
+    /// Stream an image command, optionally writing stdin before closing it.
+    pub fn run_streaming_with_stdin<F>(
+        &mut self,
+        config: RunConfig,
+        stdin_data: Option<Vec<u8>>,
+        on_event: F,
+    ) -> Result<()>
     where
         F: FnMut(ExecEvent),
     {
@@ -2523,13 +2608,11 @@ impl AgentClient {
             background: false,
             s3_volumes: config.s3_volumes.clone(),
             stop_vm_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
         })?;
 
-        // These streaming calls do not forward host stdin. Close the guest pipe
-        // explicitly so commands that read until EOF (for example `cat`) exit.
-        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
-
-        collect_exec_events(self, "run streaming", on_event)
+        self.collect_with_streaming_stdin(stdin_data, "run streaming", on_event)
     }
 
     /// Run a command interactively with streaming I/O.
@@ -2566,6 +2649,8 @@ impl AgentClient {
                 background: false,
                 s3_volumes: config.s3_volumes.clone(),
                 stop_vm_on_exit: false,
+                stop_signal: None,
+                stop_timeout_secs: None,
             },
             tty,
             "run interactive",
@@ -2605,6 +2690,8 @@ impl AgentClient {
             background: false,
             s3_volumes: config.s3_volumes,
             stop_vm_on_exit: config.stop_vm_on_exit,
+            stop_signal: config.stop_signal.clone(),
+            stop_timeout_secs: config.stop_timeout_secs,
         })?;
         let resp = loop {
             match self.receive()? {
@@ -2856,6 +2943,8 @@ impl AgentClient {
                 background: false,
                 s3_volumes: config.s3_volumes.clone(),
                 stop_vm_on_exit: false,
+                stop_signal: None,
+                stop_timeout_secs: None,
             },
             input,
             on_output,
@@ -3298,6 +3387,22 @@ impl AgentClient {
     where
         F: FnMut(ExecEvent),
     {
+        self.vm_exec_streaming_with_stdin(command, env, workdir, timeout, None, on_event)
+    }
+
+    /// Stream a bare-VM command, optionally writing stdin before closing it.
+    pub fn vm_exec_streaming_with_stdin<F>(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        stdin_data: Option<Vec<u8>>,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExecEvent),
+    {
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
         let _timeout_guard = self.set_exec_timeout(timeout)?;
 
@@ -3312,10 +3417,79 @@ impl AgentClient {
             stdin_data: None,
         })?;
 
-        // No stdin is forwarded on this path; tell the guest it has reached EOF.
-        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+        self.collect_with_streaming_stdin(stdin_data, "streaming exec", on_event)
+    }
 
-        collect_exec_events(self, "streaming exec", on_event)
+    fn collect_with_streaming_stdin<F>(
+        &mut self,
+        stdin_data: Option<Vec<u8>>,
+        op: &str,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExecEvent),
+    {
+        let Some(data) = stdin_data.filter(|data| !data.is_empty()) else {
+            self.send_streaming_stdin(None)?;
+            return collect_exec_events(self, op, on_event);
+        };
+
+        // Write stdin on a separate handle while draining stdout/stderr on
+        // this one. Commands that echo as they read can otherwise fill both
+        // socket directions and wait on each other indefinitely.
+        let mut writer = AgentClient {
+            stream: self.stream.try_clone()?,
+            trace_id: self.trace_id.clone(),
+        };
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(move || {
+                let sent = writer.send_streaming_stdin(Some(data));
+                if sent.is_err() {
+                    // Without the EOF frame, a child waiting for stdin would
+                    // otherwise wait forever after a failed host write.
+                    let _ = writer.stream.shutdown(std::net::Shutdown::Write);
+                }
+                sent
+            });
+            let mut exited = false;
+            let mut on_event = on_event;
+            let result = collect_exec_events(self, op, |event| {
+                if matches!(event, ExecEvent::Exit(_)) {
+                    exited = true;
+                }
+                on_event(event);
+            });
+            if !sender.is_finished() {
+                // A command can exit before consuming its entire stdin. Stop
+                // any blocked socket write so joining the writer is bounded.
+                let _ = self.stream.shutdown(std::net::Shutdown::Write);
+            }
+            let sent = sender
+                .join()
+                .map_err(|_| Error::agent("send stdin", "writer thread panicked"))?;
+            result?;
+            // A command may exit without reading its input (e.g. `true`).
+            // Its valid exit result takes precedence over a broken stdin pipe.
+            if exited {
+                Ok(())
+            } else {
+                sent
+            }
+        })
+    }
+
+    fn send_streaming_stdin(&mut self, stdin_data: Option<Vec<u8>>) -> Result<()> {
+        if let Some(data) = stdin_data {
+            // Stdin frames are JSON/base64 encoded and the guest limits frame
+            // size to 16 MiB. Bound each frame even for large API requests.
+            for chunk in data.chunks(256 * 1024) {
+                self.send(&AgentRequest::Stdin {
+                    data: chunk.to_vec(),
+                })?;
+            }
+        }
+        // The guest reads until EOF; even absent input needs an explicit close.
+        self.send(&AgentRequest::Stdin { data: Vec::new() })
     }
 
     /// Low-level send without waiting for response (public).
@@ -3527,13 +3701,12 @@ impl AgentClient {
 /// Cumulative byte ceiling for the streaming/collect exec path.
 ///
 /// The buffered (`Completed`) exec path caps guest output inside the guest at
-/// `smolvm_agent::process::MAX_EXEC_OUTPUT` (11 MiB). The streaming path,
-/// however, relays frames one at a time and the SSE handler
-/// (`api::handlers::exec::exec_stream`) buffers the *entire* event vector in
-/// host RAM before responding. Without a cap, a chatty or infinite guest
-/// command (`yes`, `cat /dev/zero`) that emits `Stdout` frames forever and
-/// never sends `Exited` grows the host `serve` process without bound → host
-/// OOM → every co-tenant VM on the node is killed (cross-tenant DoS).
+/// `smolvm_agent::process::MAX_EXEC_OUTPUT` (11 MiB). The streaming path
+/// relays frames one at a time. Its compatibility wrapper (`vm_exec_streaming`)
+/// buffers events for callers, while the HTTP SSE handler forwards them through
+/// a bounded queue. A chatty or infinite guest command (`yes`, `cat /dev/zero`)
+/// still needs a cumulative cap to bound the compatibility wrapper and stop
+/// endless guest output.
 ///
 /// We mirror the buffered path's 11 MiB ceiling: once cumulative stdout+stderr
 /// crosses it, we emit a truncation error event and stop relaying (terminating
@@ -4283,6 +4456,83 @@ mod run_streaming_tests {
     use std::thread;
 
     #[test]
+    fn streamed_stdin_is_chunked_and_closed_for_bare_and_image_commands() {
+        for image in [false, true] {
+            let input = "snowman ☃".repeat(40_000).into_bytes();
+            let expected = input.clone();
+            let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let server = thread::spawn(move || {
+                let mut received = Vec::new();
+                let mut frames = 0;
+                loop {
+                    let mut header = [0u8; 4];
+                    server_stream.read_exact(&mut header).unwrap();
+                    let mut payload = vec![0; u32::from_be_bytes(header) as usize];
+                    server_stream.read_exact(&mut payload).unwrap();
+                    let envelope: Envelope<AgentRequest> =
+                        serde_json::from_slice(&payload).unwrap();
+                    match envelope.body {
+                        AgentRequest::Run {
+                            interactive: true, ..
+                        } if image && frames == 0 => {}
+                        AgentRequest::VmExec {
+                            interactive: true, ..
+                        } if !image && frames == 0 => {}
+                        AgentRequest::Stdin { data } if data.is_empty() => break,
+                        AgentRequest::Stdin { data } => {
+                            assert!(data.len() <= 256 * 1024);
+                            received.extend(data);
+                        }
+                        other => panic!("unexpected streamed exec request: {other:?}"),
+                    }
+                    frames += 1;
+                }
+                assert!(frames > 2, "large stdin must use multiple frames");
+                assert_eq!(received, expected);
+                for response in [
+                    AgentResponse::Started,
+                    AgentResponse::Exited {
+                        exit_code: 0,
+                        oom: false,
+                    },
+                ] {
+                    server_stream
+                        .write_all(&encode_message(&response).unwrap())
+                        .unwrap();
+                }
+            });
+
+            let mut client = AgentClient::from_stream(client_stream);
+            let mut events = Vec::new();
+            if image {
+                client
+                    .run_streaming_with_stdin(
+                        RunConfig::new("alpine", vec!["cat".into()]),
+                        Some(input),
+                        |event| events.push(event),
+                    )
+                    .unwrap();
+            } else {
+                client
+                    .vm_exec_streaming_with_stdin(
+                        vec!["cat".into()],
+                        vec![],
+                        None,
+                        None,
+                        Some(input),
+                        |event| events.push(event),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(events, vec![ExecEvent::Exit(0)]);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn vm_exec_streaming_closes_guest_stdin_before_waiting_for_exit() {
         let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
         server_stream
@@ -4330,6 +4580,93 @@ mod run_streaming_tests {
             })
             .unwrap();
         assert_eq!(events, vec![ExecEvent::Exit(0)]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn preparing_file_access_sends_no_guest_command() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut len_buf = [0; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(request.body, AgentRequest::Ping));
+            server_stream
+                .write_all(
+                    &encode_message(&AgentResponse::Pong {
+                        version: smolvm_protocol::PROTOCOL_VERSION,
+                        capabilities: vec![smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY.into()],
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(
+                request.body,
+                AgentRequest::PrepareFileAccess { image, workload_id }
+                    if image == "alpine:3.20" && workload_id == "fork-overlay-owner"
+            ));
+            server_stream
+                .write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                .unwrap();
+        });
+        AgentClient::from_stream(client_stream)
+            .prepare_file_access("alpine:3.20", "fork-overlay-owner")
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn preparing_file_access_keeps_old_guests_working() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut len_buf = [0; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(request.body, AgentRequest::Ping));
+            server_stream
+                .write_all(
+                    &encode_message(&AgentResponse::Pong {
+                        version: smolvm_protocol::PROTOCOL_VERSION,
+                        capabilities: vec![],
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let mut payload = vec![0; u32::from_be_bytes(len_buf) as usize];
+            server_stream.read_exact(&mut payload).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(
+                request.body,
+                AgentRequest::Run { image, command, persistent_overlay_id, .. }
+                    if image == "docker.io/library/alpine:3.20"
+                    && command == ["/bin/true"]
+                    && persistent_overlay_id.as_deref() == Some("fork-overlay-owner")
+            ));
+            server_stream
+                .write_all(
+                    &encode_message(&AgentResponse::Completed {
+                        exit_code: 0,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        AgentClient::from_stream(client_stream)
+            .prepare_file_access("alpine:3.20", "fork-overlay-owner")
+            .unwrap();
         server.join().unwrap();
     }
 
@@ -4684,7 +5021,7 @@ mod stalled_body_tests {
             }
         });
         AgentClient::from_stream(client_stream)
-            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2), None)
             .unwrap();
         server.join().unwrap();
     }
@@ -4704,7 +5041,7 @@ mod stalled_body_tests {
             peer.write_all(&body).unwrap();
         });
         let error = AgentClient::from_stream(client_stream)
-            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2), None)
             .unwrap_err();
         assert!(error.to_string().contains("filesystems were quiesced"));
         server.join().unwrap();
@@ -4749,7 +5086,7 @@ mod stalled_body_tests {
         });
         let start = Instant::now();
         let error = AgentClient::from_stream(client_stream)
-            .shutdown_with_timeouts(Duration::from_millis(80), Duration::from_millis(160))
+            .shutdown_with_timeouts(Duration::from_millis(80), Duration::from_millis(160), None)
             .unwrap_err();
         assert!(error.to_string().contains("deadline exceeded"));
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -5331,5 +5668,67 @@ mod streamed_path_cleanup_tests {
             b"complete archive".len() as u64
         );
         assert_eq!(std::fs::read(&output).unwrap(), b"complete archive");
+    }
+}
+
+#[cfg(test)]
+mod mirror_auth_tests {
+    use super::*;
+
+    #[test]
+    fn mirror_uses_its_own_credentials_instead_of_upstream_credentials() {
+        let config: RegistryConfig = toml::from_str(
+            r#"
+[registries."origin.example.invalid"]
+username = "origin"
+password = "upstream-secret"
+mirror = "mirror.example.invalid"
+
+[registries."mirror.example.invalid"]
+username = "mirror"
+password = "mirror-secret"
+"#,
+        )
+        .unwrap();
+        let image = rewrite_image_registry(
+            "origin.example.invalid/app:latest",
+            "mirror.example.invalid",
+        );
+        let auth = registry_pull_credentials(&config, &image, None).unwrap();
+        assert_eq!(auth.username, "mirror");
+        assert_eq!(auth.password, "mirror-secret");
+        let original =
+            registry_pull_credentials(&config, "origin.example.invalid/app:latest", None).unwrap();
+        assert_eq!(original.username, "origin");
+        assert_eq!(original.password, "upstream-secret");
+    }
+
+    #[test]
+    fn local_images_never_look_up_registry_credentials() {
+        let config = RegistryConfig::default();
+        let explicit = || {
+            Some(RegistryAuth {
+                username: "explicit".into(),
+                password: "secret".into(),
+            })
+        };
+        assert!(registry_pull_credentials(&config, "local:7fc08832", explicit()).is_none());
+        assert!(registry_pull_credentials(&config, "local-dir:/tmp/rootfs", explicit()).is_none());
+    }
+
+    #[test]
+    fn explicit_credentials_remain_available_for_private_mirrors() {
+        let config = RegistryConfig::default();
+        let auth = registry_pull_credentials(
+            &config,
+            "mirror.example.invalid/app:latest",
+            Some(RegistryAuth {
+                username: "explicit".into(),
+                password: "secret".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(auth.username, "explicit");
+        assert_eq!(auth.password, "secret");
     }
 }

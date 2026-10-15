@@ -193,6 +193,7 @@ pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+    udp_publish: Option<crate::udp_publish::UdpPublishChannels>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
 ) -> std::io::Result<JoinHandle<()>> {
@@ -218,6 +219,7 @@ pub fn start_network_stack(
                 queues,
                 config,
                 tcp_receiver,
+                udp_publish,
                 egress,
                 fabric,
                 sequence_seed,
@@ -226,10 +228,12 @@ pub fn start_network_stack(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+    udp_publish: Option<crate::udp_publish::UdpPublishChannels>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
     sequence_seed: u64,
@@ -294,6 +298,12 @@ fn run_network_stack(
     let mut reported_relay_spawn_failures = 0_u64;
     let mut last_relay_stats = StdInstant::now();
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
+    // Published UDP ports: one gateway-side session per remote client.
+    let mut published_udp = crate::udp_publish::PublishedUdpTable::new(
+        config.gateway_ipv4,
+        config.guest_ipv4,
+        port_seed,
+    );
     let udp_channels = {
         let shutdown_queues = queues.clone();
         udp_relay::start_udp_relay(
@@ -388,6 +398,18 @@ fn run_network_stack(
                         device.drop_staged_frame();
                     }
                 }
+                FrameAction::UdpFlow { destination }
+                    if published_udp.is_session_endpoint(destination) =>
+                {
+                    // The guest answering a published-port client: deliver it to
+                    // that client's session socket. Not egress, so no policy.
+                    if matches!(
+                        interface.poll_ingress_single(now, &mut device, &mut sockets),
+                        PollIngressSingleResult::None
+                    ) {
+                        device.drop_staged_frame();
+                    }
+                }
                 FrameAction::UdpFlow { destination } => {
                     // Same egress policy as TCP; a denied destination's datagram
                     // is silently dropped (a guest sees a normal UDP black hole),
@@ -426,6 +448,10 @@ fn run_network_stack(
                     }
                 }
             }
+        }
+
+        if let Some(channels) = &udp_publish {
+            published_udp.deliver_inbound(&mut sockets, &channels.from_host);
         }
 
         relay_accepted_tcp_connection(
@@ -487,6 +513,12 @@ fn run_network_stack(
         }
         udp_sockets.deliver_replies(&mut sockets, &udp_channels.from_relay);
         udp_sockets.expire_idle(&mut sockets);
+        if let Some(channels) = &udp_publish {
+            if published_udp.drain_to_host(&mut sockets, &channels.to_host) {
+                channels.host_wake.wake();
+            }
+            published_udp.expire_idle(&mut sockets);
+        }
 
         // ICMP echo: the raw sockets captured any guest echo requests during
         // ingress above. Forward external pings to the relay (answering gateway

@@ -71,6 +71,10 @@ keeps running with the helper as its init. A batch branch waits
 single `--name` branch never waits. With `--name-prefix` or `--hold`, even a
 count of one is a batch and gets the same boundary, identity, and release.
 
+A child inherits the source's labels. `--label KEY=VALUE` on `machine branch`
+sets or replaces a label on the child, so a caller that finds its machines by
+label can tell children apart from their source.
+
 Add `--branchable` to a child when it must branch again. A branchable child
 costs the same as a leaf: both share the source's memory pages, and branching
 the child later copies only the pages it has written since, so a deep tree of

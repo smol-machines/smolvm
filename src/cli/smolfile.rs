@@ -150,6 +150,7 @@ pub fn build_create_params(
                 net,
                 network_backend: cli_network_backend,
                 dns: cli_dns,
+                dns_options: Vec::new(),
                 network_name: cli_network_name,
                 guest_subnet: None,
                 init: cli_init,
@@ -161,6 +162,7 @@ pub fn build_create_params(
                 block_io: cli_block_io.unwrap_or_default(),
                 disk_durability: DiskDurability::default(),
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
+                block_private: None,
                 restart_policy: None,
                 restart_max_retries: None,
                 restart_max_backoff_secs: None,
@@ -173,6 +175,8 @@ pub fn build_create_params(
                 cuda: false,
                 forkable: false,
                 stop_on_exit: false,
+                stop_signal: None,
+                stop_timeout_secs: None,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
                 docker_socket: false,
@@ -349,6 +353,9 @@ pub fn build_create_params(
         net
     };
     let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
+    let sf_block_private = (network.block_private || !network.allow_private.is_empty())
+        .then(|| network.allow_private.clone());
+    let net = net || sf_block_private.is_some();
 
     // Restart policy from [restart] section
     let restart_policy = sf
@@ -390,6 +397,9 @@ pub fn build_create_params(
         .and_then(|h| h.startup_grace.as_ref())
         .and_then(|s| parse_duration_secs(s));
 
+    smolvm::workload::validate_stop_settings(sf.stop_signal.as_deref(), sf.stop_timeout)
+        .map_err(|e| smolvm::Error::config("smolfile stop settings", e))?;
+
     Ok(CreateVmParams {
         disks: Vec::new(),
         cache_disk: None,
@@ -408,6 +418,7 @@ pub fn build_create_params(
         net,
         network_backend,
         dns: cli_dns,
+        dns_options: Vec::new(),
         network_name: cli_network_name,
         guest_subnet: None,
         init,
@@ -419,6 +430,7 @@ pub fn build_create_params(
         block_io,
         disk_durability,
         allowed_cidrs,
+        block_private: sf_block_private,
         restart_policy,
         restart_max_retries,
         restart_max_backoff_secs,
@@ -431,6 +443,8 @@ pub fn build_create_params(
         cuda,
         forkable,
         stop_on_exit: sf.stop_on_exit,
+        stop_signal: sf.stop_signal.clone(),
+        stop_timeout_secs: sf.stop_timeout,
         cuda_fork_pool_size: fork.pool_size,
         cuda_vram_limit_mib: fork.cuda_vram_limit_mib,
         docker_socket: sf.docker_socket.unwrap_or(false),
@@ -995,6 +1009,31 @@ init = ["echo init"]
 
         let params = build_from_smolfile(path).unwrap();
         assert_eq!(params.block_io, BlockIoEngine::Async);
+    }
+
+    #[test]
+    fn stop_settings_in_a_smolfile_reach_the_machine_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\nstop_signal = \"SIGINT\"\nstop_timeout = 45\n",
+        )
+        .unwrap();
+        let params = build_from_smolfile(path).unwrap();
+        let record = crate::cli::vm_common::build_vm_record(&params).unwrap();
+        assert_eq!(record.stop_signal.as_deref(), Some("SIGINT"));
+        assert_eq!(record.stop_timeout_secs, Some(45));
+
+        for bad in [
+            "image = \"alpine\"\nstop_signal = \"SIGNOPE\"\n",
+            "image = \"alpine\"\nstop_timeout = 301\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Smolfile");
+            std::fs::write(&path, bad).unwrap();
+            assert!(build_from_smolfile(path).is_err(), "{bad}");
+        }
     }
 
     #[test]

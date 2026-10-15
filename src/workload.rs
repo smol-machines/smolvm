@@ -51,6 +51,30 @@ pub fn persistent_overlay_owner_with_lineage(
     fork_overlay_owner.or(golden).unwrap_or(name).to_string()
 }
 
+/// Check a machine's stop settings: the signal must name a Linux signal and
+/// the timeout must not exceed [`smolvm_protocol::MAX_STOP_TIMEOUT_SECS`].
+pub fn validate_stop_settings(
+    signal: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> std::result::Result<(), String> {
+    if let Some(signal) = signal {
+        if smolvm_protocol::parse_stop_signal(signal).is_none() {
+            return Err(format!(
+                "unknown stop signal '{signal}': use a signal name such as SIGTERM, SIGINT or SIGRTMIN+3, or its number"
+            ));
+        }
+    }
+    if let Some(timeout) = timeout_secs {
+        if timeout > smolvm_protocol::MAX_STOP_TIMEOUT_SECS {
+            return Err(format!(
+                "stop timeout {timeout}s is longer than the {}s maximum",
+                smolvm_protocol::MAX_STOP_TIMEOUT_SECS
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Launch an image machine's workload container in the background.
 ///
 /// `exec_env` is the record env with secrets already resolved — resolution is
@@ -100,7 +124,8 @@ pub fn launch_image_workload(
                 .with_mounts(record_mounts_to_bindings(record))
                 .in_machine(record, machine_name, &exec_env)
                 .with_env(exec_env.clone())
-                .with_stop_vm_on_exit(record.stop_on_exit),
+                .with_stop_vm_on_exit(record.stop_on_exit)
+                .with_stop(record.stop_signal.clone(), record.stop_timeout_secs),
         )
     };
     match launch(client) {

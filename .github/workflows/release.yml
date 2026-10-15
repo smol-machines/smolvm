@@ -248,11 +248,11 @@ jobs:
             rootfs_arch: aarch64
             agent_arch: aarch64
             lib_dir: lib
-          # Linux dist binaries build on 22.04 (glibc 2.35), NOT ubuntu-latest
-          # (24.04 = glibc 2.39). Symbol versioning is backward-compatible only,
-          # so the build host's glibc is the MINIMUM a user needs at runtime —
-          # a 2.39-built binary dies on 22.04 with "GLIBC_2.39 not found". 2.35
-          # covers Ubuntu 22.04+ / Debian 12+ / RHEL 9+.
+          # Linux dist binaries link against glibc 2.31 with zig (LINUX_GLIBC
+          # below), not the runner's: symbol versioning is backward-compatible
+          # only, so the glibc a binary links against is the MINIMUM a user
+          # needs at runtime. 2.31 covers Ubuntu 20.04+ / Debian 11+ / RHEL 9+;
+          # build-dist.sh fails the build if anything shipped needs newer.
           - platform: linux-x86_64
             runner: ubuntu-22.04
             rootfs_arch: x86_64
@@ -377,10 +377,23 @@ jobs:
       # the 2.0.0 submodule, and a VM boots from the embedded init with no
       # external init.krun (verified). build-dist.sh no longer bundles init.krun.
 
+      - name: Set up zig (Linux)
+        if: runner.os == 'Linux'
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild (Linux)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
       - name: Build distribution tarball
         run: ./scripts/build-dist.sh --skip-agent-build
         env:
           LIB_DIR: ${{ matrix.lib_dir }}
+          LINUX_GLIBC: ${{ runner.os == 'Linux' && '2.31' || '' }}
           CODESIGN_IDENTITY: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.CODESIGN_IDENTITY || '-' }}
 
       # Notarize the macOS binary if Developer ID signing was used.

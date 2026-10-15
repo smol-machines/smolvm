@@ -42,6 +42,23 @@ host.
 A bare `--` is rejected: the stub takes a subcommand first, and the tip it prints does not mention
 `run`. `smolvm pack run` takes `--sidecar <PATH>`, not a positional path.
 
+## A named machine from the artifact
+
+```bash
+smolvm machine create --name my-vm --from my-app.smolmachine
+smolvm machine start --name my-vm            # ~250ms boot, no image pull
+smolvm machine exec --name my-vm -- pip install x   # fully persistent
+smolvm machine stop --name my-vm
+smolvm machine ls                            # shows my-vm
+```
+
+That gives the artifact the full machine lifecycle: it boots from the payload's pre-extracted
+layers, and package installs and file writes survive `exec` sessions and a stop and start.
+
+The `.smolmachine` manifest also records `host_platform`, the host OS and architecture the stub
+runs on (`darwin/arm64`, distinct from `platform`, the guest's), `created`, an RFC 3339 timestamp of
+the pack, and `smolvm_version`, the release that built it.
+
 ## Assert a value, not a boot
 
 **A pack that lost its rootfs still boots, still prints a guest kernel and still exits zero.** Write
