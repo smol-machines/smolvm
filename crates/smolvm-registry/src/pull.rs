@@ -121,6 +121,8 @@ pub async fn pull_with_progress(
     // otherwise create a `.partial` file or touch atime outside the cache dir.
     crate::client::validate_digest(digest)?;
 
+    sweep_abandoned_partials_now_and_then(cache);
+
     // 3. Wait out any other pull of this blob, then check the cache: a pull that
     //    queued behind one fetching the same blob finds it cached here instead of
     //    streaming into the partial file the first one is about to rename away.
@@ -167,6 +169,35 @@ pub async fn pull_with_progress(
     tracing::info!(digest = %digest, size = result.size, "pull complete");
 
     Ok(result)
+}
+
+/// How long an abandoned partial download is kept for a retry to resume.
+const ABANDONED_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often a process sweeps abandoned partial downloads.
+const PARTIAL_SWEEP_INTERVAL_SECS: u64 = 60 * 60;
+
+/// Sweep the cache's abandoned partial downloads, at most once per interval
+/// per process, from the pull path, so a long-running serve keeps its cache
+/// clean without a separate timer. A failed sweep only logs.
+fn sweep_abandoned_partials_now_and_then(cache: &BlobCache) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_SWEEP: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_SWEEP.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < PARTIAL_SWEEP_INTERVAL_SECS
+        || LAST_SWEEP
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    if let Err(error) = cache.sweep_abandoned_partials(ABANDONED_PARTIAL_AGE) {
+        tracing::warn!(%error, "could not sweep abandoned partial downloads");
+    }
 }
 
 /// How often a pull waiting on another pull of the same blob checks again.

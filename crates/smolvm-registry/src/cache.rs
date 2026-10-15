@@ -262,6 +262,58 @@ impl BlobCache {
         Ok(())
     }
 
+    /// Remove `.partial` files untouched for `max_age` that no pull is writing,
+    /// returning the bytes freed.
+    ///
+    /// A pull that is cancelled or crashes leaves its partial behind, and
+    /// nothing else ever removed one: eviction skips partials because an active
+    /// pull may be writing them, so workers kept abandoned downloads from months
+    /// earlier. A resumable `<digest>.partial` is in use exactly while its
+    /// blob's download lock is held, so one whose lock this sweep can take is
+    /// abandoned; a recent one is kept so a retry can still resume it. Other
+    /// partials are temp files that live only within one call.
+    pub fn sweep_abandoned_partials(&self, max_age: std::time::Duration) -> io::Result<u64> {
+        let now = std::time::SystemTime::now();
+        let mut freed = 0u64;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() || !is_partial(&path) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            let age = now.duration_since(meta.modified()?).unwrap_or_default();
+            if age < max_age {
+                continue;
+            }
+            let digest = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| stem.starts_with("sha256_"))
+                .map(|stem| stem.replacen('_', ":", 1));
+            let _lock = match digest {
+                Some(digest) => {
+                    let lock = self.download_lock_file(&digest)?;
+                    match lock.try_lock() {
+                        Ok(()) => Some(lock),
+                        Err(fs::TryLockError::WouldBlock) => continue,
+                        Err(fs::TryLockError::Error(e)) => return Err(e),
+                    }
+                }
+                None => None,
+            };
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), bytes = meta.len(), "removed an abandoned partial download");
+                    freed += meta.len();
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(freed)
+    }
+
     /// Return the cache path for a blob with this digest.
     ///
     /// Used by the pull flow to write directly to `path.with_extension("partial")`,
@@ -485,6 +537,60 @@ mod tests {
             victim_partial.exists(),
             "eviction deleted another concurrent pull's in-flight .partial (the ENOENT bug)"
         );
+    }
+
+    /// Workers kept abandoned partial downloads for months: nothing removed a
+    /// partial a cancelled pull left behind. A sweep removes an old one no pull
+    /// holds, and keeps a recent one (a retry may resume it), one whose pull is
+    /// running, and every finished blob.
+    #[test]
+    fn a_sweep_removes_only_old_partials_no_pull_is_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), u64::MAX).unwrap();
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let age = |path: &Path, by: std::time::Duration| {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - by)
+                .unwrap();
+        };
+        let partial = |digest: &str| cache.blob_path_for(digest).with_extension("partial");
+        let abandoned = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let recent = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let pulling = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        for digest in [abandoned, recent, pulling] {
+            fs::write(partial(digest), [0u8; 64]).unwrap();
+        }
+        age(&partial(abandoned), 2 * day);
+        age(&partial(pulling), 2 * day);
+        let temp = tmp.path().join(".tmpAbC123.partial");
+        fs::write(&temp, [0u8; 8]).unwrap();
+        age(&temp, 2 * day);
+        let finished = cache.put("sha256:abc", b"blob").unwrap();
+        age(&finished, 2 * day);
+
+        let held = cache.download_lock_file(pulling).unwrap();
+        held.lock().unwrap();
+        let freed = cache.sweep_abandoned_partials(day).unwrap();
+
+        assert_eq!(freed, 64 + 8);
+        assert!(
+            !partial(abandoned).exists(),
+            "an old partial no pull holds is removed"
+        );
+        assert!(!temp.exists(), "an old temp partial is removed");
+        assert!(
+            partial(recent).exists(),
+            "a recent partial stays for a resume"
+        );
+        assert!(
+            partial(pulling).exists(),
+            "a partial an active pull holds stays"
+        );
+        assert!(finished.exists(), "finished blobs are never swept");
+        drop(held);
     }
 
     #[test]
