@@ -45,7 +45,7 @@ use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialValuesRequest, DeleteQuery, DeleteResponse,
     EgressEventsResponse, ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest,
     ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
-    ResourceSpec, StartMachineQuery, UpdateEgressRequest,
+    ResourceSpec, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -97,14 +97,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
                 staged: mount.staged,
             })
             .collect(),
-        ports: record
-            .ports
-            .iter()
-            .map(|(host, guest)| PortSpec {
-                host: *host,
-                guest: *guest,
-            })
-            .collect(),
+        ports: record.port_mappings().iter().map(PortSpec::from).collect(),
         network: record.network,
         gpu: record.gpu.unwrap_or(false),
         cuda: record.cuda,
@@ -992,6 +985,18 @@ pub struct CaptureCheckpointQuery {
     /// chunked file, and a delta of the checkpoint the machine continues from
     /// when this node holds it.
     pub incremental: Option<bool>,
+    /// With `incremental`: export a complete file even when a base is held,
+    /// so a caller can cap the chain of deltas a restore imports.
+    pub force_full: Option<bool>,
+    /// With a `cache_key`: reply as soon as the artifact is captured and held
+    /// on this node, and leave its upload to `POST /checkpoints/{key}/upload`.
+    /// Uploading a multi-gigabyte artifact took most of a checkpoint's time
+    /// while the caller only needed the capture, which a restore on this node
+    /// already serves from the node's copy. A caller may pass `upload_urls`
+    /// as well: this node ignores them, and a node that predates
+    /// `defer_upload` ignores it instead and uploads inline, so one request
+    /// works on both and the reply (`captured` or `uploaded`) says which ran.
+    pub defer_upload: Option<bool>,
 }
 
 /// Capture a live checkpoint of a running machine and stream it back as a
@@ -1018,6 +1023,15 @@ pub async fn capture_portable_checkpoint(
         .as_deref()
         .map(checked_upload_urls)
         .transpose()?;
+    let defer_upload = capture_options.defer_upload.unwrap_or(false);
+    if defer_upload {
+        let Some(key) = capture_options.cache_key.as_deref() else {
+            return Err(ApiError::BadRequest(
+                "defer_upload needs a cache_key to upload the artifact by later".into(),
+            ));
+        };
+        pending_checkpoint_upload_path(key)?;
+    }
 
     let mut transfer_builder = tempfile::Builder::new();
     transfer_builder.prefix("checkpoint-transfer-");
@@ -1039,12 +1053,16 @@ pub async fn capture_portable_checkpoint(
             .unwrap_or_else(crate::portable_checkpoint::prepared_checkpoint_budget)
     });
     let incremental = capture_options.incremental.unwrap_or(false);
+    let force_full = capture_options.force_full.unwrap_or(false);
     // Keep staging alive until the background capture finishes, even on disconnect.
     let (transfer, result) = with_owned_transfer(transfer, move |_dir| {
         if incremental {
-            return crate::checkpoint_delta::capture(&capture_name, &capture_path, move || {
-                drop(guard)
-            })
+            return crate::checkpoint_delta::capture(
+                &capture_name,
+                &capture_path,
+                force_full,
+                move || drop(guard),
+            )
             .map(|capture| (capture.result.clone(), None, Some(capture)));
         }
         crate::portable_checkpoint::capture_to_path_deferring_retention(
@@ -1113,22 +1131,49 @@ pub async fn capture_portable_checkpoint(
     };
 
     if let Some(key) = capture_options.cache_key {
-        let artifact = artifact.clone();
+        let cached = key.clone();
+        let source = artifact.clone();
         if let Err(error) =
-            tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact)).await
+            tokio::task::spawn_blocking(move || checkpoint_cache_put(&cached, &source)).await
         {
             tracing::warn!(%error, "checkpoint cache task failed");
+        }
+        if defer_upload {
+            let source = artifact.clone();
+            tokio::task::spawn_blocking(move || hold_checkpoint_for_upload(&key, &source))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("hold checkpoint for upload: {error}"))
+                })??;
+            let size = match &incremental {
+                Some(capture) => capture.export.bytes,
+                None => result.size_bytes,
+            };
+            finish(transfer);
+            return Ok(axum::response::IntoResponse::into_response(Json(
+                with_lineage(
+                    serde_json::json!({
+                        "captured": true,
+                        "sizeBytes": size,
+                        "pauseMs": result.source_pause.as_millis() as u64,
+                    }),
+                    incremental.as_ref(),
+                ),
+            )));
         }
     }
     if let Some(urls) = upload_urls {
         let size = upload_checkpoint(&artifact, urls).await?;
         finish(transfer);
         return Ok(axum::response::IntoResponse::into_response(Json(
-            serde_json::json!({
-                "uploaded": true,
-                "sizeBytes": size,
-                "pauseMs": result.source_pause.as_millis() as u64,
-            }),
+            with_lineage(
+                serde_json::json!({
+                    "uploaded": true,
+                    "sizeBytes": size,
+                    "pauseMs": result.source_pause.as_millis() as u64,
+                }),
+                incremental.as_ref(),
+            ),
         )));
     }
     #[cfg(target_os = "linux")]
@@ -1206,6 +1251,126 @@ fn upload_part_ranges(size: u64, parts: usize) -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// Captured artifacts waiting for `POST /checkpoints/{key}/upload`. Kept apart
+/// from the checkpoint cache, whose eviction could drop one before its upload
+/// runs; an upload removes its entry, and one never uploaded is swept after a
+/// day.
+fn pending_checkpoint_upload_dir() -> Result<std::path::PathBuf, ApiError> {
+    let dir = checkpoint_transfer_root()?.join("checkpoint-pending-upload");
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        ApiError::internal(format!("create pending checkpoint uploads: {error}"))
+    })?;
+    Ok(dir)
+}
+
+fn pending_checkpoint_upload_path(key: &str) -> Result<std::path::PathBuf, ApiError> {
+    let cached = checkpoint_cache_path(key)?;
+    let name = cached
+        .file_name()
+        .ok_or_else(|| ApiError::internal("checkpoint cache path has no name"))?;
+    Ok(pending_checkpoint_upload_dir()?.join(name))
+}
+
+/// How long a captured artifact waits for its upload before it is swept.
+const PENDING_CHECKPOINT_UPLOAD_TTL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Hold `artifact` for a later upload under `key`, sweeping holds never
+/// uploaded. A hard link, so the capture's own staging can go.
+fn hold_checkpoint_for_upload(key: &str, artifact: &std::path::Path) -> Result<(), ApiError> {
+    let destination = pending_checkpoint_upload_path(key)?;
+    hold_checkpoint_at(&destination, artifact)
+        .map_err(|error| ApiError::internal(format!("hold checkpoint for upload: {error}")))
+}
+
+/// Link `artifact` to `destination` in the pending-upload directory, after
+/// removing holds there older than [`PENDING_CHECKPOINT_UPLOAD_TTL`].
+fn hold_checkpoint_at(
+    destination: &std::path::Path,
+    artifact: &std::path::Path,
+) -> std::io::Result<()> {
+    let dir = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("hold path has no parent"))?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| {
+                    now.duration_since(modified).unwrap_or_default() > PENDING_CHECKPOINT_UPLOAD_TTL
+                });
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    link_checkpoint_cache_alias(artifact, destination, true)
+}
+
+/// Options for uploading a held checkpoint.
+#[derive(Debug, serde::Deserialize)]
+pub struct UploadHeldCheckpointQuery {
+    /// JSON array of pre-signed object-store URLs, one contiguous part each.
+    pub upload_urls: String,
+}
+
+/// Upload a checkpoint captured with `defer_upload` to pre-signed object-store
+/// URLs, then release the node's hold on it. The node's cached copy is the
+/// fallback when the hold is gone.
+pub async fn upload_held_checkpoint(
+    Path(key): Path<String>,
+    Query(query): Query<UploadHeldCheckpointQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let urls = checked_upload_urls(&query.upload_urls)?;
+    let held = pending_checkpoint_upload_path(&key)?;
+    let source = if held.exists() {
+        held.clone()
+    } else {
+        let cached = checkpoint_cache_path(&key)?;
+        if !cached.exists() {
+            return Err(ApiError::NotFound(format!(
+                "checkpoint {key} is not held on this node"
+            )));
+        }
+        cached
+    };
+    let size = upload_checkpoint(&source, urls).await?;
+    if source == held {
+        let _ = std::fs::remove_file(&held);
+    }
+    Ok(Json(
+        serde_json::json!({ "uploaded": true, "sizeBytes": size }),
+    ))
+}
+
+/// An incremental capture's lineage in a JSON reply, which the streamed reply
+/// carries as `x-smolvm-checkpoint-*` headers: whether the artifact is a delta,
+/// the checkpoint's lineage id, and the base a delta needs imported first.
+fn with_lineage(
+    mut reply: serde_json::Value,
+    capture: Option<&crate::checkpoint_delta::IncrementalCapture>,
+) -> serde_json::Value {
+    if let (Some(capture), Some(fields)) = (capture, reply.as_object_mut()) {
+        fields.insert(
+            "checkpointKind".into(),
+            if capture.base.is_some() {
+                "delta"
+            } else {
+                "full"
+            }
+            .into(),
+        );
+        fields.insert("lineageId".into(), capture.id.clone().into());
+        if let Some(base) = &capture.base {
+            fields.insert("baseLineageId".into(), base.clone().into());
+        }
+        fields.insert("reusedBytes".into(), capture.result.reused_bytes.into());
+    }
+    reply
+}
+
 fn checked_upload_urls(raw: &str) -> Result<Vec<reqwest::Url>, ApiError> {
     let urls: Vec<String> = serde_json::from_str(raw)
         .map_err(|error| ApiError::BadRequest(format!("invalid upload_urls: {error}")))?;
@@ -1231,7 +1396,7 @@ async fn upload_checkpoint(
 ) -> Result<u64, ApiError> {
     let file = std::fs::File::open(artifact)
         .map_err(|error| ApiError::internal(format!("open checkpoint artifact: {error}")))?;
-    upload_checkpoint_file(file, urls).await
+    upload_checkpoint_file(file, urls, crate::api::progress::Progress::default()).await
 }
 
 /// Read `length` bytes at `offset` of `file` as a body stream, positionally, so
@@ -1241,44 +1406,50 @@ fn checkpoint_part_stream(
     file: Arc<std::fs::File>,
     offset: u64,
     length: u64,
+    progress: crate::api::progress::Progress,
 ) -> impl futures_util::Stream<Item = std::io::Result<axum::body::Bytes>> {
     const CHUNK: u64 = 1024 * 1024;
-    futures_util::stream::try_unfold((file, offset, length), |(file, offset, left)| async move {
-        if left == 0 {
-            return Ok(None);
-        }
-        let want = left.min(CHUNK) as usize;
-        let reader = file.clone();
-        let chunk = tokio::task::spawn_blocking(move || {
-            let mut buffer = vec![0_u8; want];
-            let mut filled = 0;
-            while filled < want {
-                #[cfg(unix)]
-                let read = std::os::unix::fs::FileExt::read_at(
-                    &*reader,
-                    &mut buffer[filled..],
-                    offset + filled as u64,
-                )?;
-                #[cfg(windows)]
-                let read = std::os::windows::fs::FileExt::seek_read(
-                    &*reader,
-                    &mut buffer[filled..],
-                    offset + filled as u64,
-                )?;
-                if read == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "checkpoint artifact shrank during upload",
-                    ));
-                }
-                filled += read;
+    futures_util::stream::try_unfold((file, offset, length), move |(file, offset, left)| {
+        let progress = progress.clone();
+        async move {
+            if left == 0 {
+                return Ok(None);
             }
-            Ok(axum::body::Bytes::from(buffer))
-        })
-        .await
-        .map_err(std::io::Error::other)??;
-        let read = chunk.len() as u64;
-        Ok(Some((chunk, (file, offset + read, left - read))))
+            let want = left.min(CHUNK) as usize;
+            let reader = file.clone();
+            let chunk = tokio::task::spawn_blocking(move || {
+                let mut buffer = vec![0_u8; want];
+                let mut filled = 0;
+                while filled < want {
+                    #[cfg(unix)]
+                    let read = std::os::unix::fs::FileExt::read_at(
+                        &*reader,
+                        &mut buffer[filled..],
+                        offset + filled as u64,
+                    )?;
+                    #[cfg(windows)]
+                    let read = std::os::windows::fs::FileExt::seek_read(
+                        &*reader,
+                        &mut buffer[filled..],
+                        offset + filled as u64,
+                    )?;
+                    if read == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "checkpoint artifact shrank during upload",
+                        ));
+                    }
+                    filled += read;
+                }
+                Ok(axum::body::Bytes::from(buffer))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            let read = chunk.len() as u64;
+            // The body asks for the next chunk only once the last one is sent.
+            progress.touch();
+            Ok(Some((chunk, (file, offset + read, left - read))))
+        }
     })
 }
 
@@ -1286,6 +1457,7 @@ fn checkpoint_part_stream(
 async fn upload_checkpoint_file(
     file: std::fs::File,
     urls: Vec<reqwest::Url>,
+    progress: crate::api::progress::Progress,
 ) -> Result<u64, ApiError> {
     let size = file
         .metadata()
@@ -1308,9 +1480,11 @@ async fn upload_checkpoint_file(
             .map(|(index, (url, (start, length)))| {
                 let client = client.clone();
                 let file = file.clone();
+                let progress = progress.clone();
                 async move {
-                    let body =
-                        reqwest::Body::wrap_stream(checkpoint_part_stream(file, start, length));
+                    let body = reqwest::Body::wrap_stream(checkpoint_part_stream(
+                        file, start, length, progress,
+                    ));
                     let response = client
                         .put(url)
                         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1435,13 +1609,16 @@ mod checkpoint_upload_tests {
         std::fs::remove_file(&path).unwrap();
         let ranges = upload_part_ranges(content.len() as u64, 4);
         let parts = futures_util::future::try_join_all(ranges.iter().map(|&(start, length)| {
-            checkpoint_part_stream(file.clone(), start, length).try_fold(
-                Vec::new(),
-                |mut acc, chunk| async move {
-                    acc.extend_from_slice(&chunk);
-                    Ok(acc)
-                },
+            checkpoint_part_stream(
+                file.clone(),
+                start,
+                length,
+                crate::api::progress::Progress::default(),
             )
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
         }))
         .await
         .unwrap();
@@ -1477,6 +1654,46 @@ mod checkpoint_upload_tests {
         assert!(checked_upload_urls(r#"["https://169.254.169.254/latest"]"#).is_err());
         assert!(checked_upload_urls(r#"["http://storage.googleapis.com/o"]"#).is_err());
         assert!(checked_upload_urls("not json").is_err());
+    }
+}
+
+#[cfg(test)]
+mod held_checkpoint_tests {
+    use super::{hold_checkpoint_at, PENDING_CHECKPOINT_UPLOAD_TTL};
+
+    /// A deferred capture holds its artifact apart from the cache, so cache
+    /// eviction cannot drop it before the upload, and a hold never uploaded is
+    /// swept rather than kept forever.
+    #[test]
+    fn a_hold_survives_its_source_and_stale_holds_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = dir.path().join("pending");
+        std::fs::create_dir_all(&pending).unwrap();
+        let stale = pending.join("ckpt-old.smolcheckpoint");
+        std::fs::write(&stale, b"old").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - PENDING_CHECKPOINT_UPLOAD_TTL
+                    - std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let fresh = pending.join("ckpt-recent.smolcheckpoint");
+        std::fs::write(&fresh, b"recent").unwrap();
+
+        let artifact = dir.path().join("staging.smolcheckpoint");
+        std::fs::write(&artifact, b"captured").unwrap();
+        let held = pending.join("ckpt-new.smolcheckpoint");
+        hold_checkpoint_at(&held, &artifact).unwrap();
+        // The capture's staging goes away; the hold keeps the bytes.
+        std::fs::remove_file(&artifact).unwrap();
+
+        assert_eq!(std::fs::read(&held).unwrap(), b"captured");
+        assert!(!stale.exists(), "a hold past its TTL is swept");
+        assert!(fresh.exists(), "a recent hold is kept");
     }
 }
 
@@ -2080,14 +2297,7 @@ pub async fn restore_portable_checkpoint(
 /// so the two branches don't drift.
 fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> MachineEntry {
     let mounts = record.host_mounts().iter().map(MountSpec::from).collect();
-    let ports = record
-        .ports
-        .iter()
-        .map(|(h, g)| PortSpec {
-            host: *h,
-            guest: *g,
-        })
-        .collect();
+    let ports = record.port_mappings().iter().map(PortSpec::from).collect();
     MachineEntry {
         manager,
         cache_disk: record.cache_disk.clone(),
@@ -2331,15 +2541,13 @@ pub async fn create_machine(
 /// is a private request-scoped handoff, not a public option.
 async fn create_machine_inner(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<CreateMachineRequest>,
+    Json(mut req): Json<CreateMachineRequest>,
     verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
     cached_checkpoint: bool,
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Refused before any image pull or disk work, so a server that has not opted
     // in never builds a nested machine.
     state.ensure_nested_virt_allowed(req.nested_virt)?;
-    #[cfg(target_os = "linux")]
-    let mut req = req;
     #[cfg(target_os = "linux")]
     let _prepared = if let Some(reference) = req
         .from
@@ -2376,6 +2584,12 @@ async fn create_machine_inner(
         ));
     }
 
+    // Resolve local images after validating the exclusive source choice, before
+    // creating or registering the machine. This persists a stable local: ref.
+    if let Some(image) = req.image.take() {
+        req.image = Some(resolve_api_image(&state, image).await?);
+    }
+
     // Published ports need the inbound path that only virtio-net has. With an
     // UNSET backend the launcher auto-selects virtio-net when ports are present
     // (see `plan_launch_network`), so ports "just work" without per-request
@@ -2408,8 +2622,6 @@ async fn create_machine_inner(
     }
 
     // If registry_ref is set, pull the artifact from the registry and treat as `from`
-    #[cfg(not(target_os = "linux"))]
-    let mut req = req;
     // Where a pack came from, kept on the machine so a live checkpoint of it can
     // name the pack for a host that has to fetch it.
     let mut pack_registry_ref: Option<String> = None;
@@ -2515,11 +2727,7 @@ async fn create_machine_inner(
             ));
         }
     }
-    let port_mappings: Vec<PortMapping> = req
-        .ports
-        .iter()
-        .map(|p| PortMapping::new(p.host, p.guest))
-        .collect();
+    let port_mappings: Vec<PortMapping> = req.ports.iter().map(PortMapping::from).collect();
     PortMapping::check_duplicates(&port_mappings).map_err(ApiError::BadRequest)?;
 
     // Validate and normalize egress CIDRs, matching the CLI's --allow-cidr
@@ -2749,6 +2957,7 @@ async fn create_machine_inner(
                 .map(|port| PortSpec {
                     host: port.host,
                     guest: port.guest,
+                    protocol: Default::default(),
                 })
                 .collect()
         })
@@ -2801,6 +3010,8 @@ async fn create_machine_inner(
             ));
         }
     }
+    crate::workload::validate_stop_settings(req.stop_signal.as_deref(), req.stop_timeout_secs)
+        .map_err(ApiError::BadRequest)?;
     // Reject invalid resources up front (as the CLI does at create time), so the
     // API returns a clear 400 here instead of persisting an unbootable machine
     // that only fails with a deferred 500 when it is later started.
@@ -2930,11 +3141,10 @@ async fn create_machine_inner(
     // Extract the bundle's OCI layers into this machine's own data dir (created
     // by the manager above) rather than the shared pack cache, so every start is
     // independent of the .smolmachine file surviving and the macOS layers volume
-    // is owned 1:1 by the machine. Extraction mounts the case-sensitive volume on
+    // initially belongs only to this machine. Extraction mounts the volume on
     // macOS; detach it immediately so a created-but-unstarted machine leaves
-    // nothing mounted (invariant: the per-machine layers volume is mounted iff
-    // the VM is running). The name was reserved above, so this never clobbers
-    // another machine's layers.
+    // nothing mounted (it has no children yet). The name was reserved above,
+    // so this never clobbers another machine's layers.
     if let Some(ref sidecar_path) = source_smolmachine {
         let name = name.clone();
         let sidecar_path = sidecar_path.clone();
@@ -3210,6 +3420,8 @@ async fn create_machine_inner(
         forkable: manifest_checkpoint.is_some(),
         init_completed: manifest_checkpoint.is_some(),
         docker_socket: req.docker_socket,
+        stop_signal: req.stop_signal.clone(),
+        stop_timeout_secs: req.stop_timeout_secs,
         image: match &restored_host_image {
             Some(restored) => Some(restored.local.clone()),
             None => image,
@@ -3303,6 +3515,54 @@ async fn create_machine_inner(
         .ok_or_else(|| ApiError::internal("machine disappeared after creation".to_string()))?;
 
     Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Normalize an API image before the machine is registered. A registry
+/// reference passes through. A local archive or rootfs directory is accepted
+/// only under the server's `--local-image-dir`, after resolving symlinks, since
+/// a path names the server's own files; an already-resolved `local:` /
+/// `local-dir:` reference is never accepted from a caller. A request has no
+/// stdin archive stream, so `-` fails. Hashing multi-GiB archives runs off the
+/// Tokio reactor.
+async fn resolve_api_image(state: &ApiState, image: String) -> Result<String, ApiError> {
+    use crate::data::image_source::{
+        classify, is_local_ref, resolve, ArchiveInput, ImageSource, ResolvedImage,
+    };
+    if is_local_ref(&image) {
+        return Err(ApiError::BadRequest(
+            "image names a resolved local source; give the archive or directory path".into(),
+        ));
+    }
+    let path = match classify(&image) {
+        ImageSource::Registry(_) => return Ok(image),
+        ImageSource::Archive(ArchiveInput::Stdin) => {
+            return Err(ApiError::BadRequest(
+                "image '-' requires CLI stdin; give the API a server-local archive path".into(),
+            ))
+        }
+        ImageSource::Unsupported { hint, .. } => return Err(ApiError::BadRequest(hint)),
+        ImageSource::Archive(ArchiveInput::File(path)) | ImageSource::Directory(path) => path,
+    };
+    let dir = state.local_image_dir()?;
+    let canonical = path.canonicalize().map_err(|error| {
+        ApiError::BadRequest(format!("local image '{}': {error}", path.display()))
+    })?;
+    if !canonical.starts_with(&dir) {
+        return Err(ApiError::BadRequest(format!(
+            "local image '{}' is outside this server's local image directory",
+            path.display()
+        )));
+    }
+    let source = classify(&canonical.to_string_lossy());
+    tokio::task::spawn_blocking(move || resolve(source))
+        .await
+        .map_err(|error| ApiError::internal(format!("image resolution task failed: {error}")))?
+        .map(|resolved| match resolved {
+            ResolvedImage::Registry(reference) | ResolvedImage::Local { reference, .. } => {
+                reference
+            }
+        })
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 /// List all machines.
@@ -3466,7 +3726,9 @@ pub async fn get_machine_mediation_events(
 /// scoped to the virtio-net path so an unrelated AddrInUse can't be mistaken for
 /// it.
 fn classify_launch_error(e: String) -> ApiError {
-    if crate::api::error::is_invalid_image_archive(&e) {
+    if crate::api::error::is_invalid_image_archive(&e)
+        || crate::api::error::is_refused_remote_volume(&e)
+    {
         return ApiError::BadRequest(e);
     }
     let lc = e.to_ascii_lowercase();
@@ -3554,6 +3816,7 @@ pub async fn start_machine(
     body: Bytes,
 ) -> Result<Json<MachineInfo>, ApiError> {
     let request: crate::api::types::StartMachineRequest = optional_json_body(&headers, &body)?;
+    let query = query.with_body(&request);
     let registry_auth: Option<crate::registry::RegistryAuth> =
         request.registry_auth.map(Into::into);
     let mediated_egress = request
@@ -3652,16 +3915,18 @@ pub async fn start_machine(
     if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
-            .map_err(ApiError::database)?;
+        let clones = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::restart_blocking_dependent_clones(&db, &golden)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        .map_err(ApiError::database)?;
         let reason = if clones.is_empty() {
             "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
                 .to_string()
         } else {
             format!(
-                "it is the fork base for {} live clone(s) ({}); delete the clones first",
+                "it is the fork base for {} dependent clone(s) ({}); delete the clones first",
                 clones.len(),
                 clones.join(", ")
             )
@@ -4024,6 +4289,8 @@ pub async fn start_machine(
         // crun/overlay hiccup leaves a reachable (exec-able) VM rather than
         // failing an otherwise-pullable start — the image is already local, so a
         // retry or the health loop can bring the workload up.
+        let stop_on_exit = record.stop_on_exit;
+        let (stop_signal, stop_timeout) = (record.stop_signal.clone(), record.stop_timeout_secs);
         let launch = with_machine_client_traced(&entry, None, move |c| {
             let config = crate::agent::RunConfig::new(image, command)
                 .with_env(env)
@@ -4031,7 +4298,9 @@ pub async fn start_machine(
                 .with_user(user)
                 .with_mounts(mounts_config)
                 .with_persistent_overlay(Some(overlay_id))
-                .with_s3_volumes(s3_volumes);
+                .with_s3_volumes(s3_volumes)
+                .with_stop_vm_on_exit(stop_on_exit)
+                .with_stop(stop_signal, stop_timeout);
             c.run_container_detached(config).map(|_| ())
         })
         .await;
@@ -4096,6 +4365,7 @@ fn classify_fork_error(e: SmolvmError) -> ApiError {
     } else if lc.contains("already exists")
         || lc.contains("not running forkable")
         || lc.contains("no memfd-backed ram")
+        || lc.contains("not started as branchable")
         || lc.contains("control socket not responding")
         || lc.contains("not ready to fork")
     {
@@ -4205,10 +4475,11 @@ const MAX_CONCURRENT_BRANCH_BOOTS: usize = 8;
 /// requests queued for it. Every queued request was sent before the batch takes
 /// its checkpoint, so one checkpoint taken then is a state of the source each
 /// of them could have branched alone; for a running source this replaces one
-/// checkpoint per child with one per batch. Held pool slots and pinned ports
-/// keep the one-at-a-time path.
+/// checkpoint per child with one per batch. Pinned ports go with their child,
+/// and a host port asked for twice fails only the later request. Held pool
+/// slots keep the one-at-a-time path.
 fn coalescable_branch(req: &ForkRequest) -> bool {
-    !req.hold && req.ports.is_empty()
+    !req.hold
 }
 
 /// Take the source as a single branch does, then serve every compatible
@@ -4247,8 +4518,9 @@ async fn branch_batch_transaction(
 ) {
     let mut accepted = Vec::with_capacity(batch.len());
     let mut names = std::collections::HashSet::new();
+    let mut host_ports = std::collections::HashSet::new();
     for queued in batch {
-        match check_queued_branch(state, golden, &queued.req, &mut names).await {
+        match check_queued_branch(state, golden, &queued.req, &mut names, &mut host_ports).await {
             Ok(fork_env) => accepted.push((queued, fork_env)),
             Err(error) => {
                 let _ = queued.reply.send(Err(error));
@@ -4350,25 +4622,38 @@ async fn prepare_and_boot_branches(
             .map(|(queued, fork_env)| {
                 (
                     queued.req.name.clone(),
+                    queued
+                        .req
+                        .ports
+                        .iter()
+                        .map(|p| (p.host, p.guest))
+                        .collect::<Vec<(u16, u16)>>(),
                     queued.req.forkable,
                     fork_env.clone(),
                     queued.req.secrets.clone(),
+                    queued
+                        .req
+                        .labels
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<Vec<(String, String)>>(),
                 )
             })
             .collect();
         tokio::task::spawn_blocking(move || {
             let specs: Vec<_> = children
                 .iter()
-                .map(
-                    |(clone, forkable, fork_env, secrets)| crate::agent::fork::ForkSpec {
+                .map(|(clone, ports, forkable, fork_env, secrets, labels)| {
+                    crate::agent::fork::ForkSpec {
                         clone,
-                        pinned_ports: &[],
+                        pinned_ports: ports,
                         clone_forkable: *forkable,
                         fork_env,
                         fork_secrets: secrets,
                         hold: false,
-                    },
-                )
+                        labels,
+                    }
+                })
                 .collect();
             crate::agent::fork::prepare_forks(&db, &golden_b, &specs, source_policy)
         })
@@ -4410,14 +4695,57 @@ async fn prepare_and_boot_branches(
     Ok(())
 }
 
+/// A branch request's pinned ports as `(host, guest)`. Pins name TCP ports: a
+/// branch gets fresh host ports for its source's UDP forwards on its own.
+fn branch_pins(ports: &[PortSpec]) -> Result<Vec<(u16, u16)>, ApiError> {
+    if let Some(udp) = ports.iter().find(|p| !p.protocol.is_tcp()) {
+        return Err(ApiError::BadRequest(format!(
+            "{}:{}/udp cannot be pinned: a branch pins TCP ports, and gets fresh host ports for UDP forwards automatically",
+            udp.host, udp.guest
+        )));
+    }
+    Ok(ports.iter().map(|p| (p.host, p.guest)).collect())
+}
+
 /// The checks a single branch makes before preparing its child. Returns the
 /// child's parsed environment. `names` collects the batch's child names.
+/// Validate a branch's pinned ports as the create path does: a branch uses
+/// these host ports as-is, so port 0 or a duplicated host port would otherwise
+/// surface only as a confusing child-boot bind failure instead of a clean 400.
+fn validate_pinned_ports(pinned_ports: &[(u16, u16)]) -> Result<(), ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    for (host, guest) in pinned_ports {
+        if *host == 0 || *guest == 0 {
+            return Err(ApiError::BadRequest(
+                "port 0 is not valid for VM port forwarding".to_string(),
+            ));
+        }
+        if !seen.insert(*host) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate host port {host}: each host port can only be mapped once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn check_queued_branch(
     state: &ApiState,
     golden: &str,
     req: &ForkRequest,
     names: &mut std::collections::HashSet<String>,
+    host_ports: &mut std::collections::HashSet<u16>,
 ) -> Result<Vec<(String, String)>, ApiError> {
+    let pinned_ports = branch_pins(&req.ports)?;
+    validate_pinned_ports(&pinned_ports)?;
+    if let Some((host, _)) = pinned_ports
+        .iter()
+        .find(|(host, _)| host_ports.contains(host))
+    {
+        return Err(ApiError::Conflict(format!(
+            "host port {host} is already pinned by another branch of '{golden}'"
+        )));
+    }
     crate::api::handlers::validate_fork_secrets(&req.secrets)?;
     let fork_env = crate::util::parse_request_env_list(&req.env).map_err(ApiError::BadRequest)?;
     crate::agent::fork::validate_fork_env(&fork_env)
@@ -4434,6 +4762,7 @@ async fn check_queued_branch(
             req.name
         )));
     }
+    host_ports.extend(pinned_ports.iter().map(|(host, _)| *host));
     Ok(fork_env)
 }
 
@@ -4457,7 +4786,7 @@ async fn fork_machine_transaction(
     reply: &tokio::sync::oneshot::Sender<Result<MachineInfo, ApiError>>,
 ) -> Result<MachineInfo, ApiError> {
     let clone = req.name.clone();
-    let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+    let pinned_ports = branch_pins(&req.ports)?;
     let req_share_weights = req.share_weights;
     let req_forkable = req.forkable;
     let req_hold = req.hold;
@@ -4489,26 +4818,7 @@ async fn fork_machine_transaction(
         )));
     }
 
-    // Validate pinned ports as the create path does: fork uses these host ports
-    // as-is (no remapping), so port 0 or a duplicated host port would otherwise
-    // surface only as a confusing clone-boot bind failure instead of a clean 400.
-    for (h, g) in &pinned_ports {
-        if *h == 0 || *g == 0 {
-            return Err(ApiError::BadRequest(
-                "port 0 is not valid for VM port forwarding".to_string(),
-            ));
-        }
-    }
-    {
-        let mut seen = std::collections::HashSet::new();
-        for (h, _) in &pinned_ports {
-            if !seen.insert(*h) {
-                return Err(ApiError::BadRequest(format!(
-                    "duplicate host port {h}: each host port can only be mapped once"
-                )));
-            }
-        }
-    }
+    validate_pinned_ports(&pinned_ports)?;
 
     // A failed clone finalization may need to roll back the golden and discard
     // the retained checkpoint that produced it. Keep that state transition in
@@ -4579,6 +4889,11 @@ async fn fork_machine_transaction(
         let ports = pinned_ports.clone();
         let env = fork_env.clone();
         let secrets = fork_secrets.clone();
+        let labels: Vec<(String, String)> = req
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         tokio::task::spawn_blocking(move || {
             if req_hold {
                 crate::agent::fork::prepare_held_fork(
@@ -4588,6 +4903,7 @@ async fn fork_machine_transaction(
                     &ports,
                     &env,
                     &secrets,
+                    &labels,
                     source_policy,
                 )
             } else {
@@ -4599,6 +4915,7 @@ async fn fork_machine_transaction(
                     req_forkable,
                     &env,
                     &secrets,
+                    &labels,
                     source_policy,
                 )
             }
@@ -4707,6 +5024,7 @@ pub(crate) async fn fork_held_machines_inner(
                     fork_env: &[],
                     fork_secrets: &empty_secrets,
                     hold: true,
+                    labels: &[],
                 })
                 .collect();
             crate::agent::fork::prepare_forks_reusing(
@@ -5244,7 +5562,8 @@ pub async fn paused_checkpoint(
     if let Some(urls) = upload_urls {
         // Straight to the store, so the artifact never crosses the control
         // plane: relaying it there cost a full copy, an fsync and one stream.
-        let size = upload_checkpoint_file(file, urls).await?;
+        let size =
+            upload_checkpoint_file(file, urls, crate::api::progress::Progress::default()).await?;
         return Ok(axum::response::IntoResponse::into_response(Json(
             serde_json::json!({ "uploaded": true, "sizeBytes": size }),
         )));
@@ -5268,7 +5587,8 @@ pub async fn paused_checkpoint(
     path = "/api/v1/machines/{name}/stop",
     tag = "Machines",
     params(
-        ("name" = String, Path, description = "Machine name")
+        ("name" = String, Path, description = "Machine name"),
+        ("timeout" = Option<u64>, Query, description = "Seconds the workload gets to exit after its stop signal before it is killed, instead of the machine's stop timeout; 0 kills it at once")
     ),
     responses(
         (status = 200, description = "Machine stopped", body = MachineInfo),
@@ -5279,7 +5599,11 @@ pub async fn paused_checkpoint(
 pub async fn stop_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<crate::api::types::StopQuery>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    let stop_timeout = query.timeout;
+    crate::workload::validate_stop_settings(None, stop_timeout).map_err(ApiError::BadRequest)?;
+    let stop_timeout = stop_timeout.map(std::time::Duration::from_secs);
     // Hold the per-machine lifecycle lock across the whole stop so the layers
     // volume detach below cannot race a concurrent start's acquire+mount+launch
     // (review finding #3). Acquired before the DB read and liveness probe
@@ -5321,14 +5645,16 @@ pub async fn stop_machine(
     if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-            .map_err(ApiError::database)?;
+        let clones = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::restart_blocking_dependent_clones(&db, &golden)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(ApiError::database)?;
         if !clones.is_empty() {
             return Err(ApiError::Conflict(format!(
-                "machine '{}' is the fork base of {} live clone(s) ({}); they CoW-map its \
-                 memory and disks — stop or delete the clones first",
+                "machine '{}' is the fork base of {} dependent clone(s) ({}); they CoW-map its \
+                 memory and disks — delete those clones first",
                 name,
                 clones.len(),
                 clones.join(", ")
@@ -5344,10 +5670,9 @@ pub async fn stop_machine(
     ) {
         // Not running. If a prior start mounted the layers volume but the VM
         // then failed to boot (or the server crashed while running), the volume
-        // could still be mounted — detach it so a stopped machine never holds a
-        // mount (invariant: the per-machine layers volume is mounted iff the VM
-        // is running). Safe: actual_state() probed liveness, so the process is
-        // confirmed dead and nothing is using the volume. macOS hdiutil detach;
+        // could still be mounted — detach it unless fork children reference it.
+        // actual_state() probed this process's liveness; the detach helper also
+        // checks child pack references before unmounting. macOS hdiutil detach;
         // a no-op on Linux.
         if record.source_smolmachine.is_some() {
             let name_clone = name.clone();
@@ -5414,6 +5739,8 @@ pub async fn stop_machine(
             // above, so nothing still maps its memory or disks.
             let stop = if frozen {
                 e.manager.stop_paused()
+            } else if let Some(stop_timeout) = stop_timeout {
+                e.manager.stop_with_timeout(stop_timeout)
             } else {
                 e.manager.stop()
             };
@@ -5429,8 +5756,8 @@ pub async fn stop_machine(
         if outcome.is_ok() {
             // Process is gone — detach this machine's case-sensitive layers
             // volume (macOS hdiutil mount; no-op on Linux). The volume lives
-            // under the machine's own data dir and is owned 1:1 by it, so the
-            // detach is unconditional and re-acquired on the next start.
+            // under the machine's data dir. The detach helper preserves it if
+            // a continuing source still has children referencing its layers.
             smolvm_pack::extract::force_detach_layers_volume(
                 &crate::agent::machine_layers_cache_dir(&name_clone),
             );
@@ -5478,6 +5805,9 @@ pub async fn sync_machine(
         .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
     if record.staged_mounts.is_empty() {
         return Ok(Json(record_to_info(&name, &record)));
+    }
+    if let Some(error) = crate::staged_mount::refuse_detached_sync(&record, &name) {
+        return Err(ApiError::Conflict(error.to_string()));
     }
     if crate::agent::state_probe::resolve_state(&name, &record) != RecordState::Running {
         return Err(ApiError::Conflict(format!(
@@ -5862,7 +6192,8 @@ async fn delete_one_transaction(
             // Process is gone — detach this machine's case-sensitive layers
             // volume (macOS hdiutil mount; no-op on Linux) before the data dir is
             // removed below, otherwise `rm -rf` fails with "Resource busy". The
-            // volume is owned 1:1 by this machine, so the detach is unconditional.
+            // dependent children were checked above; the detach helper also
+            // preserves any remaining child pack references.
             smolvm_pack::extract::force_detach_layers_volume(
                 &crate::agent::machine_layers_cache_dir(&name_clone),
             );
@@ -6008,6 +6339,62 @@ pub async fn put_credential_values(
             .collect(),
     );
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Replace a machine's published ports, live when it runs.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/ports",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = SetPortsRequest,
+    responses(
+        (status = 200, description = "Ports set; a running machine is already serving them", body = MachineInfo),
+        (status = 400, description = "Invalid ports, or a running machine that cannot change them", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "A host port is already in use (PORT_IN_USE), or a UDP change on a running machine", body = ApiErrorResponse)
+    )
+)]
+pub async fn set_machine_ports(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetPortsRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    // Under the lifecycle lock so a start or stop cannot land between reading
+    // the state and applying the ports.
+    let lifecycle = state.lifecycle_lock(&name);
+    let guard = lifecycle.lock_owned().await;
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let running = record.actual_state() == RecordState::Running;
+    let ports: Vec<PortMapping> = req.ports.iter().map(PortMapping::from).collect();
+    let db = state.db().clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        crate::agent::live_ports::set_published_ports(&db, &record, running, &ports)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("set ports task failed: {error}")))?
+    .map_err(classify_set_ports_error)?;
+    Ok(Json(record_to_info(&name, &saved)))
+}
+
+/// A host port something else holds is `PortConflict`, which the control plane
+/// retries on another port; any other configuration refusal is the caller's.
+fn classify_set_ports_error(error: crate::Error) -> ApiError {
+    let message = error.to_string();
+    let lc = message.to_ascii_lowercase();
+    if lc.contains("address already in use") || lc.contains("os error 10048") {
+        return ApiError::PortConflict(message);
+    }
+    match error {
+        crate::Error::Config { .. } => ApiError::BadRequest(message),
+        other => ApiError::from(other),
+    }
 }
 
 /// Resize a machine's disk resources.
@@ -6226,8 +6613,10 @@ pub async fn resize_machine(
 pub async fn publish_cache_disk(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    progress: Option<axum::Extension<crate::api::progress::Progress>>,
     Json(req): Json<crate::api::types::PublishCacheDiskRequest>,
 ) -> Result<Json<crate::api::types::PublishCacheDiskResponse>, ApiError> {
+    let progress = progress.map(|p| p.0).unwrap_or_default();
     let dir = state.cache_disk_dir()?;
     crate::data::disk::validate_base_name(&req.base).map_err(ApiError::BadRequest)?;
 
@@ -6272,10 +6661,11 @@ pub async fn publish_cache_disk(
         .transpose()?;
 
     let layer = crate::data::disk::CacheDisk::layer_path(&vm_data_dir(&name));
+    let flatten_dir = dir.clone();
     let base = req.base.clone();
-    let published = dir.join(&req.base);
-    let (size_bytes, sha256) =
-        tokio::task::spawn_blocking(move || -> Result<(u64, String), ApiError> {
+    let flattening = progress.clone();
+    let (staged, sha256) =
+        tokio::task::spawn_blocking(move || -> Result<(StagedBase, String), ApiError> {
             let _guard = guard;
             // A machine that never started has no layer yet: its cache is the base.
             let top = if layer.exists() {
@@ -6283,18 +6673,25 @@ pub async fn publish_cache_disk(
             } else {
                 cache.base.clone()
             };
-            let size = publish_flattened(&top, &dir, &base)?;
-            let digest = file_sha256(&dir.join(&base))?;
-            crate::data::disk::record_base_digest(&dir.join(&base), &digest);
-            Ok((size, digest))
+            let staged = flatten_staged(&top, &flatten_dir, &base, &flattening)?;
+            let digest = file_sha256(staged.path(), &flattening)?;
+            Ok((staged, digest))
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    // The base takes its name only once the upload has landed. Named first, a
+    // failed upload left it behind under a version the control plane never
+    // recorded, and every later publish of that version collided with it.
     if let Some(urls) = upload_urls {
-        let file = std::fs::File::open(&published)
-            .map_err(|e| ApiError::internal(format!("open {}: {e}", published.display())))?;
-        upload_checkpoint_file(file, urls).await?;
+        let file = std::fs::File::open(staged.path())
+            .map_err(|e| ApiError::internal(format!("open {}: {e}", staged.path().display())))?;
+        upload_checkpoint_file(file, urls, progress).await?;
     }
+    let base = req.base.clone();
+    let digest = sha256.clone();
+    let size_bytes = tokio::task::spawn_blocking(move || staged.install(&dir, &base, &digest))
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
     Ok(Json(crate::api::types::PublishCacheDiskResponse {
         base: req.base,
         size_bytes,
@@ -6302,19 +6699,100 @@ pub async fn publish_cache_disk(
     }))
 }
 
-/// The SHA-256 of a file, as lowercase hex.
-fn file_sha256(path: &std::path::Path) -> Result<String, ApiError> {
+/// Remove a cache base from this server: a base a failed publish left behind,
+/// or one whose cache disk was deleted. Refused while a machine here is
+/// attached to it. Removing a base that is not here succeeds, so a retry is
+/// safe; a base that is needed again is fetched from its source.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/cache-bases/{base}",
+    tag = "Machines",
+    params(
+        ("base" = String, Path, description = "Cache base file name")
+    ),
+    responses(
+        (status = 204, description = "Cache base removed, or was not here"),
+        (status = 400, description = "Invalid name, or cache disks disabled", body = ApiErrorResponse),
+        (status = 409, description = "A machine is attached to the base", body = ApiErrorResponse),
+    )
+)]
+pub async fn delete_cache_base(
+    State(state): State<Arc<ApiState>>,
+    Path(base): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let dir = state.cache_disk_dir()?;
+    crate::data::disk::validate_base_name(&base).map_err(ApiError::BadRequest)?;
+    // Held so a create fetching this base cannot have it removed underneath.
+    let fetch_lock = cache_base_fetch_lock(&base);
+    let _fetching = fetch_lock.lock().await;
+    let path = dir.join(&base);
+    let db = state.db().clone();
+    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        let attached = db
+            .list_vms()
+            .map_err(|e| ApiError::internal(format!("list machines: {e}")))?
+            .into_iter()
+            .find(|(_, record)| {
+                // Base names are unique per cache disk version, so the name
+                // alone identifies it however the path was spelled.
+                record
+                    .cache_disk
+                    .as_ref()
+                    .is_some_and(|cache| cache.base.file_name() == path.file_name())
+            });
+        if let Some((name, _)) = attached {
+            return Err(ApiError::Conflict(format!(
+                "cache base '{}' is attached to machine '{name}'",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
+        crate::data::disk::remove_base(&path)
+            .map_err(|e| ApiError::internal(format!("remove {}: {e}", path.display())))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// The SHA-256 of a file, as lowercase hex, touching `progress` as it reads.
+fn file_sha256(
+    path: &std::path::Path,
+    progress: &crate::api::progress::Progress,
+) -> Result<String, ApiError> {
     use sha2::Digest;
+    use std::io::Read;
     let mut file = std::fs::File::open(path)
         .map_err(|e| ApiError::internal(format!("open {}: {e}", path.display())))?;
     let mut hasher = sha2::Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|e| ApiError::internal(format!("hash {}: {e}", path.display())))?;
+    let mut buffer = vec![0_u8; 8 << 20];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| ApiError::internal(format!("hash {}: {e}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        progress.touch();
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Largest cache base a create may fetch.
 const MAX_CACHE_BASE_BYTES: u64 = 512 << 30;
+
+/// The lock a fetch of `base` holds, shared by every create that needs it.
+fn cache_base_fetch_lock(base: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .entry(base.to_string())
+        .or_default()
+        .clone()
+}
 
 /// Fetch a requested cache base this server does not have yet from its signed
 /// source URL, verified against its SHA-256 before it appears under its name.
@@ -6323,7 +6801,6 @@ async fn fetch_cache_base(
     state: &ApiState,
     spec: &crate::api::types::CacheDiskSpec,
 ) -> Result<(), ApiError> {
-    use sha2::Digest;
     let dir = state.cache_disk_dir()?;
     crate::data::disk::validate_base_name(&spec.base).map_err(ApiError::BadRequest)?;
     let target = dir.join(&spec.base);
@@ -6342,66 +6819,46 @@ async fn fetch_cache_base(
             ApiError::BadRequest("cacheDisk.sourceUrl needs a hex sha256 to verify against".into())
         })?;
     let url = checked_checkpoint_source(raw)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| ApiError::internal(format!("build cache base fetch client: {e}")))?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| ApiError::internal(format!("fetch cache base: {}", e.without_url())))?;
-    if !response.status().is_success() {
-        return Err(ApiError::BadRequest(format!(
-            "cache base source url returned {}",
-            response.status()
-        )));
-    }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let partial = dir.join(format!(
-        ".{}.{}.{stamp}.partial",
-        spec.base,
-        std::process::id()
-    ));
-    let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-            .await
-            .map_err(|e| ApiError::internal(format!("create {}: {e}", partial.display())))?;
-        let mut hasher = sha2::Sha256::new();
-        let mut received = 0_u64;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| ApiError::internal(format!("read cache base: {}", e.without_url())))?;
-            received += chunk.len() as u64;
-            if received > MAX_CACHE_BASE_BYTES {
-                return Err(ApiError::BadRequest(format!(
-                    "cache base exceeds {MAX_CACHE_BASE_BYTES} bytes"
-                )));
-            }
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| ApiError::internal(format!("write cache base: {e}")))?;
+    // One download per base, in a task of its own: a create that needs a base
+    // another create is already fetching waits for it instead of fetching it
+    // again, and a create whose caller gave up waiting leaves the download
+    // running, so the retry finds the base instead of starting over.
+    let lock = cache_base_fetch_lock(&spec.base);
+    let base = spec.base.clone();
+    let fetch = tokio::spawn(async move {
+        let _fetching = lock.lock_owned().await;
+        if target.exists() {
+            return Ok(());
         }
-        file.sync_all()
-            .await
-            .map_err(|e| ApiError::internal(format!("sync cache base: {e}")))?;
-        let actual = format!("{:x}", hasher.finalize());
+        // Under the lock no other fetch of this base runs in this server, so
+        // any partial download of it left behind is abandoned.
+        remove_abandoned_partials(&dir, &base);
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|e| ApiError::internal(format!("build cache base fetch client: {e}")))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let partial =
+            PartialDownload(dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id())));
+        let actual = crate::api::cache_base_fetch::download(
+            &client,
+            &url,
+            &partial.0,
+            MAX_CACHE_BASE_BYTES,
+            Default::default(),
+        )
+        .await?;
         if actual != expected {
             return Err(ApiError::BadRequest(format!(
                 "cache base sha256 is {actual}, expected {expected}"
             )));
         }
-        match std::fs::hard_link(&partial, &target) {
+        match std::fs::hard_link(&partial.0, &target) {
             // Verified as it arrived, so a checkpoint of a machine on it need
             // not hash it again.
             Ok(()) => {
@@ -6415,30 +6872,68 @@ async fn fetch_cache_base(
                 target.display()
             ))),
         }
-    }
-    .await;
-    let _ = std::fs::remove_file(&partial);
-    result
+    });
+    fetch
+        .await
+        .map_err(|e| ApiError::internal(format!("cache base fetch task: {e}")))?
 }
 
-/// Flatten `top` into `dir/base`: written to a hidden partial file, then
-/// linked into place, which fails rather than replace a base that appeared
-/// meanwhile.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn publish_flattened(
-    top: &std::path::Path,
-    dir: &std::path::Path,
-    base: &str,
-) -> Result<u64, ApiError> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let partial = dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id()));
-    let target = dir.join(base);
-    let result = (|| {
-        crate::agent::fork::flatten_standalone(top, &partial).map_err(ApiError::from)?;
-        std::fs::hard_link(&partial, &target).map_err(|e| {
+/// A cache base download in progress, removed when the fetch ends however it
+/// ends; a fetch that succeeded has linked it into place first.
+struct PartialDownload(std::path::PathBuf);
+
+impl Drop for PartialDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Remove partial downloads of `base` in `dir`: `.<base>.<pid>.<stamp>.partial`.
+fn remove_abandoned_partials(dir: &std::path::Path, base: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{base}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let is_partial_of_base = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".partial"))
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(pid, stamp)| {
+                !pid.is_empty()
+                    && !stamp.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && stamp.bytes().all(|b| b.is_ascii_digit())
+            });
+        if is_partial_of_base {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => tracing::info!(file = name, "removed an abandoned cache base download"),
+                Err(e) => {
+                    tracing::warn!(file = name, error = %e, "could not remove an abandoned cache base download")
+                }
+            }
+        }
+    }
+}
+
+/// A published base still under its hidden partial name: removed on drop
+/// unless [`StagedBase::install`] gave it its real name.
+struct StagedBase(std::path::PathBuf);
+
+impl StagedBase {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    /// Link the staged file to `dir/base`, which fails rather than replace a
+    /// base that appeared meanwhile, and record its digest. Returns its size.
+    fn install(self, dir: &std::path::Path, base: &str, digest: &str) -> Result<u64, ApiError> {
+        let target = dir.join(base);
+        std::fs::hard_link(&self.0, &target).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 ApiError::Conflict(format!(
                     "cache base '{base}' already exists; publish each version under a new name"
@@ -6447,23 +6942,47 @@ fn publish_flattened(
                 ApiError::internal(format!("publish {}: {e}", target.display()))
             }
         })?;
+        crate::data::disk::record_base_digest(&target, digest);
         std::fs::File::open(dir)
             .and_then(|d| d.sync_all())
             .map_err(|e| ApiError::internal(format!("sync {}: {e}", dir.display())))?;
         std::fs::metadata(&target)
             .map(|meta| meta.len())
             .map_err(|e| ApiError::internal(format!("stat {}: {e}", target.display())))
-    })();
-    let _ = std::fs::remove_file(&partial);
-    result
+    }
+}
+
+impl Drop for StagedBase {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Flatten `top` into a hidden partial file in `dir`, named for `base`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn flatten_staged(
+    top: &std::path::Path,
+    dir: &std::path::Path,
+    base: &str,
+    progress: &crate::api::progress::Progress,
+) -> Result<StagedBase, ApiError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let staged = StagedBase(dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id())));
+    crate::agent::fork::flatten_standalone(top, staged.path(), &|| progress.touch())
+        .map_err(ApiError::from)?;
+    Ok(staged)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn publish_flattened(
+fn flatten_staged(
     _top: &std::path::Path,
     _dir: &std::path::Path,
     _base: &str,
-) -> Result<u64, ApiError> {
+    _progress: &crate::api::progress::Progress,
+) -> Result<StagedBase, ApiError> {
     Err(ApiError::BadRequest(
         "cache disks are not supported on this host".into(),
     ))
@@ -6532,6 +7051,7 @@ pub async fn update_machine_egress(
         remove_allow_cidrs: normalize(&req.remove_allow_cidrs)?,
         outbound_localhost_only: req.outbound_localhost_only,
         allow_all: req.allow_all,
+        reset_allow_list: req.reset_allow_list,
     };
 
     let next = record
@@ -6922,6 +7442,118 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn only_partial_downloads_of_the_base_are_removed() {
+        let dir = TempDir::new().unwrap();
+        let names = [
+            ".cdisk-1-v1.qcow2.4242.1791794701210442779.partial",
+            ".cdisk-1-v1.qcow2.17.99.partial",
+            ".cdisk-1-v12.qcow2.4242.1791794701210442779.partial",
+            ".cdisk-1-v1.qcow2.sha256",
+            "cdisk-1-v1.qcow2",
+            ".cdisk-1-v1.qcow2.oops.partial",
+        ];
+        for name in names {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        remove_abandoned_partials(dir.path(), "cdisk-1-v1.qcow2");
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".cdisk-1-v1.qcow2.oops.partial",
+                ".cdisk-1-v1.qcow2.sha256",
+                ".cdisk-1-v12.qcow2.4242.1791794701210442779.partial",
+                "cdisk-1-v1.qcow2",
+            ]
+        );
+    }
+
+    fn branch_request(json: serde_json::Value) -> ForkRequest {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn branches_with_pinned_ports_share_their_source_transaction() {
+        let ported = branch_request(serde_json::json!({
+            "name": "child",
+            "ports": [{"host": 31028, "guest": 4318}]
+        }));
+        assert!(coalescable_branch(&ported));
+        let held = branch_request(serde_json::json!({"name": "slot", "hold": true}));
+        assert!(!coalescable_branch(&held));
+    }
+
+    #[test]
+    fn pinned_ports_reject_port_zero_and_a_repeated_host_port() {
+        assert!(validate_pinned_ports(&[(31028, 4318), (31029, 8080)]).is_ok());
+        assert!(matches!(
+            validate_pinned_ports(&[(0, 4318)]),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_pinned_ports(&[(31028, 0)]),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_pinned_ports(&[(31028, 4318), (31028, 8080)]),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn api_local_images_need_the_local_image_dir_and_stay_inside_it() {
+        let (_db_dir, state) = setup_test_state();
+        let bad = |result: Result<String, ApiError>| matches!(result, Err(ApiError::BadRequest(_)));
+        assert_eq!(
+            resolve_api_image(&state, "alpine:3.20".into())
+                .await
+                .unwrap(),
+            "alpine:3.20"
+        );
+        assert!(bad(resolve_api_image(&state, "-".into()).await));
+
+        let images = TempDir::new().unwrap();
+        let rootfs = images.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let outside = TempDir::new().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), images.path().join("escape")).unwrap();
+
+        // No --local-image-dir: every local path is refused.
+        assert!(bad(
+            resolve_api_image(&state, rootfs.display().to_string()).await
+        ));
+
+        state.set_local_image_dir(Some(images.path().canonicalize().unwrap()));
+        let accepted = resolve_api_image(&state, rootfs.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted,
+            format!("local-dir:{}", rootfs.canonicalize().unwrap().display())
+        );
+        for refused in [
+            "/".to_string(),
+            outside.path().display().to_string(),
+            format!("{}/../", images.path().display()),
+            images.path().join("escape").display().to_string(),
+            images.path().join("missing.tar").display().to_string(),
+            format!("local-dir:{}", rootfs.display()),
+            "local-dir:/".to_string(),
+            "local:../../..".to_string(),
+        ] {
+            assert!(
+                bad(resolve_api_image(&state, refused.clone()).await),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    #[test]
     fn start_body_is_optional_even_with_a_json_content_type() {
         use crate::api::types::StartMachineRequest;
         let json = {
@@ -6945,6 +7577,43 @@ mod tests {
             optional_json_body::<StartMachineRequest>(&json, b"{not json"),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn start_options_in_the_body_are_taken_like_the_query_string() {
+        use crate::api::types::StartMachineRequest;
+        let json = {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            headers
+        };
+        let body = |text: &str| -> StartMachineRequest {
+            optional_json_body(&json, text.as_bytes()).unwrap()
+        };
+
+        let start = StartMachineQuery::default().with_body(&body(r#"{"branchable":true}"#));
+        assert!(start.forkable);
+        let start = StartMachineQuery::default().with_body(&body(r#"{"forkable":true}"#));
+        assert!(start.forkable);
+        let start = StartMachineQuery::default()
+            .with_body(&body(r#"{"branchPoolSize":4,"cudaVramLimitMib":2048}"#));
+        assert_eq!(start.fork_pool_size, Some(4));
+        assert_eq!(start.cuda_vram_limit_mib, Some(2048));
+
+        // The query string wins, and an empty body changes nothing.
+        let query = StartMachineQuery {
+            forkable: true,
+            fork_pool_size: Some(2),
+            cuda_vram_limit_mib: None,
+        };
+        let start = query.with_body(&body(r#"{"branchable":false,"branchPoolSize":8}"#));
+        assert!(start.forkable);
+        assert_eq!(start.fork_pool_size, Some(2));
+        let start = StartMachineQuery::default().with_body(&body("{}"));
+        assert!(!start.forkable && start.fork_pool_size.is_none());
+
+        // Unknown fields stay tolerated for an older node.
+        assert!(!body(r#"{"someNewerField":1}"#).branchable);
     }
 
     #[test]
@@ -6976,20 +7645,24 @@ mod tests {
             PortSpec {
                 host: 30001,
                 guest: 8080,
+                protocol: Default::default(),
             },
             PortSpec {
                 host: 30002,
                 guest: 3000,
+                protocol: Default::default(),
             },
         ];
         let requested = vec![
             PortSpec {
                 host: 31002,
                 guest: 3000,
+                protocol: Default::default(),
             },
             PortSpec {
                 host: 31001,
                 guest: 8080,
+                protocol: Default::default(),
             },
         ];
         let ports = checkpoint_host_ports(&captured, &requested).unwrap();
@@ -7004,7 +7677,8 @@ mod tests {
             &captured,
             &[PortSpec {
                 host: 31001,
-                guest: 9090
+                guest: 9090,
+                protocol: Default::default(),
             }]
         )
         .is_err());
@@ -7261,6 +7935,12 @@ mod tests {
             "golden FORK failed: ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)",
         );
         assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
+        // The same refusal as the fork layer rewords it for people.
+        let e = SmolvmError::agent(
+            "fork",
+            "machine 'g' was not started as branchable, so it has no copy-on-write memory to branch from.",
+        );
+        assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
         // A stopped golden's dead control socket is likewise a 409.
         let e = SmolvmError::agent("fork", "golden 'g' control socket not responding");
         assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
@@ -7329,6 +8009,46 @@ mod tests {
             classify_launch_error("failed to start machine: kernel panic".to_string()),
             ApiError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn a_staged_base_that_is_never_installed_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join(".b-v1.qcow2.1.2.partial");
+        std::fs::write(&partial, b"base").unwrap();
+        drop(StagedBase(partial.clone()));
+        assert!(!partial.exists());
+        assert!(!dir.path().join("b-v1.qcow2").exists());
+    }
+
+    #[test]
+    fn installing_a_staged_base_names_it_and_refuses_a_taken_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = |n: u8| {
+            let partial = dir.path().join(format!(".b-v1.qcow2.{n}.1.partial"));
+            std::fs::write(&partial, [n; 4]).unwrap();
+            StagedBase(partial)
+        };
+        let first = stage(1);
+        let first_partial = first.path().to_path_buf();
+        assert_eq!(first.install(dir.path(), "b-v1.qcow2", "ab").unwrap(), 4);
+        assert!(!first_partial.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("b-v1.qcow2")).unwrap(),
+            [1; 4]
+        );
+
+        let second = stage(2);
+        let second_partial = second.path().to_path_buf();
+        assert!(matches!(
+            second.install(dir.path(), "b-v1.qcow2", "cd"),
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(!second_partial.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("b-v1.qcow2")).unwrap(),
+            [1; 4]
+        );
     }
 
     #[test]
@@ -7483,6 +8203,8 @@ mod tests {
             entrypoint: vec![],
             cmd: vec![],
             docker_socket: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
             storage_gb: None,
             overlay_gb: None,
             block_io: None,
@@ -7802,6 +8524,81 @@ mod tests {
         };
         let result = resize_machine(State(state), Path("nonexistent".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn set_ports_on_a_stopped_machine_saves_the_whole_set() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "ports-vm", Some(20), Some(5));
+        let port = |host, guest, protocol| PortSpec {
+            host,
+            guest,
+            protocol,
+        };
+        use crate::data::network::PortProtocol::{Tcp, Udp};
+
+        let req = SetPortsRequest {
+            ports: vec![port(18080, 80, Tcp), port(15353, 53, Udp)],
+        };
+        let info = set_machine_ports(State(state.clone()), Path("ports-vm".into()), Json(req))
+            .await
+            .unwrap();
+        assert_eq!(info.ports.len(), 2);
+        let saved = state.db().get_vm("ports-vm").unwrap().unwrap();
+        assert_eq!(saved.ports, vec![(18080, 80)]);
+        assert_eq!(saved.udp_ports, vec![(15353, 53)]);
+
+        // The whole set: an empty list removes them all.
+        let req = SetPortsRequest { ports: vec![] };
+        let info = set_machine_ports(State(state.clone()), Path("ports-vm".into()), Json(req))
+            .await
+            .unwrap();
+        assert!(info.ports.is_empty());
+        let saved = state.db().get_vm("ports-vm").unwrap().unwrap();
+        assert!(saved.ports.is_empty() && saved.udp_ports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_ports_refuses_a_host_port_twice_and_an_unknown_machine() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "ports-vm", Some(20), Some(5));
+        let tcp = |host, guest| PortSpec {
+            host,
+            guest,
+            protocol: crate::data::network::PortProtocol::Tcp,
+        };
+        let req = SetPortsRequest {
+            ports: vec![tcp(18080, 80), tcp(18080, 81)],
+        };
+        let result =
+            set_machine_ports(State(state.clone()), Path("ports-vm".into()), Json(req)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+
+        let req = SetPortsRequest { ports: vec![] };
+        let result = set_machine_ports(State(state), Path("nope".into()), Json(req)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[test]
+    fn a_taken_host_port_is_a_retryable_port_conflict() {
+        let taken = crate::Error::config(
+            "published ports",
+            "could not change machine 'm''s published ports while it runs: cannot publish \
+             host TCP 0.0.0.0:18080 to guest TCP 80: Address already in use (os error 98)",
+        );
+        assert!(matches!(
+            classify_set_ports_error(taken),
+            ApiError::PortConflict(_)
+        ));
+        let refused = crate::Error::config(
+            "published ports",
+            "machine 'm' is running without virtio-net networking, so its ports can only \
+             change while it is stopped",
+        );
+        assert!(matches!(
+            classify_set_ports_error(refused),
+            ApiError::BadRequest(_)
+        ));
     }
 
     /// Helper to create a VM record in the database.

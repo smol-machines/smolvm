@@ -123,14 +123,9 @@ pub async fn upload_file(
             if c.query(image)?.is_none() {
                 c.pull_with_registry_config(image)?;
             }
-            // Activate the per-machine container overlay so the file op targets
-            // the image container, not the read-only agent base. `prepare_overlay`
-            // mounts but doesn't make it the active fs for write_file/read_file;
-            // a no-op container run (same path exec takes) does.
-            c.run_non_interactive(
-                crate::agent::RunConfig::new(image.clone(), vec!["/bin/true".to_string()])
-                    .with_persistent_overlay(Some(overlay_id.clone())),
-            )?;
+            // The guest's own keepalive exposes the same filesystem as exec,
+            // without running `/bin/true` (which belongs to the image).
+            c.prepare_file_access(image, &overlay_id)?;
         }
         match source {
             // The agent stages a streamed file and renames it into place only
@@ -261,14 +256,9 @@ pub async fn download_file(
             if c.query(image)?.is_none() {
                 c.pull_with_registry_config(image)?;
             }
-            // Activate the per-machine container overlay so the file op targets
-            // the image container, not the read-only agent base. `prepare_overlay`
-            // mounts but doesn't make it the active fs for write_file/read_file;
-            // a no-op container run (same path exec takes) does.
-            c.run_non_interactive(
-                crate::agent::RunConfig::new(image.clone(), vec!["/bin/true".to_string()])
-                    .with_persistent_overlay(Some(overlay_id.clone())),
-            )?;
+            // The guest's own keepalive exposes the same filesystem as exec,
+            // without running `/bin/true` (which belongs to the image).
+            c.prepare_file_access(image, &overlay_id)?;
         }
         // Asking for a directory returns its listing rather than an error: a
         // caller exploring a tree should not have to know in advance which

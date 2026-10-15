@@ -46,8 +46,8 @@ pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
     let pid_alive = record.is_process_alive();
 
     if pid_alive {
-        // A fork base with live clones or a retained checkpoint was
-        // snapshot-frozen by `machine fork`: its guest is paused and never
+        // A fork base with frozen-generation clones or a retained frozen
+        // checkpoint was snapshot-frozen: its guest is paused and never
         // answers a vsock ping. A retained checkpoint remains authoritative
         // between pool fills, when there may be zero dependent clone rows.
         // Report it as Frozen *without* probing — this distinguishes it
@@ -79,7 +79,7 @@ pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
 }
 
 /// Cheap (no vsock probe) check for a snapshot-frozen fork base: its
-/// record says `Running`, its VMM PID is alive, and it has dependent clones
+/// record says `Running`, its VMM PID is alive, and it has frozen-generation clones
 /// or a retained checkpoint bound to that exact process. Such a VM's guest
 /// agent is paused and must not be connected to or probed — doing so blocks
 /// for the full vsock timeout. Callers report it as [`RecordState::Frozen`]
@@ -91,26 +91,36 @@ pub fn is_frozen_fork_base(name: &str, record: &VmRecord) -> bool {
         && has_frozen_fork_state(name, record)
 }
 
-/// True if `name` is a fork base — at least one VM record's disk overlays
-/// are copy-on-write backed by this machine's disks (`golden == Some(name)`).
-/// Such a machine is snapshot-frozen and must not be probed, reaped, or
-/// auto-restarted; it has to outlive its clones. Best-effort: a DB error
+/// True if `name` has a frozen checkpoint or children requiring a frozen source.
+/// Continuing generations pivot the source's disks, so their children alone do
+/// not imply that its current process is paused. Frozen sources must not be
+/// probed, reaped, or auto-restarted. Best-effort: a DB error
 /// resolves to `false` (treat as not-a-fork-base) so a transient failure
 /// can't wedge state resolution.
 fn has_frozen_fork_state(name: &str, record: &VmRecord) -> bool {
     let Ok(db) = SmolvmDb::open() else {
         return false;
     };
+    has_frozen_fork_state_in(
+        &db,
+        name,
+        record,
+        &crate::agent::vm_data_dir(name).join("s"),
+    )
+}
+
+fn has_frozen_fork_state_in(
+    db: &SmolvmDb,
+    name: &str,
+    record: &VmRecord,
+    snapshot_root: &std::path::Path,
+) -> bool {
     let retained = db
         .retained_fork_snapshot(name)
         .ok()
         .flatten()
         .filter(|snapshot| {
-            crate::agent::fork::retained_snapshot_matches_golden(
-                record,
-                &crate::agent::vm_data_dir(name).join("s"),
-                snapshot,
-            )
+            crate::agent::fork::retained_snapshot_matches_golden(record, snapshot_root, snapshot)
         });
     if retained
         .as_ref()
@@ -118,8 +128,10 @@ fn has_frozen_fork_state(name: &str, record: &VmRecord) -> bool {
     {
         return false;
     }
-    if db
-        .dependent_clones(name)
+    // A retained checkpoint is bound to the source's old PID after restart.
+    // Keep the same generation-aware distinction used to permit that restart:
+    // children of a committed continuing generation do not freeze the new VMM.
+    if crate::agent::fork::restart_blocking_dependent_clones_in(db, name, snapshot_root)
         .map(|clones| !clones.is_empty())
         .unwrap_or(false)
     {
@@ -336,6 +348,100 @@ mod tests {
         // "does-not-exist" so this also covers has_live_clones == false.)
         let r = record(RecordState::Stopped, Some(99999));
         assert!(!is_frozen_fork_base("does-not-exist", &r));
+    }
+
+    #[test]
+    fn continuing_source_is_not_frozen_after_restart_with_retained_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let snapshot_root = temp.path().join("s");
+        let snapshot = crate::agent::fork::RetainedForkSnapshot {
+            path: snapshot_root.join("0123abcd"),
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        std::fs::create_dir_all(&snapshot.path).unwrap();
+        std::fs::write(snapshot.path.join("source-continues-v1"), b"").unwrap();
+        db.set_retained_fork_snapshot("source", &snapshot).unwrap();
+
+        let mut child = VmRecord::new("child".into(), 1, 128, vec![], vec![], false);
+        child.golden = Some("source".into());
+        child.fork_generation = Some("0123abcd".into());
+        db.insert_vm("child", &child).unwrap();
+        for child_state in [RecordState::Running, RecordState::Stopped] {
+            db.update_vm("child", |r| r.state = child_state.clone())
+                .unwrap();
+            // The original process, a new PID, and a reused PID must all
+            // remain eligible for the ordinary running/unreachable probe.
+            for (pid, start) in [(123, 456), (124, 457), (123, 458)] {
+                let mut source = record(RecordState::Running, Some(pid));
+                source.pid_start_time = Some(start);
+                assert!(
+                    !has_frozen_fork_state_in(&db, "source", &source, &snapshot_root),
+                    "source {pid}/{start} with {child_state:?} child was classified frozen"
+                );
+            }
+        }
+        // Retained checkpoints are an optimization. The child's committed
+        // continuing generation also suffices when that hint is absent.
+        db.remove_retained_fork_snapshot("source").unwrap();
+        let mut source = record(RecordState::Running, Some(124));
+        source.pid_start_time = Some(457);
+        assert!(!has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+
+        // Do not relax the guard for children lacking a committed pivot.
+        let mut frozen_child = VmRecord::new("frozen-child".into(), 1, 128, vec![], vec![], false);
+        frozen_child.golden = Some("source".into());
+        frozen_child.fork_generation = Some("deadbeef".into());
+        db.insert_vm("frozen-child", &frozen_child).unwrap();
+        assert!(has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+        db.remove_vm("frozen-child").unwrap();
+        std::fs::remove_file(snapshot.path.join("source-continues-v1")).unwrap();
+        assert!(has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+    }
+
+    #[test]
+    fn retained_frozen_checkpoint_requires_the_current_process_even_without_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let snapshot_root = temp.path().join("s");
+        let snapshot = crate::agent::fork::RetainedForkSnapshot {
+            path: snapshot_root.join("0123abcd"),
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        std::fs::create_dir_all(&snapshot.path).unwrap();
+        db.set_retained_fork_snapshot("source", &snapshot).unwrap();
+        let mut source = record(RecordState::Running, Some(123));
+        source.pid_start_time = Some(456);
+        assert!(has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+        source.pid_start_time = Some(457);
+        assert!(!has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
     }
 
     #[test]

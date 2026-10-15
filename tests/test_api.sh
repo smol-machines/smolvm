@@ -28,6 +28,7 @@ SERVER_PID=""
 MACHINE_NAME="api-test-machine"
 REGISTRY_TEST_NAME="registry-coherence-test"
 OUT_OF_BAND_STOP_NAME="api-out-of-band-stop-test"
+FAILED_START_NAME="api-failed-startup-preserves-vm"
 
 # API client shortcut
 CURL=(curl --unix-socket "$API_SOCKET")
@@ -74,6 +75,7 @@ cleanup() {
         "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME" >/dev/null 2>&1 || true
         "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME" >/dev/null 2>&1 || true
         "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME" >/dev/null 2>&1 || true
+        "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$FAILED_START_NAME" >/dev/null 2>&1 || true
     fi
     stop_server
 
@@ -106,6 +108,37 @@ test_create_and_start_machine() {
     local response
     response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/start")
     [[ "$response" == *'"state":"running"'* ]]
+}
+
+# A second `serve start` reconnects to the first server's live VM, then
+# fails to bind its rollout ingress. Its teardown must not stop that VM.
+test_failed_startup_preserves_running_machine() {
+    local status response log succeeded=1
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$FAILED_START_NAME\", \"cpus\": 1, \"memoryMb\": 512}")
+    [[ "$status" == "200" ]] || { echo "create failed: $status"; return 1; }
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$FAILED_START_NAME/start")
+    [[ "$response" == *'"state":"running"'* ]] || { echo "start failed: $response"; return 1; }
+
+    log=$(mktemp)
+    if "$SMOLVM" serve start --listen 127.0.0.1:0 >"$log" 2>&1; then
+        echo "second server unexpectedly started"
+        succeeded=0
+    elif ! grep -q "bind guest rollout ingress" "$log"; then
+        echo "second server failed for the wrong reason: $(cat "$log")"
+        succeeded=0
+    fi
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$FAILED_START_NAME/exec" \
+        -H "Content-Type: application/json" \
+        -d '{"command": ["echo", "still-running-after-failed-serve"]}')
+    [[ "$response" == *'"exitCode":0'* && "$response" == *"still-running-after-failed-serve"* ]] || {
+        echo "failed startup stopped the VM: $response"
+        succeeded=0
+    }
+    "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$FAILED_START_NAME" >/dev/null || true
+    rm -f "$log"
+    [[ "$succeeded" == "1" ]]
 }
 
 test_exec_echo() {
@@ -322,6 +355,7 @@ fi
 
 run_test "Health check" test_health || true
 run_test "Create and start machine" test_create_and_start_machine || true
+run_test "Failed serve startup preserves running machine" test_failed_startup_preserves_running_machine || true
 run_test "Exec echo" test_exec_echo || true
 run_test "Exec reads VM filesystem" test_exec_reads_vm_filesystem || true
 run_test "Exec exit codes" test_exec_exit_codes || true

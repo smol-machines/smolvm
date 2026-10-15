@@ -13,6 +13,7 @@ pub mod input;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
+pub mod live_ports;
 pub mod live_resize;
 mod manager;
 pub mod pod_net;
@@ -99,13 +100,14 @@ pub use launcher::{
     DiskOverlaySpec, LaunchConfig, LaunchFeatures, VmDisks,
 };
 pub(crate) use manager::cleanup_dead_vm_runtime_in_db;
-pub use manager::{apply_live_egress_policy, cleanup_dead_vm_runtime};
+pub use manager::{apply_live_egress_policy, apply_live_published_ports, cleanup_dead_vm_runtime};
 pub use manager::{
-    disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
-    prune_orphaned_ready_markers, read_egress_denials, read_egress_signals, read_egress_telemetry,
-    read_mediation_machine_id, read_shared_pack_pointer, resolve_disk_image, restore_base_dir,
-    shared_pack_cache_root, shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash,
-    vm_uid_registry_dir, AgentManager, AgentState, EgressDenial, EgressSignal, SHARED_PACK_POINTER,
+    bind_ready_listener, disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir,
+    machine_layers_cache_dir, prune_orphaned_ready_markers, read_egress_denials,
+    read_egress_signals, read_egress_telemetry, read_mediation_machine_id,
+    read_shared_pack_pointer, resolve_disk_image, restore_base_dir, shared_pack_cache_root,
+    shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir,
+    AgentManager, AgentState, EgressDenial, EgressSignal, SHARED_PACK_POINTER,
 };
 
 /// Agent VM name.
@@ -196,6 +198,8 @@ fn gpu_virgl_flags() -> u32 {
 pub(crate) fn guest_network_env(
     guest_network: Option<smolvm_network::GuestNetworkConfig>,
     dns_override: Option<std::net::Ipv4Addr>,
+    dns_options: &[String],
+    gateway_mac: Option<[u8; 6]>,
 ) -> Vec<std::ffi::CString> {
     use smolvm_protocol::guest_env;
     let mut env: Vec<std::ffi::CString> = Vec::new();
@@ -211,6 +215,13 @@ pub(crate) fn guest_network_env(
         push(guest_env::GATEWAY, n.gateway_ip.to_string());
         push(guest_env::PREFIX_LEN, n.prefix_len.to_string());
         push(guest_env::GUEST_MAC, format_mac(n.guest_mac));
+        // Pod-networking only: CNIs that pre-program the gateway as a static
+        // neighbor entry answer no ARP, so the guest must
+        // install the entry itself. The fabric path hands the guest no MAC and
+        // keeps resolving the gateway over ARP as before.
+        if let Some(gateway_mac) = gateway_mac {
+            push(guest_env::GATEWAY_MAC, format_mac(gateway_mac));
+        }
         // Only hand the guest an IPv6 identity when the host can actually
         // route v6: a global-scope guest address makes dual-stack clients
         // sort AAAA answers first (RFC 6724), and on a v6-less host every
@@ -229,6 +240,11 @@ pub(crate) fn guest_network_env(
     .addr
     {
         push(guest_env::DNS, dns.to_string());
+    }
+    // Resolver options (`--dns-option`) apply to whichever resolver the guest
+    // ends up with; the agent renders them into every resolv.conf it writes.
+    if !dns_options.is_empty() {
+        push(guest_env::DNS_OPTIONS, dns_options.join(" "));
     }
     env
 }
@@ -275,5 +291,37 @@ mod display_size_tests {
         assert_eq!(parse_display_size(Some("1920x0")), None);
         assert_eq!(parse_display_size(Some("99999x1080")), None);
         assert_eq!(parse_display_size(Some("1920x99999")), None);
+    }
+}
+
+#[cfg(test)]
+mod guest_network_env_tests {
+    use super::guest_network_env;
+    use smolvm_protocol::guest_env;
+
+    fn value(env: &[std::ffi::CString], key: &str) -> Option<String> {
+        env.iter()
+            .filter_map(|entry| entry.to_str().ok())
+            .find_map(|entry| entry.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    // `--dns-option` reaches the agent as one ordered, space-separated value;
+    // with none set, the variable is absent (the agent then writes no
+    // `options` line, the pre-flag file).
+    #[test]
+    fn dns_options_travel_in_order_only_when_set() {
+        let options = ["timeout:1", "attempts:3", "rotate", "use-vc"].map(String::from);
+        let env = guest_network_env(None, None, &options, None);
+        assert_eq!(
+            value(&env, guest_env::DNS_OPTIONS).as_deref(),
+            Some("timeout:1 attempts:3 rotate use-vc")
+        );
+        assert_eq!(
+            value(
+                &guest_network_env(None, None, &[], None),
+                guest_env::DNS_OPTIONS
+            ),
+            None
+        );
     }
 }

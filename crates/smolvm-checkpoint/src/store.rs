@@ -2431,16 +2431,19 @@ pub fn publish(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let src = std::ffi::CString::new(source.as_os_str().as_bytes())?;
     let dst = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+    // Through the system call: the libc crate declares renameat2 for glibc
+    // only, and musl has the call all the same.
     #[cfg(target_os = "linux")]
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             src.as_ptr(),
             libc::AT_FDCWD,
             dst.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
-    };
+    } as libc::c_int;
     #[cfg(target_os = "macos")]
     let result = unsafe { libc::renamex_np(src.as_ptr(), dst.as_ptr(), libc::RENAME_EXCL) };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -3651,6 +3654,7 @@ mod tests {
             sha256: String::new(),
         };
         manifest.checkpoint = Some(PortableCheckpointManifest {
+            host_mounts: Vec::new(),
             version: 1,
             runtime_abi: "test".into(),
             host_platform: "linux/amd64".into(),

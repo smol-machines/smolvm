@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-VERIFIED_VERSION="1.23.0"
+VERIFIED_VERSION="1.27.3"
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 

@@ -240,10 +240,11 @@ mod imp {
         seedable_image(name, record.image.as_deref(), record.storage_gb)
     }
 
-    /// `image` when a machine called `name` with that image and storage size can
-    /// start on a seed: a registry image, at least the default storage size (a
-    /// larger disk is the seed grown, see [`grow`]), no storage disk yet, and
-    /// seeding on.
+    /// `image` when a machine called `name` with that image can start on a
+    /// seed: a registry image or staged archive, no storage disk yet, and
+    /// seeding on. A disk at or above the default size is the default seed
+    /// grown (see [`grow`]); a smaller one gets a seed built at its own size
+    /// (see [`small_seed_gb`]).
     pub fn seedable_image(
         name: &str,
         image: Option<&str>,
@@ -252,7 +253,7 @@ mod imp {
         // The builder's own machine pulls the normal way.
         if name.starts_with(SEED_MACHINE_PREFIX)
             || std::env::var("SMOLVM_IMAGE_SEEDS").is_ok_and(|v| v.trim() == "0")
-            || storage_gb.is_some_and(|gb| gb < crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+            || storage_gb == Some(0)
         {
             return None;
         }
@@ -468,6 +469,7 @@ mod imp {
             proxy,
             no_proxy,
             trust_host_certs,
+            small_seed_gb(storage_gb),
         )?;
         let Some((seed, format)) = seed_disk(&key_dir) else {
             return Err(Error::config(
@@ -487,6 +489,14 @@ mod imp {
         Ok(true)
     }
 
+    /// The size of the seed a disk of `storage_gb` needs when it is below the
+    /// default: a seed's filesystem fills the builder's disk and cannot be cut
+    /// down without resize2fs, so a smaller disk gets a seed built at exactly
+    /// its size. `None` means the default seed, grown as needed.
+    pub(super) fn small_seed_gb(storage_gb: Option<u64>) -> Option<u64> {
+        storage_gb.filter(|gb| *gb < crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+    }
+
     /// The seed directory for `image` once its seed exists, holding the shared
     /// cache lock so prune cannot remove it before the caller attaches it.
     struct EnsuredSeed {
@@ -497,7 +507,9 @@ mod imp {
     }
 
     /// Make sure the seed for `image` at its current digest exists, building it
-    /// (with `exe`) when it does not.
+    /// (with `exe`) when it does not. `small_gb` asks for the seed of a disk
+    /// below the default size (see [`small_seed_gb`]).
+    #[allow(clippy::too_many_arguments)]
     fn ensure_seed(
         exe: &Path,
         image: &str,
@@ -506,6 +518,7 @@ mod imp {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         trust_host_certs: bool,
+        small_gb: Option<u64>,
     ) -> Result<EnsuredSeed> {
         let template = storage_template();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -519,7 +532,7 @@ mod imp {
             Some(hash) => hash.to_string(),
             None => resolved_digest(image, auth, digest_ttl, resolve)?,
         };
-        let key = seed_key(image, &digest, template.as_deref())?;
+        let key = seed_key(image, &digest, template.as_deref(), small_gb)?;
         let root = seed_root();
         std::fs::create_dir_all(&root).map_err(|e| Error::config("image seed", e.to_string()))?;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o711))
@@ -546,6 +559,7 @@ mod imp {
                     proxy,
                     no_proxy,
                     trust_host_certs,
+                    small_gb,
                 )?;
                 // The builder pulled the tag, not the digest. If the tag moved
                 // in the meantime, discard the seed rather than miskey it. An
@@ -689,7 +703,16 @@ mod imp {
         let root = seed_root();
         for image in prewarm_candidates(&root, now_secs()) {
             let started = std::time::Instant::now();
-            match ensure_seed(exe, &image, &PullAuth::FromConfig, None, None, None, false) {
+            match ensure_seed(
+                exe,
+                &image,
+                &PullAuth::FromConfig,
+                None,
+                None,
+                None,
+                false,
+                None,
+            ) {
                 Ok(EnsuredSeed { built, .. }) => tracing::info!(
                     %image,
                     built,
@@ -746,7 +769,12 @@ mod imp {
                     rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?
                 }
             };
-            let key_dir = root.join(seed_key(image, &digest, template.as_deref())?);
+            let small_gb = small_seed_gb(
+                crate::db::SmolvmDb::open()?
+                    .get_vm(name)?
+                    .and_then(|record| record.storage_gb),
+            );
+            let key_dir = root.join(seed_key(image, &digest, template.as_deref(), small_gb)?);
             seed_disk(&key_dir)
                 .map(|(seed, _)| seed)
                 .ok_or_else(|| Error::config("image seed", "no seed for the authorized digest"))
@@ -782,6 +810,7 @@ mod imp {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         trust_host_certs: bool,
+        small_gb: Option<u64>,
     ) -> Result<()> {
         reap_stale_builders(exe);
         let tmp = format!("{SEED_MACHINE_PREFIX}{}-{}", &key[..16], std::process::id());
@@ -804,6 +833,12 @@ mod imp {
             };
             if trust_host_certs {
                 create.push("--trust-host-certs");
+            }
+            // A small disk's seed is built on a disk of that size, so the
+            // filesystem the guest grows into it fits the machines it seeds.
+            let small_size = small_gb.map(|gb| gb.to_string());
+            if let Some(size) = small_size.as_deref() {
+                create.extend(["--storage", size]);
             }
             run(exe, &create)?;
             let mut start = vec!["machine", "start", "--name", &tmp, "--no-workload"];
@@ -908,8 +943,15 @@ mod imp {
     }
 
     /// A seed depends on the exact template bytes under it, the image content, the
-    /// guest architecture and the guest's storage layout.
-    pub(super) fn seed_key(image: &str, digest: &str, template: Option<&Path>) -> Result<String> {
+    /// guest architecture and the guest's storage layout, and for a disk below
+    /// the default size on that size. A default-size key is unchanged by the
+    /// size, so existing seeds stay valid.
+    pub(super) fn seed_key(
+        image: &str,
+        digest: &str,
+        template: Option<&Path>,
+        small_gb: Option<u64>,
+    ) -> Result<String> {
         // Without a template the disk is formatted by this smolvm version,
         // which the key already carries.
         let (path, identity) = match template {
@@ -940,6 +982,10 @@ mod imp {
             &identity,
         ] {
             hash.update(part.as_bytes());
+            hash.update([0]);
+        }
+        if let Some(gb) = small_gb {
+            hash.update(format!("storage-gib:{gb}").as_bytes());
             hash.update([0]);
         }
         Ok(hex::encode(hash.finalize()))
@@ -1314,13 +1360,17 @@ mod tests {
     }
 
     #[test]
-    fn a_larger_disk_seeds_and_a_smaller_one_pulls() {
+    fn every_disk_size_seeds_and_a_small_one_gets_its_own_seed() {
         let default = crate::storage::DEFAULT_STORAGE_SIZE_GIB;
         let name = "seed-size-gate-test";
         assert!(seedable_image(name, Some("alpine"), None).is_some());
         assert!(seedable_image(name, Some("alpine"), Some(default)).is_some());
         assert!(seedable_image(name, Some("alpine"), Some(default * 5)).is_some());
-        assert!(seedable_image(name, Some("alpine"), Some(default - 1)).is_none());
+        assert!(seedable_image(name, Some("alpine"), Some(8)).is_some());
+        assert_eq!(small_seed_gb(None), None);
+        assert_eq!(small_seed_gb(Some(default)), None);
+        assert_eq!(small_seed_gb(Some(default * 5)), None);
+        assert_eq!(small_seed_gb(Some(8)), Some(8));
     }
 
     #[test]
@@ -1411,18 +1461,33 @@ mod tests {
     }
 
     #[test]
+    fn a_small_disk_seed_has_its_own_key_per_size() {
+        let default = seed_key("alpine", "sha256:aa", None, None).unwrap();
+        let eight = seed_key("alpine", "sha256:aa", None, Some(8)).unwrap();
+        assert_ne!(default, eight);
+        assert_ne!(
+            eight,
+            seed_key("alpine", "sha256:aa", None, Some(4)).unwrap()
+        );
+        assert_eq!(
+            eight,
+            seed_key("alpine", "sha256:aa", None, Some(8)).unwrap()
+        );
+    }
+
+    #[test]
     fn key_changes_with_digest_and_image() {
         let template = std::env::temp_dir().join("seed-key-template");
         std::fs::write(&template, b"t").unwrap();
         let template = Some(template.as_path());
-        let a = seed_key("alpine", "sha256:aa", template).unwrap();
-        assert_eq!(a, seed_key("alpine", "sha256:aa", template).unwrap());
-        assert_ne!(a, seed_key("alpine", "sha256:bb", template).unwrap());
-        assert_ne!(a, seed_key("busybox", "sha256:aa", template).unwrap());
+        let a = seed_key("alpine", "sha256:aa", template, None).unwrap();
+        assert_eq!(a, seed_key("alpine", "sha256:aa", template, None).unwrap());
+        assert_ne!(a, seed_key("alpine", "sha256:bb", template, None).unwrap());
+        assert_ne!(a, seed_key("busybox", "sha256:aa", template, None).unwrap());
         // A raw seed built without a template never answers for one built on it.
-        let bare = seed_key("alpine", "sha256:aa", None).unwrap();
+        let bare = seed_key("alpine", "sha256:aa", None, None).unwrap();
         assert_ne!(a, bare);
-        assert_eq!(bare, seed_key("alpine", "sha256:aa", None).unwrap());
+        assert_eq!(bare, seed_key("alpine", "sha256:aa", None, None).unwrap());
     }
 
     #[test]
