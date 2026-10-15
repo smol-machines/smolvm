@@ -2908,14 +2908,20 @@ pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
             buffer: *mut libc::c_void,
             buffersize: libc::c_int,
         ) -> libc::c_int;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+    }
+
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
     }
 
     const PROC_PIDTASKINFO: libc::c_int = 4;
 
     /// Subset of `struct proc_taskinfo` from <libproc.h>. CPU times are in
-    /// mach_absolute_time units, which on Apple Silicon equal 1 nanosecond.
-    /// (For full portability we'd convert via mach_timebase_info; on arm64
-    /// macOS the ratio is 1:1, and smolvm targets Apple Silicon.)
+    /// mach_absolute_time units, which are not nanoseconds on Apple Silicon:
+    /// its 24 MHz timebase makes one tick 125/3 ns.
     #[repr(C)]
     struct ProcTaskInfo {
         pti_virtual_size: u64,
@@ -2951,10 +2957,22 @@ pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
     if ret <= 0 {
         return None;
     }
+    let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+    if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
+        return None;
+    }
+    let ticks = info.pti_total_user.saturating_add(info.pti_total_system);
     Some(ProcessStats {
-        cpu_time_ns: info.pti_total_user.saturating_add(info.pti_total_system),
+        cpu_time_ns: mach_ticks_to_ns(ticks, timebase.numer, timebase.denom),
         rss_bytes: info.pti_resident_size,
     })
+}
+
+/// Convert mach_absolute_time ticks to nanoseconds with the host's timebase.
+#[cfg(target_os = "macos")]
+fn mach_ticks_to_ns(ticks: u64, numer: u32, denom: u32) -> u64 {
+    let ns = u128::from(ticks) * u128::from(numer) / u128::from(denom);
+    u64::try_from(ns).unwrap_or(u64::MAX)
 }
 
 /// Sample CPU time and RSS for a single process on Linux via /proc/<pid>/{stat,statm}.
@@ -5147,6 +5165,36 @@ mod tests {
             "a live process must have non-zero RSS, got {}",
             stats.rss_bytes
         );
+    }
+
+    /// CPU time is reported in nanoseconds on every host. On Apple Silicon
+    /// `proc_pidinfo` counts in mach ticks of about 41.7 ns, so an unconverted
+    /// value reads some forty times too low.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn process_stats_cpu_time_is_in_nanoseconds() {
+        let me = std::process::id() as Pid;
+        let before = process_stats(me).expect("sample before").cpu_time_ns;
+        let spin = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let mut sink = 0u64;
+        while started.elapsed() < spin {
+            sink = std::hint::black_box(sink.wrapping_add(1));
+        }
+        let after = process_stats(me).expect("sample after").cpu_time_ns;
+        let spent = after.saturating_sub(before);
+        assert!(
+            spent >= 150_000_000,
+            "300 ms of busy wall time must count at least 150 ms of CPU, got {spent} ns"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mach_ticks_scale_by_the_timebase() {
+        assert_eq!(mach_ticks_to_ns(24_000_000, 125, 3), 1_000_000_000);
+        assert_eq!(mach_ticks_to_ns(1_000, 1, 1), 1_000);
+        assert_eq!(mach_ticks_to_ns(u64::MAX, 125, 3), u64::MAX);
     }
 
     #[cfg(target_os = "linux")]
