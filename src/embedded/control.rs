@@ -487,6 +487,7 @@ pub(crate) fn fork_vm_with_options(
         clone_forkable,
         &[],
         &std::collections::BTreeMap::new(),
+        &[],
         source_policy,
     )?;
 
@@ -622,6 +623,7 @@ pub fn fork_vm_batch(
             fork_env: &[],
             fork_secrets: &empty_secrets,
             hold: false,
+            labels: &[],
         })
         .collect();
     let prepared = crate::agent::fork::prepare_forks(db, golden, &specs, source_policy)?;

@@ -1396,6 +1396,9 @@ pub struct ForkRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
+    /// Labels set on the child over the ones inherited from the source.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// Preferred public name for [`ForkRequest`].

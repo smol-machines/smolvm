@@ -4419,22 +4419,29 @@ async fn prepare_and_boot_branches(
                     queued.req.forkable,
                     fork_env.clone(),
                     queued.req.secrets.clone(),
+                    queued
+                        .req
+                        .labels
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<Vec<(String, String)>>(),
                 )
             })
             .collect();
         tokio::task::spawn_blocking(move || {
             let specs: Vec<_> = children
                 .iter()
-                .map(
-                    |(clone, ports, forkable, fork_env, secrets)| crate::agent::fork::ForkSpec {
+                .map(|(clone, ports, forkable, fork_env, secrets, labels)| {
+                    crate::agent::fork::ForkSpec {
                         clone,
                         pinned_ports: ports,
                         clone_forkable: *forkable,
                         fork_env,
                         fork_secrets: secrets,
                         hold: false,
-                    },
-                )
+                        labels,
+                    }
+                })
                 .collect();
             crate::agent::fork::prepare_forks(&db, &golden_b, &specs, source_policy)
         })
@@ -4670,6 +4677,11 @@ async fn fork_machine_transaction(
         let ports = pinned_ports.clone();
         let env = fork_env.clone();
         let secrets = fork_secrets.clone();
+        let labels: Vec<(String, String)> = req
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         tokio::task::spawn_blocking(move || {
             if req_hold {
                 crate::agent::fork::prepare_held_fork(
@@ -4679,6 +4691,7 @@ async fn fork_machine_transaction(
                     &ports,
                     &env,
                     &secrets,
+                    &labels,
                     source_policy,
                 )
             } else {
@@ -4690,6 +4703,7 @@ async fn fork_machine_transaction(
                     req_forkable,
                     &env,
                     &secrets,
+                    &labels,
                     source_policy,
                 )
             }
@@ -4798,6 +4812,7 @@ pub(crate) async fn fork_held_machines_inner(
                     fork_env: &[],
                     fork_secrets: &empty_secrets,
                     hold: true,
+                    labels: &[],
                 })
                 .collect();
             crate::agent::fork::prepare_forks_reusing(

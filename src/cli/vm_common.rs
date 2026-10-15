@@ -971,6 +971,8 @@ pub struct ForkVmOptions<'a> {
     pub hold: bool,
     pub freeze_source: bool,
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// Labels set on the child over the ones inherited from the source.
+    pub labels: &'a [(String, String)],
 }
 
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
@@ -1024,6 +1026,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.pinned_ports,
             options.fork_env,
             options.fork_secrets,
+            options.labels,
             source_policy,
         )?
     } else {
@@ -1035,6 +1038,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.clone_forkable,
             options.fork_env,
             options.fork_secrets,
+            options.labels,
             source_policy,
         )?
     };
@@ -1105,6 +1109,8 @@ pub struct ForkBatchOptions<'a> {
     /// tearing the batch down if one never does.
     pub worker_ready: Option<std::time::Duration>,
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// Labels set on every child over the ones inherited from the source.
+    pub labels: &'a [(String, String)],
 }
 
 pub fn fork_vm_batch(
@@ -1121,6 +1127,7 @@ pub fn fork_vm_batch(
         freeze_source,
         worker_ready,
         external_interceptor,
+        labels,
     } = options;
     let source_policy = if freeze_source {
         smolvm::agent::fork::ForkSourcePolicy::Freeze
@@ -1169,6 +1176,7 @@ pub fn fork_vm_batch(
             fork_env: env,
             fork_secrets,
             hold,
+            labels,
         })
         .collect();
     eprintln!(

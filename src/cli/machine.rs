@@ -5450,6 +5450,11 @@ pub struct ForkCmd {
     #[arg(long)]
     pub share_weights: bool,
 
+    /// Label the child (repeatable, KEY=VALUE). A child inherits the source's
+    /// labels; a key given here replaces the inherited value.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
     /// Per-branch parameter (repeatable, KEY=VALUE). Reaches the child through
     /// `smolvm-branch-ready`: the program it runs (`-- prog`) gets it in its
     /// environment, a shell gets it from `eval "$(smolvm-branch-ready)"`, and
@@ -5520,6 +5525,9 @@ impl ForkCmd {
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
+        let labels: Vec<(String, String)> = smolvm::util::parse_labels(&self.labels)?
+            .into_iter()
+            .collect();
         let count = self.count.get();
         let wait_ready = forkpoint_timeout(
             is_plain_branch(count, self.name_prefix.is_some(), self.hold),
@@ -5570,6 +5578,7 @@ impl ForkCmd {
                     hold: self.hold,
                     freeze_source: self.freeze_source,
                     external_interceptor,
+                    labels: &labels,
                 },
             );
         }
@@ -5643,6 +5652,7 @@ impl ForkCmd {
                 freeze_source: self.freeze_source,
                 worker_ready,
                 external_interceptor,
+                labels: &labels,
             },
         )
     }

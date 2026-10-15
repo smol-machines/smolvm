@@ -2213,6 +2213,8 @@ pub struct ForkSpec<'a> {
     /// Keep the restored workload parked at its inherited forkpoint until a
     /// later assignment explicitly releases it.
     pub hold: bool,
+    /// Labels set on the clone over the ones it inherits from the golden.
+    pub labels: &'a [(String, String)],
 }
 
 /// Freeze a running, forkable `golden`, snapshot it, register `clone` in the DB
@@ -2233,6 +2235,7 @@ pub fn prepare_fork(
     clone_forkable: bool,
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    labels: &[(String, String)],
     source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
@@ -2245,6 +2248,7 @@ pub fn prepare_fork(
             fork_env,
             fork_secrets,
             hold: false,
+            labels,
         }],
         source_policy,
     )?;
@@ -2253,6 +2257,7 @@ pub fn prepare_fork(
 
 /// Prepare one clean clone that remains parked at the inherited forkpoint.
 /// Held slots are deliberately non-forkable and one-shot.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_held_fork(
     db: &SmolvmDb,
     golden: &str,
@@ -2260,6 +2265,7 @@ pub fn prepare_held_fork(
     pinned_ports: &[(u16, u16)],
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    labels: &[(String, String)],
     source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
@@ -2272,10 +2278,22 @@ pub fn prepare_held_fork(
             fork_env,
             fork_secrets,
             hold: true,
+            labels,
         }],
         source_policy,
     )?;
     Ok(prepared.remove(0))
+}
+
+/// A clone starts with the golden's labels; a label given at branch time
+/// replaces the inherited value of the same key.
+pub(crate) fn apply_clone_labels(
+    labels: &mut std::collections::BTreeMap<String, String>,
+    overrides: &[(String, String)],
+) {
+    for (key, value) in overrides {
+        labels.insert(key.clone(), value.clone());
+    }
 }
 
 /// Capture one golden generation and prepare every requested clone from it.
@@ -2982,6 +3000,7 @@ fn prepare_clone_from_snapshot(
         for (key, secret) in spec.fork_secrets {
             clone_rec.secret_refs.insert(key.clone(), secret.clone());
         }
+        apply_clone_labels(&mut clone_rec.labels, spec.labels);
 
         let mut port_remaps = Vec::new();
         if !spec.pinned_ports.is_empty() {
@@ -4190,6 +4209,26 @@ fn check_pinned_ports_keep_network_backend(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clone_labels_override_inherited_ones_and_keep_the_rest() {
+        let mut labels = std::collections::BTreeMap::from([
+            ("owner".to_string(), "source".to_string()),
+            ("tier".to_string(), "gold".to_string()),
+        ]);
+        super::apply_clone_labels(
+            &mut labels,
+            &[
+                ("owner".to_string(), "child".to_string()),
+                ("job".to_string(), "7".to_string()),
+            ],
+        );
+        assert_eq!(labels["owner"], "child");
+        assert_eq!(labels["tier"], "gold");
+        assert_eq!(labels["job"], "7");
+        super::apply_clone_labels(&mut labels, &[]);
+        assert_eq!(labels.len(), 3);
+    }
+
     use super::*;
 
     #[test]
