@@ -120,6 +120,8 @@ smolvm machine monitor [--name NAME]              # foreground health + restart
 smolvm pack create --image IMAGE -o PATH          # package
 smolvm pack create --from-vm NAME -o PATH         # pack from VM snapshot
 smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
+smolvm pack pull REF [-o PATH]                    # pull .smolmachine into the cache
+smolvm pack list [--json]                         # pulled artifacts and their paths
 
 smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
 smolvm config registries edit                     # registry auth

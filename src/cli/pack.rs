@@ -54,6 +54,10 @@ pub enum PackCmd {
     /// Pull a .smolmachine artifact from a registry
     Pull(PackPullCmd),
 
+    /// List pulled .smolmachine artifacts and where they are stored
+    #[command(alias = "ls")]
+    List(PackListCmd),
+
     /// Inspect a .smolmachine artifact in a registry (without downloading)
     Inspect(PackInspectCmd),
 
@@ -68,6 +72,7 @@ impl PackCmd {
             PackCmd::Run(cmd) => cmd.run(),
             PackCmd::Push(cmd) => cmd.run(),
             PackCmd::Pull(cmd) => cmd.run(),
+            PackCmd::List(cmd) => cmd.run(),
             PackCmd::Inspect(cmd) => cmd.run(),
             PackCmd::Prune(cmd) => cmd.run(),
         }
@@ -1894,7 +1899,9 @@ impl PackPullCmd {
             .or(parsed.tag.as_deref())
             .unwrap_or("latest");
 
-        eprintln!("Pulling {}/{}:{}", parsed.registry, repo, tag_or_digest);
+        let separator = if parsed.digest.is_some() { '@' } else { ':' };
+        let qualified = format!("{}/{}{}{}", parsed.registry, repo, separator, tag_or_digest);
+        eprintln!("Pulling {qualified}");
 
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
@@ -1951,12 +1958,21 @@ impl PackPullCmd {
             eprintln!("Using cached blob ({})", result.digest);
         }
 
+        let into_cache = self.output.is_none();
         let dest = self.output.unwrap_or(result.path);
         eprintln!(
             "Pulled successfully -> {} ({})",
             dest.display(),
             crate::cli::format_bytes(result.size),
         );
+        if into_cache {
+            // The blob path is not meant to be typed: name the artifact by the
+            // reference it was pulled as, which reuses this cached copy. The
+            // registry host stays in: `--image` sends a bare name to Docker Hub.
+            eprintln!(
+                "\nCreate a machine from it:\n  smolvm machine create --name <name> --image {qualified}\nList pulled artifacts: smolvm pack list",
+            );
+        }
 
         // Warn if the artifact targets a different host platform.
         // This is not an error — the user may be inspecting or transferring
@@ -1975,6 +1991,129 @@ impl PackPullCmd {
 
         Ok(())
     }
+}
+
+/// List the .smolmachine artifacts in the local registry cache.
+///
+/// Shows each pulled reference, the blob it resolved to, and the blob's path,
+/// which works anywhere a `.smolmachine` file does. A blob with no reference
+/// came from a portable checkpoint or a pull by an older smolvm.
+///
+/// Examples:
+///   smolvm pack list
+///   smolvm pack list --json
+#[derive(Args, Debug)]
+pub struct PackListCmd {
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl PackListCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let cache = smolvm_registry::BlobCache::open_default()
+            .map_err(|e| Error::agent("open blob cache", e.to_string()))?;
+        let artifacts = cache
+            .list_artifacts()
+            .map_err(|e| Error::agent("list blob cache", e.to_string()))?;
+
+        if self.json {
+            let out = serde_json::to_string_pretty(&artifacts)
+                .map_err(|e| Error::agent("serialize artifacts", e.to_string()))?;
+            println!("{out}");
+            return Ok(());
+        }
+        if artifacts.is_empty() {
+            println!("No pulled artifacts. Pull one with: smolvm pack pull <reference>");
+            return Ok(());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut rows: Vec<[String; 5]> = Vec::new();
+        for artifact in &artifacts {
+            let digest = short_digest(&artifact.digest);
+            let size = crate::cli::format_bytes(artifact.size);
+            let path = artifact.path.display().to_string();
+            if artifact.refs.is_empty() {
+                rows.push(["<none>".into(), digest, size, "-".into(), path]);
+                continue;
+            }
+            for pulled in &artifact.refs {
+                rows.push([
+                    display_reference(pulled),
+                    digest.clone(),
+                    size.clone(),
+                    format_age(now.saturating_sub(pulled.pulled_at)),
+                    path.clone(),
+                ]);
+            }
+        }
+        let header = ["REFERENCE", "DIGEST", "SIZE", "PULLED", "PATH"];
+        let widths: Vec<usize> = (0..4)
+            .map(|i| {
+                rows.iter()
+                    .map(|r| r[i].len())
+                    .chain([header[i].len()])
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let print = |r: [&str; 5]| {
+            println!(
+                "{:w0$}  {:w1$}  {:w2$}  {:w3$}  {}",
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4],
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+                w3 = widths[3],
+            );
+        };
+        print(header);
+        for r in &rows {
+            print([&r[0], &r[1], &r[2], &r[3], &r[4]]);
+        }
+        Ok(())
+    }
+}
+
+/// `registry/repo:tag`, or `registry/repo@sha256:…` for a digest pull.
+fn display_reference(pulled: &smolvm_registry::PulledRef) -> String {
+    let separator = if pulled.reference.starts_with("sha256:") {
+        '@'
+    } else {
+        ':'
+    };
+    format!(
+        "{}/{}{}{}",
+        pulled.registry, pulled.repository, separator, pulled.reference
+    )
+}
+
+/// The first 12 hex characters of a `sha256:` digest, as `docker images` shows.
+fn short_digest(digest: &str) -> String {
+    digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .chars()
+        .take(12)
+        .collect()
+}
+
+/// How long ago, coarsely: `45 seconds ago`, `3 hours ago`, `2 days ago`.
+fn format_age(secs: u64) -> String {
+    let (n, unit) = match secs {
+        0..=59 => (secs, "second"),
+        60..=3599 => (secs / 60, "minute"),
+        3600..=86_399 => (secs / 3600, "hour"),
+        _ => (secs / 86_400, "day"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
 /// Inspect a .smolmachine artifact in a registry without downloading the full artifact.
@@ -2210,6 +2349,30 @@ fn dir_size(path: &std::path::Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_list_formats_references_digests_and_ages() {
+        let pulled = |reference: &str| smolvm_registry::PulledRef {
+            registry: "registry.smolmachines.com".into(),
+            repository: "library/pi".into(),
+            reference: reference.into(),
+            digest: String::new(),
+            pulled_at: 0,
+        };
+        assert_eq!(
+            display_reference(&pulled("latest")),
+            "registry.smolmachines.com/library/pi:latest"
+        );
+        assert_eq!(
+            display_reference(&pulled("sha256:abc")),
+            "registry.smolmachines.com/library/pi@sha256:abc"
+        );
+        assert_eq!(short_digest("sha256:7197c078314f9a5a9490"), "7197c078314f");
+        assert_eq!(format_age(1), "1 second ago");
+        assert_eq!(format_age(150), "2 minutes ago");
+        assert_eq!(format_age(3600), "1 hour ago");
+        assert_eq!(format_age(3 * 86_400), "3 days ago");
+    }
 
     /// Verify that dladdr-based libkrun discovery finds the loaded library.
     ///

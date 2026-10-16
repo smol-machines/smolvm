@@ -77,6 +77,48 @@ pub async fn pull_with_progress(
     blob_peers: &[String],
     on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<PullResult> {
+    let result = pull_unrecorded(
+        client,
+        repo,
+        reference,
+        output,
+        cache,
+        blob_peers,
+        on_progress,
+    )
+    .await?;
+    // Remember which reference this blob came from, so `pack list` can show
+    // what was pulled by name. Losing the record only loses the name.
+    let registry = client.base_url();
+    let pulled = crate::cache::PulledRef {
+        registry: registry
+            .split_once("://")
+            .map_or(registry, |(_, host)| host)
+            .trim_end_matches('/')
+            .to_string(),
+        repository: repo.to_string(),
+        reference: reference.to_string(),
+        digest: result.digest.clone(),
+        pulled_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    };
+    if let Err(error) = cache.record_pull(&pulled) {
+        tracing::debug!(%error, "could not record the pulled reference");
+    }
+    Ok(result)
+}
+
+/// [`pull_with_progress`] without recording the reference.
+async fn pull_unrecorded(
+    client: &RegistryClient,
+    repo: &str,
+    reference: &str,
+    output: Option<&Path>,
+    cache: &BlobCache,
+    blob_peers: &[String],
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> Result<PullResult> {
     // 1. Fetch the manifest, resolving a multi-platform index to this machine's
     //    host-platform entry (Docker-style fan-out). Shared with `inspect`.
     //    A manifest already fetched from this repo by digest cannot have changed,

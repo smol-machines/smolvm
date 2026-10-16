@@ -18,6 +18,40 @@ const MANIFEST_DIR: &str = "manifests";
 /// [`BlobCache::download_lock_file`]); a directory, so the blob walks skip it.
 const LOCK_DIR: &str = "locks";
 
+/// Subdirectory recording which reference each pull resolved to which blob
+/// (see [`BlobCache::record_pull`]); a directory, so the blob walks skip it.
+const REFS_DIR: &str = "refs";
+
+/// What one pull of a reference left in the cache.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PulledRef {
+    /// Registry host the blob came from (`registry.smolmachines.com`).
+    pub registry: String,
+    /// Repository within the registry (`library/pi`).
+    pub repository: String,
+    /// Tag or digest the pull asked for (`latest`, `sha256:…`).
+    pub reference: String,
+    /// Digest of the `.smolmachine` blob it resolved to.
+    pub digest: String,
+    /// When the pull finished, as seconds since the Unix epoch.
+    pub pulled_at: u64,
+}
+
+/// A `.smolmachine` blob in the cache, with the pulls that resolved to it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CachedArtifact {
+    /// Digest of the blob.
+    pub digest: String,
+    /// Size of the blob in bytes.
+    pub size: u64,
+    /// Path of the blob, usable wherever a `.smolmachine` file is.
+    pub path: PathBuf,
+    /// Pulls that resolved to this blob, newest first. Empty for a blob put
+    /// here some other way (a portable checkpoint, or a pull by an older
+    /// smolvm that recorded nothing).
+    pub refs: Vec<PulledRef>,
+}
+
 /// `sha256:<hex>` of `bytes`.
 fn digest_of(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
@@ -223,8 +257,86 @@ impl BlobCache {
                 }
             }
             let _ = fs::remove_dir_all(self.root.join(MANIFEST_DIR));
+            let _ = fs::remove_dir_all(self.root.join(REFS_DIR));
         }
         Ok(freed)
+    }
+
+    /// Record that pulling `registry`/`repository`:`reference` produced the
+    /// blob `digest`, replacing what an earlier pull of the same reference
+    /// recorded (a tag moved on is listed under its new blob).
+    pub fn record_pull(&self, pulled: &PulledRef) -> io::Result<()> {
+        let dir = self.root.join(REFS_DIR);
+        fs::create_dir_all(&dir)?;
+        let mut key = Sha256::new();
+        for part in [&pulled.registry, &pulled.repository, &pulled.reference] {
+            key.update(part.as_bytes());
+            key.update([0]);
+        }
+        let mut staged = tempfile::Builder::new()
+            .suffix(".partial")
+            .tempfile_in(&dir)?;
+        serde_json::to_writer(&mut staged, pulled)?;
+        staged
+            .persist(dir.join(format!("{:x}.json", key.finalize())))
+            .map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    /// Every blob in the cache with the references pulled to it, most recently
+    /// pulled first. Records whose blob was evicted are dropped.
+    pub fn list_artifacts(&self) -> io::Result<Vec<CachedArtifact>> {
+        let mut by_digest: std::collections::BTreeMap<String, CachedArtifact> =
+            std::collections::BTreeMap::new();
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() || is_partial(&path) || is_lru_marker(&path) {
+                continue;
+            }
+            let Some(digest) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("sha256_"))
+                .map(|hex| format!("sha256:{hex}"))
+            else {
+                continue;
+            };
+            by_digest.insert(
+                digest.clone(),
+                CachedArtifact {
+                    digest,
+                    size: entry.metadata()?.len(),
+                    path,
+                    refs: Vec::new(),
+                },
+            );
+        }
+        if let Ok(refs) = fs::read_dir(self.root.join(REFS_DIR)) {
+            for entry in refs.flatten() {
+                let Ok(bytes) = fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(pulled) = serde_json::from_slice::<PulledRef>(&bytes) else {
+                    continue;
+                };
+                if let Some(artifact) = by_digest.get_mut(&pulled.digest) {
+                    artifact.refs.push(pulled);
+                }
+            }
+        }
+        let mut artifacts: Vec<CachedArtifact> = by_digest.into_values().collect();
+        for artifact in &mut artifacts {
+            artifact
+                .refs
+                .sort_by_key(|a| std::cmp::Reverse(a.pulled_at));
+        }
+        artifacts
+            .sort_by_key(|a| std::cmp::Reverse(a.refs.first().map(|r| r.pulled_at).unwrap_or(0)));
+        Ok(artifacts)
     }
 
     /// Evict least-recently-accessed blobs until total size is at or below `target`.
@@ -622,6 +734,59 @@ mod tests {
 
         assert_eq!(cache.sweep_abandoned_partials(day).unwrap(), 64);
         assert!(!ranged.exists(), "an abandoned ranged partial is removed");
+    }
+
+    /// A pull's reference is listed with its blob; a re-pull of a moved tag
+    /// lists it under the new blob, leaving the old one without a name; an
+    /// evicted blob's record is not listed; prune forgets every record.
+    #[test]
+    fn listed_artifacts_carry_the_references_pulled_to_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), u64::MAX).unwrap();
+        let old = cache.put(&digest_of(b"old"), b"old").unwrap();
+        cache.put(&digest_of(b"new"), b"new!").unwrap();
+        let pulled = |reference: &str, digest: &str, at: u64| PulledRef {
+            registry: "registry.smolmachines.com".into(),
+            repository: "library/pi".into(),
+            reference: reference.into(),
+            digest: digest.into(),
+            pulled_at: at,
+        };
+        cache
+            .record_pull(&pulled("latest", &digest_of(b"old"), 1))
+            .unwrap();
+        cache
+            .record_pull(&pulled("v1", &digest_of(b"old"), 2))
+            .unwrap();
+        cache
+            .record_pull(&pulled("latest", &digest_of(b"new"), 3))
+            .unwrap();
+        cache
+            .record_pull(&pulled("gone", &digest_of(b"evicted"), 4))
+            .unwrap();
+
+        let listed = cache.list_artifacts().unwrap();
+        assert_eq!(listed.len(), 2, "one entry per blob still cached");
+        assert_eq!(
+            listed[0].digest,
+            digest_of(b"new"),
+            "most recent pull first"
+        );
+        assert_eq!(listed[0].size, 4);
+        assert_eq!(
+            listed[0].refs,
+            vec![pulled("latest", &digest_of(b"new"), 3)]
+        );
+        assert_eq!(listed[1].path, old);
+        assert_eq!(
+            listed[1].refs,
+            vec![pulled("v1", &digest_of(b"old"), 2)],
+            "the moved tag no longer names the old blob"
+        );
+
+        cache.prune_all().unwrap();
+        cache.put(&digest_of(b"new"), b"new!").unwrap();
+        assert!(cache.list_artifacts().unwrap()[0].refs.is_empty());
     }
 
     #[test]
