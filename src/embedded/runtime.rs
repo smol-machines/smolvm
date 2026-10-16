@@ -1065,6 +1065,36 @@ impl EmbeddedRuntime {
         op.finish(result)
     }
 
+    /// Start a command and return its guest pid without waiting for it to
+    /// finish: a server, a watcher or another long-lived process. It runs in
+    /// the same filesystem as [`Self::exec_with_options`] and keeps running
+    /// after this returns. A background command has no stdin and no timeout.
+    pub fn exec_background(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<u32> {
+        if options.stdin.is_some() || options.timeout.is_some() {
+            return Err(Error::config(
+                "background exec",
+                "a background command takes no stdin and no timeout",
+            ));
+        }
+        let op = self.inflight.begin(name, "exec")?;
+        let result = (|| {
+            let options = self.with_machine_context(name, options)?;
+            let target = self.machine_target(name)?;
+            let config = self.command_run_config(name, target, &command, &options)?;
+            let mut client = self.command_client(name)?;
+            match config {
+                Some(config) => client.run_background(config),
+                None => client.vm_exec_background(command, options.env, options.workdir),
+            }
+        })();
+        op.finish(result)
+    }
+
     /// The [`RunConfig`] for a command on an image machine, or `None` for a
     /// bare VM (which rejects a per-command user it cannot honor).
     ///
