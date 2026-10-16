@@ -1194,6 +1194,7 @@ struct RegisteredStream {
 
 impl RegisteredStream {
     fn new(stream: TcpStream, poller: Arc<polling::Poller>) -> io::Result<Self> {
+        stream.set_nodelay(true)?;
         // SAFETY: the stream is owned by the value returned here, whose Drop
         // removes it from the poller before the stream itself is dropped.
         unsafe { poller.add(&stream, Event::none(HOST_STREAM_KEY))? };
@@ -1506,6 +1507,21 @@ mod initial_bytes_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let outbound = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+
+        for stream in [outbound, accepted] {
+            stream.set_nodelay(false).unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let poller = Arc::new(polling::Poller::new().unwrap());
+            let registered = RegisteredStream::new(stream, poller).unwrap();
+            assert!(registered.stream.nodelay().unwrap());
+        }
+    }
 
     #[test]
     fn relay_accepts_burst_beyond_old_256_limit_and_honors_configured_cap() {
