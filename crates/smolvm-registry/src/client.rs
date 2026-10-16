@@ -720,6 +720,64 @@ impl RegistryClient {
         Ok((resp.bytes_stream(), resumed_at))
     }
 
+    /// Download bytes `start..=end` of a blob.
+    ///
+    /// Returns `None` when the registry ignored the range and answered with the
+    /// whole blob (200), so the caller can fall back to one stream instead of
+    /// reading gigabytes it did not ask for. A 206 whose `Content-Range` starts
+    /// anywhere but `start`, or whose body is not exactly the requested length,
+    /// is an error: writing it at `start` would corrupt the file.
+    pub async fn pull_blob_range(
+        &self,
+        repo: &str,
+        digest: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<bytes::Bytes>> {
+        validate_digest(digest)?;
+        let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
+        let req = self
+            .request(reqwest::Method::GET, &url)
+            .header(RANGE, format!("bytes={start}-{end}"));
+        let resp = self.send_replayable(req).await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(digest.to_string()));
+        }
+        if resp.status() == reqwest::StatusCode::OK {
+            return Ok(None);
+        }
+        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let served_start = resp
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes "))
+            .and_then(|v| v.split('-').next())
+            .and_then(|v| v.parse::<u64>().ok());
+        if served_start != Some(start) {
+            return Err(RegistryError::ApiError {
+                status: 206,
+                body: format!("asked for bytes from {start}, registry served {served_start:?}"),
+            });
+        }
+        let body = resp.bytes().await?;
+        if body.len() as u64 != end - start + 1 {
+            return Err(RegistryError::DownloadStalled {
+                digest: digest.to_string(),
+                received: body.len() as u64,
+                total: end - start + 1,
+            });
+        }
+        Ok(Some(body))
+    }
+
     /// Download a blob as a byte stream from the beginning.
     ///
     /// Returns the stream after verifying the response status. The caller is

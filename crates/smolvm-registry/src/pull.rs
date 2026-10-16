@@ -163,8 +163,17 @@ pub async fn pull_with_progress(
     //    transfer, then verify the digest and adopt into cache.
     tracing::info!(digest = %digest, size, "downloading blob...");
 
-    let result =
-        download_with_resume(client, repo, digest, size, output, cache, on_progress).await?;
+    let result = download_blob(
+        client,
+        repo,
+        digest,
+        size,
+        output,
+        cache,
+        RangedPlan::default(),
+        on_progress,
+    )
+    .await?;
 
     tracing::info!(digest = %digest, size = result.size, "pull complete");
 
@@ -224,6 +233,159 @@ async fn lock_blob_download(cache: &BlobCache, digest: &str) -> Result<std::fs::
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
     }
+}
+
+/// How a large blob is fetched over parallel ranged requests. The registry
+/// streams each blob from object storage, where one stream runs at tens of
+/// MB/s, so a multi-GiB layer waited most of a minute on a single GET.
+#[derive(Clone, Copy, Debug)]
+struct RangedPlan {
+    /// Blobs smaller than this use one stream: ranged parts only pay off for
+    /// large blobs.
+    parallel_min_bytes: u64,
+    /// Bytes per ranged request. Each part is held in memory while it is
+    /// written, so `part_bytes * streams` bounds the buffering.
+    part_bytes: u64,
+    /// Ranged requests in flight at once.
+    streams: usize,
+}
+
+impl Default for RangedPlan {
+    fn default() -> Self {
+        Self {
+            parallel_min_bytes: 256 << 20,
+            part_bytes: 16 << 20,
+            streams: 16,
+        }
+    }
+}
+
+/// Download `digest` into the cache: as parallel ranged parts when the blob is
+/// large and the registry serves ranges, otherwise (or when the ranged fetch
+/// fails) as one resumable stream.
+#[allow(clippy::too_many_arguments)]
+async fn download_blob(
+    client: &RegistryClient,
+    repo: &str,
+    digest: &str,
+    size: u64,
+    output: Option<&Path>,
+    cache: &BlobCache,
+    plan: RangedPlan,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> Result<PullResult> {
+    let partial_path = cache.blob_path_for(digest).with_extension("partial");
+    // A partial left by an interrupted single-stream pull is resumed by that
+    // path rather than thrown away here.
+    let resumable = tokio::fs::try_exists(&partial_path).await.unwrap_or(false);
+    if size >= plan.parallel_min_bytes && !resumable {
+        let started = std::time::Instant::now();
+        match fetch_ranged(client, repo, digest, size, &partial_path, plan, on_progress).await {
+            Ok(true) => {
+                let actual = hash_file(&partial_path).await?;
+                if actual != *digest {
+                    discard_partial(&partial_path).await;
+                    return Err(RegistryError::DigestMismatch {
+                        expected: digest.to_string(),
+                        actual,
+                    });
+                }
+                tracing::info!(
+                    digest = %digest,
+                    size,
+                    streams = plan.streams,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "blob downloaded in ranged parts"
+                );
+                return finish_download(digest, size, output, cache).await;
+            }
+            Ok(false) => {
+                tracing::info!(digest = %digest, "registry does not serve ranges; using one stream");
+            }
+            Err(error) => {
+                tracing::warn!(digest = %digest, %error, "ranged blob download failed; retrying as one stream");
+                discard_partial(&partial_path).await;
+            }
+        }
+    }
+    download_with_resume(client, repo, digest, size, output, cache, on_progress).await
+}
+
+/// Fetch the blob into `partial_path` as `plan.part_bytes` parts over
+/// `plan.streams` concurrent ranged requests, each written in place.
+///
+/// The first part goes alone: it settles the registry token every other part
+/// reuses, and a registry answering it with the whole blob (200) means ranges
+/// are unsupported, reported as `Ok(false)` before any file is created.
+async fn fetch_ranged(
+    client: &RegistryClient,
+    repo: &str,
+    digest: &str,
+    size: u64,
+    partial_path: &Path,
+    plan: RangedPlan,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> Result<bool> {
+    let parts: Vec<(u64, u64)> = (0..size)
+        .step_by(plan.part_bytes as usize)
+        .map(|start| (start, (start + plan.part_bytes).min(size) - 1))
+        .collect();
+    let Some(first) = fetch_part(client, repo, digest, parts[0]).await? else {
+        return Ok(false);
+    };
+    let file = tokio::fs::File::create(partial_path).await?;
+    file.set_len(size).await?;
+    drop(file);
+    write_part(partial_path, 0, &first).await?;
+    let mut done = first.len() as u64;
+    on_progress(done, size);
+
+    let mut rest = futures_util::stream::iter(parts[1..].iter().copied())
+        .map(|(start, end)| async move {
+            let bytes = fetch_part(client, repo, digest, (start, end))
+                .await?
+                .ok_or_else(|| RegistryError::ApiError {
+                    status: 200,
+                    body: "registry stopped serving ranges mid-download".into(),
+                })?;
+            write_part(partial_path, start, &bytes).await?;
+            Ok::<u64, RegistryError>(bytes.len() as u64)
+        })
+        .buffer_unordered(plan.streams);
+    while let Some(written) = rest.next().await {
+        done += written?;
+        on_progress(done, size);
+    }
+    Ok(true)
+}
+
+/// One ranged part, retried with backoff on the faults a resume would retry.
+async fn fetch_part(
+    client: &RegistryClient,
+    repo: &str,
+    digest: &str,
+    (start, end): (u64, u64),
+) -> Result<Option<bytes::Bytes>> {
+    let mut attempt = 1;
+    loop {
+        match client.pull_blob_range(repo, digest, start, end).await {
+            Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
+                tokio::time::sleep(RETRY_BACKOFF * 2u32.pow(attempt - 1)).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Write `bytes` into `path` at `offset`.
+async fn write_part(path: &Path, offset: u64, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncSeekExt;
+    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    file.write_all(bytes).await?;
+    file.flush().await?;
+    Ok(())
 }
 
 /// Attempts allowed for one blob (first try plus retries).
@@ -985,6 +1147,157 @@ mod tests {
             "expected BlobNotFound, got {err:?}"
         );
         // expect(1) asserts the blob endpoint was hit once, not MAX_ATTEMPTS times.
+    }
+
+    /// A registry that serves `data` honoring `Range: bytes=a-b` with a 206,
+    /// failing the first `fail_first` ranged requests with a 503.
+    struct RangeServer {
+        data: Vec<u8>,
+        fail_first: usize,
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for RangeServer {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.fail_first {
+                return ResponseTemplate::new(503);
+            }
+            let Some(range) = req.headers.get("range").and_then(|v| v.to_str().ok()) else {
+                return ResponseTemplate::new(200).set_body_bytes(self.data.clone());
+            };
+            let (a, b) = range.trim_start_matches("bytes=").split_once('-').unwrap();
+            let a: usize = a.parse().unwrap();
+            let b: usize = b.parse().unwrap_or(self.data.len() - 1);
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "content-range",
+                    format!("bytes {a}-{b}/{}", self.data.len()).as_str(),
+                )
+                .set_body_bytes(self.data[a..=b].to_vec())
+        }
+    }
+
+    fn small_plan() -> RangedPlan {
+        RangedPlan {
+            parallel_min_bytes: 1024,
+            part_bytes: 300,
+            streams: 4,
+        }
+    }
+
+    async fn ranged_download(
+        responder: impl wiremock::Respond + 'static,
+        data: &[u8],
+        digest: &str,
+    ) -> (Result<PullResult>, BlobCache, tempfile::TempDir) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let client = RegistryClient::new(server.uri());
+        let mut progress = 0;
+        let result = download_blob(
+            &client,
+            "myrepo",
+            digest,
+            data.len() as u64,
+            None,
+            &cache,
+            small_plan(),
+            &mut |done, _| progress = done,
+        )
+        .await;
+        if result.is_ok() {
+            assert_eq!(
+                progress,
+                data.len() as u64,
+                "progress must reach the blob size"
+            );
+        }
+        (result, cache, tmp)
+    }
+
+    /// A large blob arrives as many ranged parts written in place, and the file
+    /// is byte-identical to the blob, including the short last part.
+    #[tokio::test]
+    async fn a_large_blob_downloads_in_ranged_parts() {
+        let (data, digest) = test_blob();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responder = RangeServer {
+            data: data.clone(),
+            fail_first: 0,
+            seen: seen.clone(),
+        };
+        let (result, cache, _tmp) = ranged_download(responder, &data, &digest).await;
+        result.expect("ranged download must succeed");
+        let parts = data.len().div_ceil(300);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), parts);
+        let cached = cache.get(&digest).expect("blob must be adopted into cache");
+        assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
+    }
+
+    /// A part that fails transiently is retried on its own, not the whole blob.
+    #[tokio::test]
+    async fn a_failed_part_is_retried() {
+        let (data, digest) = test_blob();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responder = RangeServer {
+            data: data.clone(),
+            fail_first: 1,
+            seen: seen.clone(),
+        };
+        let (result, cache, _tmp) = ranged_download(responder, &data, &digest).await;
+        result.expect("a retried part must still complete the download");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            data.len().div_ceil(300) + 1
+        );
+        let cached = cache.get(&digest).unwrap();
+        assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
+    }
+
+    /// A registry that ignores ranges is read once as a whole, not once per part.
+    #[tokio::test]
+    async fn a_registry_without_ranges_falls_back_to_one_stream() {
+        let (data, digest) = test_blob();
+        let (result, cache, _tmp) = ranged_download(
+            ResponseTemplate::new(200).set_body_bytes(data.clone()),
+            &data,
+            &digest,
+        )
+        .await;
+        result.expect("one stream must complete the download");
+        let cached = cache.get(&digest).unwrap();
+        assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
+    }
+
+    /// Parts that do not hash to the digest fail the pull and leave no partial
+    /// behind for a later pull to resume onto.
+    #[tokio::test]
+    async fn ranged_parts_with_wrong_bytes_fail_the_digest_check() {
+        let (data, _) = test_blob();
+        let (_, other_digest) = {
+            use sha2::{Digest, Sha256};
+            let other = b"other".to_vec();
+            (
+                other.clone(),
+                format!("sha256:{}", hex::encode(Sha256::digest(&other))),
+            )
+        };
+        let responder = RangeServer {
+            data: data.clone(),
+            fail_first: 0,
+            seen: Default::default(),
+        };
+        let (result, cache, _tmp) = ranged_download(responder, &data, &other_digest).await;
+        assert!(matches!(result, Err(RegistryError::DigestMismatch { .. })));
+        let partial = cache.blob_path_for(&other_digest).with_extension("partial");
+        assert!(!partial.exists(), "a mismatched partial must be removed");
     }
 
     /// Retry classification: transient transport/5xx faults resume, terminal ones
