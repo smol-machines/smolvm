@@ -37,6 +37,12 @@ pub(super) const SYNC_COMPACT_AT_DEPTH: usize = 24;
 /// Bytes copied per read and write while merging.
 const COPY_CHUNK: u64 = 4 << 20;
 
+/// Threads reading the chain while a flatten writes. A cloud disk serves one
+/// sequential reader at a fraction of its throughput (256 MB/s against 2.1 GB/s
+/// for sixteen on a worker's hyperdisk), and the chain's reads, not the writes,
+/// set a flatten's pace. Each reader opens its own view of the chain.
+const FLATTEN_READERS: usize = 16;
+
 /// Disks with a merge running, so one source never runs two at once.
 static IN_FLIGHT: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
@@ -279,6 +285,7 @@ pub(crate) fn flatten_standalone(top: &Path, out: &Path, copied: &dyn Fn()) -> R
                 .await
         })
         .map_err(|e| compact_err(&format!("create {}", out.display()), e))?;
+    drop(view);
     let result = (|| {
         let qcow = Qcow2::<ImagoFile>::builder_path(out)
             .data_file(None)
@@ -287,23 +294,15 @@ pub(crate) fn flatten_standalone(top: &Path, out: &Path, copied: &dyn Fn()) -> R
             .open_sync(PermissiveImplicitOpenGate::default())
             .map_err(|e| compact_err("open flattened image", e))?;
         let writer = SyncFormatAccess::new(qcow).map_err(|e| compact_err("wrap flattened", e))?;
-        let mut buffer = vec![0_u8; COPY_CHUNK as usize];
-        for (start, end) in coalesce(ranges) {
-            let mut offset = start;
-            while offset < end {
-                let length = (end - offset).min(COPY_CHUNK);
-                let chunk = &mut buffer[..length as usize];
-                view.read(&mut *chunk, offset)
-                    .map_err(|e| compact_err("read chain", e))?;
-                if chunk.iter().any(|byte| *byte != 0) {
-                    writer
-                        .write(&*chunk, offset)
-                        .map_err(|e| compact_err("write data", e))?;
-                }
-                offset += length;
-                copied();
+        read_chain_parallel(top, coalesce(ranges), |offset, chunk| {
+            if let Some(chunk) = chunk {
+                writer
+                    .write(chunk, offset)
+                    .map_err(|e| compact_err("write data", e))?;
             }
-        }
+            copied();
+            Ok(())
+        })?;
         writer
             .flush()
             .map_err(|e| compact_err("flush flattened", e))?;
@@ -313,6 +312,64 @@ pub(crate) fn flatten_standalone(top: &Path, out: &Path, copied: &dyn Fn()) -> R
         let _ = std::fs::remove_file(out);
     }
     result
+}
+
+/// Read `ranges` of `top`'s chain in [`COPY_CHUNK`] chunks with
+/// [`FLATTEN_READERS`] threads, each over its own contiguous share, and hand
+/// every chunk to `sink` on the calling thread, in no particular order:
+/// `None` for an all-zero chunk, which a sparse copy leaves unallocated.
+fn read_chain_parallel(
+    top: &Path,
+    ranges: Vec<(u64, u64)>,
+    mut sink: impl FnMut(u64, Option<&[u8]>) -> Result<()>,
+) -> Result<()> {
+    let mut chunks = Vec::new();
+    for (start, end) in ranges {
+        let mut offset = start;
+        while offset < end {
+            let length = (end - offset).min(COPY_CHUNK);
+            chunks.push((offset, length));
+            offset += length;
+        }
+    }
+    let readers = FLATTEN_READERS.min(chunks.len()).max(1);
+    let per = chunks.len().div_ceil(readers);
+    // Two chunks in hand per reader keeps every reader busy while the writer
+    // drains, and bounds memory at a fixed number of chunks.
+    let (send, receive) =
+        std::sync::mpsc::sync_channel::<Result<(u64, Option<Vec<u8>>)>>(readers * 2);
+    std::thread::scope(|scope| {
+        for share in chunks.chunks(per) {
+            let send = send.clone();
+            scope.spawn(move || {
+                let view = match open_readonly(top, true) {
+                    Ok(view) => view,
+                    Err(e) => {
+                        let _ = send.send(Err(e));
+                        return;
+                    }
+                };
+                for &(offset, length) in share {
+                    let mut chunk = vec![0_u8; length as usize];
+                    let read = view
+                        .read(&mut chunk[..], offset)
+                        .map_err(|e| compact_err("read chain", e))
+                        .map(|()| (offset, chunk.iter().any(|byte| *byte != 0).then_some(chunk)));
+                    let failed = read.is_err();
+                    // A closed channel means the writer stopped; so does this reader.
+                    if send.send(read).is_err() || failed {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(send);
+        for received in receive {
+            let (offset, chunk) = received?;
+            sink(offset, chunk.as_deref())?;
+        }
+        Ok(())
+    })
 }
 
 /// A read view of a whole chain, its size, and the ranges some layer of the
@@ -868,6 +925,58 @@ mod tests {
         flatten_to_raw(top, &out).unwrap();
 
         assert_eq!(std::fs::read(&out).unwrap(), read_all(top));
+    }
+
+    /// A publish flattens with many readers at once: the result must read exactly
+    /// as the chain across every reader's share, chunk boundaries and all-zero
+    /// spans, and stand alone.
+    #[test]
+    fn flatten_standalone_reads_exactly_as_the_chain_with_parallel_readers() {
+        use std::os::unix::fs::FileExt;
+        const SIZE: u64 = 50 * COPY_CHUNK;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.raw");
+        let file = std::fs::File::create(&root).unwrap();
+        file.set_len(SIZE).unwrap();
+        for chunk in 0..50u64 {
+            // Chunks 20..30 stay zero; the rest each carry their own pattern.
+            if !(20..30).contains(&chunk) {
+                let fill = vec![chunk as u8 + 1; COPY_CHUNK as usize];
+                file.write_all_at(&fill, chunk * COPY_CHUNK).unwrap();
+            }
+        }
+        drop(file);
+        let top = dir.path().join("top.qcow2");
+        create_overlay(&top, SIZE, &root.canonicalize().unwrap()).unwrap();
+        let access = writable(&top);
+        access
+            .write(&[0xEE; 8192][..], 3 * COPY_CHUNK - 4096)
+            .unwrap();
+        access.write(&[0x00; 65536][..], 7 * COPY_CHUNK).unwrap();
+        access
+            .write(&[0x5A; 4096][..], 25 * COPY_CHUNK + 12345)
+            .unwrap();
+        access.flush().unwrap();
+        drop(access);
+        let out = dir.path().join("flat.qcow2");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        flatten_standalone(&top, &out, &|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .unwrap();
+
+        assert_eq!(read_all(&out), read_all(&top));
+        assert!(
+            qcow2_backing_name(&out).unwrap().is_none(),
+            "the flattened image must stand alone"
+        );
+        // Holes in the base are never read: 40 written chunks, plus chunk 25,
+        // which only the overlay wrote into.
+        assert_eq!(calls.into_inner(), 41, "one progress call per chunk read");
+        let failed = dir.path().join("missing.qcow2");
+        assert!(flatten_standalone(&dir.path().join("absent.qcow2"), &failed, &|| {}).is_err());
+        assert!(!failed.exists(), "a failed flatten leaves nothing behind");
     }
 
     #[test]
