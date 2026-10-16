@@ -289,6 +289,7 @@ impl BlobCache {
             let digest = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
+                .map(|stem| stem.trim_end_matches(".ranged"))
                 .filter(|stem| stem.starts_with("sha256_"))
                 .map(|stem| stem.replacen('_', ":", 1));
             let _lock = match digest {
@@ -591,6 +592,36 @@ mod tests {
         );
         assert!(finished.exists(), "finished blobs are never swept");
         drop(held);
+    }
+
+    /// A ranged download's `<digest>.ranged.partial` is guarded by the same
+    /// download lock as the blob's resumable partial: kept while its pull runs,
+    /// removed once abandoned.
+    #[test]
+    fn a_sweep_honors_the_lock_on_a_ranged_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), u64::MAX).unwrap();
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let digest = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+        let ranged = cache
+            .blob_path_for(digest)
+            .with_extension(crate::pull::RANGED_PARTIAL_EXTENSION);
+        fs::write(&ranged, [0u8; 64]).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&ranged)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - 2 * day)
+            .unwrap();
+
+        let held = cache.download_lock_file(digest).unwrap();
+        held.lock().unwrap();
+        assert_eq!(cache.sweep_abandoned_partials(day).unwrap(), 0);
+        assert!(ranged.exists(), "a ranged partial its pull holds stays");
+        drop(held);
+
+        assert_eq!(cache.sweep_abandoned_partials(day).unwrap(), 64);
+        assert!(!ranged.exists(), "an abandoned ranged partial is removed");
     }
 
     #[test]

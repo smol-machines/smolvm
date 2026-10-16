@@ -260,6 +260,11 @@ impl Default for RangedPlan {
     }
 }
 
+/// Extension of the file a ranged download fills before it is verified. It
+/// ends in `partial`, so eviction skips it and the abandoned-partial sweep
+/// removes it under the blob's download lock.
+pub(crate) const RANGED_PARTIAL_EXTENSION: &str = "ranged.partial";
+
 /// Download `digest` into the cache: as parallel ranged parts when the blob is
 /// large and the registry serves ranges, otherwise (or when the ranged fetch
 /// fails) as one resumable stream.
@@ -275,16 +280,23 @@ async fn download_blob(
     on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<PullResult> {
     let partial_path = cache.blob_path_for(digest).with_extension("partial");
+    // Parts land at their offsets in a file sized up front, so until the last
+    // part arrives it has holes: it gets its own name, renamed to the resumable
+    // partial only once it is the blob, so a cancelled ranged pull never leaves
+    // a full-length file a single-stream resume would take as complete.
+    let ranged_path = cache
+        .blob_path_for(digest)
+        .with_extension(RANGED_PARTIAL_EXTENSION);
     // A partial left by an interrupted single-stream pull is resumed by that
     // path rather than thrown away here.
     let resumable = tokio::fs::try_exists(&partial_path).await.unwrap_or(false);
     if size >= plan.parallel_min_bytes && !resumable {
         let started = std::time::Instant::now();
-        match fetch_ranged(client, repo, digest, size, &partial_path, plan, on_progress).await {
+        match fetch_ranged(client, repo, digest, size, &ranged_path, plan, on_progress).await {
             Ok(true) => {
-                let actual = hash_file(&partial_path).await?;
+                let actual = hash_file(&ranged_path).await?;
                 if actual != *digest {
-                    discard_partial(&partial_path).await;
+                    discard_partial(&ranged_path).await;
                     return Err(RegistryError::DigestMismatch {
                         expected: digest.to_string(),
                         actual,
@@ -297,6 +309,7 @@ async fn download_blob(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "blob downloaded in ranged parts"
                 );
+                tokio::fs::rename(&ranged_path, &partial_path).await?;
                 return finish_download(digest, size, output, cache).await;
             }
             Ok(false) => {
@@ -304,7 +317,7 @@ async fn download_blob(
             }
             Err(error) => {
                 tracing::warn!(digest = %digest, %error, "ranged blob download failed; retrying as one stream");
-                discard_partial(&partial_path).await;
+                discard_partial(&ranged_path).await;
             }
         }
     }
@@ -1241,6 +1254,50 @@ mod tests {
         assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
     }
 
+    /// A ranged pull cancelled midway leaves a full-length file with holes. It
+    /// must not be taken for a resumable partial, and the next pull downloads
+    /// the blob in parts again over it.
+    #[tokio::test]
+    async fn a_cancelled_ranged_pull_does_not_poison_the_next_one() {
+        let (data, digest) = test_blob();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(RangeServer {
+                data: data.clone(),
+                fail_first: 0,
+                seen: Default::default(),
+            })
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let leftover = cache
+            .blob_path_for(&digest)
+            .with_extension(RANGED_PARTIAL_EXTENSION);
+        std::fs::write(&leftover, vec![0u8; data.len()]).unwrap();
+
+        let client = RegistryClient::new(server.uri());
+        download_blob(
+            &client,
+            "myrepo",
+            &digest,
+            data.len() as u64,
+            None,
+            &cache,
+            small_plan(),
+            &mut |_, _| {},
+        )
+        .await
+        .expect("the pull after a cancelled ranged pull must succeed");
+        let cached = cache.get(&digest).unwrap();
+        assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
+        assert!(
+            !leftover.exists(),
+            "the ranged file is renamed into the cache"
+        );
+    }
+
     /// A part that fails transiently is retried on its own, not the whole blob.
     #[tokio::test]
     async fn a_failed_part_is_retried() {
@@ -1296,8 +1353,10 @@ mod tests {
         };
         let (result, cache, _tmp) = ranged_download(responder, &data, &other_digest).await;
         assert!(matches!(result, Err(RegistryError::DigestMismatch { .. })));
-        let partial = cache.blob_path_for(&other_digest).with_extension("partial");
-        assert!(!partial.exists(), "a mismatched partial must be removed");
+        for ext in ["partial", RANGED_PARTIAL_EXTENSION] {
+            let partial = cache.blob_path_for(&other_digest).with_extension(ext);
+            assert!(!partial.exists(), "a mismatched {ext} must be removed");
+        }
     }
 
     /// Retry classification: transient transport/5xx faults resume, terminal ones
