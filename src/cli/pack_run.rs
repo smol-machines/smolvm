@@ -10,9 +10,9 @@
 
 use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_env_spec};
 use clap::{Args, Parser, Subcommand};
-use smolvm::agent::launcher_dynamic::{
-    launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
-};
+use smolvm::agent::launcher_dynamic::PackedMount;
+#[cfg(target_os = "linux")]
+use smolvm::agent::launcher_dynamic::{launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig};
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMappingSpec;
 use smolvm::data::resources::BlockIoEngine;
@@ -95,7 +95,7 @@ fn agent_ready_timeout() -> Duration {
 /// own log, level from `SMOLVM_KRUN_LOG_LEVEL`) is captured there instead of
 /// discarded — the only way to see a libkrun-level boot failure in a packed run,
 /// since the guest's virtio-console goes to a separate file.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn detach_vm_child_stdio() {
     match std::env::var("SMOLVM_PACKED_KRUN_STDERR_LOG").ok() {
         Some(p) if !p.trim().is_empty() => {
@@ -108,9 +108,78 @@ fn detach_vm_child_stdio() {
     }
 }
 
-#[cfg(not(unix))]
-fn detach_vm_child_stdio() {
-    smolvm::process::detach_stdio();
+/// Boot a packed VM in a fresh `_boot-vm` process rather than a forked child.
+///
+/// macOS Hypervisor.framework crashes a child forked from a process that
+/// already has threads, and a pack run that pulled from a registry has
+/// Security.framework's (#1819). Windows has no fork. `watch_parent` ends the
+/// VM with this process, as a foreground run's forked child does (#1193).
+/// `SMOLVM_PACKED_KRUN_STDERR_LOG` still captures libkrun's log.
+#[cfg(not(target_os = "linux"))]
+fn spawn_packed_boot_vm(
+    boot_config: &smolvm::agent::boot_config::BootConfig,
+    config_path: &Path,
+    lib_dir: &Path,
+    watch_parent: bool,
+    debug: bool,
+) -> smolvm::Result<smolvm::process::Pid> {
+    let config_json = serde_json::to_vec(boot_config)
+        .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
+    std::fs::write(config_path, &config_json)
+        .map_err(|e| Error::agent("write boot config", e.to_string()))?;
+
+    let exe = smolvm::process::self_exe_for_spawn()
+        .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+        // The boot subprocess loads libkrun/libkrunfw from here.
+        .env("SMOLVM_LIB_DIR", lib_dir)
+        .env(
+            "SMOLVM_BOOT_WATCH_PARENT",
+            if watch_parent { "1" } else { "0" },
+        )
+        // Per-VM readiness marker name so the agent writes its own marker.
+        .env(
+            smolvm_protocol::guest_env::READY_MARKER,
+            smolvm_protocol::AGENT_READY_MARKER,
+        )
+        .stdin(std::process::Stdio::null());
+    let krun_log = std::env::var("SMOLVM_PACKED_KRUN_STDERR_LOG")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .and_then(|path| std::fs::File::create(path.trim()).ok());
+    if debug {
+        cmd.stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+    } else {
+        cmd.stdout(std::process::Stdio::null());
+        match krun_log {
+            Some(file) => cmd.stderr(file),
+            None => cmd.stderr(std::process::Stdio::null()),
+        };
+    }
+    // Its own process group, so a Ctrl-C meant for the CLI isn't also sent to
+    // the VM, as the forked child's setsid() ensures on Linux.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    // Detach from the launching console, mirroring the `_boot-vm` spawn in
+    // `src/agent/manager.rs`.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
+    // `Pid` is `i32` on Windows while `Child::id` returns `u32`; the downstream
+    // liveness/start-time/kill helpers take `Pid`.
+    Ok(child.id() as smolvm::process::Pid)
 }
 
 /// Resolve the lib directory containing libkrun/libkrunfw.
@@ -647,14 +716,19 @@ impl PackRunCmd {
 
         let console_log_path = runtime_dir.path().join("console.log");
 
-        // Watched from the parent, which owns the run: a forked child can't use
-        // the macOS watcher (#1192).
-        #[cfg(unix)]
+        // Linux forks the VM child. macOS boots it in a fresh `_boot-vm` process
+        // instead: Hypervisor.framework crashes a child forked from a process
+        // that already has threads, and a registry pull leaves this one with
+        // Security.framework's (#1819). Windows has no fork.
+        //
+        // Watched from the parent, which owns the run (#1192); `_boot-vm`
+        // watches its own mounts.
+        #[cfg(target_os = "linux")]
         let watched_mounts = watched_packed_mounts(&packed_mounts);
         // The CLI as the forked VM child will see its parent (#1193).
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let cli_pid = std::process::id() as smolvm::process::Pid;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let child_pid = {
             let vsock_path_clone = vsock_path.clone();
             let cuda_sock_clone = cuda_sock.clone();
@@ -710,11 +784,11 @@ impl PackRunCmd {
             })
             .map_err(|e| Error::agent("fork VM process", e.to_string()))?
         };
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let _fsnotify_watcher =
             smolvm::agent::FsNotifyWatcher::start_tagged(vsock_path.clone(), watched_mounts);
 
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         let child_pid = {
             // These bindings are consumed by the Unix fork closure above; on
             // Windows the BootConfig carries the same data, so silence the
@@ -763,50 +837,13 @@ impl PackRunCmd {
                 mediated_parent_id: [0; 16],
             };
 
-            let config_path = runtime_dir.path().join("boot-config.json");
-            let config_json = serde_json::to_vec(&boot_config)
-                .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
-            std::fs::write(&config_path, &config_json)
-                .map_err(|e| Error::agent("write boot config", e.to_string()))?;
-
-            let exe = smolvm::process::self_exe_for_spawn()
-                .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.args(["_boot-vm", &config_path.to_string_lossy()])
-                // The boot subprocess loads libkrun/libkrunfw from here.
-                .env("SMOLVM_LIB_DIR", &lib_dir)
-                // The CLI detaches the VM; don't arm the parent-death watchdog.
-                .env("SMOLVM_BOOT_WATCH_PARENT", "0")
-                // Per-VM readiness marker name so the agent writes its own marker.
-                .env(
-                    smolvm_protocol::guest_env::READY_MARKER,
-                    smolvm_protocol::AGENT_READY_MARKER,
-                );
-            if self.debug {
-                cmd.stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit());
-            } else {
-                cmd.stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-            }
-            // Detach from the launching console and give the VM its own process
-            // group so a Ctrl-C in the launcher isn't forwarded — mirrors the
-            // `_boot-vm` spawn in `src/agent/manager.rs`.
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                const DETACHED_PROCESS: u32 = 0x0000_0008;
-                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-                cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-            }
-            let child = cmd
-                .spawn()
-                .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
-            // `Pid` is `i32` on Windows while `Child::id` returns `u32`; the
-            // downstream liveness/start-time/kill helpers take `Pid`.
-            child.id() as smolvm::process::Pid
+            spawn_packed_boot_vm(
+                &boot_config,
+                &runtime_dir.path().join("boot-config.json"),
+                &lib_dir,
+                true,
+                self.debug,
+            )?
         };
 
         // Capture the child's start time so we can verify PID identity
@@ -893,7 +930,7 @@ impl PackRunCmd {
 
 /// The `(host path, virtiofs tag)` of every live-coherent mount, for the
 /// host-to-guest change watcher. Staged mounts have no live coherence.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn watched_packed_mounts(mounts: &[PackedMount]) -> Vec<(PathBuf, String)> {
     mounts
         .iter()
@@ -1897,13 +1934,14 @@ fn run_from_cache(
 
     let console_log_path = runtime_dir.path().join("console.log");
     let vsock_path_clone = vsock_path.clone();
-    // As in a packed `run`: the parent watches mounts (#1192) and the child
-    // ends with the CLI (#1193).
-    #[cfg(unix)]
+    // As in a packed `run`: Linux forks, macOS and Windows boot in `_boot-vm`
+    // (#1819), the parent watches mounts (#1192) and the VM ends with the CLI
+    // (#1193).
+    #[cfg(target_os = "linux")]
     let watched_mounts = watched_packed_mounts(&packed_mounts);
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let cli_pid = std::process::id() as smolvm::process::Pid;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let child_pid = smolvm::process::fork_session_leader(move || {
         smolvm::process::exit_when_parent_is_not(cli_pid);
 
@@ -1946,14 +1984,14 @@ fn run_from_cache(
         smolvm::process::exit_child(1);
     })
     .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let _fsnotify_watcher =
         smolvm::agent::FsNotifyWatcher::start_tagged(vsock_path.clone(), watched_mounts);
 
-    // Windows has no fork(): re-spawn this executable as `_boot-vm <config>`,
-    // mirroring the non-packed launcher and the `--sidecar` path. BootConfig
-    // carries the same packed launch data (rootfs/disks/layers/ports).
-    #[cfg(not(unix))]
+    // Re-spawn this executable as `_boot-vm <config>`, mirroring the non-packed
+    // launcher and the `--sidecar` path. BootConfig carries the same packed
+    // launch data (rootfs/disks/layers/ports).
+    #[cfg(not(target_os = "linux"))]
     let child_pid = {
         let _ = (&packed_mounts, &port_mappings, &vsock_path_clone);
         let overlay_disk_path = overlay_runtime_path
@@ -1989,41 +2027,13 @@ fn run_from_cache(
             mediated_egress: false,
             mediated_parent_id: [0; 16],
         };
-        let config_path = runtime_dir.path().join("boot-config.json");
-        let config_json = serde_json::to_vec(&boot_config)
-            .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
-        std::fs::write(&config_path, &config_json)
-            .map_err(|e| Error::agent("write boot config", e.to_string()))?;
-        let exe = smolvm::process::self_exe_for_spawn()
-            .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["_boot-vm", &config_path.to_string_lossy()])
-            .env("SMOLVM_LIB_DIR", &lib_dir)
-            .env("SMOLVM_BOOT_WATCH_PARENT", "0")
-            .env(
-                smolvm_protocol::guest_env::READY_MARKER,
-                smolvm_protocol::AGENT_READY_MARKER,
-            );
-        if debug {
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit());
-        } else {
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
-        child.id() as smolvm::process::Pid
+        spawn_packed_boot_vm(
+            &boot_config,
+            &runtime_dir.path().join("boot-config.json"),
+            &lib_dir,
+            true,
+            debug,
+        )?
     };
 
     let child_start_time = {
@@ -2377,6 +2387,52 @@ fn daemon_start(
 
     let console_log_path = daemon.join("console.log");
     let vsock_path_clone = vsock_path.clone();
+    // Linux forks; macOS and Windows boot in `_boot-vm`, which watches the
+    // daemon's mounts itself (#1819).
+    #[cfg(not(target_os = "linux"))]
+    let child_pid = {
+        let _ = (&packed_mounts, &port_mappings, &vsock_path_clone);
+        let boot_config = smolvm::agent::boot_config::BootConfig {
+            rootfs_path: rootfs_path.clone(),
+            storage_disk_path: storage_path.clone(),
+            overlay_disk_path: overlay_daemon_path
+                .clone()
+                .unwrap_or_else(|| daemon.join("overlay.raw")),
+            vsock_socket: vsock_path.clone(),
+            console_log: Some(console_log_path.clone()),
+            startup_error_log: daemon.join("startup-error.log"),
+            storage_size_gb: storage_gib.unwrap_or(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB),
+            overlay_size_gb: args
+                .overlay
+                .unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
+            mounts: mounts.clone(),
+            ports: ports.clone(),
+            resources: resources.clone(),
+            ssh_agent_socket: ssh_agent_socket.clone(),
+            cuda: false,
+            expose_docker: false,
+            published_sockets: Vec::new(),
+            dns_filter_hosts: None,
+            packed_layers_dir: Some(layers_dir.to_path_buf()),
+            packed_layers_dax_window: smolvm::agent::legacy_packed_layers_dax_window(),
+            pack_idmap_source: None,
+            extra_disks: vec![],
+            pod_netns: None,
+            workload_log: None,
+            credentials: None,
+            external_interceptor: None,
+            mediated_egress: false,
+            mediated_parent_id: [0; 16],
+        };
+        spawn_packed_boot_vm(
+            &boot_config,
+            &daemon.join("boot-config.json"),
+            &lib_dir,
+            false,
+            debug,
+        )?
+    };
+    #[cfg(target_os = "linux")]
     let child_pid = smolvm::process::fork_session_leader(move || {
         let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
             Ok(k) => k,
