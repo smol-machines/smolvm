@@ -3533,9 +3533,10 @@ pub fn extract_verified_checkpoint_sidecar(
     extract_checkpoint_sidecar_checked(sidecar_path, dest, footer, skip, required, false)
 }
 
-/// [`extract_verified_checkpoint_sidecar`] for a caller reading through a
-/// private hard link of a checkpoint whose other names may be removed meanwhile:
-/// a link count that changed is not a change to the checkpoint. Its bytes, size,
+/// [`extract_verified_checkpoint_sidecar`] for a checkpoint that may gain or
+/// lose names meanwhile: a resume reads its pause while an export links it, and
+/// an export reads its link while the resume removes the original. Each moves
+/// the change time without changing the checkpoint, so only its bytes, size,
 /// modification time and inode must still be what they were.
 pub fn extract_linked_checkpoint_sidecar(
     sidecar_path: &Path,
@@ -3670,13 +3671,14 @@ fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool
         && before.ctime_nsec() == after.ctime_nsec()
 }
 
-/// The same checkpoint whose link count changed: adding or removing a name
-/// moves its change time, and nothing else may differ.
+/// The same checkpoint after its names changed: adding or removing one moves
+/// its change time even when the count ends where it began (an export links
+/// it and drops the link), and nothing about its contents may differ. Only
+/// root writes a checkpoint's metadata, and the checksum covers every byte.
 #[cfg(unix)]
 fn same_checkpoint_across_links(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    before.nlink() != after.nlink()
-        && before.dev() == after.dev()
+    before.dev() == after.dev()
         && before.ino() == after.ino()
         && before.len() == after.len()
         && before.mtime() == after.mtime()
@@ -3697,12 +3699,12 @@ fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool
 mod resume_extract_tests {
     use super::*;
 
-    /// Removing another name of a checkpoint moves its change time; that alone
-    /// is accepted across links, while a permission or content change is not.
+    /// Adding or removing another name of a checkpoint moves its change time;
+    /// that is accepted across links, while a content change is not.
     #[cfg(unix)]
     #[test]
     fn only_a_link_count_change_is_tolerated_across_links() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::MetadataExt;
         let temp = tempfile::tempdir().unwrap();
         let original = temp.path().join("pause.smolcheckpoint");
         fs::write(&original, b"saved").unwrap();
@@ -3719,13 +3721,15 @@ mod resume_extract_tests {
         );
         assert!(same_checkpoint_across_links(&before, &unlinked));
 
+        // A link added and dropped again leaves the count where it began.
         let before = unlinked;
         std::thread::sleep(std::time::Duration::from_millis(20));
-        fs::set_permissions(&linked, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(!same_checkpoint_across_links(
-            &before,
-            &fs::metadata(&linked).unwrap()
-        ));
+        fs::hard_link(&linked, &original).unwrap();
+        fs::remove_file(&original).unwrap();
+        let relinked = fs::metadata(&linked).unwrap();
+        assert_eq!(before.nlink(), relinked.nlink());
+        assert!(!same_checkpoint_identity(&before, &relinked));
+        assert!(same_checkpoint_across_links(&before, &relinked));
 
         let before = fs::metadata(&linked).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3735,6 +3739,100 @@ mod resume_extract_tests {
             &before,
             &fs::metadata(&linked).unwrap()
         ));
+    }
+
+    /// A checkpoint sidecar holding `checkpoint/memory.bin` = `memory`.
+    fn sidecar_with_memory(artifact: &Path, memory: &[u8]) -> PackFooter {
+        let encoder = zstd::stream::Encoder::new(File::create(artifact).unwrap(), 1).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(memory.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, "checkpoint/memory.bin", memory)
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        let assets_size = fs::metadata(artifact).unwrap().len();
+        let manifest = b"{}";
+        File::options()
+            .append(true)
+            .open(artifact)
+            .unwrap()
+            .write_all(manifest)
+            .unwrap();
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size,
+            manifest_offset: assets_size,
+            manifest_size: manifest.len() as u64,
+            checksum: crate::assets::crc32_file_range(
+                artifact,
+                0,
+                assets_size + manifest.len() as u64,
+            )
+            .unwrap(),
+        };
+        File::options()
+            .append(true)
+            .open(artifact)
+            .unwrap()
+            .write_all(&footer.to_bytes())
+            .unwrap();
+        footer
+    }
+
+    /// A resume extracts its pause while an off-host export links and unlinks
+    /// the same file: the strict check reads that as a change (the 500 a
+    /// resume right after a pause hit in production), the link-aware one
+    /// verifies the same bytes and accepts it.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_extracts_its_pause_while_an_export_links_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("pause.smolcheckpoint");
+        let mut memory = vec![0_u8; 32 << 20];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for chunk in memory.chunks_mut(8) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            chunk.copy_from_slice(&seed.to_le_bytes()[..chunk.len()]);
+        }
+        let footer = sidecar_with_memory(&artifact, &memory);
+        let extract = |linked: bool, dest: &Path| {
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            let exporter = {
+                let (done, artifact) = (done.clone(), artifact.clone());
+                let link = temp.path().join("export.smolcheckpoint");
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        fs::hard_link(&artifact, &link).unwrap();
+                        fs::remove_file(&link).unwrap();
+                    }
+                })
+            };
+            let required = ["checkpoint/memory.bin".into()];
+            let result = if linked {
+                extract_linked_checkpoint_sidecar(&artifact, dest, &footer, &[], &required)
+            } else {
+                extract_verified_checkpoint_sidecar(&artifact, dest, &footer, &[], &required)
+            };
+            done.store(true, Ordering::Relaxed);
+            exporter.join().unwrap();
+            result
+        };
+        let strict = extract(false, &temp.path().join("strict")).unwrap_err();
+        assert!(
+            strict.to_string().contains("changed during extraction"),
+            "{strict}"
+        );
+        let resumed = temp.path().join("resumed");
+        extract(true, &resumed).unwrap();
+        assert_eq!(
+            fs::read(resumed.join("checkpoint/memory.bin")).unwrap(),
+            memory
+        );
     }
 
     #[test]

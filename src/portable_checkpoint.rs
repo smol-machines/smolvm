@@ -6197,7 +6197,8 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
             .prefix("resume-")
             .tempdir_in(parent)?;
         let extract_started = std::time::Instant::now();
-        smolvm_pack::extract::extract_verified_checkpoint_sidecar(
+        // An off-host export may be linking this artifact meanwhile.
+        smolvm_pack::extract::extract_linked_checkpoint_sidecar(
             artifact,
             staged.path(),
             &footer,
