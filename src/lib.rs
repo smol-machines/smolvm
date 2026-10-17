@@ -73,6 +73,13 @@ pub mod credentials;
 // so the module (and its callers in cuda_host) are unix-only.
 pub mod checkpoint_delta;
 pub mod checkpoint_store;
+/// The engine's command-line commands, usable by other front ends (the `smol` CLI
+/// flattens them so every engine flag is available without a second implementation).
+#[allow(missing_docs)]
+pub mod cli;
+// The CLI modules name this crate as a dependency would, so they compile
+// unchanged inside it.
+extern crate self as smolvm;
 #[cfg(unix)]
 pub mod cuda_daemon;
 pub mod cuda_host;

@@ -3,7 +3,7 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-mod cli;
+use smolvm::cli;
 
 /// smolvm - build and run portable, self-contained virtual machines
 #[derive(Parser, Debug)]
