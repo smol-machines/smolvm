@@ -5550,13 +5550,20 @@ pub async fn paused_checkpoint(
         })?;
         crate::portable_checkpoint::verified_sidecar_footer(&path)?;
         // A download leaves the host, so it carries the layers a pause pinned.
-        crate::portable_checkpoint::exportable_paused_artifact(
-            &crate::agent::vm_data_dir(&name),
-            &path,
-        )
+        // Only linking its inputs needs the locks: building it can take as long
+        // as the pause did, and a resume waiting on them waited that long too.
+        crate::portable_checkpoint::prepare_paused_export(&crate::agent::vm_data_dir(&name), &path)
     })
     .await?
     .map_err(ApiError::from)?;
+    let file = match file {
+        crate::portable_checkpoint::PausedExport::Ready(file) => file,
+        crate::portable_checkpoint::PausedExport::Build(build) => {
+            tokio::task::spawn_blocking(move || build.build())
+                .await?
+                .map_err(ApiError::from)?
+        }
+    };
     // The open descriptor survives deletion of the machine or a concurrent
     // resume; downloading never takes ownership of its recovery artifact.
     if let Some(urls) = upload_urls {

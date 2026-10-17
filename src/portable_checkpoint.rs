@@ -4444,53 +4444,103 @@ fn paused_layers(vm_data: &Path, artifact: &Path) -> Result<Vec<PinnedLayer>> {
 }
 
 /// A paused machine's saved execution as a self-contained artifact, for use
-/// on another host: the artifact itself when its pause pinned nothing, or else
-/// a new one with the pinned layers packed back in, open and already unlinked.
-/// Building it costs what packing those layers at pause would have, paid only
-/// by a pause that leaves the host.
-pub(crate) fn exportable_paused_artifact(vm_data: &Path, artifact: &Path) -> Result<std::fs::File> {
-    let pinned = paused_layers(vm_data, artifact)?;
-    if pinned.is_empty() {
-        return Ok(std::fs::File::open(artifact)?);
+/// on another host: the artifact itself when its pause pinned nothing, or the
+/// inputs to build one with the pinned layers packed back in. Building costs
+/// what packing those layers at pause would have, paid only by a pause that
+/// leaves the host.
+pub(crate) enum PausedExport {
+    Ready(std::fs::File),
+    Build(PausedExportBuild),
+}
+
+/// A complete artifact's inputs, linked where nothing else touches them: the
+/// pause artifact and its pinned layers. Building from these needs none of the
+/// machine's locks, so a resume does not wait out the extract and repack.
+pub(crate) struct PausedExportBuild {
+    work: tempfile::TempDir,
+    artifact: PathBuf,
+    pins: PathBuf,
+    layers: Vec<PinnedLayer>,
+}
+
+/// Take what an off-host export of a paused machine needs while the caller
+/// holds the machine's saved-execution lock: hard links to the artifact and
+/// each pinned layer, checked against what the pause recorded. A resume or
+/// delete may then remove the originals; the links keep the same bytes, and
+/// the layers are another machine's, which nothing writes.
+pub(crate) fn prepare_paused_export(vm_data: &Path, artifact: &Path) -> Result<PausedExport> {
+    let layers = paused_layers(vm_data, artifact)?;
+    if layers.is_empty() {
+        return Ok(PausedExport::Ready(std::fs::File::open(artifact)?));
     }
-    let footer = ensure_checkpoint_layout(artifact)?;
-    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
-        .map_err(|error| Error::agent("read paused checkpoint", error.to_string()))?;
-    // Beside the pins, so raw layers link instead of copying.
+    // Beside the pins, so they and the raw layers link instead of copying.
     let work = tempfile::Builder::new()
         .prefix(".export-")
         .tempdir_in(vm_data)?;
-    let staging = work.path().join("assets");
-    smolvm_pack::extract::extract_verified_checkpoint_sidecar(
-        artifact,
-        &staging,
-        &footer,
-        &[],
-        &[],
-    )
-    .map_err(|error| Error::agent("extract paused checkpoint", error.to_string()))?;
-    for layer in &pinned {
-        install_pinned_layer(vm_data, layer, &staging)?;
+    let linked = work.path().join("paused.smolcheckpoint");
+    std::fs::hard_link(artifact, &linked)
+        .map_err(|error| Error::agent("link paused checkpoint", error.to_string()))?;
+    let pins = work.path().join("pins");
+    std::fs::create_dir(&pins)?;
+    let source = paused_layers_dir(vm_data)?;
+    for layer in &layers {
+        let pin = source.join(&layer.pin);
+        check_pinned_layer(&pin, layer)?;
+        std::fs::hard_link(&pin, pins.join(&layer.pin))
+            .map_err(|error| Error::agent("link pinned layer", error.to_string()))?;
     }
-    let output = work.path().join("complete.smolcheckpoint");
-    let collector = AssetCollector::new(staging)
-        .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
-    Packer::new(manifest)
-        .with_asset_collector(collector)
-        .with_direct_artifact_io()
-        .pack_artifact(&output)
-        .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
-    // The open file outlives the work directory.
-    Ok(std::fs::File::open(&output)?)
+    Ok(PausedExport::Build(PausedExportBuild {
+        work,
+        artifact: linked,
+        pins,
+        layers,
+    }))
+}
+
+impl PausedExportBuild {
+    /// Build the complete artifact, open and already unlinked.
+    pub(crate) fn build(self) -> Result<std::fs::File> {
+        let footer = ensure_checkpoint_layout(&self.artifact)?;
+        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(&self.artifact)
+            .map_err(|error| Error::agent("read paused checkpoint", error.to_string()))?;
+        let staging = self.work.path().join("assets");
+        smolvm_pack::extract::extract_verified_checkpoint_sidecar(
+            &self.artifact,
+            &staging,
+            &footer,
+            &[],
+            &[],
+        )
+        .map_err(|error| Error::agent("extract paused checkpoint", error.to_string()))?;
+        for layer in &self.layers {
+            install_pinned_layer_from(&self.pins, layer, &staging)?;
+        }
+        let output = self.work.path().join("complete.smolcheckpoint");
+        let collector = AssetCollector::new(staging)
+            .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
+        Packer::new(manifest)
+            .with_asset_collector(collector)
+            .with_direct_artifact_io()
+            .pack_artifact(&output)
+            .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+        // The open file outlives the work directory.
+        Ok(std::fs::File::open(&output)?)
+    }
 }
 
 /// Put a pinned layer where extraction would have: at its archive path under
 /// `extracted`, with its backing filename rewritten as packing would have.
 #[cfg(unix)]
 fn install_pinned_layer(vm_data: &Path, layer: &PinnedLayer, extracted: &Path) -> Result<()> {
+    install_pinned_layer_from(&paused_layers_dir(vm_data)?, layer, extracted)
+}
+
+/// Fail unless `pin` is the file the pause recorded for `layer`. A hard link
+/// is the same file, so a linked copy of a pin passes too.
+#[cfg(unix)]
+fn check_pinned_layer(pin: &Path, layer: &PinnedLayer) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let pin = paused_layers_dir(vm_data)?.join(&layer.pin);
-    let metadata = std::fs::symlink_metadata(&pin)
+    let metadata = std::fs::symlink_metadata(pin)
         .map_err(|error| Error::agent("install pinned layer", error.to_string()))?;
     if !metadata.is_file()
         || (metadata.dev(), metadata.ino(), metadata.len()) != (layer.dev, layer.ino, layer.size)
@@ -4500,6 +4550,14 @@ fn install_pinned_layer(vm_data: &Path, layer: &PinnedLayer, extracted: &Path) -
             format!("{} is not the layer that was pinned", pin.display()),
         ));
     }
+    Ok(())
+}
+
+/// [`install_pinned_layer`] from the pins in `pins`.
+#[cfg(unix)]
+fn install_pinned_layer_from(pins: &Path, layer: &PinnedLayer, extracted: &Path) -> Result<()> {
+    let pin = pins.join(&layer.pin);
+    check_pinned_layer(&pin, layer)?;
     let destination = extracted.join(&layer.archive_path);
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
@@ -4521,6 +4579,22 @@ fn install_pinned_layer(vm_data: &Path, layer: &PinnedLayer, extracted: &Path) -
 
 #[cfg(not(unix))]
 fn install_pinned_layer(_vm_data: &Path, _layer: &PinnedLayer, _extracted: &Path) -> Result<()> {
+    Err(Error::agent(
+        "install pinned layer",
+        "pinned layers are Unix-only",
+    ))
+}
+
+#[cfg(not(unix))]
+fn check_pinned_layer(_pin: &Path, _layer: &PinnedLayer) -> Result<()> {
+    Err(Error::agent(
+        "install pinned layer",
+        "pinned layers are Unix-only",
+    ))
+}
+
+#[cfg(not(unix))]
+fn install_pinned_layer_from(_pins: &Path, _layer: &PinnedLayer, _extracted: &Path) -> Result<()> {
     Err(Error::agent(
         "install pinned layer",
         "pinned layers are Unix-only",
@@ -7706,6 +7780,97 @@ mod tests {
 
         remove_paused_layers(&fork).unwrap();
         assert!(!paused_layers_dir(&fork).unwrap().exists());
+    }
+
+    /// An off-host export links its inputs while the machine is locked and
+    /// builds from the links after: a resume that then deletes the pause
+    /// artifact and drops the pins leaves the export everything it needs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_paused_export_keeps_its_inputs_when_a_resume_removes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        let live = restored_disk_chain(&golden);
+        let fork = dir.path().join("fork");
+        std::fs::create_dir(&fork).unwrap();
+        std::fs::write(fork.join(crate::storage::OVERLAY_DISK_FILENAME), b"overlay").unwrap();
+        create_qcow2(
+            &fork.join("storage.qcow2"),
+            golden.join("storage.qcow2").to_str().unwrap(),
+            "qcow2",
+        );
+        let checkpoint = dir.path().join("staging/checkpoint");
+        let mut pins = LayerPins::new(&fork).unwrap();
+        let (disks, _) = stage_disk_chains(&fork, &checkpoint, Some(&mut pins)).unwrap();
+        let artifact = fork.join("pause-1.smolcheckpoint");
+        std::fs::write(&artifact, b"saved execution").unwrap();
+        pins.commit(&artifact).unwrap();
+
+        let PausedExport::Build(build) = prepare_paused_export(&fork, &artifact).unwrap() else {
+            panic!("a pause with pinned layers needs a build");
+        };
+        // What a resume does once the locks are free.
+        std::fs::remove_file(&artifact).unwrap();
+        remove_paused_layers(&fork).unwrap();
+        std::fs::remove_dir_all(&golden).unwrap();
+
+        assert_eq!(std::fs::read(&build.artifact).unwrap(), b"saved execution");
+        let extracted = dir.path().join("extracted");
+        for layer in &build.layers {
+            install_pinned_layer_from(&build.pins, layer, &extracted).unwrap();
+        }
+        let installed = extracted.join("checkpoint/disks/storage/2");
+        let expected = dir.path().join("expected");
+        std::fs::write(&expected, &live).unwrap();
+        rewrite_qcow2_backing(&expected, &disks[0].files[3].target).unwrap();
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            std::fs::read(&expected).unwrap()
+        );
+    }
+
+    /// A pin that is no longer the recorded layer is refused before anything
+    /// is linked, and a pause that pinned nothing exports as it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_paused_export_refuses_a_replaced_pin_and_passes_an_unpinned_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        restored_disk_chain(&golden);
+        let fork = dir.path().join("fork");
+        std::fs::create_dir(&fork).unwrap();
+        std::fs::write(fork.join(crate::storage::OVERLAY_DISK_FILENAME), b"overlay").unwrap();
+        create_qcow2(
+            &fork.join("storage.qcow2"),
+            golden.join("storage.qcow2").to_str().unwrap(),
+            "qcow2",
+        );
+        let mut pins = LayerPins::new(&fork).unwrap();
+        stage_disk_chains(
+            &fork,
+            &dir.path().join("staging/checkpoint"),
+            Some(&mut pins),
+        )
+        .unwrap();
+        let artifact = fork.join("pause-1.smolcheckpoint");
+        std::fs::write(&artifact, b"saved execution").unwrap();
+        pins.commit(&artifact).unwrap();
+        let layers = paused_layers(&fork, &artifact).unwrap();
+        let pin = paused_layers_dir(&fork).unwrap().join(&layers[0].pin);
+        std::fs::remove_file(&pin).unwrap();
+        std::fs::write(&pin, b"other").unwrap();
+        assert!(prepare_paused_export(&fork, &artifact).is_err());
+
+        let unpinned = dir.path().join("unpinned");
+        std::fs::create_dir(&unpinned).unwrap();
+        let own = unpinned.join("pause-1.smolcheckpoint");
+        std::fs::write(&own, b"whole").unwrap();
+        let PausedExport::Ready(mut file) = prepare_paused_export(&unpinned, &own).unwrap() else {
+            panic!("a pause that pinned nothing is already complete");
+        };
+        let mut read = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut read).unwrap();
+        assert_eq!(read, b"whole");
     }
 
     #[cfg(unix)]
