@@ -59,6 +59,10 @@ const PAUSED_DISKS_SUFFIX: &str = ".paused-disks";
 /// Suffix of the directory beside a paused machine's data directory that pins
 /// the backing layers its pause artifact references instead of carrying.
 const PAUSED_LAYERS_SUFFIX: &str = ".paused-layers";
+
+/// Marks the directory an off-host export of a paused machine builds in,
+/// beside its data directory: `.<data dir>.export-<random>`.
+const PAUSED_EXPORT_INFIX: &str = ".export-";
 /// The pinned layers' index inside that directory.
 const PAUSED_LAYERS_INDEX: &str = "layers";
 /// Service-owned tmpfs directory where a resume stages its checkpoint, so the
@@ -4276,6 +4280,14 @@ pub(crate) fn paused_layers_owner(path: &Path) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+/// The data directory name a paused export's work directory belongs to, or
+/// `None` when `path` is not one.
+pub(crate) fn paused_export_owner(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?.strip_prefix('.')?;
+    let (owner, _) = name.split_once(PAUSED_EXPORT_INFIX)?;
+    (!owner.is_empty()).then_some(owner)
+}
+
 /// Drop a machine's pinned layers. A layer stays on disk while its owner or
 /// any other pin still links it.
 pub(crate) fn remove_paused_layers(vm_data: &Path) -> Result<()> {
@@ -4473,10 +4485,22 @@ pub(crate) fn prepare_paused_export(vm_data: &Path, artifact: &Path) -> Result<P
     if layers.is_empty() {
         return Ok(PausedExport::Ready(std::fs::File::open(artifact)?));
     }
-    // Beside the pins, so they and the raw layers link instead of copying.
+    // Beside the data directory, like the pins, so the links are on their
+    // filesystem and outside the tree a launch hands to the machine's own uid:
+    // a resume can launch while this builds, and its chown would otherwise
+    // give the machine the golden's pinned layers through these links.
+    let (Some(parent), Some(owner)) = (vm_data.parent(), vm_data.file_name()) else {
+        return Err(Error::agent(
+            "export paused checkpoint",
+            format!("{} has no parent", vm_data.display()),
+        ));
+    };
     let work = tempfile::Builder::new()
-        .prefix(".export-")
-        .tempdir_in(vm_data)?;
+        .prefix(&format!(
+            ".{}{PAUSED_EXPORT_INFIX}",
+            owner.to_string_lossy()
+        ))
+        .tempdir_in(parent)?;
     let linked = work.path().join("paused.smolcheckpoint");
     std::fs::hard_link(artifact, &linked)
         .map_err(|error| Error::agent("link paused checkpoint", error.to_string()))?;
@@ -7828,6 +7852,78 @@ mod tests {
             std::fs::read(&installed).unwrap(),
             std::fs::read(&expected).unwrap()
         );
+    }
+
+    /// What an export links is out of reach of the machine's own data
+    /// directory, which every launch chowns to the machine's uid: a resume that
+    /// launches while the export builds must not take over the golden's layers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_paused_export_links_nothing_inside_the_machines_data_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        restored_disk_chain(&golden);
+        let fork = dir.path().join("fork");
+        std::fs::create_dir(&fork).unwrap();
+        std::fs::write(fork.join(crate::storage::OVERLAY_DISK_FILENAME), b"overlay").unwrap();
+        create_qcow2(
+            &fork.join("storage.qcow2"),
+            golden.join("storage.qcow2").to_str().unwrap(),
+            "qcow2",
+        );
+        let mut pins = LayerPins::new(&fork).unwrap();
+        let (_, _deferred) = stage_disk_chains(
+            &fork,
+            &dir.path().join("staging/checkpoint"),
+            Some(&mut pins),
+        )
+        .unwrap();
+        let artifact = fork.join("pause-1.smolcheckpoint");
+        std::fs::write(&artifact, b"saved execution").unwrap();
+        pins.commit(&artifact).unwrap();
+
+        let PausedExport::Build(build) = prepare_paused_export(&fork, &artifact).unwrap() else {
+            panic!("a pause with pinned layers needs a build");
+        };
+        assert!(!build.work.path().starts_with(&fork));
+        assert_eq!(paused_export_owner(build.work.path()), Some("fork"));
+        let mut linked: Vec<(u64, u64)> = std::fs::read_dir(&build.pins)
+            .unwrap()
+            .map(|entry| {
+                let meta = entry.unwrap().metadata().unwrap();
+                (meta.dev(), meta.ino())
+            })
+            .collect();
+        assert!(!linked.is_empty());
+        let meta = std::fs::metadata(&build.artifact).unwrap();
+        linked.push((meta.dev(), meta.ino()));
+        fn walk(dir: &Path, found: &mut Vec<(u64, u64, PathBuf)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    walk(&entry.path(), found);
+                } else {
+                    found.push((meta.dev(), meta.ino(), entry.path()));
+                }
+            }
+        }
+        let mut inside = Vec::new();
+        walk(&fork, &mut inside);
+        let artifact_inode = (meta.dev(), meta.ino());
+        for (dev, ino, path) in inside {
+            // The pause artifact itself is the machine's; only its new names
+            // and the golden's layers must stay out.
+            if (dev, ino) == artifact_inode && path == artifact {
+                continue;
+            }
+            assert!(
+                !linked.contains(&(dev, ino)),
+                "{} is linked by the export",
+                path.display()
+            );
+        }
     }
 
     /// A pin that is no longer the recorded layer is refused before anything

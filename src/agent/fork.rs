@@ -280,6 +280,21 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
             }
             continue;
         }
+        // An export's work directory lives only while the export builds, which
+        // takes minutes: one whose machine is gone, or a day old, was left by
+        // an export that never finished.
+        if let Some(dir) = crate::portable_checkpoint::paused_export_owner(&path) {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(24 * 60 * 60));
+            if stale || !vms_dir.join(dir).is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            continue;
+        }
         let Some(source) = fork_source_lock_owner(&path) else {
             continue;
         };
@@ -4253,6 +4268,25 @@ mod tests {
     }
 
     use super::*;
+
+    /// An export work directory left beside a machine that no longer exists is
+    /// swept; one beside a machine that still exists is left to its export.
+    #[test]
+    fn a_left_export_directory_is_swept_once_its_machine_is_gone() {
+        let vms = tempfile::tempdir().unwrap();
+        std::fs::create_dir(vms.path().join("live")).unwrap();
+        let live = vms.path().join(".live.export-abc123");
+        let gone = vms.path().join(".gone.export-def456");
+        for dir in [&live, &gone] {
+            std::fs::create_dir_all(dir.join("pins")).unwrap();
+        }
+        prune_orphaned_fork_source_locks_in(vms.path());
+        assert!(
+            live.exists(),
+            "an export of a live machine is still building"
+        );
+        assert!(!gone.exists());
+    }
 
     #[test]
     fn a_branch_keeps_staged_mounts_but_not_their_host_binding() {
