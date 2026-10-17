@@ -43,6 +43,9 @@ before attempting source deletion.
 
 Writes are staged on the VM until a successful flush or fsync uploads them.
 S3 cannot recover writes lost with the VM before they reach that boundary.
-A separate reader can fail to read a newly staged file before its writer is
-flushed, including with the metadata cache disabled; flush or close the writer
-before reopening the file through another handle.
+Handles on the same file share local staged bytes: a separate reader can see
+pending writes without waiting for an upload, and closing one writer does not
+discard another writer's staging state. This visibility is local to this
+mount, not a durability guarantee or cross-machine cache coherence. Failed
+uploads return an error and retain the staged bytes for retry while the mount
+remains alive; failed downloads are not treated as empty file contents.

@@ -79,6 +79,7 @@ struct Staged {
     key: String,
     size: u64,
     dirty: bool,
+    writers: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -97,10 +98,8 @@ pub struct S3Fs {
     inodes: Mutex<HashMap<u64, String>>,
     /// path -> inode, so repeated lookups are stable (the kernel caches by ino).
     paths: Mutex<HashMap<String, u64>>,
-    /// Open write handles, keyed by file handle.
+    /// Shared writable files, keyed by their reference-counted file handle.
     staged: Mutex<HashMap<u64, Staged>>,
-    /// Paths with an unflushed staging file, so reads see pending writes.
-    pending: Mutex<HashMap<String, u64>>,
     /// How long a lookup, a miss or a small file's bytes are trusted.
     cache_ttl: Duration,
     /// path -> what it resolved to, and when.
@@ -130,7 +129,6 @@ impl S3Fs {
             inodes: Mutex::new(inodes),
             paths: Mutex::new(paths),
             staged: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
             cache_ttl,
             meta: Mutex::new(HashMap::new()),
             small: Mutex::new(HashMap::new()),
@@ -342,10 +340,10 @@ impl S3Fs {
         if path.is_empty() {
             return Some(Node::Dir);
         }
-        if let Ok(pending) = self.pending.lock() {
-            if let Some(size) = pending.get(path) {
+        if let Ok(staged) = self.staged.lock() {
+            if let Some(st) = staged.values().find(|st| st.key == path) {
                 return Some(Node::File {
-                    size: *size,
+                    size: st.size,
                     mtime: Self::now(),
                 });
             }
@@ -397,6 +395,24 @@ impl S3Fs {
     /// Open a staging file, seeded with the object's current bytes when it
     /// exists — required so a partial write does not truncate the rest away.
     fn open_staged(&self, path: &str, truncate: bool) -> std::io::Result<u64> {
+        let mut staged = self
+            .staged
+            .lock()
+            .map_err(|_| std::io::Error::other("staging lock poisoned"))?;
+        if let Some((fh, st)) = staged.iter_mut().find(|(_, st)| st.key == path) {
+            if truncate {
+                st.file.set_len(0)?;
+                st.size = 0;
+                st.dirty = true;
+            }
+            st.writers += 1;
+            return Ok(*fh);
+        }
+        let bytes = if truncate {
+            Vec::new()
+        } else {
+            self.client.get(path, None).map_err(std::io::Error::other)?
+        };
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let spath = self.staging_path(fh);
         let mut file = std::fs::OpenOptions::new()
@@ -405,30 +421,22 @@ impl S3Fs {
             .create(true)
             .truncate(true)
             .open(&spath)?;
-        let mut size = 0u64;
-        if !truncate {
-            if let Ok(bytes) = self.client.get(path, None) {
-                file.write_all(&bytes)?;
-                file.flush()?;
-                size = bytes.len() as u64;
-                file.seek(SeekFrom::Start(0))?;
-            }
+        if let Err(error) = file.write_all(&bytes) {
+            let _ = std::fs::remove_file(&spath);
+            return Err(error);
         }
-        if let Ok(mut staged) = self.staged.lock() {
-            staged.insert(
-                fh,
-                Staged {
-                    file,
-                    path: spath,
-                    key: path.to_string(),
-                    size,
-                    dirty: truncate,
-                },
-            );
-        }
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(path.to_string(), size);
-        }
+        let size = bytes.len() as u64;
+        staged.insert(
+            fh,
+            Staged {
+                file,
+                path: spath,
+                key: path.to_string(),
+                size,
+                dirty: truncate,
+                writers: 1,
+            },
+        );
         Ok(fh)
     }
 
@@ -442,7 +450,8 @@ impl S3Fs {
     /// tail in place and read back a mix of old and new data.
     fn truncate(&self, path: &str, fh: Option<u64>, size: u64) -> Result<(), i32> {
         let mut staged_any = false;
-        if let Ok(mut guard) = self.staged.lock() {
+        let mut guard = self.staged.lock().map_err(|_| libc::EIO)?;
+        {
             // Resize every open handle on this object, not only the one the
             // request names. An `O_TRUNC` open arrives as a truncate with no
             // file handle while a staging file is already open, and leaving
@@ -460,9 +469,6 @@ impl S3Fs {
             }
         }
         if staged_any {
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.insert(path.to_string(), size);
-            }
             return Ok(());
         }
         // No open handle: rewrite the object at its new length. Growing pads
@@ -470,9 +476,15 @@ impl S3Fs {
         let mut bytes = if size == 0 {
             Vec::new()
         } else {
-            self.client.get(path, None).unwrap_or_default()
+            self.client.get(path, None).map_err(|_| libc::EIO)?
         };
-        bytes.resize(size as usize, 0);
+        let size_usize = usize::try_from(size).map_err(|_| libc::EFBIG)?;
+        if size_usize > bytes.len() {
+            bytes
+                .try_reserve(size_usize - bytes.len())
+                .map_err(|_| libc::EFBIG)?;
+        }
+        bytes.resize(size_usize, 0);
         self.client.put(path, &bytes).map_err(|_| libc::EIO)?;
         self.forget_bytes(path);
         self.remember(
@@ -482,11 +494,6 @@ impl S3Fs {
                 mtime: Self::now(),
             }),
         );
-        // The object now really is this size, so no pending entry is needed —
-        // and a stale one would misreport the size of every later read.
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(path);
-        }
         Ok(())
     }
 
@@ -499,6 +506,9 @@ impl S3Fs {
         let Some(st) = guard.get_mut(&fh) else {
             return Ok(()); // read-only handle: nothing staged
         };
+        if close {
+            st.writers = st.writers.saturating_sub(1);
+        }
         if st.dirty {
             let mut buf = Vec::with_capacity(st.size as usize);
             if st.file.seek(SeekFrom::Start(0)).is_err() || st.file.read_to_end(&mut buf).is_err() {
@@ -518,13 +528,9 @@ impl S3Fs {
                 }),
             );
         }
-        if close {
+        if st.writers == 0 {
             if let Some(st) = guard.remove(&fh) {
                 let _ = std::fs::remove_file(&st.path);
-            }
-            drop(guard);
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.remove(path);
             }
         }
         Ok(())
@@ -707,14 +713,28 @@ impl Filesystem for S3Fs {
 
                 // A file with unflushed writes must read back what was written,
                 // not the stale object still sitting in the bucket.
-                if fh != 0 {
-                    if let Ok(mut guard) = self.staged.lock() {
-                        if let Some(st) = guard.get_mut(&fh) {
+                {
+                    let Ok(mut guard) = self.staged.lock() else {
+                        return Reply::Error(libc::EIO);
+                    };
+                    let staged_fh = if guard.contains_key(&fh) {
+                        Some(fh)
+                    } else {
+                        guard
+                            .iter()
+                            .find(|(_, st)| st.key == path)
+                            .map(|(fh, _)| *fh)
+                    };
+                    if let Some(staged_fh) = staged_fh {
+                        if let Some(st) = guard.get_mut(&staged_fh) {
                             let mut buf = vec![0u8; size as usize];
                             if st.file.seek(SeekFrom::Start(offset)).is_err() {
                                 return Reply::Error(libc::EIO);
                             }
-                            let n = st.file.read(&mut buf).unwrap_or(0);
+                            let n = match st.file.read(&mut buf) {
+                                Ok(n) => n,
+                                Err(_) => return Reply::Error(libc::EIO),
+                            };
                             buf.truncate(n);
                             return Reply::Data(buf);
                         }
@@ -754,9 +774,6 @@ impl Filesystem for S3Fs {
                 let Some(data) = req.data.get(40..40 + size) else {
                     return Reply::Error(libc::EINVAL);
                 };
-                let Some(path) = self.path_of(req.nodeid) else {
-                    return Reply::Error(libc::ENOENT);
-                };
                 let Ok(mut guard) = self.staged.lock() else {
                     return Reply::Error(libc::EIO);
                 };
@@ -770,21 +787,24 @@ impl Filesystem for S3Fs {
                 }
                 st.dirty = true;
                 st.size = st.size.max(offset + size as u64);
-                let new_size = st.size;
-                drop(guard);
-                if let Ok(mut pending) = self.pending.lock() {
-                    pending.insert(path, new_size);
-                }
                 Reply::Written(size as u32)
             }
 
             // FLUSH (close(2)) and FSYNC both have to make the data durable:
             // for object storage "durable" means the upload has happened.
             op::FLUSH | op::FSYNC => {
-                let fh = req.u64_at(0);
+                let mut fh = req.u64_at(0);
                 let Some(path) = self.path_of(req.nodeid) else {
                     return Reply::Error(libc::ENOENT);
                 };
+                if req.opcode == op::FSYNC && fh == 0 {
+                    let Ok(guard) = self.staged.lock() else {
+                        return Reply::Error(libc::EIO);
+                    };
+                    if let Some((handle, _)) = guard.iter().find(|(_, st)| st.key == path) {
+                        fh = *handle;
+                    }
+                }
                 match self.flush_staged(fh, &path, false) {
                     Ok(()) => Reply::Ok,
                     Err(e) => Reply::Error(e),
@@ -959,6 +979,211 @@ mod tests {
     use super::*;
 
     const COPIED_OBJECT: &str = "<CopyObjectResult><ETag>&quot;abc&quot;</ETag><LastModified>2013-05-24T00:00:00.000Z</LastModified></CopyObjectResult>";
+
+    fn file_request(fs: &S3Fs, opcode: u32, path: &str, data: &[u8]) -> Reply {
+        fs.dispatch(&Request {
+            opcode,
+            unique: 1,
+            nodeid: fs.ino_for(path),
+            uid: 0,
+            gid: 0,
+            data,
+        })
+    }
+
+    fn write_file(fs: &S3Fs, path: &str, fh: u64, offset: u64, bytes: &[u8]) {
+        let mut data = vec![0; 40];
+        data[..8].copy_from_slice(&fh.to_ne_bytes());
+        data[8..16].copy_from_slice(&offset.to_ne_bytes());
+        data[16..20].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+        data.extend_from_slice(bytes);
+        assert!(matches!(
+            file_request(fs, fuse::op::WRITE, path, &data),
+            Reply::Written(size) if size as usize == bytes.len()
+        ));
+    }
+
+    fn read_file(fs: &S3Fs, path: &str, fh: u64, offset: u64, size: u32) -> Reply {
+        let mut data = vec![0; 40];
+        data[..8].copy_from_slice(&fh.to_ne_bytes());
+        data[8..16].copy_from_slice(&offset.to_ne_bytes());
+        data[16..20].copy_from_slice(&size.to_ne_bytes());
+        file_request(fs, fuse::op::READ, path, &data)
+    }
+
+    #[test]
+    fn independent_readers_see_pending_bytes_and_eof_without_s3() {
+        for ttl in [Duration::ZERO, Duration::from_secs(60)] {
+            let server = crate::test_support::Server::new(vec![("PUT", "/b/file", 200, "")]);
+            let mut fs = fs_with_ttl(ttl);
+            fs.client = server.client("");
+            fs.remember("file", Known::Present(Node::File { size: 5, mtime: 1 }));
+            let fh = fs.open_staged("file", true).unwrap();
+            write_file(&fs, "file", fh, 0, b"pending");
+            assert!(
+                matches!(read_file(&fs, "file", 0, 1, 3), Reply::Data(bytes) if bytes == b"end")
+            );
+            assert!(
+                matches!(read_file(&fs, "file", 0, 7, 8), Reply::Data(bytes) if bytes.is_empty())
+            );
+            assert!(matches!(fs.stat("file"), Some(Node::File { size: 7, .. })));
+            fs.flush_staged(fh, "file", true).unwrap();
+            assert_eq!(server.finish_requests()[0].body, b"pending");
+            std::fs::remove_dir_all(&fs.scratch).unwrap();
+        }
+    }
+
+    #[test]
+    fn multiple_writers_share_bytes_and_closing_one_preserves_the_other() {
+        let server = crate::test_support::Server::new(vec![
+            ("GET", "/b/file", 200, "abcdef"),
+            ("PUT", "/b/file", 200, ""),
+            ("PUT", "/b/file", 200, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let first = fs.open_staged("file", false).unwrap();
+        write_file(&fs, "file", first, 0, b"XY");
+        let second = fs.open_staged("file", false).unwrap();
+        write_file(&fs, "file", second, 4, b"ZZ");
+        assert!(
+            matches!(read_file(&fs, "file", first, 0, 6), Reply::Data(bytes) if bytes == b"XYcdZZ")
+        );
+        fs.flush_staged(first, "file", true).unwrap();
+        assert!(matches!(fs.stat("file"), Some(Node::File { size: 6, .. })));
+        write_file(&fs, "file", second, 2, b"12");
+        fs.flush_staged(second, "file", true).unwrap();
+        assert!(fs.staged.lock().unwrap().is_empty());
+        let requests = server.finish_requests();
+        assert_eq!(requests[1].body, b"XYcdZZ");
+        assert_eq!(requests[2].body, b"XY12ZZ");
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn truncate_is_visible_to_all_open_writers_and_readers() {
+        let server = crate::test_support::Server::new(vec![("PUT", "/b/file", 200, "")]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let first = fs.open_staged("file", true).unwrap();
+        write_file(&fs, "file", first, 0, b"old contents");
+        let second = fs.open_staged("file", true).unwrap();
+        assert!(
+            matches!(read_file(&fs, "file", first, 0, 20), Reply::Data(bytes) if bytes.is_empty())
+        );
+        write_file(&fs, "file", first, 0, b"new");
+        fs.truncate("file", Some(second), 5).unwrap();
+        assert!(
+            matches!(read_file(&fs, "file", 0, 0, 20), Reply::Data(bytes) if bytes == b"new\0\0")
+        );
+        fs.flush_staged(first, "file", true).unwrap();
+        fs.flush_staged(second, "file", true).unwrap();
+        assert_eq!(server.finish_requests()[0].body, b"new\0\0");
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn failed_downloads_never_stage_or_overwrite_an_empty_file() {
+        for status in [403, 404, 500] {
+            let server = crate::test_support::Server::new(vec![
+                ("GET", "/b/file", status, "unavailable"),
+                ("GET", "/b/file", status, "unavailable"),
+            ]);
+            let mut fs = fs_with_ttl(Duration::ZERO);
+            fs.client = server.client("");
+            assert!(fs.open_staged("file", false).is_err());
+            assert!(fs.staged.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read_dir(&fs.scratch).unwrap().count(), 0);
+            assert_eq!(fs.truncate("file", None, 8), Err(libc::EIO));
+            assert_eq!(server.finish_requests().len(), 2);
+            std::fs::remove_dir_all(&fs.scratch).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_uploads_preserve_pending_data_for_reading_and_retry() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/file", 500, "unavailable"),
+            ("PUT", "/b/file", 200, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let fh = fs.open_staged("file", true).unwrap();
+        write_file(&fs, "file", fh, 0, b"keep me");
+        assert_eq!(fs.flush_staged(fh, "file", true), Err(libc::EIO));
+        assert!(
+            matches!(read_file(&fs, "file", 0, 0, 20), Reply::Data(bytes) if bytes == b"keep me")
+        );
+        assert!(fs.staged.lock().unwrap()[&fh].dirty);
+        let reopened = fs.open_staged("file", false).unwrap();
+        fs.flush_staged(reopened, "file", true).unwrap();
+        let requests = server.finish_requests();
+        assert!(requests.iter().all(|request| request.body == b"keep me"));
+        assert!(fs.staged.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn readonly_fsync_uploads_pending_data_but_readonly_close_does_not() {
+        let server = crate::test_support::Server::new(vec![("PUT", "/b/file", 200, "")]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let fh = fs.open_staged("file", true).unwrap();
+        write_file(&fs, "file", fh, 0, b"sync from reader");
+        assert!(matches!(
+            file_request(&fs, fuse::op::FLUSH, "file", &0u64.to_ne_bytes()),
+            Reply::Ok
+        ));
+        assert!(fs.staged.lock().unwrap()[&fh].dirty);
+        assert!(matches!(
+            file_request(&fs, fuse::op::FSYNC, "file", &0u64.to_ne_bytes()),
+            Reply::Ok
+        ));
+        assert!(!fs.staged.lock().unwrap()[&fh].dirty);
+        fs.flush_staged(fh, "file", true).unwrap();
+        assert_eq!(server.finish_requests()[0].body, b"sync from reader");
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn readonly_fsync_propagates_upload_errors_and_can_retry() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/file", 503, "unavailable"),
+            ("PUT", "/b/file", 200, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let fh = fs.open_staged("file", true).unwrap();
+        write_file(&fs, "file", fh, 0, b"retry");
+        assert!(matches!(
+            file_request(&fs, fuse::op::FSYNC, "file", &0u64.to_ne_bytes()),
+            Reply::Error(libc::EIO)
+        ));
+        assert!(fs.staged.lock().unwrap()[&fh].dirty);
+        assert!(matches!(
+            file_request(&fs, fuse::op::FSYNC, "file", &0u64.to_ne_bytes()),
+            Reply::Ok
+        ));
+        fs.flush_staged(fh, "file", true).unwrap();
+        assert!(server
+            .finish_requests()
+            .iter()
+            .all(|request| request.body == b"retry"));
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn local_read_errors_are_not_reported_as_eof() {
+        let fs = fs_with_ttl(Duration::ZERO);
+        let fh = fs.open_staged("file", true).unwrap();
+        fs.staged.lock().unwrap().get_mut(&fh).unwrap().file =
+            std::fs::File::open(&fs.scratch).unwrap();
+        assert!(matches!(
+            read_file(&fs, "file", 0, 0, 20),
+            Reply::Error(libc::EIO)
+        ));
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
 
     fn rename(fs: &S3Fs, from: &str, to: &str) -> Reply {
         let mut data = FUSE_ROOT_ID.to_ne_bytes().to_vec();
@@ -1257,7 +1482,12 @@ mod tests {
     /// A mount whose bucket is unreachable, so any answer it gives without an
     /// error came from its cache.
     fn fs_with_ttl(cache_ttl: Duration) -> S3Fs {
-        let dir = std::env::temp_dir().join(format!("s3fs-test-{}", std::process::id()));
+        static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "s3fs-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
         S3Fs::new(
             s3::Client::new(s3::Config {
                 endpoint: "http://127.0.0.1:1".into(),
