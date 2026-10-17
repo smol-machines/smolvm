@@ -100,7 +100,7 @@ mod oci;
 mod paths;
 mod pod;
 mod process;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod pty;
 mod publish_socket;
 mod retry;
@@ -6004,7 +6004,7 @@ fn run_interactive_loop(
 ///
 /// Unlike `run_interactive_loop`, this polls a single PTY master fd
 /// (PTY merges stdout and stderr) and supports terminal resize.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn run_interactive_loop_pty(
     stream: &mut impl ReadWrite,
     child: &mut Child,
@@ -6016,12 +6016,19 @@ fn run_interactive_loop_pty(
     let start = Instant::now();
     let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
 
+    let mut pending_stdin = Vec::new();
+    let mut stdin_offset = 0;
+    let mut input_frame = InteractiveFrame::default();
+
     // Set the master fd to non-blocking so we can poll it.
     if !set_nonblocking(pty_master.as_raw_fd()) {
         warn!("failed to set PTY master to non-blocking mode");
     }
 
     let mut buf = [0u8; IO_BUFFER_SIZE];
+    // Wakes the poll below the moment the child exits, instead of on the
+    // next timeout tick.
+    let exit_signal = process::ExitSignal::open(child);
 
     loop {
         // Check if child has exited.
@@ -6077,22 +6084,39 @@ fn run_interactive_loop_pty(
             None => INTERACTIVE_POLL_TIMEOUT_MS,
         };
 
-        // Poll PTY master and vsock stream for readable data.
+        // Poll PTY master, vsock stream, and child exit signal.
         let stream_fd = stream.as_raw_fd();
+        let pty_fd = pty_master.as_raw_fd();
         let mut poll_fds = [
             libc::pollfd {
-                fd: pty_master.as_raw_fd(),
-                events: libc::POLLIN,
+                fd: pty_fd,
+                events: libc::POLLIN
+                    | if pending_stdin.is_empty() {
+                        0
+                    } else {
+                        libc::POLLOUT
+                    },
                 revents: 0,
             },
             libc::pollfd {
                 fd: stream_fd,
+                // Finish writing a pending frame before reading another one.
+                // This keeps guest memory bounded to a single stdin frame.
+                events: if pending_stdin.is_empty() {
+                    libc::POLLIN
+                } else {
+                    0
+                },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: exit_signal.raw_fd().unwrap_or(-1),
                 events: libc::POLLIN,
                 revents: 0,
             },
         ];
 
-        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, poll_timeout_ms) };
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 3, poll_timeout_ms) };
 
         if poll_result < 0 {
             let err = std::io::Error::last_os_error();
@@ -6100,6 +6124,16 @@ fn run_interactive_loop_pty(
                 debug!(error = %err, "poll error on PTY master");
             }
             continue;
+        }
+
+        // POLLHUP/POLLERR are reported even when POLLIN is disabled while a
+        // stdin frame waits for the PTY buffer. Without this check a client
+        // disconnect can leave a child running until its timeout.
+        if !pending_stdin.is_empty()
+            && poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        {
+            debug!("host disconnected with pending PTY stdin");
+            return Ok(kill_child_on_disconnect(child));
         }
 
         // Read available data from PTY master. If send_response fails
@@ -6144,28 +6178,25 @@ fn run_interactive_loop_pty(
             return Ok(process::exit_code_from_status(&status));
         }
 
-        // Read incoming request from host — only when poll confirms data
-        // is available, then use blocking read_exact (safe, data is buffered).
-        // If the host disconnects, kill the child and return gracefully.
-        if poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let mut header = [0u8; 4];
-            if let Err(e) = stream.read_exact(&mut header) {
-                debug!(error = %e, "host disconnected during PTY interactive exec");
-                return Ok(kill_child_on_disconnect(child));
-            }
-            let len = u32::from_be_bytes(header) as usize;
-            if len > MAX_MESSAGE_SIZE {
-                return Err(format!("message too large: {} bytes", len).into());
-            }
-            let mut msg_buf = vec![0u8; len];
-            if let Err(e) = stream.read_exact(&mut msg_buf) {
-                debug!(error = %e, "host disconnected during PTY interactive exec payload");
-                return Ok(kill_child_on_disconnect(child));
-            }
-            let request: AgentRequest = serde_json::from_slice(&msg_buf)?;
+        // Read only bytes currently available; a partial frame must leave the
+        // loop free to drain child output and enforce the command deadline.
+        if pending_stdin.is_empty() && poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let request = match input_frame.read_next(stream_fd) {
+                Ok(request) => request,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    // Keep the existing protocol-error behavior while also
+                    // reaping the workload before returning the error.
+                    process::kill_child_tree(child);
+                    return Err(error.into());
+                }
+                Err(error) => {
+                    debug!(%error, "host disconnected during PTY interactive exec");
+                    return Ok(kill_child_on_disconnect(child));
+                }
+            };
 
             match request {
-                AgentRequest::Stdin { data } => {
+                Some(AgentRequest::Stdin { data }) => {
                     if data.is_empty() {
                         // Host stdin reached EOF. A PTY cannot have one
                         // direction closed, so signal end-of-input to the
@@ -6184,18 +6215,41 @@ fn run_interactive_loop_pty(
                         // produces the zero-length read. When the buffer is
                         // already empty the first VEOF yields EOF and the
                         // second is harmlessly consumed after the child exits.
-                        let _ = pty_master.write_all(&[0x04, 0x04]);
+                        pending_stdin = vec![0x04, 0x04];
+                        stdin_offset = 0;
                     } else {
-                        let _ = pty_master.write_all(&data);
+                        pending_stdin = data;
+                        stdin_offset = 0;
                     }
                 }
-                AgentRequest::Resize { cols, rows } => {
+                Some(AgentRequest::Resize { cols, rows }) => {
                     if let Err(e) = pty_master.set_window_size(cols, rows) {
                         debug!(error = %e, cols, rows, "failed to set PTY window size");
                     }
                 }
-                _ => {
+                Some(_) => {
                     warn!("unexpected request during interactive PTY session");
+                }
+                None => {}
+            }
+        }
+
+        // Write pending stdin chunks when PTY master has buffer space available.
+        if !pending_stdin.is_empty() && poll_fds[0].revents & libc::POLLOUT != 0 {
+            match pty_master.write(&pending_stdin[stdin_offset..]) {
+                Ok(0) => {
+                    pending_stdin.clear();
+                }
+                Ok(n) => {
+                    stdin_offset += n;
+                    if stdin_offset == pending_stdin.len() {
+                        pending_stdin.clear();
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    debug!(error = %e, "PTY master stdin write error");
+                    pending_stdin.clear();
                 }
             }
         }
@@ -7933,7 +7987,7 @@ fn handle_interactive_vm_exec(
     // reaper, so an unreaped interactive child would linger as a zombie holding
     // its stdio/PTY fds. Mirrors the loop's own kill_child_on_disconnect.
     let loop_result = match pty_master {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms),
         _ => run_interactive_loop(stream, &mut child, timeout_ms),
     };
@@ -7962,7 +8016,7 @@ fn handle_interactive_vm_exec(
 ///
 /// When `tty` is true, allocates a PTY pair and attaches the slave side
 /// to the child process. Returns the child and an optional `PtyMaster`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn spawn_direct_interactive_command(
     command: &[String],
     env: &[(String, String)],
@@ -8017,8 +8071,8 @@ fn spawn_direct_interactive_command(
     }
 }
 
-/// Stub for non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
+/// Stub for non-Unix platforms.
+#[cfg(not(unix))]
 fn spawn_direct_interactive_command(
     command: &[String],
     env: &[(String, String)],
@@ -8727,7 +8781,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn interactive_pty_timeout_writes_reason_to_terminal() {
         use std::os::unix::net::UnixStream;
 
@@ -8836,6 +8890,202 @@ mod tests {
         assert_eq!(stdout, input);
         sender.join().unwrap();
         guest.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streamed_pty_cat_drains_stdout_while_writing_large_stdin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut child, pty) = spawn_direct_interactive_command(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "stty -echo -onlcr 2>/dev/null; exec cat".to_string(),
+                ],
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+            let pty = pty.unwrap();
+            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            let code = run_interactive_loop_pty(&mut agent, &mut child, pty, Some(5000)).unwrap();
+            send_response(
+                &mut agent,
+                &AgentResponse::Exited {
+                    exit_code: code,
+                    oom: false,
+                },
+            )
+            .unwrap();
+        });
+
+        // 64KB with newlines so canonical mode flushes lines to cat
+        let chunk_size = 1024;
+        let mut line = vec![b'x'; chunk_size - 1];
+        line.push(b'\n');
+        let num_lines = 64;
+        let mut input = Vec::with_capacity(chunk_size * num_lines);
+        for _ in 0..num_lines {
+            input.extend_from_slice(&line);
+        }
+
+        let mut writer = client.try_clone().unwrap();
+        let payload = input.clone();
+        let sender = std::thread::spawn(move || {
+            for chunk in payload.chunks(8 * 1024) {
+                let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                    data: chunk.to_vec(),
+                })
+                .unwrap();
+                if chunk.as_ptr() == payload.as_ptr() {
+                    // Fragments across both prefix and payload
+                    writer.write_all(&frame[..1]).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    writer.write_all(&frame[1..5]).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    writer.write_all(&frame[5..]).unwrap();
+                } else {
+                    writer.write_all(&frame).unwrap();
+                }
+            }
+            writer
+                .write_all(
+                    &smolvm_protocol::encode_message(&AgentRequest::Stdin { data: Vec::new() })
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+
+        let mut stdout = Vec::new();
+        loop {
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut body).unwrap();
+            match serde_json::from_slice::<AgentResponse>(&body).unwrap() {
+                AgentResponse::Started => {}
+                AgentResponse::Stdout { data } => stdout.extend(data),
+                AgentResponse::Exited { exit_code, .. } => {
+                    assert_eq!(exit_code, 0);
+                    break;
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        assert_eq!(stdout, input);
+        sender.join().unwrap();
+        guest.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streamed_pty_exec_timeout_survives_partial_stdin_frame() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+            data: b"hello".to_vec(),
+        })
+        .unwrap();
+
+        for fragment in [&frame[..1], &frame[..4], &frame[..5]] {
+            let (mut agent, mut client) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let (tx, done) = std::sync::mpsc::channel();
+            let guest = std::thread::spawn(move || {
+                let (mut child, pty) = spawn_direct_interactive_command(
+                    &["sleep".to_string(), "5".to_string()],
+                    &[],
+                    None,
+                    true,
+                )
+                .unwrap();
+                send_response(&mut agent, &AgentResponse::Started).unwrap();
+                let code =
+                    run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100))
+                        .unwrap();
+                tx.send(code).unwrap();
+            });
+
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut response = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut response).unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<AgentResponse>(&response).unwrap(),
+                AgentResponse::Started
+            ));
+
+            client.write_all(fragment).unwrap();
+            let result = done.recv_timeout(std::time::Duration::from_secs(2));
+            drop(client);
+            guest.join().unwrap();
+            assert_eq!(result.unwrap(), 124);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn streamed_pty_exec_reaps_child_on_disconnect_with_pending_stdin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut agent, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut child, pty) = spawn_direct_interactive_command(
+                &["sleep".to_string(), "5".to_string()],
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+            let pty = pty.unwrap();
+            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            let started = std::time::Instant::now();
+            let code = run_interactive_loop_pty(&mut agent, &mut child, pty, Some(2000)).unwrap();
+            (code, started.elapsed())
+        });
+
+        let mut header = [0; 4];
+        client.read_exact(&mut header).unwrap();
+        let mut response = vec![0; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut response).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<AgentResponse>(&response).unwrap(),
+            AgentResponse::Started
+        ));
+        client
+            .write_all(
+                &smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                    data: vec![b'x'; 512 * 1024],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        drop(client);
+
+        let (code, elapsed) = guest.join().unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "expected immediate exit on client disconnect, took {elapsed:?}"
+        );
     }
 
     // The shipped agent runs in a Linux guest on every host. macOS poll() does

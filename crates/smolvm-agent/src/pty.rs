@@ -34,15 +34,22 @@ impl PtyMaster {
         }
     }
 
+    /// Write bytes to the PTY master.
+    pub fn write(&self, data: &[u8]) -> io::Result<usize> {
+        let n = unsafe { libc::write(self.fd.as_raw_fd(), data.as_ptr() as *const _, data.len()) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
     /// Write all bytes to the PTY master.
+    #[allow(dead_code)]
     pub fn write_all(&self, mut data: &[u8]) -> io::Result<()> {
         while !data.is_empty() {
-            let n =
-                unsafe { libc::write(self.fd.as_raw_fd(), data.as_ptr() as *const _, data.len()) };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            data = &data[n as usize..];
+            let n = self.write(data)?;
+            data = &data[n..];
         }
         Ok(())
     }
@@ -70,6 +77,7 @@ impl PtyMaster {
 
     /// Wrap an already-open master fd — e.g. one received from crun over a
     /// `--console-socket` — as a `PtyMaster`.
+    #[allow(dead_code)]
     pub fn from_owned_fd(fd: OwnedFd) -> Self {
         PtyMaster { fd }
     }
@@ -271,5 +279,27 @@ pub fn slave_pre_exec(slave_fd: RawFd) -> impl FnMut() -> io::Result<()> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_pty_read_write() {
+        use std::io::Read;
+
+        let (master, slave) = open_pty(80, 24).unwrap();
+        assert!(master.as_raw_fd() >= 0);
+        assert!(slave.as_raw_fd() >= 0);
+
+        let data = b"hello pty\n";
+        master.write_all(data).unwrap();
+
+        let mut slave_file = std::fs::File::from(slave);
+        let mut buf = vec![0u8; data.len()];
+        slave_file.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, data);
     }
 }
