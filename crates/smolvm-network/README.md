@@ -36,10 +36,11 @@ nor installs a host firewall. The runtime must apply the policy to traffic.
 Guest kernel → virtio-net → libkrun frame bridge → shared frame queues →
 smoltcp gateway → host sockets.
 
-TCP relay data sockets use `TCP_NODELAY`, for both outbound connections and
-accepted published-port connections. Guest socket options do not propagate to
-these separate host sockets; disabling Nagle here avoids adding host-side
-batching delays to small guest writes.
+TCP relay data sockets use `TCP_NODELAY` on the host and disable Nagle on the
+guest-facing smoltcp sockets, for both outbound connections and accepted
+published-port connections. Guest socket options do not propagate to these
+separate relay sockets; disabling Nagle on both sides avoids adding batching
+delays to small writes in either direction.
 
 The crate includes:
 

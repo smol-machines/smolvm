@@ -528,6 +528,7 @@ impl TcpRelayTable {
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+        socket.set_nagle_enabled(false);
 
         let listen_endpoint = IpListenEndpoint {
             addr: Some(destination.ip().into()),
@@ -620,6 +621,7 @@ impl TcpRelayTable {
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+        socket.set_nagle_enabled(false);
         let local_endpoint = IpListenEndpoint {
             addr: Some(gateway_ip.into()),
             port: local_port,
@@ -1507,6 +1509,47 @@ mod initial_bytes_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_relay_sockets_disable_nagle_for_outbound_and_published_connections() {
+        use smoltcp::iface::Config;
+        use smoltcp::phy::{Loopback, Medium};
+        use smoltcp::time::Instant;
+        use smoltcp::wire::{EthernetAddress, HardwareAddress};
+
+        let gateway = Ipv4Addr::new(100, 96, 0, 1);
+        let mut device = Loopback::new(Medium::Ethernet);
+        let mut interface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress([
+                0x02, 0, 0, 0, 0, 1,
+            ]))),
+            &mut device,
+            Instant::ZERO,
+        );
+        let mut sockets = SocketSet::new(vec![]);
+        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+        let source = SocketAddr::from((Ipv4Addr::new(100, 96, 0, 2), 40_000));
+        let destination = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 443));
+        assert!(table.create_tcp_socket(source, destination, &mut sockets));
+        let outbound_handle = *table.connections.keys().next().unwrap();
+        assert!(!sockets.get::<tcp::Socket>(outbound_handle).nagle_enabled());
+
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        let guest = SocketAddr::from((Ipv4Addr::new(100, 96, 0, 2), 8080));
+        assert!(table.create_published_socket(
+            &mut interface,
+            gateway,
+            guest,
+            client,
+            &mut sockets,
+        ));
+        assert_eq!(table.connections.len(), 2);
+        for handle in table.connections.keys() {
+            assert!(!sockets.get::<tcp::Socket>(*handle).nagle_enabled());
+        }
+    }
 
     #[test]
     fn registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets() {

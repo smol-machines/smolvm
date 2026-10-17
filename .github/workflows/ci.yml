@@ -142,10 +142,9 @@ jobs:
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
 
       - name: Test TCP relay socket options
-        run: >
-          cargo test -p smolvm-network --lib
-          tcp_relay::tests::registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets
-          -- --exact
+        run: |
+          cargo test -p smolvm-network --lib tcp_relay::tests::registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets -- --exact
+          cargo test -p smolvm-network --lib tcp_relay::tests::guest_relay_sockets_disable_nagle_for_outbound_and_published_connections -- --exact
 
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins
@@ -269,10 +268,9 @@ jobs:
           LD_LIBRARY_PATH: /usr/local/lib
 
       - name: Test TCP relay socket options
-        run: >
-          cargo test -p smolvm-network --lib --target ${{ matrix.target }}
-          tcp_relay::tests::registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets
-          -- --exact
+        run: |
+          cargo test -p smolvm-network --lib --target ${{ matrix.target }} tcp_relay::tests::registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets -- --exact
+          cargo test -p smolvm-network --lib --target ${{ matrix.target }} tcp_relay::tests::guest_relay_sockets_disable_nagle_for_outbound_and_published_connections -- --exact
 
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins --target ${{ matrix.target }}
