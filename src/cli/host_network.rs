@@ -358,11 +358,7 @@ fn stage_bundle(pem: &str) -> smolvm::Result<PathBuf> {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(pem.as_bytes());
     let name: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    let root = smolvm::agent::vm_cache_root()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("host-trust");
+    let root = smolvm::agent::cache_root().join("host-trust");
     let dir = root.join(name);
     let file = dir.join(BUNDLE_FILE);
     if !file.exists() {
