@@ -889,6 +889,110 @@ pub(crate) fn build_vm_record_for(
     Ok(record)
 }
 
+pub fn create_vm_from_machine(params: CreateVmParams, base_name: &str) -> smolvm::Result<()> {
+    let record = build_vm_record(&params)?;
+    let _base_lock = smolvm::agent::fork::lock_fork_source(base_name)?;
+    let base = SmolvmDb::open()?
+        .get_vm(base_name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(base_name))?;
+    let record = record_from_disk_base(record, base_name, &base)?;
+    let reservation = CreateVmReservation::reserve(&record.name)?;
+    let dir = smolvm::agent::ensure_vm_dir(&record.name)?;
+    let created = smolvm::storage::clone_machine_disks(&vm_data_dir(base_name), &dir)
+        .and_then(|()| reservation.commit(&record));
+    if let Err(error) = created {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(error);
+    }
+    print_create_success(&params);
+    Ok(())
+}
+
+fn record_from_disk_base(
+    mut record: VmRecord,
+    base_name: &str,
+    base: &VmRecord,
+) -> smolvm::Result<VmRecord> {
+    let refuse = |reason: String| Err(smolvm::Error::config("create from machine", reason));
+    if record.name == base_name {
+        return refuse(format!(
+            "machine '{base_name}' cannot be created from itself"
+        ));
+    }
+    match base.actual_state() {
+        RecordState::Stopped => {}
+        RecordState::Created => {
+            return refuse(format!(
+                "machine '{base_name}' has never been started, so it has no disks to copy"
+            ))
+        }
+        state => {
+            return refuse(format!(
+                "machine '{base_name}' is {state}; stop it first with: smolvm machine stop --name {base_name}"
+            ))
+        }
+    }
+    if let Some(golden) = &base.golden {
+        return refuse(format!(
+            "machine '{base_name}' is a branch of '{golden}' and its disks are layers over that machine's"
+        ));
+    }
+    if base.source_smolmachine.is_some() {
+        return refuse(format!(
+            "machine '{base_name}' was created from a .smolmachine, whose layers are not on its disks"
+        ));
+    }
+    if record.image.is_some() {
+        return refuse(
+            "the new machine boots the base machine's image; remove the image from the Smolfile"
+                .to_string(),
+        );
+    }
+    if !record.init.is_empty() {
+        return refuse(format!(
+            "init commands run on a machine's first boot, and this one starts from the disks of '{base_name}'; run them on the base instead"
+        ));
+    }
+    for (size, base_size, default, disk) in [
+        (
+            record.storage_gb,
+            base.storage_gb,
+            DEFAULT_STORAGE_SIZE_GIB,
+            "storage",
+        ),
+        (
+            record.overlay_gb,
+            base.overlay_gb,
+            DEFAULT_OVERLAY_SIZE_GIB,
+            "overlay",
+        ),
+    ] {
+        let base_size = base_size.unwrap_or(default);
+        if size.is_some_and(|size| size < base_size) {
+            return refuse(format!(
+                "the {disk} disk cannot be smaller than the {base_size} GiB of '{base_name}'"
+            ));
+        }
+    }
+    record.storage_gb = record.storage_gb.or(base.storage_gb);
+    record.overlay_gb = record.overlay_gb.or(base.overlay_gb);
+    record.image = base.image.clone();
+    record.image_origin = base.image_origin.clone();
+    record.image_origin_digest = base.image_origin_digest.clone();
+    if record.entrypoint.is_empty() && record.cmd.is_empty() {
+        record.entrypoint = base.entrypoint.clone();
+        record.cmd = base.cmd.clone();
+    }
+    record.fork_overlay_owner = Some(
+        base.fork_overlay_owner
+            .clone()
+            .unwrap_or_else(|| base_name.to_string()),
+    );
+    record.host_uid_owner = Some(record.name.clone());
+    record.init_completed = true;
+    Ok(record)
+}
+
 pub(crate) fn print_create_success(params: &CreateVmParams) {
     println!("Created machine: {}", params.name);
     println!("  CPUs: {}, Memory: {} MiB", params.cpus, params.mem);
@@ -4903,5 +5007,167 @@ mod status_dns_tests {
             status["dns_options"],
             serde_json::json!(["timeout:1", "use-vc"])
         );
+    }
+}
+
+#[cfg(test)]
+mod from_machine_tests {
+    use super::*;
+
+    fn stopped_base() -> VmRecord {
+        let mut base = VmRecord::new(
+            "base".to_string(),
+            2,
+            1024,
+            vec![("/host/base".to_string(), "/base".to_string(), false)],
+            vec![(8080, 80)],
+            true,
+        );
+        base.state = RecordState::Stopped;
+        base.image = Some("alpine:3.20".to_string());
+        base.image_origin = Some("alpine".to_string());
+        base.entrypoint = vec!["/entrypoint".to_string()];
+        base.cmd = vec!["serve".to_string()];
+        base.env = vec![("BASE_ONLY".to_string(), "1".to_string())];
+        base.secret_refs.insert(
+            "TOKEN".to_string(),
+            SecretRef {
+                from_env: Some("HOST_TOKEN".to_string()),
+                from_file: None,
+            },
+        );
+        base.workdir = Some("/srv".to_string());
+        base.storage_gb = Some(30);
+        base.overlay_gb = Some(12);
+        base.init = vec!["apk add curl".to_string()];
+        base.init_completed = true;
+        base.labels.insert("role".to_string(), "base".to_string());
+        base
+    }
+
+    fn child() -> VmRecord {
+        let mut child = VmRecord::new(
+            "child".to_string(),
+            4,
+            8192,
+            vec![("/host/child".to_string(), "/child".to_string(), true)],
+            vec![(9090, 90)],
+            false,
+        );
+        child.env = vec![("CHILD_ONLY".to_string(), "1".to_string())];
+        child
+    }
+
+    #[test]
+    fn child_takes_the_base_filesystem_and_nothing_else() {
+        let record = record_from_disk_base(child(), "base", &stopped_base()).unwrap();
+
+        assert_eq!(record.name, "child");
+        assert_eq!(record.image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(record.image_origin.as_deref(), Some("alpine"));
+        assert_eq!(record.fork_overlay_owner.as_deref(), Some("base"));
+        assert_eq!(record.host_uid_owner.as_deref(), Some("child"));
+        assert!(record.golden.is_none());
+        assert!(record.init_completed);
+        assert_eq!(record.storage_gb, Some(30));
+        assert_eq!(record.overlay_gb, Some(12));
+        assert_eq!(record.entrypoint, ["/entrypoint"]);
+        assert_eq!(record.cmd, ["serve"]);
+
+        assert_eq!((record.cpus, record.mem), (4, 8192));
+        assert_eq!(
+            record.mounts,
+            [("/host/child".to_string(), "/child".to_string(), true)]
+        );
+        assert_eq!(record.ports, [(9090, 90)]);
+        assert!(!record.network);
+        assert_eq!(record.env, [("CHILD_ONLY".to_string(), "1".to_string())]);
+        assert!(record.secret_refs.is_empty());
+        assert!(record.workdir.is_none());
+        assert!(record.init.is_empty());
+        assert!(record.labels.is_empty());
+    }
+
+    #[test]
+    fn child_keeps_its_own_workload_command() {
+        let mut own = child();
+        own.cmd = vec!["worker".to_string()];
+
+        let record = record_from_disk_base(own, "base", &stopped_base()).unwrap();
+
+        assert!(record.entrypoint.is_empty());
+        assert_eq!(record.cmd, ["worker"]);
+    }
+
+    #[test]
+    fn child_addresses_the_overlay_the_base_inherited() {
+        let mut base = stopped_base();
+        base.fork_overlay_owner = Some("root".to_string());
+
+        let record = record_from_disk_base(child(), "base", &base).unwrap();
+
+        assert_eq!(record.fork_overlay_owner.as_deref(), Some("root"));
+        assert_eq!(record.host_uid_owner.as_deref(), Some("child"));
+    }
+
+    #[test]
+    fn child_may_grow_the_disks_but_not_shrink_them() {
+        let mut larger = child();
+        larger.storage_gb = Some(40);
+        let record = record_from_disk_base(larger, "base", &stopped_base()).unwrap();
+        assert_eq!(record.storage_gb, Some(40));
+
+        let mut smaller = child();
+        smaller.storage_gb = Some(10);
+        assert!(record_from_disk_base(smaller, "base", &stopped_base()).is_err());
+
+        let mut smaller = child();
+        smaller.overlay_gb = Some(1);
+        assert!(record_from_disk_base(smaller, "base", &stopped_base()).is_err());
+    }
+
+    #[test]
+    fn a_base_that_is_not_stopped_is_refused() {
+        for state in [
+            RecordState::Created,
+            RecordState::Paused,
+            RecordState::Frozen,
+        ] {
+            let mut base = stopped_base();
+            base.state = state.clone();
+            let error = record_from_disk_base(child(), "base", &base)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("base"), "{state}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_base_whose_disks_live_elsewhere_is_refused() {
+        let mut branch = stopped_base();
+        branch.golden = Some("golden".to_string());
+        assert!(record_from_disk_base(child(), "base", &branch).is_err());
+
+        let mut packed = stopped_base();
+        packed.source_smolmachine = Some("/packs/app.smolmachine".to_string());
+        assert!(record_from_disk_base(child(), "base", &packed).is_err());
+    }
+
+    #[test]
+    fn an_image_or_init_of_the_child_is_refused() {
+        let mut imaged = child();
+        imaged.image = Some("ubuntu".to_string());
+        assert!(record_from_disk_base(imaged, "base", &stopped_base()).is_err());
+
+        let mut with_init = child();
+        with_init.init = vec!["echo hi".to_string()];
+        assert!(record_from_disk_base(with_init, "base", &stopped_base()).is_err());
+    }
+
+    #[test]
+    fn a_machine_cannot_be_its_own_base() {
+        let mut base = stopped_base();
+        base.name = "child".to_string();
+        assert!(record_from_disk_base(child(), "child", &base).is_err());
     }
 }

@@ -84,6 +84,24 @@ source in memory; `machine checkpoint` saves that same state as a durable
 `.checkpoint` file that can be restored later or elsewhere
 ([format](../crates/smolvm-checkpoint/FORMAT.md)).
 
+A machine can also start from a stopped machine's disks, without its memory:
+
+```bash
+smolvm machine stop --name base
+smolvm machine create --name child --from-machine base --net -p 8080:80 -e MODE=child
+```
+
+The child gets copy-on-write clones of the base's storage and overlay disks (an
+APFS clone on macOS, a reflink where Linux has one), so it boots the base's
+image with every file the base wrote, and only its own writes take new space.
+Everything else comes from the create flags, as for any new machine: env,
+secrets, network policy, credentials, ports, mounts and resources are never
+copied from the base. The child keeps no reference to the base, which can be
+started, changed or deleted afterwards. The base must be stopped, and cannot
+be a branch or a machine created from a `.smolmachine`. The child counts as
+already booted once, so `--init` is refused rather than skipped. Without a
+command of its own, the child runs the base's workload.
+
 Building checkpoint tooling in Rust? [`smolvm-checkpoint`](../crates/smolvm-checkpoint)
 provides incremental storage, verified file restoration, and portable export
 without depending on the VM runtime.
