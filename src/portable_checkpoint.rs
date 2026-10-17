@@ -4504,7 +4504,8 @@ impl PausedExportBuild {
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(&self.artifact)
             .map_err(|error| Error::agent("read paused checkpoint", error.to_string()))?;
         let staging = self.work.path().join("assets");
-        smolvm_pack::extract::extract_verified_checkpoint_sidecar(
+        // A resume removes the pause artifact's own name meanwhile.
+        smolvm_pack::extract::extract_linked_checkpoint_sidecar(
             &self.artifact,
             &staging,
             &footer,

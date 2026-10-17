@@ -3530,6 +3530,31 @@ pub fn extract_verified_checkpoint_sidecar(
     skip: &[PathBuf],
     required: &[PathBuf],
 ) -> std::io::Result<()> {
+    extract_checkpoint_sidecar_checked(sidecar_path, dest, footer, skip, required, false)
+}
+
+/// [`extract_verified_checkpoint_sidecar`] for a caller reading through a
+/// private hard link of a checkpoint whose other names may be removed meanwhile:
+/// a link count that changed is not a change to the checkpoint. Its bytes, size,
+/// modification time and inode must still be what they were.
+pub fn extract_linked_checkpoint_sidecar(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+    required: &[PathBuf],
+) -> std::io::Result<()> {
+    extract_checkpoint_sidecar_checked(sidecar_path, dest, footer, skip, required, true)
+}
+
+fn extract_checkpoint_sidecar_checked(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+    required: &[PathBuf],
+    links_may_change: bool,
+) -> std::io::Result<()> {
     let mut file = File::open(sidecar_path)?;
     let before = file.metadata()?;
     let actual_footer =
@@ -3585,8 +3610,11 @@ pub fn extract_verified_checkpoint_sidecar(
     }
     let after = reader.inner.metadata()?;
     let path_after = fs::metadata(sidecar_path)?;
-    if !same_checkpoint_identity(&before, &after) || !same_checkpoint_identity(&before, &path_after)
-    {
+    let same = |after: &fs::Metadata| {
+        same_checkpoint_identity(&before, after)
+            || (links_may_change && same_checkpoint_across_links(&before, after))
+    };
+    if !same(&after) || !same(&path_after) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "checkpoint changed during extraction",
@@ -3638,6 +3666,24 @@ fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool
         && before.ctime_nsec() == after.ctime_nsec()
 }
 
+/// The same checkpoint whose link count changed: adding or removing a name
+/// moves its change time, and nothing else may differ.
+#[cfg(unix)]
+fn same_checkpoint_across_links(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.nlink() != after.nlink()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_checkpoint_across_links(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    same_checkpoint_identity(before, after)
+}
+
 #[cfg(not(unix))]
 fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
@@ -3646,6 +3692,46 @@ fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool
 #[cfg(test)]
 mod resume_extract_tests {
     use super::*;
+
+    /// Removing another name of a checkpoint moves its change time; that alone
+    /// is accepted across links, while a permission or content change is not.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_link_count_change_is_tolerated_across_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("pause.smolcheckpoint");
+        fs::write(&original, b"saved").unwrap();
+        let linked = temp.path().join("linked.smolcheckpoint");
+        fs::hard_link(&original, &linked).unwrap();
+        let before = fs::metadata(&linked).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::remove_file(&original).unwrap();
+        let unlinked = fs::metadata(&linked).unwrap();
+        assert!(
+            !same_checkpoint_identity(&before, &unlinked),
+            "an unlink moves the change time"
+        );
+        assert!(same_checkpoint_across_links(&before, &unlinked));
+
+        let before = unlinked;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::set_permissions(&linked, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!same_checkpoint_across_links(
+            &before,
+            &fs::metadata(&linked).unwrap()
+        ));
+
+        let before = fs::metadata(&linked).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::hard_link(&linked, &original).unwrap();
+        fs::write(&linked, b"other").unwrap();
+        assert!(!same_checkpoint_across_links(
+            &before,
+            &fs::metadata(&linked).unwrap()
+        ));
+    }
 
     #[test]
     fn one_pass_extract_checks_unneeded_archive_bytes() {
