@@ -131,11 +131,11 @@ broker_pid=
 
 for index in 1 2; do
   file="$tmp/prelude.$index"
-  [[ $(dd if="$file" bs=1 count=8 2>/dev/null) == SMOLMEG2 ]] || fail "broker prelude $index has wrong magic"
+  [[ $(dd if="$file" bs=1 count=8 2>/dev/null) == SMOLMEG3 ]] || fail "broker prelude $index has wrong magic"
   [[ $(hex_at "$file" 8 32) == "$token" ]] || fail "broker prelude $index has wrong token"
   [[ $(hex_at "$file" 72 1) == 04 && $(hex_at "$file" 73 2) == 01bb ]] || fail "broker prelude $index has wrong family or port"
-  [[ $(hex_at "$file" 75 4) == 01010101 && $(hex_at "$file" 79 2) == 0005 ]] || fail "broker prelude $index has wrong destination or payload length"
-  [[ $(dd if="$file" bs=1 skip=81 count=5 2>/dev/null) == hello ]] || fail "broker prelude $index has wrong first payload"
+  [[ $(hex_at "$file" 75 4) == 01010101 && $(hex_at "$file" 79 1) == 00 && $(hex_at "$file" 80 2) == 0005 ]] || fail "broker prelude $index has wrong destination, hostname or payload length"
+  [[ $(dd if="$file" bs=1 skip=82 count=5 2>/dev/null) == hello ]] || fail "broker prelude $index has wrong first payload"
 done
 source_id=$(hex_at "$tmp/prelude.1" 40 16)
 child_id=$(hex_at "$tmp/prelude.2" 40 16)
