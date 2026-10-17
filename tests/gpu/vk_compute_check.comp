@@ -1,0 +1,4 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Buf { uint data[]; };
+void main() { data[gl_GlobalInvocationID.x] = gl_GlobalInvocationID.x * 3u + 7u; }
