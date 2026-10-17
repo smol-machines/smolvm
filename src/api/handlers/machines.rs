@@ -6692,7 +6692,18 @@ pub async fn publish_cache_disk(
     // The base takes its name only once the upload has landed. Named first, a
     // failed upload left it behind under a version the control plane never
     // recorded, and every later publish of that version collided with it.
+    //
+    // The flatten leaves its writes in the page cache, and the hash and upload
+    // read them from there; only installing the base needs them on disk. So
+    // the sync runs alongside the transfer instead of ahead of it, which on a
+    // worker took 12 s of a 67 s publish of 32 GB.
     let transfer_started = std::time::Instant::now();
+    let sync_path = staged.path().to_path_buf();
+    let syncing = progress.clone();
+    let sync = tokio::task::spawn_blocking(move || {
+        sync_with_progress(&sync_path, &syncing)
+            .map_err(|e| ApiError::internal(format!("sync {}: {e}", sync_path.display())))
+    });
     let hash_path = staged.path().to_path_buf();
     let hashing = progress.clone();
     let hash = tokio::task::spawn_blocking(move || file_sha256(&hash_path, &hashing));
@@ -6705,8 +6716,9 @@ pub async fn publish_cache_disk(
             .map_err(|e| ApiError::internal(format!("open {}: {e}", staged.path().display())))?;
         upload_checkpoint_file(file, urls, progress).await.map(drop)
     };
-    let (hashed, upload) = tokio::join!(hash, upload);
+    let (hashed, upload, synced) = tokio::join!(hash, upload, sync);
     upload?;
+    synced.map_err(|e| ApiError::internal(format!("task error: {e}")))??;
     let sha256 = hashed.map_err(|e| ApiError::internal(format!("task error: {e}")))??;
     let transfer_elapsed = transfer_started.elapsed();
 
@@ -6785,6 +6797,50 @@ pub async fn delete_cache_base(
     .await
     .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Make `path` durable, touching `progress` as its data reaches the disk.
+///
+/// One fsync of a freshly written base is a single long call: tens of
+/// seconds on a worker, minutes on a slower disk, with nothing to show for it
+/// until it returns, so a request's idle timeout gave up on a publish that was
+/// only waiting on its sync. On Linux the data is written back a range at a
+/// time first, so a disk that is slow but moving keeps the request alive and
+/// one that has stopped still times it out.
+fn sync_with_progress(
+    path: &std::path::Path,
+    progress: &crate::api::progress::Progress,
+) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        const STEP: u64 = 256 << 20;
+        let length = file.metadata()?.len();
+        let mut offset = 0;
+        while offset < length {
+            let step = STEP.min(length - offset);
+            // SAFETY: the fd is open for the lifetime of `file`; no pointers.
+            let rc = unsafe {
+                libc::sync_file_range(
+                    file.as_raw_fd(),
+                    offset as libc::off64_t,
+                    step as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            progress.touch();
+            offset += step;
+        }
+    }
+    file.sync_all()?;
+    progress.touch();
+    Ok(())
 }
 
 /// The SHA-256 of a file, as lowercase hex, touching `progress` as it reads.

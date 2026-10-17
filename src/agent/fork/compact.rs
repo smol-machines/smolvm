@@ -273,6 +273,10 @@ fn raw_data_ranges(path: &Path, size: u64, into: &mut Vec<(u64, u64)>) -> Result
 /// unallocated, so the result is no larger than the data it carries. Calls
 /// `copied` after each chunk, so a caller can tell a long flatten from a
 /// stuck one.
+///
+/// `out` holds its final bytes on return but is not yet durable: the caller
+/// syncs it before relying on it surviving a crash. A publish reads the file
+/// back for its hash and upload while that sync runs, rather than after it.
 pub(crate) fn flatten_standalone(top: &Path, out: &Path, copied: &dyn Fn()) -> Result<()> {
     let ChainData { view, size, ranges } = chain_data(top)?;
     runtime()?
@@ -305,8 +309,7 @@ pub(crate) fn flatten_standalone(top: &Path, out: &Path, copied: &dyn Fn()) -> R
         })?;
         writer
             .flush()
-            .map_err(|e| compact_err("flush flattened", e))?;
-        writer.sync().map_err(|e| compact_err("sync flattened", e))
+            .map_err(|e| compact_err("flush flattened", e))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(out);
