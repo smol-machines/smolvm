@@ -3566,6 +3566,10 @@ fn extract_checkpoint_sidecar_checked(
         ));
     }
     file.seek(SeekFrom::Start(0))?;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+    }
     fs::create_dir_all(dest)?;
     let mut reader = ChecksumReader::new(file);
     {
@@ -3737,11 +3741,19 @@ mod resume_extract_tests {
     fn one_pass_extract_checks_unneeded_archive_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let artifact = temp.path().join("pause.smolcheckpoint");
+        let mut unused = vec![0; 1024 * 1024];
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for chunk in unused.chunks_mut(8) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            chunk.copy_from_slice(&seed.to_le_bytes()[..chunk.len()]);
+        }
         let encoder = zstd::stream::Encoder::new(File::create(&artifact).unwrap(), 1).unwrap();
         let mut tar = tar::Builder::new(encoder);
         for (path, bytes) in [
             ("checkpoint/memory.bin", b"memory".as_slice()),
-            ("portable-after.txt", b"unused".as_slice()),
+            ("portable-after.txt", unused.as_slice()),
         ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
@@ -3795,7 +3807,11 @@ mod resume_extract_tests {
             checksum: footer.checksum ^ 1,
             ..footer
         };
-        let mut file = File::options().write(true).open(&artifact).unwrap();
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(&artifact)
+            .unwrap();
         file.seek(SeekFrom::End(-(crate::format::FOOTER_SIZE as i64)))
             .unwrap();
         file.write_all(&bad_footer.to_bytes()).unwrap();
@@ -3803,6 +3819,43 @@ mod resume_extract_tests {
             &artifact,
             &temp.path().join("rejected"),
             &bad_footer,
+            &[],
+            &["checkpoint/memory.bin".into()],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum mismatch"));
+
+        file.seek(SeekFrom::End(-(crate::format::FOOTER_SIZE as i64)))
+            .unwrap();
+        file.write_all(&footer.to_bytes()).unwrap();
+        assert!(footer.assets_size > 512 * 1024);
+        let corrupt_at = footer.assets_size - 32;
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        let mut original = [0];
+        file.read_exact(&mut original).unwrap();
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        file.write_all(&[original[0] ^ 0x80]).unwrap();
+        let error = extract_verified_checkpoint_sidecar(
+            &artifact,
+            &temp.path().join("corrupt-unused-tail"),
+            &footer,
+            &[],
+            &["checkpoint/memory.bin".into()],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum mismatch"));
+
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        file.write_all(&original).unwrap();
+        file.seek(SeekFrom::Start(footer.manifest_offset + 1))
+            .unwrap();
+        file.write_all(b"!").unwrap();
+        let error = extract_verified_checkpoint_sidecar(
+            &artifact,
+            &temp.path().join("corrupt-manifest"),
+            &footer,
             &[],
             &["checkpoint/memory.bin".into()],
         )
