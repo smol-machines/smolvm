@@ -31,6 +31,9 @@ pub mod fuse;
 pub mod s3;
 pub mod sigv4;
 
+#[cfg(test)]
+mod test_support;
+
 /// How to mount.
 #[derive(Clone, Debug)]
 pub struct MountOptions {

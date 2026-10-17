@@ -374,7 +374,9 @@ impl S3Fs {
         // Not an object: it may still be a directory prefix. The listing that
         // answers that also describes its children, which come next.
         match self.client.list_dir(path) {
-            Ok(l) if !l.objects.is_empty() || !l.prefixes.is_empty() => {
+            Ok(l)
+                if l.directory_marker_exists || !l.objects.is_empty() || !l.prefixes.is_empty() =>
+            {
                 self.remember_listing(path, &l);
                 Some(Node::Dir)
             }
@@ -944,6 +946,164 @@ impl Filesystem for S3Fs {
 mod tests {
     use super::*;
 
+    const EMPTY_DIRECTORY: &str = "<ListBucketResult><Contents><Key>empty/</Key><Size>0</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>";
+
+    fn create_empty_directory(fs: &S3Fs) -> u64 {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0o755u32.to_ne_bytes());
+        data.extend_from_slice(&0u32.to_ne_bytes());
+        data.extend_from_slice(b"empty\0");
+        match fs.dispatch(&Request {
+            opcode: fuse::op::MKDIR,
+            unique: 1,
+            nodeid: FUSE_ROOT_ID,
+            uid: 0,
+            gid: 0,
+            data: &data,
+        }) {
+            Reply::Entry(attr) => attr.ino,
+            _ => panic!("mkdir must succeed"),
+        }
+    }
+
+    fn empty_directory_server() -> crate::test_support::Server {
+        crate::test_support::Server::new(vec![
+            ("PUT", "/b/empty/", 200, ""),
+            ("HEAD", "/b/empty", 404, ""),
+            ("GET", "/b/", 200, EMPTY_DIRECTORY),
+        ])
+    }
+
+    #[test]
+    fn empty_directory_survives_expired_metadata_cache() {
+        let server = empty_directory_server();
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        create_empty_directory(&fs);
+        assert_eq!(fs.stat("empty"), Some(Node::Dir));
+        fs.meta.lock().unwrap().get_mut("empty").unwrap().1 =
+            Instant::now() - Duration::from_secs(120);
+        assert_eq!(fs.stat("empty"), Some(Node::Dir));
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn empty_directory_survives_disabled_metadata_cache() {
+        let server = empty_directory_server();
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        create_empty_directory(&fs);
+        assert_eq!(fs.stat("empty"), Some(Node::Dir));
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn empty_directory_survives_a_fresh_filesystem_instance() {
+        let server = empty_directory_server();
+        let mut original = fs_with_ttl(Duration::from_secs(60));
+        original.client = server.client("");
+        create_empty_directory(&original);
+        drop(original);
+        let mut fresh = fs_with_ttl(Duration::from_secs(60));
+        fresh.client = server.client("");
+        assert_eq!(fresh.stat("empty"), Some(Node::Dir));
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn directory_lookup_preserves_missing_and_implicit_directory_semantics() {
+        for (body, expected) in [
+            ("<ListBucketResult/>", None),
+            (
+                "<ListBucketResult><Contents><Key>empty/file</Key><Size>1</Size></Contents></ListBucketResult>",
+                Some(Node::Dir),
+            ),
+            (
+                "<ListBucketResult><CommonPrefixes><Prefix>empty/sub/</Prefix></CommonPrefixes></ListBucketResult>",
+                Some(Node::Dir),
+            ),
+        ] {
+            let server = crate::test_support::Server::new(vec![
+                ("HEAD", "/b/empty", 404, ""),
+                ("GET", "/b/", 200, body),
+            ]);
+            let mut fs = fs_with_ttl(Duration::ZERO);
+            fs.client = server.client("");
+            assert_eq!(fs.stat("empty"), expected);
+            assert_eq!(server.finish().len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_directory_marker_is_not_a_child_when_removing_a_directory() {
+        for (body, empty) in [
+            (EMPTY_DIRECTORY, true),
+            (
+                "<ListBucketResult><Contents><Key>empty/</Key><Size>0</Size></Contents><Contents><Key>empty/file</Key><Size>1</Size></Contents></ListBucketResult>",
+                false,
+            ),
+            (
+                "<ListBucketResult><Contents><Key>empty/</Key><Size>0</Size></Contents><CommonPrefixes><Prefix>empty/sub/</Prefix></CommonPrefixes></ListBucketResult>",
+                false,
+            ),
+        ] {
+            let mut responses = vec![("GET", "/b/", 200, body)];
+            if empty {
+                responses.push(("DELETE", "/b/empty/", 204, ""));
+            }
+            let expected_requests = responses.len();
+            let server = crate::test_support::Server::new(responses);
+            let mut fs = fs_with_ttl(Duration::from_secs(60));
+            fs.client = server.client("");
+            let result = fs.dispatch(&Request {
+                opcode: fuse::op::RMDIR,
+                unique: 1,
+                nodeid: FUSE_ROOT_ID,
+                uid: 0,
+                gid: 0,
+                data: b"empty\0",
+            });
+            if empty {
+                assert!(matches!(result, Reply::Ok));
+                assert_eq!(fs.known("empty"), Some(Known::Absent));
+            } else {
+                assert!(matches!(result, Reply::Error(libc::ENOTEMPTY)));
+            }
+            assert_eq!(server.finish().len(), expected_requests);
+        }
+    }
+
+    #[test]
+    fn a_directory_marker_is_not_a_child_in_readdir() {
+        let server = crate::test_support::Server::new(vec![
+            ("HEAD", "/b/empty", 404, ""),
+            ("GET", "/b/", 200, EMPTY_DIRECTORY),
+            ("GET", "/b/", 200, EMPTY_DIRECTORY),
+        ]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        assert_eq!(fs.stat("empty"), Some(Node::Dir));
+        let mut data = [0u8; 40];
+        data[16..20].copy_from_slice(&4096u32.to_ne_bytes());
+        let result = fs.dispatch(&Request {
+            opcode: fuse::op::READDIR,
+            unique: 1,
+            nodeid: fs.ino_for("empty"),
+            uid: 0,
+            gid: 0,
+            data: &data,
+        });
+        match result {
+            Reply::Directory(entries) => {
+                assert_eq!(entries.len(), 64);
+                assert_eq!(&entries[24..25], b".");
+                assert_eq!(&entries[56..58], b"..");
+            }
+            _ => panic!("readdir must succeed"),
+        }
+        assert_eq!(server.finish().len(), 3);
+    }
+
     fn fs() -> S3Fs {
         fs_with_ttl(Duration::ZERO)
     }
@@ -981,6 +1141,7 @@ mod tests {
                 last_modified_secs: 7,
             }],
             prefixes: vec!["sub".into()],
+            ..Default::default()
         };
         fs.remember_listing("d", &listing);
         fs.remember("d/missing", Known::Absent);

@@ -75,6 +75,7 @@ pub struct ObjectInfo {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Listing {
     pub objects: Vec<ObjectInfo>,
+    pub directory_marker_exists: bool,
     /// Sub-prefixes, i.e. child directories (without the trailing `/`).
     pub prefixes: Vec<String>,
 }
@@ -330,6 +331,7 @@ impl Client {
                     continue;
                 };
                 if key == prefix {
+                    out.directory_marker_exists = true;
                     continue; // the directory marker itself
                 }
                 let rel_key = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
@@ -506,6 +508,35 @@ fn parse_http_date(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_marker_survives_pagination_without_becoming_a_child() {
+        let server = crate::test_support::Server::new(vec![
+            (
+                "GET",
+                "/b/",
+                200,
+                "<ListBucketResult><Contents><Key>mount/empty/</Key><Size>0</Size></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>",
+            ),
+            (
+                "GET",
+                "/b/",
+                200,
+                "<ListBucketResult><Contents><Key>mount/empty/file</Key><Size>1</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>",
+            ),
+        ]);
+        let listing = server.client("mount").list_dir("empty").unwrap();
+        assert!(listing.directory_marker_exists);
+        assert_eq!(listing.objects.len(), 1);
+        assert_eq!(listing.objects[0].key, "file");
+        assert!(listing.prefixes.is_empty());
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.contains("prefix=mount%2Fempty%2F")));
+        assert!(requests[1].contains("continuation-token=next"));
+    }
 
     #[test]
     fn parses_a_listing_into_objects_and_child_directories() {

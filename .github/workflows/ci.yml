@@ -263,7 +263,7 @@ jobs:
         run: >
           cargo test --lib --target ${{ matrix.target }}
           -p smolvm -p smolvm-pack -p smolvm-registry
-          -p smolvm-protocol -p smolfile -p smolvm-cuda
+          -p smolvm-protocol -p smolfile -p smolvm-cuda -p smolvm-s3fs
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
