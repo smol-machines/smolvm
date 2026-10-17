@@ -217,6 +217,18 @@ pub struct ApiDoc;
 /// wrapped in this timeout.
 const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// Timeout for creating a machine. Creating one from an image builds its image
+/// seed, which pulls the whole image inside the request, and a large image from
+/// a customer's own registry runs past [`API_REQUEST_TIMEOUT_SECS`]. Each image
+/// pull is already bounded at ten minutes (`IMAGE_PULL_TIMEOUT_SECS`), so this
+/// window sits above that and the pull, not the request, decides when it is
+/// stuck. The control plane's create timeout matches it.
+const CREATE_REQUEST_TIMEOUT_SECS: u64 = 900;
+const _: () = assert!(
+    CREATE_REQUEST_TIMEOUT_SECS > crate::agent::IMAGE_PULL_TIMEOUT_SECS,
+    "a machine create must outlast the image pull it waits on"
+);
+
 /// Body cap for the file-upload route. axum's 2 MiB default silently 413s larger
 /// uploads before the handler runs; the control plane permits 100 MiB, so match
 /// it here. The agent streams the write and enforces the true ceiling.
@@ -332,7 +344,6 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             "/{id}/mediation-events",
             get(handlers::machines::get_machine_mediation_events),
         )
-        .route("/", post(handlers::machines::create_machine))
         .route("/{id}/branches", post(handlers::machines::branch_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route(
@@ -381,6 +392,13 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
         ));
 
+    let create_route = Router::new()
+        .route("/", post(handlers::machines::create_machine))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(CREATE_REQUEST_TIMEOUT_SECS),
+        ));
+
     // Long operations own their deadline. In particular, exec and run pass
     // `timeout_secs` through to the guest agent; wrapping them in the generic
     // five-minute timeout used to turn a valid 30-minute exec into an HTTP 408
@@ -405,6 +423,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     let machine_routes = Router::new()
         .merge(logs_route)
         .merge(bounded_machine_routes)
+        .merge(create_route)
         .merge(long_machine_routes);
 
     // Automatic pool operations are bounded by the same request timeout as

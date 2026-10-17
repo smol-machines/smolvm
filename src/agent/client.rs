@@ -380,7 +380,7 @@ mod write_backpressure_tests {
 
 /// Read timeout for image pull operations (10 minutes).
 /// Image pulls can take a long time for large images over slow connections.
-const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
+pub(crate) const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
 
 /// Maximum silence while starting a detached container.
 ///

@@ -88,6 +88,7 @@ mod websocket;
 pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;
 pub use crate::data::storage::HostMount;
+pub(crate) use client::IMAGE_PULL_TIMEOUT_SECS;
 pub use client::{
     file_transfer_max_total, interactive_input, pack_export_max_total, AgentClient, ExecEvent,
     FileWriteMeta, InputClosed, InteractiveInput, InteractiveInputReceiver, InteractiveInputSender,
