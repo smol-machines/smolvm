@@ -66,6 +66,7 @@ allow_host_patterns = ["api.example.com", "*.files.example.com"]  # exact name, 
 allow_cidrs = ["10.0.0.0/8"]          # IP/CIDR ranges (implies net)
 block_private = true                  # public internet open; LAN, metadata, CGNAT, host loopback blocked
 allow_private = ["10.20.0.0/16"]      # private ranges re-opened under block_private (implies it)
+deny_cidrs = ["169.254.169.254"]      # denied before any allow (implies net)
 
 # Dev profile (used by `machine run` and `machine create`)
 [dev]

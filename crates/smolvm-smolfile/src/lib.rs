@@ -70,6 +70,7 @@
 //! | `allow_hosts` | string[] | Legacy hostname and subdomain entries |
 //! | `allow_host_patterns` | string[] | Exact hostnames or `*.` subdomain patterns |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
+//! | `deny_cidrs` | string[] | Denied CIDR ranges, checked before any allow |
 //! | `credentials` | table[] | Credential bindings (see below) |
 //!
 //! #### `[[network.credentials]]` — Credential substitution
@@ -388,6 +389,9 @@ pub struct NetworkConfig {
     /// Private ranges to re-open under `block_private` (implies it).
     #[serde(default)]
     pub allow_private: Vec<String>,
+    /// Denied egress CIDR ranges, checked before anything is allowed.
+    #[serde(default)]
+    pub deny_cidrs: Vec<String>,
     /// Credential bindings (`[[network.credentials]]`). The guest receives a
     /// placeholder in each `environment_variable`; the host substitutes the
     /// real value on HTTPS requests to the binding's `allowed_hosts` only.
