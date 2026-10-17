@@ -2812,7 +2812,7 @@ pub fn cpu_fingerprint() -> Result<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("sysctl")
+        let output = std::process::Command::new(MACOS_SYSCTL)
             .args(["-n", "machdep.cpu.brand_string", "hw.model"])
             .output()
             .map_err(|error| Error::agent("fingerprint CPU", error.to_string()))?;
@@ -2890,9 +2890,13 @@ fn is_masked_from_guest(name: &str) -> bool {
     name.contains("SME")
 }
 
+/// sysctl lives in /usr/sbin, which a daemon's or service's PATH often lacks.
+#[cfg(target_os = "macos")]
+const MACOS_SYSCTL: &str = "/usr/sbin/sysctl";
+
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 fn collect_aarch64_host_features() -> Result<Vec<String>> {
-    let output = std::process::Command::new("sysctl")
+    let output = std::process::Command::new(MACOS_SYSCTL)
         .arg("-a")
         .output()
         .map_err(|error| Error::agent("read CPU features", error.to_string()))?;
