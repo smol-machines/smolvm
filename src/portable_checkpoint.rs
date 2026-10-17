@@ -7847,7 +7847,7 @@ mod tests {
             "qcow2",
         );
         let mut pins = LayerPins::new(&fork).unwrap();
-        stage_disk_chains(
+        let (_, _deferred) = stage_disk_chains(
             &fork,
             &dir.path().join("staging/checkpoint"),
             Some(&mut pins),
