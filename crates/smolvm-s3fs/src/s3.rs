@@ -334,12 +334,18 @@ impl Client {
     /// List one directory level under `rel` using a delimiter, so the result
     /// separates child objects from child "directories" the way readdir needs.
     pub fn list_dir(&self, rel: &str) -> Result<Listing> {
+        self.list_dir_snapshot(rel).map(|(listing, _)| listing)
+    }
+
+    pub(crate) fn list_dir_snapshot(&self, rel: &str) -> Result<(Listing, bool)> {
         let mut prefix = self.full_key(rel);
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
         let mut out = Listing::default();
         let mut token: Option<String> = None;
+        let mut tokens = std::collections::HashSet::new();
+        let mut complete = true;
         loop {
             let mut query = vec![
                 ("list-type".to_string(), "2".to_string()),
@@ -357,6 +363,14 @@ impl Client {
             let body = r
                 .into_string()
                 .map_err(|e| Error::Transport(e.to_string()))?;
+            let root = body
+                .find("<ListBucketResult")
+                .map(|start| body[start..].trim_end())
+                .ok_or_else(|| Error::Parse("invalid listing response".into()))?;
+            let empty_root = root.ends_with("/>") && !root[..root.len() - 2].contains('>');
+            if !root.ends_with("</ListBucketResult>") && !empty_root {
+                return Err(Error::Parse("invalid listing response".into()));
+            }
 
             for c in xml_blocks(&body, "Contents") {
                 let Some(key) = xml_field(&c, "Key") else {
@@ -393,14 +407,25 @@ impl Client {
                 }
             }
 
-            match xml_field(&body, "NextContinuationToken") {
-                Some(t) if xml_field(&body, "IsTruncated").as_deref() == Some("true") => {
-                    token = Some(t)
+            match xml_field(&body, "IsTruncated").as_deref() {
+                Some("true") => {
+                    let next = xml_field(&body, "NextContinuationToken")
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| Error::Parse("truncated listing has no token".into()))?;
+                    if !tokens.insert(next.clone()) {
+                        return Err(Error::Parse("listing repeats a continuation token".into()));
+                    }
+                    token = Some(next);
                 }
-                _ => break,
+                Some("false") => break,
+                None => {
+                    complete = false;
+                    break;
+                }
+                Some(_) => return Err(Error::Parse("invalid listing truncation flag".into())),
             }
         }
-        Ok(out)
+        Ok((out, complete))
     }
 }
 
@@ -540,6 +565,75 @@ fn parse_http_date(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_listing_requires_all_pages_and_encodes_continuation_tokens() {
+        let server = crate::test_support::Server::new(vec![
+            ("GET", "/b/", 200, "<ListBucketResult><Contents><Key>dir/first</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>a+b /%</NextContinuationToken></ListBucketResult>"),
+            ("GET", "/b/", 200, "<ListBucketResult><Contents><Key>dir/last</Key><Size>2</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"),
+        ]);
+        let (listing, complete) = server.client("").list_dir_snapshot("dir").unwrap();
+        assert!(complete);
+        assert_eq!(
+            listing
+                .objects
+                .iter()
+                .map(|object| object.key.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "last"]
+        );
+        let requests = server.finish_requests();
+        assert!(requests[1]
+            .line
+            .contains("continuation-token=a%2Bb%20%2F%25"));
+    }
+
+    #[test]
+    fn listing_without_a_truncation_flag_is_not_negative_cache_evidence() {
+        let server = crate::test_support::Server::new(vec![(
+            "GET", "/b/", 200, "<ListBucketResult><Contents><Key>file</Key><Size>1</Size></Contents></ListBucketResult>",
+        )]);
+        let (listing, complete) = server.client("").list_dir_snapshot("").unwrap();
+        assert!(!complete);
+        assert_eq!(listing.objects.len(), 1);
+        server.finish();
+    }
+
+    #[test]
+    fn malformed_or_unresumable_listings_are_rejected() {
+        for body in [
+            "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken></NextContinuationToken></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>unknown</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Nested/>",
+            "<html>not an S3 response</html>",
+        ] {
+            let server = crate::test_support::Server::new(vec![("GET", "/b/", 200, body)]);
+            assert!(server.client("").list_dir_snapshot("").is_err(), "{body}");
+            assert_eq!(server.finish_requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn repeated_listing_tokens_do_not_loop_or_publish_partial_results() {
+        let page = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>same</NextContinuationToken></ListBucketResult>";
+        let server = crate::test_support::Server::new(vec![
+            ("GET", "/b/", 200, page),
+            ("GET", "/b/", 200, page),
+        ]);
+        assert!(server.client("").list_dir_snapshot("").is_err());
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn later_page_failures_do_not_publish_a_partial_listing() {
+        let server = crate::test_support::Server::new(vec![
+            ("GET", "/b/", 200, "<ListBucketResult><Contents><Key>first</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>"),
+            ("GET", "/b/", 503, "unavailable"),
+        ]);
+        assert!(server.client("").list_dir_snapshot("").is_err());
+        assert_eq!(server.finish_requests().len(), 2);
+    }
 
     #[test]
     fn server_side_copy_encodes_the_source_and_signs_its_headers() {

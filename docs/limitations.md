@@ -33,6 +33,13 @@ to ownership, permissions (including executable bits), and timestamps are not
 persisted. Copying a Git repository can therefore lose information even when
 all regular-file contents match.
 
+Complete directory listings can answer missing-child lookups locally until
+the metadata TTL expires; inferred misses do not extend that lifetime, and a
+zero TTL disables them. Local mutations update cached child names and fence
+out older lookup/listing responses. Failed or incomplete listings are not
+evidence of absence. External changes can remain hidden until the configured
+TTL expires; this is not cross-mount coordination or locking.
+
 File renames use the provider's server-side `CopyObject` operation followed by
 source deletion, rather than downloading and reuploading the object. This
 requires `CopyObject` support and is subject to its single-request object-size

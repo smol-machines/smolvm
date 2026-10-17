@@ -27,7 +27,7 @@
 //!   this mount update the caches as they happen; a change made by another
 //!   writer becomes visible within the TTL.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -50,12 +50,79 @@ const FATTR_FH: u32 = 1 << 6;
 const SMALL_FILE_MAX: u64 = 1024 * 1024;
 /// Memory the small-file cache may hold; least recently used goes first.
 const SMALL_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const DIRECTORY_CACHE_NAMES: usize = 100_000;
+const DIRECTORY_CACHE_COUNT: usize = 1024;
 
 /// What a path resolved to, kept for the cache TTL.
 #[derive(Clone, Debug, PartialEq)]
 enum Known {
     Present(Node),
     Absent,
+}
+
+struct CachedDirectory {
+    names: HashSet<String>,
+    fetched: Instant,
+}
+
+#[derive(Default)]
+struct Metadata {
+    entries: HashMap<String, (Known, Instant)>,
+    directories: HashMap<String, CachedDirectory>,
+    listed_names: usize,
+    generation: u64,
+}
+
+impl Metadata {
+    fn prune_entries(&mut self, ttl: Duration) {
+        if self.entries.len() > 100_000 {
+            self.entries.retain(|_, (_, at)| at.elapsed() < ttl);
+        }
+    }
+
+    fn record(&mut self, path: &str, known: Known, at: Instant) {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if let Some(directory) = self.directories.get_mut(parent) {
+            match &known {
+                Known::Present(_) => {
+                    if directory.names.insert(name.to_string()) {
+                        self.listed_names += 1;
+                    }
+                }
+                Known::Absent => {
+                    if directory.names.remove(name) {
+                        self.listed_names -= 1;
+                    }
+                }
+            }
+        }
+        self.entries.insert(path.to_string(), (known, at));
+        self.bound_directories();
+    }
+
+    fn bound_directories(&mut self) {
+        while self.listed_names > DIRECTORY_CACHE_NAMES
+            || self.directories.len() > DIRECTORY_CACHE_COUNT
+        {
+            let Some(oldest) = self
+                .directories
+                .iter()
+                .min_by_key(|(_, directory)| directory.fetched)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            if let Some(directory) = self.directories.remove(&oldest) {
+                self.listed_names -= directory.names.len();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CacheSnapshot {
+    generation: u64,
+    started: Instant,
 }
 
 /// A small object's bytes, valid while the object keeps this size and time.
@@ -103,7 +170,7 @@ pub struct S3Fs {
     /// How long a lookup, a miss or a small file's bytes are trusted.
     cache_ttl: Duration,
     /// path -> what it resolved to, and when.
-    meta: Mutex<HashMap<String, (Known, Instant)>>,
+    meta: Mutex<Metadata>,
     /// path -> the whole bytes of a small object.
     small: Mutex<HashMap<String, SmallFile>>,
 }
@@ -130,7 +197,7 @@ impl S3Fs {
             paths: Mutex::new(paths),
             staged: Mutex::new(HashMap::new()),
             cache_ttl,
-            meta: Mutex::new(HashMap::new()),
+            meta: Mutex::new(Metadata::default()),
             small: Mutex::new(HashMap::new()),
         })
     }
@@ -141,8 +208,15 @@ impl S3Fs {
             return None;
         }
         let meta = self.meta.lock().ok()?;
-        let (known, at) = meta.get(path)?;
-        (at.elapsed() < self.cache_ttl).then(|| known.clone())
+        if let Some((known, at)) = meta.entries.get(path) {
+            if at.elapsed() < self.cache_ttl {
+                return Some(known.clone());
+            }
+        }
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let directory = meta.directories.get(parent)?;
+        (directory.fetched.elapsed() < self.cache_ttl && !directory.names.contains(name))
+            .then_some(Known::Absent)
     }
 
     /// Record what `path` is. A change made through this mount calls this as
@@ -153,33 +227,120 @@ impl S3Fs {
         }
         if let Ok(mut meta) = self.meta.lock() {
             // Bounded: drop what has expired once the table grows large.
-            if meta.len() > 100_000 {
+            if meta.entries.len() > 100_000 {
                 let ttl = self.cache_ttl;
-                meta.retain(|_, (_, at)| at.elapsed() < ttl);
+                meta.entries.retain(|_, (_, at)| at.elapsed() < ttl);
             }
-            meta.insert(path.to_string(), (known, Instant::now()));
+            meta.generation = meta.generation.wrapping_add(1);
+            meta.record(path, known, Instant::now());
+        }
+    }
+
+    fn cache_snapshot(&self) -> CacheSnapshot {
+        CacheSnapshot {
+            generation: self.meta.lock().map(|meta| meta.generation).unwrap_or(0),
+            started: Instant::now(),
+        }
+    }
+
+    fn remember_observed(&self, path: &str, known: Known, snapshot: CacheSnapshot) {
+        if self.cache_ttl.is_zero() || snapshot.started.elapsed() >= self.cache_ttl {
+            return;
+        }
+        if let Ok(mut meta) = self.meta.lock() {
+            if meta.generation == snapshot.generation {
+                meta.prune_entries(self.cache_ttl);
+                meta.record(path, known, snapshot.started);
+            }
+        }
+    }
+
+    fn invalidate_copied_destination(&self, path: &str) {
+        if let Ok(mut meta) = self.meta.lock() {
+            meta.generation = meta.generation.wrapping_add(1);
+            meta.entries.remove(path);
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            if let Some(directory) = meta.directories.get_mut(parent) {
+                if directory.names.insert(name.to_string()) {
+                    meta.listed_names += 1;
+                }
+            }
+            meta.bound_directories();
         }
     }
 
     /// Record one listed level: every child, and the directory itself.
-    fn remember_listing(&self, dir: &str, listing: &s3::Listing) {
-        if !dir.is_empty() {
-            self.remember(dir, Known::Present(Node::Dir));
+    fn remember_listing(
+        &self,
+        dir: &str,
+        listing: &s3::Listing,
+        complete: bool,
+        snapshot: CacheSnapshot,
+    ) {
+        if self.cache_ttl.is_zero() || snapshot.started.elapsed() >= self.cache_ttl {
+            return;
         }
+        let Ok(mut meta) = self.meta.lock() else {
+            return;
+        };
+        if meta.generation != snapshot.generation {
+            return;
+        }
+        meta.prune_entries(self.cache_ttl);
+        if !dir.is_empty()
+            && (listing.directory_marker_exists
+                || !listing.objects.is_empty()
+                || !listing.prefixes.is_empty())
+        {
+            meta.record(dir, Known::Present(Node::Dir), snapshot.started);
+        }
+        let mut names = HashSet::new();
         for d in &listing.prefixes {
-            self.remember(&Self::join(dir, d), Known::Present(Node::Dir));
+            names.insert(d.clone());
+            meta.record(
+                &Self::join(dir, d),
+                Known::Present(Node::Dir),
+                snapshot.started,
+            );
         }
         for o in &listing.objects {
             if o.key.ends_with('/') {
+                let name = o.key.trim_end_matches('/');
+                if !name.is_empty() {
+                    names.insert(name.to_string());
+                    meta.record(
+                        &Self::join(dir, name),
+                        Known::Present(Node::Dir),
+                        snapshot.started,
+                    );
+                }
                 continue;
             }
-            self.remember(
+            names.insert(o.key.clone());
+            meta.record(
                 &Self::join(dir, &o.key),
                 Known::Present(Node::File {
                     size: o.size,
                     mtime: o.last_modified_secs,
                 }),
+                snapshot.started,
             );
+        }
+        let single_level = names
+            .iter()
+            .all(|name| !name.is_empty() && !name.contains('/'));
+        if complete && single_level && names.len() <= DIRECTORY_CACHE_NAMES {
+            if let Some(old) = meta.directories.insert(
+                dir.to_string(),
+                CachedDirectory {
+                    names,
+                    fetched: snapshot.started,
+                },
+            ) {
+                meta.listed_names -= old.names.len();
+            }
+            meta.listed_names += meta.directories[dir].names.len();
+            meta.bound_directories();
         }
     }
 
@@ -353,6 +514,7 @@ impl S3Fs {
             Some(Known::Absent) => return None,
             None => {}
         }
+        let snapshot = self.cache_snapshot();
         let mut head_failed = false;
         match self.client.head(path) {
             Ok(Some(info)) => {
@@ -360,7 +522,7 @@ impl S3Fs {
                     size: info.size,
                     mtime: info.last_modified_secs,
                 };
-                self.remember(path, Known::Present(node.clone()));
+                self.remember_observed(path, Known::Present(node.clone()), snapshot);
                 return Some(node);
             }
             Ok(None) => {}
@@ -371,17 +533,20 @@ impl S3Fs {
         }
         // Not an object: it may still be a directory prefix. The listing that
         // answers that also describes its children, which come next.
-        match self.client.list_dir(path) {
-            Ok(l)
+        match self.client.list_dir_snapshot(path) {
+            Ok((l, complete))
                 if l.directory_marker_exists || !l.objects.is_empty() || !l.prefixes.is_empty() =>
             {
-                self.remember_listing(path, &l);
+                self.remember_listing(path, &l, complete, snapshot);
                 Some(Node::Dir)
             }
             // Only a definite answer is remembered: a failed HEAD or LIST is a
             // transient error, not proof the path is absent.
-            Ok(_) if !head_failed => {
-                self.remember(path, Known::Absent);
+            Ok((listing, complete)) if !head_failed => {
+                self.remember_listing(path, &listing, complete, snapshot);
+                if complete {
+                    self.remember_observed(path, Known::Absent, snapshot);
+                }
                 None
             }
             _ => None,
@@ -606,7 +771,8 @@ impl Filesystem for S3Fs {
                 if offset > 0 {
                     return Reply::Directory(Vec::new()); // single-shot listing
                 }
-                let listing = match self.client.list_dir(&path) {
+                let snapshot = self.cache_snapshot();
+                let (listing, complete) = match self.client.list_dir_snapshot(&path) {
                     Ok(l) => l,
                     Err(e) => {
                         tracing::warn!(path, error = %e, "list failed");
@@ -615,7 +781,7 @@ impl Filesystem for S3Fs {
                 };
                 // `ls -l` and the lookups that follow a listing then cost
                 // nothing: the listing already said what each child is.
-                self.remember_listing(&path, &listing);
+                self.remember_listing(&path, &listing, complete, snapshot);
                 let mut buf = Vec::new();
                 let mut next = 1u64;
                 for (name, kind) in [(".", DT_DIR), ("..", DT_DIR)] {
@@ -937,9 +1103,7 @@ impl Filesystem for S3Fs {
                     }
                 };
                 self.forget_bytes(&to);
-                if let Ok(mut meta) = self.meta.lock() {
-                    meta.remove(&to);
-                }
+                self.invalidate_copied_destination(&to);
                 if let Err(error) = self.client.delete(&from) {
                     tracing::warn!(from, to, error = %error, "rename source delete failed");
                     return Reply::Error(libc::EIO);
@@ -1352,7 +1516,7 @@ mod tests {
         fs.client = server.client("");
         create_empty_directory(&fs);
         assert_eq!(fs.stat("empty"), Some(Node::Dir));
-        fs.meta.lock().unwrap().get_mut("empty").unwrap().1 =
+        fs.meta.lock().unwrap().entries.get_mut("empty").unwrap().1 =
             Instant::now() - Duration::from_secs(120);
         assert_eq!(fs.stat("empty"), Some(Node::Dir));
         assert_eq!(server.finish().len(), 3);
@@ -1519,7 +1683,7 @@ mod tests {
             prefixes: vec!["sub".into()],
             ..Default::default()
         };
-        fs.remember_listing("d", &listing);
+        fs.remember_listing("d", &listing, true, fs.cache_snapshot());
         fs.remember("d/missing", Known::Absent);
         assert!(matches!(
             fs.stat("d/a.txt"),
@@ -1537,6 +1701,214 @@ mod tests {
         let fs = fs_with_ttl(Duration::ZERO);
         fs.remember("d/a.txt", Known::Present(Node::Dir));
         assert!(fs.known("d/a.txt").is_none());
+    }
+
+    #[test]
+    fn complete_empty_directory_answers_sibling_misses_without_requests() {
+        let server = crate::test_support::Server::new(vec![
+            ("HEAD", "/b/empty", 404, ""),
+            (
+                "GET",
+                "/b/",
+                200,
+                "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+            ),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        assert!(fs.stat("empty").is_none());
+        fs.remember("empty", Known::Present(Node::Dir));
+        for name in ["file", ".file.tmp", "other"] {
+            let path = format!("empty/{name}");
+            assert_eq!(fs.known(&path), Some(Known::Absent));
+            assert!(fs.stat(&path).is_none());
+        }
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn incomplete_or_disabled_listing_cache_never_proves_a_miss() {
+        for (ttl, complete) in [(Duration::ZERO, true), (Duration::from_secs(60), false)] {
+            let fs = fs_with_ttl(ttl);
+            fs.remember_listing(
+                "dir",
+                &s3::Listing::default(),
+                complete,
+                fs.cache_snapshot(),
+            );
+            assert_eq!(fs.known("dir/missing"), None);
+        }
+    }
+
+    #[test]
+    fn incomplete_directory_probe_does_not_cache_a_negative_answer() {
+        let server = crate::test_support::Server::new(vec![
+            ("HEAD", "/b/missing", 404, ""),
+            ("GET", "/b/", 200, "<ListBucketResult/>"),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        assert!(fs.stat("missing").is_none());
+        assert_eq!(fs.known("missing"), None);
+        assert_eq!(fs.known("missing/child"), None);
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn inferred_misses_and_local_updates_do_not_extend_listing_lifetime() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        fs.remember_listing("dir", &s3::Listing::default(), true, fs.cache_snapshot());
+        let fetched = fs.meta.lock().unwrap().directories["dir"].fetched;
+        assert_eq!(fs.known("dir/first"), Some(Known::Absent));
+        fs.remember("dir/new", Known::Present(Node::File { size: 3, mtime: 1 }));
+        assert_eq!(fs.meta.lock().unwrap().directories["dir"].fetched, fetched);
+        fs.meta
+            .lock()
+            .unwrap()
+            .directories
+            .get_mut("dir")
+            .unwrap()
+            .fetched = Instant::now() - Duration::from_secs(61);
+        assert_eq!(fs.known("dir/first"), None);
+        assert_eq!(fs.known("dir/second"), None);
+    }
+
+    #[test]
+    fn local_changes_fence_out_old_listings_and_lookup_answers() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        let old = fs.cache_snapshot();
+        fs.remember_listing("dir", &s3::Listing::default(), true, old);
+        fs.remember("dir/new", Known::Present(Node::File { size: 3, mtime: 1 }));
+        fs.remember_observed("dir/new", Known::Absent, old);
+        fs.remember_listing("dir", &s3::Listing::default(), true, old);
+        assert!(matches!(
+            fs.known("dir/new"),
+            Some(Known::Present(Node::File { size: 3, .. }))
+        ));
+        assert!(fs.meta.lock().unwrap().directories["dir"]
+            .names
+            .contains("new"));
+        let before_delete = fs.cache_snapshot();
+        fs.remember("dir/new", Known::Absent);
+        let stale = s3::Listing {
+            objects: vec![s3::ObjectInfo {
+                key: "new".into(),
+                size: 3,
+                last_modified_secs: 1,
+            }],
+            ..Default::default()
+        };
+        fs.remember_listing("dir", &stale, true, before_delete);
+        fs.remember_observed("dir/new", Known::Present(Node::Dir), before_delete);
+        assert_eq!(fs.known("dir/new"), Some(Known::Absent));
+        assert!(!fs.meta.lock().unwrap().directories["dir"]
+            .names
+            .contains("new"));
+    }
+
+    #[test]
+    fn slow_responses_do_not_receive_a_fresh_cache_lifetime() {
+        let fs = fs_with_ttl(Duration::from_secs(1));
+        let snapshot = CacheSnapshot {
+            generation: 0,
+            started: Instant::now() - Duration::from_secs(2),
+        };
+        fs.remember_listing("dir", &s3::Listing::default(), true, snapshot);
+        fs.remember_observed("dir/file", Known::Absent, snapshot);
+        assert_eq!(fs.known("dir/file"), None);
+        assert!(fs.meta.lock().unwrap().directories.is_empty());
+    }
+
+    #[test]
+    fn copied_destination_is_not_hidden_by_a_complete_listing() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/to", 200, COPIED_OBJECT),
+            ("DELETE", "/b/from", 204, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        fs.remember_listing("", &s3::Listing::default(), true, fs.cache_snapshot());
+        assert_eq!(fs.known("to"), Some(Known::Absent));
+        assert!(matches!(rename(&fs, "from", "to"), Reply::Ok));
+        assert_eq!(fs.known("to"), None);
+        assert!(fs.meta.lock().unwrap().directories[""].names.contains("to"));
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn marker_objects_and_file_directory_collisions_are_not_negative_hits() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        let listing = s3::Listing {
+            prefixes: vec!["both".into()],
+            objects: vec![
+                s3::ObjectInfo {
+                    key: "child/".into(),
+                    size: 0,
+                    last_modified_secs: 0,
+                },
+                s3::ObjectInfo {
+                    key: "both".into(),
+                    size: 2,
+                    last_modified_secs: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        fs.remember_listing("dir", &listing, true, fs.cache_snapshot());
+        assert_eq!(fs.known("dir/child"), Some(Known::Present(Node::Dir)));
+        assert!(matches!(
+            fs.known("dir/both"),
+            Some(Known::Present(Node::File { size: 2, .. }))
+        ));
+        assert_eq!(fs.known("dir/absent"), Some(Known::Absent));
+    }
+
+    #[test]
+    fn non_delimited_provider_responses_cannot_hide_implicit_directories() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        let listing = s3::Listing {
+            objects: vec![s3::ObjectInfo {
+                key: "nested/file".into(),
+                size: 2,
+                last_modified_secs: 1,
+            }],
+            ..Default::default()
+        };
+        fs.remember_listing("dir", &listing, true, fs.cache_snapshot());
+        assert_eq!(fs.known("dir/nested"), None);
+        assert_eq!(fs.known("dir/missing"), None);
+    }
+
+    #[test]
+    fn directory_cache_bounds_both_names_and_empty_directories() {
+        let mut meta = Metadata::default();
+        for index in 0..=DIRECTORY_CACHE_COUNT {
+            meta.directories.insert(
+                index.to_string(),
+                CachedDirectory {
+                    names: HashSet::new(),
+                    fetched: Instant::now(),
+                },
+            );
+            meta.bound_directories();
+        }
+        assert_eq!(meta.directories.len(), DIRECTORY_CACHE_COUNT);
+        assert!(!meta.directories.contains_key("0"));
+        meta.directories.clear();
+        let names = (0..DIRECTORY_CACHE_NAMES)
+            .map(|index| index.to_string())
+            .collect();
+        meta.directories.insert(
+            "dir".into(),
+            CachedDirectory {
+                names,
+                fetched: Instant::now(),
+            },
+        );
+        meta.listed_names = DIRECTORY_CACHE_NAMES;
+        meta.record("dir/new", Known::Present(Node::Dir), Instant::now());
+        assert!(meta.directories.is_empty());
+        assert_eq!(meta.listed_names, 0);
     }
 
     // `rename(2)` keeps the inode and moves the name onto it. Forgetting the
