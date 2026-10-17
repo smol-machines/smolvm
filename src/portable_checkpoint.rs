@@ -6184,7 +6184,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         for layer in &pinned {
             install_pinned_layer(&vm_data, layer, staged.path())?;
         }
-        tracing::info!(machine = %record.name, phase = "extract", elapsed_ms = extract_started.elapsed().as_millis(), "paused resume phase completed");
+        tracing::info!(machine = %record.name, phase = "extract", staging = %parent.display(), elapsed_ms = extract_started.elapsed().as_millis(), "paused resume phase completed");
         clear_stale_restore_state(&vm_data)?;
         install_with(
             staged.path(),
@@ -6200,11 +6200,10 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
     // Pinned layers are not in the artifact's size, and link only on disk.
     #[cfg(target_os = "linux")]
     if let Some(root) = restore_tmpfs_root().filter(|_| pinned.is_empty()) {
-        let needed = footer
-            .assets_size
-            .saturating_mul(4)
-            .saturating_add(64 << 20);
-        if free_bytes(&root).is_some_and(|free| free >= needed) {
+        let needed = paused_restore_staging_bytes(footer.assets_size, checkpoint, keep_disks);
+        let available = free_bytes(&root);
+        tracing::info!(machine = %record.name, needed_bytes = needed, available_bytes = available, "paused resume tmpfs admission");
+        if available.is_some_and(|free| free >= needed) {
             match extract_and_install(&root) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
@@ -6215,6 +6214,31 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         }
     }
     extract_and_install(&vm_data)
+}
+
+#[cfg(target_os = "linux")]
+fn paused_restore_staging_bytes(
+    compressed_bytes: u64,
+    checkpoint: &PortableCheckpointManifest,
+    keep_disks: bool,
+) -> u64 {
+    let mut logical_bytes = expected_assets(checkpoint)
+        .into_iter()
+        .map(|(asset, _)| asset.size)
+        .chain(checkpoint.credential_ca.iter().map(|asset| asset.size))
+        .fold(0u64, u64::saturating_add);
+    if !keep_disks {
+        logical_bytes = checkpoint
+            .disks
+            .iter()
+            .flat_map(|disk| &disk.files)
+            .map(|file| file.asset.size)
+            .fold(logical_bytes, u64::saturating_add);
+    }
+    compressed_bytes
+        .saturating_mul(4)
+        .min(logical_bytes)
+        .saturating_add(64 << 20)
 }
 
 /// Remove what an earlier restore left in a stopped machine's data dir before
@@ -6407,6 +6431,59 @@ mod tests {
         ));
         let other = std::io::Error::from(std::io::ErrorKind::Other);
         assert!(!staged_by_root_only(&staged, &other));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paused_restore_tmpfs_estimate_is_capped_by_the_inputs_we_extract() {
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.memory.size = 8 << 30;
+        checkpoint.state.size = 4096;
+        checkpoint.layout.size = 4096;
+        checkpoint.credential_ca = Some(CheckpointAsset {
+            path: "checkpoint/credential-ca.bin".into(),
+            size: 2048,
+            sha256: String::new(),
+        });
+        assert_eq!(
+            paused_restore_staging_bytes(4 << 30, &checkpoint, true),
+            (8 << 30) + 10240 + (64 << 20)
+        );
+        assert_eq!(
+            paused_restore_staging_bytes(128 << 20, &checkpoint, true),
+            (512 << 20) + (64 << 20)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paused_restore_tmpfs_estimate_counts_disks_only_when_extracting_them() {
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.disks = vec![CheckpointDisk {
+            role: "storage".into(),
+            files: vec![CheckpointDiskFile {
+                asset: CheckpointAsset {
+                    path: "checkpoint/disks/storage/0".into(),
+                    size: 16 << 30,
+                    sha256: String::new(),
+                },
+                target: "storage.raw".into(),
+                format: "raw".into(),
+            }],
+        }];
+        assert_eq!(
+            paused_restore_staging_bytes(8 << 30, &checkpoint, true),
+            3 + (64 << 20)
+        );
+        assert_eq!(
+            paused_restore_staging_bytes(8 << 30, &checkpoint, false),
+            (16 << 30) + 3 + (64 << 20)
+        );
+        checkpoint.memory.size = u64::MAX;
+        assert_eq!(
+            paused_restore_staging_bytes(u64::MAX, &checkpoint, false),
+            u64::MAX
+        );
     }
 
     #[test]
