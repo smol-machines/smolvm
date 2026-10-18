@@ -3138,6 +3138,31 @@ fn install_file_atomic(
 /// With no running workload the local write is correct and is kept: overlayfs
 /// reads `upper` at mount time, so seeding it before the container starts is
 /// exactly how the file becomes visible once it does.
+/// The uid and gid the workload container runs as, read from its OCI bundle.
+/// An upload with no explicit owner is given to that user, so a non-root
+/// workload (an image with `USER`) can read and replace what was uploaded;
+/// root workloads and VM-level writes are left as written.
+fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
+    let Some(merged) = root.overlay_merged_root() else {
+        return (None, None);
+    };
+    let Some(config) = merged.parent().map(|p| p.join("bundle").join("config.json")) else {
+        return (None, None);
+    };
+    let Ok(text) = std::fs::read_to_string(&config) else {
+        return (None, None);
+    };
+    let Ok(spec) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (None, None);
+    };
+    let uid = spec["process"]["user"]["uid"].as_u64().map(|u| u as u32);
+    let gid = spec["process"]["user"]["gid"].as_u64().map(|g| g as u32);
+    match uid {
+        Some(0) | None => (None, None),
+        Some(uid) => (Some(uid), gid),
+    }
+}
+
 fn handle_file_write(
     path: &str,
     data: &[u8],
@@ -3149,6 +3174,11 @@ fn handle_file_write(
     let root = match io_target::IoRoot::resolve(target) {
         Ok(root) => root,
         Err(response) => return response,
+    };
+    let (uid, gid) = if uid.is_none() && gid.is_none() {
+        workload_owner(&root)
+    } else {
+        (uid, gid)
     };
     match root.namespace() {
         nsfile::GuestNs::Container(ns) => match ns.write(path, data, mode, uid, gid) {
@@ -3414,6 +3444,11 @@ fn handle_file_write_begin(
     let resolved = match resolve_guest_io_path(&path, FilePathAccess::Write, &root) {
         Ok(p) => p,
         Err(resp) => return (None, resp),
+    };
+    let (uid, gid) = if uid.is_none() && gid.is_none() {
+        workload_owner(&root)
+    } else {
+        (uid, gid)
     };
     match WriteSession::open(resolved, mode, uid, gid, total_size, root) {
         Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
@@ -10058,5 +10093,49 @@ mod pull_heartbeat_tests {
             progress_frames(&stream),
             [(Some(100), Some("sha256:small".to_string()))]
         );
+    }
+}
+
+#[cfg(test)]
+mod workload_owner_tests {
+    use super::*;
+
+    fn root_with_user(dir: &std::path::Path, user: &str) -> io_target::IoRoot {
+        let merged = dir.join("merged");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(dir.join("bundle")).unwrap();
+        std::fs::write(
+            dir.join("bundle").join("config.json"),
+            format!(r#"{{"ociVersion":"1.0.2","process":{{"user":{user},"args":["sh"]}}}}"#),
+        )
+        .unwrap();
+        io_target::IoRoot::Overlay {
+            workload_id: "persistent-test".into(),
+            merged,
+        }
+    }
+
+    #[test]
+    fn uploads_default_to_the_non_root_workload_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_with_user(dir.path(), r#"{"uid":1001,"gid":1001}"#);
+        assert_eq!(workload_owner(&root), (Some(1001), Some(1001)));
+    }
+
+    #[test]
+    fn root_workloads_and_vm_writes_leave_ownership_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_with_user(dir.path(), r#"{"uid":0,"gid":0}"#);
+        assert_eq!(workload_owner(&root), (None, None));
+        assert_eq!(workload_owner(&io_target::IoRoot::Vm), (None, None));
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_bundle_leaves_ownership_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = dir.path().join("merged");
+        std::fs::create_dir_all(&merged).unwrap();
+        let root = io_target::IoRoot::Overlay { workload_id: "persistent-x".into(), merged };
+        assert_eq!(workload_owner(&root), (None, None));
     }
 }
