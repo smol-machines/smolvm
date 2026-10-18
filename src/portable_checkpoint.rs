@@ -1385,6 +1385,21 @@ pub fn restored_guest_subnet(checkpoint: &PortableCheckpointManifest) -> Result<
         .transpose()
 }
 
+/// The resolver options the captured guest wrote into its resolv.conf. The
+/// artifact is untrusted, so each one is held to the rules `--dns-option` is.
+pub fn restored_dns_options(checkpoint: &PortableCheckpointManifest) -> Result<Vec<String>> {
+    let options = checkpoint
+        .network
+        .as_ref()
+        .map(|network| network.dns_options.clone())
+        .unwrap_or_default();
+    for option in &options {
+        smolvm_protocol::resolv::validate_option(option)
+            .map_err(|error| Error::config("restore checkpoint DNS options", error))?;
+    }
+    Ok(options)
+}
+
 fn restored_record(
     name: &str,
     manifest: &PackManifest,
@@ -1446,6 +1461,7 @@ fn restored_record(
         .map_err(|error: std::net::AddrParseError| {
             Error::config("restore checkpoint DNS", error.to_string())
         })?;
+    record.dns_options = restored_dns_options(checkpoint)?;
     record.network_name = network.and_then(|network| network.network_name.clone());
     record.guest_subnet = restored_guest_subnet(checkpoint)?;
     // The restored machine continues this checkpoint's history.
@@ -3843,6 +3859,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
             .collect(),
         backend,
         dns: vm.dns.map(|dns| dns.to_string()),
+        dns_options: vm.dns_options.clone(),
         network_name: vm.network_name.clone(),
         guest_subnet: vm.guest_subnet.clone(),
         allowed_cidrs: vm.allowed_cidrs.clone(),
@@ -7277,12 +7294,20 @@ mod tests {
             enabled: true,
             backend: Some("virtio-net".into()),
             guest_subnet: Some("10.200.0.0/30".into()),
+            dns_options: vec!["timeout:1".into(), "use-vc".into()],
             ..Default::default()
         });
         let restored = restored_record("local-restore", &manifest, &remote).unwrap();
         // The restored guest still has its captured address, so the host side
         // must come back on the same subnet.
         assert_eq!(restored.guest_subnet.as_deref(), Some("10.200.0.0/30"));
+        // It also keeps the resolv.conf it wrote at boot, and later cold boots
+        // write the same options from the record.
+        assert_eq!(restored.dns_options, ["timeout:1", "use-vc"]);
+        // The artifact is untrusted: an option `--dns-option` would refuse is
+        // refused on restore too.
+        remote.network.as_mut().unwrap().dns_options = vec!["options rotate".into()];
+        assert!(restored_record("local-restore", &manifest, &remote).is_err());
         // The restored machine continues the checkpoint's history.
         assert_eq!(
             restored.checkpoint_head.as_deref(),
@@ -8272,6 +8297,7 @@ mod tests {
         record.restart.max_retries = 7;
         record.restart.max_backoff_secs = 19;
         record.guest_subnet = Some("10.200.0.0/30".to_string());
+        record.dns_options = vec!["timeout:1".into(), "use-vc".into()];
 
         validate_capture_profile(&record, false).expect("image + network + ports must be portable");
         let workload = checkpoint_workload(&record.name, &record).unwrap();
@@ -8284,6 +8310,7 @@ mod tests {
         assert!(network.enabled);
         assert_eq!(network.backend.as_deref(), Some("virtio-net"));
         assert_eq!(network.guest_subnet.as_deref(), Some("10.200.0.0/30"));
+        assert_eq!(network.dns_options, ["timeout:1", "use-vc"]);
         assert_eq!(
             network.ports,
             vec![CheckpointPort {

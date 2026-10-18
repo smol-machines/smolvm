@@ -2891,6 +2891,30 @@ mod tests {
     }
 
     #[test]
+    fn update_replaces_or_clears_dns_options() {
+        let parse = |args: &[&str]| {
+            TestMachineCli::try_parse_from(
+                ["machine", "update", "--name", "dns-3"].iter().chain(args),
+            )
+        };
+        let MachineCmd::Update(cmd) =
+            parse(&["--dns-option", "timeout:1", "--dns-option", "use-vc"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected machine update");
+        };
+        assert_eq!(cmd.dns_option, ["timeout:1", "use-vc"]);
+        assert!(!cmd.changes_only_egress() && !cmd.changes_only_ports());
+        let MachineCmd::Update(cmd) = parse(&["--clear-dns-options"]).unwrap().command else {
+            panic!("expected machine update");
+        };
+        assert!(cmd.clear_dns_options && cmd.dns_option.is_empty());
+        assert!(parse(&["--dns-option", "bogus"]).is_err());
+        assert!(parse(&["--dns-option", "use-vc", "--clear-dns-options"]).is_err());
+    }
+
+    #[test]
     fn create_accepts_keep_identity() {
         let cli = TestMachineCli::try_parse_from([
             "machine",
@@ -4886,6 +4910,30 @@ impl CreateCmd {
             Some(checkpoint) => smolvm::portable_checkpoint::restored_guest_subnet(checkpoint)?,
             None => None,
         };
+        // The restored guest keeps the resolv.conf it wrote at boot, so its
+        // options are the checkpoint's; a different set would only be written
+        // to the record, never to the guest.
+        let dns_options = match checkpoint.as_ref() {
+            Some(checkpoint) => {
+                let captured = smolvm::portable_checkpoint::restored_dns_options(checkpoint)?;
+                if !self.dns_option.is_empty() && self.dns_option != captured {
+                    return Err(smolvm::Error::config(
+                        "create from .smolcheckpoint",
+                        format!(
+                            "a live checkpoint resumes with the resolver options it was captured with ({}); \
+                             set --dns-option on the source machine before checkpointing it",
+                            if captured.is_empty() {
+                                "none".to_string()
+                            } else {
+                                captured.join(" ")
+                            }
+                        ),
+                    ));
+                }
+                captured
+            }
+            None => self.dns_option.clone(),
+        };
         let cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
         // A restored guest resumes with the devices it was captured with: a
         // checkpoint of a machine with a cache disk restores over the same
@@ -4962,7 +5010,7 @@ impl CreateCmd {
             net: network,
             network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
-            dns_options: self.dns_option.clone(),
+            dns_options,
             network_name: self.network_name.clone(),
             guest_subnet: checkpoint_subnet.or_else(|| self.guest_subnet.clone()),
             init: self.init.clone(),
@@ -6330,6 +6378,17 @@ pub struct UpdateCmd {
     /// Set the host block I/O engine for the next start.
     #[arg(long = "block-io", value_enum)]
     pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
+
+    /// Replace the guest resolv.conf options (repeatable, in order), as
+    /// `machine create --dns-option` sets them. Written when the guest next
+    /// boots; a machine waiting to resume a checkpoint resumes with the file it
+    /// was captured with and boots with these afterwards.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, conflicts_with = "clear_dns_options")]
+    pub dns_option: Vec<String>,
+
+    /// Remove every guest resolv.conf option.
+    #[arg(long)]
+    pub clear_dns_options: bool,
 }
 
 impl UpdateCmd {
@@ -6395,6 +6454,8 @@ impl UpdateCmd {
             storage,
             overlay,
             block_io,
+            dns_option,
+            clear_dns_options,
         } = self;
         let egress = *net
             || *outbound_localhost_only
@@ -6420,7 +6481,9 @@ impl UpdateCmd {
             || *no_rosetta
             || storage.is_some()
             || overlay.is_some()
-            || block_io.is_some();
+            || block_io.is_some()
+            || !dns_option.is_empty()
+            || *clear_dns_options;
         (egress, ports, other)
     }
 
@@ -6838,6 +6901,15 @@ impl UpdateCmd {
             if let Some(ref wd) = self.workdir {
                 changes.push(format!("  workdir: {}", wd));
                 r.workdir = Some(wd.clone());
+            }
+
+            // Resolver options
+            if !self.dns_option.is_empty() {
+                changes.push(format!("  dns options: {}", self.dns_option.join(" ")));
+                r.dns_options = self.dns_option.clone();
+            } else if self.clear_dns_options {
+                changes.push("  dns options: none".to_string());
+                r.dns_options.clear();
             }
 
             // GPU

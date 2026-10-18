@@ -487,6 +487,11 @@ pub struct CheckpointNetwork {
     /// Custom IPv4 DNS resolver, when one was explicitly configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<String>,
+    /// Resolver options of the captured guest's resolv.conf, in order. The
+    /// restored guest keeps the file it wrote at boot, so the record must say
+    /// the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_options: Vec<String>,
     /// Named local inter-VM network joined by the captured machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
