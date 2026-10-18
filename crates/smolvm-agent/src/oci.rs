@@ -1220,7 +1220,10 @@ fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
                 "noexec".to_string(),
                 "nodev".to_string(),
                 "mode=1777".to_string(),
-                "size=65536k".to_string(),
+                // Half the guest's RAM, as on a Linux VM or a hosted CI runner rather
+                // than Docker's 64 MiB: browsers and ML loaders size buffers from it.
+                // tmpfs takes memory only as files are written.
+                "size=50%".to_string(),
             ],
         },
         // /dev/mqueue - POSIX message queues
@@ -1365,6 +1368,18 @@ fn is_dns_label(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dev_shm_takes_half_the_guest_ram_in_every_mode() {
+        for unprivileged in [false, true] {
+            let mounts = super::default_mounts(unprivileged);
+            let shm = mounts
+                .iter()
+                .find(|mount| mount.destination == "/dev/shm")
+                .expect("/dev/shm is mounted");
+            assert!(shm.options.iter().any(|option| option == "size=50%"));
+        }
+    }
+
     #[test]
     fn dns_label_check_accepts_valid_names_rejects_the_rest() {
         use super::is_dns_label;

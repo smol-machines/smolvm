@@ -142,6 +142,28 @@ const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 pub(crate) const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
 
 #[cfg(target_os = "linux")]
+/// File watchers (webpack, jest, IDE servers) need more inotify watches than
+/// a small guest kernel defaults to (about 16k at 2 GiB). Raise them to what
+/// hosted CI runners and IDEs use; a watch costs memory only once added, and a
+/// higher value already set is kept.
+#[cfg(target_os = "linux")]
+fn raise_inotify_limits() {
+    for (path, wanted) in [
+        ("/proc/sys/fs/inotify/max_user_watches", 524_288u64),
+        ("/proc/sys/fs/inotify/max_user_instances", 1_024),
+    ] {
+        let current = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        if current.is_some_and(|current| current >= wanted) {
+            continue;
+        }
+        if let Err(error) = std::fs::write(path, wanted.to_string()) {
+            boot_log("WARN", &format!("raise {path} to {wanted}: {error}"));
+        }
+    }
+}
+
 fn raise_nofile_limit() {
     let desired = libc::rlimit {
         rlim_cur: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
@@ -341,6 +363,8 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     delegate_root_cgroup_controllers();
+    #[cfg(target_os = "linux")]
+    raise_inotify_limits();
 
     // Create /dev/dri device nodes only when GPU is enabled. The setup
     // function polls up to 500ms for the virtio-gpu driver to finish probing —
