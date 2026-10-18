@@ -7746,6 +7746,7 @@ mod tests {
     // resolve the link against its own root. A symlinked etc is refused too.
     #[test]
     fn symlinked_resolver_and_hosts_are_kept_and_never_written_through() {
+        let _guard = env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let outside = tmp.path().join("agent-file");
         std::fs::write(&outside, "agent's own\n").unwrap();
@@ -7785,6 +7786,7 @@ mod tests {
 
     #[test]
     fn a_regular_resolver_is_rewritten_and_a_missing_hosts_is_created() {
+        let _guard = env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("etc")).unwrap();
         std::fs::write(tmp.path().join("etc/resolv.conf"), "nameserver 9.9.9.9\n").unwrap();
