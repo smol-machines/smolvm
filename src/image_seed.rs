@@ -36,6 +36,8 @@
 //! one alive.
 
 #[cfg(unix)]
+pub(crate) use imp::qcow2_backing;
+#[cfg(unix)]
 pub use imp::{
     discard_unbooted_archive_storage, prewarm_recent_seeds, revalidate_seed, seed_root,
     seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
@@ -1211,7 +1213,7 @@ mod imp {
     }
 
     /// The backing file a qcow2 image names in its header, if it is one.
-    pub(super) fn qcow2_backing(path: &Path) -> Option<PathBuf> {
+    pub(crate) fn qcow2_backing(path: &Path) -> Option<PathBuf> {
         use std::io::{Read, Seek, SeekFrom};
         use std::os::unix::ffi::OsStrExt;
         let mut file = std::fs::File::open(path).ok()?;

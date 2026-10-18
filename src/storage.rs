@@ -134,6 +134,76 @@ fn seed_vm_mode_disks_by_copy(
     )
 }
 
+/// Give the machine whose data dir is `dest_dir` copy-on-write clones of the
+/// storage and overlay disks of the stopped machine in `source_dir`, with their
+/// format markers, so it boots the source's filesystem and never reads the
+/// source again.
+pub fn clone_machine_disks(source_dir: &Path, dest_dir: &Path) -> Result<()> {
+    let disks: Vec<(&str, PathBuf, DiskFormat)> = [STORAGE_DISK_FILENAME, OVERLAY_DISK_FILENAME]
+        .into_iter()
+        .map(|raw_filename| {
+            let (path, format) = crate::agent::resolve_disk_image(source_dir, raw_filename);
+            (raw_filename, path, format)
+        })
+        .filter(|(_, path, _)| path.exists())
+        .collect();
+    if disks.is_empty() {
+        return Err(Error::storage(
+            "clone machine disks",
+            format!("no disks in {}", source_dir.display()),
+        ));
+    }
+    for (_, path, format) in &disks {
+        if *format == DiskFormat::Qcow2 && backed_inside(path, source_dir) {
+            return Err(Error::storage(
+                "clone machine disks",
+                format!(
+                    "{} is a layer over another disk of the same machine",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    for (raw_filename, source, format) in disks {
+        let raw = dest_dir.join(raw_filename);
+        let marker = raw.with_extension("formatted");
+        for stale in [
+            raw.clone(),
+            raw.with_extension(DiskFormat::Qcow2.extension()),
+            marker.clone(),
+        ] {
+            match std::fs::remove_file(&stale) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into())
+                }
+                _ => {}
+            }
+        }
+        let dest = raw.with_extension(format.extension());
+        disk_utils::clone_or_copy_file(&source, &dest)?;
+        let source_marker = source_dir.join(raw_filename).with_extension("formatted");
+        if source_marker.exists() {
+            std::fs::copy(&source_marker, &marker)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn backed_inside(disk: &Path, dir: &Path) -> bool {
+    let Some(backing) = crate::image_seed::qcow2_backing(disk) else {
+        return false;
+    };
+    let backing = disk.parent().unwrap_or(dir).join(backing);
+    let backing = backing.canonicalize().unwrap_or(backing);
+    dir.canonicalize().is_ok_and(|dir| backing.starts_with(dir))
+}
+
+#[cfg(not(unix))]
+fn backed_inside(_: &Path, _: &Path) -> bool {
+    true
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct CowBaseMetadata {
@@ -1516,5 +1586,125 @@ mod tests {
                 true
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clone_machine_disks_tests {
+    use super::*;
+
+    fn write_disk(dir: &Path, filename: &str, contents: &[u8], formatted: bool) -> PathBuf {
+        let path = dir.join(filename);
+        std::fs::write(&path, contents).unwrap();
+        if formatted {
+            std::fs::write(path.with_extension("formatted"), "1").unwrap();
+        }
+        path
+    }
+
+    #[cfg(unix)]
+    fn qcow2_header_with_backing(backing: &str) -> Vec<u8> {
+        let offset: u64 = 72;
+        let mut header = Vec::new();
+        header.extend_from_slice(b"QFI\xfb");
+        header.extend_from_slice(&3u32.to_be_bytes());
+        header.extend_from_slice(&offset.to_be_bytes());
+        header.extend_from_slice(&(backing.len() as u32).to_be_bytes());
+        header.resize(offset as usize, 0);
+        header.extend_from_slice(backing.as_bytes());
+        header
+    }
+
+    #[test]
+    fn clones_both_disks_with_their_markers_and_stays_independent() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_disk(source.path(), STORAGE_DISK_FILENAME, b"storage", true);
+        write_disk(source.path(), OVERLAY_DISK_FILENAME, b"overlay", true);
+        std::fs::write(source.path().join("storage.seed"), "/seeds/x").unwrap();
+
+        clone_machine_disks(source.path(), dest.path()).unwrap();
+
+        let storage = dest.path().join(STORAGE_DISK_FILENAME);
+        let overlay = dest.path().join(OVERLAY_DISK_FILENAME);
+        assert_eq!(std::fs::read(&storage).unwrap(), b"storage");
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"overlay");
+        assert!(storage.with_extension("formatted").exists());
+        assert!(overlay.with_extension("formatted").exists());
+        assert!(!dest.path().join("storage.seed").exists());
+
+        std::fs::write(&storage, b"child write").unwrap();
+        assert_eq!(
+            std::fs::read(source.path().join(STORAGE_DISK_FILENAME)).unwrap(),
+            b"storage"
+        );
+    }
+
+    #[test]
+    fn replaces_stale_disks_and_skips_a_disk_the_source_never_made() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_disk(source.path(), STORAGE_DISK_FILENAME, b"storage", true);
+        write_disk(dest.path(), STORAGE_DISK_FILENAME, b"stale", false);
+        write_disk(dest.path(), "storage.qcow2", b"stale overlay", false);
+
+        clone_machine_disks(source.path(), dest.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.path().join(STORAGE_DISK_FILENAME)).unwrap(),
+            b"storage"
+        );
+        assert!(!dest.path().join("storage.qcow2").exists());
+        assert!(!dest.path().join(OVERLAY_DISK_FILENAME).exists());
+    }
+
+    #[test]
+    fn a_source_with_no_disks_is_refused() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        assert!(clone_machine_disks(source.path(), dest.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_qcow2_disk_backed_outside_the_source_is_cloned() {
+        let source = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let base = write_disk(shared.path(), "seed.raw", b"seed", false);
+        let header = qcow2_header_with_backing(base.to_str().unwrap());
+        write_disk(source.path(), "storage.qcow2", &header, true);
+
+        clone_machine_disks(source.path(), dest.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.path().join("storage.qcow2")).unwrap(),
+            header
+        );
+        assert!(dest.path().join("storage.formatted").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_qcow2_disk_backed_inside_the_source_is_refused() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::create_dir(source.path().join("s")).unwrap();
+        write_disk(
+            &source.path().join("s"),
+            "storage.raw",
+            b"generation",
+            false,
+        );
+        write_disk(
+            source.path(),
+            "storage.qcow2",
+            &qcow2_header_with_backing("s/storage.raw"),
+            true,
+        );
+
+        assert!(clone_machine_disks(source.path(), dest.path()).is_err());
+        assert!(!dest.path().join("storage.qcow2").exists());
     }
 }

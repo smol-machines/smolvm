@@ -105,6 +105,7 @@ smolvm machine exec --name NAME [-- COMMAND]      # run in existing VM
 smolvm machine shell [--name NAME]                # interactive shell (must be running)
 smolvm machine create --name NAME [OPTIONS]              # create persistent
 smolvm machine create --name NAME --from FILE.smolmachine  # from packed artifact
+smolvm machine create --name NAME --from-machine BASE  # CoW clone of a stopped machine's disks
 smolvm machine start [--name NAME]                # start (default: "default")
 smolvm machine stop [--name NAME] [--timeout SECS]  # stop (workload gets SIGTERM first)
 smolvm machine logs [--name NAME] [-f] [--tail N] # workload stdout/stderr, even when stopped

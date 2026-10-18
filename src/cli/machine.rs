@@ -2891,6 +2891,37 @@ mod tests {
     }
 
     #[test]
+    fn create_from_machine_takes_its_own_flags_but_no_image_or_pack() {
+        let cli = TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "child",
+            "--from-machine",
+            "base",
+            "-p",
+            "8080:80",
+            "-e",
+            "A=1",
+        ])
+        .unwrap();
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create");
+        };
+        assert_eq!(cmd.from_machine.as_deref(), Some("base"));
+        assert_eq!(cmd.port.len(), 1);
+        assert_eq!(cmd.env, ["A=1"]);
+        for conflicting in [["--image", "alpine"], ["--from", "app.smolmachine"]] {
+            let mut argv = vec!["machine", "create", "--from-machine", "base"];
+            argv.extend(conflicting);
+            assert!(
+                TestMachineCli::try_parse_from(&argv).is_err(),
+                "{conflicting:?}"
+            );
+        }
+    }
+
+    #[test]
     fn create_accepts_keep_identity() {
         let cli = TestMachineCli::try_parse_from([
             "machine",
@@ -4361,6 +4392,14 @@ pub struct CreateCmd {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
 
+    /// Start from copy-on-write clones of a stopped machine's disks, so the new
+    /// machine boots that machine's image and filesystem. Nothing else carries
+    /// over: env, secrets, network, ports, mounts and resources come from this
+    /// command's own flags, and the new machine does not depend on the other
+    /// one afterwards.
+    #[arg(long, value_name = "MACHINE", conflicts_with_all = ["from", "image"])]
+    pub from_machine: Option<String>,
+
     /// With --from <checkpoint>: restore an earlier generation the checkpoint
     /// retains — `~N` (N back along its history), a generation id, or an id
     /// prefix. Quote `~N` in zsh, e.g. `--at '~2'`. See `machine checkpoint-log`.
@@ -4647,7 +4686,10 @@ impl CreateCmd {
         }
         PortMapping::check_duplicates(&params.port)
             .map_err(|e| smolvm::Error::config("validate ports", e))?;
-        vm_common::create_vm(params)
+        match self.from_machine.as_deref() {
+            Some(base) => vm_common::create_vm_from_machine(params, base),
+            None => vm_common::create_vm(params),
+        }
     }
 
     /// Create a machine from a .smolmachine artifact.
