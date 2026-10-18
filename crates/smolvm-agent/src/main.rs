@@ -7093,23 +7093,7 @@ fn handle_streaming_pull<S: Read + Write>(
         "pulling image with progress"
     );
 
-    // Create a progress callback that sends updates over the stream
-    let progress_callback = |current: usize, total: usize, layer: &str| {
-        let percent = if total > 0 {
-            ((current as f64 / total as f64) * 100.0) as u8
-        } else {
-            0
-        };
-        let response = AgentResponse::Progress {
-            message: format!("Pulling layer {}/{}", current, total),
-            percent: Some(percent),
-            layer: Some(layer.to_string()),
-        };
-        // Ignore errors from progress updates - non-critical
-        let _ = send_response(stream, &response);
-    };
-
-    let response = AgentResponse::from_result(
+    let result = pull_with_heartbeat(stream, PULL_PROGRESS_HEARTBEAT, |progress| {
         storage::pull_image_with_progress_and_auth(
             image,
             cache_as,
@@ -7117,12 +7101,65 @@ fn handle_streaming_pull<S: Read + Write>(
             auth,
             proxy,
             no_proxy,
-            progress_callback,
-        ),
-        error_codes::PULL_FAILED,
-    );
+            progress,
+        )
+    })?;
+
+    let response = AgentResponse::from_result(result, error_codes::PULL_FAILED);
 
     send_response(stream, &response)
+}
+
+/// How long a pull may stay quiet before its latest progress is sent again;
+/// well inside the host's frame timeout.
+const PULL_PROGRESS_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run `pull` on its own thread and stream its progress. Progress arrives once
+/// per layer, and one large layer on a slow link can take longer than the
+/// host's frame timeout, so while the pull is quiet this thread (the stream's
+/// only writer) repeats the latest update every `heartbeat`.
+fn pull_with_heartbeat<S: Write, T: Send>(
+    stream: &mut S,
+    heartbeat: std::time::Duration,
+    pull: impl FnOnce(&mut dyn FnMut(usize, usize, &str)) -> T + Send,
+) -> Result<T, Box<dyn std::error::Error>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    std::thread::scope(|scope| {
+        let (updates, progress) = std::sync::mpsc::channel::<(usize, usize, String)>();
+        let pull = scope.spawn(move || {
+            pull(&mut |current, total, layer| {
+                let _ = updates.send((current, total, layer.to_string()));
+            })
+        });
+        let mut latest = None;
+        loop {
+            match progress.recv_timeout(heartbeat) {
+                Ok(update) => latest = Some(update),
+                Err(RecvTimeoutError::Timeout) => {
+                    latest.get_or_insert((0, 0, String::new()));
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            if let Some((current, total, layer)) = &latest {
+                // Ignore errors from progress updates - non-critical
+                let _ = send_response(stream, &pull_progress(*current, *total, layer));
+            }
+        }
+        pull.join().map_err(|_| "image pull thread panicked".into())
+    })
+}
+
+fn pull_progress(current: usize, total: usize, layer: &str) -> AgentResponse {
+    let percent = if total > 0 {
+        ((current as f64 / total as f64) * 100.0) as u8
+    } else {
+        0
+    };
+    AgentResponse::Progress {
+        message: format!("Pulling layer {}/{}", current, total),
+        percent: Some(percent),
+        layer: (!layer.is_empty()).then(|| layer.to_string()),
+    }
 }
 
 /// Handle image query request.
@@ -9707,5 +9744,68 @@ mod meminfo_tests {
         let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
         assert_eq!(m.total_bytes, 2048 * 1024);
         assert_eq!(m.available_bytes, 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod pull_heartbeat_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn progress_frames(mut bytes: &[u8]) -> Vec<(Option<u8>, Option<String>)> {
+        let mut frames = Vec::new();
+        while bytes.len() >= 4 {
+            let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let frame: AgentResponse = serde_json::from_slice(&bytes[4..4 + len]).unwrap();
+            let AgentResponse::Progress { percent, layer, .. } = frame else {
+                panic!("expected only progress frames");
+            };
+            frames.push((percent, layer));
+            bytes = &bytes[4 + len..];
+        }
+        frames
+    }
+
+    // A pull that stays quiet for several heartbeats, as one large layer on a
+    // slow link does, still sends a frame every heartbeat: before its first
+    // layer, and repeating the latest layer after it.
+    #[test]
+    fn a_quiet_pull_keeps_sending_its_latest_progress() {
+        let heartbeat = Duration::from_millis(40);
+        let mut stream = Vec::new();
+        let result = pull_with_heartbeat(&mut stream, heartbeat, |progress| {
+            std::thread::sleep(heartbeat * 3 + heartbeat / 2);
+            progress(1, 2, "sha256:big");
+            std::thread::sleep(heartbeat * 3 + heartbeat / 2);
+            "pulled"
+        })
+        .unwrap();
+        assert_eq!(result, "pulled");
+        let frames = progress_frames(&stream);
+        let before = frames
+            .iter()
+            .take_while(|(_, layer)| layer.is_none())
+            .count();
+        assert!(before >= 2, "heartbeats before the first layer: {frames:?}");
+        let after = &frames[before..];
+        assert!(after.len() >= 3, "the layer and its repeats: {frames:?}");
+        assert!(after
+            .iter()
+            .all(|frame| *frame == (Some(50), Some("sha256:big".to_string()))));
+    }
+
+    #[test]
+    fn a_pull_that_finishes_at_once_sends_nothing_extra() {
+        let mut stream = Vec::new();
+        let result = pull_with_heartbeat(&mut stream, Duration::from_secs(60), |progress| {
+            progress(1, 1, "sha256:small");
+            7
+        })
+        .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(
+            progress_frames(&stream),
+            [(Some(100), Some("sha256:small".to_string()))]
+        );
     }
 }
