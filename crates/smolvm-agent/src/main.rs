@@ -3146,7 +3146,10 @@ fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
     let Some(merged) = root.overlay_merged_root() else {
         return (None, None);
     };
-    let Some(config) = merged.parent().map(|p| p.join("bundle").join("config.json")) else {
+    let Some(config) = merged
+        .parent()
+        .map(|p| p.join("bundle").join("config.json"))
+    else {
         return (None, None);
     };
     let Ok(text) = std::fs::read_to_string(&config) else {
@@ -10135,7 +10138,10 @@ mod workload_owner_tests {
         let dir = tempfile::tempdir().unwrap();
         let merged = dir.path().join("merged");
         std::fs::create_dir_all(&merged).unwrap();
-        let root = io_target::IoRoot::Overlay { workload_id: "persistent-x".into(), merged };
+        let root = io_target::IoRoot::Overlay {
+            workload_id: "persistent-x".into(),
+            merged,
+        };
         assert_eq!(workload_owner(&root), (None, None));
     }
 }
