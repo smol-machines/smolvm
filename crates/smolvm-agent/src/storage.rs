@@ -4235,13 +4235,81 @@ impl OverlaySetup {
 // Mounted overlays must be written through merged, never their live upperdir.
 fn refresh_overlay_resolver(root: &Path) -> Result<()> {
     let path = root.join("etc/resolv.conf");
-    std::fs::write(&path, overlay_resolv_conf_contents()).map_err(|error| {
-        warn!(path = %path.display(), error = %error, "persistent overlay resolver refresh failed");
-        StorageError::new(format!(
-            "refresh persistent overlay resolver {}: {error}",
-            path.display()
-        ))
-    })
+    let written = open_overlay_etc_file(
+        root,
+        c"resolv.conf",
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+    )
+    .and_then(|file| match file {
+        Some(mut file) => file
+            .write_all(overlay_resolv_conf_contents().as_bytes())
+            .map(|()| true),
+        None => Ok(false),
+    });
+    match written {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            // A symlinked resolv.conf (systemd-resolved's stub, for one) is the
+            // image's own resolver setup: keep it rather than write through a
+            // link the agent would resolve against its own root.
+            info!(path = %path.display(), "resolv.conf is a symlink; leaving the image's resolver in place");
+            Ok(())
+        }
+        Err(error) => {
+            warn!(path = %path.display(), error = %error, "persistent overlay resolver refresh failed");
+            Err(StorageError::new(format!(
+                "refresh persistent overlay resolver {}: {error}",
+                path.display()
+            )))
+        }
+    }
+}
+
+/// Open `etc/<name>` under an overlay root without following a symlink at
+/// `etc` or at `name`: the image owns both, and a link would be resolved
+/// against the agent's root, not the container's. `None` when either one is a
+/// symlink. `flags` are the access flags for `name`.
+fn open_overlay_etc_file(
+    root: &Path,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::io::FromRawFd;
+    fn refused(fd: libc::c_int) -> std::io::Result<Option<libc::c_int>> {
+        if fd >= 0 {
+            return Ok(Some(fd));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ELOOP | libc::ENOTDIR) => Ok(None),
+            _ => Err(error),
+        }
+    }
+    let root = std::fs::File::open(root)?;
+    // SAFETY: `root` is open and the path is a NUL-terminated literal.
+    let etc = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            c"etc".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    let Some(etc) = refused(etc)? else {
+        return Ok(None);
+    };
+    // SAFETY: `etc` was just opened here and is owned from now on.
+    let etc = unsafe { std::fs::File::from_raw_fd(etc) };
+    // SAFETY: `etc` is open and `name` is NUL-terminated.
+    let file = unsafe {
+        libc::openat(
+            etc.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644 as libc::c_uint,
+        )
+    };
+    // SAFETY: an fd returned by `refused` was just opened and is owned here.
+    Ok(refused(file)?.map(|fd| unsafe { std::fs::File::from_raw_fd(fd) }))
 }
 
 fn overlay_resolv_conf_contents() -> String {
@@ -4282,11 +4350,22 @@ fn ensure_overlay_hostname(root: &Path, hostname: &str) -> Result<()> {
     if hostname.is_empty() || hostname == "localhost" {
         return Ok(());
     }
-    let path = root.join("etc/hosts");
-    let existing = match std::fs::read(&path) {
-        Ok(contents) => contents,
+    // A symlinked /etc/hosts belongs to the image: keep it, as with resolv.conf.
+    let existing = match open_overlay_etc_file(root, c"hosts", libc::O_RDONLY) {
+        Ok(Some(mut file)) => {
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            contents
+        }
+        Ok(None) => return Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&path, overlay_hosts_contents(hostname))?;
+            if let Some(mut file) = open_overlay_etc_file(
+                root,
+                c"hosts",
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            )? {
+                file.write_all(overlay_hosts_contents(hostname).as_bytes())?;
+            }
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -4300,7 +4379,10 @@ fn ensure_overlay_hostname(root: &Path, hostname: &str) -> Result<()> {
     }) {
         return Ok(());
     }
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+    let Some(mut file) = open_overlay_etc_file(root, c"hosts", libc::O_WRONLY | libc::O_APPEND)?
+    else {
+        return Ok(());
+    };
     if !existing.is_empty() && !existing.ends_with(b"\n") {
         file.write_all(b"\n")?;
     }
@@ -7657,6 +7739,65 @@ mod tests {
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .ends_with("127.0.1.1\tworker-2\n"));
+    }
+
+    // An image's symlinked resolv.conf or hosts (systemd-resolved's stub, or a
+    // link into its own /run) is kept, never written through: the agent would
+    // resolve the link against its own root. A symlinked etc is refused too.
+    #[test]
+    fn symlinked_resolver_and_hosts_are_kept_and_never_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("agent-file");
+        std::fs::write(&outside, "agent's own\n").unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        for name in ["resolv.conf", "hosts"] {
+            std::os::unix::fs::symlink(&outside, root.join("etc").join(name)).unwrap();
+        }
+        refresh_overlay_resolver(&root).unwrap();
+        ensure_overlay_hostname(&root, "worker-1").unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "agent's own\n");
+        for name in ["resolv.conf", "hosts"] {
+            assert!(std::fs::symlink_metadata(root.join("etc").join(name))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+
+        // A dangling link, the usual shape before systemd-resolved runs.
+        let dangling = tmp.path().join("dangling");
+        std::fs::create_dir_all(dangling.join("etc")).unwrap();
+        std::os::unix::fs::symlink(
+            "/run/systemd/resolve/stub-resolv.conf",
+            dangling.join("etc/resolv.conf"),
+        )
+        .unwrap();
+        refresh_overlay_resolver(&dangling).unwrap();
+
+        let linked_etc = tmp.path().join("linked-etc");
+        std::fs::create_dir_all(&linked_etc).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), linked_etc.join("etc")).unwrap();
+        refresh_overlay_resolver(&linked_etc).unwrap();
+        ensure_overlay_hostname(&linked_etc, "worker-1").unwrap();
+        assert!(!tmp.path().join("resolv.conf").exists());
+        assert!(!tmp.path().join("hosts").exists());
+    }
+
+    #[test]
+    fn a_regular_resolver_is_rewritten_and_a_missing_hosts_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("etc")).unwrap();
+        std::fs::write(tmp.path().join("etc/resolv.conf"), "nameserver 9.9.9.9\n").unwrap();
+        refresh_overlay_resolver(tmp.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("etc/resolv.conf")).unwrap(),
+            overlay_resolv_conf_contents()
+        );
+        ensure_overlay_hostname(tmp.path(), "worker-1").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("etc/hosts")).unwrap(),
+            overlay_hosts_contents("worker-1")
+        );
     }
 
     #[test]
