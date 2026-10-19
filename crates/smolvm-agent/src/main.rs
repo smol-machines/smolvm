@@ -90,7 +90,6 @@ mod credentials;
 mod cuda;
 mod dirwatch;
 mod disk_trim;
-mod dns_proxy;
 mod docker_bridge;
 mod forkpoint;
 mod io_target;
@@ -445,23 +444,19 @@ fn main() {
         }
         Ok(false) => {
             // TSI mode or no network. The overlay may contain a stale
-            // "nameserver 127.0.0.1" written by a previous --allow-host run.
-            // TSI forwards UDP to the resolver directly, so reset resolv.conf to
-            // a known-good value unless the DNS filter proxy is about to
-            // overwrite it with 127.0.0.1 anyway. Honor an explicit `--dns`
+            // "nameserver 127.0.0.1" written by an older guest DNS proxy. TSI
+            // forwards UDP to the resolver directly, so reset resolv.conf to a
+            // known-good value. Honor an explicit `--dns`
             // override (forwarded by the host as guest_env::DNS) — the virtio
             // path already derives the guest resolver from the same env var, so
             // both backends now agree on which nameserver the guest uses. This
             // is what makes `--dns` work on a network where the public resolvers
             // (1.1.1.1/8.8.8.8) are blocked.
-            if !dns_proxy::is_enabled() {
-                let dns_override = std::env::var(guest_env::DNS).ok();
-                let current = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-                if let Some(new) =
-                    tsi_resolv_conf(dns_override.as_deref(), &current, &resolv_options())
-                {
-                    let _ = std::fs::write("/etc/resolv.conf", new);
-                }
+            let dns_override = std::env::var(guest_env::DNS).ok();
+            let current = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+            if let Some(new) = tsi_resolv_conf(dns_override.as_deref(), &current, &resolv_options())
+            {
+                let _ = std::fs::write("/etc/resolv.conf", new);
             }
         }
         Err(err) => {
@@ -569,12 +564,6 @@ fn main() {
     if rosetta::is_enabled() {
         info!("Rosetta 2 requested, setting up x86_64 translation");
         rosetta::setup();
-    }
-
-    // Start DNS filtering proxy if enabled by host (when --allow-host is used)
-    if dns_proxy::is_enabled() {
-        info!("DNS filtering enabled, starting guest proxy");
-        dns_proxy::start();
     }
 
     // If the host started us with --gpu, sanity-check that the guest

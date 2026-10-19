@@ -21,8 +21,6 @@ use std::path::Path;
 pub struct VsockServiceInputs<'a> {
     /// Host SSH agent socket to forward into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
-    /// Host DNS-filter proxy socket.
-    pub dns_filter_socket: Option<&'a Path>,
     /// Host CUDA-over-vsock server socket (experimental).
     pub cuda_socket: Option<&'a Path>,
     /// Host-side Docker socket to expose. libkrun *listens* on this path and
@@ -71,21 +69,6 @@ impl VsockService for SshAgentService {
             listen: false,
             socket,
             guest_env: &[("SMOLVM_SSH_AGENT", "1")],
-        })
-    }
-}
-
-/// DNS filtering proxy: the guest forwards DNS queries to a host listener that
-/// enforces the egress allow-list.
-struct DnsFilterService;
-impl VsockService for DnsFilterService {
-    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
-        inputs.dns_filter_socket.map(|socket| ActiveVsockService {
-            name: "DNS filtering",
-            port: ports::DNS_FILTER,
-            listen: false,
-            socket,
-            guest_env: &[],
         })
     }
 }
@@ -147,7 +130,6 @@ impl VsockService for WorkloadLogService {
 pub fn registry() -> &'static [&'static dyn VsockService] {
     &[
         &SshAgentService,
-        &DnsFilterService,
         &CudaService,
         &DockerSocketService,
         &WorkloadLogService,
@@ -163,7 +145,6 @@ mod tests {
         let socket = Path::new("/tmp/ssh-agent.sock");
         let inputs = VsockServiceInputs {
             ssh_agent_socket: Some(socket),
-            dns_filter_socket: None,
             cuda_socket: None,
             docker_socket: None,
             workload_log_socket: None,

@@ -111,8 +111,6 @@ pub const DNS: &str = "SMOLVM_NETWORK_DNS";
 /// (`--dns-option`, repeatable), e.g. `timeout:1 attempts:3 rotate use-vc`.
 /// Every writer of resolv.conf appends them as one `options` line.
 pub const DNS_OPTIONS: &str = "SMOLVM_NETWORK_DNS_OPTIONS";
-/// Enables the guest-side DNS filtering proxy.
-pub const DNS_FILTER: &str = "SMOLVM_DNS_FILTER";
 /// Enables the guest-side Docker socket bridge: the agent listens on the
 /// `ports::DOCKER` vsock port and proxies each connection to the in-guest
 /// Docker daemon socket, so the host can reach it over a Unix socket.

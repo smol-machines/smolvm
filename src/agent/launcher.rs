@@ -601,8 +601,9 @@ pub struct LaunchConfig<'a> {
     pub resources: VmResources,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
-    /// Host DNS filter socket path. When set, the guest DNS proxy forwards
-    /// queries over vsock to this socket for filtering.
+    /// Ignored. `--allow-host` is enforced by the virtio-net egress policy (TSI
+    /// refuses an allow list), and no guest DNS proxy reads this socket any
+    /// more; kept so embedders that still set it compile.
     pub dns_filter_socket: Option<&'a Path>,
     /// Host CUDA-over-vsock server socket (experimental). When set, the guest
     /// CUDA client connects out to this AF_UNIX path and the host server runs
@@ -695,7 +696,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         port_mappings,
         resources,
         ssh_agent_socket,
-        dns_filter_socket,
+        dns_filter_socket: _,
         cuda_socket,
         docker_socket,
         workload_log_socket,
@@ -1827,7 +1828,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // host and guest sides cannot drift.
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
-            dns_filter_socket: dns_filter_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),
             docker_socket: docker_socket.as_deref(),
             workload_log_socket: workload_log_socket.as_deref(),

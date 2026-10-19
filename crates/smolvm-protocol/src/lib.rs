@@ -280,7 +280,8 @@ pub mod ports {
     pub const AGENT_CONTROL: u32 = 6000;
     /// SSH agent forwarding (host SSH_AUTH_SOCK bridged to guest).
     pub const SSH_AGENT: u32 = 6001;
-    /// DNS filtering proxy (guest forwards DNS queries to host for filtering).
+    /// Retired guest DNS filtering proxy; reserved so no other service takes
+    /// the port an older guest might still dial.
     pub const DNS_FILTER: u32 = 6002;
     /// Docker socket bridge: the guest listens on this vsock port and proxies
     /// each connection to the in-guest `/var/run/docker.sock`, so the host can

@@ -4313,12 +4313,8 @@ fn open_overlay_etc_file(
 }
 
 fn overlay_resolv_conf_contents() -> String {
-    // Resolver options (`--dns-option`) ride on every file, the filter proxy's
-    // included: it answers on both UDP and TCP, so even `use-vc` works there.
+    // Resolver options (`--dns-option`) ride on every file.
     let options = crate::resolv_options();
-    if std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1") {
-        return smolvm_protocol::resolv::render(&["127.0.0.1"], &options);
-    }
 
     // A nameserver supplied by the host (SMOLVM_NETWORK_DNS) wins for either
     // backend: under virtio-net it's the gateway address, and under TSI it's a
@@ -7589,21 +7585,8 @@ mod tests {
     }
 
     #[test]
-    fn overlay_resolv_conf_uses_localhost_when_dns_filter_enabled() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var(guest_env::DNS_FILTER, "1");
-        std::env::remove_var(guest_env::BACKEND);
-        std::env::remove_var(guest_env::DNS);
-
-        assert_eq!(overlay_resolv_conf_contents(), "nameserver 127.0.0.1\n");
-
-        std::env::remove_var(guest_env::DNS_FILTER);
-    }
-
-    #[test]
     fn overlay_resolv_conf_uses_virtio_dns_server() {
         let _guard = env_lock().lock().unwrap();
-        std::env::remove_var(guest_env::DNS_FILTER);
         std::env::set_var(guest_env::BACKEND, guest_env::BACKEND_VIRTIO_NET);
         std::env::set_var(guest_env::DNS, "100.96.0.1");
 
@@ -7618,7 +7601,6 @@ mod tests {
         // TSI sets SMOLVM_NETWORK_DNS without SMOLVM_NETWORK_BACKEND. The guest
         // must honor the custom resolver (--dns) rather than the public default.
         let _guard = env_lock().lock().unwrap();
-        std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::BACKEND);
         std::env::set_var(guest_env::DNS, "100.100.100.100");
 
@@ -7662,7 +7644,6 @@ mod tests {
     #[test]
     fn overlay_resolv_conf_defaults_to_public_resolvers() {
         let _guard = env_lock().lock().unwrap();
-        std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::BACKEND);
         std::env::remove_var(guest_env::DNS);
         std::env::remove_var(guest_env::DNS_OPTIONS);
@@ -7677,7 +7658,6 @@ mod tests {
     #[test]
     fn overlay_resolv_conf_carries_resolver_options_on_every_path() {
         let _guard = env_lock().lock().unwrap();
-        std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::BACKEND);
         std::env::remove_var(guest_env::DNS);
         std::env::set_var(
@@ -7694,14 +7674,6 @@ mod tests {
             overlay_resolv_conf_contents(),
             "nameserver 100.100.100.100\noptions timeout:1 attempts:3 rotate use-vc\n"
         );
-        // The filter proxy answers on UDP and TCP, so it gets the options too.
-        std::env::set_var(guest_env::DNS_FILTER, "1");
-        assert_eq!(
-            overlay_resolv_conf_contents(),
-            "nameserver 127.0.0.1\noptions timeout:1 attempts:3 rotate use-vc\n"
-        );
-
-        std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::DNS);
         std::env::remove_var(guest_env::DNS_OPTIONS);
     }

@@ -625,27 +625,6 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         overlay: Some(&overlay_disk),
     };
 
-    // Start DNS filter listener if configured
-    let dns_filter_socket_path = if let Some(ref hosts) = config.dns_filter_hosts {
-        if !hosts.is_empty() {
-            let socket_path = config
-                .vsock_socket
-                .parent()
-                .unwrap_or(std::path::Path::new("/tmp"))
-                .join("dns-filter.sock");
-            if let Err(e) = crate::dns_filter_listener::start(&socket_path, hosts.clone()) {
-                tracing::warn!(error = %e, "failed to start DNS filter listener");
-                None
-            } else {
-                Some(socket_path)
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // CUDA-over-vsock opt-in, resolved once here at the boot-config boundary so
     // the launcher receives a typed socket path (it never reads the environment).
     // Two ways in, both inherited by this boot subprocess from the manager:
@@ -755,7 +734,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         port_mappings: &config.ports,
         resources: config.resources,
         ssh_agent_socket: config.ssh_agent_socket.as_deref(),
-        dns_filter_socket: dns_filter_socket_path.as_deref(),
+        dns_filter_socket: None,
         cuda_socket: cuda_socket.as_deref(),
         docker_socket: docker_socket.as_deref(),
         workload_log_socket: workload_log_socket.as_deref(),

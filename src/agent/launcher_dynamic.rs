@@ -707,7 +707,6 @@ pub fn launch_agent_vm_dynamic(
     // while building the init environment.
     let vsock_inputs = vsock_service::VsockServiceInputs {
         ssh_agent_socket: config.ssh_agent_socket,
-        dns_filter_socket: None,
         cuda_socket: config.cuda_socket,
         docker_socket: None,
         workload_log_socket: None,
