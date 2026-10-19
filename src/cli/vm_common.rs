@@ -3181,7 +3181,12 @@ pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
         {
             Some(record) => {
                 let state = smolvm::agent::state_probe::resolve_state(n, &record);
-                format!("Machine '{}': {}\n", label, state)
+                let mut output = format!("Machine '{}': {}\n", label, state);
+                // Why the VMM ended, when smolvm reaped it.
+                if let Some(exit) = smolvm::vm_exit::read(&smolvm::agent::vm_data_dir(n)) {
+                    output.push_str(&format!("  last exit: VMM {}\n", exit.describe()));
+                }
+                output
             }
             None => return Err(smolvm::Error::vm_not_found(n)),
         }
@@ -3578,6 +3583,9 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     }
     if !record.dns_options.is_empty() {
         fields.insert("dns_options".into(), serde_json::json!(record.dns_options));
+    }
+    if let Some(exit) = smolvm::vm_exit::read(&smolvm::agent::vm_data_dir(name)) {
+        fields.insert("last_exit".into(), serde_json::json!(exit));
     }
     // A branch keeps its staged working copies but never writes them back;
     // name the machine that does, so tooling can send the user there.

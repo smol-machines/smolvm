@@ -120,6 +120,7 @@ pub mod systemd_scope;
 pub mod usage;
 pub mod util;
 pub mod vm;
+pub mod vm_exit;
 /// Shared machine-workload launch used by every machine-start front-end.
 pub mod workload;
 pub mod workload_log;

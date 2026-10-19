@@ -1852,6 +1852,9 @@ impl AgentManager {
 
     /// Inner liveness check that accepts a lock guard to avoid double-locking.
     fn is_process_alive_inner(&self, inner: &AgentInner) -> bool {
+        // An embedding process is the VMM's parent: reap (and record) an exit
+        // here, as serve's supervisor tick does.
+        crate::process::reap_vm_children();
         // Try in-memory child handle first (has stored start time)
         if let Some(child) = inner.child.as_ref() {
             return crate::process::is_our_process(child.pid(), child.start_time());
@@ -3144,7 +3147,7 @@ impl AgentManager {
         // (In non-serve callers without a supervisor this is a harmless no-op —
         // the sweep is only driven from serve.) The `child` handle drops without
         // waiting (Rust `Child::drop` is a no-op), leaving the PID for the sweep.
-        crate::process::register_vm_child(child_pid);
+        crate::process::register_vm_child(child_pid, self.name().map(vm_data_dir));
         // The layers lease names this launcher; hand it to the VMM so it ends
         // with the VM rather than with a long-lived `serve`. macOS only.
         if let Some(layers) = leased_layers.as_deref() {
@@ -3326,6 +3329,10 @@ impl AgentManager {
         guest_is_paused: bool,
         stop_timeout: Option<Duration>,
     ) -> Result<()> {
+        // Whatever ends the VMM from here, smolvm asked for it.
+        if let Some(name) = self.name() {
+            crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+        }
         // A paused guest has no vCPU to service the request and nothing left to
         // flush, so skip the handshake rather than wait out its deadline and
         // then refuse the stop. Identity is still verified below, from the PID

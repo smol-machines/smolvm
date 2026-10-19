@@ -2269,42 +2269,166 @@ pub fn self_exe_for_spawn() -> std::io::Result<std::path::PathBuf> {
 /// under concurrent VM boots. Reaping only registered VM PIDs leaves those
 /// transient subprocesses to their own waits. Mirrors the guest agent's
 /// `BG_CHILDREN` pattern (`crates/smolvm-agent/src/main.rs`).
-static VM_CHILDREN: OnceLock<Mutex<Vec<i32>>> = OnceLock::new();
+static VM_CHILDREN: OnceLock<Mutex<Vec<VmChild>>> = OnceLock::new();
 
-fn vm_children() -> &'static Mutex<Vec<i32>> {
+/// A detached VM boot subprocess, and the machine directory its exit record
+/// goes to (see [`crate::vm_exit`]).
+struct VmChild {
+    pid: i32,
+    machine_dir: Option<std::path::PathBuf>,
+}
+
+fn vm_children() -> &'static Mutex<Vec<VmChild>> {
     VM_CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Wait statuses the sweep collected, kept for a later [`try_wait`] or
+/// [`wait`] on the same PID (a boot that failed reports its signal from it).
+/// Bounded: a status nobody asks for is only kept for so many exits.
+#[cfg(unix)]
+static REAPED: Mutex<std::collections::VecDeque<(i32, libc::c_int)>> =
+    Mutex::new(std::collections::VecDeque::new());
+#[cfg(unix)]
+const REAPED_KEPT: usize = 256;
+
 /// Track a detached VM boot subprocess PID so a later [`reap_vm_children`] sweep
-/// reaps it. The Rust `Child` handle's `Drop` does not `wait()`, so the caller
-/// can let it drop after recording the PID.
-pub fn register_vm_child(pid: i32) {
-    vm_children().lock().unwrap().push(pid);
+/// reaps it and records why it ended in `machine_dir`. The Rust `Child`
+/// handle's `Drop` does not `wait()`, so the caller can let it drop after
+/// recording the PID.
+pub fn register_vm_child(pid: i32, machine_dir: Option<std::path::PathBuf>) {
+    vm_children()
+        .lock()
+        .unwrap()
+        .push(VmChild { pid, machine_dir });
 }
 
-/// Reap any exited registered VM children (non-blocking, per-PID). Called from
-/// the serve supervisor tick. Scoped to registered PIDs so it never steals an
+/// Reap any exited registered VM children (non-blocking, per-PID), recording
+/// why each ended. Called from the serve supervisor tick and before an
+/// in-process liveness check. Scoped to registered PIDs so it never steals an
 /// exit status from a sibling `.output()`/`.wait()` (the `ECHILD` fix).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn reap_vm_children() {
     let mut guard = vm_children().lock().unwrap();
-    guard.retain(|&pid| {
-        let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
-        match ret {
-            // >0 = reaped; drop from tracking.
-            r if r > 0 => false,
-            // 0 = still running; keep for the next sweep.
-            0 => true,
-            // <0 = error (typically ECHILD — already gone). Drop either way.
-            _ => false,
-        }
-    });
+    guard.retain(|child| matches!(reap_vm_child(child, false), Reap::Running));
 }
 
-/// No-op on non-Linux: VM scope adoption + the serve supervisor reaper are
-/// Linux-only; nothing registers VM children here.
-#[cfg(not(target_os = "linux"))]
+/// No-op on Windows: a process handle carries its exit code, and nothing
+/// registers VM children there.
+#[cfg(not(unix))]
 pub fn reap_vm_children() {}
+
+#[cfg(unix)]
+enum Reap {
+    Running,
+    Reaped,
+    Gone,
+}
+
+/// Reap one registered VM child, `block`ing until it exits or not. On Linux
+/// the exit is first observed without reaping, so the zombie's cgroup can
+/// still be read for an OOM kill.
+#[cfg(unix)]
+fn reap_vm_child(child: &VmChild, block: bool) -> Reap {
+    let nohang = if block { 0 } else { libc::WNOHANG };
+    #[cfg(target_os = "linux")]
+    let oom_kills = {
+        // SAFETY: `info` is a valid out-pointer; WNOWAIT leaves the child
+        // waitable, so the waitpid below still collects it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let peeked = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | nohang,
+            )
+        };
+        if peeked < 0 {
+            return Reap::Gone;
+        }
+        // SAFETY: waitid filled `info`; si_pid is 0 when nothing has exited.
+        if unsafe { info.si_pid() } == 0 {
+            return Reap::Running;
+        }
+        crate::vm_exit::own_cgroup_oom_kills(child.pid)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let oom_kills = None;
+    loop {
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(child.pid, &mut status, nohang) };
+        if ret > 0 {
+            if let Some(dir) = &child.machine_dir {
+                crate::vm_exit::record(
+                    dir,
+                    &crate::vm_exit::from_wait_status(child.pid, status, oom_kills),
+                );
+            }
+            let mut reaped = REAPED.lock().unwrap_or_else(|p| p.into_inner());
+            if reaped.len() == REAPED_KEPT {
+                reaped.pop_front();
+            }
+            reaped.push_back((child.pid, status));
+            return Reap::Reaped;
+        }
+        if ret == 0 {
+            return Reap::Running;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Reap::Gone;
+        }
+    }
+}
+
+/// The status of `pid` if it is a registered VM child: one the sweep already
+/// collected, or one reaped (and recorded) now. `None` means `pid` is not a
+/// VM child, or it is still running when `block` is false.
+#[cfg(unix)]
+fn take_vm_child_status(pid: i32, block: bool) -> Option<Option<libc::c_int>> {
+    {
+        let mut reaped = REAPED.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(at) = reaped.iter().position(|(p, _)| *p == pid) {
+            return Some(reaped.remove(at).map(|(_, status)| status));
+        }
+    }
+    let child = {
+        let mut children = vm_children().lock().unwrap();
+        let at = children.iter().position(|c| c.pid == pid)?;
+        if !block {
+            return Some(match reap_vm_child(&children[at], false) {
+                Reap::Running => None,
+                Reap::Reaped | Reap::Gone => {
+                    children.remove(at);
+                    take_reaped(pid)
+                }
+            });
+        }
+        children.remove(at)
+    };
+    // Blocking: wait outside the lock so the sweep keeps running.
+    match reap_vm_child(&child, true) {
+        Reap::Reaped => Some(take_reaped(pid)),
+        Reap::Running | Reap::Gone => Some(None),
+    }
+}
+
+#[cfg(unix)]
+fn take_reaped(pid: i32) -> Option<libc::c_int> {
+    let mut reaped = REAPED.lock().unwrap_or_else(|p| p.into_inner());
+    let at = reaped.iter().position(|(p, _)| *p == pid)?;
+    reaped.remove(at).map(|(_, status)| status)
+}
+
+#[cfg(unix)]
+fn exit_code_of(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    }
+}
 
 /// Install a GLOBAL SIGCHLD handler that reaps every terminated child via
 /// `waitpid(-1, WNOHANG)`. Used only by the `pack_run` fork-pool paths (single
@@ -2427,6 +2551,9 @@ pub fn is_alive(pid: Pid) -> bool {
 /// Handles EINTR by retrying the waitpid call.
 #[cfg(unix)]
 pub fn try_wait(pid: Pid) -> Option<i32> {
+    if let Some(status) = take_vm_child_status(pid, false) {
+        return status.map(exit_code_of);
+    }
     loop {
         let mut status: libc::c_int = 0;
         let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -2468,6 +2595,9 @@ pub fn try_wait(pid: Pid) -> Option<i32> {
 /// Returns the exit code. Handles EINTR by retrying the waitpid call.
 #[cfg(unix)]
 pub fn wait(pid: Pid) -> i32 {
+    if let Some(status) = take_vm_child_status(pid, true) {
+        return status.map_or(-1, exit_code_of);
+    }
     loop {
         let mut status: libc::c_int = 0;
         let result = unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -5292,9 +5422,49 @@ mod tests {
 
     /// The selective reaper drains registered VM PIDs once they exit, and a
     /// non-child PID (would-be ECHILD) is dropped without affecting others.
+    /// Tests that sweep the process-wide registry run one at a time.
+    #[cfg(unix)]
+    static VM_CHILD_TESTS: Mutex<()> = Mutex::new(());
+
+    // A VM child killed by a signal leaves a record of it in its machine
+    // directory, and a later try_wait still reports the signal.
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_vm_child_records_why_it_ended() {
+        let _serial = VM_CHILD_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new("sh")
+            .args(["-c", "kill -KILL $$"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        std::mem::forget(child);
+        register_vm_child(pid, Some(dir.path().to_path_buf()));
+        let mut exit = None;
+        for _ in 0..100 {
+            reap_vm_children();
+            exit = crate::vm_exit::read(dir.path());
+            if exit.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let exit = exit.expect("the sweep records the exit");
+        assert_eq!(exit.pid, pid);
+        assert_eq!(exit.cause, crate::vm_exit::Cause::Killed);
+        assert_eq!(exit.signal_name.as_deref(), Some("SIGKILL"));
+        assert_eq!(
+            try_wait(pid),
+            Some(128 + libc::SIGKILL),
+            "the boot path still sees the signal"
+        );
+        assert_eq!(try_wait(pid), None, "the status is handed out once");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn reap_vm_children_is_scoped_and_drains() {
+        let _serial = VM_CHILD_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         // A real short-lived child: register its PID and forget the handle so the
         // reaper (not Child::drop) reaps it.
         let child = std::process::Command::new("true")
@@ -5302,9 +5472,9 @@ mod tests {
             .expect("spawn true");
         let real_pid = child.id() as i32;
         std::mem::forget(child);
-        register_vm_child(real_pid);
+        register_vm_child(real_pid, None);
         // A PID we never parented → waitpid returns ECHILD → must be dropped.
-        register_vm_child(i32::MAX);
+        register_vm_child(i32::MAX, None);
 
         // Sweep until the registry drains (the real child exits ~immediately).
         let mut drained = false;
