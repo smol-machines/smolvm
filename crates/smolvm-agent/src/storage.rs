@@ -363,6 +363,16 @@ pub fn volume_bind_source(tag: &str) -> PathBuf {
     }
 }
 
+/// Add each prepared mount to a container spec as a bind of its
+/// [`volume_bind_source`]. crun applies the spec's mounts in order, so a mount
+/// goes ahead of those nested below it (see [`mounts_parents_first`]).
+pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
+    for (tag, container_path, read_only) in mounts_parents_first(mounts) {
+        let source = volume_bind_source(tag);
+        spec.add_bind_mount(&source.to_string_lossy(), container_path, *read_only);
+    }
+}
+
 /// Mount a virtiofs device with one policy for every host-backed filesystem:
 /// request DAX first, then fall back to the normal buffered data path when the
 /// host did not give this device a DAX window. Explicit fsync still provides
@@ -4847,14 +4857,7 @@ pub fn run_command(
         let build_spec = |cmd: &[String], spec_env: &[(String, String)]| {
             let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
             spec.add_gpu_devices_if_available();
-            for (tag, container_path, read_only) in mounts {
-                let virtiofs_mount = volume_bind_source(tag);
-                spec.add_bind_mount(
-                    &virtiofs_mount.to_string_lossy(),
-                    container_path,
-                    *read_only,
-                );
-            }
+            add_volume_bind_mounts(&mut spec, mounts);
             add_workspace_fallback(&mut spec, mounts);
             add_storage_fallback(&mut spec, mounts, unprivileged);
             // Forward SSH agent + published sockets + forkpoint if enabled at boot.
@@ -4976,14 +4979,7 @@ pub fn spawn_in_overlay(
         .map_err(StorageError::new)?;
     let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
 
-    for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = volume_bind_source(tag);
-        spec.add_bind_mount(
-            &virtiofs_mount.to_string_lossy(),
-            container_path,
-            *read_only,
-        );
-    }
+    add_volume_bind_mounts(&mut spec, mounts);
 
     add_workspace_fallback(&mut spec, mounts);
     add_storage_fallback(&mut spec, mounts, unprivileged);
@@ -5106,13 +5102,23 @@ pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<(
     Ok(())
 }
 
+/// `mounts` with every mount ahead of those nested below it, keeping the given
+/// order otherwise. Binding a parent after its child would cover the child:
+/// `-v /home/node/.npm -v /home/node` left `.npm` hidden under the
+/// `/home/node` volume.
+fn mounts_parents_first(mounts: &[(String, String, bool)]) -> Vec<&(String, String, bool)> {
+    let mut ordered: Vec<_> = mounts.iter().collect();
+    ordered.sort_by_key(|(_, container_path, _)| Path::new(container_path).components().count());
+    ordered
+}
+
 /// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs.
 #[cfg(target_os = "linux")]
 fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
     let mut mounted_paths = Vec::new();
     let rootfs_path = Path::new(rootfs);
 
-    for (tag, container_path, read_only) in mounts {
+    for (tag, container_path, read_only) in mounts_parents_first(mounts) {
         let (device_tag, staged_id) = split_staged_mount_tag(tag);
         let staged = staged_id.is_some();
         validate_storage_id(device_tag, "mount tag")?;
@@ -6492,6 +6498,23 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mounts_bind_parents_before_their_nested_mounts() {
+        let mount = |tag: &str, path: &str| (tag.to_string(), path.to_string(), false);
+        let mounts = vec![
+            mount("npm", "/home/node/.npm"),
+            mount("data", "/data"),
+            mount("node", "/home/node"),
+            mount("cache", "/home/node/.cache"),
+        ];
+        let tags: Vec<_> = super::mounts_parents_first(&mounts)
+            .into_iter()
+            .map(|(tag, _, _)| tag.as_str())
+            .collect();
+        assert_eq!(tags, ["data", "node", "npm", "cache"]);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn image_dir_at_prefers_the_exact_path_then_the_nearest_parent() {

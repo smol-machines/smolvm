@@ -377,14 +377,15 @@ test_image_volume_targets_resolve_inside_guest() {
 # volume does (#1858): /var/cache/nginx is 101:0 775 in this image. A volume
 # without an image directory takes its parent's owner (a nested one, its
 # enclosing volume's), a new top-level one stays root, and an owner set inside
-# the machine survives a restart rather than being reset to the image's.
+# the machine survives a restart rather than being reset to the image's. The
+# nested volume is listed before its parent, which must not cover it.
 test_disk_volume_takes_image_ownership() {
     local vm_name="test-vm-diskvol-owner"
     $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
 
     $SMOLVM machine create --name "$vm_name" --net \
         --image nginxinc/nginx-unprivileged:stable-alpine \
-        -v /var/cache/nginx -v /var/cache/nginx/sub -v /data >/dev/null 2>&1 || return 1
+        -v /var/cache/nginx/sub -v /var/cache/nginx -v /data >/dev/null 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
         $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1
         return 1

@@ -4132,14 +4132,7 @@ fn write_oci_bundle(
         spec.add_bind_mount(INIT_SOURCE, INIT_DESTINATION, true);
     }
 
-    for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = storage::volume_bind_source(tag);
-        spec.add_bind_mount(
-            &virtiofs_mount.to_string_lossy(),
-            container_path,
-            *read_only,
-        );
-    }
+    storage::add_volume_bind_mounts(&mut spec, mounts);
 
     storage::add_workspace_fallback(&mut spec, mounts);
     storage::add_storage_fallback(&mut spec, mounts, unprivileged);
@@ -5640,14 +5633,7 @@ fn spawn_interactive_command(
     spec.add_gpu_devices_if_available();
     spec.add_kvm_device_if_available();
 
-    for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = storage::volume_bind_source(tag);
-        spec.add_bind_mount(
-            &virtiofs_mount.to_string_lossy(),
-            container_path,
-            *read_only,
-        );
-    }
+    storage::add_volume_bind_mounts(&mut spec, mounts);
 
     storage::add_workspace_fallback(&mut spec, mounts);
     storage::add_storage_fallback(&mut spec, mounts, unprivileged);
