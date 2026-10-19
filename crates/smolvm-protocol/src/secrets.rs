@@ -26,6 +26,9 @@ pub enum SecretSourceKind {
     Env,
     /// The ref points at a host file path.
     File,
+    /// The ref points at an item in the host's keychain (macOS Keychain or a
+    /// Linux Secret Service).
+    Keychain,
 }
 
 impl SecretSourceKind {
@@ -34,11 +37,12 @@ impl SecretSourceKind {
         match self {
             Self::Env => "env",
             Self::File => "file",
+            Self::Keychain => "keychain",
         }
     }
 }
 
-/// A reference to a secret. Exactly one of the two sources must be
+/// A reference to a secret. Exactly one of the sources must be
 /// populated; validation is performed by the host crate's
 /// `validate_ref` (policy lives where it's enforced).
 ///
@@ -56,6 +60,12 @@ pub struct SecretRef {
     /// Read the secret from a host file path (must be absolute).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_file: Option<PathBuf>,
+
+    /// Read the secret from the host keychain: `SERVICE` or
+    /// `SERVICE/ACCOUNT` (a generic password item on macOS, a Secret Service
+    /// item with those `service` and `account` attributes on Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_keychain: Option<String>,
 }
 
 impl SecretRef {
@@ -66,9 +76,14 @@ impl SecretRef {
     /// crate's `validate_ref` before calling this; this function is
     /// primarily for audit logging of a known-good ref.
     pub fn source_kind(&self) -> Option<SecretSourceKind> {
-        match (self.from_env.is_some(), self.from_file.is_some()) {
-            (true, false) => Some(SecretSourceKind::Env),
-            (false, true) => Some(SecretSourceKind::File),
+        match (
+            self.from_env.is_some(),
+            self.from_file.is_some(),
+            self.from_keychain.is_some(),
+        ) {
+            (true, false, false) => Some(SecretSourceKind::Env),
+            (false, true, false) => Some(SecretSourceKind::File),
+            (false, false, true) => Some(SecretSourceKind::Keychain),
             _ => None,
         }
     }
@@ -84,6 +99,7 @@ mod tests {
             SecretRef {
                 from_env: Some("Y".into()),
                 from_file: None,
+                from_keychain: None,
             }
             .source_kind(),
             Some(SecretSourceKind::Env)
@@ -92,6 +108,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some(PathBuf::from("/z")),
+                from_keychain: None,
             }
             .source_kind(),
             Some(SecretSourceKind::File)
@@ -99,11 +116,13 @@ mod tests {
         let empty = SecretRef {
             from_env: None,
             from_file: None,
+            from_keychain: None,
         };
         assert_eq!(empty.source_kind(), None);
         let both = SecretRef {
             from_env: Some("Y".into()),
             from_file: Some(PathBuf::from("/z")),
+            from_keychain: None,
         };
         assert_eq!(both.source_kind(), None);
     }
@@ -121,6 +140,7 @@ mod tests {
         let r = SecretRef {
             from_env: Some("API_KEY".into()),
             from_file: None,
+            from_keychain: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: SecretRef = serde_json::from_str(&json).unwrap();
@@ -132,6 +152,7 @@ mod tests {
         let r = SecretRef {
             from_env: Some("X".into()),
             from_file: None,
+            from_keychain: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("from_env"));

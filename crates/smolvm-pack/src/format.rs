@@ -977,6 +977,7 @@ mod tests {
             smolvm_protocol::SecretRef {
                 from_env: Some("PGPASSWORD".to_string()),
                 from_file: None,
+                from_keychain: None,
             },
         );
         let restored = PackManifest::from_json(&m.to_json().unwrap()).unwrap();

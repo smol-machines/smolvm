@@ -277,8 +277,11 @@ fn parse_published_sockets(
 fn parse_cli_secret_refs(
     secret_env: &[String],
     secret_file: &[String],
+    secret_keychain: &[String],
 ) -> smolvm::Result<std::collections::BTreeMap<String, smolvm::secrets::SecretRef>> {
-    use smolvm::secrets::{env_ref, file_ref, validate_ref, ResolutionScope, SecretRef};
+    use smolvm::secrets::{
+        env_ref, file_ref, keychain_ref, validate_ref, ResolutionScope, SecretRef,
+    };
     use std::collections::BTreeMap;
 
     let mut out: BTreeMap<String, SecretRef> = BTreeMap::new();
@@ -311,6 +314,9 @@ fn parse_cli_secret_refs(
     }
     for spec in secret_file {
         add("--secret-file", spec, &|v| file_ref(v))?;
+    }
+    for spec in secret_keychain {
+        add("--secret-keychain", spec, &|v| keychain_ref(v))?;
     }
     Ok(out)
 }
@@ -549,7 +555,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -891,6 +897,16 @@ pub struct RunCmd {
         help_heading = "Security"
     )]
     pub secret_file: Vec<String>,
+
+    /// Inject a secret from the host keychain (GUEST_VAR=SERVICE or
+    /// GUEST_VAR=SERVICE/ACCOUNT): a macOS Keychain generic password, or a
+    /// Linux Secret Service item, read at launch and never persisted.
+    #[arg(
+        long = "secret-keychain",
+        value_name = "GUEST_VAR=SERVICE[/ACCOUNT]",
+        help_heading = "Security"
+    )]
+    pub secret_keychain: Vec<String>,
 
     /// Run command before the workload (can be used multiple times); the same
     /// as `init` in a Smolfile, which the CLI form extends when both are given.
@@ -1527,7 +1543,9 @@ impl RunCmd {
             parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins).
-        for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
+        for (key, r) in
+            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?
+        {
             params.secret_refs.insert(key, r);
         }
 
@@ -2870,6 +2888,7 @@ mod tests {
         let refs = parse_cli_secret_refs(
             &["GUEST_TOKEN=HOST_TOKEN".to_string()],
             &["GUEST_KEY=/abs/key".to_string()],
+            &["GUEST_API=anthropic/me".to_string()],
         )
         .unwrap();
         assert_eq!(refs["GUEST_TOKEN"].from_env.as_deref(), Some("HOST_TOKEN"));
@@ -2880,19 +2899,36 @@ mod tests {
                 .map(|p| p.to_string_lossy().into_owned()),
             Some("/abs/key".to_string())
         );
+        assert_eq!(
+            refs["GUEST_API"].from_keychain.as_deref(),
+            Some("anthropic/me")
+        );
     }
 
     #[test]
     fn parse_cli_secret_refs_rejects_bad_specs() {
         // Missing '='.
-        assert!(parse_cli_secret_refs(&["NO_EQUALS".to_string()], &[]).is_err());
+        assert!(parse_cli_secret_refs(&["NO_EQUALS".to_string()], &[], &[]).is_err());
         // Empty key.
-        assert!(parse_cli_secret_refs(&["=HOST".to_string()], &[]).is_err());
+        assert!(parse_cli_secret_refs(&["=HOST".to_string()], &[], &[]).is_err());
         // Relative from_file path (validate_ref under TrustedLocal).
-        assert!(parse_cli_secret_refs(&[], &["K=relative/path".to_string()]).is_err());
+        assert!(parse_cli_secret_refs(&[], &["K=relative/path".to_string()], &[]).is_err());
         // Duplicate key across the two flags.
+        assert!(parse_cli_secret_refs(
+            &["DUP=HOST".to_string()],
+            &["DUP=/abs/path".to_string()],
+            &[]
+        )
+        .is_err());
+        // A keychain item needs a service, and an account when it has a '/'.
+        for bad in ["K=", "K=/me", "K=svc/"] {
+            assert!(
+                parse_cli_secret_refs(&[], &[], &[bad.to_string()]).is_err(),
+                "{bad}"
+            );
+        }
         assert!(
-            parse_cli_secret_refs(&["DUP=HOST".to_string()], &["DUP=/abs/path".to_string()])
+            parse_cli_secret_refs(&["DUP=HOST".to_string()], &[], &["DUP=svc".to_string()])
                 .is_err()
         );
     }
@@ -3863,6 +3899,16 @@ pub struct ExecCmd {
     #[arg(long = "secret-file", value_name = "GUEST_VAR=PATH")]
     pub secret_file: Vec<String>,
 
+    /// Inject a secret from the host keychain (GUEST_VAR=SERVICE or
+    /// GUEST_VAR=SERVICE/ACCOUNT): a macOS Keychain generic password, or a
+    /// Linux Secret Service item, read at launch and never persisted.
+    #[arg(
+        long = "secret-keychain",
+        value_name = "GUEST_VAR=SERVICE[/ACCOUNT]",
+        help_heading = "Security"
+    )]
+    pub secret_keychain: Vec<String>,
+
     /// Kill command after duration (e.g., "30s", "5m")
     #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
     pub timeout: Option<Duration>,
@@ -3935,7 +3981,8 @@ impl ExecCmd {
         // Ad-hoc `--secret-env`/`--secret-file` refs for this exec only. The CLI
         // user is TrustedLocal; resolved plaintext lives only in this local and
         // is layered under any explicit `--env` overrides below.
-        let exec_secret_refs = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
+        let exec_secret_refs =
+            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?;
         record_env.extend(smolvm::secrets::expose_into_env(
             smolvm::secrets::resolve_refs_to_env(
                 &exec_secret_refs,
@@ -4151,6 +4198,7 @@ impl ShellCmd {
             env: vec![],
             secret_env: vec![],
             secret_file: vec![],
+            secret_keychain: vec![],
             timeout: None,
             interactive: true,
             tty: true,
@@ -4484,6 +4532,16 @@ pub struct CreateCmd {
     #[arg(long = "secret-file", value_name = "GUEST_VAR=PATH")]
     pub secret_file: Vec<String>,
 
+    /// Inject a secret from the host keychain (GUEST_VAR=SERVICE or
+    /// GUEST_VAR=SERVICE/ACCOUNT): a macOS Keychain generic password, or a
+    /// Linux Secret Service item, read at launch and never persisted.
+    #[arg(
+        long = "secret-keychain",
+        value_name = "GUEST_VAR=SERVICE[/ACCOUNT]",
+        help_heading = "Security"
+    )]
+    pub secret_keychain: Vec<String>,
+
     /// Load configuration from a Smolfile (TOML)
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
@@ -4713,7 +4771,9 @@ impl CreateCmd {
             parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins). Only refs are persisted.
-        for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
+        for (key, r) in
+            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?
+        {
             params.secret_refs.insert(key, r);
         }
         let resources = VmResources {
@@ -5688,6 +5748,16 @@ pub struct ForkCmd {
     )]
     pub secret_file: Vec<String>,
 
+    /// Inject a secret from the host keychain (GUEST_VAR=SERVICE or
+    /// GUEST_VAR=SERVICE/ACCOUNT): a macOS Keychain generic password, or a
+    /// Linux Secret Service item, read at launch and never persisted.
+    #[arg(
+        long = "secret-keychain",
+        value_name = "GUEST_VAR=SERVICE[/ACCOUNT]",
+        help_heading = "Security"
+    )]
+    pub secret_keychain: Vec<String>,
+
     /// Rebind a host egress interceptor for each branched child.
     #[arg(long, value_name = "ADDR")]
     pub egress_interceptor: Option<std::net::SocketAddr>,
@@ -5727,7 +5797,8 @@ impl ForkCmd {
         let ports: Vec<(u16, u16)> = ports.into_iter().map(|port| port.to_tuple()).collect();
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
-        let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
+        let fork_secrets =
+            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?;
         let labels: Vec<(String, String)> = smolvm::util::parse_labels(&self.labels)?
             .into_iter()
             .collect();

@@ -2081,6 +2081,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some("/run/secrets/tls.key".into()),
+                from_keychain: None,
             },
         );
         record.secret_refs.insert(
@@ -2088,6 +2089,7 @@ mod tests {
             SecretRef {
                 from_env: Some("PROD_DB".into()),
                 from_file: None,
+                from_keychain: None,
             },
         );
 

@@ -2,7 +2,8 @@
 //!
 //! smolvm does not store secret material. A [`SecretRef`] is a pointer to
 //! a secret that already lives somewhere on the host — a host environment
-//! variable (`from_env`) or a host file (`from_file`) — and resolution
+//! variable (`from_env`), a host file (`from_file`) or an item in the host
+//! keychain (`from_keychain`) — and resolution
 //! reads that source fresh at workload launch, injecting the value into
 //! the guest env as part of the existing `env` field in
 //! `AgentRequest::Run`/`VmExec` (no protocol change).
@@ -156,11 +157,11 @@ fn classify_file_source_error(e: FileSourceError) -> ResolutionFailure {
 /// input surfaces present refs with different trust; the scope chosen at
 /// the validation site determines which source kinds can be honored.
 ///
-/// | Scope | `from_env` | `from_file` |
-/// |---|:-:|:-:|
-/// | `TrustedLocal` | yes | yes (absolute paths only) |
-/// | `RecordReplay` | yes | yes |
-/// | `Untrusted` | no | no |
+/// | Scope | `from_env` | `from_file` | `from_keychain` |
+/// |---|:-:|:-:|:-:|
+/// | `TrustedLocal` | yes | yes (absolute paths only) | yes |
+/// | `RecordReplay` | yes | yes | yes |
+/// | `Untrusted` | no | no | no |
 ///
 /// Both source kinds dereference *this host's* environment / filesystem,
 /// so they are only meaningful for a trusted-local actor (the CLI running
@@ -199,6 +200,9 @@ impl ResolutionScope {
     fn allows_file(self) -> bool {
         !matches!(self, Self::Untrusted)
     }
+    fn allows_keychain(self) -> bool {
+        !matches!(self, Self::Untrusted)
+    }
 }
 
 /// Structural or scope-policy violations rejected by [`validate_ref`].
@@ -211,6 +215,8 @@ pub enum SecretRefError {
     /// `from_file` was given a relative path. Persisted refs must be
     /// absolute to avoid CWD-dependent resolution surprises.
     RelativeFilePath(std::path::PathBuf),
+    /// `from_keychain` is not `SERVICE` or `SERVICE/ACCOUNT`.
+    InvalidKeychainItem(String),
     /// The source kind is valid in general but not in the given scope —
     /// e.g., `from_file` submitted via an untrusted HTTP request body.
     SourceNotAllowedInScope {
@@ -226,16 +232,20 @@ impl std::fmt::Display for SecretRefError {
         match self {
             Self::NoSource => write!(
                 f,
-                "no source set: exactly one of from_env, from_file must be specified"
+                "no source set: exactly one of from_env, from_file, from_keychain must be specified"
             ),
             Self::MultipleSources => write!(
                 f,
-                "multiple sources set: exactly one of from_env, from_file must be specified"
+                "multiple sources set: exactly one of from_env, from_file, from_keychain must be specified"
             ),
             Self::RelativeFilePath(p) => write!(
                 f,
                 "from_file path '{}' is relative; absolute paths are required",
                 p.display()
+            ),
+            Self::InvalidKeychainItem(item) => write!(
+                f,
+                "keychain item '{item}' must be SERVICE or SERVICE/ACCOUNT, with neither part empty"
             ),
             Self::SourceNotAllowedInScope { kind, scope } => write!(
                 f,
@@ -259,10 +269,14 @@ pub fn validate_ref(
     r: &SecretRef,
     scope: ResolutionScope,
 ) -> std::result::Result<(), SecretRefError> {
-    let count = [r.from_env.is_some(), r.from_file.is_some()]
-        .into_iter()
-        .filter(|b| *b)
-        .count();
+    let count = [
+        r.from_env.is_some(),
+        r.from_file.is_some(),
+        r.from_keychain.is_some(),
+    ]
+    .into_iter()
+    .filter(|b| *b)
+    .count();
 
     match count {
         0 => return Err(SecretRefError::NoSource),
@@ -287,8 +301,85 @@ pub fn validate_ref(
             return Err(SecretRefError::RelativeFilePath(path.clone()));
         }
     }
+    if let Some(item) = &r.from_keychain {
+        if !scope.allows_keychain() {
+            return Err(SecretRefError::SourceNotAllowedInScope {
+                kind: SecretSourceKind::Keychain,
+                scope,
+            });
+        }
+        if keychain_item_parts(item).is_none() {
+            return Err(SecretRefError::InvalidKeychainItem(item.clone()));
+        }
+    }
 
     Ok(())
+}
+
+// ============================================================================
+// Keychain source
+// ============================================================================
+
+/// Split `SERVICE` or `SERVICE/ACCOUNT` (split at the first `/`), refusing an
+/// empty part.
+fn keychain_item_parts(item: &str) -> Option<(&str, Option<&str>)> {
+    let (service, account) = match item.split_once('/') {
+        Some((service, account)) => (service, Some(account)),
+        None => (item, None),
+    };
+    (!service.is_empty() && account.is_none_or(|a| !a.is_empty())).then_some((service, account))
+}
+
+/// Read a keychain item fresh, as the other sources are read: macOS's
+/// `security`, or `secret-tool` for a Linux Secret Service. Both run by
+/// absolute path, so a launch environment with a short `PATH` or a planted
+/// binary cannot change which tool answers.
+fn read_keychain_item(item: &str) -> std::result::Result<Zeroizing<String>, ResolutionFailure> {
+    let (service, account) = keychain_item_parts(item).ok_or(ResolutionFailure::Internal)?;
+    let mut command =
+        keychain_command(service, account).ok_or(ResolutionFailure::KeychainUnavailable)?;
+    let output = command
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| ResolutionFailure::KeychainUnavailable)?;
+    let stdout = Zeroizing::new(output.stdout);
+    if !output.status.success() {
+        return Err(ResolutionFailure::KeychainItemMissing);
+    }
+    let value = std::str::from_utf8(&stdout).map_err(|_| ResolutionFailure::KeychainItemMissing)?;
+    Ok(Zeroizing::new(
+        value.trim_end_matches(['\n', '\r']).to_string(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_command(service: &str, account: Option<&str>) -> Option<std::process::Command> {
+    let mut command = std::process::Command::new("/usr/bin/security");
+    command.args(["find-generic-password", "-s", service]);
+    if let Some(account) = account {
+        command.args(["-a", account]);
+    }
+    command.arg("-w");
+    Some(command)
+}
+
+#[cfg(target_os = "linux")]
+fn keychain_command(service: &str, account: Option<&str>) -> Option<std::process::Command> {
+    let tool = ["/usr/bin/secret-tool", "/bin/secret-tool"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())?;
+    let mut command = std::process::Command::new(tool);
+    command.args(["lookup", "service", service]);
+    if let Some(account) = account {
+        command.args(["account", account]);
+    }
+    Some(command)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn keychain_command(_service: &str, _account: Option<&str>) -> Option<std::process::Command> {
+    None
 }
 
 // ============================================================================
@@ -313,6 +404,12 @@ pub enum ResolutionFailure {
     FileReadFailed,
     /// `from_file` target exceeds the size cap.
     FileTooLarge,
+    /// `from_keychain` names an item the host keychain does not hold (or
+    /// that the user declined to release).
+    KeychainItemMissing,
+    /// This host has no keychain smolvm can read: not macOS, and no
+    /// `secret-tool` for a Linux Secret Service.
+    KeychainUnavailable,
     /// Any other failure: an internal/unexpected condition (e.g. a ref
     /// with no source reaching resolution despite validation).
     Internal,
@@ -324,7 +421,11 @@ impl ResolutionFailure {
     pub fn is_client_error(self) -> bool {
         matches!(
             self,
-            Self::EnvUnset | Self::FileReadFailed | Self::FileTooLarge
+            Self::EnvUnset
+                | Self::FileReadFailed
+                | Self::FileTooLarge
+                | Self::KeychainItemMissing
+                | Self::KeychainUnavailable
         )
     }
 
@@ -335,6 +436,8 @@ impl ResolutionFailure {
             Self::EnvUnset => "env_unset",
             Self::FileReadFailed => "file_read_failed",
             Self::FileTooLarge => "file_too_large",
+            Self::KeychainItemMissing => "keychain_item_missing",
+            Self::KeychainUnavailable => "keychain_unavailable",
             Self::Internal => "internal",
         }
     }
@@ -416,6 +519,8 @@ pub fn resolve_secret_ref_classified(
             read_from_file_source(path)
                 .map(|v| Zeroizing::new(v.trim_end_matches(['\n', '\r']).to_string()))
                 .map_err(classify_file_source_error)
+        } else if let Some(item) = &r.from_keychain {
+            read_keychain_item(item)
         } else {
             // Never reachable if validate_ref was called at the boundary.
             Err(ResolutionFailure::Internal)
@@ -553,6 +658,16 @@ pub fn env_ref(env_var: impl Into<String>) -> SecretRef {
     SecretRef {
         from_env: Some(env_var.into()),
         from_file: None,
+        from_keychain: None,
+    }
+}
+
+/// Build a `from_keychain` ref for `SERVICE` or `SERVICE/ACCOUNT`.
+pub fn keychain_ref(item: impl Into<String>) -> SecretRef {
+    SecretRef {
+        from_env: None,
+        from_file: None,
+        from_keychain: Some(item.into()),
     }
 }
 
@@ -561,6 +676,7 @@ pub fn file_ref(path: impl Into<std::path::PathBuf>) -> SecretRef {
     SecretRef {
         from_env: None,
         from_file: Some(path.into()),
+        from_keychain: None,
     }
 }
 
@@ -620,6 +736,7 @@ mod tests {
         let none = SecretRef {
             from_env: None,
             from_file: None,
+            from_keychain: None,
         };
         assert_eq!(
             validate_ref(&none, ResolutionScope::TrustedLocal),
@@ -628,6 +745,7 @@ mod tests {
         let both = SecretRef {
             from_env: Some("X".into()),
             from_file: Some("/abs".into()),
+            from_keychain: None,
         };
         assert_eq!(
             validate_ref(&both, ResolutionScope::TrustedLocal),
@@ -664,6 +782,59 @@ mod tests {
                 ..
             })
         ));
+        // An HTTP body or a foreign pack must not read this host's keychain.
+        assert!(matches!(
+            validate_ref(&keychain_ref("anthropic"), ResolutionScope::Untrusted),
+            Err(SecretRefError::SourceNotAllowedInScope {
+                kind: SecretSourceKind::Keychain,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn keychain_items_name_a_service_and_maybe_an_account() {
+        for good in ["anthropic", "anthropic/me", "svc/a/b"] {
+            assert!(
+                validate_ref(&keychain_ref(good), ResolutionScope::TrustedLocal).is_ok(),
+                "{good}"
+            );
+            assert!(
+                validate_ref(&keychain_ref(good), ResolutionScope::RecordReplay).is_ok(),
+                "{good}"
+            );
+        }
+        assert_eq!(keychain_item_parts("svc/a/b"), Some(("svc", Some("a/b"))));
+        for bad in ["", "/me", "svc/"] {
+            assert!(
+                matches!(
+                    validate_ref(&keychain_ref(bad), ResolutionScope::TrustedLocal),
+                    Err(SecretRefError::InvalidKeychainItem(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        let mut both = keychain_ref("svc");
+        both.from_env = Some("X".into());
+        assert_eq!(
+            validate_ref(&both, ResolutionScope::TrustedLocal),
+            Err(SecretRefError::MultipleSources)
+        );
+    }
+
+    /// A missing item is a caller error naming the source kind, never the item.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_missing_keychain_item_is_reported_without_its_name() {
+        let r = keychain_ref("smolvm-test-no-such-item-7f3a/nobody");
+        let failure =
+            resolve_secret_ref_classified("K", &r, ResolutionScope::TrustedLocal).unwrap_err();
+        assert!(matches!(
+            failure,
+            ResolutionFailure::KeychainItemMissing | ResolutionFailure::KeychainUnavailable
+        ));
+        assert!(failure.is_client_error());
+        assert!(!failure.as_str().contains("smolvm-test"));
     }
 
     #[test]
