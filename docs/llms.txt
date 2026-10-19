@@ -25,6 +25,7 @@
 - [mediated-egress.md](mediated-egress.md): a host decider for each guest TCP flow, and its protocol
 - [branching.md](branching.md): live branches, frozen sources and batch branches
 - [pause-resume.md](pause-resume.md): pausing a running machine and resuming it under the same name
+- [live-resize.md](live-resize.md): growing a running machine's CPUs, RAM and disks without rebooting it
 - [incremental-checkpoints.md](incremental-checkpoints.md): checkpoint stores, history, export and pruning
 - [mac-to-linux.md](mac-to-linux.md): moving a running machine from an arm64 Mac to arm64 Linux
 - [pack-layer-ownership.md](pack-layer-ownership.md): why a pack built before 1.8.1 loses its files' owners

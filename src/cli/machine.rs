@@ -423,7 +423,7 @@ pub enum MachineCmd {
     /// Grow a running machine's CPUs, RAM, or disks without rebooting
     Resize(ResizeCmd),
 
-    /// Modify settings on a stopped machine (mounts, ports, resources, disks)
+    /// Modify a machine's settings (mounts, ports, resources, network); `resize` grows a running one
     Update(UpdateCmd),
 
     /// List cached images and storage usage
@@ -6348,12 +6348,14 @@ impl ResizeCmd {
 // Update Command
 // ============================================================================
 
-/// Modify settings on a stopped machine, or the allow list of a running one.
+/// Modify settings on a stopped machine, or the allow list or ports of a running one.
 ///
 /// Changes are applied to the DB record and take effect on the next
 /// `machine start`. The machine must be stopped, except to add or remove
-/// allowed hosts and CIDRs on a machine started with an allow list: those take
-/// effect on its next connection or DNS lookup.
+/// allowed hosts and CIDRs on a machine started with an allow list, which take
+/// effect on its next connection or DNS lookup, or to add or remove TCP ports
+/// on their own, which apply at once. UDP ports change only while stopped. To
+/// grow a running machine's CPUs, RAM or disks, use `machine resize`.
 ///
 /// Examples:
 ///   smolvm machine update --name myvm -v ./src:/app -p 8080:8080
@@ -7568,7 +7570,7 @@ impl SyncCmd {
 ///
 /// Runs in the foreground, watching the machine and restarting on crash
 /// or health check failure. Uses the restart policy from the machine's
-/// config (set via Smolfile [restart] or --restart flag on create).
+/// config (set via Smolfile [restart]), or from --restart here.
 ///
 /// Ctrl+C stops monitoring; the machine keeps running.
 ///

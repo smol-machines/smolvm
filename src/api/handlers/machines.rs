@@ -6404,7 +6404,8 @@ fn classify_set_ports_error(error: crate::Error) -> ApiError {
     }
 }
 
-/// Resize a machine's disk resources.
+/// Resize a machine: grow a running machine's CPUs, RAM or disks (one kind per
+/// request), or a stopped machine's disks.
 #[utoipa::path(
     post,
     path = "/api/v1/machines/{name}/resize",

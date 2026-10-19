@@ -50,6 +50,7 @@ macOS arm64, where throwaway-machine's says `result=blocked`; its `SKILL.md` say
 | [mediated-egress.md](mediated-egress.md) | a host decider for each guest TCP flow, and its protocol |
 | [branching.md](branching.md) | live branches, frozen sources and batch branches |
 | [pause-resume.md](pause-resume.md) | pausing a running machine and resuming it under the same name |
+| [live-resize.md](live-resize.md) | growing a running machine's CPUs, RAM and disks without rebooting it |
 | [usage-journal.md](usage-journal.md) | the local record of machine lifecycle events, what it contains, and how to read, disable or share it |
 | [incremental-checkpoints.md](incremental-checkpoints.md) | checkpoint stores, history, export and pruning |
 | [mac-to-linux.md](mac-to-linux.md) | moving a running machine from an arm64 Mac to arm64 Linux |

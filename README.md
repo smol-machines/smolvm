@@ -45,8 +45,11 @@ Real VMs with their own kernel, free on your laptop or your own servers. They bo
 ```bash
 smolvm machine create --net --name dev && smolvm machine start --name dev
 smolvm machine exec --name dev -- apk add git
+smolvm machine resize --name dev --cpus 8 --storage 40       # grow it live, no reboot
 docker save myapp | smolvm machine run --image - -- ./app    # local image, no registry
 ```
+
+A running machine's CPUs, RAM and disks grow in place with [live resize](docs/live-resize.md).
 
 Declare a machine in a [Smolfile](docs/smolfile.md): image, resources, ports, mounts and network policy in one checked-in file.
 
@@ -126,7 +129,7 @@ How It Works
 
 Each workload runs in a hardware-virtualized VM with its own guest kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) is the VMM and [libkrunfw](https://github.com/smol-machines/libkrunfw) supplies the guest kernel. Images use the [OCI](https://opencontainers.org/) format, so anything on Docker Hub, ghcr.io or another registry boots as a microVM, with no Docker daemon.
 
-Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon and idle vCPUs sleep in the hypervisor, so over-provisioning costs almost nothing. Override with `--cpus` and `--mem`.
+Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon and idle vCPUs sleep in the hypervisor, so over-provisioning costs almost nothing. Override with `--cpus` and `--mem`, or grow a running machine with `machine resize`.
 
 Comparison
 ----------
