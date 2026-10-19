@@ -3,7 +3,7 @@
 # run_tests.sh -- primary test runner for smolvm
 #
 # Usage:
-#   ./tests/run_tests.sh                        # run all 11 feature suites (~10 min)
+#   ./tests/run_tests.sh                        # run all 13 feature suites (~10 min)
 #   ./tests/run_tests.sh bare network           # run specific groups
 #   SMOLVM_SKIP_SLOW=1 ./tests/run_tests.sh     # skip tests with long sleeps
 #

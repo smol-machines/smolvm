@@ -42,7 +42,7 @@ fi
 echo ""
 echo "Binary ready! Run it with:"
 echo "  cargo make smolvm --version"
-echo "  cargo make smolvm sandbox run --net alpine:latest -- echo hello"
+echo "  cargo make smolvm machine run --net --image alpine:latest -- echo hello"
 '''
 ]
 
@@ -210,7 +210,7 @@ script = [
 # =============================================================================
 
 [tasks.test]
-description = "Run all feature suites (11 groups, ~10 min)"
+description = "Run all feature suites (13 groups, ~10 min)"
 category = "Test"
 dependencies = ["test-lib"]
 script_runner = "bash"
