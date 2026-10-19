@@ -36,6 +36,8 @@ GET    /api/v1/machines/:name/exec/interactive  exec, WebSocket
 PUT    /api/v1/machines/:name/files/*path  upload           GET    /api/v1/machines/:name/files/*path  download
 GET    /api/v1/machines/:name/logs         logs, SSE        POST   /api/v1/machines/:name/images/pull   pull
 POST   /api/v1/machines/:name/pause        pause            POST   /api/v1/machines/:name/resume  resume
+POST   /api/v1/machines/:name/resize       live resize      POST   /api/v1/pools                warm branch pool
+POST   /api/v1/pools/:name/leases          lease a worker   (see ../branching.md#warm-pools-over-the-api)
 ```
 
 Machines that ask for nested virtualization (`nestedVirt`) are refused unless the server is started

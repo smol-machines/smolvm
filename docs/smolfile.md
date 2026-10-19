@@ -86,7 +86,7 @@ oci_platform = "linux/amd64"          # target OCI platform
 
 # Health check (used by `machine monitor`)
 [health]
-exec = ["curl", "-f", "http://127.0.0.1:8080/health"]
+exec = ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]  # runs in the agent, which has no curl
 interval = "10s"
 timeout = "2s"
 retries = 3

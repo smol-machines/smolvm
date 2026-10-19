@@ -612,10 +612,11 @@ pub struct RunCmd {
     /// accepts S3-compatible object storage, mounted inside the container:
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
-    /// for R2/MinIO; anonymous without them). Nothing is required of the
-    /// image: the agent performs the mount itself. `:staged` runs from a
-    /// guest-local copy for metadata-heavy workloads; `machine sync` and
-    /// graceful stop copy it back, so do not modify its host source concurrently.
+    /// for R2/MinIO; anonymous without them; needs --net; `:ro` is its only
+    /// mode). Nothing is required of the image: the agent performs the mount
+    /// itself. `:staged` runs from a guest-local copy, seeded at first boot,
+    /// for metadata-heavy workloads; `machine sync` and graceful stop mirror it
+    /// back onto the host source, deleting host files the copy lacks.
     /// A container path alone (`-v /var/lib/docker`) is a directory on the
     /// machine's own disk instead of its overlay root, which nested container
     /// runtimes need; it persists across stop and start.
@@ -671,7 +672,8 @@ pub struct RunCmd {
     pub guest_subnet: Option<String>,
 
     /// Join a named inter-VM network (implies --net, virtio-net only): members
-    /// get distinct addresses and can reach each other directly
+    /// can reach each other by IP (100.96.N.2, leased at start; names do not
+    /// resolve)
     #[arg(long = "network", value_name = "NAME", help_heading = "Network")]
     pub network_name: Option<String>,
 
@@ -694,7 +696,7 @@ pub struct RunCmd {
     /// Pass this host's proxy into the workload: HTTPS_PROXY/HTTP_PROXY/
     /// ALL_PROXY/NO_PROXY from the environment, or on macOS the system proxy.
     /// A proxy on the host's loopback is rewritten to an address the guest can
-    /// reach. Implies --net.
+    /// reach. Also used for the image pull. Implies --net.
     #[arg(long, help_heading = "Network")]
     pub use_host_proxy: bool,
 
@@ -702,6 +704,7 @@ pub struct RunCmd {
     /// corporate TLS-inspection root on the host. Mounts them read-only at
     /// /etc/smolvm-host-trust/ca-bundle.pem and points SSL_CERT_FILE,
     /// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE and similar at it.
+    /// SMOLVM_HOST_CA_BUNDLE selects another bundle. Not with --credential.
     #[arg(long, help_heading = "Network")]
     pub trust_host_certs: bool,
 
@@ -748,6 +751,8 @@ pub struct RunCmd {
     /// i.e. run smolvm, QEMU or Docker Desktop's hypervisor inside the machine.
     /// Off by default: nesting turns work the guest would do natively into
     /// vmexits, so a nested guest runs far slower.
+    /// Needs nested KVM on a Linux host (kvm_intel/kvm_amd nested=1) or an
+    /// M3 or newer Mac on macOS 15+.
     #[arg(long = "nested", help_heading = "Resources")]
     pub nested_virt: bool,
 
@@ -846,8 +851,8 @@ pub struct RunCmd {
     pub docker_socket: bool,
 
     /// Expose a Unix socket the guest listens on to the host (repeatable). The
-    /// host reaches it at the given host path, or `<vm-dir>/<basename>` by
-    /// default. Format: GUEST_PATH[:HOST_PATH].
+    /// host reaches it at the given host path, or `<basename>` in
+    /// `smolvm machine data-dir` by default. Format: GUEST_PATH[:HOST_PATH].
     #[arg(
         long = "expose-socket",
         value_name = "GUEST_PATH[:HOST_PATH]",
@@ -4261,10 +4266,11 @@ pub struct CreateCmd {
     /// S3-compatible object storage, mounted inside the guest on every start:
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
-    /// for R2/MinIO; anonymous without them). Nothing is required of the
-    /// image: the agent performs the mount itself. `:staged` runs from a
-    /// guest-local copy for metadata-heavy workloads; `machine sync` and
-    /// graceful stop copy it back, so do not modify its host source concurrently.
+    /// for R2/MinIO; anonymous without them; needs --net; `:ro` is its only
+    /// mode). Nothing is required of the image: the agent performs the mount
+    /// itself. `:staged` runs from a guest-local copy, seeded at first boot,
+    /// for metadata-heavy workloads; `machine sync` and graceful stop mirror it
+    /// back onto the host source, deleting host files the copy lacks.
     /// A container path alone (`-v /var/lib/docker`) is a directory on the
     /// machine's own disk instead of its overlay root, which nested container
     /// runtimes need; it persists across stop and start.
@@ -4319,7 +4325,8 @@ pub struct CreateCmd {
     pub guest_subnet: Option<String>,
 
     /// Join a named inter-VM network (implies --net, virtio-net only): members
-    /// get distinct addresses and can reach each other directly
+    /// can reach each other by IP (100.96.N.2, leased at start; names do not
+    /// resolve)
     #[arg(long = "network", value_name = "NAME")]
     pub network_name: Option<String>,
 
@@ -4338,7 +4345,7 @@ pub struct CreateCmd {
     /// Pass this host's proxy into the workload: HTTPS_PROXY/HTTP_PROXY/
     /// ALL_PROXY/NO_PROXY from the environment, or on macOS the system proxy.
     /// A proxy on the host's loopback is rewritten to an address the guest can
-    /// reach. Implies --net.
+    /// reach. Also used for the image pull. Implies --net.
     #[arg(long, help_heading = "Network")]
     pub use_host_proxy: bool,
 
@@ -4346,6 +4353,7 @@ pub struct CreateCmd {
     /// corporate TLS-inspection root on the host. Mounts them read-only at
     /// /etc/smolvm-host-trust/ca-bundle.pem and points SSL_CERT_FILE,
     /// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE and similar at it.
+    /// SMOLVM_HOST_CA_BUNDLE selects another bundle. Not with --credential.
     #[arg(long, help_heading = "Network")]
     pub trust_host_certs: bool,
 
@@ -4384,6 +4392,8 @@ pub struct CreateCmd {
     /// Expose the host's virtualization extensions so the guest can run KVM --
     /// i.e. run smolvm, QEMU or another hypervisor inside the machine. Off by
     /// default: nesting turns work the guest would do natively into vmexits.
+    /// Needs nested KVM on a Linux host (kvm_intel/kvm_amd nested=1) or an
+    /// M3 or newer Mac on macOS 15+.
     #[arg(long = "nested")]
     pub nested_virt: bool,
 
@@ -4401,8 +4411,8 @@ pub struct CreateCmd {
     pub rosetta: bool,
 
     /// Expose a Unix socket the guest listens on to the host (repeatable). The
-    /// host reaches it at the given host path, or `<vm-dir>/<basename>` by
-    /// default. Format: GUEST_PATH[:HOST_PATH].
+    /// host reaches it at the given host path, or `<basename>` in
+    /// `smolvm machine data-dir` by default. Format: GUEST_PATH[:HOST_PATH].
     #[arg(long = "expose-socket", value_name = "GUEST_PATH[:HOST_PATH]")]
     pub expose_socket: Vec<String>,
 
@@ -6350,8 +6360,9 @@ pub struct UpdateCmd {
     #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: String,
 
-    /// Add volume mount. A staged mount is guest-local until sync or graceful stop;
-    /// do not modify its host source concurrently. A guest path alone adds a
+    /// Add volume mount. A staged mount is guest-local until sync or graceful stop,
+    /// which mirror it onto the host source, deleting host files the copy lacks.
+    /// A guest path alone adds a
     /// directory on the machine's own disk.
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     pub volume: Vec<String>,

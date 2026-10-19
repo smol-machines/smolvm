@@ -48,6 +48,8 @@ smolvm machine exec --name dev -- apk add git
 docker save myapp | smolvm machine run --image - -- ./app    # local image, no registry
 ```
 
+Mount an S3, R2 or MinIO bucket with `-v s3://bucket/prefix:/data`, see [volumes](docs/volumes.md).
+
 Declare a machine in a [Smolfile](docs/smolfile.md): image, resources, ports, mounts and network policy in one checked-in file.
 
 Embeddable
@@ -159,6 +161,9 @@ More
 
 * [Kubernetes](docs/kubernetes.md): run pods as microVMs through a `RuntimeClass`.
 * [GPU and CUDA](docs/gpu.md): Vulkan via virtio-gpu / Venus, and CUDA API remoting.
+* [Named networks](docs/named-networks.md): machines that reach each other by IP.
+* [Nested virtualization](docs/nested-virtualization.md): run KVM, smolvm or QEMU inside a machine.
+* [Browser display](docs/browser-display.md): a machine's desktop in the browser, with keyboard and mouse.
 * [Examples](examples/): python, node, docker-in-vm, local-llm, headless-browser, doom.
 * [Development](docs/DEVELOPMENT.md) · User docs at [smolmachines.com/docs](https://smolmachines.com/docs/), written in [smol-machines/docs](https://github.com/smol-machines/docs) (corrections welcome there; runtime bugs stay here).
 

@@ -87,3 +87,23 @@ source in memory; `machine checkpoint` saves that same state as a durable
 Building checkpoint tooling in Rust? [`smolvm-checkpoint`](../crates/smolvm-checkpoint)
 provides incremental storage, verified file restoration, and portable export
 without depending on the VM runtime.
+
+## Warm pools over the API
+
+`smolvm serve` keeps a pool of held branches of a running branchable source and
+hands one out per lease, with the job's environment and files installed before
+its program runs.
+
+```sh
+J='-H content-type:application/json'
+curl $J -XPOST $API/api/v1/pools -d '{"name":"p","source":"src","desiredReady":4}'
+curl $J -XPOST $API/api/v1/pools/p/leases -d '{"idempotencyKey":"job-1","env":["JOB=1"],
+  "files":[{"path":"job.json","dataBase64":"e30="}]}'
+curl -XPOST $API/api/v1/pools/p/leases/$LEASE/heartbeat   # before expiresAt
+curl -XPOST $API/api/v1/pools/p/leases/$LEASE/complete    # the worker is replaced
+```
+
+Files land under `/workspace`. A lease returns the worker's `machine` name for
+the exec and file APIs. Reusing an `idempotencyKey` with a different body is
+refused. Without `waitSecs` a lease fails with 503 when no worker is ready.
+`PUT …/size` changes the target and `DELETE …?force=true` cancels active leases.

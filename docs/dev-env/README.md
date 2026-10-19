@@ -29,6 +29,41 @@ credentials and configuration, which should not sit in `/tmp` or behind a symlin
 The storage disk defaults to 20 GiB and the rootfs overlay to 10 GiB, as `machine list` showed on
 v1.22.2 and on v1.27.3. Both are sparse, so they cost what they hold.
 
+## Changing ports while it runs
+
+`machine update` adds or removes TCP ports on a running machine; the change
+applies at once and is saved for the next start.
+
+```sh
+smolvm machine update --name dev -p 9090:9090
+smolvm machine update --name dev --remove-port 8080:8080
+```
+
+Connections a removed port already accepted carry on. The machine must have
+been started with at least one published port, since only that networking can
+change live. UDP ports, and any other setting in the same command, need the
+machine stopped. A host port already in use fails the command and changes
+nothing. The API equivalent is `PUT /api/v1/machines/{name}/ports` with the
+whole set: `{"ports":[{"host":9090,"guest":9090}]}`.
+
+To grow a running machine's CPUs, RAM or disks, see [live resize](../live-resize.md).
+
+## Watching a running machine
+
+```sh
+smolvm machine logs --name dev            # workload stdout and stderr
+smolvm machine logs --name dev -f --tail 50
+smolvm machine stats --name dev           # add --json for scripts
+```
+
+`logs` shows the output of the machine's workload (the image's entrypoint or
+the Smolfile command), not of `exec` sessions. The log is kept across restarts,
+rotated at 10 MiB, and readable while the machine is stopped. `-f` runs until
+interrupted.
+
+`stats` needs a running machine. CPU is the VM process on the host over half a
+second, where 100% is one busy CPU; memory is the guest's own account.
+
 ## `init` runs once
 
 A Smolfile's `init` is provisioning, as [`smolfile.md`](../smolfile.md) says: it runs on the first
