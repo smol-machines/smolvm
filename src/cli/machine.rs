@@ -6645,7 +6645,6 @@ impl UpdateCmd {
         db: &smolvm::db::SmolvmDb,
         record: &smolvm::config::VmRecord,
     ) -> smolvm::Result<()> {
-        record.check_live_ports()?;
         let all = self.next_ports(record)?;
         // A UDP port is bound for the runtime's life; only TCP ones change live.
         let udp = |ports: &[PortMapping]| {

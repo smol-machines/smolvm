@@ -260,6 +260,17 @@ pub fn serve_egress_control(
 /// complete set of `host:guest` mappings to publish and gets back `ok` or
 /// `error: <reason>`.
 pub fn serve_ports_control(ports: smolvm_network::PublishedPorts, vm_dir: &std::path::Path) {
+    serve_ports_requests(vm_dir, move |next| {
+        ports.replace(next).map_err(|error| error.to_string())
+    });
+}
+
+/// Serve the ports control socket in `vm_dir`, handing each request's parsed
+/// mappings to `replace`; shared by virtio-net and the TSI port forwarder.
+pub(crate) fn serve_ports_requests(
+    vm_dir: &std::path::Path,
+    replace: impl Fn(&[smolvm_network::PortMapping]) -> Result<(), String> + Send + 'static,
+) {
     let path = vm_dir.join(smolvm_network::PORTS_SOCKET);
     let _ = std::fs::remove_file(&path);
     serve_control_socket(
@@ -268,7 +279,7 @@ pub fn serve_ports_control(ports: smolvm_network::PublishedPorts, vm_dir: &std::
         MAX_PORTS_REQUEST_BYTES,
         move |request| {
             let next = smolvm_network::parse_port_mappings(request)?;
-            ports.replace(&next).map_err(|error| error.to_string())?;
+            replace(&next)?;
             tracing::info!(ports = %smolvm_network::render_port_mappings(&next).trim_end(), "published ports replaced");
             Ok(())
         },

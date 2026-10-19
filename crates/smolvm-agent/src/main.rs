@@ -98,10 +98,12 @@ mod nsfile;
 mod oci;
 mod paths;
 mod pod;
+mod port_forward;
 mod process;
 #[cfg(unix)]
 mod pty;
 mod publish_socket;
+mod relay;
 mod retry;
 mod rosetta;
 mod s3mount;
@@ -576,6 +578,11 @@ fn main() {
     if docker_bridge::is_enabled() {
         info!("Docker socket bridge enabled, starting guest bridge");
         docker_bridge::start();
+    }
+
+    // Forward ports published while the machine runs (no virtio-net).
+    if port_forward::is_enabled() {
+        port_forward::start();
     }
 
     // Start any user-published Unix-socket bridges (`--expose-socket` /

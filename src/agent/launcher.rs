@@ -1826,10 +1826,33 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // no new control flow in this function. The `active_vsock` set is reused
         // below to inject each service's guest-side activation env vars, so the
         // host and guest sides cannot drift.
+        // A machine without virtio-net has no host listeners of its own, so the
+        // ports it publishes while running go through the port forwarder. A
+        // socket path too long for the platform only costs that live change.
+        let port_forward_socket = if network_plan.backend == EffectiveNetworkBackend::VirtioNet {
+            None
+        } else {
+            vsock_socket
+                .parent()
+                .map(|dir| dir.join(crate::network::port_forward::PORT_FORWARD_SOCKET))
+                .filter(|socket| {
+                    super::launcher_dynamic::check_socket_path_len(socket)
+                        .inspect_err(|e| tracing::warn!("live port forwarding disabled: {e}"))
+                        .is_ok()
+                })
+        };
+        if let (Some(socket), Some(dir)) = (&port_forward_socket, vsock_socket.parent()) {
+            let _ = std::fs::remove_file(socket);
+            crate::network::port_forward::serve_forwarded_ports_control(
+                crate::network::port_forward::PortForwarder::new(socket),
+                dir,
+            );
+        }
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),
             docker_socket: docker_socket.as_deref(),
+            port_forward_socket: port_forward_socket.as_deref(),
             workload_log_socket: workload_log_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()

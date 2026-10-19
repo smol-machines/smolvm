@@ -15,9 +15,9 @@ use crate::{Error, Result};
 /// A stopped machine gets them at its next start. A running one changes its
 /// TCP ports now: new host ports start accepting, removed ones stop
 /// (connections they already accepted carry on). Its UDP ports are bound for
-/// the life of the VM, so a running machine refuses a UDP change, and only a
-/// machine on virtio-net networking can change ports while running. A host
-/// port already taken fails the call and changes nothing.
+/// the life of the VM, so a running machine refuses a UDP change. A machine on
+/// virtio-net changes its own listeners; any other runs them in the port
+/// forwarder. A host port already taken fails the call and changes nothing.
 pub fn set_published_ports(
     db: &SmolvmDb,
     record: &VmRecord,
@@ -44,7 +44,6 @@ pub fn set_published_ports(
                 "published UDP ports cannot change on a running machine; stop it first",
             ));
         }
-        record.check_live_ports()?;
         crate::agent::apply_live_published_ports(name, &tcp)?;
     }
     let saved = db.update_vm(name, |r| {

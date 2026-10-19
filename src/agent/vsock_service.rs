@@ -27,6 +27,10 @@ pub struct VsockServiceInputs<'a> {
     /// forwards each host connection to the guest, which proxies it to the
     /// in-guest dockerd socket. When set, the Docker bridge is enabled.
     pub docker_socket: Option<&'a Path>,
+    /// Host-side socket for ports published while a machine without virtio-net
+    /// runs. libkrun *listens* on this path and forwards each connection to the
+    /// guest's port forwarder.
+    pub port_forward_socket: Option<&'a Path>,
     /// Host socket the workload's output is appended from. When set, the
     /// guest agent forwards a detached workload's stdout and stderr to it.
     pub workload_log_socket: Option<&'a Path>,
@@ -110,6 +114,25 @@ impl VsockService for DockerSocketService {
     }
 }
 
+/// Live port forwarding for machines without virtio-net: the host's
+/// forwarder connects in, and the guest relays each connection to the guest
+/// port it names.
+struct PortForwardService;
+impl VsockService for PortForwardService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.port_forward_socket.map(|socket| ActiveVsockService {
+            name: "live port forwarding",
+            port: ports::PORT_FORWARD,
+            listen: true,
+            socket,
+            guest_env: &[(
+                smolvm_protocol::guest_env::PORT_FORWARD,
+                smolvm_protocol::guest_env::VALUE_ON,
+            )],
+        })
+    }
+}
+
 /// Workload logs: the guest agent connects out and streams a detached
 /// workload's stdout and stderr to a host listener that appends them to the
 /// machine's `workload.log`.
@@ -132,6 +155,7 @@ pub fn registry() -> &'static [&'static dyn VsockService] {
         &SshAgentService,
         &CudaService,
         &DockerSocketService,
+        &PortForwardService,
         &WorkloadLogService,
     ]
 }
@@ -147,6 +171,7 @@ mod tests {
             ssh_agent_socket: Some(socket),
             cuda_socket: None,
             docker_socket: None,
+            port_forward_socket: None,
             workload_log_socket: None,
         };
 

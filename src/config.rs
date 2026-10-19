@@ -1545,23 +1545,6 @@ impl VmRecord {
         Ok(())
     }
 
-    /// Refuse a port change a running machine can't take: only a machine
-    /// running on virtio-net has host-side listeners to change.
-    pub fn check_live_ports(&self) -> Result<()> {
-        use crate::network::launch::EffectiveNetworkBackend;
-        if self.launch_network_plan().backend != EffectiveNetworkBackend::VirtioNet {
-            return Err(crate::Error::config(
-                "published ports",
-                format!(
-                    "machine '{}' is running without virtio-net networking, so its ports can \
-                     only change while it is stopped",
-                    self.name
-                ),
-            ));
-        }
-        Ok(())
-    }
-
     /// The network this machine launches with. A credential policy steers the
     /// default backend to virtio-net, so anything that records or checks the
     /// backend (validation, checkpoint capture) must plan it the same way the
@@ -1817,23 +1800,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_machine_running_on_virtio_net_takes_port_changes_live() {
-        VmRecord::new("p".to_string(), 1, 512, vec![], vec![(3000, 3000)], false)
-            .check_live_ports()
-            .unwrap();
-        let mut restricted = VmRecord::new("p".to_string(), 1, 512, vec![], vec![], true);
-        restricted.dns_filter_hosts = Some(vec!["pypi.org".to_string()]);
-        restricted.check_live_ports().unwrap();
-        for record in [
-            VmRecord::new("p".to_string(), 1, 512, vec![], vec![], true),
-            VmRecord::new("p".to_string(), 1, 512, vec![], vec![], false),
-        ] {
-            let err = record.check_live_ports().unwrap_err().to_string();
-            assert!(err.contains("stopped"), "{err}");
-        }
-    }
-
-    #[test]
     fn udp_only_ports_plan_virtio_net_as_the_launcher_does() {
         let mut record = VmRecord::new("u".to_string(), 1, 512, vec![], vec![], true);
         record.udp_ports = vec![(9000, 9000)];
@@ -1841,7 +1807,6 @@ mod tests {
             record.launch_network_plan().backend,
             crate::network::launch::EffectiveNetworkBackend::VirtioNet
         );
-        record.check_live_ports().unwrap();
     }
 
     #[test]

@@ -297,6 +297,10 @@ pub mod ports {
     /// ping remain as fallbacks. A fork clone resumes past the ring, so it never
     /// dials this — clones detect readiness by pinging the restored agent.
     pub const AGENT_READY: u32 = 6004;
+    /// Live port forwarding for machines without virtio-net: the guest listens
+    /// on this port, reads the target guest port as one decimal line, then
+    /// relays the connection to `127.0.0.1:<port>` inside the guest.
+    pub const PORT_FORWARD: u32 = 6005;
     /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
     /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
     pub const CUDA: u32 = 7000;

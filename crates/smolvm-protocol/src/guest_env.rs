@@ -114,6 +114,8 @@ pub const DNS_OPTIONS: &str = "SMOLVM_NETWORK_DNS_OPTIONS";
 /// `/dev/shm` size for the workload container (`--shm-size`), already a
 /// tmpfs `size=` value from [`shm_size_option`]. Unset = half the guest RAM.
 pub const SHM_SIZE: &str = "SMOLVM_SHM_SIZE";
+/// Enables the guest-side port forwarder on [`crate::ports::PORT_FORWARD`].
+pub const PORT_FORWARD: &str = "SMOLVM_PORT_FORWARD";
 
 /// Validate a `--shm-size` value and return it as a tmpfs `size=` value: a
 /// byte count with an optional `k`, `m` or `g` suffix (`512m`, `2g`), or a
