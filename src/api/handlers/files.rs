@@ -67,6 +67,13 @@ pub async fn upload_file(
     let limit = crate::api::MAX_FILE_UPLOAD_BYTES as u64;
     let too_large =
         || ApiError::PayloadTooLarge(format!("file exceeds the {} MiB upload limit", limit >> 20));
+    let unsized_too_large = || {
+        ApiError::PayloadTooLarge(format!(
+            "an upload without a Content-Length is limited to {} MiB; send its length to upload up to {} MiB",
+            crate::api::MAX_BUFFERED_UPLOAD_BYTES >> 20,
+            limit >> 20
+        ))
+    };
     let declared = headers
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -91,15 +98,17 @@ pub async fn upload_file(
         Some(len) if len > smolvm_protocol::FILE_WRITE_SINGLE_SHOT_MAX as u64 => {
             UploadSource::Streamed(len, BodyReader::spawn(body, len))
         }
-        _ => UploadSource::Whole(axum::body::to_bytes(body, limit as usize).await.map_err(
-            |e| {
-                if e.to_string().contains("length limit") {
-                    too_large()
-                } else {
-                    ApiError::BadRequest(format!("upload body did not arrive in full: {e}"))
-                }
-            },
-        )?),
+        _ => UploadSource::Whole(
+            axum::body::to_bytes(body, crate::api::MAX_BUFFERED_UPLOAD_BYTES)
+                .await
+                .map_err(|e| {
+                    if e.to_string().contains("length limit") {
+                        unsized_too_large()
+                    } else {
+                        ApiError::BadRequest(format!("upload body did not arrive in full: {e}"))
+                    }
+                })?,
+        ),
     };
     let size = match &source {
         UploadSource::Streamed(len, _) => *len,

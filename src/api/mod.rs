@@ -230,9 +230,13 @@ const _: () = assert!(
 );
 
 /// Body cap for the file-upload route. axum's 2 MiB default silently 413s larger
-/// uploads before the handler runs; the control plane permits 100 MiB, so match
-/// it here. The agent streams the write and enforces the true ceiling.
-pub(crate) const MAX_FILE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+/// uploads before the handler runs; the control plane permits 1 GiB, so match
+/// it here. A body of declared length streams into the guest, so this costs no
+/// memory; the agent enforces the true ceiling.
+pub(crate) const MAX_FILE_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
+/// Cap for an upload without a Content-Length, which is read whole into memory
+/// before it is written.
+pub(crate) const MAX_BUFFERED_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 /// Bounded but large enough for cohorts of pre-tokenized RL prompts.
 const MAX_ROLLOUT_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 
@@ -374,13 +378,12 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         )
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
-        // File I/O routes. The upload handler buffers the whole body (`body:
-        // Bytes`), so without a raised limit axum's 2 MiB default rejects any
-        // larger upload with a bare 413 "Failed to buffer the request body" —
-        // the control plane already permits 100 MiB here, so match it (the agent
-        // streams the write, so the real ceiling is FILE_TRANSFER_MAX_TOTAL).
-        // Per-route so only uploads get the large cap; the agent enforces the
-        // true maximum.
+        // File I/O routes. Without a raised limit axum's 2 MiB default rejects
+        // any larger upload with a bare 413 "Failed to buffer the request
+        // body"; the control plane permits 1 GiB here, so match it. The
+        // handler streams a body of declared length and caps one without at
+        // MAX_BUFFERED_UPLOAD_BYTES. Per-route so only uploads get the large
+        // cap; the agent enforces the true maximum (FILE_TRANSFER_MAX_TOTAL).
         .route(
             "/{id}/files/{*path}",
             put(handlers::files::upload_file).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
