@@ -4360,6 +4360,10 @@ fn classify_fork_error(e: SmolvmError) -> ApiError {
     let lc = msg.to_ascii_lowercase();
     if lc.contains("branch needs at least") && lc.contains("effective host headroom") {
         ApiError::Unavailable(msg)
+    } else if lc.contains("no reply to fork") {
+        // The source's checkpoint outlasted the wait: a busy host, not a
+        // broken source, which a retry gets past.
+        ApiError::Unavailable(format!("{msg}; the host is busy, retry the branch"))
     } else if lc.contains("cuda fork descendants") || lc.contains("fork lineage would exceed") {
         ApiError::BadRequest(msg)
     } else if lc.contains("already exists")
@@ -8037,6 +8041,15 @@ mod tests {
             "the derived sidecar must be the .smolmachine artifact"
         );
         assert_ne!(stub, sidecar);
+    }
+
+    #[test]
+    fn a_capture_that_outlasts_its_wait_is_a_retryable_unavailable() {
+        let e = SmolvmError::agent("read control socket", "no reply to FORK within 220 s");
+        match classify_fork_error(e) {
+            ApiError::Unavailable(msg) => assert!(msg.contains("retry the branch"), "{msg}"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
     }
 
     #[test]

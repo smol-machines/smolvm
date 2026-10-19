@@ -364,10 +364,45 @@ pub fn control_socket_cmd_with_timeout(
                 }
                 reply.push(byte[0] as char);
             }
+            // A read timeout surfaces as EAGAIN, which says nothing about why.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(Error::agent(
+                    "read control socket",
+                    format!(
+                        "no reply to {} within {} s",
+                        verb_of(cmd),
+                        timeout.as_secs()
+                    ),
+                ));
+            }
             Err(e) => return Err(Error::agent("read control socket", e.to_string())),
         }
     }
     Ok(reply)
+}
+
+/// The command word of a control command, without its arguments (paths).
+fn verb_of(cmd: &str) -> &str {
+    cmd.split_whitespace().next().unwrap_or(cmd)
+}
+
+/// How long a branch waits for its source's checkpoint. The capture copies
+/// what the source has written since its last one, so a large or busy machine
+/// on a loaded host can take far longer than the 60 s other commands get: a
+/// capture that was still progressing used to fail at 60 s and fail every
+/// branch waiting on it. Capped below the control plane's 600 s wait for a
+/// branch, so the node answers before its caller gives up.
+pub fn fork_capture_timeout(mem_mib: u32) -> Duration {
+    const BASE_SECS: u64 = 60;
+    const SECS_PER_GIB: u64 = 20;
+    const MAX_SECS: u64 = 540;
+    let gib = u64::from(mem_mib).div_ceil(1024);
+    Duration::from_secs((BASE_SECS + SECS_PER_GIB * gib).min(MAX_SECS))
 }
 
 /// Workload preparation choices inherited by every clone of one golden.
@@ -2650,7 +2685,11 @@ pub(crate) fn prepare_forks_reusing(
         } else {
             "FORK"
         };
-        let reply = control_socket_cmd(&ctl, &format!("{fork_verb} {}", snapshot_dir.display()));
+        let reply = control_socket_cmd_with_timeout(
+            &ctl,
+            &format!("{fork_verb} {}", snapshot_dir.display()),
+            fork_capture_timeout(golden_rec.mem),
+        );
         if fork_continue && forkpoint_armed {
             if let Err(error) = park_forkpoint_after_capture(golden) {
                 tracing::warn!(%golden, %error, "continued source did not park after capture");
@@ -5600,6 +5639,39 @@ mod tests {
             !torn_down.get(),
             "a successful rejuvenation must not tear the clone down"
         );
+    }
+
+    #[test]
+    fn a_branch_waits_longer_for_a_bigger_source_but_not_past_the_control_plane() {
+        assert_eq!(fork_capture_timeout(0), Duration::from_secs(60));
+        assert_eq!(fork_capture_timeout(2048), Duration::from_secs(100));
+        assert_eq!(fork_capture_timeout(8192), Duration::from_secs(220));
+        assert_eq!(fork_capture_timeout(8193), Duration::from_secs(240));
+        assert_eq!(fork_capture_timeout(65536), Duration::from_secs(540));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_control_command_with_no_reply_says_which_command_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Accept and hold the connection without answering, like a VMM
+        // still working on a capture.
+        let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let error = control_socket_cmd_with_timeout(
+            &sock,
+            "FORK /var/lib/smolvm/vms/x/s/abcd1234",
+            Duration::from_secs(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no reply to FORK within 1 s"), "{error}");
+        assert!(
+            !error.contains("/var/lib"),
+            "the path stays out of the message: {error}"
+        );
+        drop(held.join());
     }
 
     #[test]
