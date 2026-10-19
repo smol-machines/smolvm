@@ -66,6 +66,7 @@ pub mod fabric;
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.
 pub mod frame_stream;
 pub mod icmp_relay;
+pub mod opening;
 // CNI netns ↔ virtio-net L2 bridge for the Kubernetes runtime (Linux only:
 // needs /dev/net/tun + setns).
 #[cfg(target_os = "linux")]
@@ -377,10 +378,15 @@ pub fn parse_port_mappings(text: &str) -> Result<Vec<PortMapping>, String> {
         .collect()
 }
 
-/// Filename of the per-VM egress signal log: watchlist matches, recorded beside
-/// the denial log by the launcher and read back by the host's
-/// `read_egress_signals`. Created on the first match only.
+/// Filename of the per-VM egress signal log: watchlist matches and stratum
+/// handshakes, recorded beside the denial log by the launcher and read back by
+/// the host's `read_egress_signals`. Created on the first signal only.
 pub const EGRESS_SIGNALS_LOG: &str = "egress-signals.log";
+
+/// Label of the signal a guest's stratum handshake records: a miner logging in
+/// to its pool. Built in, so it is recorded whether or not an operator watchlist
+/// is attached, and reported beside watchlist matches.
+pub const STRATUM_SIGNAL: &str = "stratum";
 
 /// Whether the host can actually reach the IPv6 internet.
 ///

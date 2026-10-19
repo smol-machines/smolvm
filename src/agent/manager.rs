@@ -673,7 +673,8 @@ fn parse_egress_denial_line(line: &str) -> Option<EgressDenial> {
 }
 
 /// Per-VM egress signal log: `<vm_data_dir>/egress-signals.log`, where the
-/// virtio-net runtime records matches against the operator's egress watchlist.
+/// virtio-net runtime records matches against the operator's egress watchlist
+/// and stratum handshakes.
 pub fn egress_signals_log_file(name: &str) -> PathBuf {
     vm_data_dir(name).join(smolvm_network::EGRESS_SIGNALS_LOG)
 }
@@ -683,9 +684,11 @@ pub fn egress_signals_log_file(name: &str) -> PathBuf {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EgressSignal {
-    /// The watchlist entry's label, as written in the watchlist file.
+    /// The watchlist entry's label, as written in the watchlist file, or
+    /// `stratum` for a miner's pool login.
     pub label: String,
-    /// What matched: the name asked in a DNS question, or `ip:port`.
+    /// What matched: the name asked in a DNS question or a TLS ClientHello,
+    /// or `ip:port`.
     pub dest: String,
     /// How many times it was recorded in the recent log. A repeat within a
     /// minute is recorded once, so this counts minutes with activity, roughly.
@@ -711,8 +714,8 @@ pub fn read_mediation_machine_id(name: &str) -> Option<String> {
     Some(id.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// Summarize the watchlist matches recorded for `name`, latest first, or `None`
-/// when there are none (no watchlist, or nothing matched). Only the log's
+/// Summarize the signals recorded for `name`, latest first, or `None` when
+/// there are none. Only the log's
 /// recent tail is read, bounding the work per machine-info call.
 pub fn read_egress_signals(name: &str) -> Option<Vec<EgressSignal>> {
     read_egress_signals_at(&egress_signals_log_file(name))

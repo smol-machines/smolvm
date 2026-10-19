@@ -554,17 +554,7 @@ fn run_network_stack(
         // can spawn the corresponding host relay thread.
         for connection in relays.take_new_connections(&mut sockets) {
             relay_spawn_attempts = relay_spawn_attempts.saturating_add(1);
-            if spawn_tcp_relay(
-                connection.destination,
-                connection.relay_target,
-                connection.from_smoltcp,
-                connection.to_smoltcp,
-                relay_wake.clone(),
-                connection.proxy_wake,
-                connection.exit_state,
-            )
-            .is_ok()
-            {
+            if spawn_tcp_relay(connection, relay_wake.clone()).is_ok() {
                 relay_spawn_successes = relay_spawn_successes.saturating_add(1);
             } else {
                 relay_spawn_failures = relay_spawn_failures.saturating_add(1);

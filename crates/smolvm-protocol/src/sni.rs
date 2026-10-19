@@ -1,11 +1,11 @@
 //! TLS ClientHello inspection.
 //!
-//! The interceptor receives every redirected HTTPS flow before deciding
-//! whether it belongs to a credential host. It peeks at the first TLS record
-//! for the `server_name` extension; the record is then either handed to the
-//! terminating TLS stack or replayed toward the real destination unchanged.
+//! Peeks at the first TLS record of a flow for the `server_name` extension
+//! without consuming it. The credential interceptor uses it to decide whether
+//! a redirected HTTPS flow belongs to a credential host, and the host network
+//! stack to check the name a guest connects to against the egress watchlist.
 
-/// Largest ClientHello the interceptor will buffer while looking for SNI.
+/// Largest ClientHello a caller should buffer while looking for SNI.
 pub const MAX_CLIENT_HELLO: usize = 16 * 1024;
 
 /// Result of inspecting the bytes buffered so far.

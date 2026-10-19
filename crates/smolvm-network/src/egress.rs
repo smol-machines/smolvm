@@ -362,8 +362,9 @@ pub struct EgressPolicy {
     /// The operator's egress watchlist for this VM, when one was provisioned:
     /// destinations to flag in `signal_log`, never to block.
     watchlist: Option<Arc<crate::watchlist::WatchlistSource>>,
-    /// Audit sink for watchlist matches, kept apart from denials so neither
-    /// evicts the other. Created on the first match only.
+    /// Audit sink for signals (watchlist matches and stratum handshakes), kept
+    /// apart from denials so neither evicts the other. Created on the first
+    /// signal only.
     signal_log: Option<Arc<std::path::PathBuf>>,
     decision_log: Option<Arc<DecisionLog>>,
 }
@@ -682,18 +683,17 @@ impl EgressPolicy {
         }
     }
 
-    /// Attach the operator's watchlist and the file its matches are appended to.
+    /// Attach the operator's watchlist and the file signals are appended to.
     /// `watchlist` is the VM's copy (`EGRESS_WATCHLIST_FILE`); when there is no
-    /// copy the policy observes nothing and never creates the signal log.
+    /// copy only the built-in signals, such as a stratum handshake, are
+    /// recorded, and the signal log is created only when one is.
     pub fn with_watchlist(
         mut self,
         watchlist: std::path::PathBuf,
         signal_log: std::path::PathBuf,
     ) -> Self {
-        if let Some(source) = crate::watchlist::WatchlistSource::open(watchlist) {
-            self.watchlist = Some(source);
-            self.signal_log = Some(Arc::new(signal_log));
-        }
+        self.watchlist = crate::watchlist::WatchlistSource::open(watchlist);
+        self.signal_log = Some(Arc::new(signal_log));
         self
     }
 
@@ -726,6 +726,26 @@ impl EgressPolicy {
             self.record_signal(label, &dest);
         }
         verdict.block
+    }
+
+    /// Note what a guest's opening bytes on an outbound TCP connection to
+    /// `destination` are, returning whether a `block` watchlist entry refuses
+    /// the connection. A stratum handshake is recorded under
+    /// [`STRATUM_SIGNAL`](crate::STRATUM_SIGNAL) with or without a watchlist;
+    /// a TLS server name is matched against the watchlist like a DNS question.
+    pub fn observe_opening(
+        &self,
+        destination: std::net::SocketAddr,
+        opening: &crate::opening::Opening,
+    ) -> bool {
+        match opening {
+            crate::opening::Opening::Stratum(_) => {
+                self.record_signal(crate::STRATUM_SIGNAL, &destination);
+                false
+            }
+            crate::opening::Opening::ServerName(name) => self.observe_dns(name),
+            crate::opening::Opening::Other => false,
+        }
     }
 
     /// Record one match. Keep the marker text stable: the host's

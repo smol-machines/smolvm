@@ -63,6 +63,7 @@ pub mod publish_socket;
 pub mod resolv;
 pub mod retry;
 pub mod secrets;
+pub mod sni;
 pub mod workload_target;
 
 pub use credentials::{CredentialBinding, CredentialPolicy};

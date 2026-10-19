@@ -120,6 +120,9 @@ pub struct NewTcpConnection {
     /// Wakes the relay thread when the poll loop hands it a guest payload or
     /// closes the guest side.
     pub proxy_wake: WakePipe,
+    /// The policy to show the guest's opening bytes to, for an outbound
+    /// connection; `None` for a published port's inbound one.
+    pub watch_opening: Option<EgressPolicy>,
 }
 
 #[derive(Debug)]
@@ -158,6 +161,7 @@ struct PendingProxyEndpoints {
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_target: RelayTarget,
     proxy_wake: WakePipe,
+    watch_opening: Option<EgressPolicy>,
 }
 
 /// The poll loop's sending half of a guest->host channel. It wakes the relay
@@ -569,6 +573,7 @@ impl TcpRelayTable {
                     to_smoltcp: from_proxy_tx,
                     relay_target: self.outbound_target(destination),
                     proxy_wake,
+                    watch_opening: Some(self.egress.clone()),
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -670,6 +675,7 @@ impl TcpRelayTable {
                     to_smoltcp: from_proxy_tx,
                     relay_target: RelayTarget::Attached(host_stream),
                     proxy_wake,
+                    watch_opening: None,
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -782,6 +788,7 @@ impl TcpRelayTable {
                         to_smoltcp: endpoints.to_smoltcp,
                         exit_state: connection.exit_state.clone(),
                         proxy_wake: endpoints.proxy_wake,
+                        watch_opening: endpoints.watch_opening,
                     });
                 }
             }
@@ -870,34 +877,19 @@ fn first_refusal_of_guest_port(reported: &mut HashSet<u16>, guest_port: u16) -> 
 /// - copy bytes host->guest into `to_smoltcp`
 /// - wake the poll loop when host->guest data arrives or guest->host backpressure eases
 /// - report termination mode through `exit_state`
-pub fn spawn_tcp_relay(
-    destination: SocketAddr,
-    relay_target: RelayTarget,
-    from_smoltcp: Receiver<Vec<u8>>,
-    to_smoltcp: SyncSender<Vec<u8>>,
-    relay_wake: Arc<WakePipe>,
-    proxy_wake: WakePipe,
-    exit_state: RelayExitState,
-) -> io::Result<()> {
+pub fn spawn_tcp_relay(connection: NewTcpConnection, relay_wake: Arc<WakePipe>) -> io::Result<()> {
+    let destination = connection.destination;
     let thread_name = format!("smolvm-tcp-{}", destination.port());
     virtio_net_log!(
         "virtio-net: host TCP relay thread spawn attempt destination={} thread={}",
         destination,
         thread_name
     );
-    let spawn_failure_exit_state = exit_state.clone();
+    let spawn_failure_exit_state = connection.exit_state.clone();
     let spawn_failure_wake = relay_wake.clone();
-    let spawn_result = thread::Builder::new().name(thread_name).spawn(move || {
-        run_tcp_relay(
-            destination,
-            relay_target,
-            from_smoltcp,
-            to_smoltcp,
-            relay_wake,
-            proxy_wake,
-            exit_state,
-        )
-    });
+    let spawn_result = thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || run_tcp_relay(connection, relay_wake));
     match handle_relay_spawn_result(
         spawn_result,
         destination,
@@ -931,30 +923,16 @@ fn handle_relay_spawn_result<T>(
     })
 }
 
-fn run_tcp_relay(
-    destination: SocketAddr,
-    relay_target: RelayTarget,
-    from_smoltcp: Receiver<Vec<u8>>,
-    to_smoltcp: SyncSender<Vec<u8>>,
-    relay_wake: Arc<WakePipe>,
-    proxy_wake: WakePipe,
-    exit_state: RelayExitState,
-) {
+fn run_tcp_relay(connection: NewTcpConnection, relay_wake: Arc<WakePipe>) {
+    let destination = connection.destination;
+    let exit_state = connection.exit_state.clone();
     // The relay thread is intentionally isolated from smoltcp internals. Its
     // contract is just channels in, channels out, and an exit code back.
     virtio_net_log!(
         "virtio-net: host TCP relay thread started destination={}",
         destination
     );
-    match tcp_relay_loop(
-        destination,
-        relay_target,
-        from_smoltcp,
-        to_smoltcp,
-        relay_wake,
-        proxy_wake,
-        &exit_state,
-    ) {
+    match tcp_relay_loop(connection, relay_wake, &exit_state) {
         Ok(mode) => {
             virtio_net_log!(
                 "virtio-net: host TCP relay thread exited destination={} mode={:?}",
@@ -975,14 +953,19 @@ fn run_tcp_relay(
 }
 
 fn tcp_relay_loop(
-    destination: SocketAddr,
-    relay_target: RelayTarget,
-    from_smoltcp: Receiver<Vec<u8>>,
-    to_smoltcp: SyncSender<Vec<u8>>,
+    connection: NewTcpConnection,
     relay_wake: Arc<WakePipe>,
-    proxy_wake: WakePipe,
     exit_state: &RelayExitState,
 ) -> io::Result<RelayExitMode> {
+    let NewTcpConnection {
+        destination,
+        relay_target,
+        from_smoltcp,
+        to_smoltcp,
+        proxy_wake,
+        watch_opening,
+        ..
+    } = connection;
     // Host-side flow:
     //
     // 1. Connect a normal host TcpStream to the destination.
@@ -1137,6 +1120,7 @@ fn tcp_relay_loop(
         RelayFlow {
             mediated,
             pending_guest_data,
+            opening: watch_opening.map(|egress| OpeningWatch::new(egress, destination)),
         },
     )
 }
@@ -1228,6 +1212,38 @@ struct RelayFlow {
     /// Guest bytes already read (with the offset written so far) that must
     /// reach the host before anything else.
     pending_guest_data: Option<(Vec<u8>, usize)>,
+    /// Shown the guest's opening bytes until it has seen enough of them.
+    opening: Option<OpeningWatch>,
+}
+
+/// Copies of the first bytes a guest sends on an outbound connection, held
+/// until they say what the connection is (a miner's stratum login, a TLS
+/// server name) and then shown to the egress policy once. Holding copies
+/// never delays the guest's bytes on their way to the host.
+struct OpeningWatch {
+    egress: EgressPolicy,
+    destination: SocketAddr,
+    seen: Vec<u8>,
+}
+
+impl OpeningWatch {
+    fn new(egress: EgressPolicy, destination: SocketAddr) -> Self {
+        Self {
+            egress,
+            destination,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Take the next guest segment. `None` while more are needed; once the
+    /// opening is known, whether a `block` watchlist entry refuses the flow.
+    fn feed(&mut self, segment: &[u8]) -> Option<bool> {
+        let room = crate::opening::MAX_OPENING_BYTES.saturating_sub(self.seen.len());
+        self.seen
+            .extend_from_slice(&segment[..segment.len().min(room)]);
+        let opening = crate::opening::classify(&self.seen)?;
+        Some(self.egress.observe_opening(self.destination, &opening))
+    }
 }
 
 /// Copies bytes both ways between the host socket and the guest channels
@@ -1245,7 +1261,28 @@ fn relay_stream(
     let RelayFlow {
         mediated,
         mut pending_guest_data,
+        mut opening,
     } = flow;
+    // Shows a guest segment to the opening watch until it has a verdict, and
+    // ends the flow when that verdict is a watchlist `block`.
+    let mut watch = |segment: &[u8]| -> io::Result<()> {
+        let Some(verdict) = opening.as_mut().and_then(|watch| watch.feed(segment)) else {
+            return Ok(());
+        };
+        opening = None;
+        if verdict {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "egress watchlist blocked the server name",
+            ));
+        }
+        Ok(())
+    };
+    // The whole first payload is the guest's opening, including any prefix a
+    // decider already forwarded.
+    if let Some((payload, _)) = &pending_guest_data {
+        watch(payload)?;
+    }
     let mut stream = stream;
     let mut events = Events::new();
     let mut guest_write_closed = false;
@@ -1270,6 +1307,7 @@ fn relay_stream(
         if pending_guest_data.is_none() && !guest_channel_closed {
             match from_smoltcp.try_recv() {
                 Ok(payload) => {
+                    watch(&payload)?;
                     pending_guest_data = Some((payload, 0));
                     // Consuming from the bounded guest->host channel may free
                     // capacity for a payload buffered in the smoltcp poll
@@ -1678,20 +1716,110 @@ mod tests {
 
     /// A relay thread connected to `destination`, with the poll loop's ends of its channels.
     fn spawn_test_relay(destination: SocketAddr) -> (ToProxy, Receiver<Vec<u8>>, RelayExitState) {
+        spawn_watched_relay(destination, None)
+    }
+
+    /// `spawn_test_relay`, showing the guest's opening bytes to `watch_opening`.
+    fn spawn_watched_relay(
+        destination: SocketAddr,
+        watch_opening: Option<EgressPolicy>,
+    ) -> (ToProxy, Receiver<Vec<u8>>, RelayExitState) {
         let (to_proxy, from_smoltcp, proxy_wake) = proxy_channel();
         let (to_smoltcp, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let exit_state = RelayExitState::new();
         spawn_tcp_relay(
-            destination,
-            RelayTarget::Connect(destination),
-            from_smoltcp,
-            to_smoltcp,
+            NewTcpConnection {
+                destination,
+                relay_target: RelayTarget::Connect(destination),
+                from_smoltcp,
+                to_smoltcp,
+                exit_state: exit_state.clone(),
+                proxy_wake,
+                watch_opening,
+            },
             Arc::new(WakePipe::new()),
-            proxy_wake,
-            exit_state.clone(),
         )
         .unwrap();
         (to_proxy, from_proxy, exit_state)
+    }
+
+    /// A policy that admits everything and records signals to `dir`, watching
+    /// `watchlist` when it is written.
+    fn watching_policy(dir: &std::path::Path) -> EgressPolicy {
+        EgressPolicy::unrestricted().with_watchlist(
+            dir.join(crate::watchlist::EGRESS_WATCHLIST_FILE),
+            dir.join(crate::EGRESS_SIGNALS_LOG),
+        )
+    }
+
+    #[test]
+    fn a_miner_logging_in_to_its_pool_is_recorded_and_still_relayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = echo_server();
+        let (to_proxy, from_proxy, _exit_state) =
+            spawn_watched_relay(pool, Some(watching_policy(dir.path())));
+        // ccminer's login is split across two segments, as TCP may deliver it.
+        let login: &[u8] =
+            b"{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"ccminer/2.3.1\"]}\n";
+        to_proxy.try_send(login[..20].to_vec()).unwrap();
+        to_proxy.try_send(login[20..].to_vec()).unwrap();
+        let mut echoed = Vec::new();
+        while echoed.len() < login.len() {
+            echoed.extend(from_proxy.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        assert_eq!(echoed, login, "the miner's bytes reach the pool unchanged");
+        let log = std::fs::read_to_string(dir.path().join(crate::EGRESS_SIGNALS_LOG)).unwrap();
+        assert!(
+            log.contains(&format!("egress watch {} {pool}", crate::STRATUM_SIGNAL)),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn ordinary_traffic_records_no_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server();
+        let (to_proxy, from_proxy, _exit_state) =
+            spawn_watched_relay(server, Some(watching_policy(dir.path())));
+        to_proxy
+            .try_send(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec())
+            .unwrap();
+        from_proxy.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!dir.path().join(crate::EGRESS_SIGNALS_LOG).exists());
+    }
+
+    #[test]
+    fn a_blocked_server_name_ends_the_flow_before_its_hello_leaves() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let digest = sha2::Sha256::digest(b"pool.example");
+        std::fs::write(
+            dir.path().join(crate::watchlist::EGRESS_WATCHLIST_FILE),
+            format!("p1 dns-sha256:{digest:x} block\n"),
+        )
+        .unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let server = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = Vec::new();
+            let _ = stream.read_to_end(&mut received);
+            let _ = accepted_tx.send(received);
+        });
+        let (to_proxy, _from_proxy, exit_state) =
+            spawn_watched_relay(server, Some(watching_policy(dir.path())));
+        to_proxy
+            .try_send(crate::opening::client_hello("Pool.Example"))
+            .unwrap();
+        wait_for_exit_mode(&exit_state, RelayExitMode::Abort, Duration::from_secs(2));
+        assert_eq!(
+            accepted_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Vec::<u8>::new(),
+            "the ClientHello never reached the server"
+        );
+        let log = std::fs::read_to_string(dir.path().join(crate::EGRESS_SIGNALS_LOG)).unwrap();
+        assert!(log.contains("egress watch p1 pool.example"), "{log}");
     }
 
     #[test]
@@ -1962,12 +2090,16 @@ mod tests {
         });
 
         let relay_exit = tcp_relay_loop(
-            server_addr,
-            RelayTarget::Connect(server_addr),
-            from_smoltcp_rx,
-            to_smoltcp_tx,
+            NewTcpConnection {
+                destination: server_addr,
+                relay_target: RelayTarget::Connect(server_addr),
+                from_smoltcp: from_smoltcp_rx,
+                to_smoltcp: to_smoltcp_tx,
+                exit_state: exit_state.clone(),
+                proxy_wake: WakePipe::new(),
+                watch_opening: None,
+            },
             wake_pipe,
-            WakePipe::new(),
             &exit_state,
         )
         .unwrap();
@@ -2007,15 +2139,19 @@ mod tests {
         });
 
         let relay_exit = tcp_relay_loop(
-            destination,
-            RelayTarget::Intercept {
-                endpoint,
+            NewTcpConnection {
                 destination,
+                relay_target: RelayTarget::Intercept {
+                    endpoint,
+                    destination,
+                },
+                from_smoltcp: from_smoltcp_rx,
+                to_smoltcp: to_smoltcp_tx,
+                exit_state: exit_state.clone(),
+                proxy_wake: WakePipe::new(),
+                watch_opening: None,
             },
-            from_smoltcp_rx,
-            to_smoltcp_tx,
             wake_pipe,
-            WakePipe::new(),
             &exit_state,
         )
         .unwrap();
@@ -2133,18 +2269,22 @@ mod tests {
             drop(guest_tx);
             let state = RelayExitState::new();
             let result = tcp_relay_loop(
-                destination,
-                RelayTarget::Mediated {
-                    binding,
+                NewTcpConnection {
                     destination,
-                    direct_address: origin_addr,
-                    direct_allowed: true,
-                    audit: EgressPolicy::unrestricted(),
+                    relay_target: RelayTarget::Mediated {
+                        binding,
+                        destination,
+                        direct_address: origin_addr,
+                        direct_allowed: true,
+                        audit: EgressPolicy::unrestricted(),
+                    },
+                    from_smoltcp: guest_rx,
+                    to_smoltcp: reply_tx,
+                    exit_state: state.clone(),
+                    proxy_wake: WakePipe::new(),
+                    watch_opening: None,
                 },
-                guest_rx,
-                reply_tx,
                 Arc::new(WakePipe::new()),
-                WakePipe::new(),
                 &state,
             );
             broker_thread.join().unwrap();
@@ -2207,18 +2347,22 @@ mod tests {
             let state = RelayExitState::new();
             let relay = thread::spawn(move || {
                 tcp_relay_loop(
-                    destination,
-                    RelayTarget::Mediated {
-                        binding,
+                    NewTcpConnection {
                         destination,
-                        direct_address: destination,
-                        direct_allowed: false,
-                        audit: EgressPolicy::unrestricted(),
+                        relay_target: RelayTarget::Mediated {
+                            binding,
+                            destination,
+                            direct_address: destination,
+                            direct_allowed: false,
+                            audit: EgressPolicy::unrestricted(),
+                        },
+                        from_smoltcp: guest_rx,
+                        to_smoltcp: reply_tx,
+                        exit_state: state.clone(),
+                        proxy_wake: WakePipe::new(),
+                        watch_opening: None,
                     },
-                    guest_rx,
-                    reply_tx,
                     Arc::new(WakePipe::new()),
-                    WakePipe::new(),
                     &state,
                 )
             });
@@ -2256,15 +2400,19 @@ mod tests {
             sender.send(b"guest payload".to_vec()).unwrap();
             let (reply, _receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
             assert!(tcp_relay_loop(
-                destination,
-                RelayTarget::Intercept {
-                    endpoint,
-                    destination
+                NewTcpConnection {
+                    destination,
+                    relay_target: RelayTarget::Intercept {
+                        endpoint,
+                        destination
+                    },
+                    from_smoltcp: receiver,
+                    to_smoltcp: reply,
+                    exit_state: RelayExitState::new(),
+                    proxy_wake: WakePipe::new(),
+                    watch_opening: None,
                 },
-                receiver,
-                reply,
                 Arc::new(WakePipe::new()),
-                WakePipe::new(),
                 &RelayExitState::new(),
             )
             .is_err());
