@@ -243,6 +243,7 @@ script = [
 [tasks.test-lib]
 description = "Run unit tests (no VM required)"
 category = "Test"
+env = { LIBRARY_PATH = "${CARGO_MAKE_WORKING_DIRECTORY}/lib", DYLD_LIBRARY_PATH = "${CARGO_MAKE_WORKING_DIRECTORY}/lib" }
 command = "cargo"
 args = ["test", "--lib"]
 
