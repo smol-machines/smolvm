@@ -373,6 +373,44 @@ test_image_volume_targets_resolve_inside_guest() {
     assert_volume_targets_resolve img --image alpine:latest --net
 }
 
+# A new disk volume takes the image's ownership at its path, as a Docker named
+# volume does (#1858): /var/cache/nginx is 101:0 775 in this image. A volume
+# without an image directory takes its parent's owner (a nested one, its
+# enclosing volume's), a new top-level one stays root, and an owner set inside
+# the machine survives a restart rather than being reset to the image's.
+test_disk_volume_takes_image_ownership() {
+    local vm_name="test-vm-diskvol-owner"
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+
+    $SMOLVM machine create --name "$vm_name" --net \
+        --image nginxinc/nginx-unprivileged:stable-alpine \
+        -v /var/cache/nginx -v /var/cache/nginx/sub -v /data >/dev/null 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1
+        return 1
+    }
+
+    local stat_cmd='stat -c "%n %u:%g %a" /var/cache/nginx /var/cache/nginx/sub /data'
+    local fresh restarted
+    fresh=$($SMOLVM machine exec --name "$vm_name" --user root -- sh -c "$stat_cmd" 2>&1)
+    $SMOLVM machine exec --name "$vm_name" --user root -- sh -c 'chown 70:70 /var/cache/nginx && chmod 700 /var/cache/nginx' >/dev/null 2>&1
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1
+    restarted=$($SMOLVM machine exec --name "$vm_name" --user root -- sh -c "$stat_cmd" 2>&1)
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+
+    local expected_fresh=$'/var/cache/nginx 101:0 775\n/var/cache/nginx/sub 101:0 755\n/data 0:0 755'
+    local expected_restarted=$'/var/cache/nginx 70:70 700\n/var/cache/nginx/sub 101:0 755\n/data 0:0 755'
+    if [[ "$fresh" != "$expected_fresh" ]]; then
+        log_fail "fresh ownership: $fresh"
+        return 1
+    fi
+    if [[ "$restarted" != "$expected_restarted" ]]; then
+        log_fail "ownership after restart: $restarted"
+        return 1
+    fi
+}
+
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true
 run_test "Volume: -v host:/workspace is virtiofs not symlink" test_volume_mount_workspace_is_virtiofs_not_symlink || true
 run_test "Volume: arbitrary mount path (/data)" test_volume_mount_arbitrary_path || true
@@ -383,5 +421,6 @@ run_test "Create with --image: volume mount visible to exec" test_image_exec_vol
 run_test "Create with --image: Smolfile volumes visible to exec" test_image_exec_volume_mount_visible_smolfile || true
 run_test "Create with --image: volume targets at/below /workspace resolve in guest" test_image_volume_targets_resolve_inside_guest || true
 run_test "Volume: staged sync and restart persistence" test_staged_volume_sync_and_restart || true
+run_test "Volume: new disk volume takes the image's ownership" test_disk_volume_takes_image_ownership || true
 
 print_summary "Volume Tests"

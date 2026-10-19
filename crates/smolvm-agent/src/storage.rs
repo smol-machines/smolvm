@@ -677,7 +677,17 @@ fn mount_disk_volumes() -> Vec<(String, String, bool)> {
         let tag = format!("{DISK_VOLUME_TAG_PREFIX}{name}");
         let data = Path::new(DISK_VOLUME_ROOT).join(&name);
         let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(&tag);
+        // A volume created now has no owner of its own yet: mark it so the
+        // first image it is mounted into gives it that image's ownership.
+        let created = !data.exists();
         let prepared = std::fs::create_dir_all(&data)
+            .and_then(|()| {
+                if created {
+                    std::fs::write(disk_volume_owner_marker(&name), b"")
+                } else {
+                    Ok(())
+                }
+            })
             .and_then(|()| std::fs::create_dir_all(&staging))
             .and_then(|()| {
                 if is_mountpoint(&staging) {
@@ -703,6 +713,88 @@ fn mount_disk_volumes() -> Vec<(String, String, bool)> {
 #[cfg(not(target_os = "linux"))]
 fn mount_disk_volumes() -> Vec<(String, String, bool)> {
     Vec::new()
+}
+
+/// Marks a disk volume that has not yet taken its owner from an image. It sits
+/// beside the volume directories (whose names never start with `.`), outside
+/// what the workload sees.
+fn disk_volume_owner_marker(name: &str) -> PathBuf {
+    Path::new(DISK_VOLUME_ROOT).join(format!(".{name}.owner-pending"))
+}
+
+/// Give a new disk volume the ownership the image has at its path, as Docker
+/// does for a new named volume: a volume at `/var/lib/postgresql/data` in a
+/// postgres image belongs to postgres, not root. When the image has no such
+/// directory, the volume takes the owner (not the mode) of the nearest
+/// directory above it, so `/home/node/.cache` belongs to node. This runs once
+/// per volume, so an owner later set inside the machine is kept.
+#[cfg(target_os = "linux")]
+fn adopt_image_ownership(rootfs: &Path, tag: &str, container_path: &str, volume: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Some(name) = tag.strip_prefix(DISK_VOLUME_TAG_PREFIX) else {
+        return;
+    };
+    let marker = disk_volume_owner_marker(name);
+    if !marker.exists() {
+        return;
+    }
+    let result = match image_dir_at(rootfs, container_path) {
+        Some((meta, exact)) => std::os::unix::fs::chown(volume, Some(meta.uid()), Some(meta.gid()))
+            .and_then(|()| {
+                info!(
+                    target = %container_path,
+                    uid = meta.uid(),
+                    gid = meta.gid(),
+                    exact,
+                    "disk volume took the image's ownership"
+                );
+                if exact {
+                    std::fs::set_permissions(
+                        volume,
+                        std::fs::Permissions::from_mode(meta.mode() & 0o7777),
+                    )
+                } else {
+                    Ok(())
+                }
+            }),
+        None => Ok(()),
+    };
+    // Drop the marker either way: the first image decides, and a later one
+    // must not override an owner set inside the machine in between.
+    if let Err(error) = result.and_then(|()| std::fs::remove_file(&marker)) {
+        warn!(%error, target = %container_path, "failed to set disk volume owner");
+    }
+}
+
+/// The image directory at `container_path` (`true`), or else the nearest
+/// directory above it (`false`), without following symlinks so nothing outside
+/// the rootfs is read. `None` when that is the rootfs itself: a volume at a new
+/// top-level path keeps the root ownership it was created with.
+///
+/// A mount above the path (an enclosing volume) ends the walk as the parent:
+/// what lies below it is that mount's content, such as the root-owned mount
+/// point boot setup made for a nested volume, not the image's.
+#[cfg(target_os = "linux")]
+fn image_dir_at(rootfs: &Path, container_path: &str) -> Option<(std::fs::Metadata, bool)> {
+    let relative = Path::new(container_path.trim_start_matches('/'));
+    let depth = relative.components().count();
+    let mut current = rootfs.to_path_buf();
+    let mut found = None;
+    for (index, component) in relative.components().enumerate() {
+        current.push(component);
+        let exact = index + 1 == depth;
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.is_dir() => {
+                if !exact && is_mountpoint(&current) {
+                    return Some((meta, false));
+                }
+                found = Some((meta, exact));
+            }
+            _ => break,
+        }
+    }
+    found
 }
 
 /// Bind `source` onto `target`.
@@ -5056,6 +5148,12 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
             virtiofs_mount.clone()
         };
 
+        // Boot binds onto the agent root ("/") carry no image; the first
+        // container rootfs a volume is mounted into supplies its ownership.
+        if rootfs_path != Path::new("/") && is_disk_volume_tag(device_tag) {
+            adopt_image_ownership(rootfs_path, device_tag, container_path, &bind_source);
+        }
+
         // Now bind-mount into the container rootfs
         let target_path = ensure_mount_target_under_root(rootfs_path, container_path)?;
 
@@ -6394,6 +6492,37 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn image_dir_at_prefers_the_exact_path_then_the_nearest_parent() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let rootfs = root.path();
+        std::fs::create_dir_all(rootfs.join("var/lib/postgresql/data")).unwrap();
+        std::fs::create_dir_all(rootfs.join("home/node")).unwrap();
+        std::os::unix::fs::symlink("/etc", rootfs.join("home/link")).unwrap();
+
+        let (meta, exact) = super::image_dir_at(rootfs, "/var/lib/postgresql/data").unwrap();
+        assert!(exact);
+        let expected = std::fs::metadata(rootfs.join("var/lib/postgresql/data")).unwrap();
+        assert_eq!(meta.ino(), expected.ino());
+
+        let (meta, exact) = super::image_dir_at(rootfs, "/home/node/.cache/x").unwrap();
+        assert!(!exact);
+        let node = std::fs::metadata(rootfs.join("home/node")).unwrap();
+        assert_eq!(meta.ino(), node.ino());
+
+        // A symlink is never followed: the parent above it decides.
+        let (meta, exact) = super::image_dir_at(rootfs, "/home/link/data").unwrap();
+        assert!(!exact);
+        let home = std::fs::metadata(rootfs.join("home")).unwrap();
+        assert_eq!(meta.ino(), home.ino());
+
+        // A new top-level path keeps the volume's own (root) ownership.
+        assert!(super::image_dir_at(rootfs, "/data").is_none());
+    }
+
     #[test]
     fn pure_oci_archive_streams_with_docker_compatibility_manifest() {
         use sha2::{Digest, Sha256};
