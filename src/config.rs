@@ -597,6 +597,10 @@ pub struct VmRecord {
     /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_options: Vec<String>,
+    /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
+    /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<String>,
 
     /// Named inter-VM network this machine joins on start (virtio-net only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -935,6 +939,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             dns_options: Vec::new(),
+            shm_size: None,
             network_name: None,
             guest_subnet: None,
             image: None,
@@ -1033,6 +1038,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             dns_options: Vec::new(),
+            shm_size: None,
             network_name: None,
             guest_subnet: None,
             image: None,
@@ -1593,6 +1599,7 @@ impl VmRecord {
             egress_rules: self.egress_rules.clone(),
             dns: self.dns,
             dns_options: self.dns_options.clone(),
+            shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
         }

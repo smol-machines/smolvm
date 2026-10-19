@@ -111,6 +111,34 @@ pub const DNS: &str = "SMOLVM_NETWORK_DNS";
 /// (`--dns-option`, repeatable), e.g. `timeout:1 attempts:3 rotate use-vc`.
 /// Every writer of resolv.conf appends them as one `options` line.
 pub const DNS_OPTIONS: &str = "SMOLVM_NETWORK_DNS_OPTIONS";
+/// `/dev/shm` size for the workload container (`--shm-size`), already a
+/// tmpfs `size=` value from [`shm_size_option`]. Unset = half the guest RAM.
+pub const SHM_SIZE: &str = "SMOLVM_SHM_SIZE";
+
+/// Validate a `--shm-size` value and return it as a tmpfs `size=` value: a
+/// byte count with an optional `k`, `m` or `g` suffix (`512m`, `2g`), or a
+/// share of guest RAM from 1% to 100% (`25%`). The host and the agent both
+/// check it, so a hand-edited record cannot reach the mount.
+pub fn shm_size_option(value: &str) -> Result<String, String> {
+    let value = value.trim().to_ascii_lowercase();
+    let refuse = || {
+        format!("invalid --shm-size `{value}`: use bytes with an optional k/m/g suffix (e.g. 512m, 2g) or a share of RAM (e.g. 25%)")
+    };
+    if let Some(percent) = value.strip_suffix('%') {
+        return match percent.parse::<u8>() {
+            Ok(1..=100) => Ok(value),
+            _ => Err(refuse()),
+        };
+    }
+    let digits = value.trim_end_matches(['k', 'm', 'g']);
+    if value.len() - digits.len() > 1 {
+        return Err(refuse());
+    }
+    match digits.parse::<u64>() {
+        Ok(1..) => Ok(value),
+        _ => Err(refuse()),
+    }
+}
 /// Enables the guest-side Docker socket bridge: the agent listens on the
 /// `ports::DOCKER` vsock port and proxies each connection to the in-guest
 /// Docker daemon socket, so the host can reach it over a Unix socket.
@@ -136,3 +164,27 @@ pub const DISK_VOLUMES: &str = "SMOLVM_DISK_VOLUMES";
 /// the `ports::WORKLOAD_LOGS` vsock port, where the host appends them to the
 /// machine's `workload.log`. Absent means the output is discarded.
 pub const WORKLOAD_LOGS: &str = "SMOLVM_WORKLOAD_LOGS";
+
+#[cfg(test)]
+mod shm_size_tests {
+    use super::shm_size_option;
+
+    #[test]
+    fn shm_size_takes_byte_counts_and_shares_of_ram() {
+        for (given, size) in [
+            ("512m", "512m"),
+            ("2G", "2g"),
+            ("65536k", "65536k"),
+            ("1048576", "1048576"),
+            ("25%", "25%"),
+            ("100%", "100%"),
+        ] {
+            assert_eq!(shm_size_option(given).as_deref(), Ok(size), "{given}");
+        }
+        for bad in [
+            "", "0", "0m", "0%", "101%", "1.5g", "2gb", "-1m", "m", "10t", "50%%", "size=1g",
+        ] {
+            assert!(shm_size_option(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+}

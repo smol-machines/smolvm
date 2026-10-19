@@ -1976,6 +1976,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // does not expose it, so API-launched VMs inherit the backend default.
         dns: None,
         dns_options: Vec::new(),
+        shm_size: None,
         network_name: None,
         guest_subnet: spec.guest_subnet.clone(),
     }

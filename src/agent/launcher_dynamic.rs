@@ -864,6 +864,9 @@ pub fn launch_agent_vm_dynamic(
         &config.resources.dns_options,
         None,
     ));
+    env_strings.extend(crate::agent::guest_workload_env(
+        config.resources.shm_size.as_deref(),
+    ));
 
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
     envp.push(std::ptr::null());

@@ -2411,6 +2411,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             &resources.dns_options,
             pod_net.as_ref().and_then(|p| p.gateway_mac),
         ));
+        env_strings.extend(crate::agent::guest_workload_env(
+            resources.shm_size.as_deref(),
+        ));
 
         // Tell the agent about pre-extracted packed layers
         if packed_layers_dir.is_some_and(|d| d.exists()) {

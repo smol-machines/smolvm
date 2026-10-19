@@ -1172,6 +1172,17 @@ fn tun_device_mount(guest_node: &Path) -> Option<OciMount> {
 }
 
 /// Default mounts for container execution.
+/// The workload's /dev/shm size: the machine's `--shm-size`, else half the
+/// guest's RAM, as on a Linux VM or a hosted CI runner rather than Docker's
+/// 64 MiB (browsers and ML loaders size buffers from it). tmpfs takes memory
+/// only as files are written.
+fn shm_size() -> String {
+    std::env::var(smolvm_protocol::guest_env::SHM_SIZE)
+        .ok()
+        .and_then(|size| smolvm_protocol::guest_env::shm_size_option(&size).ok())
+        .unwrap_or_else(|| "50%".to_string())
+}
+
 fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
     let mut mounts = vec![
         // /proc - process information
@@ -1220,10 +1231,7 @@ fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
                 "noexec".to_string(),
                 "nodev".to_string(),
                 "mode=1777".to_string(),
-                // Half the guest's RAM, as on a Linux VM or a hosted CI runner rather
-                // than Docker's 64 MiB: browsers and ML loaders size buffers from it.
-                // tmpfs takes memory only as files are written.
-                "size=50%".to_string(),
+                format!("size={}", shm_size()),
             ],
         },
         // /dev/mqueue - POSIX message queues
@@ -1369,15 +1377,27 @@ fn is_dns_label(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn dev_shm_takes_half_the_guest_ram_in_every_mode() {
-        for unprivileged in [false, true] {
-            let mounts = super::default_mounts(unprivileged);
-            let shm = mounts
-                .iter()
+    fn dev_shm_takes_half_the_guest_ram_unless_the_machine_sets_a_size() {
+        let shm_size = |unprivileged| {
+            super::default_mounts(unprivileged)
+                .into_iter()
                 .find(|mount| mount.destination == "/dev/shm")
-                .expect("/dev/shm is mounted");
-            assert!(shm.options.iter().any(|option| option == "size=50%"));
+                .expect("/dev/shm is mounted")
+                .options
+                .into_iter()
+                .find(|option| option.starts_with("size="))
+        };
+        let key = smolvm_protocol::guest_env::SHM_SIZE;
+        std::env::remove_var(key);
+        for unprivileged in [false, true] {
+            assert_eq!(shm_size(unprivileged).as_deref(), Some("size=50%"));
         }
+        std::env::set_var(key, "2G");
+        assert_eq!(shm_size(false).as_deref(), Some("size=2g"));
+        // A value the validator refuses never reaches the mount.
+        std::env::set_var(key, "1g,mode=0777");
+        assert_eq!(shm_size(false).as_deref(), Some("size=50%"));
+        std::env::remove_var(key);
     }
 
     #[test]

@@ -158,6 +158,10 @@ pub struct VmResources {
     /// Empty = none. Validated with `smolvm_protocol::resolv::validate_option`.
     #[serde(default)]
     pub dns_options: Vec<String>,
+    /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
+    /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
+    #[serde(default)]
+    pub shm_size: Option<String>,
     /// Named inter-VM network to join (virtio-net only). Members lease
     /// distinct guest addresses and route IP packets to each other through
     /// the host-side fabric; VMs on different networks (or none) stay fully
@@ -255,6 +259,7 @@ impl Default for VmResources {
             egress_rules: Vec::new(),
             dns: None,
             dns_options: Vec::new(),
+            shm_size: None,
             network_name: None,
             guest_subnet: None,
         }

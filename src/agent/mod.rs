@@ -183,6 +183,20 @@ fn gpu_virgl_flags() -> u32 {
     }
 }
 
+/// Guest env for the workload container, shared by both launchers like
+/// [`guest_network_env`]. A size the validator refuses (a hand-edited record)
+/// is dropped, so the agent falls back to its default.
+pub(crate) fn guest_workload_env(shm_size: Option<&str>) -> Vec<std::ffi::CString> {
+    shm_size
+        .and_then(|size| smolvm_protocol::guest_env::shm_size_option(size).ok())
+        .map(|size| {
+            std::ffi::CString::new(format!("{}={size}", smolvm_protocol::guest_env::SHM_SIZE))
+                .expect("validated size has no NUL")
+        })
+        .into_iter()
+        .collect()
+}
+
 /// Build the guest-network environment variables handed to the agent at boot.
 ///
 /// Shared by both the static (`launcher.rs`) and dynamic (`launcher_dynamic.rs`)

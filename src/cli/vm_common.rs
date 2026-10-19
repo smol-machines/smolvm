@@ -471,6 +471,9 @@ pub struct CreateVmParams {
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub dns_options: Vec<String>,
+    /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
+    /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
+    pub shm_size: Option<String>,
     pub network_name: Option<String>,
     /// Canonical `--guest-subnet` CIDR, when set.
     pub guest_subnet: Option<String>,
@@ -834,6 +837,7 @@ pub(crate) fn build_vm_record_for(
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.dns_options = params.dns_options.clone();
+    record.shm_size = params.shm_size.clone();
     record.network_name = params.network_name.clone();
     record.guest_subnet = params.guest_subnet.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
@@ -2191,6 +2195,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.network_backend = o.network_backend;
     r.dns = o.dns;
     r.dns_options = o.dns_options.clone();
+    r.shm_size = o.shm_size.clone();
     r.network_name = o.network_name.clone();
     r.guest_subnet = o.guest_subnet.clone();
     r.storage_gb = o.storage_gb;
@@ -2269,6 +2274,9 @@ pub struct DefaultVmOverrides {
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub dns_options: Vec<String>,
+    /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
+    /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
+    pub shm_size: Option<String>,
     pub network_name: Option<String>,
     pub guest_subnet: Option<String>,
     pub storage_gb: Option<u64>,
@@ -2327,6 +2335,7 @@ impl DefaultVmOverrides {
             network_backend: params.network_backend,
             dns: params.dns,
             dns_options: params.dns_options.clone(),
+            shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             storage_gb: params.storage_gb,

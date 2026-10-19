@@ -848,6 +848,7 @@ impl PackCreateCmd {
                 network_backend: None,
                 dns: self.dns,
                 dns_options: Vec::new(),
+                shm_size: None,
                 network_name: None,
                 guest_subnet: None,
                 gpu: false,

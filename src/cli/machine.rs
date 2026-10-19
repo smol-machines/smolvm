@@ -658,6 +658,11 @@ pub struct RunCmd {
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, help_heading = "Network")]
     pub dns_option: Vec<String>,
 
+    /// Size of the workload's /dev/shm: bytes with a k/m/g suffix (`512m`,
+    /// `2g`) or a share of guest RAM (`25%`). Defaults to half the RAM.
+    #[arg(long = "shm-size", value_name = "SIZE", value_parser = parse_shm_size)]
+    pub shm_size: Option<String>,
+
     /// IPv4 subnet for the guest link, e.g. 10.200.0.0/30 (implies --net,
     /// virtio-net). The gateway and resolver take the first address, the guest
     /// the second. Use it when the guest runs Tailscale or another VPN that
@@ -1485,6 +1490,7 @@ impl RunCmd {
         params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
+        params.shm_size = self.shm_size.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -1871,6 +1877,7 @@ impl RunCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             dns_options: params.dns_options.clone(),
+            shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
@@ -2888,6 +2895,46 @@ mod tests {
                 "{bad:?} must be refused at the command line"
             );
         }
+    }
+
+    #[test]
+    fn create_run_and_update_take_a_validated_shm_size() {
+        for command in ["create", "update"] {
+            let cli = TestMachineCli::try_parse_from([
+                "machine",
+                command,
+                "--name",
+                "shm-1",
+                "--shm-size",
+                "2G",
+            ])
+            .unwrap();
+            let size = match cli.command {
+                MachineCmd::Create(cmd) => cmd.shm_size,
+                MachineCmd::Update(cmd) => {
+                    assert!(!cmd.changes_only_egress() && !cmd.changes_only_ports());
+                    cmd.shm_size
+                }
+                _ => panic!("expected machine {command}"),
+            };
+            assert_eq!(size.as_deref(), Some("2g"), "{command}");
+            assert!(TestMachineCli::try_parse_from([
+                "machine",
+                command,
+                "--name",
+                "shm-2",
+                "--shm-size",
+                "1g,mode=777",
+            ])
+            .is_err());
+        }
+        let cli =
+            TestMachineCli::try_parse_from(["machine", "run", "--shm-size", "25%", "--", "true"])
+                .unwrap();
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run");
+        };
+        assert_eq!(cmd.shm_size.as_deref(), Some("25%"));
     }
 
     #[test]
@@ -4219,6 +4266,11 @@ pub struct CreateCmd {
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option)]
     pub dns_option: Vec<String>,
 
+    /// Size of the workload's /dev/shm: bytes with a k/m/g suffix (`512m`,
+    /// `2g`) or a share of guest RAM (`25%`). Defaults to half the RAM.
+    #[arg(long = "shm-size", value_name = "SIZE", value_parser = parse_shm_size)]
+    pub shm_size: Option<String>,
+
     /// IPv4 subnet for the guest link, e.g. 10.200.0.0/30 (implies --net,
     /// virtio-net). The gateway and resolver take the first address, the guest
     /// the second. Use it when the guest runs Tailscale or another VPN that
@@ -4558,6 +4610,7 @@ impl CreateCmd {
         params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
+        params.shm_size = self.shm_size.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -4614,6 +4667,7 @@ impl CreateCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             dns_options: params.dns_options.clone(),
+            shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             gpu: params.gpu,
@@ -5011,6 +5065,7 @@ impl CreateCmd {
             network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
             dns_options,
+            shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: checkpoint_subnet.or_else(|| self.guest_subnet.clone()),
             init: self.init.clone(),
@@ -5097,6 +5152,7 @@ impl CreateCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             dns_options: params.dns_options.clone(),
+            shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             gpu: params.gpu,
@@ -6386,6 +6442,11 @@ pub struct UpdateCmd {
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, conflicts_with = "clear_dns_options")]
     pub dns_option: Vec<String>,
 
+    /// Size of the workload's /dev/shm: bytes with a k/m/g suffix (`512m`,
+    /// `2g`) or a share of guest RAM (`25%`). Defaults to half the RAM.
+    #[arg(long = "shm-size", value_name = "SIZE", value_parser = parse_shm_size)]
+    pub shm_size: Option<String>,
+
     /// Remove every guest resolv.conf option.
     #[arg(long)]
     pub clear_dns_options: bool,
@@ -6456,6 +6517,7 @@ impl UpdateCmd {
             block_io,
             dns_option,
             clear_dns_options,
+            shm_size,
         } = self;
         let egress = *net
             || *outbound_localhost_only
@@ -6483,7 +6545,8 @@ impl UpdateCmd {
             || overlay.is_some()
             || block_io.is_some()
             || !dns_option.is_empty()
-            || *clear_dns_options;
+            || *clear_dns_options
+            || shm_size.is_some();
         (egress, ports, other)
     }
 
@@ -6910,6 +6973,12 @@ impl UpdateCmd {
             } else if self.clear_dns_options {
                 changes.push("  dns options: none".to_string());
                 r.dns_options.clear();
+            }
+
+            // /dev/shm size, applied when the workload container next starts
+            if let Some(ref size) = self.shm_size {
+                changes.push(format!("  shm size: {size}"));
+                r.shm_size = Some(size.clone());
             }
 
             // GPU
@@ -7798,6 +7867,10 @@ impl MonitorCmd {
 
 /// clap value parser for `--dns-option`: the same validation the guest agent
 /// applies, so an option the agent would drop is refused at the command line.
+pub(crate) fn parse_shm_size(value: &str) -> Result<String, String> {
+    smolvm_protocol::guest_env::shm_size_option(value)
+}
+
 pub(crate) fn parse_dns_option(value: &str) -> Result<String, String> {
     smolvm_protocol::resolv::validate_option(value).map(|()| value.to_string())
 }
