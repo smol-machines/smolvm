@@ -289,13 +289,12 @@ impl CacheDisk {
         if let Some(digest) = recorded_base_digest(&self.base) {
             return Ok(digest);
         }
-        use sha2::Digest;
         use std::io::Read;
         let mut file = std::fs::File::open(&self.base).map_err(|e| {
             crate::Error::agent("hash cache base", format!("{}: {e}", self.base.display()))
         })?;
-        let mut hasher = sha2::Sha256::new();
-        let mut buffer = vec![0_u8; 1 << 20];
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut buffer = vec![0_u8; 8 << 20];
         loop {
             let read = file.read(&mut buffer).map_err(|e| {
                 crate::Error::agent("hash cache base", format!("{}: {e}", self.base.display()))
@@ -305,7 +304,7 @@ impl CacheDisk {
             }
             hasher.update(&buffer[..read]);
         }
-        let digest = hex::encode(hasher.finalize());
+        let digest = hex::encode(hasher.finish());
         record_base_digest(&self.base, &digest);
         Ok(digest)
     }

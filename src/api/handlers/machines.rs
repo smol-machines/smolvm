@@ -6848,11 +6848,12 @@ fn file_sha256(
     path: &std::path::Path,
     progress: &crate::api::progress::Progress,
 ) -> Result<String, ApiError> {
-    use sha2::Digest;
     use std::io::Read;
     let mut file = std::fs::File::open(path)
         .map_err(|e| ApiError::internal(format!("open {}: {e}", path.display())))?;
-    let mut hasher = sha2::Sha256::new();
+    // ring's SHA-256 is the same digest at several times the speed of sha2's,
+    // and this one pass over the whole base sets how long a publish takes.
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = vec![0_u8; 8 << 20];
     loop {
         let read = file
@@ -6864,7 +6865,7 @@ fn file_sha256(
         hasher.update(&buffer[..read]);
         progress.touch();
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finish()))
 }
 
 /// Largest cache base a create may fetch.
