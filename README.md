@@ -61,6 +61,7 @@ Drive machines from your own code with one `Machine` API. The SDKs run in your p
 npm install smolmachines     # Node / TypeScript
 pip install smolmachines     # Python
 cargo add smolmachines       # Rust
+go get github.com/smol-machines/smol/sdk/go   # Go
 ```
 
 ```ts
