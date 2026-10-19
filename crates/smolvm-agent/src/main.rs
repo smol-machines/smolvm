@@ -1387,8 +1387,15 @@ fn setup_persistent_rootfs() {
     // lower layer is the initramfs (ramfs) which has no file-handle support,
     // so the kernel falls back to index=off for any overlay2 upper dir on this
     // root regardless. Docker's data root is on /storage/ (bare ext4), not here.
+    //
+    // index=off explicitly, whatever the kernel's default: the index keys a
+    // hardlinked lower file by its file handle, and virtiofs hands out new
+    // handles every boot. After a restart an entry names a different file, and
+    // overlayfs answers that file with EIO ("bad index found"). An agent rootfs
+    // whose files are hardlinked (a Nix store, a `cp -al` install) then loses
+    // libraries such as crun's libseccomp, and every container fails with 127.
     let overlay_opts = cstr(&format!(
-        "lowerdir=/,upperdir={}/upper,workdir={}/work",
+        "lowerdir=/,upperdir={}/upper,workdir={}/work,index=off",
         OVERLAY_MOUNT, OVERLAY_MOUNT
     ));
     // SAFETY: mount overlayfs with the specified options
