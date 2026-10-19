@@ -5306,8 +5306,31 @@ async fn boot_prepared_fork_inner(
     entry.external_interceptor = inherited_interceptor;
     state.insert_machine(&clone, entry);
 
-    // Persist the running state.
+    // A VMM that exited between boot and here must not be reported as running.
+    // Without this check the caller gets a 200 and a `running` record for a dead
+    // VM, and anyone reading the runtime database directly sees it as live until
+    // the supervisor's next tick; a fleet controller built on that record then
+    // dispatches work to a machine that is gone. Check the actual process now.
     let pid_start_time = pid.and_then(process_start_time);
+    if let (Some(dead_pid), None) = (pid, pid_start_time) {
+        let exit_code = crate::process::try_wait(dead_pid);
+        let _ = state
+            .update_vm(&clone, |r| {
+                r.state = RecordState::Stopped;
+                r.pid = None;
+                r.pid_start_time = None;
+            })
+            .await;
+        return Err(ApiError::internal(format!(
+            "clone '{}' exited right after boot{}; the source is unchanged and the clone is recorded as stopped",
+            clone,
+            exit_code
+                .map(|code| format!(" (exit code {code})"))
+                .unwrap_or_default()
+        )));
+    }
+
+    // Persist the running state.
     let record = state
         .update_vm(&clone, move |r| {
             r.state = RecordState::Running;
