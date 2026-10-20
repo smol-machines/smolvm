@@ -17,4 +17,8 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # webpki-roots 0.26 — distrusted emSign roots. 0.26.11 only re-exports
+    # webpki-roots 1.x (pinned at the fixed 1.0.10); axum's tokio-tungstenite
+    # still names 0.26, which gets no release of its own.
+    "RUSTSEC-2026-0381",
 ]
