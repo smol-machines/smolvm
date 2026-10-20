@@ -283,6 +283,37 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
     }))
 }
 
+/// `Some` once `shared` is extracted: the tree for a chunked `artifact`, or
+/// `None` inside for a classic one, which takes the ordinary path.
+fn already_prepared(artifact: &Path, shared: &Path) -> Result<Option<Option<PathBuf>>> {
+    if !smolvm_pack::extract::is_extracted(shared) {
+        return Ok(None);
+    }
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|e| Error::agent("read checkpoint manifest", e.to_string()))?;
+    let chunked = manifest
+        .checkpoint
+        .as_ref()
+        .is_some_and(|c| c.payload == smolvm_pack::format::CheckpointLayout::Chunked);
+    Ok(Some(chunked.then(|| shared.to_path_buf())))
+}
+
+/// The lock the pack extractor holds while it extracts into `shared`.
+fn lock_shared_extraction(shared: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options
+        .open(shared.with_extension("lock"))
+        .map_err(io("open shared extraction lock"))?;
+    lock.lock().map_err(io("lock shared extraction"))?;
+    Ok(lock)
+}
+
 /// Make a chunked checkpoint file restorable through the ordinary extraction
 /// path: import it, then materialize its full payload into the shared
 /// extraction directory its footer names, reusing the closest held base's
@@ -292,17 +323,17 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         .map_err(|e| Error::agent("read checkpoint footer", e.to_string()))?;
     let shared_root = crate::agent::shared_pack_cache_root();
     let shared = smolvm_pack::extract::shared_pack_dir(&shared_root, footer.checksum);
-    if smolvm_pack::extract::is_extracted(&shared) {
-        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
-            .map_err(|e| Error::agent("read checkpoint manifest", e.to_string()))?;
-        if manifest
-            .checkpoint
-            .as_ref()
-            .is_some_and(|c| c.payload == smolvm_pack::format::CheckpointLayout::Chunked)
-        {
-            return Ok(Some(shared));
-        }
-        return Ok(None);
+    if let Some(prepared) = already_prepared(artifact, &shared)? {
+        return Ok(prepared);
+    }
+    std::fs::create_dir_all(&shared_root).map_err(io("create shared extraction root"))?;
+    // Overlapping restores of one checkpoint share the partial directory
+    // below and each cleared it on entry, removing the tree another was still
+    // writing. The extractor's lock for this checksum makes them take turns;
+    // the ones that waited find the tree published and reuse it.
+    let _lock = lock_shared_extraction(&shared)?;
+    if let Some(prepared) = already_prepared(artifact, &shared)? {
+        return Ok(prepared);
     }
     let started = std::time::Instant::now();
     let Some(imported) = import(artifact)? else {
@@ -331,7 +362,6 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
             .map_err(io("read checkpoint lineage"))?
             .and_then(|record| record.parent);
     }
-    std::fs::create_dir_all(&shared_root).map_err(io("create shared extraction root"))?;
     let partial = shared_root.join(format!(
         ".{:08x}-materialize-{}",
         footer.checksum,
