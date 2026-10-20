@@ -3497,8 +3497,10 @@ fn published_port_states(
 }
 
 /// Build the per-machine JSON object shared by `machine list --json` and
-/// `machine status --json` so the two outputs never drift apart.
-fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
+/// `machine status --json` so the two outputs never drift apart. The `smol`
+/// CLI builds its local `ls --json` and `status --json` rows from it too, so
+/// both CLIs report a local machine with the same fields.
+pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     // Resolve via vsock probe so the JSON reflects truth (Unreachable vs
     // Running) instead of trusting the PID-only check.
     let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
