@@ -55,6 +55,12 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
     let (allocated_cpus, allocated_memory_mb) = state.allocated_resources();
     let utilization = state.real_utilization();
     let host_memory = crate::process::host_memory_stats();
+    let branch_admission = host_memory.and_then(|memory| {
+        crate::agent::fork::branch_admission_params(memory.total_bytes / (1024 * 1024))
+            .inspect_err(|error| tracing::warn!(%error, "capacity: branch admission parameters"))
+            .ok()
+            .flatten()
+    });
     let cuda_devices = state.cuda_devices().map(|devices| {
         devices
             .into_iter()
@@ -80,6 +86,8 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
         used_memory_shared_mapped_mb: utilization.shared_memory_mapped_mb,
         host_memory_total_mb: host_memory.map(|memory| memory.total_bytes / (1024 * 1024)),
         host_memory_available_mb: host_memory.map(|memory| memory.available_bytes / (1024 * 1024)),
+        branch_reserve_mb: branch_admission.map(|params| params.reserve_mib),
+        branch_child_overhead_mb: branch_admission.map(|params| params.child_overhead_mib),
         used_disk_gb: utilization.disk_gb,
         boot_id: boot_id().to_string(),
         cuda_devices,

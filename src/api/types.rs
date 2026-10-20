@@ -664,6 +664,15 @@ pub struct CapacityResponse {
     /// Effective memory currently available (MB) to this runtime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_memory_available_mb: Option<u64>,
+    /// Host memory (MB) a branch must leave free on this node. A branch of N
+    /// children is refused unless `host_memory_available_mb` covers this plus
+    /// `N * branch_child_overhead_mb` plus any fresh RAM generation it copies.
+    /// Omitted when branch memory admission is off or host memory is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_reserve_mb: Option<u64>,
+    /// Boot overhead (MB) branch admission charges per child on this node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_child_overhead_mb: Option<u64>,
     /// Real disk (GB) consumed by VM storage + overlay files.
     pub used_disk_gb: u64,
     /// Opaque id minted once per serve process. It changes iff the serve restarts

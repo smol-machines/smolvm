@@ -640,6 +640,43 @@ fn branch_admission_value(name: &str, default: u64) -> Result<u64> {
     }
 }
 
+/// What a branch must leave free on the host: a reserve kept for the host and
+/// the boot overhead charged per child. Shared by the fork-time check and
+/// `GET /capacity`, so a control plane that pre-checks a fan-out uses the same
+/// numbers this node will enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchAdmissionParams {
+    /// Host memory a branch must leave free (MiB).
+    pub reserve_mib: u64,
+    /// Boot overhead charged per child (MiB).
+    pub child_overhead_mib: u64,
+}
+
+/// The branch admission parameters for a host with `total_mib` of effective
+/// memory, or `None` when admission is turned off with
+/// `SMOLVM_BRANCH_MEMORY_ADMISSION=0`.
+pub fn branch_admission_params(total_mib: u64) -> Result<Option<BranchAdmissionParams>> {
+    if std::env::var("SMOLVM_BRANCH_MEMORY_ADMISSION").as_deref() == Ok("0") {
+        return Ok(None);
+    }
+    let reserve_mib = branch_admission_value(
+        "SMOLVM_HOST_MEMORY_RESERVE_MIB",
+        default_branch_reserve_mib(total_mib),
+    )?;
+    // H100 and ordinary Linux QA put a booted, idle VMM at roughly 39–42 MiB.
+    // Reserve 64 MiB to include thread stacks and transient launch state.
+    let child_overhead_mib = branch_admission_value("SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD", 64)?;
+    Ok(Some(BranchAdmissionParams {
+        reserve_mib,
+        child_overhead_mib,
+    }))
+}
+
+/// 5% of the host, at least 512 MiB and at most 4 GiB, never more than half.
+fn default_branch_reserve_mib(total_mib: u64) -> u64 {
+    (total_mib / 20).clamp(512, 4096).min(total_mib / 2)
+}
+
 fn branch_admission_required_mib(
     children: usize,
     child_overhead_mib: u64,
@@ -664,21 +701,19 @@ fn admit_branch_memory(
     children: usize,
     materializes_shared_generation: bool,
 ) -> Result<()> {
-    if std::env::var("SMOLVM_BRANCH_MEMORY_ADMISSION").as_deref() == Ok("0") {
-        return Ok(());
-    }
     let Some(memory) = crate::process::host_memory_stats() else {
         return Ok(());
     };
     const MIB: u64 = 1024 * 1024;
     let total_mib = memory.total_bytes / MIB;
     let available_mib = memory.available_bytes / MIB;
-    let default_reserve_mib = (total_mib / 20).clamp(512, 4096).min(total_mib / 2);
-    let reserve_mib =
-        branch_admission_value("SMOLVM_HOST_MEMORY_RESERVE_MIB", default_reserve_mib)?;
-    // H100 and ordinary Linux QA put a booted, idle VMM at roughly 39–42 MiB.
-    // Reserve 64 MiB to include thread stacks and transient launch state.
-    let child_overhead_mib = branch_admission_value("SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD", 64)?;
+    let Some(BranchAdmissionParams {
+        reserve_mib,
+        child_overhead_mib,
+    }) = branch_admission_params(total_mib)?
+    else {
+        return Ok(());
+    };
     let materialized_generation_mib = if materializes_shared_generation {
         record
             .pid
@@ -4475,6 +4510,14 @@ mod tests {
             branch_admission_required_mib(usize::MAX, u64::MAX, 1, 1),
             None
         );
+    }
+
+    #[test]
+    fn branch_reserve_defaults_to_five_percent_within_bounds() {
+        assert_eq!(default_branch_reserve_mib(64 * 1024), 3276);
+        assert_eq!(default_branch_reserve_mib(256 * 1024), 4096);
+        assert_eq!(default_branch_reserve_mib(4 * 1024), 512);
+        assert_eq!(default_branch_reserve_mib(800), 400);
     }
 
     #[test]
