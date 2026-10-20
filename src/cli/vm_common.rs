@@ -118,10 +118,13 @@ pub fn ensure_running_and_connect(
             ));
         }
 
+        // `machine start` runs in its own process, so a start can be in flight
+        // while this one finds no agent yet. Say so instead of sending the
+        // user to start a machine that is already starting.
         return Err(smolvm::Error::agent(
             "connect",
             format!(
-                "machine '{}' is not running. Use '{}' first.",
+                "machine '{}' is not running. Start it with '{}'; if a start is already in progress, retry once it finishes.",
                 label, start_hint
             ),
         ));
