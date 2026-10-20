@@ -233,6 +233,15 @@ the Smolfile form is `[network] deny_cidrs`.
 Every rule, the Smolfile keys and `--guest-subnet`:
 `docs/throwaway-machine/README.md`.
 
+A registry image does not need `--net`. When the guest cannot reach the
+registry itself (no network, or an allow list that does not cover it), smolvm
+fetches the image on the host at the machine's first start and boots that copy,
+so a machine created without network never needs network to provision. That
+first start still asks the registry to authorize the pull, so it fails if the
+registry refuses or rate-limits the request; later starts boot the stored disk
+without contacting it. `machine ls` and `machine status` keep reporting the
+image the machine was created from.
+
 ### Proxy Support
 
 Pass proxy settings into VMs with `-e` when behind a corporate proxy or VPN:
