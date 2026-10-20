@@ -88,6 +88,16 @@ fi
 
 echo "Building smolvm distribution: ${DIST_NAME}"
 
+# The base agent rootfs is built separately. Check for it before the long
+# compile below, not after it.
+ROOTFS_SRC="$PROJECT_ROOT/target/agent-rootfs"
+if [[ ! -d "$ROOTFS_SRC" ]]; then
+    echo "Error: target/agent-rootfs not found"
+    echo "Run ./scripts/build-agent-rootfs.sh first to create the base rootfs"
+    echo "(--no-build-agent is enough; this script builds the agent itself)."
+    exit 1
+fi
+
 # Check for git-lfs (required for library binaries)
 if ! command -v git-lfs &> /dev/null && ! git lfs version &> /dev/null 2>&1; then
     echo "Error: git-lfs is required to build smolvm distributions"
@@ -539,12 +549,6 @@ fi
 
 # Build agent-rootfs
 echo "Building agent-rootfs..."
-ROOTFS_SRC="$PROJECT_ROOT/target/agent-rootfs"
-if [[ ! -d "$ROOTFS_SRC" ]]; then
-    echo "Error: target/agent-rootfs not found"
-    echo "Run ./scripts/build-agent-rootfs.sh first to create the base rootfs."
-    exit 1
-fi
 
 # Copy rootfs and update agent binary
 # Use cp -a to preserve symlinks (busybox creates many symlinks in /bin)

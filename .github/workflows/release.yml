@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Nightly and on-demand runs build the same bundles from main and keep them
+  # as workflow artifacts, so main can be tested without a source build. Only
+  # a tag push publishes a release.
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -522,6 +528,7 @@ jobs:
   # ==========================================================================
   release:
     name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-dist, build-dist-windows]
     runs-on: ubuntu-latest
     permissions:
