@@ -22,6 +22,12 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = ErrorFormat::Text)]
     error_format: ErrorFormat,
 
+    /// Keep all smolvm state (machines, images, caches, the database) under
+    /// PATH instead of the user's default directories, for example to run a
+    /// second engine version beside an installed one. Linux only.
+    #[arg(long, global = true, value_name = "PATH")]
+    state_dir: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -143,6 +149,36 @@ fn stray_stub_note(exe_stem: &str) -> Option<String> {
     ))
 }
 
+/// `--state-dir` must take effect before anything computes a path, which is
+/// before clap runs, so it is read from argv here and handed to the
+/// `SMOLVM_DATA_DIR` root that child processes inherit. Arguments after `--`
+/// belong to the workload and are never read. A relative path is made
+/// absolute so children started in another directory agree on it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn state_dir_from_args(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.to_str() {
+            Some("--") => return None,
+            Some("--state-dir") => args.next()?,
+            Some(other) => match other.strip_prefix("--state-dir=") {
+                Some(value) => value.into(),
+                None => continue,
+            },
+            None => continue,
+        };
+        let path = std::path::PathBuf::from(value);
+        return Some(if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        });
+    }
+    None
+}
+
 fn main() {
     // Lets pack extraction pick host-side layers when this host's virtiofs
     // server can present their recorded ownership.
@@ -151,6 +187,10 @@ fn main() {
     // agree on where smolvm state lives) before anything computes a path. The
     // auto /var/lib/smolvm default is serve-only (applied in its run()). Done
     // first, single-threaded, so the set_var is safe.
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = state_dir_from_args(std::env::args_os().skip(1)) {
+        std::env::set_var("SMOLVM_DATA_DIR", dir);
+    }
     smolvm::process::apply_system_data_root(/* allow_auto */ false);
 
     // Auto-detect packed binary mode BEFORE parsing the normal CLI.
@@ -197,6 +237,10 @@ fn main() {
 
     let cli = Cli::parse();
     let error_format = cli.error_format;
+    if cli.state_dir.is_some() && !cfg!(target_os = "linux") {
+        eprintln!("Error: --state-dir is only supported on Linux");
+        std::process::exit(2);
+    }
 
     // Initialize logging based on RUST_LOG or default to warn
     init_logging();
@@ -310,6 +354,44 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_dir_is_read_before_the_workload_arguments_only() {
+        let args = |list: &[&str]| {
+            list.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            state_dir_from_args(args(&["--state-dir", "/srv/smol", "machine", "ls"])),
+            Some("/srv/smol".into())
+        );
+        assert_eq!(
+            state_dir_from_args(args(&["machine", "ls", "--state-dir=/srv/smol"])),
+            Some("/srv/smol".into())
+        );
+        assert_eq!(
+            state_dir_from_args(args(&["machine", "run", "--", "app", "--state-dir", "/x"])),
+            None
+        );
+        assert_eq!(
+            state_dir_from_args(args(&["machine", "ls", "--state-dir"])),
+            None
+        );
+        let relative = state_dir_from_args(args(&["--state-dir", "state", "machine", "ls"]))
+            .expect("a relative state dir is accepted");
+        assert!(relative.is_absolute() && relative.ends_with("state"));
+    }
+
+    #[test]
+    fn state_dir_is_a_global_flag() {
+        assert!(
+            Cli::try_parse_from(["smolvm", "--state-dir", "/srv/smol", "machine", "ls"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["smolvm", "machine", "ls", "--state-dir", "/srv/smol"]).is_ok()
+        );
+    }
 
     #[test]
     fn the_shipped_binary_name_is_not_flagged() {
