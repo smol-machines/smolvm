@@ -8,6 +8,7 @@ use std::os::fd::IntoRawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -2269,15 +2270,18 @@ pub fn self_exe_for_spawn() -> std::io::Result<std::path::PathBuf> {
 /// under concurrent VM boots. Reaping only registered VM PIDs leaves those
 /// transient subprocesses to their own waits. Mirrors the guest agent's
 /// `BG_CHILDREN` pattern (`crates/smolvm-agent/src/main.rs`).
+#[cfg(unix)]
 static VM_CHILDREN: OnceLock<Mutex<Vec<VmChild>>> = OnceLock::new();
 
 /// A detached VM boot subprocess, and the machine directory its exit record
 /// goes to (see [`crate::vm_exit`]).
+#[cfg(unix)]
 struct VmChild {
     pid: i32,
     machine_dir: Option<std::path::PathBuf>,
 }
 
+#[cfg(unix)]
 fn vm_children() -> &'static Mutex<Vec<VmChild>> {
     VM_CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -2295,12 +2299,17 @@ const REAPED_KEPT: usize = 256;
 /// reaps it and records why it ended in `machine_dir`. The Rust `Child`
 /// handle's `Drop` does not `wait()`, so the caller can let it drop after
 /// recording the PID.
+#[cfg(unix)]
 pub fn register_vm_child(pid: i32, machine_dir: Option<std::path::PathBuf>) {
     vm_children()
         .lock()
         .unwrap()
         .push(VmChild { pid, machine_dir });
 }
+
+/// No-op on Windows, where process handles carry exit status.
+#[cfg(not(unix))]
+pub fn register_vm_child(_pid: i32, _machine_dir: Option<std::path::PathBuf>) {}
 
 /// Reap any exited registered VM children (non-blocking, per-PID), recording
 /// why each ended. Called from the serve supervisor tick and before an

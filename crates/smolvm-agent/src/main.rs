@@ -9271,7 +9271,7 @@ mod tests {
                 &[
                     "sh".to_string(),
                     "-c".to_string(),
-                    "stty -echo -onlcr 2>/dev/null; exec cat".to_string(),
+                    "stty -echo -onlcr && printf 'PTY_READY\\n' && exec cat".to_string(),
                 ],
                 &[],
                 None,
@@ -9290,6 +9290,22 @@ mod tests {
             )
             .unwrap();
         });
+
+        let ready_marker = b"PTY_READY\n";
+        let mut ready = Vec::new();
+        while ready.len() < ready_marker.len() {
+            let mut header = [0; 4];
+            client.read_exact(&mut header).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(header) as usize];
+            client.read_exact(&mut body).unwrap();
+            match serde_json::from_slice::<AgentResponse>(&body).unwrap() {
+                AgentResponse::Started => {}
+                AgentResponse::Stdout { data } => ready.extend(data),
+                other => panic!("unexpected response before PTY readiness: {other:?}"),
+            }
+            assert!(ready_marker.starts_with(&ready));
+        }
+        assert_eq!(ready, ready_marker);
 
         // 64KB with newlines so canonical mode flushes lines to cat
         let chunk_size = 1024;
