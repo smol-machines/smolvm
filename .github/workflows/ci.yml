@@ -9,8 +9,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Every Linux job runs on smol machines (`runs-on: smol`, sized automatically, warm-started from a golden of the
-  # job's last run). macOS, native Windows and Linux arm64 stay on GitHub-hosted runners until smol has those tiers.
+  # Every Linux job runs on smol machines (`runs-on: smol`, or `smol-arm64` on arm64 nodes; sized automatically,
+  # warm-started from a golden of the job's last run). macOS and native Windows stay on GitHub-hosted runners.
   # CI builds the release profile only to check it compiles, warns nothing and passes its tests; that binary is never
   # shipped. Thin LTO with 16 codegen units keeps cross-crate optimisation but runs it in parallel: an incremental
   # release build of the main crate drops from ~300 s (fat LTO, 1 codegen unit, one core) to a fraction of that.
@@ -187,7 +187,7 @@ jobs:
             runner: smol
             target: x86_64-unknown-linux-gnu
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            runner: smol-arm64
             target: aarch64-unknown-linux-gnu
 
     steps:
