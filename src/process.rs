@@ -643,29 +643,81 @@ pub fn set_managed_vmm_memory_limit(
         return Ok(false);
     };
     let scope = crate::systemd_scope::scope_name(machine);
+    let owned = leaf == scope || leaf == format!("vm-{pid}");
+    if !owned {
+        return Ok(false);
+    }
+    // A generation's pages stay charged here until every child mapping them
+    // has exited, which can be after its record is gone. A ceiling below what
+    // is charged reclaims nothing (shmem) and kills the source on the spot.
+    let read = |file: &str| -> Option<u64> {
+        std::fs::read_to_string(dir.join(file))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let requested = VmmMemoryBudget {
+        max_bytes: memory_max_bytes,
+        high_bytes: memory_high_bytes,
+    };
+    let budget = match read("memory.current") {
+        Some(charged) => floored_memory_budget(requested, charged, read("memory.max")),
+        None => requested,
+    };
+    if budget != requested {
+        tracing::warn!(
+            machine,
+            requested_max_bytes = memory_max_bytes,
+            kept_max_bytes = budget.max_bytes,
+            "kept a VM's memory limit above what its cgroup still holds"
+        );
+    }
+    let (memory_max_bytes, memory_high_bytes) = (budget.max_bytes, budget.high_bytes);
     if leaf == scope {
         crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes, memory_high_bytes)?;
         return Ok(true);
     }
-    if leaf == format!("vm-{pid}") {
-        write_cgroup(&dir, "memory.high", &memory_high_bytes.to_string()).map_err(|error| {
-            Error::agent(
-                "VM cgroup",
-                format!("update {} memory.high: {error}", dir.display()),
-            )
-        })?;
-        write_cgroup(&dir, "memory.max", &memory_max_bytes.to_string()).map_err(|error| {
-            Error::agent(
-                "VM cgroup",
-                format!(
-                    "update {} memory.max to {memory_max_bytes}: {error}",
-                    dir.display()
-                ),
-            )
-        })?;
-        return Ok(true);
+    write_cgroup(&dir, "memory.high", &memory_high_bytes.to_string()).map_err(|error| {
+        Error::agent(
+            "VM cgroup",
+            format!("update {} memory.high: {error}", dir.display()),
+        )
+    })?;
+    write_cgroup(&dir, "memory.max", &memory_max_bytes.to_string()).map_err(|error| {
+        Error::agent(
+            "VM cgroup",
+            format!(
+                "update {} memory.max to {memory_max_bytes}: {error}",
+                dir.display()
+            ),
+        )
+    })?;
+    Ok(true)
+}
+
+/// `requested`, unless it would put the ceiling under what the cgroup holds:
+/// then the ceiling stays that charge plus the requested reclaim band, never
+/// above the limit already in place when this was meant to lower it.
+#[cfg(any(target_os = "linux", test))]
+fn floored_memory_budget(
+    requested: VmmMemoryBudget,
+    charged: u64,
+    existing_max: Option<u64>,
+) -> VmmMemoryBudget {
+    let band = requested.max_bytes.saturating_sub(requested.high_bytes);
+    let floor = charged.saturating_add(band);
+    if requested.max_bytes >= floor {
+        return requested;
     }
-    Ok(false)
+    let max_bytes = match existing_max {
+        Some(existing) if existing > requested.max_bytes => floor.min(existing),
+        _ => floor,
+    };
+    VmmMemoryBudget {
+        max_bytes,
+        high_bytes: max_bytes.saturating_sub(band),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4230,6 +4282,41 @@ mod tests {
             assert!(raised_memory_budget(existing, invalid).is_err());
             assert!(raised_memory_budget(invalid, existing).is_err());
         }
+    }
+
+    /// The 10-20 kill: deleting children dropped the lineage count while their
+    /// generations were still charged, and the lowered ceiling killed the source.
+    #[test]
+    fn a_lowered_memory_limit_never_drops_under_what_the_cgroup_holds() {
+        let existing = Some(1000);
+        let lowered = VmmMemoryBudget {
+            high_bytes: 300,
+            max_bytes: 400,
+        };
+        // Freed already: lower all the way.
+        assert_eq!(floored_memory_budget(lowered, 200, existing), lowered);
+        // Still charged: keep the charge plus the reclaim band.
+        assert_eq!(
+            floored_memory_budget(lowered, 700, existing),
+            VmmMemoryBudget {
+                high_bytes: 700,
+                max_bytes: 800
+            }
+        );
+        // Never above the limit it was meant to lower.
+        assert_eq!(
+            floored_memory_budget(lowered, 990, existing),
+            VmmMemoryBudget {
+                high_bytes: 900,
+                max_bytes: 1000
+            }
+        );
+        // A raise that already covers the charge is untouched.
+        let raised = VmmMemoryBudget {
+            high_bytes: 1900,
+            max_bytes: 2000,
+        };
+        assert_eq!(floored_memory_budget(raised, 990, existing), raised);
     }
 
     #[test]
