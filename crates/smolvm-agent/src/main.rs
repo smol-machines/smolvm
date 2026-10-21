@@ -8664,7 +8664,7 @@ mod tests {
         std::fs::write(dir.path().join("alpha.txt"), b"abc").unwrap();
         std::fs::create_dir(dir.path().join("middle")).unwrap();
 
-        let resp = handle_list_directory(dir.path().to_str().unwrap(), None);
+        let resp = handle_list_directory(dir.path().to_str().unwrap(), Some(&WorkloadTarget::Vm));
         let AgentResponse::Ok { data: Some(data) } = resp else {
             panic!("expected a listing, got {resp:?}");
         };
@@ -8691,13 +8691,16 @@ mod tests {
     #[test]
     fn a_missing_directory_is_an_error_not_an_empty_listing() {
         let dir = tempfile::tempdir().unwrap();
-        let resp = handle_list_directory(dir.path().join("nope").to_str().unwrap(), None);
+        let resp = handle_list_directory(
+            dir.path().join("nope").to_str().unwrap(),
+            Some(&WorkloadTarget::Vm),
+        );
         let AgentResponse::Error { code, message, .. } = resp else {
             panic!("expected an error, got {resp:?}");
         };
         assert_eq!(code.as_deref(), Some("NOT_FOUND"), "message: {message}");
 
-        let empty = handle_list_directory(dir.path().to_str().unwrap(), None);
+        let empty = handle_list_directory(dir.path().to_str().unwrap(), Some(&WorkloadTarget::Vm));
         let AgentResponse::Ok { data: Some(data) } = empty else {
             panic!("an empty directory still lists");
         };
@@ -8715,7 +8718,7 @@ mod tests {
         std::os::unix::fs::symlink("gone.txt", dir.path().join("dangling.txt")).unwrap();
 
         let AgentResponse::Ok { data: Some(data) } =
-            handle_list_directory(dir.path().to_str().unwrap(), None)
+            handle_list_directory(dir.path().to_str().unwrap(), Some(&WorkloadTarget::Vm))
         else {
             panic!("expected a listing");
         };
@@ -9749,7 +9752,7 @@ mod tests {
             None,
             None,
             smolvm_protocol::FILE_TRANSFER_MAX_TOTAL + 1,
-            None,
+            Some(&WorkloadTarget::Vm),
         );
         assert!(session.is_none(), "session must not be created");
         assert!(
@@ -9807,7 +9810,7 @@ mod tests {
             None,
             None,
             payload.len() as u64,
-            None,
+            Some(&WorkloadTarget::Vm),
         );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
 
@@ -9850,7 +9853,7 @@ mod tests {
             None,
             None,
             total as u64,
-            None,
+            Some(&WorkloadTarget::Vm),
         );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
 
@@ -9886,8 +9889,14 @@ mod tests {
         let target = tmp_target(&tmp, "short.bin");
         std::fs::write(&target, b"original").unwrap();
 
-        let (session, resp) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10, None);
+        let (session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            10,
+            Some(&WorkloadTarget::Vm),
+        );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
         let (session, resp) = handle_file_write_chunk(session, b"short", true);
         assert!(session.is_none());
@@ -9901,8 +9910,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "overflow.bin");
 
-        let (session, _resp) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10, None);
+        let (session, _resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            10,
+            Some(&WorkloadTarget::Vm),
+        );
         assert!(session.is_some());
 
         // First chunk fits.
@@ -9931,8 +9946,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "dropped.bin");
 
-        let (session, _) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 100, None);
+        let (session, _) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            100,
+            Some(&WorkloadTarget::Vm),
+        );
         let (session, _) = handle_file_write_chunk(session, &[0u8; 50], false);
         assert!(session.is_some());
         // Staging file exists mid-stream.
@@ -9960,8 +9981,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "empty.bin");
 
-        let (session, _) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 0, None);
+        let (session, _) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            0,
+            Some(&WorkloadTarget::Vm),
+        );
         let (session, resp) = handle_file_write_chunk(session, &[], true);
         assert!(matches!(resp, AgentResponse::Ok { .. }));
         assert!(session.is_none());
@@ -9990,7 +10017,7 @@ mod tests {
             Some(0o644),
             None,
             None,
-            None,
+            Some(&WorkloadTarget::Vm),
         );
         assert!(
             matches!(resp, AgentResponse::Ok { .. }),
