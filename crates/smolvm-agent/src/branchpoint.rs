@@ -484,7 +484,8 @@ mod tests {
         // A process another test forks inherits the lock's descriptor until it execs, so the lock can outlive `drop`
         // for a moment: wait for it to clear instead of checking once.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while live_ready_contents(&ready).unwrap().is_some() && std::time::Instant::now() < deadline {
+        while live_ready_contents(&ready).unwrap().is_some() && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(live_ready_contents(&ready).unwrap(), None);
