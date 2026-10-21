@@ -2948,6 +2948,12 @@ fn normalize_guest_path(path: &str) -> std::result::Result<String, AgentResponse
 }
 
 fn active_persistent_overlay_merged_root() -> Option<std::path::PathBuf> {
+    // Unit tests never consult the machine they run on. On a smol machine the
+    // real /storage/overlays is visible, and the file handlers under test
+    // resolved their temp paths through that machine's overlay instead.
+    if cfg!(test) {
+        return None;
+    }
     let overlays_dir = std::path::Path::new("/storage/overlays");
     let entries = std::fs::read_dir(overlays_dir).ok()?;
     for entry in entries.flatten() {
