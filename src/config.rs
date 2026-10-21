@@ -8,7 +8,7 @@
 //! and provides the same API as the old confy-based implementation.
 /// smol ci parallel-steps measurement (scratch branch, not for merge).
 #[allow(dead_code)]
-pub(crate) const SMOL_CI_MEASUREMENT: u32 = 2;
+pub(crate) const SMOL_CI_MEASUREMENT: u32 = 3;
 
 use crate::data::network;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
