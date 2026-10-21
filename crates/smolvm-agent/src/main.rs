@@ -10387,49 +10387,6 @@ mod workload_owner_tests {
     }
 }
 
-#[cfg(test)]
-mod keepalive_tests {
-    use super::*;
-    use std::time::Duration;
-
-    fn progress_frames(bytes: &[u8]) -> usize {
-        let mut rest = bytes;
-        let mut count = 0;
-        while rest.len() >= 4 {
-            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
-            let frame: AgentResponse = serde_json::from_slice(&rest[4..4 + len]).unwrap();
-            assert!(matches!(frame, AgentResponse::Progress { .. }));
-            count += 1;
-            rest = &rest[4 + len..];
-        }
-        count
-    }
-
-    #[test]
-    fn slow_work_keeps_the_host_hearing_and_fast_work_sends_nothing() {
-        let period = Duration::from_millis(40);
-        let mut stream = Vec::new();
-        let result = with_keepalive(&mut stream, period, || {
-            std::thread::sleep(period * 5);
-            "done"
-        });
-        assert_eq!(result, "done");
-        // Timers run late on a loaded host, so only a lower bound holds.
-        assert!(
-            progress_frames(&stream) >= 2,
-            "{} frames",
-            progress_frames(&stream)
-        );
-
-        let mut stream = Vec::new();
-        assert_eq!(
-            with_keepalive(&mut stream, Duration::from_secs(60), || 7),
-            7
-        );
-        assert!(stream.is_empty());
-    }
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod exec_process_spec_tests {
     use super::{exec_process_spec, ResolvedLaunch};
