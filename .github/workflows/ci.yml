@@ -96,8 +96,8 @@ jobs:
           components: clippy
 
       - name: Cache cargo
-        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
-        if: ${{ !startsWith(runner.name, 'gh-') }}
+        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
+        if: ${{ env.SMOL_WARM != '1' }}
         uses: actions/cache@v5
         with:
           path: |
@@ -199,8 +199,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
-        if: ${{ !startsWith(runner.name, 'gh-') }}
+        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
+        if: ${{ env.SMOL_WARM != '1' }}
         uses: actions/cache@v5
         with:
           path: |
@@ -335,8 +335,8 @@ jobs:
           targets: x86_64-pc-windows-gnu
 
       - name: Cache cargo
-        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
-        if: ${{ !startsWith(runner.name, 'gh-') }}
+        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
+        if: ${{ env.SMOL_WARM != '1' }}
         uses: actions/cache@v5
         with:
           path: |
@@ -381,8 +381,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
-        if: ${{ !startsWith(runner.name, 'gh-') }}
+        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
+        if: ${{ env.SMOL_WARM != '1' }}
         uses: actions/cache@v5
         with:
           path: |
@@ -481,8 +481,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
-        if: ${{ !startsWith(runner.name, 'gh-') }}
+        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
+        if: ${{ env.SMOL_WARM != '1' }}
         uses: actions/cache@v4
         with:
           path: |
