@@ -1031,7 +1031,11 @@ impl ApiState {
                 continue;
             };
             total_rss_bytes = total_rss_bytes.saturating_add(stats.rss_bytes);
-            match crate::process::process_memory_stats(pid) {
+            // Counters, not `smaps_rollup`: summed over a hundred-odd VMMs the
+            // rollup took seconds and ran `/capacity` past the node-agent's
+            // poll timeout, self-cordoning the node (10-20). Node PSS is
+            // therefore not reported; per-machine endpoints still read it.
+            match crate::process::process_memory_counters(pid) {
                 Some(memory) => {
                     if let Some(value) = memory.pss_bytes {
                         total_pss_bytes = total_pss_bytes.saturating_add(value);

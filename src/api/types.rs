@@ -647,7 +647,9 @@ pub struct CapacityResponse {
     pub used_memory_mb: u64,
     /// Proportional resident memory (MB) across VM processes. Unlike summed
     /// RSS, this counts clean pages shared by branch siblings only once in the
-    /// aggregate. Omitted where the host cannot provide process PSS.
+    /// aggregate. Omitted: `/capacity` sums the kernel's cheap per-process
+    /// counters, which carry no PSS, because summing `smaps_rollup` over every
+    /// machine outlasts the node-agent's poll. A machine's own usage reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub used_memory_pss_mb: Option<u64>,
     /// Private resident memory (MB) across VM processes.

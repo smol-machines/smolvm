@@ -2712,6 +2712,15 @@ pub fn process_memory_stats(pid: Pid) -> Option<ProcessMemoryStats> {
             return Some(stats);
         }
     }
+    process_memory_counters(pid)
+}
+
+/// Read a VMM's memory from the kernel's per-process counters (`statm`,
+/// `status`): resident, its private/shared split and anonymous memory, without
+/// PSS. Unlike `smaps_rollup`, which walks every mapping of a guest's RAM and
+/// takes tens of milliseconds per VMM, this costs microseconds, so it suits a
+/// sum over every machine on the node.
+pub fn process_memory_counters(pid: Pid) -> Option<ProcessMemoryStats> {
     let stats = process_stats(pid)?;
     #[cfg(target_os = "linux")]
     let statm = std::fs::read_to_string(format!("/proc/{pid}/statm"))
@@ -5320,6 +5329,20 @@ mod tests {
         if let Some(pss) = stats.pss_bytes {
             assert!(pss <= stats.rss_bytes);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_memory_counters_sample_self_without_pss() {
+        let stats = process_memory_counters(std::process::id() as Pid)
+            .expect("memory counters must sample the current process");
+        assert!(stats.rss_bytes > 0);
+        assert!(stats.pss_bytes.is_none(), "counters never walk smaps");
+        let (private, shared) = (
+            stats.private_bytes.unwrap(),
+            stats.shared_mapped_bytes.unwrap(),
+        );
+        assert!(private <= stats.rss_bytes && shared <= stats.rss_bytes);
     }
 
     /// A PID that does not exist must yield None, not a bogus sample.
