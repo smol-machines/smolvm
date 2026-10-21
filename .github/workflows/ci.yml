@@ -9,6 +9,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every Linux job runs on smol machines (`runs-on: smol`, sized automatically, warm-started from a golden of the
+  # job's last run). macOS, native Windows and Linux arm64 stay on GitHub-hosted runners until smol has those tiers.
   # CI builds the release profile only to check it compiles, warns nothing and passes its tests; that binary is never
   # shipped. Thin LTO with 16 codegen units keeps cross-crate optimisation but runs it in parallel: an incremental
   # release build of the main crate drops from ~300 s (fat LTO, 1 codegen unit, one core) to a fraction of that.
@@ -23,7 +25,7 @@ jobs:
   # ==========================================================================
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: smol
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -33,7 +35,7 @@ jobs:
 
   secrets-guards:
     name: Secrets invariants
-    runs-on: ubuntu-latest
+    runs-on: smol
     steps:
       - uses: actions/checkout@v4
       - name: Check secrets guardrails
@@ -41,7 +43,7 @@ jobs:
 
   libkrun-provenance:
     name: libkrun freshness
-    runs-on: ubuntu-latest
+    runs-on: smol
     steps:
       # LFS on: check-krun-exports.sh reads the actual bundled lib binaries.
       # (check-libkrun-provenance.sh itself only needs the pinned gitlinks.)
@@ -70,7 +72,7 @@ jobs:
 
   audit:
     name: Cargo Audit
-    runs-on: ubuntu-latest
+    runs-on: smol
     # Scans Cargo.lock for RustSec advisories — no engine/libkrun needed. Honors
     # .cargo/audit.toml, which ignores documented unmaintained-transitive notices
     # so a real vulnerability stands out instead of hiding in warning noise.
@@ -94,6 +96,8 @@ jobs:
           components: clippy
 
       - name: Cache cargo
+        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
+        if: ${{ !startsWith(runner.name, 'gh-') }}
         uses: actions/cache@v5
         with:
           path: |
@@ -180,7 +184,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: smol
             target: x86_64-unknown-linux-gnu
           - arch: aarch64
             runner: ubuntu-24.04-arm
@@ -195,6 +199,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
+        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
+        if: ${{ !startsWith(runner.name, 'gh-') }}
         uses: actions/cache@v5
         with:
           path: |
@@ -303,7 +309,7 @@ jobs:
   # cannot slip back in unnoticed.
   linux-musl:
     name: Linux musl (Alpine)
-    runs-on: ubuntu-latest
+    runs-on: smol
     container: alpine:3.20
     steps:
       - name: Install build dependencies
@@ -317,7 +323,7 @@ jobs:
 
   windows:
     name: Windows (x86_64, cross)
-    runs-on: ubuntu-latest
+    runs-on: smol
     env:
       CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
     steps:
@@ -329,6 +335,8 @@ jobs:
           targets: x86_64-pc-windows-gnu
 
       - name: Cache cargo
+        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
+        if: ${{ !startsWith(runner.name, 'gh-') }}
         uses: actions/cache@v5
         with:
           path: |
@@ -373,6 +381,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
+        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
+        if: ${{ !startsWith(runner.name, 'gh-') }}
         uses: actions/cache@v5
         with:
           path: |
@@ -391,7 +401,7 @@ jobs:
   # ==========================================================================
   agent:
     name: Agent (Linux musl)
-    runs-on: ubuntu-latest
+    runs-on: smol
     steps:
       - uses: actions/checkout@v6
 
@@ -456,7 +466,7 @@ jobs:
   # ==========================================================================
   smol-compat:
     name: smol CLI compatibility
-    runs-on: ubuntu-latest
+    runs-on: smol
     steps:
       - uses: actions/checkout@v6
         with:
@@ -471,6 +481,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
+        # smol runners start from a golden that already holds a warm target/; restoring a cache over it costs time
+        if: ${{ !startsWith(runner.name, 'gh-') }}
         uses: actions/cache@v4
         with:
           path: |
@@ -528,7 +540,7 @@ jobs:
   ci-success:
     name: CI Success
     needs: [fmt, macos, linux, linux-musl, windows, agent, smol-compat]
-    runs-on: ubuntu-latest
+    runs-on: smol
     if: always()
     steps:
       - name: Check all jobs passed
