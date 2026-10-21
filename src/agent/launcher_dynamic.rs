@@ -709,6 +709,7 @@ pub fn launch_agent_vm_dynamic(
         ssh_agent_socket: config.ssh_agent_socket,
         cuda_socket: config.cuda_socket,
         docker_socket: None,
+        clipboard_socket: None,
         workload_log_socket: None,
     };
     let active_vsock: Vec<_> = vsock_service::registry()

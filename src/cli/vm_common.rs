@@ -474,6 +474,9 @@ pub struct CreateVmParams {
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub dns_options: Vec<String>,
+    /// Keep the guest's clipboard commands off the host clipboard
+    /// (`--no-clipboard`). The bridge is on by default.
+    pub no_clipboard: bool,
     /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
     /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
     pub shm_size: Option<String>,
@@ -844,6 +847,7 @@ pub(crate) fn build_vm_record_for(
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.dns_options = params.dns_options.clone();
+    record.no_clipboard = params.no_clipboard;
     record.shm_size = params.shm_size.clone();
     record.network_name = params.network_name.clone();
     record.guest_subnet = params.guest_subnet.clone();
@@ -2202,6 +2206,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.network_backend = o.network_backend;
     r.dns = o.dns;
     r.dns_options = o.dns_options.clone();
+    r.no_clipboard = o.no_clipboard;
     r.shm_size = o.shm_size.clone();
     r.network_name = o.network_name.clone();
     r.guest_subnet = o.guest_subnet.clone();
@@ -2282,6 +2287,9 @@ pub struct DefaultVmOverrides {
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub dns_options: Vec<String>,
+    /// Keep the guest's clipboard commands off the host clipboard
+    /// (`--no-clipboard`). The bridge is on by default.
+    pub no_clipboard: bool,
     /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
     /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
     pub shm_size: Option<String>,
@@ -2371,6 +2379,7 @@ impl DefaultVmOverrides {
             network_backend: params.network_backend,
             dns: params.dns,
             dns_options: params.dns_options.clone(),
+            no_clipboard: params.no_clipboard,
             shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),

@@ -80,6 +80,7 @@ pub mod cli;
 // The CLI modules name this crate as a dependency would, so they compile
 // unchanged inside it.
 extern crate self as smolvm;
+pub mod clipboard;
 #[cfg(unix)]
 pub mod cuda_daemon;
 pub mod cuda_host;

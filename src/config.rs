@@ -602,6 +602,10 @@ pub struct VmRecord {
     /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_options: Vec<String>,
+    /// Keep the guest's clipboard commands off the host clipboard
+    /// (`--no-clipboard`). The bridge is on by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_clipboard: bool,
     /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
     /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -945,6 +949,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             dns_options: Vec::new(),
+            no_clipboard: false,
             shm_size: None,
             network_name: None,
             guest_subnet: None,
@@ -1045,6 +1050,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             dns_options: Vec::new(),
+            no_clipboard: false,
             shm_size: None,
             network_name: None,
             guest_subnet: None,
@@ -1606,6 +1612,7 @@ impl VmRecord {
             egress_rules: self.egress_rules.clone(),
             dns: self.dns,
             dns_options: self.dns_options.clone(),
+            no_clipboard: self.no_clipboard,
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
@@ -1649,6 +1656,15 @@ mod tests {
 
     // A record written before `--dns-option` existed still loads (no options),
     // and a record's options reach the launch resources in order.
+    #[test]
+    fn a_record_without_the_clipboard_setting_bridges_it() {
+        let mut old =
+            serde_json::to_value(VmRecord::new("c".into(), 1, 512, vec![], vec![], false)).unwrap();
+        old.as_object_mut().unwrap().remove("no_clipboard");
+        let loaded: VmRecord = serde_json::from_value(old).unwrap();
+        assert!(!loaded.no_clipboard && !loaded.vm_resources().no_clipboard);
+    }
+
     #[test]
     fn dns_options_persist_on_the_record_and_reach_launch_resources() {
         let mut record = VmRecord::new("d".to_string(), 1, 512, vec![], vec![], true);

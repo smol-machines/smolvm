@@ -161,8 +161,15 @@ else
     printf 'egress=none\n'
 fi
 
+# Untrusted code must not read the host clipboard, which smolvm bridges by
+# default; a release without --no-clipboard has no bridge to turn off.
+noclip=()
+if "$SMOLVM" machine run --help 2>/dev/null | grep -q -- '--no-clipboard'; then
+    noclip=(--no-clipboard)
+fi
+
 logfile="$STATE_DIR/throwaway-machine.lastrun.log"
-SMOLVM_IMAGE_SEEDS=0 "$SMOLVM" machine run --mem 2048 ${cache[@]+"${cache[@]}"} --image "$IMAGE" \
+SMOLVM_IMAGE_SEEDS=0 "$SMOLVM" machine run --mem 2048 ${noclip[@]+"${noclip[@]}"} ${cache[@]+"${cache[@]}"} --image "$IMAGE" \
     --volume "$REPO:$REPO_PATH:ro" \
     --volume "$OUT:/out" \
     ${allow[@]+"${allow[@]}"} \

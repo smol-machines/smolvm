@@ -61,7 +61,11 @@ check() {
 }
 
 # --- from inside the guest, in the same shape a real run uses ----------------
-inside="$("$SMOLVM" machine run --mem 2048 ${cache[@]+"${cache[@]}"} ${net[@]+"${net[@]}"} --image "$IMAGE" \
+noclip=()
+if "$SMOLVM" machine run --help 2>/dev/null | grep -q -- '--no-clipboard'; then
+    noclip=(--no-clipboard)
+fi
+inside="$("$SMOLVM" machine run --mem 2048 ${noclip[@]+"${noclip[@]}"} ${cache[@]+"${cache[@]}"} ${net[@]+"${net[@]}"} --image "$IMAGE" \
     --volume "$REPO:/workspace:ro" \
     --volume "$OUT:/out" \
     -- sh -c '

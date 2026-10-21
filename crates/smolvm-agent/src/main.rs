@@ -86,6 +86,7 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod branchpoint;
+mod clipboard;
 mod credentials;
 mod cuda;
 mod dirwatch;
@@ -303,6 +304,9 @@ fn main() {
     }
     if forkpoint::helper_requested() {
         std::process::exit(forkpoint::run_helper());
+    }
+    if clipboard::helper_requested() {
+        std::process::exit(clipboard::run_helper());
     }
 
     // Namespace file helper. Dispatched here, before the async runtime starts,
@@ -577,6 +581,9 @@ fn main() {
         info!("Docker socket bridge enabled, starting guest bridge");
         docker_bridge::start();
     }
+
+    // Clipboard commands for a machine with no image (`--clipboard`).
+    clipboard::install_bare_vm_helpers();
 
     // Start any user-published Unix-socket bridges (`--expose-socket` /
     // `--mount-socket`). No-op when none are configured.
@@ -4207,6 +4214,7 @@ fn write_oci_bundle(
     publish_socket::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
+    clipboard::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
     vulkan::inject_into_container(&mut spec, rootfs_path);
     credentials::inject_into_container(&mut spec, rootfs_path, mounts);
@@ -5875,6 +5883,7 @@ fn spawn_interactive_command(
     publish_socket::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
+    clipboard::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
     vulkan::inject_into_container(&mut spec, rootfs_path);
     credentials::inject_into_container(&mut spec, rootfs_path, mounts);

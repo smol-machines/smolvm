@@ -111,6 +111,9 @@ pub const DNS: &str = "SMOLVM_NETWORK_DNS";
 /// (`--dns-option`, repeatable), e.g. `timeout:1 attempts:3 rotate use-vc`.
 /// Every writer of resolv.conf appends them as one `options` line.
 pub const DNS_OPTIONS: &str = "SMOLVM_NETWORK_DNS_OPTIONS";
+/// Enables the guest clipboard commands that bridge to the host clipboard
+/// (set unless the machine was created with `--no-clipboard`).
+pub const CLIPBOARD: &str = "SMOLVM_CLIPBOARD";
 /// `/dev/shm` size for the workload container (`--shm-size`), already a
 /// tmpfs `size=` value from [`shm_size_option`]. Unset = half the guest RAM.
 pub const SHM_SIZE: &str = "SMOLVM_SHM_SIZE";

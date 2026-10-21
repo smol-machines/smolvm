@@ -27,6 +27,9 @@ pub struct VsockServiceInputs<'a> {
     /// forwards each host connection to the guest, which proxies it to the
     /// in-guest dockerd socket. When set, the Docker bridge is enabled.
     pub docker_socket: Option<&'a Path>,
+    /// Host clipboard bridge socket (on unless `--no-clipboard`): the guest's clipboard
+    /// commands connect out to it.
+    pub clipboard_socket: Option<&'a Path>,
     /// Host socket the workload's output is appended from. When set, the
     /// guest agent forwards a detached workload's stdout and stderr to it.
     pub workload_log_socket: Option<&'a Path>,
@@ -110,6 +113,24 @@ impl VsockService for DockerSocketService {
     }
 }
 
+/// Clipboard bridge (on unless `--no-clipboard`): the guest's `pbcopy`/`xclip`/`wl-copy`
+/// family connects out to the host's clipboard server.
+struct ClipboardService;
+impl VsockService for ClipboardService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.clipboard_socket.map(|socket| ActiveVsockService {
+            name: "clipboard bridge",
+            port: ports::CLIPBOARD,
+            listen: false,
+            socket,
+            guest_env: &[(
+                smolvm_protocol::guest_env::CLIPBOARD,
+                smolvm_protocol::guest_env::VALUE_ON,
+            )],
+        })
+    }
+}
+
 /// Workload logs: the guest agent connects out and streams a detached
 /// workload's stdout and stderr to a host listener that appends them to the
 /// machine's `workload.log`.
@@ -132,6 +153,7 @@ pub fn registry() -> &'static [&'static dyn VsockService] {
         &SshAgentService,
         &CudaService,
         &DockerSocketService,
+        &ClipboardService,
         &WorkloadLogService,
     ]
 }
@@ -147,6 +169,7 @@ mod tests {
             ssh_agent_socket: Some(socket),
             cuda_socket: None,
             docker_socket: None,
+            clipboard_socket: None,
             workload_log_socket: None,
         };
 

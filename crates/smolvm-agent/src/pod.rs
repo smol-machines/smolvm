@@ -1013,6 +1013,7 @@ fn write_pod_bundle(
     crate::publish_socket::inject_into_container(&mut spec);
     crate::rosetta::inject_into_container(&mut spec);
     crate::forkpoint::inject_into_container(&mut spec);
+    crate::clipboard::inject_into_container(&mut spec);
     crate::cuda::inject_into_container(&mut spec, &pod.rootfs);
     crate::vulkan::inject_into_container(&mut spec, &pod.rootfs);
 

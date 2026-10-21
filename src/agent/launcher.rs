@@ -1826,8 +1826,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // no new control flow in this function. The `active_vsock` set is reused
         // below to inject each service's guest-side activation env vars, so the
         // host and guest sides cannot drift.
+        // Serve the host clipboard to the guest's commands, unless the machine
+        // was created with `--no-clipboard`.
+        let clipboard_socket = (!resources.no_clipboard)
+            .then(|| vsock_socket.parent())
+            .flatten()
+            .map(|dir| {
+                let socket = dir.join(crate::clipboard::CLIPBOARD_SOCKET);
+                crate::clipboard::serve(&socket, dir);
+                socket
+            });
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
+            clipboard_socket: clipboard_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),
             docker_socket: docker_socket.as_deref(),
             workload_log_socket: workload_log_socket.as_deref(),
