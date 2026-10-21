@@ -2750,6 +2750,47 @@ mod tests {
         assert_eq!(binding.environment_variable, "GITHUB_AUTH");
     }
 
+    /// `machine monitor` flags override the machine's Smolfile `[health]`
+    /// values, which override the defaults.
+    #[test]
+    fn monitor_health_flags_override_the_smolfile_values() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            cmd: super::MachineCmd,
+        }
+        let monitor = |argv: &[&str]| match Harness::try_parse_from(argv).map(|h| h.cmd) {
+            Ok(super::MachineCmd::Monitor(monitor)) => monitor,
+            _ => panic!("monitor must parse"),
+        };
+        let secs = Duration::from_secs;
+
+        let mut record =
+            smolvm::config::VmRecord::new("web".into(), 1, 512, Vec::new(), Vec::new(), false);
+        let defaults = monitor(&["machine", "monitor", "--name", "web"]);
+        assert_eq!(defaults.health_settings(&record), (secs(5), 3, secs(5)));
+
+        record.health_timeout_secs = Some(2);
+        record.health_retries = Some(4);
+        record.health_interval_secs = Some(10);
+        assert_eq!(defaults.health_settings(&record), (secs(2), 4, secs(10)));
+
+        let flags = monitor(&[
+            "machine",
+            "monitor",
+            "--name",
+            "web",
+            "--health-timeout",
+            "7",
+            "--health-retries",
+            "1",
+            "--interval",
+            "30",
+        ]);
+        assert_eq!(flags.health_settings(&record), (secs(7), 1, secs(30)));
+    }
+
     #[test]
     fn cli_overlay_owner_uses_the_golden_for_fork_clones() {
         let ordinary =
@@ -7717,17 +7758,17 @@ pub struct MonitorCmd {
     #[arg(long, value_name = "CMD")]
     pub health_cmd: Option<String>,
 
-    /// Health check timeout in seconds
-    #[arg(long, default_value = "5", value_name = "SECS")]
-    pub health_timeout: u64,
+    /// Health check timeout in seconds [default: the Smolfile's, else 5]
+    #[arg(long, value_name = "SECS")]
+    pub health_timeout: Option<u64>,
 
-    /// Check interval in seconds
-    #[arg(long, default_value = "5", value_name = "SECS")]
-    pub interval: u64,
+    /// Check interval in seconds [default: the Smolfile's, else 5]
+    #[arg(long, value_name = "SECS")]
+    pub interval: Option<u64>,
 
-    /// Health check failures before triggering restart
-    #[arg(long, default_value = "3", value_name = "N")]
-    pub health_retries: u32,
+    /// Health check failures before triggering restart [default: the Smolfile's, else 3]
+    #[arg(long, value_name = "N")]
+    pub health_retries: Option<u32>,
 
     /// Rebind the host egress interceptor on each automatic restart.
     /// Requires SMOLVM_INTERCEPTOR_TOKEN (64 hex digits).
@@ -7745,6 +7786,22 @@ pub struct MonitorCmd {
 }
 
 impl MonitorCmd {
+    /// Health check timeout, retries and check interval: a flag wins over the
+    /// machine's Smolfile `[health]` value, which wins over the default.
+    fn health_settings(&self, record: &smolvm::config::VmRecord) -> (Duration, u32, Duration) {
+        let timeout = self
+            .health_timeout
+            .or(record.health_timeout_secs)
+            .unwrap_or(5);
+        let retries = self.health_retries.or(record.health_retries).unwrap_or(3);
+        let interval = self.interval.or(record.health_interval_secs).unwrap_or(5);
+        (
+            Duration::from_secs(timeout),
+            retries,
+            Duration::from_secs(interval),
+        )
+    }
+
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::config::{RecordState, RestartPolicy};
         use smolvm::db::SmolvmDb;
@@ -7756,7 +7813,7 @@ impl MonitorCmd {
             self.egress_interceptor,
             self.egress_interceptor_token.as_ref(),
         )?;
-        let name = self.name.unwrap_or_else(|| "default".to_string());
+        let name = self.name.clone().unwrap_or_else(|| "default".to_string());
 
         // Load machine config from DB
         let db = SmolvmDb::open()?;
@@ -7792,10 +7849,7 @@ impl MonitorCmd {
             .clone()
             .map(|c| vec!["sh".into(), "-c".into(), c])
             .or_else(|| record.health_cmd.clone());
-        let health_timeout =
-            Duration::from_secs(record.health_timeout_secs.unwrap_or(self.health_timeout));
-        let health_retries = record.health_retries.unwrap_or(self.health_retries);
-        let interval = Duration::from_secs(record.health_interval_secs.unwrap_or(self.interval));
+        let (health_timeout, health_retries, interval) = self.health_settings(&record);
         let startup_grace = record
             .health_startup_grace_secs
             .map(Duration::from_secs)
