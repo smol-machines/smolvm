@@ -10390,37 +10390,36 @@ mod workload_owner_tests {
 #[cfg(test)]
 mod keepalive_tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    fn progress_frames(bytes: &[u8]) -> usize {
-        let mut rest = bytes;
-        let mut count = 0;
-        while rest.len() >= 4 {
-            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
-            let frame: AgentResponse = serde_json::from_slice(&rest[4..4 + len]).unwrap();
-            assert!(matches!(frame, AgentResponse::Progress { .. }));
-            count += 1;
-            rest = &rest[4 + len..];
-        }
-        count
-    }
-
     #[test]
-    fn slow_work_keeps_the_host_hearing_and_fast_work_sends_nothing() {
-        let period = Duration::from_millis(40);
-        let mut stream = Vec::new();
-        let result = with_keepalive(&mut stream, period, || {
-            std::thread::sleep(period * 5);
+    fn unfinished_work_keeps_sending_progress_until_it_completes() {
+        let (mut stream, mut host) = UnixStream::pair().unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let result = with_keepalive(&mut stream, Duration::from_millis(40), || {
+            for _ in 0..2 {
+                let mut header = [0; 4];
+                host.read_exact(&mut header).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                host.read_exact(&mut body).unwrap();
+                let frame: AgentResponse = serde_json::from_slice(&body).unwrap();
+                assert!(matches!(
+                    frame,
+                    AgentResponse::Progress {
+                        message,
+                        percent: None,
+                        layer: None,
+                    } if message == "finalizing file write"
+                ));
+            }
             "done"
         });
         assert_eq!(result, "done");
-        // Timers run late on a loaded host, so only a lower bound holds.
-        assert!(
-            progress_frames(&stream) >= 2,
-            "{} frames",
-            progress_frames(&stream)
-        );
+    }
 
+    #[test]
+    fn work_that_completes_at_once_sends_no_progress() {
         let mut stream = Vec::new();
         assert_eq!(
             with_keepalive(&mut stream, Duration::from_secs(60), || 7),
