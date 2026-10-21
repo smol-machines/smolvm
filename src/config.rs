@@ -1561,7 +1561,8 @@ impl VmRecord {
                 "published ports",
                 format!(
                     "machine '{}' is running without virtio-net networking, so its ports can \
-                     only change while it is stopped",
+                     only change while it is stopped; create it with `--net-backend virtio-net` \
+                     to change ports while it runs",
                     self.name
                 ),
             ));
@@ -1837,6 +1838,7 @@ mod tests {
         ] {
             let err = record.check_live_ports().unwrap_err().to_string();
             assert!(err.contains("stopped"), "{err}");
+            assert!(err.contains("--net-backend virtio-net"), "{err}");
         }
     }
 

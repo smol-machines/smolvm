@@ -3698,10 +3698,17 @@ pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> 
     if unsupported.is_empty() {
         return Ok(());
     }
+    // Directory mounts are the one entry a flag admits: say so, or the
+    // refusal reads as a dead end.
+    let hint = if !vm.mounts.is_empty() && !host_mounts && vm.staged_mounts.is_empty() {
+        "; pass --host-mounts to keep the directory mounts (the checkpoint then restores only where the same host paths exist)"
+    } else {
+        ""
+    };
     Err(Error::config(
         "checkpoint machine",
         format!(
-            "the initial portable checkpoint profile does not support {}; stop or detach these resources before capture",
+            "the initial portable checkpoint profile does not support {}; stop or detach these resources before capture{hint}",
             unsupported.join(", ")
         ),
     ))
@@ -8369,6 +8376,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("host mounts"), "{error}");
+        assert!(
+            error.contains("--host-mounts"),
+            "the refusal names the flag: {error}"
+        );
 
         // Opting in keeps the mounts: they are recorded and re-attached on
         // restore, which binds the artifact to hosts that have the paths.
@@ -8387,6 +8398,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("host mounts"), "{error}");
+        assert!(
+            !error.contains("--host-mounts"),
+            "the flag cannot keep staged mounts: {error}"
+        );
         record.staged_mounts.clear();
 
         // A pack source is recorded in the checkpoint and reattached on restore.
