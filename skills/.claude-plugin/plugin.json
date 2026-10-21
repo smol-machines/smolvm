@@ -1,0 +1,36 @@
+{
+  "name": "smolvm",
+  "description": "Skills for running agent work in smolvm microVMs: isolated, branchable machines that boot in under a second.",
+  "author": {
+    "name": "smol machines",
+    "url": "https://smolmachines.com"
+  },
+  "homepage": "https://smolmachines.com",
+  "repository": "https://github.com/smol-machines/smolvm",
+  "license": "Apache-2.0",
+  "keywords": [
+    "sandbox",
+    "microvm",
+    "virtual-machine",
+    "agents",
+    "claude-code",
+    "codex",
+    "branching",
+    "checkpoint",
+    "isolation"
+  ],
+  "skills": [
+    "./smolvm",
+    "./branch-and-checkpoint",
+    "./coding-agent",
+    "./credentials",
+    "./dev-env",
+    "./docker-in-machine",
+    "./gpu-cuda",
+    "./install",
+    "./local-api",
+    "./pack",
+    "./teardown",
+    "./throwaway-machine"
+  ]
+}

@@ -93,7 +93,7 @@ driver entry points a program resolves through the shim.
 
 Without an NVIDIA driver the host serves a CPU-emulation backend (test-only:
 it knows the `vecadd` test kernel), so the transport stays testable anywhere.
-The [gpu-cuda packet](gpu-cuda/README.md) has the procedure and what tells that
+The [gpu-cuda packet](../skills/gpu-cuda/README.md) has the procedure and what tells that
 backend apart from a real GPU.
 
 Fork-heavy Linux hosts should use a kernel containing upstream KVM fix

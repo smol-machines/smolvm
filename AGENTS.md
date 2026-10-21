@@ -93,7 +93,7 @@ machine's storage disk, bare or image-based, across exec sessions and a stop and
 start. `pack run` starts fresh each time, while `pack start` + `exec` and
 `machine create --from .smolmachine` persist. `/tmp`, `/run` and `/dev/shm` are
 tmpfs and empty after a restart, so write what must survive to `/workspace`.
-Every mode, `--stop-on-exit` and the tmpfs details: `docs/dev-env/README.md`.
+Every mode, `--stop-on-exit` and the tmpfs details: `skills/dev-env/README.md`.
 
 ## CLI Structure
 
@@ -232,7 +232,7 @@ virtio-net backend; the Smolfile form is `[network] block_private = true` and
 including the host's loopback reached through the gateway. It implies `--net`;
 the Smolfile form is `[network] deny_cidrs`.
 Every rule, the Smolfile keys and `--guest-subnet`:
-`docs/throwaway-machine/README.md`.
+`skills/throwaway-machine/README.md`.
 
 A registry image does not need `--net`. When the guest cannot reach the
 registry itself (no network, or an allow list that does not cover it), smolvm
@@ -326,7 +326,7 @@ vsock, separate from `--gpu`. The host needs a working NVIDIA driver and no CUDA
 toolkit; the guest gets no `/dev/nvidia*`, only Driver and Runtime API shims at
 `/opt/smolvm-cuda` that need a glibc image. Without an NVIDIA driver the host
 answers with a CPU-emulation device, so check the device name, not the exit code.
-Coverage: `docs/gpu.md`; the tested procedure: `docs/gpu-cuda/`.
+Coverage: `docs/gpu.md`; the tested procedure: `skills/gpu-cuda/`.
 
 ## Secrets
 
@@ -504,7 +504,7 @@ as a normal executable: `./my-app run -- CMD` is ephemeral, and `start`,
 `exec` and `stop` drive a persistent daemon. `machine create --name NAME
 --from my-app.smolmachine` makes it a named machine with the full lifecycle,
 booting from pre-extracted layers with no image pull. Details, the manifest's
-metadata and the traps: `docs/pack/`.
+metadata and the traps: `skills/pack/`.
 
 ## HTTP API
 
@@ -514,7 +514,7 @@ A plain server has no authentication: whoever reaches the socket or the port
 can create and run machines. Machines that ask for nested virtualization
 (`nestedVirt`) are refused with 403 unless the server runs with `--allow-nested-virt`.
 `smolvm serve openapi` prints the spec; the endpoints, field names and traps:
-`docs/local-api/`.
+`skills/local-api/`.
 
 ## Important Defaults
 

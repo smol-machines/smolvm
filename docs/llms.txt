@@ -4,17 +4,17 @@
 
 ## Skill packets
 
-- [branch-and-checkpoint](branch-and-checkpoint/SKILL.md): scheduled checkpoints with history, restores, pause and resume, and branches with their branch point kept
-- [credentials](credentials/SKILL.md): an API key a workload can use but never read, substituted on the way out
-- [dev-env](dev-env/SKILL.md): a machine you come back to, and what survives a stop and start
-- [coding-agent](coding-agent/SKILL.md): a coding agent with full permissions inside a machine, the project mounted
-- [docker-in-machine](docker-in-machine/SKILL.md): a Docker daemon inside a machine, for tools that call Docker themselves
-- [gpu-cuda](gpu-cuda/SKILL.md): the guest's CUDA Driver API calls, and Runtime API calls through a `libcudart` shim, remoted to the host's NVIDIA GPU
-- [install](install/SKILL.md): installing smolvm and proving the host can boot a microVM
-- [local-api](local-api/SKILL.md): driving the machine lifecycle over the local HTTP API
-- [pack](pack/SKILL.md): packing an image or a machine into a portable artifact
-- [teardown](teardown/SKILL.md): what state exists, where it lives, and how to leave nothing running
-- [throwaway-machine](throwaway-machine/SKILL.md): running untrusted code in a throwaway machine, with egress granted one host at a time
+- [branch-and-checkpoint](../skills/branch-and-checkpoint/SKILL.md): scheduled checkpoints with history, restores, pause and resume, and branches with their branch point kept
+- [credentials](../skills/credentials/SKILL.md): an API key a workload can use but never read, substituted on the way out
+- [dev-env](../skills/dev-env/SKILL.md): a machine you come back to, and what survives a stop and start
+- [coding-agent](../skills/coding-agent/SKILL.md): a coding agent with full permissions inside a machine, the project mounted
+- [docker-in-machine](../skills/docker-in-machine/SKILL.md): a Docker daemon inside a machine, for tools that call Docker themselves
+- [gpu-cuda](../skills/gpu-cuda/SKILL.md): the guest's CUDA Driver API calls, and Runtime API calls through a `libcudart` shim, remoted to the host's NVIDIA GPU
+- [install](../skills/install/SKILL.md): installing smolvm and proving the host can boot a microVM
+- [local-api](../skills/local-api/SKILL.md): driving the machine lifecycle over the local HTTP API
+- [pack](../skills/pack/SKILL.md): packing an image or a machine into a portable artifact
+- [teardown](../skills/teardown/SKILL.md): what state exists, where it lives, and how to leave nothing running
+- [throwaway-machine](../skills/throwaway-machine/SKILL.md): running untrusted code in a throwaway machine, with egress granted one host at a time
 
 ## Reference pages
 

@@ -1,0 +1,27 @@
+{
+  "name": "smol-machines",
+  "owner": {
+    "name": "smol machines",
+    "url": "https://smolmachines.com"
+  },
+  "description": "smol machines' agent skills for smolvm microVMs.",
+  "plugins": [
+    {
+      "name": "smolvm",
+      "source": "./skills",
+      "description": "Skills for running agent work in smolvm microVMs: isolated, branchable machines that boot in under a second.",
+      "category": "development",
+      "keywords": [
+        "sandbox",
+        "microvm",
+        "virtual-machine",
+        "agents",
+        "claude-code",
+        "codex",
+        "branching",
+        "checkpoint",
+        "isolation"
+      ]
+    }
+  ]
+}

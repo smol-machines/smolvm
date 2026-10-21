@@ -27,7 +27,18 @@ curl -sSL https://smolmachines.com/install.sh | bash   # macOS + Linux
 
 Windows: unzip the `windows-x86_64` [release](https://github.com/smol-machines/smolvm/releases) and run `smolvm.exe` (needs the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/)). Coding agents: run `smolvm --help` after installing to discover every command.
 
-The documentation for humans and agents is in [`docs/`](docs/README.md), one folder per task: a `README.md` with the facts and a `SKILL.md` an agent can follow, with its scripts, beside the reference page for each feature.
+Agent skills
+------------
+
+Give your coding agent the tested procedures for running, branching and tearing down machines. They live in [`skills/`](skills/), one folder per task with a `SKILL.md` and its scripts, and install as a plugin:
+
+```bash
+claude plugin marketplace add smol-machines/smolvm && claude plugin install smolvm@smol-machines   # Claude Code
+codex plugin marketplace add smol-machines/smolvm && codex plugin add smolvm@smol-machines         # Codex
+npx skills@latest add smol-machines/smolvm                                                          # Cursor, OpenCode, others
+```
+
+The reference page for each feature is in [`docs/`](docs/README.md).
 
 Quick Start
 -----------
