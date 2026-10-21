@@ -1714,19 +1714,26 @@ fn checkpoint_rootfs_dir(options: &CaptureOptions) -> Result<PathBuf> {
     )
 }
 
-fn validated_capture_source(name: &str, host_mounts: bool) -> Result<SmolvmConfig> {
+/// A checkpointable source and whether it is frozen as a branch base: paused
+/// in its VMM for its branches, so it is captured without being resumed or
+/// asked anything through its paused guest.
+fn validated_capture_source(name: &str, host_mounts: bool) -> Result<(SmolvmConfig, bool)> {
     let config = SmolvmConfig::load()?;
     config.db().require_completed_resize(name)?;
     let vm = config
         .vms
         .get(name)
         .ok_or_else(|| Error::vm_not_found(name))?;
-    if crate::agent::state_probe::resolve_state(name, vm) != RecordState::Running {
-        return Err(Error::agent_conflict(
-            "checkpoint machine",
-            format!("machine '{name}' must be running"),
-        ));
-    }
+    let frozen = match crate::agent::state_probe::resolve_state(name, vm) {
+        RecordState::Running => false,
+        RecordState::Frozen => true,
+        _ => {
+            return Err(Error::agent_conflict(
+                "checkpoint machine",
+                format!("machine '{name}' must be running"),
+            ))
+        }
+    };
     validate_capture_profile(vm, host_mounts)?;
 
     let control = crate::agent::fork::control_socket_path(name);
@@ -1738,14 +1745,17 @@ fn validated_capture_source(name: &str, host_mounts: bool) -> Result<SmolvmConfi
             ),
         )
     })?;
-    if status.trim() != "OK running" {
+    let expected = if frozen { "OK paused" } else { "OK running" };
+    if status.trim() != expected {
         return Err(Error::agent_conflict(
             "checkpoint machine",
             format!("machine '{name}' is not checkpointable: {status}"),
         ));
     }
-    crate::agent::fork::validate_checkpoint_agent(name)?;
-    Ok(config)
+    if !frozen {
+        crate::agent::fork::validate_checkpoint_agent(name)?;
+    }
+    Ok((config, frozen))
 }
 
 /// Capture a running checkpointable machine into a self-contained artifact.
@@ -1970,7 +1980,17 @@ fn capture_with_completion(
     // be ineligible. The source is revalidated under the cross-process lock
     // immediately before capture so this fast preflight is never trusted for
     // the consistency boundary.
-    let _ = validated_capture_source(name, options.host_mounts)?;
+    let (_, frozen) = validated_capture_source(name, options.host_mounts)?;
+    // A frozen source stays frozen for its branches: it cannot be stopped by a
+    // pause, and its RAM is captured whole rather than streamed into a store.
+    if frozen && (stop_after_capture || options.store_dir.is_some()) {
+        return Err(Error::agent_conflict(
+            "checkpoint machine",
+            format!(
+                "machine '{name}' is frozen as a branch base; it can only be captured as a full standalone checkpoint"
+            ),
+        ));
+    }
     if options.store_dir.is_some() {
         let reply = crate::agent::fork::control_socket_cmd(
             &crate::agent::fork::control_socket_path(name),
@@ -2073,7 +2093,13 @@ fn capture_with_completion(
     // fork resizing the same scope. Release before packaging and compression.
     let mut source_lock = Some(crate::agent::fork::lock_fork_source(name)?);
     let mut release_source = Some(release_source);
-    let config = validated_capture_source(name, options.host_mounts)?;
+    let (config, still_frozen) = validated_capture_source(name, options.host_mounts)?;
+    if still_frozen != frozen {
+        return Err(Error::agent_conflict(
+            "checkpoint machine",
+            format!("machine '{name}' changed state during the capture; retry"),
+        ));
+    }
     let vm = config
         .vms
         .get(name)
@@ -2107,7 +2133,12 @@ fn capture_with_completion(
     let checkpoint_created_at =
         humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
     // Ask while the guest still runs: its agent answers for the kernel it is on.
-    let (clock, guest_cpu_features) = checkpoint_guest_view(name);
+    // A frozen guest cannot answer; record what an unreachable agent would.
+    let (clock, guest_cpu_features) = if frozen {
+        unanswered_guest_view()
+    } else {
+        checkpoint_guest_view(name)
+    };
     if stop_after_capture {
         let db = crate::db::SmolvmDb::open()?;
         if !db.dependent_clones(name)?.is_empty() {
@@ -2142,10 +2173,13 @@ fn capture_with_completion(
         )) && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
     let max_memory_image = max_checkpoint_memory_image(vm.mem, mounts_image_layers(vm))?;
-    crate::agent::fork::sync_fork_source(name)?;
-    log_phase(name, "capture_sync", &mut phase);
-    release_free_guest_memory(name, &control);
-    log_phase(name, "capture_free_memory_hint", &mut phase);
+    // A frozen guest was synced when it froze, and cannot free pages now.
+    if !frozen {
+        crate::agent::fork::sync_fork_source(name)?;
+        log_phase(name, "capture_sync", &mut phase);
+        release_free_guest_memory(name, &control);
+        log_phase(name, "capture_free_memory_hint", &mut phase);
+    }
     if stop_after_capture {
         remove_paused_disks_marker(&crate::agent::vm_data_dir(name))?;
         publish_resume_point(PauseCaptureStage::Capturing)?;
@@ -2157,7 +2191,8 @@ fn capture_with_completion(
     // intact for the source to keep executing after the checkpoint.
     // WHP only implements the eager, frozen save. Send SAVE directly rather
     // than probing deferred commands that the Windows VMM cannot handle.
-    let use_deferred_save = !cfg!(target_os = "windows")
+    let use_deferred_save = !frozen
+        && !cfg!(target_os = "windows")
         && (!cfg!(all(target_os = "linux", target_arch = "x86_64")) || !mounts_image_layers(vm));
     // A capture that stops the VM keeps it paused until the RAM is written, so
     // libkrun can read RAM it cannot retain as a generation (a fork clone's)
@@ -2170,7 +2205,11 @@ fn capture_with_completion(
         && stop_after_capture
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_HELD_CAPABILITIES")
             .is_ok_and(|reply| reply.trim() == "OK held-windows-in-place-v1");
-    let command = if held_in_place {
+    // A frozen source is saved as it stands and never resumed: its branches
+    // map its RAM.
+    let command = if frozen {
+        "SAVE_FROZEN"
+    } else if held_in_place {
         "PREPARE_SAVE_HELD"
     } else if !use_deferred_save {
         "SAVE"
@@ -2205,6 +2244,14 @@ fn capture_with_completion(
     } else {
         send(command)?
     };
+    if frozen && reply.trim() == "ERR EINVAL unknown command" {
+        return Err(Error::agent_conflict(
+            "checkpoint machine",
+            format!(
+                "machine '{name}' is frozen as a branch base and its libkrun cannot checkpoint it; restart it under a newer smolvm"
+            ),
+        ));
+    }
     if command == "PREPARE_SAVE_HELD"
         && !held_in_place
         && reply.trim() == "ERR EINVAL unknown command"
@@ -2215,7 +2262,7 @@ fn capture_with_completion(
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     // A packed machine whose held save failed goes back to SAVE, never to the
     // rebasing PREPARE_SAVE.
-    if !prepared && (held_in_place || declined_deferred_save(&reply)) {
+    if !frozen && !prepared && (held_in_place || declined_deferred_save(&reply)) {
         reply = synchronous_save()?;
         tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
@@ -2228,7 +2275,8 @@ fn capture_with_completion(
     let mut pause = SavedVmPause {
         control,
         prepared_save: prepared.then(|| runtime_snapshot.clone()),
-        armed: true,
+        // Resuming a frozen source would write RAM its branches still map.
+        armed: !frozen,
     };
     #[cfg(target_os = "linux")]
     if prepared {
@@ -3071,6 +3119,19 @@ fn parse_linux_features(cpuinfo: &str) -> Vec<String> {
 /// platform needs: whether its kernel follows a change of counter rate, and
 /// the CPU features it was given. Both `None` on x86_64, where the TSC and
 /// CPUID contracts cover them.
+/// The guest view recorded when the guest cannot be asked: the host counter
+/// rate, no assumption that the guest follows it, and no CPU feature list.
+fn unanswered_guest_view() -> (
+    Option<smolvm_pack::format::CheckpointClock>,
+    Option<Vec<String>>,
+) {
+    let clock = host_counter_hz().map(|counter_hz| smolvm_pack::format::CheckpointClock {
+        counter_hz,
+        follows_counter_rate: false,
+    });
+    (clock, None)
+}
+
 fn checkpoint_guest_view(
     name: &str,
 ) -> (
