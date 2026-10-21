@@ -6,6 +6,9 @@
 //! State is persisted to a SQLite database at `~/.local/share/smolvm/server/smolvm.db`.
 //! For backward compatibility, `SmolvmConfig` maintains an in-memory cache of VMs
 //! and provides the same API as the old confy-based implementation.
+/// smol ci parallel-steps measurement (scratch branch, not for merge).
+#[allow(dead_code)]
+pub(crate) const SMOL_CI_MEASUREMENT: u32 = 1;
 
 use crate::data::network;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
