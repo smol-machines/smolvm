@@ -16,6 +16,10 @@
 
 #![deny(missing_docs)]
 
+/// smol ci incremental measurement (scratch branch, not for merge).
+#[doc(hidden)]
+pub const SMOL_CI_MEASUREMENT: u32 = 3;
+
 use serde::{Deserialize, Serialize};
 
 /// One S3-compatible bucket to mount inside the workload container.
