@@ -6695,6 +6695,8 @@ pub async fn publish_cache_disk(
         })
         .transpose()?;
 
+    // The flattened copy is about as large as the disk: room first, not after.
+    crate::api::cache_base_budget::make_room(&state).await;
     let layer = crate::data::disk::CacheDisk::layer_path(&vm_data_dir(&name));
     let flatten_dir = dir.clone();
     let base = req.base.clone();
@@ -6765,6 +6767,7 @@ pub async fn publish_cache_disk(
         install_ms = install_started.elapsed().as_millis() as u64,
         "published cache disk"
     );
+    crate::api::cache_base_budget::make_room(&state).await;
     Ok(Json(crate::api::types::PublishCacheDiskResponse {
         base: req.base,
         size_bytes,
@@ -6801,19 +6804,10 @@ pub async fn delete_cache_base(
     let path = dir.join(&base);
     let db = state.db().clone();
     tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-        let attached = db
-            .list_vms()
-            .map_err(|e| ApiError::internal(format!("list machines: {e}")))?
-            .into_iter()
-            .find(|(_, record)| {
-                // Base names are unique per cache disk version, so the name
-                // alone identifies it however the path was spelled.
-                record
-                    .cache_disk
-                    .as_ref()
-                    .is_some_and(|cache| cache.base.file_name() == path.file_name())
-            });
-        if let Some((name, _)) = attached {
+        // Base names are unique per cache disk version, so the name alone
+        // identifies it however the path was spelled.
+        let attached = crate::api::cache_base_budget::attached_bases(&db)?;
+        if let Some(name) = path.file_name().and_then(|base| attached.get(base)) {
             return Err(ApiError::Conflict(format!(
                 "cache base '{}' is attached to machine '{name}'",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -6900,7 +6894,7 @@ fn file_sha256(
 const MAX_CACHE_BASE_BYTES: u64 = 512 << 30;
 
 /// The lock a fetch of `base` holds, shared by every create that needs it.
-fn cache_base_fetch_lock(base: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn cache_base_fetch_lock(base: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     > = std::sync::OnceLock::new();
@@ -6916,13 +6910,14 @@ fn cache_base_fetch_lock(base: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// source URL, verified against its SHA-256 before it appears under its name.
 /// A base already present is used as is: bases are immutable by name.
 async fn fetch_cache_base(
-    state: &ApiState,
+    state: &Arc<ApiState>,
     spec: &crate::api::types::CacheDiskSpec,
 ) -> Result<(), ApiError> {
     let dir = state.cache_disk_dir()?;
     crate::data::disk::validate_base_name(&spec.base).map_err(ApiError::BadRequest)?;
     let target = dir.join(&spec.base);
     if target.exists() {
+        crate::api::cache_base_budget::mark_used(&target);
         return Ok(());
     }
     let Some(raw) = spec.source_url.as_deref() else {
@@ -6943,6 +6938,7 @@ async fn fetch_cache_base(
     // running, so the retry finds the base instead of starting over.
     let lock = cache_base_fetch_lock(&spec.base);
     let base = spec.base.clone();
+    let fetch_state = state.clone();
     let fetch = tokio::spawn(async move {
         let _fetching = lock.lock_owned().await;
         if target.exists() {
@@ -6951,6 +6947,7 @@ async fn fetch_cache_base(
         // Under the lock no other fetch of this base runs in this server, so
         // any partial download of it left behind is abandoned.
         remove_abandoned_partials(&dir, &base);
+        crate::api::cache_base_budget::make_room(&fetch_state).await;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(30))
@@ -6981,6 +6978,8 @@ async fn fetch_cache_base(
             // not hash it again.
             Ok(()) => {
                 crate::data::disk::record_base_digest(&target, &expected);
+                drop(partial);
+                crate::api::cache_base_budget::make_room(&fetch_state).await;
                 Ok(())
             }
             // Another create fetched the same immutable base first.

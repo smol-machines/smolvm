@@ -126,6 +126,9 @@ pub struct ApiState {
     /// --cache-disk-dir`). `None` refuses cache disks on the API: a remote
     /// caller names a base by file name, so the server must choose where.
     cache_disk_dir: RwLock<Option<std::path::PathBuf>>,
+    /// Most bytes the cache disk bases may hold (`smolvm serve
+    /// --cache-disk-max-gb`). `None`: half the filesystem holding them.
+    cache_disk_max_bytes: RwLock<Option<u64>>,
     /// Directory API callers may name local image archives and rootfs
     /// directories under (`smolvm serve --local-image-dir`). `None` refuses
     /// local images on the API: a path names the server's own files.
@@ -354,6 +357,7 @@ impl ApiState {
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             cache_disk_dir: RwLock::new(None),
+            cache_disk_max_bytes: RwLock::new(None),
             local_image_dir: RwLock::new(None),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
@@ -377,6 +381,7 @@ impl ApiState {
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             cache_disk_dir: RwLock::new(None),
+            cache_disk_max_bytes: RwLock::new(None),
             local_image_dir: RwLock::new(None),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
@@ -396,6 +401,17 @@ impl ApiState {
     /// --cache-disk-dir`.
     pub fn set_cache_disk_dir(&self, dir: Option<std::path::PathBuf>) {
         *self.cache_disk_dir.write() = dir;
+    }
+
+    /// Cap what the cache disk bases may hold. Set once from `smolvm serve
+    /// --cache-disk-max-gb`; `None` keeps the default share of the disk.
+    pub fn set_cache_disk_max_bytes(&self, max_bytes: Option<u64>) {
+        *self.cache_disk_max_bytes.write() = max_bytes;
+    }
+
+    /// What the cache disk bases may hold, when capped by the operator.
+    pub fn cache_disk_max_bytes(&self) -> Option<u64> {
+        *self.cache_disk_max_bytes.read()
     }
 
     /// Accept local images under `dir` (canonical). Set once from `smolvm serve
@@ -429,6 +445,8 @@ impl ApiState {
         let dir = self.cache_disk_dir()?;
         let mut cache = crate::data::disk::CacheDisk::in_dir(&dir, &spec.base, &spec.mount_path)
             .map_err(ApiError::BadRequest)?;
+        // The machine resolving it is about to attach it: keep it from eviction.
+        crate::api::cache_base_budget::mark_used(&cache.base);
         cache.slot = spec.slot;
         Ok(cache)
     }

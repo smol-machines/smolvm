@@ -116,6 +116,14 @@ pub struct ServeStartCmd {
     #[arg(long = "cache-disk-dir", value_name = "DIR")]
     cache_disk_dir: Option<std::path::PathBuf>,
 
+    /// Most GiB the cache disk bases may hold before the least recently used
+    /// unattached ones are removed (they are fetched again when needed). A
+    /// tenth of the filesystem is always kept free as well. Default: half the
+    /// filesystem holding `--cache-disk-dir`.
+    #[arg(long = "cache-disk-max-gb", value_name = "GIB", requires = "cache_disk_dir",
+          value_parser = clap::value_parser!(u64).range(1..))]
+    cache_disk_max_gb: Option<u64>,
+
     /// Directory of local images the API may create machines from: `docker
     /// save` / OCI archives and unpacked rootfs directories. A request's `image`
     /// path must resolve inside it. Unset: the API accepts registry images only.
@@ -461,6 +469,7 @@ impl ServeStartCmd {
             })?;
             println!("Cache disks enabled from {}", dir.display());
             state.set_cache_disk_dir(Some(dir));
+            state.set_cache_disk_max_bytes(self.cache_disk_max_gb.map(|gb| gb << 30));
         }
         if let Some(dir) = &self.local_image_dir {
             let dir = dir.canonicalize().map_err(|e| {

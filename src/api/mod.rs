@@ -19,6 +19,7 @@
 //! ```
 
 pub mod admission;
+pub(crate) mod cache_base_budget;
 pub(crate) mod cache_base_fetch;
 #[cfg(target_os = "linux")]
 pub(crate) mod device_handoff;
