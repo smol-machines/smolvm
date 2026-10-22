@@ -1131,6 +1131,29 @@ fn prepare_running_disk_generation(
     Ok(())
 }
 
+/// Whether the VM process `pid` runs a different smolvm binary than this server.
+/// A worker roll replaces the binary under running VMs, which keep the one they
+/// started with; branching such a VM from the new engine gave children whose
+/// workload died at once (one customer's batch of 7 on 2026-10-22). The VM
+/// process is this binary run as `_boot-vm`, so the two files compare directly.
+/// Linux only; a process or file that cannot be read is not refused.
+#[cfg(target_os = "linux")]
+fn source_runs_another_engine(pid: i32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::metadata(format!("/proc/{pid}/exe")),
+        std::fs::metadata("/proc/self/exe"),
+    ) {
+        (Ok(vm), Ok(own)) => (vm.dev(), vm.ino()) != (own.dev(), own.ino()),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn source_runs_another_engine(_pid: i32) -> bool {
+    false
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FORK_DISK_CHAIN_DEPTH: usize = 32;
 
@@ -2564,6 +2587,16 @@ pub(crate) fn prepare_forks_reusing(
         return Err(Error::agent(
             "fork",
             "CUDA fork descendants are not supported yet; create a leaf clone without `forkable`",
+        ));
+    }
+    if golden_rec.pid.is_some_and(source_runs_another_engine) {
+        // A caller-fixable refusal: a restart puts the source on this engine.
+        return Err(Error::agent_conflict(
+            "fork",
+            format!(
+                "machine '{golden}' was started by a different smolvm engine than this server runs \
+                 (the server was upgraded since); restart it (stop, then start) to branch it"
+            ),
         ));
     }
     let ctl = control_socket_path(golden);
@@ -4646,6 +4679,26 @@ mod tests {
             std::fs::metadata(&raw).unwrap().ino(),
             std::fs::metadata(generation.join("0")).unwrap().ino(),
             "backing should be preserved without copying its contents"
+        );
+    }
+
+    /// A process running this very binary is this engine's; one running any other
+    /// binary, as a VM left over from before an upgrade does, is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_source_on_another_engine_binary_is_told_apart() {
+        assert!(!source_runs_another_engine(std::process::id() as i32));
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let differs = source_runs_another_engine(other.id() as i32);
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(differs);
+        assert!(
+            !source_runs_another_engine(i32::MAX),
+            "an unreadable process is not refused"
         );
     }
 
