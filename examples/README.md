@@ -27,6 +27,11 @@ smolvm machine exec --name browser -- \
 smolvm machine exec --name browser -- base64 /tmp/out.png | base64 -d > out.png
 ```
 
+### Amp orbs
+
+[`amp-orbs/`](amp-orbs/) runs [Amp](https://ampcode.com)'s self-hosted orbs as
+smol machines, on your own Linux host or on smol cloud.
+
 ### Persistent microVMs
 
 ```bash
