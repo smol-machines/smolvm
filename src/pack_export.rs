@@ -121,7 +121,8 @@ pub fn collect_from_vm_assets(
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
     let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
-    let is_artifact_sourced = is_image_based && vm.source_smolmachine.is_some();
+    let is_artifact_sourced =
+        is_image_based && vm.source_smolmachine.is_some() && !vm.packed_image_on_storage;
 
     if !is_image_based && !overlay_disk.exists() {
         return Err(Error::agent(

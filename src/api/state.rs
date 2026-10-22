@@ -181,7 +181,7 @@ pub struct MachineEntry {
     /// Path to the `.smolmachine` sidecar this machine was created from, if any.
     /// When set, the start paths mount the bundle's pre-extracted OCI layers via
     /// virtiofs instead of having the guest pull from a registry. `None` for
-    /// image/registry-sourced machines. Mirrors `VmRecord::source_smolmachine`.
+    /// image/registry-sourced machines and packs already seeded onto storage.
     pub source_smolmachine: Option<String>,
     /// Whether ordinary starts should launch this machine as a fork base.
     pub forkable: bool,
@@ -232,6 +232,8 @@ pub struct MachineRegistration {
     pub source_smolmachine: Option<String>,
     /// Registry reference that sidecar was pulled from, if any.
     pub source_registry_ref: Option<String>,
+    /// The packed image was prepared on the machine's storage disk.
+    pub packed_image_on_storage: bool,
     /// Registry reference a host-fetched `image` came from, if any.
     pub image_origin: Option<String>,
     /// Manifest digest of that host-fetched image.
@@ -698,7 +700,7 @@ impl ApiState {
                             restart: record.restart.clone(),
                             network: record.network,
                             secret_refs: record.secret_refs.clone(),
-                            source_smolmachine: record.source_smolmachine.clone(),
+                            source_smolmachine: record.packed_layer_source().map(str::to_owned),
                             forkable: record.forkable_on_start(),
                             cuda_fork_pool_size: record.cuda_fork_pool_size,
                             cuda_vram_limit_mib: record.cuda_vram_limit_mib,
@@ -1279,6 +1281,7 @@ impl ApiState {
         record.stop_timeout_secs = reg.stop_timeout_secs;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
+        record.packed_image_on_storage = reg.packed_image_on_storage;
         record.source_registry_ref = reg.source_registry_ref.clone();
         record.image_origin = reg.image_origin;
         record.image_origin_digest = reg.image_origin_digest;
@@ -1325,7 +1328,7 @@ impl ApiState {
                         restart: reg.restart,
                         network: reg.network,
                         secret_refs: reg.secret_refs,
-                        source_smolmachine: reg.source_smolmachine,
+                        source_smolmachine: record.packed_layer_source().map(str::to_owned),
                         forkable: reg.forkable,
                         cuda_fork_pool_size: None,
                         cuda_vram_limit_mib: None,

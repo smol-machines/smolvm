@@ -1920,7 +1920,7 @@ fn start_vm_named_with_db(
     }
     .with_packed_layers_with_mode(
         &smolvm::agent::machine_layers_cache_dir(name),
-        record.source_smolmachine.as_deref(),
+        record.packed_layer_source(),
         record.image.is_none(),
     )?;
     // Fork params (forkable base / clone-from-snapshot) — carried per-launch into
@@ -1951,7 +1951,7 @@ fn start_vm_named_with_db(
     if !record.init_completed {
         features.allow_image_pull_egress(
             record.image.as_deref(),
-            features.packed_layers_dir.is_some(),
+            features.packed_layers_dir.is_some() || record.packed_image_on_storage,
         );
     }
 

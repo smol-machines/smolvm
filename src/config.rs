@@ -765,6 +765,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
 
+    /// The packed image lives on the machine's storage disk, not a host share.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub packed_image_on_storage: bool,
+
     /// Registry reference `source_smolmachine` was pulled from, if any. Carried
     /// into a live checkpoint so another host can fetch the same pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -876,6 +880,15 @@ fn default_mem() -> u32 {
 }
 
 impl VmRecord {
+    /// The artifact whose layers must be mounted from the host, if any.
+    pub fn packed_layer_source(&self) -> Option<&str> {
+        if self.packed_image_on_storage {
+            None
+        } else {
+            self.source_smolmachine.as_deref()
+        }
+    }
+
     /// Host identity owner; guest overlay names only serve as a legacy fallback.
     pub fn vm_uid_owner(&self) -> Option<&str> {
         self.host_uid_owner
@@ -977,6 +990,7 @@ impl VmRecord {
             credentials_supplied_by_api: false,
             ephemeral: false,
             source_smolmachine: None,
+            packed_image_on_storage: false,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
@@ -1077,6 +1091,7 @@ impl VmRecord {
             credentials_supplied_by_api: false,
             ephemeral: false,
             source_smolmachine: None,
+            packed_image_on_storage: false,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
@@ -1934,6 +1949,28 @@ mod tests {
         let mut r = rec_with_image("alpine:3.20", false, vec![]);
         r.source_smolmachine = Some("library/alpine:latest".to_string());
         assert!(!r.image_needs_host_fetch());
+    }
+
+    #[test]
+    fn a_storage_seed_keeps_provenance_without_mounting_host_layers() {
+        let mut record = rec_with_image("alpine:latest", false, vec![]);
+        record.source_smolmachine = Some("removed.smolmachine".into());
+        assert_eq!(record.packed_layer_source(), Some("removed.smolmachine"));
+        record.packed_image_on_storage = true;
+        assert_eq!(record.packed_layer_source(), None);
+        assert!(!record.image_needs_host_fetch());
+        assert!(!record.init_completed);
+        let serialized = serde_json::to_value(&record).unwrap();
+        let restored: VmRecord = serde_json::from_value(serialized.clone()).unwrap();
+        assert!(restored.packed_image_on_storage);
+        let mut legacy = serialized;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("packed_image_on_storage");
+        let legacy: VmRecord = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.packed_image_on_storage);
+        assert_eq!(legacy.packed_layer_source(), Some("removed.smolmachine"));
     }
 
     #[test]

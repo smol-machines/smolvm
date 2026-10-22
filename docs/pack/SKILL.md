@@ -5,6 +5,9 @@ description: Turns an image, or a machine already provisioned, into a single sel
 
 # Packing a machine into a portable artifact
 
+For macOS first-import performance, storage seed behavior and a file-heavy
+reproduction, see [macOS storage seeds](references/macos-storage-seeds.md).
+
 Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.14.6** on Linux aarch64,
 2026-09-11; the Linux host could not run the packing steps on v1.18.2 or v1.22.2, for the reason in
 "Platform arms". Done means the artifact runs a command in a real VM and, for a machine pack, **the state you installed is still

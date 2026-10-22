@@ -3075,7 +3075,7 @@ async fn create_machine_to_end(
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
 
-    let resources = ResourceSpec {
+    let mut resources = ResourceSpec {
         cpus: Some(cpus),
         memory_mb: Some(mem),
         network: Some(network),
@@ -3186,43 +3186,60 @@ async fn create_machine_to_end(
     // macOS; detach it immediately so a created-but-unstarted machine leaves
     // nothing mounted (it has no children yet). The name was reserved above,
     // so this never clobbers another machine's layers.
+    let mut packed_storage_gib = None;
     if let Some(ref sidecar_path) = source_smolmachine {
         let name = name.clone();
         let sidecar_path = sidecar_path.clone();
         let digest = received_digest.take();
-        tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-            let path = std::path::Path::new(&sidecar_path);
-            let cache_dir = crate::agent::machine_layers_cache_dir(&name);
-            // The server outlives the restore, so checkpoint RAM can finish
-            // reaching the disk after the machine is created.
-            let options = smolvm_pack::extract::SharedExtractOptions {
-                digest,
-                defer_memory_sync: true,
-            };
-            let result = crate::portable_checkpoint::materialize_pack_layers_with_options(
-                &name, path, options,
-            )
-            .map_err(|e| ApiError::internal(e.to_string()));
-            // Detach the case-sensitive volume mounted during extraction so a
-            // created-but-unstarted machine leaves nothing mounted, and so the
-            // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
-            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-            if let Err(e) = result {
-                // Extraction failed after the manager created the machine's data
-                // dir. guard.complete() will not run, so no DB record persists and
-                // the name is released on drop — but the on-disk dir would be left
-                // orphaned. Roll it back so a retry starts clean. Best-effort: a
-                // remove failure only leaves the orphan, never a worse state.
-                // cache_dir is <vm_data_dir>/pack, so its parent is the data dir.
-                if let Some(vm_dir) = cache_dir.parent() {
-                    let _ = std::fs::remove_dir_all(vm_dir);
+        let is_checkpoint = manifest_checkpoint.is_some();
+        packed_storage_gib =
+            tokio::task::spawn_blocking(move || -> Result<Option<u64>, ApiError> {
+                let path = std::path::Path::new(&sidecar_path);
+                let cache_dir = crate::agent::machine_layers_cache_dir(&name);
+                if !is_checkpoint {
+                    match crate::pack_seed::try_seed(&name, path, restored_storage_gb) {
+                        Ok(Some(size)) => return Ok(Some(size)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = std::fs::remove_dir_all(vm_data_dir(&name));
+                            return Err(ApiError::internal(error.to_string()));
+                        }
+                    }
                 }
-                return Err(e);
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+                // The server outlives the restore, so checkpoint RAM can finish
+                // reaching the disk after the machine is created.
+                let options = smolvm_pack::extract::SharedExtractOptions {
+                    digest,
+                    defer_memory_sync: true,
+                };
+                let result = crate::portable_checkpoint::materialize_pack_layers_with_options(
+                    &name, path, options,
+                )
+                .map_err(|e| ApiError::internal(e.to_string()));
+                // Detach the case-sensitive volume mounted during extraction so a
+                // created-but-unstarted machine leaves nothing mounted, and so the
+                // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
+                smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+                if let Err(e) = result {
+                    // Extraction failed after the manager created the machine's data
+                    // dir. guard.complete() will not run, so no DB record persists and
+                    // the name is released on drop — but the on-disk dir would be left
+                    // orphaned. Roll it back so a retry starts clean. Best-effort: a
+                    // remove failure only leaves the orphan, never a worse state.
+                    // cache_dir is <vm_data_dir>/pack, so its parent is the data dir.
+                    if let Some(vm_dir) = cache_dir.parent() {
+                        let _ = std::fs::remove_dir_all(vm_dir);
+                    }
+                    return Err(e);
+                }
+                Ok(None)
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+    }
+
+    if let Some(size) = packed_storage_gib {
+        resources.storage_gb = Some(size);
     }
 
     if manifest_checkpoint.is_some() {
@@ -3488,6 +3505,7 @@ async fn create_machine_to_end(
         } else {
             source_smolmachine
         },
+        packed_image_on_storage: packed_storage_gib.is_some(),
         entrypoint,
         cmd,
         env: workload_env,
@@ -4116,7 +4134,7 @@ pub async fn start_machine(
     let name_clone = name.clone();
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
-    let source_smolmachine = record.source_smolmachine.clone();
+    let source_smolmachine = record.packed_layer_source().map(str::to_owned);
     let launch_image = record.image.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let credential_launch = crate::credentials::CredentialLaunch::for_record(&name, &record);
@@ -5260,7 +5278,7 @@ async fn boot_prepared_fork_inner(
 
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
-            record.source_smolmachine.as_deref(),
+            record.packed_layer_source(),
             record.image.as_deref(),
             record.dns_filter_hosts.clone(),
             crate::credentials::CredentialLaunch::for_record(&clone_b, &record),

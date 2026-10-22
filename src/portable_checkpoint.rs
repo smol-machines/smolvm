@@ -3418,6 +3418,9 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
 /// virtio-fs device: a `.smolmachine`'s layers, or a local image archive or
 /// directory (including a registry image the host fetched for it).
 fn mounts_image_layers(vm: &VmRecord) -> bool {
+    if vm.packed_image_on_storage {
+        return false;
+    }
     vm.source_smolmachine.is_some()
         || vm
             .image
@@ -3556,6 +3559,9 @@ fn serve_checkpoint_host_image(
 /// Identify the pack a machine mounts its image layers from, if any, so a
 /// restore can attach the same layers again.
 fn checkpoint_packed_layers(name: &str, vm: &VmRecord) -> Result<Option<CheckpointPackedLayers>> {
+    if vm.packed_image_on_storage {
+        return Ok(None);
+    }
     let Some(sidecar) = vm.source_smolmachine.as_deref() else {
         return Ok(None);
     };
@@ -8551,6 +8557,22 @@ mod tests {
         // this host's archive.
         let workload = checkpoint_workload(&record.name, &record).unwrap();
         assert_eq!(workload.image, "python:3.12-slim-bookworm@sha256:feedface");
+    }
+
+    #[test]
+    fn a_storage_seed_checkpoint_needs_no_pack_or_host_layer_device() {
+        let mut record = no_network_machine("alpine:latest");
+        record.source_smolmachine = Some("missing-pack.smolmachine".into());
+        record.packed_image_on_storage = true;
+        assert!(!mounts_image_layers(&record));
+        assert_eq!(
+            checkpoint_packed_layers(&record.name, &record).unwrap(),
+            None
+        );
+        validate_capture_profile(&record, false).unwrap();
+        record.packed_image_on_storage = false;
+        assert!(mounts_image_layers(&record));
+        assert!(checkpoint_packed_layers(&record.name, &record).is_err());
     }
 
     #[test]

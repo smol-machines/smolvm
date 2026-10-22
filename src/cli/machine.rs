@@ -5423,6 +5423,17 @@ impl CreateCmd {
                 params.overlay_gb,
             )?;
 
+            if checkpoint.is_none() {
+                if let Some(size) =
+                    smolvm::pack_seed::try_seed(&name_for_layers, sidecar_path, params.storage_gb)?
+                {
+                    record.packed_image_on_storage = true;
+                    record.storage_gb = Some(size);
+                    reservation.commit(&record)?;
+                    return Ok(());
+                }
+            }
+
             let cache_dir = smolvm::agent::machine_layers_cache_dir(&name_for_layers);
             smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
             match std::fs::remove_dir_all(&cache_dir) {

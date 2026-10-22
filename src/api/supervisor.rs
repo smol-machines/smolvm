@@ -318,7 +318,7 @@ impl Supervisor {
         let mounts = record.host_mounts();
         let ports = record.port_mappings();
         let resources = record.vm_resources();
-        let source_smolmachine = record.source_smolmachine.clone();
+        let source_smolmachine = record.packed_layer_source().map(str::to_owned);
         let dns_filter_hosts = record.dns_filter_hosts.clone();
         let cuda_fork_pool_size = record.cuda_fork_pool_size;
         let cuda_vram_limit_mib = record.cuda_vram_limit_mib;

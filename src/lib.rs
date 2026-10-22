@@ -103,6 +103,7 @@ pub mod log_rotation;
 pub mod network;
 /// Shared from-VM pack export used by every `pack create --from-vm` front-end.
 pub mod pack_export;
+pub mod pack_seed;
 pub mod platform;
 pub mod pool;
 /// Portable live-checkpoint compatibility and one-shot restore support.
