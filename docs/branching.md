@@ -88,6 +88,34 @@ Building checkpoint tooling in Rust? [`smolvm-checkpoint`](../crates/smolvm-chec
 provides incremental storage, verified file restoration, and portable export
 without depending on the VM runtime.
 
+## Disk-chain compaction
+
+Live branches share immutable disk layers. SmolVM compacts these layers in the
+background, including layers inherited from an earlier source. When an inherited
+base is already deep, compaction produces a standalone disk rather than retaining
+that deep base. Repeated golden → job → next golden cycles therefore do not keep
+adding disk layers indefinitely.
+
+Before a live branch approaches the disk-layer safety limit, SmolVM waits for any
+in-flight compaction and finishes necessary compaction before capturing the source.
+That branch can take longer and requires space for the flattened disk. The active,
+writable layer is never flattened; existing children retain their disk contents.
+A compaction failure fails the branch before capture instead of proceeding toward
+the limit. This does not remove the separate logical branch-ancestry safety limit.
+
+`GET /api/v1/machines/{name}` reports `diskChainDepth`: the maximum number of backing
+layers across the machine's storage, overlay and cache disks. A standalone disk
+has depth zero. The field is omitted when depth cannot be measured, and on bulk
+list responses. It measures disk layers, not branch generation.
+
+Compaction coordinates across CLI and server processes, and with disk-layer
+garbage collection. It can shorten a frozen source's inherited chain without
+replacing that source's active disk. Reader parallelism adapts to the process's
+file-descriptor limit. Shallow branches do not wait for the compaction GC lock.
+
+See [compaction QA and rollout](branch-and-checkpoint/disk-chain-compaction-qa.md)
+for failure tests, temporary-space requirements and deployment precautions.
+
 ## Warm pools over the API
 
 `smolvm serve` keeps a pool of held branches of a running branchable source and

@@ -909,6 +909,11 @@ pub struct CreateMachineRequest {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineInfo {
+    /// Maximum number of backing layers across storage, overlay and cache disks.
+    /// Measured on machine detail requests; omitted when unavailable. A raw or
+    /// standalone disk has depth zero. This is not the branch generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_chain_depth: Option<usize>,
     /// Process identity for conditional live mutations; absent when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<crate::agent::live_resize::RuntimeIdentity>,

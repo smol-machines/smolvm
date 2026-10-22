@@ -295,10 +295,14 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
             }
             continue;
         }
-        let Some(source) = fork_source_lock_owner(&path) else {
+        let owner = fork_source_lock_owner(&path)
+            .map(|source| vms_dir.join(crate::agent::vm_dir_hash(&source)));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let owner = owner.or_else(|| compact::disk_lock_owner(&path));
+        let Some(owner) = owner else {
             continue;
         };
-        if vms_dir.join(crate::agent::vm_dir_hash(&source)).is_dir() {
+        if owner.is_dir() {
             continue;
         }
         let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
@@ -1177,9 +1181,50 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
         depth = depth
             .checked_add(1)
             .ok_or_else(|| Error::agent("inspect fork disk chain", "backing depth overflow"))?;
-        if depth > MAX_FORK_DISK_CHAIN_DEPTH {
-            return Ok(depth);
+        if depth > 4 * MAX_FORK_DISK_CHAIN_DEPTH {
+            return Err(Error::agent(
+                "inspect fork disk chain",
+                "backing chain exceeds inspection limit",
+            ));
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn disk_chain_depth_at(directory: &Path) -> Result<Option<usize>> {
+    let mut maximum = None;
+    for (_, raw) in FORK_DISK_ROLES {
+        let (disk, format) = resolve_disk_image(directory, raw);
+        if !disk
+            .try_exists()
+            .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?
+        {
+            continue;
+        }
+        let depth = match format {
+            crate::data::disk::DiskFormat::Raw => 0,
+            crate::data::disk::DiskFormat::Qcow2 => qcow2_backing_depth(&disk)?,
+        };
+        maximum = Some(maximum.unwrap_or(0).max(depth));
+    }
+    Ok(maximum)
+}
+
+pub(crate) fn disk_chain_depth(name: &str) -> Option<usize> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        match disk_chain_depth_at(&vm_data_dir(name)) {
+            Ok(depth) => depth,
+            Err(error) => {
+                tracing::debug!(%name, %error, "could not measure disk backing depth");
+                None
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = name;
+        None
     }
 }
 
@@ -2558,6 +2603,8 @@ pub(crate) fn prepare_forks_reusing(
     if fork_continue && !golden_was_paused {
         recover_uncommitted_generations(db, golden, &gdir, &snapshot_root)?;
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    compact::compact_if_near_limit(&gdir, None)?;
     let reusable = retained.filter(|snapshot| {
         policy_allows_snapshot_reuse(source_policy, golden_was_paused, reuse_live_snapshot)
             && retained_snapshot_is_reusable(
@@ -2642,13 +2689,6 @@ pub(crate) fn prepare_forks_reusing(
                 .map_err(|e| Error::agent("fork: prepare snapshot permissions", e.to_string()))?;
             crate::process::chown_tree(&snapshot_dir, uid, gid)
                 .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
-        }
-
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if fork_continue {
-            if let Err(error) = compact::compact_if_near_limit(&gdir, vm_ids) {
-                tracing::warn!(%golden, %error, "could not merge a deep branch source disk chain");
-            }
         }
 
         if let Err(error) = sync_fork_source(golden) {

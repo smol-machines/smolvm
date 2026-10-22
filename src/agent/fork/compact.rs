@@ -6,8 +6,10 @@
 //! pivots the VMM onto the new overlay; every generation below it is immutable.
 //! Once the chain reaches [`COMPACT_AT_DEPTH`], the newest immutable generation is
 //! flattened: its content, and everything beneath it, is written into one new file
-//! backed by the disk the machine started from, which then replaces it at the same
-//! path by an atomic rename. Every chain that names that path reads the same bytes
+//! backed by the disk the machine started from, or standalone when that inherited
+//! disk is itself deep, which then replaces it at the same path by an atomic
+//! rename. A child may also flatten its ancestor's immutable generation. Every
+//! chain that names that path reads the same bytes
 //! through a short chain from then on, and nothing ever copies a layer a VMM can
 //! still write. A process that already opened the old file keeps reading it, and
 //! nothing a branch made earlier is deleted while a chain still reaches it.
@@ -22,7 +24,7 @@ use imago::{
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 /// Chain depth at which a background merge starts. The hard refusal sits at
 /// `MAX_FORK_DISK_CHAIN_DEPTH`; the gap is how many branches can land while the
@@ -45,13 +47,15 @@ const FLATTEN_READERS: usize = 16;
 
 /// Disks with a merge running, so one source never runs two at once.
 static IN_FLIGHT: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+static FINISHED: Condvar = Condvar::new();
 
 /// A file that marks a merge as running to every process until dropped.
 struct Busy(PathBuf);
 
 impl Busy {
     fn announce(path: PathBuf) -> Result<Self> {
-        std::fs::write(&path, b"").map_err(|e| compact_err("announce merge", e))?;
+        std::fs::write(&path, std::process::id().to_string())
+            .map_err(|e| compact_err("announce merge", e))?;
         Ok(Busy(path))
     }
 }
@@ -77,6 +81,14 @@ impl Claim {
             None
         }
     }
+
+    fn wait(key: PathBuf) -> Self {
+        let mut guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        while !guard.get_or_insert_with(HashSet::new).insert(key.clone()) {
+            guard = FINISHED.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+        Self(key)
+    }
 }
 
 impl Drop for Claim {
@@ -84,6 +96,31 @@ impl Drop for Claim {
         let mut guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(set) = guard.as_mut() {
             set.remove(&self.0);
+        }
+        FINISHED.notify_all();
+    }
+}
+
+fn lock_disk_gc(gdir: &Path, operation: libc::c_int) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let parent = gdir
+        .parent()
+        .ok_or_else(|| compact_err("lock disk GC", "machine has no parent directory"))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(parent.join(".disk-chain-gc.lock"))
+        .map_err(|error| compact_err("open disk GC lock", error))?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Ok(None),
+            _ => return Err(compact_err("lock disk GC", error)),
         }
     }
 }
@@ -148,20 +185,61 @@ fn chain(top: &Path) -> Result<Vec<PathBuf>> {
     }
 }
 
-/// A layer this module or a live branch wrote under the source's `d/`, which a
-/// merge may fold. Anything else (the disk the machine started from, or backings
-/// relocated from a restored checkpoint) is where a merge stops.
+/// A layer this module or a live branch wrote under the source's `d/`, which may
+/// be replaced in place. Other files may be read but must never be replaced.
 fn is_generation_layer(gdir_d: &Path, id: &str, layer: &Path) -> bool {
-    if !layer.starts_with(gdir_d) {
+    let Some(generation) = layer.parent() else {
+        return false;
+    };
+    if generation.parent() != Some(gdir_d) {
         return false;
     }
     let Some(name) = layer.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    let in_compact_dir = layer.parent().is_some_and(|p| p == gdir_d.join("c"));
-    name == format!("{id}.base.qcow2")
-        || name == format!("{id}.merged.qcow2")
-        || (in_compact_dir && name.starts_with(&format!("{id}.")) && name.ends_with(".qcow2"))
+    if generation.file_name().is_some_and(|name| name == "c") {
+        name.starts_with(&format!("{id}.")) && name.ends_with(".qcow2")
+    } else {
+        super::snapshot_generation_id(generation).is_some()
+            && (name == format!("{id}.base.qcow2") || name == format!("{id}.merged.qcow2"))
+    }
+}
+
+fn generation_owner(id: &str, layer: &Path) -> Option<PathBuf> {
+    let generation = layer.parent()?;
+    let directory = generation.parent()?;
+    if directory.file_name()? != "d"
+        || !is_generation_layer(directory, id, layer)
+        || (generation.file_name()? != "c" && super::snapshot_generation_id(generation).is_none())
+    {
+        return None;
+    }
+    Some(directory.parent()?.to_path_buf())
+}
+
+fn compaction_key(gdir: &Path, id: &str, target: &Path) -> PathBuf {
+    generation_owner(id, target)
+        .unwrap_or_else(|| gdir.to_path_buf())
+        .join("d")
+        .join(id)
+}
+
+fn disk_lock_path(owner: &Path, id: &str) -> PathBuf {
+    let mut path = owner.as_os_str().to_os_string();
+    path.push(format!(".compact-{id}.lock"));
+    PathBuf::from(path)
+}
+
+pub(super) fn disk_lock_owner(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    for (id, _) in super::FORK_DISK_ROLES {
+        if let Some(owner) = name.strip_suffix(&format!(".compact-{id}.lock")) {
+            if !owner.is_empty() {
+                return Some(path.with_file_name(owner));
+            }
+        }
+    }
+    None
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
@@ -335,7 +413,21 @@ fn read_chain_parallel(
             offset += length;
         }
     }
-    let readers = FLATTEN_READERS.min(chunks.len()).max(1);
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let layer_count = chain(top)?.len() as u64;
+    let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let descriptor_budget =
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } == 0 {
+            unsafe { limits.assume_init() }.rlim_cur / 4
+        } else {
+            0
+        };
+    let readers = usize::try_from(descriptor_budget / layer_count)
+        .unwrap_or(usize::MAX)
+        .clamp(1, FLATTEN_READERS)
+        .min(chunks.len());
     let per = chunks.len().div_ceil(readers);
     // Two chunks in hand per reader keeps every reader busy while the writer
     // drains, and bounds memory at a fixed number of chunks.
@@ -509,14 +601,15 @@ pub(super) fn merge_onto(top: &Path, stop: &Path, new_backing: &Path, out: &Path
 ///
 /// `live` is the one layer a VMM may still write (the active disk, or the
 /// generation a branch has just renamed it into), so the target is the layer
-/// right beneath it: the newest generation whose branch has committed. It is
-/// flattened onto the first layer of the chain that is not a generation.
+/// below it: the nearest managed generation whose branch has committed. Frozen
+/// ancestors' active disks are skipped, never replaced. A deep inherited root is
+/// folded into a standalone target instead of retained.
 fn flatten_target(
     gdir: &Path,
     id: &str,
     live: &Path,
     threshold: usize,
-) -> Result<Option<(PathBuf, PathBuf)>> {
+) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
     if !is_qcow2(live)? {
         return Ok(None);
     }
@@ -525,12 +618,15 @@ fn flatten_target(
         return Ok(None);
     }
     let gdir_d = gdir
-        .join("d")
         .canonicalize()
-        .map_err(|e| compact_err("resolve d", e))?;
+        .map_err(|e| compact_err("resolve machine", e))?
+        .join("d");
     let target = &layers[1];
     if !is_generation_layer(&gdir_d, id, target) {
-        return Ok(None);
+        return Ok(layers[1..]
+            .iter()
+            .find(|layer| generation_owner(id, layer).is_some())
+            .map(|target| (target.clone(), None)));
     }
     let Some(root) = layers[2..]
         .iter()
@@ -538,11 +634,14 @@ fn flatten_target(
     else {
         return Ok(None);
     };
-    // Already flat: the target sits directly on the root.
+    let root_depth = layers.iter().position(|layer| layer == root).unwrap();
+    if layers.len() - root_depth + 2 > COMPACT_AT_DEPTH {
+        return Ok(Some((target.clone(), None)));
+    }
     if layers.get(2) == Some(root) {
         return Ok(None);
     }
-    Ok(Some((target.clone(), root.clone())))
+    Ok(Some((target.clone(), Some(root.clone()))))
 }
 
 /// Flatten the newest immutable generation in the background when `live`'s
@@ -554,22 +653,23 @@ pub(super) fn maybe_start_compaction(
     live: &Path,
     vm_ids: Option<(u32, u32)>,
 ) -> Result<()> {
+    if matches!(flatten_target(gdir, id, live, COMPACT_AT_DEPTH), Ok(None)) {
+        return Ok(());
+    }
+    let gc_guard = lock_disk_gc(gdir, libc::LOCK_SH)?;
     let Some((target, root)) = flatten_target(gdir, id, live, COMPACT_AT_DEPTH)? else {
         return Ok(());
     };
-    let gdir_d = gdir
-        .join("d")
-        .canonicalize()
-        .map_err(|e| compact_err("resolve d", e))?;
-    let Some(claim) = Claim::take(gdir_d.join(id)) else {
+    let Some(claim) = Claim::take(compaction_key(gdir, id, &target)) else {
         return Ok(());
     };
     let (gdir, id) = (gdir.to_path_buf(), id.to_string());
     std::thread::Builder::new()
         .name("fork-disk-compact".into())
         .spawn(move || {
+            let _gc_guard = gc_guard;
             let _claim = claim;
-            if let Err(error) = flatten_in_place(&gdir, &id, &target, &root, vm_ids) {
+            if let Err(error) = flatten_in_place(&gdir, &id, &target, root.as_deref(), vm_ids) {
                 tracing::warn!(disk = %target.display(), %error, "could not flatten a branch source's disk chain");
             }
         })
@@ -577,9 +677,8 @@ pub(super) fn maybe_start_compaction(
     Ok(())
 }
 
-/// Flatten before the source freezes when its chain is near the hard limit and
-/// no flatten is running, so a process that exits right after branching (the
-/// CLI) still keeps the chain short. The source keeps running meanwhile: only
+/// Flatten before the source freezes when its chain is near the hard limit,
+/// waiting for a running merge first. The source keeps running meanwhile: only
 /// layers beneath its active disk are read.
 pub(super) fn compact_if_near_limit(gdir: &Path, vm_ids: Option<(u32, u32)>) -> Result<()> {
     for (id, raw) in super::FORK_DISK_ROLES {
@@ -587,33 +686,48 @@ pub(super) fn compact_if_near_limit(gdir: &Path, vm_ids: Option<(u32, u32)>) -> 
         if !active.is_file() {
             continue;
         }
+        if matches!(
+            flatten_target(gdir, id, &active, SYNC_COMPACT_AT_DEPTH),
+            Ok(None)
+        ) {
+            continue;
+        }
+        let _gc_guard = lock_disk_gc(gdir, libc::LOCK_SH)?;
+        let Some((target, _)) = flatten_target(gdir, id, &active, SYNC_COMPACT_AT_DEPTH)? else {
+            continue;
+        };
+        let _claim = Claim::wait(compaction_key(gdir, id, &target));
         let Some((target, root)) = flatten_target(gdir, id, &active, SYNC_COMPACT_AT_DEPTH)? else {
             continue;
         };
-        let gdir_d = gdir
-            .join("d")
-            .canonicalize()
-            .map_err(|e| compact_err("resolve d", e))?;
-        let Some(_claim) = Claim::take(gdir_d.join(id)) else {
-            continue;
-        };
-        flatten_in_place(gdir, id, &target, &root, vm_ids)?;
+        flatten_in_place(gdir, id, &target, root.as_deref(), vm_ids)?;
     }
     Ok(())
 }
 
 /// Replace the immutable `target` with one file holding the same bytes, backed
-/// directly by `root`: written beside it, given its owner and mode, synced, then
+/// directly by `root`, or standalone: given its owner and mode, synced, then
 /// renamed over it. Readers that already opened `target` keep the old file.
 fn flatten_in_place(
     gdir: &Path,
     id: &str,
     target: &Path,
-    root: &Path,
+    root: Option<&Path>,
     vm_ids: Option<(u32, u32)>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
-    let dir = compact_dir(gdir);
+    let owner = generation_owner(id, target).unwrap_or_else(|| gdir.to_path_buf());
+    let _gc_guard = lock_disk_gc(&owner, libc::LOCK_SH)?;
+    let _disk_guard = super::ForkSourceLock::acquire_at(&disk_lock_path(&owner, id))?;
+    let layers = chain(target)?;
+    if layers.len() == 1 {
+        return Ok(());
+    }
+    let root = root.filter(|root| layers.iter().any(|layer| layer == root));
+    if root.is_some_and(|root| layers.get(1).is_some_and(|backing| backing == root)) {
+        return Ok(());
+    }
+    let dir = compact_dir(&owner);
     std::fs::create_dir_all(&dir).map_err(|e| compact_err("create merge dir", e))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -621,22 +735,27 @@ fn flatten_in_place(
         .unwrap_or_default();
     // Announce the flatten before reading any layer, so a collection in another
     // process keeps every layer from the first read on.
-    let _busy = Busy::announce(dir.join(format!("{id}.{stamp}.busy")))?;
+    let _busy = Busy::announce(dir.join(format!("{id}.{}.{stamp}.busy", std::process::id())))?;
     let partial = target.with_file_name(format!(
-        "{}.{stamp}.flatten.partial",
+        "{}.{}.{stamp}.flatten.partial",
         target
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("layer")
+            .unwrap_or("layer"),
+        std::process::id(),
     ));
     let result = (|| -> Result<()> {
-        merge_onto(target, root, root, &partial)?;
+        match root {
+            Some(root) => merge_onto(target, root, root, &partial)?,
+            None => flatten_standalone(target, &partial, &|| {})?,
+        }
         let meta = std::fs::metadata(target).map_err(|e| compact_err("stat target", e))?;
         std::fs::set_permissions(&partial, meta.permissions())
             .map_err(|e| compact_err("copy mode", e))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let vm_ids = vm_ids.filter(|_| gdir.canonicalize().ok().as_ref() == Some(&owner));
             if let Some((uid, gid)) = vm_ids.or(Some((meta.uid(), meta.gid()))) {
                 let current =
                     std::fs::metadata(&partial).map_err(|e| compact_err("stat flat", e))?;
@@ -648,7 +767,14 @@ fn flatten_in_place(
         }
         #[cfg(not(unix))]
         let _ = vm_ids;
+        std::fs::File::open(&partial)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| compact_err("sync flat layer and metadata", error))?;
+        #[cfg(test)]
+        pause_publication_for_qa(gdir, "before-rename");
         std::fs::rename(&partial, target).map_err(|e| compact_err("publish flat layer", e))?;
+        #[cfg(test)]
+        pause_publication_for_qa(gdir, "after-rename");
         if let Some(parent) = target.parent() {
             std::fs::File::open(parent)
                 .and_then(|d| d.sync_all())
@@ -662,10 +788,22 @@ fn flatten_in_place(
     result?;
     tracing::info!(
         disk = %target.display(),
+        previous_depth = layers.len() - 1,
+        standalone = root.is_none(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "flattened a branch source's disk chain"
     );
     Ok(())
+}
+
+#[cfg(test)]
+fn pause_publication_for_qa(directory: &Path, phase: &str) {
+    if std::env::var("SMOLVM_COMPACTION_QA_MODE").as_deref() == Ok(phase) {
+        std::fs::write(directory.join("ready-to-publish"), phase).unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
 }
 
 /// How long a merge may be in progress before its partial file is taken as left
@@ -729,6 +867,20 @@ fn merge_in_progress(gdir_d: &Path) -> bool {
         if !name.ends_with(".partial") && !name.ends_with(".busy") {
             continue;
         }
+        if name.ends_with(".busy") {
+            let dead = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+                .filter(|pid| *pid > 0)
+                .is_some_and(|pid| {
+                    (unsafe { libc::kill(pid, 0) }) == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                });
+            if dead {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        }
         let age = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -746,8 +898,22 @@ fn merge_in_progress(gdir_d: &Path) -> bool {
 
 /// Delete the disk layers under `gdir/d` that no machine can read any more, given
 /// the data directories of every machine on this host. Returns how many files went.
+/// The caller holds this machine's fork-source lock, preventing new generations
+/// while reachability is scanned. Ancestor compaction can only shorten existing
+/// paths, so scanning before taking the GC lock conservatively keeps extra layers
+/// without blocking other machines' compactions during the scan.
 pub(super) fn collect_unreachable_layers(gdir: &Path, machine_dirs: &[PathBuf]) -> Result<usize> {
     let Ok(gdir_d) = gdir.join("d").canonicalize() else {
+        return Ok(0);
+    };
+    if merge_in_progress(&gdir_d) {
+        return Ok(0);
+    }
+    let Some(reachable) = reachable_layers(machine_dirs) else {
+        tracing::debug!(gdir = %gdir.display(), "kept every disk layer: a chain could not be read");
+        return Ok(0);
+    };
+    let Some(_gc_guard) = lock_disk_gc(gdir, libc::LOCK_EX | libc::LOCK_NB)? else {
         return Ok(0);
     };
     if merge_in_progress(&gdir_d) {
@@ -762,10 +928,6 @@ pub(super) fn collect_unreachable_layers(gdir: &Path, machine_dirs: &[PathBuf]) 
             }
         }
     }
-    let Some(reachable) = reachable_layers(machine_dirs) else {
-        tracing::debug!(gdir = %gdir.display(), "kept every disk layer: a chain could not be read");
-        return Ok(0);
-    };
     let mut removed = 0;
     let entries = std::fs::read_dir(&gdir_d).map_err(|e| compact_err("list layers", e))?;
     for entry in entries.flatten() {
@@ -825,6 +987,156 @@ fn remove_unreachable_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestProcess(std::process::Child);
+
+    impl TestProcess {
+        fn spawn(directory: &Path, mode: &str) -> Self {
+            Self(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "agent::fork::compact::tests::compaction_process_helper",
+                        "--nocapture",
+                    ])
+                    .env("SMOLVM_COMPACTION_QA_DIRECTORY", directory)
+                    .env("SMOLVM_COMPACTION_QA_MODE", mode)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn finish(&mut self) -> std::process::ExitStatus {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    return status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "compaction process did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn compaction_process_helper() {
+        let Some(directory) = std::env::var_os("SMOLVM_COMPACTION_QA_DIRECTORY") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        match std::env::var("SMOLVM_COMPACTION_QA_MODE").unwrap().as_str() {
+            "hold" => {
+                let _gc_guard = lock_disk_gc(&directory, libc::LOCK_SH).unwrap();
+                let _disk_guard = super::super::ForkSourceLock::acquire_at(&disk_lock_path(
+                    &directory, "storage",
+                ))
+                .unwrap();
+                let _busy = Busy::announce(directory.join("d/c/qa.busy")).unwrap();
+                std::fs::write(directory.join("ready"), b"ready").unwrap();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            "limited" => {
+                let limit = libc::rlimit {
+                    rlim_cur: 512 << 10,
+                    rlim_max: 512 << 10,
+                };
+                unsafe {
+                    libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                    assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+                }
+                assert!(compact_if_near_limit(&directory, None).is_err());
+            }
+            "low-fd" => {
+                let limit = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+                compact_if_near_limit(&directory, None).unwrap();
+            }
+            "compact" | "before-rename" | "after-rename" => {
+                compact_if_near_limit(&directory, None).unwrap()
+            }
+            #[cfg(target_os = "linux")]
+            "enospc" => full_filesystem_qa(&directory),
+            mode => panic!("unknown QA mode: {mode}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn full_filesystem_qa(directory: &Path) {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) }, 0);
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mountpoint = directory.join("full-filesystem");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let path = std::ffi::CString::new(mountpoint.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    path.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV,
+                    c"size=64m".as_ptr().cast(),
+                )
+            },
+            0
+        );
+        let (source, live, _) = branched_machine(&mountpoint, 30);
+        let before = read_all(&live);
+        let depth = super::super::qcow2_backing_depth(&live).unwrap();
+        let mut filler = std::fs::File::create(mountpoint.join("filler")).unwrap();
+        let mut statistics = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        assert_eq!(
+            unsafe { libc::statvfs(path.as_ptr(), statistics.as_mut_ptr()) },
+            0
+        );
+        let statistics = unsafe { statistics.assume_init() };
+        let mut remaining = (statistics.f_bavail * statistics.f_frsize).saturating_sub(256 << 10);
+        let buffer = vec![0xA5_u8; 1 << 20];
+        while remaining > 0 {
+            let length = remaining.min(buffer.len() as u64) as usize;
+            filler.write_all(&buffer[..length]).unwrap();
+            remaining -= length as u64;
+        }
+        filler.sync_all().unwrap();
+        let error = compact_if_near_limit(&source, None).unwrap_err();
+        eprintln!("full-filesystem compaction failure: {error}");
+        assert!(error.to_string().contains("os error 28"), "{error}");
+        assert_eq!(super::super::qcow2_backing_depth(&live).unwrap(), depth);
+        assert_eq!(read_all(&live), before);
+        drop(filler);
+        std::fs::remove_file(mountpoint.join("filler")).unwrap();
+        compact_if_near_limit(&source, None).unwrap();
+        assert_eq!(read_all(&live), before);
+        assert!(super::super::qcow2_backing_depth(&live).unwrap() < COMPACT_AT_DEPTH);
+    }
 
     const SIZE: u64 = 8 << 20;
     const CLUSTER: u64 = 64 << 10;
@@ -1018,10 +1330,207 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&target, gens.last().unwrap(), "never the live layer itself");
-        assert_eq!(root, gdir.join("storage.raw").canonicalize().unwrap());
+        assert_eq!(root, Some(gdir.join("storage.raw").canonicalize().unwrap()));
         assert!(flatten_target(&gdir, "storage", &live, 64)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn a_branch_inheriting_a_deep_golden_can_fork_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, parent_live, generations) = branched_machine(&dir.path().join("parent"), 31);
+        let child = dir.path().join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let child_live = child.join("storage.qcow2");
+        create_overlay(&child_live, SIZE, generations.last().unwrap()).unwrap();
+        let sibling = dir.path().join("sibling.qcow2");
+        create_overlay(&sibling, SIZE, generations.last().unwrap()).unwrap();
+        let expected = read_all(&child_live);
+        let parent_expected = read_all(&parent_live);
+        let existing_reader = open_readonly(&parent_live, true).unwrap();
+        assert!(super::super::qcow2_backing_depth(&child_live).unwrap() >= 32);
+
+        compact_if_near_limit(&child, None).unwrap();
+
+        super::super::ensure_fork_disk_chain_is_bounded(&child).unwrap();
+        assert!(chain(&child_live).unwrap().len() <= COMPACT_AT_DEPTH);
+        assert_eq!(read_all(&child_live), expected);
+        assert_eq!(read_all(&sibling), expected);
+        assert_eq!(read_all(&parent_live), parent_expected);
+        let mut existing_bytes = vec![0_u8; SIZE as usize];
+        existing_reader.read(&mut existing_bytes, 0).unwrap();
+        assert_eq!(existing_bytes, parent_expected);
+        assert!(!merge_in_progress(&parent.join("d")));
+    }
+
+    #[test]
+    fn a_failed_flatten_leaves_the_source_disk_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, live, _) = branched_machine(dir.path(), 30);
+        let before = read_all(&live);
+        let depth = super::super::qcow2_backing_depth(&live).unwrap();
+        std::fs::write(source.join("d/c"), b"not a directory").unwrap();
+        assert!(compact_if_near_limit(&source, None).is_err());
+        assert_eq!(super::super::qcow2_backing_depth(&live).unwrap(), depth);
+        assert_eq!(read_all(&live), before);
+    }
+
+    #[test]
+    fn a_local_generation_on_a_deep_inherited_base_becomes_standalone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, generations) = branched_machine(&dir.path().join("parent"), 25);
+        let child = dir.path().join("child");
+        let target = child.join("d/00000001/storage.base.qcow2");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        create_overlay(&target, SIZE, generations.last().unwrap()).unwrap();
+        let live = child.join("storage.qcow2");
+        create_overlay(&live, SIZE, &target).unwrap();
+        let access = writable(&live);
+        access.write(&[91_u8; 4096][..], 0).unwrap();
+        access.flush().unwrap();
+        let before = read_all(&live);
+        compact_if_near_limit(&child, None).unwrap();
+        assert!(qcow2_backing_name(&target).unwrap().is_none());
+        assert_eq!(chain(&live).unwrap().len(), 2);
+        assert_eq!(read_all(&live), before);
+    }
+
+    #[test]
+    fn a_deep_fork_waits_for_a_merge_instead_of_hitting_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, live, _) = branched_machine(dir.path(), 30);
+        let claim = Claim::take(parent.canonicalize().unwrap().join("d/storage")).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let source = parent.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(compact_if_near_limit(&source, None))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(claim);
+        result_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(chain(&live).unwrap().len() < COMPACT_AT_DEPTH);
+    }
+
+    #[test]
+    fn repeated_golden_job_golden_cycles_keep_disks_bounded_and_siblings_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut source, _, _) = branched_machine(&dir.path().join("root"), 0);
+        let mut siblings = Vec::new();
+        let mut deepest = 0;
+        for cycle in 0..12 {
+            for step in 0..9 {
+                compact_if_near_limit(&source, None).unwrap();
+                super::super::ensure_fork_disk_chain_is_bounded(&source).unwrap();
+                let live = source.join("storage.qcow2");
+                let access = writable(&live);
+                access
+                    .write(&[cycle as u8 + 1; 4096][..], step * CLUSTER)
+                    .unwrap();
+                if step == 3 {
+                    access.write_zeroes(CLUSTER * 20, CLUSTER).unwrap();
+                }
+                access.flush().unwrap();
+                drop(access);
+                let target = source.join(format!("d/{step:08x}/storage.base.qcow2"));
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::rename(&live, &target).unwrap();
+                create_overlay(&live, SIZE, &target).unwrap();
+                deepest = deepest.max(super::super::qcow2_backing_depth(&live).unwrap());
+                assert!(deepest < super::super::MAX_FORK_DISK_CHAIN_DEPTH);
+            }
+            let base = source.join("d/00000008/storage.base.qcow2");
+            let expected = read_all(&base);
+            let sibling = dir.path().join(format!("sibling-{cycle}.qcow2"));
+            create_overlay(&sibling, SIZE, &base).unwrap();
+            siblings.push((sibling, expected));
+            source = dir.path().join(format!("golden-{cycle}"));
+            std::fs::create_dir_all(&source).unwrap();
+            create_overlay(&source.join("storage.qcow2"), SIZE, &base).unwrap();
+        }
+        assert!(deepest >= SYNC_COMPACT_AT_DEPTH);
+        for (sibling, expected) in siblings {
+            assert_eq!(read_all(&sibling), expected);
+        }
+    }
+
+    #[test]
+    fn measured_depth_includes_cache_disks_and_does_not_truncate_at_32() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, live, _) = branched_machine(dir.path(), 35);
+        let cache = source
+            .join(crate::data::storage::CACHE_DISK_FILENAME)
+            .with_extension("qcow2");
+        create_overlay(&cache, SIZE, &live).unwrap();
+        assert_eq!(
+            super::super::disk_chain_depth_at(&source).unwrap(),
+            Some(37)
+        );
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(super::super::disk_chain_depth_at(&empty).unwrap(), None);
+        std::fs::write(empty.join("storage.raw"), [0_u8; 32]).unwrap();
+        assert_eq!(super::super::disk_chain_depth_at(&empty).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn a_missing_backing_is_not_reported_as_zero_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _, generations) = branched_machine(dir.path(), 1);
+        std::fs::remove_file(&generations[0]).unwrap();
+        assert!(super::super::disk_chain_depth_at(&source).is_err());
+    }
+
+    #[test]
+    fn arbitrary_inherited_layers_are_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, layers) = layered(dir.path(), 30);
+        let child = dir.path().join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let child_live = child.join("storage.qcow2");
+        create_overlay(&child_live, SIZE, layers.last().unwrap()).unwrap();
+        assert!(
+            flatten_target(&child, "storage", &child_live, SYNC_COMPACT_AT_DEPTH)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generations_behind_frozen_active_disks_compact_without_replacing_them() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mut live, _) = branched_machine(dir.path(), 24);
+        let mut frozen = vec![(live.clone(), std::fs::metadata(&live).unwrap().ino())];
+        let mut child = PathBuf::new();
+        for index in 0..7 {
+            child = dir.path().join(format!("frozen-{index}"));
+            std::fs::create_dir(&child).unwrap();
+            let next = child.join("storage.qcow2");
+            create_overlay(&next, SIZE, &live).unwrap();
+            frozen.push((next.clone(), std::fs::metadata(&next).unwrap().ino()));
+            live = next;
+        }
+        let before = read_all(&live);
+        assert_eq!(super::super::qcow2_backing_depth(&live).unwrap(), 32);
+        compact_if_near_limit(&child, None).unwrap();
+        assert_eq!(super::super::qcow2_backing_depth(&live).unwrap(), 8);
+        assert_eq!(read_all(&live), before);
+        for (disk, inode) in frozen {
+            assert_eq!(std::fs::metadata(&disk).unwrap().ino(), inode);
+        }
     }
 
     /// Writes keep landing on the live layer while the layer beneath it is
@@ -1053,7 +1562,7 @@ mod tests {
                 written
             })
         };
-        flatten_in_place(&gdir, "storage", &target, &root, None).unwrap();
+        flatten_in_place(&gdir, "storage", &target, root.as_deref(), None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let written = writer.join().unwrap();
 
@@ -1090,7 +1599,7 @@ mod tests {
         let opened = open_readonly(&target, true).unwrap();
         let mut old = vec![0_u8; opened.size() as usize];
         opened.read(&mut old[..], 0).unwrap();
-        flatten_in_place(&gdir, "storage", &target, &root, None).unwrap();
+        flatten_in_place(&gdir, "storage", &target, root.as_deref(), None).unwrap();
         let mut again = vec![0_u8; opened.size() as usize];
         opened.read(&mut again[..], 0).unwrap();
         assert_eq!(again, old);
@@ -1159,6 +1668,17 @@ mod tests {
             "overlay",
             Path::new("/vms/m/d/c/storage.17.qcow2")
         ));
+        for path in [
+            "/vms/m/d/not-a-generation/storage.base.qcow2",
+            "/vms/m/d/0123abcd/nested/storage.base.qcow2",
+            "/vms/m/d/storage.base.qcow2",
+            "/vms/m/d2/0123abcd/storage.base.qcow2",
+        ] {
+            assert!(
+                !is_generation_layer(gdir_d, "storage", Path::new(path)),
+                "{path}"
+            );
+        }
     }
 
     /// A layer goes once no machine's chain, retained snapshot or pending merge
@@ -1296,5 +1816,233 @@ mod tests {
             coalesce(vec![(5, 9), (0, 2), (1, 4), (9, 10)]),
             vec![(0, 4), (5, 10)]
         );
+    }
+
+    #[test]
+    fn an_all_zero_sparse_disk_flattens_without_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("empty.raw");
+        std::fs::File::create(&raw).unwrap().set_len(SIZE).unwrap();
+        let top = dir.path().join("top.qcow2");
+        create_overlay(&top, SIZE, &raw).unwrap();
+        let flat = dir.path().join("flat.qcow2");
+        flatten_standalone(&top, &flat, &|| panic!("an empty disk needs no copying")).unwrap();
+        assert_eq!(chain(&flat).unwrap().len(), 1);
+        assert_eq!(read_all(&flat), vec![0_u8; SIZE as usize]);
+    }
+
+    #[test]
+    fn child_identity_does_not_change_ancestor_disk_ownership_or_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, generations) = branched_machine(dir.path(), 30);
+        let target = generations.last().unwrap();
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(target).unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        create_overlay(&child.join("storage.qcow2"), SIZE, target).unwrap();
+        compact_if_near_limit(
+            &child,
+            Some((
+                before.uid().saturating_add(1),
+                before.gid().saturating_add(1),
+            )),
+        )
+        .unwrap();
+        let after = std::fs::metadata(target).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode()),
+            (before.uid(), before.gid(), before.mode())
+        );
+    }
+
+    #[test]
+    fn a_failed_partial_write_keeps_the_old_disk_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, live, _) = branched_machine(dir.path(), 30);
+        let before = read_all(&live);
+        let depth = super::super::qcow2_backing_depth(&live).unwrap();
+        let mut worker = TestProcess::spawn(&source, "limited");
+        assert!(worker.finish().success());
+        assert_eq!(read_all(&live), before);
+        assert_eq!(super::super::qcow2_backing_depth(&live).unwrap(), depth);
+        assert!(!merge_in_progress(&source.join("d")));
+        for generation in std::fs::read_dir(source.join("d")).unwrap().flatten() {
+            for entry in std::fs::read_dir(generation.path()).unwrap().flatten() {
+                assert!(!entry.file_name().to_string_lossy().ends_with(".partial"));
+            }
+        }
+        compact_if_near_limit(&source, None).unwrap();
+        assert_eq!(read_all(&live), before);
+    }
+
+    #[test]
+    fn a_killed_process_releases_gc_and_disk_locks_and_stale_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, live, _) = branched_machine(dir.path(), 30);
+        let before = read_all(&live);
+        std::fs::create_dir(source.join("d/c")).unwrap();
+        let mut worker = TestProcess::spawn(&source, "hold");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !source.join("ready").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(lock_disk_gc(&source, libc::LOCK_EX | libc::LOCK_NB)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            collect_unreachable_layers(&source, std::slice::from_ref(&source)).unwrap(),
+            0
+        );
+        worker.0.kill().unwrap();
+        assert!(!worker.finish().success());
+        assert!(!merge_in_progress(&source.join("d")));
+        assert!(!source.join("d/c/qa.busy").exists());
+        compact_if_near_limit(&source, None).unwrap();
+        assert_eq!(read_all(&live), before);
+    }
+
+    #[test]
+    fn separate_processes_compact_one_shared_ancestor_without_changing_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _, generations) = branched_machine(dir.path(), 30);
+        let mut workers = Vec::new();
+        let mut children = Vec::new();
+        for index in 0..4 {
+            let child = dir.path().join(format!("child-{index}"));
+            std::fs::create_dir(&child).unwrap();
+            let disk = child.join("storage.qcow2");
+            create_overlay(&disk, SIZE, generations.last().unwrap()).unwrap();
+            let writer = writable(&disk);
+            writer.write(&vec![index as u8; 4096], 0).unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+            children.push((disk.clone(), read_all(&disk)));
+            workers.push(TestProcess::spawn(&child, "compact"));
+        }
+        for worker in &mut workers {
+            assert!(worker.finish().success());
+        }
+        let mut machines = vec![source.clone()];
+        machines.extend(
+            children
+                .iter()
+                .map(|(disk, _)| disk.parent().unwrap().to_path_buf()),
+        );
+        collect_unreachable_layers(&source, &machines).unwrap();
+        for (disk, before) in children {
+            assert_eq!(read_all(&disk), before);
+            assert!(super::super::qcow2_backing_depth(&disk).unwrap() < COMPACT_AT_DEPTH);
+        }
+    }
+
+    #[test]
+    fn disk_lock_cleanup_keeps_live_and_inflight_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join("machine");
+        std::fs::create_dir(&owner).unwrap();
+        let path = disk_lock_path(&owner, "storage");
+        let guard = super::super::ForkSourceLock::acquire_at(&path).unwrap();
+        super::super::prune_orphaned_fork_source_locks_in(dir.path());
+        assert!(path.exists());
+        std::fs::remove_dir(&owner).unwrap();
+        super::super::prune_orphaned_fork_source_locks_in(dir.path());
+        assert!(path.exists());
+        drop(guard);
+        super::super::prune_orphaned_fork_source_locks_in(dir.path());
+        assert!(!path.exists());
+        assert!(disk_lock_owner(Path::new(".compact-storage.lock")).is_none());
+        assert!(disk_lock_owner(Path::new("machine.compact-other.lock")).is_none());
+        assert_ne!(
+            disk_lock_path(Path::new("vm.one"), "storage"),
+            disk_lock_path(Path::new("vm.two"), "storage")
+        );
+    }
+
+    #[test]
+    fn crashing_on_either_side_of_publication_keeps_data_and_retry_safe() {
+        use std::os::unix::fs::MetadataExt;
+        for phase in ["before-rename", "after-rename"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (source, _, generations) = branched_machine(dir.path(), 30);
+            let target = generations.last().unwrap();
+            let inode = std::fs::metadata(target).unwrap().ino();
+            let child = dir.path().join("child");
+            std::fs::create_dir(&child).unwrap();
+            let live = child.join("storage.qcow2");
+            create_overlay(&live, SIZE, target).unwrap();
+            let before = read_all(&live);
+            let existing_reader = open_readonly(&live, true).unwrap();
+            let mut worker = TestProcess::spawn(&child, phase);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !child.join("ready-to-publish").exists() {
+                assert!(std::time::Instant::now() < deadline, "{phase}");
+                assert!(worker.0.try_wait().unwrap().is_none(), "{phase}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            worker.0.kill().unwrap();
+            assert!(!worker.finish().success());
+            assert_eq!(
+                std::fs::metadata(target).unwrap().ino() == inode,
+                phase == "before-rename"
+            );
+            assert_eq!(read_all(&live), before);
+            assert!(!merge_in_progress(&source.join("d")));
+            let machines = [source.clone(), child.clone()];
+            collect_unreachable_layers(&source, &machines).unwrap();
+            compact_if_near_limit(&child, None).unwrap();
+            collect_unreachable_layers(&source, &machines).unwrap();
+            assert_eq!(read_all(&live), before);
+            let mut existing = vec![0_u8; SIZE as usize];
+            existing_reader.read(&mut existing, 0).unwrap();
+            assert_eq!(existing, before);
+            assert!(super::super::qcow2_backing_depth(&live).unwrap() < COMPACT_AT_DEPTH);
+        }
+    }
+
+    #[test]
+    fn inherited_flatten_respects_a_low_file_descriptor_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, generations) = branched_machine(dir.path(), 30);
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let live = child.join("storage.qcow2");
+        create_overlay(&live, SIZE, generations.last().unwrap()).unwrap();
+        let before = read_all(&live);
+        let mut worker = TestProcess::spawn(&child, "low-fd");
+        assert!(worker.finish().success());
+        assert_eq!(read_all(&live), before);
+        assert!(super::super::qcow2_backing_depth(&live).unwrap() < COMPACT_AT_DEPTH);
+    }
+
+    #[test]
+    fn shallow_sources_do_not_wait_for_other_machines_disk_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _, _) = branched_machine(dir.path(), 0);
+        let gc_guard = lock_disk_gc(&source, libc::LOCK_EX).unwrap();
+        let (completed, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            completed
+                .send(compact_if_near_limit(&source, None))
+                .unwrap();
+        });
+        let outcome = result.recv_timeout(std::time::Duration::from_secs(3));
+        drop(gc_guard);
+        worker.join().unwrap();
+        outcome
+            .expect("a shallow branch should not take the node GC lock")
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root and a private mount namespace for actual ENOSPC"]
+    fn a_full_filesystem_keeps_the_source_readable_and_can_retry() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker = TestProcess::spawn(dir.path(), "enospc");
+        assert!(worker.finish().success());
     }
 }

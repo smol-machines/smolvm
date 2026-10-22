@@ -78,6 +78,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     let stats = pid.and_then(crate::process::process_stats);
     let memory_stats = pid.and_then(crate::process::process_memory_stats);
     MachineInfo {
+        disk_chain_depth: None,
         runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name: name.to_string(),
         image: record.display_image().map(str::to_string),
@@ -3628,7 +3629,12 @@ pub async fn get_machine(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
-    Ok(Json(record_to_info(&name, &record)))
+    let mut info = record_to_info(&name, &record);
+    info.disk_chain_depth =
+        tokio::task::spawn_blocking(move || crate::agent::fork::disk_chain_depth(&name))
+            .await
+            .map_err(|error| ApiError::internal(format!("disk depth task failed: {error}")))?;
+    Ok(Json(info))
 }
 
 /// Query string for `GET /machines/{name}/egress-events`.
@@ -8201,6 +8207,23 @@ mod tests {
                  tar (is the image a valid `docker save` / OCI archive?)"
             .to_string();
         assert!(matches!(classify_launch_error(e), ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn machine_info_distinguishes_unknown_disk_depth_from_zero() {
+        let record = VmRecord::new("depth-vm".to_string(), 1, 512, vec![], vec![], false);
+        let mut info = record_to_info("depth-vm", &record);
+        assert!(serde_json::to_value(&info)
+            .unwrap()
+            .get("diskChainDepth")
+            .is_none());
+        for depth in [0, 23, 33] {
+            info.disk_chain_depth = Some(depth);
+            assert_eq!(
+                serde_json::to_value(&info).unwrap()["diskChainDepth"],
+                depth
+            );
+        }
     }
 
     #[test]
