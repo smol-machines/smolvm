@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,8 +22,12 @@ pub const PORT_FORWARD_SOCKET: &str = "port-forward.sock";
 const ACCEPT_POLL: Duration = Duration::from_millis(200);
 
 struct Forward {
-    guest: u16,
+    /// Guest port each new connection is relayed to; changes in place.
+    guest: Arc<AtomicU16>,
     stop: Arc<AtomicBool>,
+    /// Owns the listener; joined so a removed port is closed once `replace`
+    /// returns, not up to an accept poll later.
+    accepting: std::thread::JoinHandle<()>,
 }
 
 /// The live-published ports of one running machine.
@@ -43,14 +47,15 @@ impl PortForwarder {
     }
 
     /// Publish exactly `ports` (`(host, guest)` pairs): new host ports start
-    /// accepting, removed ones stop (connections already accepted carry on).
-    /// Every new port is bound before anything changes, so a taken port fails
-    /// the call with the set as it was.
+    /// accepting, a kept host port moved to another guest port relays new
+    /// connections there, and removed ones are closed by the time this returns
+    /// (connections already accepted carry on). Every new port is bound before
+    /// anything changes, so a taken port fails the call with the set as it was.
     pub fn replace(&self, ports: &[(u16, u16)]) -> Result<(), String> {
         let mut forwards = self.forwards.lock().unwrap_or_else(|p| p.into_inner());
         let mut bound = Vec::new();
         for &(host, guest) in ports {
-            if forwards.get(&host).is_some_and(|f| f.guest == guest) {
+            if forwards.contains_key(&host) {
                 continue;
             }
             let listener = TcpListener::bind((publish_addr(), host))
@@ -61,22 +66,39 @@ impl PortForwarder {
             bound.push((host, guest, listener));
         }
         let wanted: HashMap<u16, u16> = ports.iter().copied().collect();
-        forwards.retain(|host, forward| {
-            let keep = wanted.get(host) == Some(&forward.guest);
-            if !keep {
+        let removed: Vec<u16> = forwards
+            .keys()
+            .filter(|host| !wanted.contains_key(host))
+            .copied()
+            .collect();
+        for host in removed {
+            if let Some(forward) = forwards.remove(&host) {
                 forward.stop.store(true, Ordering::Relaxed);
+                let _ = forward.accepting.join();
             }
-            keep
-        });
+        }
+        for (host, forward) in forwards.iter() {
+            if let Some(&guest) = wanted.get(host) {
+                forward.guest.store(guest, Ordering::Relaxed);
+            }
+        }
         for (host, guest, listener) in bound {
+            let guest = Arc::new(AtomicU16::new(guest));
             let stop = Arc::new(AtomicBool::new(false));
             let socket = self.socket.clone();
-            let thread_stop = stop.clone();
-            std::thread::Builder::new()
+            let (thread_guest, thread_stop) = (guest.clone(), stop.clone());
+            let accepting = std::thread::Builder::new()
                 .name(format!("port-forward-{host}"))
-                .spawn(move || accept_loop(listener, guest, socket, thread_stop))
+                .spawn(move || accept_loop(listener, thread_guest, socket, thread_stop))
                 .map_err(|error| format!("host port {host}: {error}"))?;
-            forwards.insert(host, Forward { guest, stop });
+            forwards.insert(
+                host,
+                Forward {
+                    guest,
+                    stop,
+                    accepting,
+                },
+            );
         }
         Ok(())
     }
@@ -91,10 +113,16 @@ fn publish_addr() -> Ipv4Addr {
         .unwrap_or(Ipv4Addr::LOCALHOST)
 }
 
-fn accept_loop(listener: TcpListener, guest: u16, socket: PathBuf, stop: Arc<AtomicBool>) {
+fn accept_loop(
+    listener: TcpListener,
+    guest: Arc<AtomicU16>,
+    socket: PathBuf,
+    stop: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((client, _)) => {
+                let guest = guest.load(Ordering::Relaxed);
                 let socket = socket.clone();
                 let _ = std::thread::Builder::new()
                     .name("port-forward-conn".into())
@@ -108,7 +136,7 @@ fn accept_loop(listener: TcpListener, guest: u16, socket: PathBuf, stop: Arc<Ato
                 std::thread::sleep(ACCEPT_POLL);
             }
             Err(error) => {
-                tracing::debug!(guest, %error, "port forward accept failed");
+                tracing::debug!(guest = guest.load(Ordering::Relaxed), %error, "port forward accept failed");
                 std::thread::sleep(ACCEPT_POLL);
             }
         }
@@ -218,12 +246,39 @@ mod tests {
         assert_eq!(ask(b, "x"), "9090:x");
 
         forwarder.replace(&[(b, 9090)]).unwrap();
-        std::thread::sleep(ACCEPT_POLL * 3);
-        assert!(
-            TcpStream::connect((Ipv4Addr::LOCALHOST, a)).is_err(),
-            "a removed port stops"
-        );
+        // Closed by the time the change returns, not an accept poll later. The
+        // freed port may already belong to another test's listener, so what is
+        // checked is that nothing on it reaches this machine any more.
+        if let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, a)) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let _ = stream.write_all(b"late");
+            let _ = stream.shutdown(Shutdown::Write);
+            let mut reply = String::new();
+            let _ = stream.read_to_string(&mut reply);
+            assert!(
+                !reply.starts_with("8080:"),
+                "a removed port stops: {reply:?}"
+            );
+        }
         assert_eq!(ask(b, "y"), "9090:y", "a kept port keeps serving");
+    }
+
+    /// Moving a published host port to another guest port keeps its listener
+    /// rather than binding the port a second time, which failed while the old
+    /// listener still held it.
+    #[test]
+    fn a_host_port_moves_to_another_guest_port_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(PORT_FORWARD_SOCKET);
+        fake_guest(&socket);
+        let forwarder = PortForwarder::new(&socket);
+        let a = free_port();
+        forwarder.replace(&[(a, 8080)]).unwrap();
+        assert_eq!(ask(a, "one"), "8080:one");
+        forwarder.replace(&[(a, 9090)]).unwrap();
+        assert_eq!(ask(a, "two"), "9090:two");
     }
 
     #[test]
