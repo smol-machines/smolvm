@@ -3665,7 +3665,7 @@ pub fn materialize_pack_layers_with_options(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(Error::agent("clear packed layers cache", error.to_string())),
     }
-    smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, false, false)
+    smolvm_pack::extract::extract_sidecar_for_machine(sidecar, &cache_dir, &footer)
         .map_err(|error| Error::agent("extract sidecar", error.to_string()))
 }
 

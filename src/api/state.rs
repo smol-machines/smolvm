@@ -316,6 +316,20 @@ impl Drop for ReservationGuard<'_> {
             self.state
                 .release_machine_reservation(&self.name, &self.token);
             tracing::debug!(machine = %self.name, "reservation guard released on drop");
+            // With the name released no machine owns its data directory, so
+            // whatever this create left there (an extracted pack, disks) would
+            // stay on disk with nothing to delete it. Remove it now.
+            let dir = crate::agent::vm_data_dir(&self.name);
+            smolvm_pack::extract::force_detach_layers_volume(&dir.join("pack"));
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    tracing::info!(machine = %self.name, "removed the data of a create that did not finish");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(machine = %self.name, %error, "could not remove the data of a create that did not finish");
+                }
+            }
         }
     }
 }
@@ -2181,6 +2195,23 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = SmolvmDb::open_at(&path).unwrap();
         (dir, ApiState::with_db(db))
+    }
+
+    /// A create dropped before it registers its machine leaves nothing on disk:
+    /// the data it wrote under the reserved name goes with the reservation.
+    #[test]
+    fn an_unfinished_create_removes_the_data_it_wrote() {
+        let (_dir, state) = temp_api_state();
+        let name = format!("unfinished-{}", SmolvmDb::create_reservation_token());
+        let data = crate::agent::vm_data_dir(&name);
+        {
+            let _guard = ReservationGuard::new(&state, name.clone()).unwrap();
+            std::fs::create_dir_all(data.join("pack")).unwrap();
+            std::fs::write(data.join("pack").join("layer.tar"), b"partial").unwrap();
+        }
+        assert!(!data.exists(), "{} was left behind", data.display());
+        // The name is free again.
+        drop(ReservationGuard::new(&state, name).unwrap());
     }
 
     /// Queued branches of one source are served in batches of those that wait

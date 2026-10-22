@@ -5460,12 +5460,10 @@ impl CreateCmd {
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("shared pack extraction is Linux-only")
             } else {
-                smolvm_pack::extract::extract_sidecar(
+                smolvm_pack::extract::extract_sidecar_for_machine(
                     sidecar_path,
                     &cache_dir,
                     footer.as_ref().expect("file artifact has a footer"),
-                    false,
-                    false,
                 )
                 .map(|()| (cache_dir.clone(), None::<String>))
                 .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))

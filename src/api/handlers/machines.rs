@@ -2550,12 +2550,36 @@ pub async fn create_machine(
     create_machine_inner(State(state), Json(req), None, false).await
 }
 
+/// Run a create to its end whether or not its client is still waiting.
+///
+/// A request future is dropped when its client disconnects. Dropped mid-create,
+/// it abandoned blocking work (a pack extraction) that kept writing the
+/// machine's data directory after the name had been released, which left the
+/// data on disk with no machine. In a task of its own the create either
+/// finishes, leaving a machine the client can find and delete, or fails and
+/// rolls back, before anything is released.
+async fn create_machine_inner(
+    state: State<Arc<ApiState>>,
+    req: Json<CreateMachineRequest>,
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+    cached_checkpoint: bool,
+) -> Result<Json<MachineInfo>, ApiError> {
+    tokio::spawn(create_machine_to_end(
+        state,
+        req,
+        verified,
+        cached_checkpoint,
+    ))
+    .await
+    .map_err(|e| ApiError::internal(format!("create task: {e}")))?
+}
+
 /// [`create_machine`], optionally reusing a verification of the `from`
 /// artifact that this same request already performed on a pinned descriptor.
 /// The reuse is granted only when the path about to be used still resolves to
 /// that unchanged inode; otherwise the artifact is verified afresh here. This
 /// is a private request-scoped handoff, not a public option.
-async fn create_machine_inner(
+async fn create_machine_to_end(
     State(state): State<Arc<ApiState>>,
     Json(mut req): Json<CreateMachineRequest>,
     verified: Option<crate::portable_checkpoint::VerifiedSidecar>,

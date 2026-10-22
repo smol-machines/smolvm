@@ -2018,6 +2018,104 @@ pub fn extract_sidecar(
     extract_sidecar_for_agent(sidecar_path, cache_dir, footer, force, debug, None)
 }
 
+/// Directory, beside the machine data directories, holding one unpacked
+/// template per pack. A leading `_` keeps it out of the sweep that reaps data
+/// directories no machine owns, as for the Linux shared store (`_shared`).
+pub const PACK_TEMPLATES_DIR: &str = "_pack-templates";
+
+/// Extract `sidecar_path` as the private pack directory of one machine.
+///
+/// On macOS the image layers are unpacked file by file into a case-sensitive
+/// sparse disk image, which takes minutes for a pack with hundreds of thousands
+/// of entries, and every machine made from the pack used to repeat it. Here the
+/// pack is unpacked once into a template next to the machine directories, and
+/// each machine gets an APFS clone of it: made in milliseconds, sharing every
+/// block with the template until the machine changes it. The template is never
+/// booted, so it stays detached and unchanged. Templates are capped and evicted
+/// oldest first like the other extraction caches.
+///
+/// Elsewhere, and whenever the clone cannot be made (a volume without clones,
+/// or a template evicted meanwhile), this extracts straight into `cache_dir`.
+pub fn extract_sidecar_for_machine(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    footer: &PackFooter,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(root) = cache_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(|vms| vms.join(PACK_TEMPLATES_DIR))
+    {
+        match extract_via_template(sidecar_path, cache_dir, footer, &root) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "note: could not reuse the unpacked pack ({e}); unpacking this machine's own copy"
+                );
+                if cache_dir.exists() {
+                    force_detach_layers_volume(cache_dir);
+                    fs::remove_dir_all(cache_dir)?;
+                }
+            }
+        }
+    }
+    extract_sidecar(sidecar_path, cache_dir, footer, false, false)
+}
+
+/// Unpack `sidecar_path` into its template under `root` (once per pack), then
+/// clone the template to `cache_dir`.
+#[cfg(target_os = "macos")]
+fn extract_via_template(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    footer: &PackFooter,
+    root: &Path,
+) -> std::io::Result<()> {
+    let template = shared_pack_dir(root, footer.checksum);
+    // Takes the template's lock, extracts only if it is not already complete,
+    // and evicts other templates past the cap without touching this one.
+    extract_sidecar(sidecar_path, &template, footer, false, false)?;
+    // Hold the same lock while cloning, so a concurrent extract or repair of
+    // this template cannot mount or change it mid-clone.
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(template.with_extension("lock"))?;
+    lock_file_exclusive(&lock_file)?;
+    if !is_extracted(&template) {
+        return Err(std::io::Error::other("the template was evicted"));
+    }
+    force_detach_layers_volume(&template);
+    // Marks the template as recently used for the oldest-first eviction.
+    File::open(&template)?.set_modified(std::time::SystemTime::now())?;
+    if cache_dir.exists() {
+        force_detach_layers_volume(cache_dir);
+        fs::remove_dir_all(cache_dir)?;
+    }
+    if let Some(parent) = cache_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    clone_tree(&template, cache_dir)
+}
+
+/// APFS-clone the directory tree `from` to `to`, which must not exist.
+#[cfg(target_os = "macos")]
+fn clone_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (src, dst) = (c(from)?, c(to)?);
+    // SAFETY: both are valid NUL-terminated paths that outlive the call.
+    if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// [`extract_sidecar`] for a pack that will boot a different agent than the
 /// one it carries.
 ///
@@ -8184,6 +8282,52 @@ mod tests {
         assert!(
             allocated_bytes < 16 * 1024 * 1024,
             "storage disk was densified: {allocated_bytes} bytes allocated for a sparse template"
+        );
+    }
+
+    /// A machine gets a copy-on-write clone of the pack's unpacked template, so
+    /// changing the machine's copy leaves the template as it was.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_machine_gets_its_own_clone_of_the_unpacked_pack() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vms = temp_dir.path().join("vms");
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 0,
+            manifest_offset: 0,
+            manifest_size: 0,
+            checksum: 0x5eed,
+        };
+        let template = shared_pack_dir(&vms.join(PACK_TEMPLATES_DIR), footer.checksum);
+        fs::create_dir_all(template.join("layers").join("l1")).unwrap();
+        fs::write(template.join(EXTRACTION_MARKER), "").unwrap();
+        fs::write(
+            template.join("layers").join("l1").join("f"),
+            b"from the pack",
+        )
+        .unwrap();
+        let sidecar = temp_dir.path().join("p.smolmachine");
+        fs::write(&sidecar, b"").unwrap();
+
+        let cache_dir = vms.join("0123456789abcdef").join("pack");
+        extract_sidecar_for_machine(&sidecar, &cache_dir, &footer).unwrap();
+        let copy = cache_dir.join("layers").join("l1").join("f");
+        assert_eq!(fs::read(&copy).unwrap(), b"from the pack");
+        assert!(is_extracted(&cache_dir));
+
+        fs::write(&copy, b"changed by the machine").unwrap();
+        assert_eq!(
+            fs::read(template.join("layers").join("l1").join("f")).unwrap(),
+            b"from the pack"
+        );
+        // A second machine starts from the unchanged template.
+        let second = vms.join("fedcba9876543210").join("pack");
+        extract_sidecar_for_machine(&sidecar, &second, &footer).unwrap();
+        assert_eq!(
+            fs::read(second.join("layers").join("l1").join("f")).unwrap(),
+            b"from the pack"
         );
     }
 
