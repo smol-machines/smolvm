@@ -1403,7 +1403,8 @@ fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
         }
         let depth = qcow2_backing_depth(&disk)?;
         if depth >= MAX_FORK_DISK_CHAIN_DEPTH {
-            return Err(Error::agent(
+            // A limit the caller clears by packing the machine, not a fault.
+            return Err(Error::agent_conflict(
                 "fork-continue",
                 format!(
                     "{} already has {depth} qcow2 backing layers; the safe limit is \
@@ -4663,6 +4664,13 @@ mod tests {
         }
         let error = ensure_fork_disk_chain_is_bounded(temp.path()).unwrap_err();
         assert!(error.to_string().contains("safe limit is 32"));
+        assert!(matches!(
+            error,
+            Error::Agent {
+                kind: crate::error::AgentErrorKind::Conflict,
+                ..
+            }
+        ));
     }
 
     #[cfg(target_os = "linux")]

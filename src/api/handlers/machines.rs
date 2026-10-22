@@ -4378,6 +4378,14 @@ pub async fn start_machine(
 /// name already being taken, is a 409; an unsupported descendant shape is a
 /// 400; anything else is a 500.
 fn classify_fork_error(e: SmolvmError) -> ApiError {
+    // A refusal that says what it is keeps its status, whatever its wording.
+    if let SmolvmError::Agent {
+        kind: crate::error::AgentErrorKind::Conflict,
+        ..
+    } = &e
+    {
+        return ApiError::Conflict(e.to_string());
+    }
     let msg = e.to_string();
     let lc = msg.to_ascii_lowercase();
     if lc.contains("branch needs at least") && lc.contains("effective host headroom") {
@@ -8098,6 +8106,21 @@ mod tests {
             "branch needs at least 2048 MiB of effective host headroom for 8 children, but only 1024 MiB is available",
         );
         assert!(matches!(classify_fork_error(e), ApiError::Unavailable(_)));
+    }
+
+    #[test]
+    fn a_source_at_its_disk_chain_limit_is_a_conflict_not_a_server_fault() {
+        let reason = "storage.qcow2 already has 32 qcow2 backing layers; the safe limit is 32. \
+                      Stop and pack this machine into a new root before creating another live fork";
+        match classify_fork_error(SmolvmError::agent_conflict("fork-continue", reason)) {
+            ApiError::Conflict(msg) => assert!(msg.contains("pack this machine"), "{msg}"),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        // The kind decides it, not the wording: the same text as a plain failure stays a 500.
+        assert!(matches!(
+            classify_fork_error(SmolvmError::agent("fork-continue", reason)),
+            ApiError::Internal(_)
+        ));
     }
 
     #[test]
