@@ -2493,6 +2493,25 @@ mod tests {
         assert_eq!(db.fork_lineage_depth("great-grandchild").unwrap(), 3);
     }
 
+    /// A nested lineage far past the old 32 generations still walks and deletes
+    /// deepest-first: the walk is a loop and the descent one small frame per level.
+    #[test]
+    fn a_deep_nested_lineage_walks_and_deletes_deepest_first() {
+        let (_dir, db) = temp_db();
+        let depth = 600;
+        for level in 0..=depth {
+            let name = format!("g{level}");
+            let mut record = VmRecord::new(name.clone(), 1, 128, vec![], vec![], false);
+            record.golden = (level > 0).then(|| format!("g{}", level - 1));
+            db.insert_vm(&name, &record).unwrap();
+        }
+        assert_eq!(db.fork_lineage_depth(&format!("g{depth}")).unwrap(), depth);
+        let order = db.dependent_descendants_postorder("g0").unwrap();
+        assert_eq!(order.len(), depth);
+        assert_eq!(order.first().map(String::as_str), Some("g600"));
+        assert_eq!(order.last().map(String::as_str), Some("g1"));
+    }
+
     #[test]
     fn fork_lineage_rejects_cycles_and_missing_parents() {
         let (_dir, db) = temp_db();

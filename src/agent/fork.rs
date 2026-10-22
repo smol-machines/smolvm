@@ -27,9 +27,12 @@ mod compact;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use compact::{flatten_standalone, flatten_to_raw};
 
-/// Bound qcow2 ancestry and recursive lifecycle work. Longer chains should be
-/// compacted into a new root rather than accumulating unbounded lookup cost.
-const MAX_FORK_LINEAGE_DEPTH: usize = 32;
+/// Bound how many generations of ancestors a branch may have. Disk chains no
+/// longer grow with lineage (compaction keeps them under
+/// `MAX_FORK_DISK_CHAIN_DEPTH`), so this only stops a runaway or corrupted
+/// lineage: walking it, deleting it deepest-first and reconciling it at startup
+/// all stay cheap at this depth.
+const MAX_FORK_LINEAGE_DEPTH: usize = 256;
 
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
