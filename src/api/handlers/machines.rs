@@ -1731,8 +1731,7 @@ mod checkpoint_cache_tests {
                     competing.try_lock().is_err(),
                     "alias publication must wait until verification finishes"
                 );
-                competing
-                    .try_lock_shared()
+                eventually(|| competing.try_lock_shared())
                     .expect("independent verifiers may run concurrently");
                 crate::portable_checkpoint::classify_sidecar_verification(path)
             })
@@ -1750,9 +1749,25 @@ mod checkpoint_cache_tests {
             .write(true)
             .open(dir.path().join(super::CHECKPOINT_CACHE_LOCK))
             .unwrap();
-        competing
-            .try_lock()
+        eventually(|| competing.try_lock())
             .expect("verification releases the lease before VM creation");
+    }
+
+    /// Retries a lock attempt briefly. A process another test is spawning
+    /// shares this process's open files until it execs, so for that moment
+    /// it holds the same flock and a lock that was released looks held.
+    fn eventually(
+        mut attempt: impl FnMut() -> Result<(), std::fs::TryLockError>,
+    ) -> Result<(), std::fs::TryLockError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match attempt() {
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
     }
 
     #[test]
