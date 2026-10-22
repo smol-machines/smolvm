@@ -525,9 +525,11 @@ pub struct CheckpointNetwork {
 
 /// Versioned host CPU compatibility contract for a live checkpoint.
 ///
-/// A recognized contract permits a restore on a different CPU model while the
-/// hypervisor remains the final authority for applying the captured
-/// architectural CPU state.
+/// A recognized contract permits a restore on a different CPU model. On Linux
+/// KVM x86_64, libkrun is the final authority: it refuses a restore when the
+/// destination would not give a fresh guest every CPUID feature and
+/// speculation immunity (including `IA32_ARCH_CAPABILITIES`) the source guest
+/// was given, and names what is missing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CheckpointCpuContract {
@@ -535,6 +537,10 @@ pub enum CheckpointCpuContract {
     /// under this profile from its first instruction, so host-specific extended
     /// state cannot leak into a live checkpoint.
     LinuxKvmIntelPortableV1,
+    /// AMD/KVM with the host's own CPU features. The guest saw the source
+    /// host's real CPUID, so the destination must provide all of it; libkrun
+    /// checks that on restore. A newer or equal AMD host is accepted.
+    LinuxKvmAmdHostV1,
     /// Platforms without a hypervisor-level compatibility check require the
     /// exact source CPU feature fingerprint.
     ExactV1 {
@@ -957,6 +963,28 @@ impl PackManifest {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cpu_contract_kinds_are_stable() {
+        for (contract, kind) in [
+            (
+                CheckpointCpuContract::LinuxKvmIntelPortableV1,
+                "linux-kvm-intel-portable-v1",
+            ),
+            (
+                CheckpointCpuContract::LinuxKvmAmdHostV1,
+                "linux-kvm-amd-host-v1",
+            ),
+        ] {
+            let json = serde_json::to_string(&contract).unwrap();
+            assert_eq!(json, format!("{{\"kind\":\"{kind}\"}}"));
+            assert_eq!(
+                serde_json::from_str::<CheckpointCpuContract>(&json).unwrap(),
+                contract
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

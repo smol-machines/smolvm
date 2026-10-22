@@ -191,8 +191,16 @@ A tagged object; `kind` selects the variant.
 | `kind` | Other fields | A host is compatible when |
 |---|---|---|
 | `linux-kvm-intel-portable-v1` | none | It is an Intel (`GenuineIntel`) Linux KVM host |
+| `linux-kvm-amd-host-v1` | none | It is an AMD (`AuthenticAMD`) Linux KVM host |
 | `aarch64-features-v1` | `features`: sorted array of `FEAT_*` names | It has every listed feature (a superset is fine) |
 | `exact-v1` | `fingerprint`: SHA-256 hex of the host CPU identity | Its fingerprint is identical |
+
+For the two Linux KVM x86_64 kinds, restore also requires that the host give a
+fresh guest every CPUID feature and speculation immunity (CPUID and
+`IA32_ARCH_CAPABILITIES`) the source guest was given. The guest acted on them at
+boot, so a host missing one is refused with the missing names. Intel guests see
+a Haswell-era feature baseline; AMD guests see the source host's own features,
+so they restore on an equal or newer AMD host.
 
 ### 4.5 `disks`
 

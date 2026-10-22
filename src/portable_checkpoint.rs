@@ -3290,8 +3290,10 @@ fn release_free_guest_memory(name: &str, control: &Path) {
 }
 
 fn checkpoint_cpu_contract() -> Result<CheckpointCpuContract> {
-    if cpu_vendor()?.as_deref() == Some("GenuineIntel") {
-        return Ok(CheckpointCpuContract::LinuxKvmIntelPortableV1);
+    match cpu_vendor()?.as_deref() {
+        Some("GenuineIntel") => return Ok(CheckpointCpuContract::LinuxKvmIntelPortableV1),
+        Some("AuthenticAMD") => return Ok(CheckpointCpuContract::LinuxKvmAmdHostV1),
+        _ => {}
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -3392,25 +3394,34 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             return validate_aarch64_features(features);
         }
         CheckpointCpuContract::LinuxKvmIntelPortableV1 => {
-            let current_vendor = cpu_vendor()?.ok_or_else(|| {
-                Error::agent(
-                    "restore checkpoint",
-                    "checkpoint CPU contract requires Linux KVM on x86_64",
-                )
-            })?;
-            if current_vendor != "GenuineIntel" {
-                return Err(Error::agent(
-                    "restore checkpoint",
-                    format!("checkpoint requires an Intel KVM host, found '{current_vendor}'"),
-                ));
-            }
+            require_kvm_vendor("GenuineIntel", "an Intel")?;
+        }
+        CheckpointCpuContract::LinuxKvmAmdHostV1 => {
+            require_kvm_vendor("AuthenticAMD", "an AMD")?;
         }
     }
 
     // The durable vCPU state contains the exact guest CPUID and MSR contract.
-    // KVM validates those values when libkrun applies the checkpoint, so a
-    // destination missing any required architectural feature still fails
-    // closed even though host model/stepping differences are accepted here.
+    // libkrun compares it with what this host gives a fresh guest before
+    // applying it, so a destination missing a feature or speculation immunity
+    // the guest was given fails closed with the missing names, even though
+    // host model/stepping differences are accepted here.
+    Ok(())
+}
+
+fn require_kvm_vendor(vendor: &str, article: &str) -> Result<()> {
+    let current = cpu_vendor()?.ok_or_else(|| {
+        Error::agent(
+            "restore checkpoint",
+            "checkpoint CPU contract requires Linux KVM on x86_64",
+        )
+    })?;
+    if current != vendor {
+        return Err(Error::agent(
+            "restore checkpoint",
+            format!("checkpoint requires {article} KVM host, found '{current}'"),
+        ));
+    }
     Ok(())
 }
 
@@ -7419,6 +7430,10 @@ mod tests {
                 Some("GenuineIntel") => assert_eq!(
                     metadata.cpu_contract,
                     CheckpointCpuContract::LinuxKvmIntelPortableV1
+                ),
+                Some("AuthenticAMD") => assert_eq!(
+                    metadata.cpu_contract,
+                    CheckpointCpuContract::LinuxKvmAmdHostV1
                 ),
                 _ => assert_eq!(
                     metadata.cpu_contract,
