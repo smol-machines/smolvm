@@ -968,17 +968,28 @@ fn safe_unpack_with_policy<R: Read>(
     checkpoint: bool,
     owner_xattr: bool,
 ) -> std::io::Result<UnpackReport> {
-    safe_unpack_skipping(archive, dest, limits, checkpoint, owner_xattr, &[], &[])
+    safe_unpack_skipping(
+        archive,
+        dest,
+        limits,
+        checkpoint,
+        owner_xattr,
+        true,
+        &[],
+        &[],
+    )
 }
 
 /// [`safe_unpack_with_policy`], leaving out the archive paths in `skip` and
 /// everything under them.
+#[allow(clippy::too_many_arguments)]
 fn safe_unpack_skipping<R: Read>(
     archive: &mut tar::Archive<R>,
     dest: &Path,
     limits: &SafeUnpackLimits,
     checkpoint: bool,
     owner_xattr: bool,
+    translate_whiteouts: bool,
     skip: &[PathBuf],
     required: &[PathBuf],
 ) -> std::io::Result<UnpackReport> {
@@ -1094,8 +1105,12 @@ fn safe_unpack_skipping<R: Read>(
         // OCI whiteouts, translated here when the host describes ownership to
         // the guest: overlayfs wants a 0:0 character device (faked through the
         // override xattr on an empty file, since the host cannot mknod) and an
-        // opaque directory wants the `user.overlay.opaque` marker.
-        if owner_xattr {
+        // opaque directory wants the `user.overlay.opaque` marker. A pack's only
+        // layer has nothing under it to hide: smolvm writes it as a merged view
+        // (a from-VM export tars the overlay-mounted tree, an image pack is
+        // pre-merged), so a `.wh.` name in it is a file the machine holds, such
+        // as a container runtime's own overlay data, and is kept as one.
+        if owner_xattr && translate_whiteouts {
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 let parent_rel = entry_path.parent().unwrap_or(Path::new(""));
                 if name == ".wh..wh..opq" {
@@ -3620,6 +3635,7 @@ pub fn extract_checkpoint_sidecar(
         &SafeUnpackLimits::from_env(),
         true,
         false,
+        true,
         &skip,
         required,
     )?;
@@ -3690,6 +3706,7 @@ fn extract_checkpoint_sidecar_checked(
             &SafeUnpackLimits::from_env(),
             true,
             false,
+            true,
             &skip,
             required,
         )?;
@@ -4373,6 +4390,7 @@ fn materialize_tar_dir(
     final_dir: &Path,
     debug: bool,
     owner_xattr: bool,
+    translate_whiteouts: bool,
 ) -> std::io::Result<Option<UnpackReport>> {
     if final_dir.is_dir() {
         return Ok(None);
@@ -4391,12 +4409,15 @@ fn materialize_tar_dir(
     let unpacked = (|| {
         let tar_file = File::open(tar)?;
         let mut archive = tar::Archive::new(tar_file);
-        safe_unpack_with_policy(
+        safe_unpack_skipping(
             &mut archive,
             &staging,
             &SafeUnpackLimits::from_env(),
             false,
             owner_xattr,
+            translate_whiteouts,
+            &[],
+            &[],
         )
     })();
     let report = match unpacked {
@@ -4519,7 +4540,7 @@ fn post_process_extraction(
         if debug && !rootfs_dir.exists() {
             eprintln!("debug: extracting agent-rootfs.tar...");
         }
-        materialize_tar_dir(&rootfs_tar, &rootfs_dir, debug, false)?;
+        materialize_tar_dir(&rootfs_tar, &rootfs_dir, debug, false, true)?;
     }
 
     // Extract OCI layer tars to layers/{digest}/ directories.
@@ -4567,11 +4588,13 @@ fn post_process_extraction(
         // A tar's size is a faithful upper bound on the tree it unpacks to.
         let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut needed = 0u64;
+        let mut layer_tars = 0usize;
         for entry in fs::read_dir(&layers_dir)? {
             let path = entry?.path();
             if !path.extension().is_some_and(|ext| ext == "tar") {
                 continue;
             }
+            layer_tars += 1;
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             let layer_dir = extract_dir.join(&*stem);
             if !layer_dir.is_dir() {
@@ -4589,7 +4612,9 @@ fn post_process_extraction(
                     layer_dir.file_name().unwrap_or_default().to_string_lossy()
                 );
             }
-            if let Some(report) = materialize_tar_dir(tar, layer_dir, debug, owner_xattr)? {
+            if let Some(report) =
+                materialize_tar_dir(tar, layer_dir, debug, owner_xattr, layer_tars > 1)?
+            {
                 if debug && report.skipped > 0 {
                     eprintln!(
                         "debug: layer {}: {} entries the host could not represent were skipped",
@@ -5897,7 +5922,7 @@ mod tests {
         let final_dir = dir.path().join("deadbeef");
 
         std::fs::write(&tar_path, truncated).unwrap();
-        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
+        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false, true)
             .expect_err("a truncated archive must not extract successfully");
         assert!(err.to_string().contains("nothing was kept"), "got: {err}");
         assert!(
@@ -5910,7 +5935,7 @@ mod tests {
         );
 
         std::fs::write(&tar_path, &intact).unwrap();
-        let report = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
+        let report = super::materialize_tar_dir(&tar_path, &final_dir, false, false, true)
             .unwrap()
             .expect("a fresh extraction reports what it wrote");
         assert_eq!(report.entries, 2);
@@ -5934,7 +5959,7 @@ mod tests {
 
         let tar_path = dir.path().join("layer.tar");
         std::fs::write(&tar_path, tar_of(&[("usr/fresh", b"ok")])).unwrap();
-        super::materialize_tar_dir(&tar_path, &final_dir, false, false).unwrap();
+        super::materialize_tar_dir(&tar_path, &final_dir, false, false, true).unwrap();
 
         assert!(final_dir.join("usr/fresh").is_file());
         assert!(
@@ -5955,7 +5980,7 @@ mod tests {
         let tar_path = dir.path().join("layer.tar");
         std::fs::write(&tar_path, tar_of(&[("would-overwrite", b"no")])).unwrap();
 
-        let reused = super::materialize_tar_dir(&tar_path, &final_dir, false, false).unwrap();
+        let reused = super::materialize_tar_dir(&tar_path, &final_dir, false, false, true).unwrap();
         assert!(
             reused.is_none(),
             "nothing is extracted over a complete layer"
@@ -6057,7 +6082,7 @@ mod tests {
         std::fs::write(&tar_path, builder.into_inner().unwrap()).unwrap();
 
         let final_dir = mount.join("layer0");
-        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
+        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false, true)
             .expect_err("3 MB of entries cannot fit a 2 MB volume");
         assert!(
             err.raw_os_error() == Some(libc::ENOSPC)
@@ -6081,7 +6106,7 @@ mod tests {
 
         // With room to spare the very same call completes.
         let roomy = dir.path().join("roomy");
-        super::materialize_tar_dir(&tar_path, &roomy, false, false).unwrap();
+        super::materialize_tar_dir(&tar_path, &roomy, false, false, true).unwrap();
         assert!(roomy.join("d63/blob").is_file());
     }
 
@@ -7726,6 +7751,49 @@ mod tests {
         fs::read(stream)
             .ok()
             .map(|value| String::from_utf8_lossy(&value).into_owned())
+    }
+
+    /// A pack's only layer is a merged view, so its `.wh.` names are files the
+    /// machine held (a container runtime's overlay data, say) and are kept as
+    /// files; over other layers the same name is a whiteout and is translated.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_single_layer_keeps_wh_files_and_a_stacked_layer_translates_them() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let tar_path = root.path().join("layer.tar");
+        let mut builder = tar::Builder::new(File::create(&tar_path).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(4);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "var/lib/docker/diff/etc/.wh.gone",
+                &b"kept"[..],
+            )
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+
+        let single = root.path().join("single");
+        super::materialize_tar_dir(&tar_path, &single, false, true, false).unwrap();
+        assert_eq!(
+            fs::read(single.join("var/lib/docker/diff/etc/.wh.gone")).unwrap(),
+            b"kept"
+        );
+
+        let stacked = root.path().join("stacked");
+        super::materialize_tar_dir(&tar_path, &stacked, false, true, true).unwrap();
+        assert!(!stacked.join("var/lib/docker/diff/etc/.wh.gone").exists());
+        assert!(
+            stacked.join("var/lib/docker/diff/etc/gone").exists(),
+            "becomes the whiteout"
+        );
     }
 
     /// Host-side extraction that describes ownership to the guest: every

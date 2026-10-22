@@ -329,10 +329,7 @@ fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result
             record.image.is_none(),
         )?;
     if features.packed_layers_dir.is_none() {
-        features.packed_layers_dir = record
-            .image
-            .as_deref()
-            .and_then(crate::data::image_source::packed_layers_dir_for_ref);
+        features.packed_layers_dir = record.local_image_layers_dir();
     }
     Ok(features)
 }

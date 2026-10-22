@@ -2332,7 +2332,8 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         restart: record.restart.clone(),
         network: record.network,
         secret_refs: record.secret_refs.clone(),
-        source_smolmachine: record.source_smolmachine.clone(),
+        source_smolmachine: record.packed_layer_source().map(str::to_owned),
+        packed_image_on_storage: record.packed_image_on_storage,
         forkable: record.forkable_on_start(),
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
@@ -4135,6 +4136,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.packed_layer_source().map(str::to_owned);
+    let image_on_storage = record.packed_image_on_storage;
     let launch_image = record.image.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let credential_launch = crate::credentials::CredentialLaunch::for_record(&name, &record);
@@ -4210,6 +4212,7 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            image_on_storage,
             launch_image.as_deref(),
             dns_filter_hosts,
             credential_launch,
@@ -5279,6 +5282,7 @@ async fn boot_prepared_fork_inner(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.packed_layer_source(),
+            record.packed_image_on_storage,
             record.image.as_deref(),
             record.dns_filter_hosts.clone(),
             crate::credentials::CredentialLaunch::for_record(&clone_b, &record),

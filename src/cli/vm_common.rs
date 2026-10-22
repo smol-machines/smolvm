@@ -1935,11 +1935,7 @@ fn start_vm_named_with_db(
     // reference; re-derive its virtiofs mount dir so the guest assembles the
     // rootfs from it instead of pulling.
     if features.packed_layers_dir.is_none() {
-        if let Some(dir) = record
-            .image
-            .as_deref()
-            .and_then(smolvm::data::image_source::packed_layers_dir_for_ref)
-        {
+        if let Some(dir) = record.local_image_layers_dir() {
             features.packed_layers_dir = Some(dir);
         }
     }

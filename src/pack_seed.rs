@@ -209,18 +209,27 @@ mod imp {
         let mut entries = 0u64;
         let mut blocks = 0u64;
         let mut bytes = 0u64;
+        let mut tars = Vec::new();
         for entry in fs::read_dir(layers).map_err(fail)? {
             let path = entry.map_err(fail)?.path();
-            if path.extension().is_none_or(|extension| extension != "tar") {
-                continue;
+            if path.extension().is_some_and(|extension| extension == "tar") {
+                tars.push(path);
             }
+        }
+        // Whiteouts hide files in the layers below them, which the helper's tar
+        // does not do. A pack's only layer has none below: smolvm writes it as
+        // a merged view, so a `.wh.` name in it is a file the machine holds (a
+        // container runtime's overlay data, say), which tar extracts as such.
+        let has_lower_layers = tars.len() > 1;
+        for path in tars {
             let mut archive = tar::Archive::new(LayerReader::open(&path).map_err(fail)?);
             for entry in archive.entries_with_seek().map_err(fail)? {
                 let entry = entry.map_err(fail)?;
-                if entry
-                    .path()?
-                    .file_name()
-                    .is_some_and(|name| name.as_encoded_bytes().starts_with(b".wh."))
+                if has_lower_layers
+                    && entry
+                        .path()?
+                        .file_name()
+                        .is_some_and(|name| name.as_encoded_bytes().starts_with(b".wh."))
                 {
                     return Ok(None);
                 }
@@ -1047,20 +1056,27 @@ mod imp {
         }
 
         #[test]
-        fn storage_seed_defers_whiteouts_to_the_layer_extractor() {
-            let output = tempfile::tempdir().unwrap();
-            let mut archive =
-                tar::Builder::new(File::create(output.path().join("layer.tar")).unwrap());
-            let mut header = tar::Header::new_gnu();
-            header.set_size(0);
-            header.set_mode(0o644);
-            header.set_cksum();
-            archive
-                .append_data(&mut header, "etc/.wh.removed", io::empty())
-                .unwrap();
-            archive.finish().unwrap();
-            drop(archive);
-            assert!(storage_budget(output.path()).unwrap().is_none());
+        fn storage_seed_defers_whiteouts_over_lower_layers_to_the_layer_extractor() {
+            let write_layer = |dir: &Path, name: &str| {
+                let mut archive = tar::Builder::new(File::create(dir.join(name)).unwrap());
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, "etc/.wh.removed", io::empty())
+                    .unwrap();
+                archive.finish().unwrap();
+            };
+            // A pack's only layer is a merged view: its `.wh.` name is a file.
+            let single = tempfile::tempdir().unwrap();
+            write_layer(single.path(), "layer.tar");
+            assert!(storage_budget(single.path()).unwrap().is_some());
+            // Over another layer it is a whiteout, which the helper cannot apply.
+            let stacked = tempfile::tempdir().unwrap();
+            write_layer(stacked.path(), "a.tar");
+            write_layer(stacked.path(), "b.tar");
+            assert!(storage_budget(stacked.path()).unwrap().is_none());
         }
 
         #[test]

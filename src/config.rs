@@ -890,6 +890,18 @@ fn default_mem() -> u32 {
 }
 
 impl VmRecord {
+    /// The host directory holding this machine's `local:` image, mounted so the
+    /// guest boots that image offline, or `None` when it has no local image or
+    /// its packed image was prepared on its own storage disk. Such a disk holds
+    /// the pack's image under the same reference, and mounting the archive the
+    /// reference also names would boot the pack's source image instead.
+    pub fn local_image_layers_dir(&self) -> Option<std::path::PathBuf> {
+        if self.packed_image_on_storage {
+            return None;
+        }
+        crate::data::image_source::packed_layers_dir_for_ref(self.image.as_deref()?)
+    }
+
     /// The artifact whose layers must be mounted from the host, if any.
     pub fn packed_layer_source(&self) -> Option<&str> {
         if self.packed_image_on_storage {
@@ -2103,6 +2115,17 @@ mod tests {
         let mut r = rec_with_image("alpine:3.20", false, vec![]);
         r.source_smolmachine = Some("library/alpine:latest".to_string());
         assert!(!r.image_needs_host_fetch());
+    }
+
+    /// A machine whose packed image is on its storage disk keeps the `local:`
+    /// reference of the pack's source image, and must not mount that image's
+    /// archive: doing so booted the source image instead of the pack.
+    #[test]
+    fn a_local_image_on_storage_mounts_no_archive() {
+        let mut record = rec_with_image("local:abc", false, vec![]);
+        assert!(record.local_image_layers_dir().is_some());
+        record.packed_image_on_storage = true;
+        assert_eq!(record.local_image_layers_dir(), None);
     }
 
     #[test]

@@ -183,6 +183,9 @@ pub struct MachineEntry {
     /// virtiofs instead of having the guest pull from a registry. `None` for
     /// image/registry-sourced machines and packs already seeded onto storage.
     pub source_smolmachine: Option<String>,
+    /// The packed image was prepared on the machine's storage disk, so its
+    /// `local:` image reference names no archive to mount.
+    pub packed_image_on_storage: bool,
     /// Whether ordinary starts should launch this machine as a fork base.
     pub forkable: bool,
     /// Planned CUDA clone count used to restore the same virtual-VRAM policy
@@ -701,6 +704,7 @@ impl ApiState {
                             network: record.network,
                             secret_refs: record.secret_refs.clone(),
                             source_smolmachine: record.packed_layer_source().map(str::to_owned),
+                            packed_image_on_storage: record.packed_image_on_storage,
                             forkable: record.forkable_on_start(),
                             cuda_fork_pool_size: record.cuda_fork_pool_size,
                             cuda_vram_limit_mib: record.cuda_vram_limit_mib,
@@ -1329,6 +1333,7 @@ impl ApiState {
                         network: reg.network,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: record.packed_layer_source().map(str::to_owned),
+                        packed_image_on_storage: record.packed_image_on_storage,
                         forkable: reg.forkable,
                         cuda_fork_pool_size: None,
                         cuda_vram_limit_mib: None,
@@ -1585,6 +1590,7 @@ where
 pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
+    image_on_storage: bool,
     image: Option<&str>,
     dns_filter_hosts: Option<Vec<String>>,
     credentials: Option<crate::credentials::CredentialLaunch>,
@@ -1599,8 +1605,9 @@ pub fn build_launch_features(
         None => features,
     };
     // A `local:` image (a registry image the host fetched for a machine with
-    // no network) is mounted the same way, so the guest boots it offline.
-    if features.packed_layers_dir.is_none() {
+    // no network) is mounted the same way, so the guest boots it offline,
+    // unless the image was prepared on the machine's storage disk.
+    if features.packed_layers_dir.is_none() && !image_on_storage {
         features.packed_layers_dir =
             image.and_then(crate::data::image_source::packed_layers_dir_for_ref);
     }
@@ -1677,6 +1684,7 @@ pub async fn ensure_machine_running(
         let mut features = build_launch_features(
             entry.manager.name(),
             entry.source_smolmachine.as_deref(),
+            entry.packed_image_on_storage,
             entry.image.as_deref(),
             entry.resources.allowed_hosts.clone(),
             entry.credentials.clone(),
@@ -2345,14 +2353,20 @@ mod tests {
 
     #[test]
     fn build_launch_features_mounts_a_local_image() {
-        let features = build_launch_features(None, None, Some("local:abc"), None, None).unwrap();
+        let features =
+            build_launch_features(None, None, false, Some("local:abc"), None, None).unwrap();
         assert_eq!(
             features.packed_layers_dir,
             crate::data::image_source::packed_layers_dir_for_ref("local:abc")
         );
         // A registry image is pulled by the guest; nothing to mount.
-        let features = build_launch_features(None, None, Some("alpine"), None, None).unwrap();
+        let features =
+            build_launch_features(None, None, false, Some("alpine"), None, None).unwrap();
         assert!(features.packed_layers_dir.is_none());
+        // Prepared on the machine's storage disk, it mounts no archive.
+        let features =
+            build_launch_features(None, None, true, Some("local:abc"), None, None).unwrap();
+        assert_eq!(features.packed_layers_dir, None);
     }
 
     #[test]
@@ -2360,11 +2374,12 @@ mod tests {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
         let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
-        let features = build_launch_features(None, None, None, Some(hosts.clone()), None).unwrap();
+        let features =
+            build_launch_features(None, None, false, None, Some(hosts.clone()), None).unwrap();
         assert_eq!(features.dns_filter_hosts, Some(hosts));
 
         // No hostname policy stays None (unrestricted egress, unchanged behavior).
-        let features = build_launch_features(None, None, None, None, None).unwrap();
+        let features = build_launch_features(None, None, false, None, None, None).unwrap();
         assert_eq!(features.dns_filter_hosts, None);
     }
 
@@ -2419,6 +2434,7 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                packed_image_on_storage: false,
                 forkable: false,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
@@ -2480,6 +2496,7 @@ mod tests {
             network: false,
             secret_refs: Default::default(),
             source_smolmachine: None,
+            packed_image_on_storage: false,
             forkable: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
@@ -2544,6 +2561,7 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                packed_image_on_storage: false,
                 forkable: false,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
@@ -2622,6 +2640,7 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                packed_image_on_storage: false,
                 forkable: false,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
