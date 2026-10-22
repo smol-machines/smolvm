@@ -3663,6 +3663,7 @@ mod tests {
             memory_mib: 64,
             storage_gib: None,
             overlay_gib: None,
+            disk_durability: None,
             device_profile: "test".into(),
             state: asset("checkpoint/checkpoint.bin"),
             memory: asset("checkpoint/memory.bin"),

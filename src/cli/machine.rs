@@ -6664,6 +6664,11 @@ pub struct UpdateCmd {
     #[arg(long = "block-io", value_enum)]
     pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
 
+    /// Set whether a guest flush waits for the host's disk (full) or guest
+    /// writes reach it on the host's schedule (deferred), for the next start.
+    #[arg(long = "disk-durability", value_enum)]
+    pub disk_durability: Option<smolvm::data::resources::DiskDurability>,
+
     /// Replace the guest resolv.conf options (repeatable, in order), as
     /// `machine create --dns-option` sets them. Written when the guest next
     /// boots; a machine waiting to resume a checkpoint resumes with the file it
@@ -6744,6 +6749,7 @@ impl UpdateCmd {
             storage,
             overlay,
             block_io,
+            disk_durability,
             dns_option,
             clear_dns_options,
             shm_size,
@@ -6773,6 +6779,7 @@ impl UpdateCmd {
             || storage.is_some()
             || overlay.is_some()
             || block_io.is_some()
+            || disk_durability.is_some()
             || !dns_option.is_empty()
             || *clear_dns_options
             || shm_size.is_some();
@@ -6936,6 +6943,7 @@ impl UpdateCmd {
             cpus: self.cpus.unwrap_or(record.cpus),
             memory_mib: self.mem.unwrap_or(record.mem),
             block_io: self.block_io.unwrap_or(record.block_io),
+            disk_durability: self.disk_durability.unwrap_or(record.disk_durability),
             ..record.vm_resources()
         };
         proposed.validate()?;
@@ -7100,6 +7108,13 @@ impl UpdateCmd {
             if let Some(block_io) = self.block_io {
                 changes.push(format!("  block I/O: {:?} → {:?}", r.block_io, block_io));
                 r.block_io = block_io;
+            }
+            if let Some(durability) = self.disk_durability {
+                changes.push(format!(
+                    "  disk durability: {:?} → {:?}",
+                    r.disk_durability, durability
+                ));
+                r.disk_durability = durability;
             }
 
             // Network

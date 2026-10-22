@@ -587,6 +587,11 @@ pub struct PortableCheckpointManifest {
     /// Effective writable overlay size in GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_gib: Option<u64>,
+    /// Whether a guest flush waits for the host's disk (`full`) or guest writes
+    /// reach it on the host's schedule (`deferred`). Absent on checkpoints
+    /// captured before it was recorded, which restore as `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_durability: Option<String>,
     /// Stable identifier for the captured virtual device topology.
     pub device_profile: String,
     /// Serialized VM, vCPU, and device state.

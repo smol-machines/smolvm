@@ -1430,6 +1430,7 @@ fn restored_record(
     );
     record.storage_gb = checkpoint.storage_gib;
     record.overlay_gb = checkpoint.overlay_gib;
+    record.disk_durability = restored_disk_durability(checkpoint)?;
     record.allowed_cidrs = network.and_then(|network| network.allowed_cidrs.clone());
     record.egress_rules = network.map_or_else(Vec::new, |network| network.egress_rules.clone());
     smolvm_network::EgressPolicy::unrestricted()
@@ -2527,6 +2528,13 @@ fn capture_with_completion(
         overlay_gib: Some(
             vm.overlay_gb
                 .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
+        ),
+        disk_durability: Some(
+            match vm.disk_durability {
+                crate::data::resources::DiskDurability::Full => "full",
+                crate::data::resources::DiskDurability::Deferred => "deferred",
+            }
+            .to_string(),
         ),
         device_profile: if packed_layers.is_some() || host_image.is_some() {
             DEVICE_PROFILE_PACKED_LAYERS
@@ -3809,6 +3817,21 @@ fn checkpoint_host_mounts(vm: &VmRecord) -> Vec<smolvm_pack::format::CheckpointH
             },
         )
         .collect()
+}
+
+/// The disk durability a checkpoint was captured with. One captured before it
+/// was recorded restores with the default, `full`.
+fn restored_disk_durability(
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<crate::data::resources::DiskDurability> {
+    match checkpoint.disk_durability.as_deref() {
+        None | Some("full") => Ok(crate::data::resources::DiskDurability::Full),
+        Some("deferred") => Ok(crate::data::resources::DiskDurability::Deferred),
+        Some(other) => Err(Error::agent(
+            "restore checkpoint",
+            format!("checkpoint uses unknown disk durability '{other}'"),
+        )),
+    }
 }
 
 /// Parse the effective network backend persisted by a version-two checkpoint.
@@ -7233,6 +7256,7 @@ mod tests {
             memory_mib: 512,
             storage_gib: None,
             overlay_gib: None,
+            disk_durability: None,
             device_profile: DEVICE_PROFILE.to_string(),
             state: describe_asset(&source.join("checkpoint.bin"), "checkpoint/checkpoint.bin")
                 .unwrap(),
@@ -8382,6 +8406,29 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_checkpoint_keeps_the_disk_durability_it_was_captured_with() {
+        use crate::data::resources::DiskDurability;
+        let with = |durability: Option<&str>| PortableCheckpointManifest {
+            disk_durability: durability.map(str::to_string),
+            ..minimal_checkpoint_manifest()
+        };
+        assert_eq!(
+            restored_disk_durability(&with(Some("deferred"))).unwrap(),
+            DiskDurability::Deferred
+        );
+        assert_eq!(
+            restored_disk_durability(&with(Some("full"))).unwrap(),
+            DiskDurability::Full
+        );
+        // Captured before durability was recorded: the default it ran with.
+        assert_eq!(
+            restored_disk_durability(&with(None)).unwrap(),
+            DiskDurability::Full
+        );
+        assert!(restored_disk_durability(&with(Some("none"))).is_err());
+    }
+
+    #[test]
     fn a_credentialed_machine_records_the_virtio_net_backend_it_runs_on() {
         // `--net` alone launches on TSI, but a credential policy steers the
         // default backend to virtio-net. The checkpoint must record the
@@ -8886,6 +8933,7 @@ mod tests {
             memory_mib: 1,
             storage_gib: None,
             overlay_gib: None,
+            disk_durability: None,
             device_profile: DEVICE_PROFILE.to_string(),
             state: CheckpointAsset {
                 path: "checkpoint/checkpoint.bin".to_string(),
