@@ -182,9 +182,16 @@ pub(crate) fn online_memory(start: u64, length: u64, client_fd: Option<RawFd>) -
         }
     };
     match memory_online_plan(blocks, read_state) {
-        Ok(remaining) if remaining.is_empty() => AgentResponse::Ok {
-            data: Some(serde_json::json!({"start_address": start, "online_bytes": length})),
-        },
+        Ok(remaining) if remaining.is_empty() => {
+            // The RAM is online either way; a /dev/shm left at its old size is
+            // logged rather than failing the resize.
+            if let Err(error) = crate::nsfile::regrow_shm_everywhere() {
+                tracing::warn!(%error, "could not regrow /dev/shm after a RAM grow");
+            }
+            AgentResponse::Ok {
+                data: Some(serde_json::json!({"start_address": start, "online_bytes": length})),
+            }
+        }
         _ => AgentResponse::error(
             "RAM online state could not be verified; retry the same range",
             error_codes::INTERNAL_ERROR,

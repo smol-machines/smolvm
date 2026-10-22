@@ -20,8 +20,9 @@ session are there in the second. That is the whole use case, and it turns on one
 | `pack start` then `exec` | daemon mode: package installs and file writes persist across exec sessions, and `/workspace` across a stop and start too |
 | `machine create --from <artifact>.smolmachine` | a persistent named machine from a packed artifact, booting from pre-extracted layers (the agent ready in about 150 ms on v1.29.0 on macOS arm64, no image pull), with full `exec` persistence |
 
-`/tmp`, `/run` and `/dev/shm` are tmpfs whatever the mode, except that `machine run --unprivileged`
-keeps only `/dev/shm`. They keep their contents while the
+`/run` and `/dev/shm` are tmpfs whatever the mode, except that `machine run --unprivileged`
+keeps only `/dev/shm`. `/tmp` is a directory on the machine's disk, so it holds as much as the disk
+does (`--unprivileged` uses the image's own `/tmp` instead). All three keep their contents while the
 machine runs, including across `exec` sessions, and are empty again after a stop and start. Write
 anything that must outlive a restart to `/workspace` or elsewhere on the storage disk, including
 credentials and configuration, which should not sit in `/tmp` or behind a symlink into it.

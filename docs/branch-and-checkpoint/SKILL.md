@@ -57,7 +57,7 @@ scripts/create-source.sh smolskill-src                 # for checkpoints and res
 scripts/create-source.sh smolskill-bp --branch-ready   # for a batch branch
 ```
 
-The workload writes a counter into `/tmp` every second, which is tmpfs and so RAM, and a marker to
+The workload writes a counter into `/dev/shm` every second, which is tmpfs and so RAM, and a marker to
 `/root/setup.txt` on disk. A restore that brings the counter back proves memory came back, not only
 the disk. `--branch-ready` makes the workload park in `smolvm-branch-ready` after its setup, which a
 batch branch waits for.

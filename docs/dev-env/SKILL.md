@@ -127,11 +127,11 @@ Observed, not inferred:
 | pip `--user` packages | yes | under `$HOME`, on the overlay |
 | `$HOME/...` files | yes | overlay |
 | files written at `/` | yes | overlay |
-| `/tmp` | **no** | `tmpfs` |
+| `/tmp` | **no** | emptied at each start, like a `tmpfs` |
 | `/storage/...` | yes | the ext4 disk itself |
 
 The root filesystem is an overlay whose upper layer lives on the machine's ext4 disk, which is why
-writes to `/` persist while `tmpfs` mounts do not.
+writes to `/` persist while `tmpfs` mounts and `/tmp` do not.
 
 ## Traps
 

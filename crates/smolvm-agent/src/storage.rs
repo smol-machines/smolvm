@@ -3995,6 +3995,34 @@ fn is_volume_metadata(name: &std::ffi::OsStr) -> bool {
     )
 }
 
+/// Create the directory that backs a workload's /tmp (see
+/// [`crate::oci::OciSpec::write_to`]), world-writable and sticky like any /tmp.
+fn ensure_workload_tmp(overlay_root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = overlay_root.join(crate::oci::WORKLOAD_TMP_DIR);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    // Set after creation: the process umask would drop the sticky and
+    // world-writable bits from create_dir's mode.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
+    Ok(())
+}
+
+/// Empty a workload's /tmp before its machine boots, as a tmpfs /tmp was.
+/// Best effort: a /tmp that cannot be cleared is still usable, so this never
+/// fails the boot.
+fn reset_workload_tmp(overlay_root: &Path) {
+    let dir = overlay_root.join(crate::oci::WORKLOAD_TMP_DIR);
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %dir.display(), error = %e, "could not clear workload /tmp");
+        }
+    }
+}
+
 /// Reject lower layers that cannot produce the image's filesystem.
 ///
 /// A single empty layer is legal -- an OCI layer may carry only metadata or
@@ -4234,6 +4262,8 @@ impl OverlaySetup {
             })?;
         }
 
+        ensure_workload_tmp(&self.overlay_root)?;
+
         debug!(bundle = %bundle_path.display(), "OCI bundle directory created");
         Ok(())
     }
@@ -4274,6 +4304,7 @@ impl OverlaySetup {
     /// remounts it preserving the upper layer (which contains previous changes).
     /// If the overlay does not exist at all, creates it fresh.
     fn execute_or_remount(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
+        let mut restored_fork = false;
         // Already mounted — reuse it only if it actually answers lookups.
         if self.merged_path.exists() && is_mountpoint(&self.merged_path) {
             if mounted_overlay_is_healthy(&self.merged_path) {
@@ -4302,11 +4333,17 @@ impl OverlaySetup {
             }
             let _ = std::fs::remove_file(&id_path);
             detach_mount(&self.merged_path);
+            restored_fork = true;
         }
 
         // Upper layer exists from a previous session — remount preserving it
         if self.upper_path.exists() {
             info!(workload_id = %self.workload_id, "remounting persistent overlay with existing upper layer");
+            // A boot starts with an empty /tmp, as it did on the tmpfs; a fork
+            // clone keeps the golden's, like the rest of its state.
+            if !restored_fork {
+                reset_workload_tmp(&self.overlay_root);
+            }
             refresh_overlay_resolver(&self.upper_path)?;
 
             // overlayfs requires an empty work directory at mount time
@@ -6608,6 +6645,26 @@ mod tests {
             .map(|(tag, _, _)| tag.as_str())
             .collect();
         assert_eq!(tags, ["data", "node", "npm", "cache"]);
+    }
+
+    /// The workload's /tmp directory is a sticky, world-writable /tmp that a
+    /// boot empties and a second bundle setup leaves alone.
+    #[test]
+    fn workload_tmp_is_a_sticky_tmp_that_a_boot_empties() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let overlay = tempfile::tempdir().unwrap();
+        let dir = overlay.path().join(crate::oci::WORKLOAD_TMP_DIR);
+        ensure_workload_tmp(overlay.path()).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o1777);
+
+        std::fs::write(dir.join("left-over"), b"x").unwrap();
+        ensure_workload_tmp(overlay.path()).unwrap();
+        assert!(dir.join("left-over").exists());
+
+        reset_workload_tmp(overlay.path());
+        ensure_workload_tmp(overlay.path()).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[cfg(target_os = "linux")]

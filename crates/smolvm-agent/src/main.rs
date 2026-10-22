@@ -143,16 +143,19 @@ const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 /// for package managers, browsers, language servers, and concurrent tools.
 pub(crate) const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
 
+/// Raise kernel limits to what GitHub's hosted runners set, so software that
+/// works there does not fail here on a small guest kernel's defaults. File
+/// watchers (webpack, jest, IDE servers) need more inotify watches and
+/// instances than the default (about 16k watches at 2 GiB), and Elasticsearch,
+/// OpenSearch and some JVM and database workloads refuse to start below
+/// 262144 memory maps (default 65530). A watch or a map costs memory only once
+/// used, and a higher value already set is kept.
 #[cfg(target_os = "linux")]
-/// File watchers (webpack, jest, IDE servers) need more inotify watches than
-/// a small guest kernel defaults to (about 16k at 2 GiB). Raise them to what
-/// hosted CI runners and IDEs use; a watch costs memory only once added, and a
-/// higher value already set is kept.
-#[cfg(target_os = "linux")]
-fn raise_inotify_limits() {
+fn raise_kernel_limits() {
     for (path, wanted) in [
-        ("/proc/sys/fs/inotify/max_user_watches", 524_288u64),
-        ("/proc/sys/fs/inotify/max_user_instances", 1_024),
+        ("/proc/sys/fs/inotify/max_user_watches", 655_360u64),
+        ("/proc/sys/fs/inotify/max_user_instances", 1_280),
+        ("/proc/sys/vm/max_map_count", 262_144),
     ] {
         let current = std::fs::read_to_string(path)
             .ok()
@@ -366,7 +369,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     delegate_root_cgroup_controllers();
     #[cfg(target_os = "linux")]
-    raise_inotify_limits();
+    raise_kernel_limits();
 
     // Create /dev/dri device nodes only when GPU is enabled. The setup
     // function polls up to 500ms for the virtio-gpu driver to finish probing —

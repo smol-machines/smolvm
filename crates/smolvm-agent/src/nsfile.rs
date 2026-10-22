@@ -105,6 +105,7 @@ pub fn run_helper() -> i32 {
         "write" => helper_write(&path, mode, uid, gid),
         "connect" => helper_connect(&path),
         "mount-cache" => helper_mount_cache(&path, &args),
+        "remount-shm" => helper_remount_shm(&path, &args),
         _ => Err("unknown op".to_string()),
     };
     match result {
@@ -185,18 +186,121 @@ fn helper_mount_cache(_path: &str, _args: &[String]) -> Result<(), String> {
     Err("mount namespaces are Linux-only".to_string())
 }
 
+/// Resize the tmpfs at `path` in the namespace just joined to the size after
+/// the path (`50%` and the like, resolved against the RAM online now). Anything
+/// other than a tmpfs there is left alone.
+#[cfg(target_os = "linux")]
+fn helper_remount_shm(path: &str, args: &[String]) -> Result<(), String> {
+    let size = args
+        .get(5)
+        .ok_or_else(|| "remount-shm: usage: remount-shm <pid> <path> <size>".to_string())?;
+    let c = |s: &str| std::ffi::CString::new(s).map_err(|e| e.to_string());
+    let (target, data) = (c(path)?, c(&format!("size={size}"))?);
+    // statfs rather than /proc/self/mountinfo: the container's /proc belongs to
+    // its own PID namespace, where this helper has no `self`.
+    // SAFETY: `target` is NUL-terminated and `fs` is a properly sized buffer.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(target.as_ptr(), &mut fs) } != 0 || !is_tmpfs(&fs) {
+        return Ok(());
+    }
+    // A remount clears the per-mount flags it is not given, so the mount's
+    // own are passed back (ST_* and MS_* share these bit values).
+    // SAFETY: as for statfs above.
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(target.as_ptr(), &mut vfs) } != 0 {
+        return Err(format!(
+            "statvfs {path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let kept = vfs.f_flag & (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC);
+    // SAFETY: valid NUL-terminated strings that outlive the call.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | kept,
+            data.as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "remount {path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `fs` describes a tmpfs. The type of `f_type` differs between glibc
+/// and musl, so both sides are widened to one type.
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_cast)]
+fn is_tmpfs(fs: &libc::statfs) -> bool {
+    fs.f_type as i64 == libc::TMPFS_MAGIC as i64
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_remount_shm(_path: &str, _args: &[String]) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+/// Regrow /dev/shm in every container after the machine gained RAM. Its size
+/// is a share of memory resolved when the tmpfs was mounted, so without this a
+/// live grow left it at the boot size. A machine started with `--shm-size`
+/// keeps the size it asked for.
+#[cfg(target_os = "linux")]
+pub(crate) fn regrow_shm_everywhere() -> Result<(), String> {
+    if std::env::var_os(smolvm_protocol::guest_env::SHM_SIZE).is_some() {
+        return Ok(());
+    }
+    in_every_container(|pid| {
+        vec![
+            "ns-file".into(),
+            "remount-shm".into(),
+            pid.to_string(),
+            "/dev/shm".into(),
+            "50%".into(),
+        ]
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn regrow_shm_everywhere() -> Result<(), String> {
+    Ok(())
+}
+
 /// Mount the cache slot into the mount namespace of every container this
-/// machine runs, one child per distinct namespace. Only crun's own containers
-/// are entered: a container the user runs inside one (Docker in the machine,
-/// an `unshare`) has a namespace of its own and never asked for the cache.
-/// Every container is tried, and all failures are reported together, so one
-/// namespace that refuses the mount does not leave the rest without it.
+/// machine runs, one child per distinct namespace (see [`in_every_container`]),
+/// so one namespace that refuses the mount does not leave the rest without it.
 #[cfg(target_os = "linux")]
 fn mount_cache_everywhere(args: &[String]) -> Result<(), String> {
     let (path, major, minor) = match (args.get(3), args.get(4), args.get(5)) {
         (Some(p), Some(a), Some(b)) => (p.clone(), a.clone(), b.clone()),
         _ => return Err("usage: mount-cache-all <path> <major> <minor>".to_string()),
     };
+    in_every_container(|pid| {
+        [
+            "ns-file",
+            "mount-cache",
+            &pid.to_string(),
+            &path,
+            &major,
+            &minor,
+        ]
+        .map(String::from)
+        .to_vec()
+    })
+}
+
+/// Run this binary with `helper_args(pid)` once per distinct mount namespace
+/// among the machine's crun containers. Only crun's own containers are entered:
+/// a container the user runs inside one (Docker in the machine, an `unshare`)
+/// has a namespace of its own and is left to its owner. Every container is
+/// tried, and all failures are reported together.
+#[cfg(target_os = "linux")]
+fn in_every_container(helper_args: impl Fn(u32) -> Vec<String>) -> Result<(), String> {
     let own = std::fs::read_link("/proc/self/ns/mnt").map_err(|e| format!("own namespace: {e}"))?;
     let skip = [Some(own), std::fs::read_link("/proc/1/ns/mnt").ok()];
     let containers = live_containers().into_iter().filter_map(|pid| {
@@ -204,12 +308,13 @@ fn mount_cache_everywhere(args: &[String]) -> Result<(), String> {
             .ok()
             .map(|ns| (pid, ns))
     });
-    let exe = std::env::current_exe().map_err(|e| format!("own binary: {e}"))?;
+    // The fixed path, not current_exe(): the agent pivot_roots during boot, so
+    // its own /proc/self/exe no longer resolves when PID 1 calls this.
+    let exe = AGENT_BINARY;
     let mut failures = Vec::new();
     for pid in namespaces_to_enter(containers, &skip) {
-        let pid = pid.to_string();
-        match std::process::Command::new(&exe)
-            .args(["ns-file", "mount-cache", &pid, &path, &major, &minor])
+        match std::process::Command::new(exe)
+            .args(helper_args(pid))
             .output()
         {
             Ok(output) if output.status.success() => {}

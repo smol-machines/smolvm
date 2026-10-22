@@ -91,6 +91,8 @@ pub struct OciUser {
 pub struct ProcessIdentity {
     pub user: OciUser,
     pub home: Option<String>,
+    /// The rootfs can load the `C.UTF-8` locale, so `LANG` may default to it.
+    pub c_utf8: bool,
 }
 
 impl ProcessIdentity {
@@ -102,6 +104,7 @@ impl ProcessIdentity {
                 additional_gids: vec![],
             },
             home: Some("/root".to_string()),
+            c_utf8: false,
         }
     }
 }
@@ -130,6 +133,39 @@ struct ResolvedUser {
 }
 
 pub fn resolve_process_identity(
+    rootfs: &Path,
+    user_spec: Option<&str>,
+) -> Result<ProcessIdentity, String> {
+    let mut identity = resolve_user_identity(rootfs, user_spec)?;
+    identity.c_utf8 = has_c_utf8_locale(rootfs);
+    Ok(identity)
+}
+
+/// Whether programs in `rootfs` can load `C.UTF-8`: glibc images that ship it
+/// (Debian, Ubuntu, Fedora, Amazon Linux) and musl, which needs no locale files.
+/// `LANG` stays unset elsewhere, since a locale that fails to load makes perl
+/// and others warn on every start.
+fn has_c_utf8_locale(rootfs: &Path) -> bool {
+    let locales = rootfs.join("usr/lib/locale");
+    if ["C.utf8", "C.UTF-8"]
+        .iter()
+        .any(|name| locales.join(name).is_dir())
+    {
+        return true;
+    }
+    ["lib", "usr/lib"].iter().any(|dir| {
+        std::fs::read_dir(rootfs.join(dir)).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("ld-musl-"))
+            })
+        })
+    })
+}
+
+fn resolve_user_identity(
     rootfs: &Path,
     user_spec: Option<&str>,
 ) -> Result<ProcessIdentity, String> {
@@ -173,6 +209,7 @@ pub fn resolve_process_identity(
             additional_gids,
         },
         home,
+        c_utf8: false,
     })
 }
 
@@ -198,8 +235,9 @@ pub fn home_for(identity: &ProcessIdentity) -> &str {
 /// inheriting the container's) go through here, so the two can no longer
 /// drift: earlier they did, and first `SSH_AUTH_SOCK` and then `HOME` were
 /// present on one path and silently absent on the other. The caller's
-/// variables always win; `PATH`, `TERM` and `HOME` are only filled in when the
-/// caller left them out, and nothing is ever duplicated.
+/// variables always win; `PATH`, `TERM`, `HOME` and `LANG` are only filled in
+/// when the caller left them out, and nothing is ever duplicated. `LANG` is
+/// `C.UTF-8` as on GitHub's runners, where the rootfs can load it.
 pub fn process_env_for(
     identity: &ProcessIdentity,
     env: &[(String, String)],
@@ -209,8 +247,9 @@ pub fn process_env_for(
         ("PATH", crate::crun::DEFAULT_CONTAINER_PATH),
         ("TERM", "xterm-256color"),
         ("HOME", home_for(identity)),
+        ("LANG", if identity.c_utf8 { "C.UTF-8" } else { "" }),
     ] {
-        if !out.iter().any(|(k, _)| k == key) {
+        if !value.is_empty() && !out.iter().any(|(k, _)| k == key) {
             out.push((key.to_string(), value.to_string()));
         }
     }
@@ -273,6 +312,7 @@ fn resolve_default_root_identity(
                 ),
             },
             home: Some(root.home.clone()),
+            c_utf8: false,
         };
     }
 
@@ -730,10 +770,47 @@ impl OciSpec {
         });
     }
 
+    /// Back the workload's /tmp with `dir` on the storage disk instead of a
+    /// tmpfs. A tmpfs is sized from the RAM the machine booted with and never
+    /// grows with it, so a cold `yarn install` or a large build hit ENOSPC with
+    /// the disk mostly empty; GitHub's runners and most VMs keep /tmp on disk.
+    /// The directory sits outside the overlay's upper layer, so /tmp still
+    /// hides the image's own /tmp and never ends up in a packed or exported
+    /// machine, as with the tmpfs. Only the default tmpfs is replaced: a
+    /// caller's own /tmp mount is kept.
+    fn back_tmp_with(&mut self, dir: &Path) {
+        for mount in &mut self.mounts {
+            if mount.destination == "/tmp" && mount.mount_type.as_deref() == Some("tmpfs") {
+                *mount = OciMount {
+                    destination: "/tmp".to_string(),
+                    mount_type: Some("bind".to_string()),
+                    source: dir.display().to_string(),
+                    options: vec![
+                        "bind".to_string(),
+                        "rprivate".to_string(),
+                        "nosuid".to_string(),
+                        "nodev".to_string(),
+                    ],
+                };
+            }
+        }
+    }
+
     /// Write the OCI spec to a config.json file in the bundle directory.
+    ///
+    /// When the overlay next to the bundle has a [`WORKLOAD_TMP_DIR`], the
+    /// written spec backs /tmp with it (see [`Self::back_tmp_with`]).
     pub fn write_to(&self, bundle_dir: &Path) -> std::io::Result<()> {
         let config_path = bundle_dir.join("config.json");
-        let json = serde_json::to_string_pretty(self)
+        let tmp_dir = bundle_dir
+            .parent()
+            .map(|overlay| overlay.join(WORKLOAD_TMP_DIR))
+            .filter(|dir| dir.is_dir());
+        let mut spec = std::borrow::Cow::Borrowed(self);
+        if let Some(dir) = tmp_dir {
+            spec.to_mut().back_tmp_with(&dir);
+        }
+        let json = serde_json::to_string_pretty(&*spec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(config_path, json)
     }
@@ -1171,7 +1248,9 @@ fn tun_device_mount(guest_node: &Path) -> Option<OciMount> {
     })
 }
 
-/// Default mounts for container execution.
+/// Directory beside an overlay's `bundle` that backs the workload's /tmp.
+pub const WORKLOAD_TMP_DIR: &str = "tmp";
+
 /// The workload's /dev/shm size: the machine's `--shm-size`, else half the
 /// guest's RAM, as on a Linux VM or a hosted CI runner rather than Docker's
 /// 64 MiB (browsers and ML loaders size buffers from it). tmpfs takes memory
@@ -1183,6 +1262,7 @@ fn shm_size() -> String {
         .unwrap_or_else(|| "50%".to_string())
 }
 
+/// Default mounts for container execution.
 fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
     let mut mounts = vec![
         // /proc - process information
@@ -1757,6 +1837,7 @@ mod tests {
                     additional_gids: vec![29],
                 },
                 home: Some("/home/steam".to_string()),
+                c_utf8: false,
             },
             false,
         );
@@ -1921,6 +2002,82 @@ mod tests {
         assert_eq!(spec.process.env, expected);
     }
 
+    /// /tmp is the disk directory beside the bundle when the overlay has one,
+    /// mounted where the tmpfs was so later mounts under /tmp still stack on
+    /// it, and stays a tmpfs for a bundle without one.
+    #[test]
+    fn written_spec_backs_tmp_with_the_overlay_directory() {
+        let written_tmp = |overlay: &Path| {
+            let bundle = overlay.join("bundle");
+            std::fs::create_dir_all(&bundle).unwrap();
+            let mut spec = OciSpec::new(
+                &["sh".to_string()],
+                &[],
+                "/",
+                false,
+                &ProcessIdentity::root(),
+                false,
+            );
+            spec.add_bind_mount("/storage/cache", "/tmp/cache", false);
+            spec.write_to(&bundle).unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap())
+                    .unwrap();
+            let mounts = json["mounts"].as_array().unwrap().clone();
+            let at = |dest: &str| {
+                mounts
+                    .iter()
+                    .position(|m| m["destination"] == dest)
+                    .unwrap()
+            };
+            assert!(at("/tmp") < at("/tmp/cache"));
+            mounts[at("/tmp")].clone()
+        };
+
+        let overlay = tempfile::tempdir().unwrap();
+        assert_eq!(written_tmp(overlay.path())["type"], "tmpfs");
+
+        std::fs::create_dir(overlay.path().join(WORKLOAD_TMP_DIR)).unwrap();
+        let tmp = written_tmp(overlay.path());
+        assert_eq!(tmp["type"], "bind");
+        assert_eq!(
+            tmp["source"],
+            overlay.path().join(WORKLOAD_TMP_DIR).display().to_string()
+        );
+        assert!(tmp["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "nosuid"));
+    }
+
+    /// LANG defaults to C.UTF-8 only for a rootfs that can load it, and never
+    /// overrides the image's or the caller's.
+    #[test]
+    fn lang_defaults_to_c_utf8_where_the_rootfs_has_it() {
+        let lang = |rootfs: &Path, env: &[(String, String)]| {
+            let identity = resolve_process_identity(rootfs, None).unwrap();
+            process_env_for(&identity, env)
+                .into_iter()
+                .filter(|(k, _)| k == "LANG")
+                .map(|(_, v)| v)
+                .collect::<Vec<_>>()
+        };
+        let bare = tempfile::tempdir().unwrap();
+        assert!(lang(bare.path(), &[]).is_empty());
+
+        let glibc = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(glibc.path().join("usr/lib/locale/C.utf8")).unwrap();
+        assert_eq!(lang(glibc.path(), &[]), ["C.UTF-8"]);
+        let own = [("LANG".to_string(), "en_US.UTF-8".to_string())];
+        assert_eq!(lang(glibc.path(), &own), ["en_US.UTF-8"]);
+
+        let musl = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(musl.path().join("lib")).unwrap();
+        std::fs::write(musl.path().join("lib/ld-musl-x86_64.so.1"), b"").unwrap();
+        assert_eq!(lang(musl.path(), &[]), ["C.UTF-8"]);
+    }
+
     /// A numeric uid that has no passwd entry still gets a HOME, as Docker
     /// gives it, so tools that write under $HOME do not fail on an empty path.
     #[test]
@@ -1932,6 +2089,7 @@ mod tests {
                 additional_gids: vec![],
             },
             home: None,
+            c_utf8: false,
         };
         let spec = OciSpec::new(&["sh".to_string()], &[], "/", false, &identity, false);
         assert!(spec.process.env.contains(&"HOME=/".to_string()));

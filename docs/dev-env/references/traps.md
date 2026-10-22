@@ -8,7 +8,7 @@
 - A host mount source that goes missing stops every later start
 - `machine shell` does not start a stopped machine
 - A host `volumes` mount was not writable by the `app` user
-- `/tmp` is tmpfs and is wiped by a stop
+- `/tmp` is wiped by a stop
 - `machine delete` prompts and defaults to No
 - A VPN inside the machine takes its gateway and resolver
 - Do not run two lifecycle commands against the same machine at once
@@ -135,7 +135,7 @@ root. `user` also takes a numeric `uid[:gid]`, which `machine create --help` giv
 match the owner of a mounted host directory: on v1.22.2 on macOS arm64, `machine run -v
 "$PWD/src:/app" --user "$(id -u):$(id -g)"` wrote `/app/w` and the file appeared on the host.
 
-## `/tmp` is tmpfs and is wiped by a stop
+## `/tmp` is wiped by a stop
 
 Anything a provisioning step leaves in `/tmp` is gone on the next start, while the same step's
 writes to `$HOME` or `/` persist. What survives, verified by writing one file per filesystem and
@@ -146,7 +146,7 @@ restarting:
 | pip `--user` packages | yes | under `$HOME`, on the overlay |
 | `$HOME/...` files | yes | overlay |
 | files written at `/` | yes | overlay |
-| `/tmp` | **no** | `tmpfs` |
+| `/tmp` | **no** | emptied at each start, like a `tmpfs` |
 | `/storage/...` | yes | the ext4 disk itself |
 
 Read from inside the guest, the mechanism is an overlay whose upper layer lives on the machine's

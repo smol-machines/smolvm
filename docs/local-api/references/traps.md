@@ -7,7 +7,7 @@
 A file uploaded before the workload container is up is written into the agent's own namespace.
 Once the container starts, reads resolve **inside the container**, and for a path the container
 mounts over, the earlier file is no longer in the view being read. `/tmp` is exactly such a path:
-it is a tmpfs inside the guest, so the container's own `/tmp` masks whatever was seeded underneath.
+the container mounts its own `/tmp` over the image's, which masks whatever was seeded underneath.
 
 Both directions pick a namespace per request. `handle_file_write` and
 `handle_streaming_file_read` each switch on `nsfile::GuestNs::for_workload()`
