@@ -2344,6 +2344,14 @@ impl CreateVmParams {
         self.egress_rules = rules;
         self.net = true;
     }
+
+    pub fn append_allow_udp(&mut self, rules: &[smolvm_protocol::EgressRule]) {
+        if rules.is_empty() {
+            return;
+        }
+        self.egress_rules.extend_from_slice(rules);
+        self.net = true;
+    }
 }
 
 impl DefaultVmOverrides {

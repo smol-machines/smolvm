@@ -392,6 +392,8 @@ pub struct NetworkConfig {
     /// Denied egress CIDR ranges, checked before anything is allowed.
     #[serde(default)]
     pub deny_cidrs: Vec<String>,
+    #[serde(default)]
+    pub allow_udp: Vec<String>,
     /// Credential bindings (`[[network.credentials]]`). The guest receives a
     /// placeholder in each `environment_variable`; the host substitutes the
     /// real value on HTTPS requests to the binding's `allowed_hosts` only.

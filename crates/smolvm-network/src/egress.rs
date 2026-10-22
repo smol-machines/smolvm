@@ -167,12 +167,25 @@ pub fn render_live_policy(cidrs: &[String], hosts: &[String]) -> String {
     out
 }
 
+pub fn render_live_rules(rules: &[EgressRule]) -> Result<String, String> {
+    let json = serde_json::to_string(rules).map_err(|error| format!("invalid rules: {error}"))?;
+    Ok(format!("rules {json}\n"))
+}
+
+struct LivePolicy {
+    allow_list: Rules,
+    rules: Option<Vec<CompiledRule>>,
+}
+
 /// Parse a rendered allow list. An absent kind of entry means none of it, and a
-/// list with no entries at all admits nothing.
-fn parse_live_policy(bytes: &[u8]) -> Result<Rules, String> {
+/// list with no entries at all admits nothing. An optional `rules <json>` line
+/// (see [`render_live_rules`]) carries a replacement ordered rule list; without
+/// it the rules are left as they are.
+fn parse_live_policy(bytes: &[u8]) -> Result<LivePolicy, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
     let mut cidrs = Vec::new();
     let mut hosts = Vec::new();
+    let mut rules = None;
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -185,21 +198,63 @@ fn parse_live_policy(bytes: &[u8]) -> Result<Rules, String> {
             Some(("host", value)) if !value.trim().is_empty() => {
                 hosts.push(value.trim().to_string())
             }
+            Some(("rules", value)) if rules.is_none() => {
+                let parsed: Vec<EgressRule> = serde_json::from_str(value.trim())
+                    .map_err(|error| format!("line {}: invalid rules: {error}", index + 1))?;
+                rules = Some(compile_rules(&parsed)?);
+            }
             _ => {
                 return Err(format!(
-                    "line {}: expected `cidr <range>` or `host <name>`",
+                    "line {}: expected `cidr <range>`, `host <name>` or `rules <list>`",
                     index + 1
                 ))
             }
         }
     }
-    if cidrs.is_empty() && hosts.is_empty() {
-        return Ok(Rules::build(Some(&[]), Some(&[])));
+    let allow_list = if cidrs.is_empty() && hosts.is_empty() {
+        Rules::build(Some(&[]), Some(&[]))
+    } else {
+        Rules::build(
+            (!cidrs.is_empty()).then_some(cidrs.as_slice()),
+            (!hosts.is_empty()).then_some(hosts.as_slice()),
+        )
+    };
+    Ok(LivePolicy { allow_list, rules })
+}
+
+fn compile_rules(rules: &[EgressRule]) -> Result<Vec<CompiledRule>, String> {
+    let mut compiled = Vec::with_capacity(rules.len());
+    for (index, rule) in rules.iter().enumerate() {
+        let cidr = match rule.cidr.as_deref() {
+            Some(spec) => Some(
+                Cidr::parse(spec).ok_or_else(|| format!("egress rule {index}: invalid CIDR"))?,
+            ),
+            None => None,
+        };
+        if let Some(ports) = rule.ports {
+            if ports.start == 0
+                || ports.end < ports.start
+                || rule.transport == Some(FlowTransport::Icmp)
+            {
+                return Err(format!(
+                    "egress rule {index}: invalid port range or transport"
+                ));
+            }
+        }
+        if rule.action == RuleAction::Redirect && rule.transport != Some(FlowTransport::Tcp) {
+            return Err(format!(
+                "egress rule {index}: redirect requires TCP transport"
+            ));
+        }
+        compiled.push(CompiledRule {
+            transport: rule.transport,
+            cidr,
+            ports: rule.ports,
+            action: rule.action,
+            reopens_private: false,
+        });
     }
-    Ok(Rules::build(
-        (!cidrs.is_empty()).then_some(cidrs.as_slice()),
-        (!hosts.is_empty()).then_some(hosts.as_slice()),
-    ))
+    Ok(compiled)
 }
 
 /// How much of the platform hard-floor applies, chosen once per policy from the
@@ -352,7 +407,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
 #[derive(Clone)]
 pub struct EgressPolicy {
     inner: Option<Arc<AllowList>>,
-    rules: Arc<Vec<CompiledRule>>,
+    rules: Arc<RwLock<Arc<Vec<CompiledRule>>>>,
     /// Hard-floor scope, resolved once from the deployment context at creation.
     floor: FloorMode,
     /// Audit sink for denials. When set, every denied connect/sendto/resolve is
@@ -413,6 +468,7 @@ struct CompiledRule {
     cidr: Option<Cidr>,
     ports: Option<smolvm_protocol::PortRange>,
     action: RuleAction,
+    reopens_private: bool,
 }
 
 impl EgressPolicy {
@@ -420,7 +476,7 @@ impl EgressPolicy {
     pub fn unrestricted() -> Self {
         Self {
             inner: None,
-            rules: Arc::new(Vec::new()),
+            rules: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             floor: floor_mode(),
             denial_log: None,
             watchlist: None,
@@ -442,7 +498,7 @@ impl EgressPolicy {
                 rules: RwLock::new(Arc::new(Rules::build(allowed_cidrs, allowed_hosts))),
                 learned: Mutex::new(HashMap::new()),
             })),
-            rules: Arc::new(Vec::new()),
+            rules: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             floor: floor_mode(),
             denial_log: None,
             watchlist: None,
@@ -453,13 +509,23 @@ impl EgressPolicy {
 
     /// Replace the allow list of a restricted policy with a rendered one (see
     /// [`render_live_policy`]), for every clone of this policy at once. Learned
-    /// addresses of names the new list no longer allows are forgotten. An
-    /// unrestricted policy has no list to replace.
+    /// addresses of names the new list no longer allows are forgotten. When the
+    /// message also carries a `rules <json>` line (see [`render_live_rules`]),
+    /// it replaces the whole ordered rule list, deny rules included, while the
+    /// `--allow-private` exceptions stay; a message without one, sent when the
+    /// rules have not changed, keeps them. An unrestricted policy has no list
+    /// to replace.
     pub fn replace_allow_list(&self, rendered: &str) -> Result<(), String> {
         let Some(list) = &self.inner else {
             return Err("this machine has no allow list to replace".to_string());
         };
-        let next = Arc::new(parse_live_policy(rendered.as_bytes())?);
+        let LivePolicy { allow_list, rules } = parse_live_policy(rendered.as_bytes())?;
+        let next = Arc::new(allow_list);
+        if let Some(mut rules) = rules {
+            let mut current = self.rules.write().unwrap_or_else(|e| e.into_inner());
+            rules.extend(current.iter().filter(|rule| rule.reopens_private).cloned());
+            *current = Arc::new(rules);
+        }
         if let Ok(mut learned) = list.learned.lock() {
             learned.retain(|_, entry| {
                 entry
@@ -483,39 +549,12 @@ impl EgressPolicy {
     /// Compile an ordered rule list at launch. Invalid rules fail launch rather
     /// than silently weakening the effective policy.
     pub fn with_rules(mut self, rules: &[EgressRule]) -> Result<Self, String> {
-        let mut compiled = Vec::with_capacity(rules.len());
-        for (index, rule) in rules.iter().enumerate() {
-            let cidr = match rule.cidr.as_deref() {
-                Some(spec) => Some(
-                    Cidr::parse(spec)
-                        .ok_or_else(|| format!("egress rule {index}: invalid CIDR"))?,
-                ),
-                None => None,
-            };
-            if let Some(ports) = rule.ports {
-                if ports.start == 0
-                    || ports.end < ports.start
-                    || rule.transport == Some(FlowTransport::Icmp)
-                {
-                    return Err(format!(
-                        "egress rule {index}: invalid port range or transport"
-                    ));
-                }
-            }
-            if rule.action == RuleAction::Redirect && rule.transport != Some(FlowTransport::Tcp) {
-                return Err(format!(
-                    "egress rule {index}: redirect requires TCP transport"
-                ));
-            }
-            compiled.push(CompiledRule {
-                transport: rule.transport,
-                cidr,
-                ports: rule.ports,
-                action: rule.action,
-            });
-        }
-        self.rules = Arc::new(compiled);
+        self.rules = Arc::new(RwLock::new(Arc::new(compile_rules(rules)?)));
         Ok(self)
+    }
+
+    fn compiled_rules(&self) -> Arc<Vec<CompiledRule>> {
+        Arc::clone(&self.rules.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Block private, internal and link-local destinations for this machine,
@@ -523,7 +562,7 @@ impl EgressPolicy {
     /// become allow rules after any existing ones. A host already on the strict
     /// floor keeps it, so exceptions never re-open a fleet node's internal ranges.
     pub fn with_private_floor(mut self, exceptions: &[String]) -> Result<Self, String> {
-        let mut rules = self.rules.as_ref().clone();
+        let mut rules = self.compiled_rules().as_ref().clone();
         for spec in exceptions {
             let cidr = Cidr::parse(spec)
                 .ok_or_else(|| format!("--allow-private: invalid CIDR '{spec}'"))?;
@@ -532,9 +571,10 @@ impl EgressPolicy {
                 cidr: Some(cidr),
                 ports: None,
                 action: RuleAction::Allow,
+                reopens_private: true,
             });
         }
-        self.rules = Arc::new(rules);
+        self.rules = Arc::new(RwLock::new(Arc::new(rules)));
         if self.floor != FloorMode::Strict {
             self.floor = FloorMode::Private;
         }
@@ -555,28 +595,35 @@ impl EgressPolicy {
             IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
             IpAddr::V4(_) => None,
         };
-        let action = self
-            .rules
-            .iter()
-            .find(|rule| {
-                rule.transport.is_none_or(|value| value == transport)
-                    && rule.cidr.is_none_or(|cidr| {
-                        cidr.contains(ip) || mapped.is_some_and(|v4| cidr.contains(v4))
-                    })
-                    && rule.ports.is_none_or(|ports| {
-                        port.is_some_and(|port| (ports.start..=ports.end).contains(&port))
-                    })
-            })
-            .map(|rule| rule.action);
-        action?;
+        let matches = |rule: &&CompiledRule| {
+            rule.transport.is_none_or(|value| value == transport)
+                && rule.cidr.is_none_or(|cidr| {
+                    cidr.contains(ip) || mapped.is_some_and(|v4| cidr.contains(v4))
+                })
+                && rule.ports.is_none_or(|ports| {
+                    port.is_some_and(|port| (ports.start..=ports.end).contains(&port))
+                })
+        };
+        let rules = self.compiled_rules();
+        let first = rules.iter().find(matches)?;
+        let action = Some(first.action);
         if !is_floored(ip, self.floor) {
             return action;
         }
-        if self.floor == FloorMode::Private
-            && action == Some(RuleAction::Allow)
-            && !is_link_local(ip)
-        {
-            return action;
+        if self.floor == FloorMode::Private {
+            let reopened = first.action == RuleAction::Allow
+                && !is_link_local(ip)
+                && (first.reopens_private
+                    || first.transport != Some(FlowTransport::Udp)
+                    || rules
+                        .iter()
+                        .filter(|rule| rule.reopens_private)
+                        .any(|rule| matches(&rule)));
+            return Some(if reopened {
+                RuleAction::Allow
+            } else {
+                RuleAction::Deny
+            });
         }
         if self.floor != FloorMode::Strict
             && is_host_loopback(ip)
@@ -792,7 +839,7 @@ impl EgressPolicy {
 
     /// Whether any policy is in force (false = allow-all).
     pub fn is_restricted(&self) -> bool {
-        self.inner.is_some() || !self.rules.is_empty()
+        self.inner.is_some() || !self.compiled_rules().is_empty()
     }
 
     /// Whether the gateway should DNS-filter queries (an allow-host list is set).
@@ -1122,6 +1169,244 @@ mod tests {
             original.denial_log.as_ref().unwrap(),
             datagrams.denial_log.as_ref().unwrap(),
         ));
+    }
+
+    fn udp_allow(cidr: &str, ports: Option<(u16, u16)>) -> EgressRule {
+        EgressRule {
+            transport: Some(FlowTransport::Udp),
+            cidr: Some(cidr.to_string()),
+            ports: ports.map(|(start, end)| smolvm_protocol::PortRange { start, end }),
+            action: RuleAction::Allow,
+        }
+    }
+
+    fn deny_cidr(cidr: &str) -> EgressRule {
+        EgressRule {
+            transport: None,
+            cidr: Some(cidr.to_string()),
+            ports: None,
+            action: RuleAction::Deny,
+        }
+    }
+
+    #[test]
+    fn intercepted_datagrams_honor_udp_allow_rules_and_deny_everything_else() {
+        let mut policy = EgressPolicy::new(Some(&["0.0.0.0/0".to_string()]), None)
+            .with_rules(&[
+                deny_cidr("192.0.2.128/25"),
+                udp_allow("192.0.2.0/24", Some((3478, 3480))),
+                udp_allow("198.51.100.7", None),
+            ])
+            .unwrap();
+        policy.floor = FloorMode::MetadataOnly;
+        let datagrams = policy.deny_all_datagrams();
+        let udp = |destination: &str| {
+            crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &datagrams)
+        };
+
+        assert!(udp("192.0.2.10:3478"));
+        assert!(udp("192.0.2.10:3480"));
+        assert!(!udp("192.0.2.10:3477"), "below the port range");
+        assert!(!udp("192.0.2.10:3481"), "above the port range");
+        assert!(udp("198.51.100.7:9"), "no port range admits every port");
+        assert!(!udp("192.0.2.200:3478"), "the deny CIDR wins");
+        assert!(
+            !udp("203.0.113.5:3478"),
+            "the allow list does not open datagrams"
+        );
+        assert!(!udp("198.51.100.7:53"), "DNS keeps its own path");
+        assert!(!datagrams.allows_flow(
+            FlowTransport::Tcp,
+            "203.0.113.5".parse().unwrap(),
+            Some(443)
+        ));
+        assert!(!datagrams.allows_flow(FlowTransport::Icmp, "192.0.2.10".parse().unwrap(), None));
+        assert!(crate::udp_relay::should_relay_udp(
+            "203.0.113.5:3478".parse().unwrap(),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn udp_allow_rules_never_reopen_the_floor() {
+        let mut policy = EgressPolicy::unrestricted()
+            .with_rules(&[
+                udp_allow("169.254.0.0/16", None),
+                udp_allow("10.0.0.0/8", None),
+            ])
+            .unwrap();
+        policy.floor = FloorMode::Strict;
+        let datagrams = policy.deny_all_datagrams();
+        let udp = |destination: &str| {
+            crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &datagrams)
+        };
+        assert!(!udp("169.254.169.254:123"));
+        assert!(!udp("10.1.2.3:123"));
+
+        policy.floor = FloorMode::MetadataOnly;
+        let datagrams = policy.deny_all_datagrams();
+        let udp = |destination: &str| {
+            crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &datagrams)
+        };
+        assert!(!udp("169.254.169.254:123"), "metadata stays closed");
+        assert!(udp("10.1.2.3:123"));
+    }
+
+    #[test]
+    fn udp_allow_rules_never_reopen_the_private_floor() {
+        for exceptions in [Vec::new(), vec!["10.1.0.0/16".to_string()]] {
+            let mut policy = EgressPolicy::unrestricted()
+                .with_rules(&[udp_allow("0.0.0.0/0", None)])
+                .unwrap();
+            policy.floor = FloorMode::MetadataAndLoopback;
+            let policy = policy.with_private_floor(&exceptions).unwrap();
+            assert_eq!(policy.floor, FloorMode::Private);
+            let excepted = !exceptions.is_empty();
+            for candidate in [policy.clone(), policy.deny_all_datagrams()] {
+                let udp = |destination: &str| {
+                    crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &candidate)
+                };
+                assert_eq!(udp("10.1.2.3:123"), excepted);
+                assert!(!udp("10.2.0.1:123"));
+                assert!(!udp("192.168.1.1:443"));
+                assert!(!udp("100.64.0.1:443"));
+                assert!(!udp("127.0.0.1:123"));
+                assert!(!udp("169.254.169.254:123"));
+                assert!(udp("203.0.113.5:443"));
+            }
+        }
+    }
+
+    #[test]
+    fn non_udp_allow_rules_keep_reopening_the_private_floor() {
+        let any_transport = EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: RuleAction::Allow,
+        };
+        let tcp_loopback = EgressRule {
+            transport: Some(FlowTransport::Tcp),
+            cidr: Some("127.0.0.0/8".to_string()),
+            ports: Some(smolvm_protocol::PortRange {
+                start: 443,
+                end: 443,
+            }),
+            action: RuleAction::Allow,
+        };
+        let icmp_v6 = EgressRule {
+            transport: Some(FlowTransport::Icmp),
+            cidr: Some("::/0".to_string()),
+            ports: None,
+            action: RuleAction::Allow,
+        };
+        let mut policy = EgressPolicy::unrestricted()
+            .with_rules(&[
+                tcp_loopback,
+                icmp_v6,
+                udp_allow("192.168.0.0/16", None),
+                any_transport,
+            ])
+            .unwrap();
+        policy.floor = FloorMode::MetadataAndLoopback;
+        let policy = policy.with_private_floor(&[]).unwrap();
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+
+        for candidate in [policy.clone(), policy.deny_all_datagrams()] {
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Tcp, ip("10.1.1.1"), Some(443)),
+                Some(RuleAction::Allow)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Udp, ip("10.1.1.1"), Some(123)),
+                Some(RuleAction::Allow)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Tcp, ip("127.0.0.1"), Some(443)),
+                Some(RuleAction::Allow)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Icmp, ip("::1"), None),
+                Some(RuleAction::Allow)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Udp, ip("192.168.1.1"), Some(123)),
+                Some(RuleAction::Deny)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Icmp, ip("fe80::1"), None),
+                Some(RuleAction::Deny)
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaced_rule_list_reaches_every_clone_and_keeps_the_private_exceptions() {
+        let allow_list = render_live_policy(&["198.51.100.0/24".to_string()], &[]);
+        let mut policy = EgressPolicy::new(Some(&["198.51.100.0/24".to_string()]), None)
+            .with_rules(&[deny_cidr("192.0.2.128/25")])
+            .unwrap();
+        policy.floor = FloorMode::MetadataAndLoopback;
+        let policy = policy
+            .with_private_floor(&["10.1.0.0/16".to_string()])
+            .unwrap();
+        let datagrams = policy.deny_all_datagrams();
+        let gateway_copy = policy.clone();
+        let udp = |destination: &str| {
+            crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &datagrams)
+        };
+        assert!(!udp("192.0.2.10:3478"));
+        assert!(udp("10.1.2.3:123"));
+
+        policy
+            .replace_allow_list(&format!(
+                "{allow_list}{}",
+                render_live_rules(&[
+                    deny_cidr("192.0.2.128/25"),
+                    udp_allow("192.0.2.0/24", Some((3478, 3478))),
+                ])
+                .unwrap()
+            ))
+            .unwrap();
+        assert!(udp("192.0.2.10:3478"));
+        assert!(!udp("192.0.2.10:3479"));
+        assert!(!udp("192.0.2.200:3478"), "the deny CIDR still wins");
+        assert!(udp("10.1.2.3:123"), "the private exception is kept");
+        assert!(!udp("10.2.0.1:123"));
+        assert!(gateway_copy.allows_flow(
+            FlowTransport::Udp,
+            "192.0.2.10".parse().unwrap(),
+            Some(3478)
+        ));
+
+        policy.replace_allow_list(&allow_list).unwrap();
+        assert!(udp("192.0.2.10:3478"), "no rule line keeps the rules");
+
+        assert!(policy.replace_allow_list("rules not-json\n").is_err());
+        assert!(policy
+            .replace_allow_list(&render_live_rules(&[udp_allow("not-a-cidr", None)]).unwrap())
+            .is_err());
+        assert!(udp("192.0.2.10:3478"), "a refused list keeps the rules");
+        assert!(gateway_copy.allows_v4(Ipv4Addr::new(198, 51, 100, 1)));
+
+        policy
+            .replace_allow_list(&format!("{allow_list}{}", render_live_rules(&[]).unwrap()))
+            .unwrap();
+        assert!(!udp("192.0.2.10:3478"));
+        assert!(udp("10.1.2.3:123"));
+        assert!(policy.is_restricted());
+    }
+
+    #[test]
+    fn udp_allow_rules_admit_only_udp_outside_the_interceptor() {
+        let policy = EgressPolicy::new(Some(&[]), None)
+            .with_rules(&[udp_allow("192.0.2.0/24", Some((443, 443)))])
+            .unwrap();
+        let ip = "192.0.2.10".parse().unwrap();
+        assert!(policy.allows_flow(FlowTransport::Udp, ip, Some(443)));
+        assert!(!policy.allows_flow(FlowTransport::Udp, ip, Some(444)));
+        assert!(!policy.allows_flow(FlowTransport::Tcp, ip, Some(443)));
+        assert!(!policy.allows_flow(FlowTransport::Icmp, ip, None));
     }
 
     #[test]

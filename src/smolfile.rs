@@ -103,6 +103,73 @@ pub fn parse_cidr(s: &str) -> Result<String, String> {
     Ok(net.to_string())
 }
 
+#[allow(missing_docs)]
+pub fn parse_allow_udp(s: &str) -> Result<smolvm_protocol::EgressRule, String> {
+    let invalid = |reason: String| {
+        format!(
+            "invalid UDP allow '{s}': {reason}; expected CIDR[:PORT[-END]], like 10.0.0.0/8, \
+             1.1.1.1:123, 192.0.2.0/24:3478-3480 or [2001:db8::1]:443"
+        )
+    };
+    let (cidr, ports) = if let Some(bracketed) = s.strip_prefix('[') {
+        let (inside, rest) = bracketed
+            .split_once(']')
+            .ok_or_else(|| invalid("missing ']'".to_string()))?;
+        let ports = match rest {
+            "" => None,
+            _ => Some(
+                rest.strip_prefix(':')
+                    .ok_or_else(|| invalid("expected ':' after ']'".to_string()))?,
+            ),
+        };
+        (parse_cidr(inside).map_err(invalid)?, ports)
+    } else if let Ok(cidr) = parse_cidr(s) {
+        (cidr, None)
+    } else {
+        let (address, ports) = s
+            .rsplit_once(':')
+            .ok_or_else(|| invalid("not a CIDR".to_string()))?;
+        (parse_cidr(address).map_err(invalid)?, Some(ports))
+    };
+    let ports = ports
+        .map(|spec| parse_udp_port_range(spec).map_err(invalid))
+        .transpose()?;
+    Ok(smolvm_protocol::EgressRule {
+        transport: Some(smolvm_protocol::FlowTransport::Udp),
+        cidr: Some(cidr),
+        ports,
+        action: smolvm_protocol::RuleAction::Allow,
+    })
+}
+
+fn parse_udp_port_range(spec: &str) -> Result<smolvm_protocol::PortRange, String> {
+    let port = |text: &str| match text.parse::<u16>() {
+        Ok(0) | Err(_) => Err(format!("'{text}' is not a port from 1 to 65535")),
+        Ok(port) => Ok(port),
+    };
+    let (start, end) = match spec.split_once('-') {
+        Some((start, end)) => (port(start)?, port(end)?),
+        None => {
+            let single = port(spec)?;
+            (single, single)
+        }
+    };
+    if end < start {
+        return Err(format!("port range {start}-{end} ends before it starts"));
+    }
+    Ok(smolvm_protocol::PortRange { start, end })
+}
+
+#[allow(missing_docs)]
+pub fn udp_allow_label(rule: &smolvm_protocol::EgressRule) -> String {
+    let cidr = rule.cidr.as_deref().unwrap_or("any");
+    match rule.ports {
+        None => cidr.to_string(),
+        Some(ports) if ports.start == ports.end => format!("{cidr}:{}", ports.start),
+        Some(ports) => format!("{cidr}:{}-{}", ports.start, ports.end),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +255,79 @@ init = ["echo hello"]
         std::fs::write(&path, "image = \"alpine\"\ngpu = false\n").unwrap();
         let sf = load(&path).unwrap();
         assert_eq!(sf.gpu, Some(false));
+    }
+
+    fn udp_allow(cidr: &str, ports: Option<(u16, u16)>) -> smolvm_protocol::EgressRule {
+        smolvm_protocol::EgressRule {
+            transport: Some(smolvm_protocol::FlowTransport::Udp),
+            cidr: Some(cidr.to_string()),
+            ports: ports.map(|(start, end)| smolvm_protocol::PortRange { start, end }),
+            action: smolvm_protocol::RuleAction::Allow,
+        }
+    }
+
+    #[test]
+    fn allow_udp_takes_a_cidr_with_an_optional_port_or_range() {
+        assert_eq!(
+            parse_allow_udp("10.0.0.0/8").unwrap(),
+            udp_allow("10.0.0.0/8", None)
+        );
+        assert_eq!(
+            parse_allow_udp("1.1.1.1:123").unwrap(),
+            udp_allow("1.1.1.1/32", Some((123, 123)))
+        );
+        assert_eq!(
+            parse_allow_udp("192.0.2.0/24:3478-3480").unwrap(),
+            udp_allow("192.0.2.0/24", Some((3478, 3480)))
+        );
+        assert_eq!(
+            parse_allow_udp("2001:db8::/32").unwrap(),
+            udp_allow("2001:db8::/32", None)
+        );
+        assert_eq!(
+            parse_allow_udp("2001:db8::1").unwrap(),
+            udp_allow("2001:db8::1/128", None)
+        );
+        assert_eq!(
+            parse_allow_udp("2001:db8::/32:443").unwrap(),
+            udp_allow("2001:db8::/32", Some((443, 443)))
+        );
+        assert_eq!(
+            parse_allow_udp("[2001:db8::1]").unwrap(),
+            udp_allow("2001:db8::1/128", None)
+        );
+        assert_eq!(
+            parse_allow_udp("[2001:db8::1]:443").unwrap(),
+            udp_allow("2001:db8::1/128", Some((443, 443)))
+        );
+        assert_eq!(
+            parse_allow_udp("[2001:db8::/32]:1000-2000").unwrap(),
+            udp_allow("2001:db8::/32", Some((1000, 2000)))
+        );
+    }
+
+    #[test]
+    fn allow_udp_rejects_a_bad_cidr_or_port() {
+        for value in [
+            "",
+            "10.0.0.0/33",
+            "example.com",
+            "example.com:53",
+            "1.1.1.1:",
+            "1.1.1.1:0",
+            "1.1.1.1:65536",
+            "1.1.1.1:dns",
+            "1.1.1.1:500-400",
+            "1.1.1.1:0-10",
+            "1.1.1.1:10-",
+            "[2001:db8::1]53",
+            "[2001:db8::1:53",
+        ] {
+            let error = match parse_allow_udp(value) {
+                Ok(rule) => panic!("'{value}' must be rejected, got {rule:?}"),
+                Err(error) => error,
+            };
+            assert!(error.contains("CIDR[:PORT[-END]]"), "{value}: {error}");
+        }
     }
 }

@@ -183,6 +183,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--block-private` | | run, create | Block private and internal destinations, keep the public internet (implies --net) |
 | `--allow-private` | | run, create | Re-open one private CIDR under `--block-private` |
 | `--deny-cidr` | | run, create | Deny egress to a CIDR, checked before anything is allowed (implies --net) |
+| `--allow-udp` | | run, create, update | Allow UDP to `CIDR[:PORT[-END]]`, also under an egress interceptor; a deny still wins (implies --net) |
 | `--allow-host` | | run, create, update | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create, update | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create, pack run | Forward host SSH agent (git/ssh without exposing keys) |
@@ -231,6 +232,14 @@ virtio-net backend; the Smolfile form is `[network] block_private = true` and
 `--deny-cidr CIDR` refuses a range even where an allow would admit it,
 including the host's loopback reached through the gateway. It implies `--net`;
 the Smolfile form is `[network] deny_cidrs`.
+`--allow-udp CIDR[:PORT[-END]]` admits UDP to a range, optionally one port
+or a port range (`1.1.1.1:123`, `192.0.2.0/24:3478-3480`; write an IPv6 range
+with a prefix or brackets, as in `[2001:db8::1]:443`). It is the one way to
+open UDP beyond DNS for a machine started with an external egress interceptor,
+which otherwise denies every datagram. Every deny is checked first, the
+metadata floor and `--block-private` still apply (only `--allow-private`
+re-opens a private range), and DNS keeps its own path. It implies `--net`;
+the Smolfile form is `[network] allow_udp`.
 Every rule, the Smolfile keys and `--guest-subnet`:
 `docs/throwaway-machine/README.md`.
 
@@ -532,4 +541,4 @@ can create and run machines. Machines that ask for nested virtualization
 - **`machine logs` shows the workload's output.** The workload's stdout and stderr are appended to `workload.log` in the machine's data directory, kept across restarts, rotated at 10 MiB (three old files kept), and readable while the machine is stopped. `-f` follows, `--tail N` shows the last N lines. Output of `machine exec` is not included. Over the API: `GET /api/v1/machines/{name}/logs?source=workload`.
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
-- **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped, except for allow-list changes (`--allow-host`, `--allow-host-pattern`, `--allow-cidr`, `--remove-allow-host`, `--remove-allow-cidr`) on a machine started with an allow list: those apply to its next connection or DNS lookup and persist across restarts. Lifting the allow list entirely still needs a stop.
+- **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped, except for allow-list changes (`--allow-host`, `--allow-host-pattern`, `--allow-cidr`, `--remove-allow-host`, `--remove-allow-cidr`, `--allow-udp`, `--remove-allow-udp`) on a machine started with an allow list: those apply to its next connection, datagram or DNS lookup and persist across restarts. Lifting the allow list entirely still needs a stop.

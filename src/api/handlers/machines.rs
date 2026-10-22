@@ -7203,6 +7203,16 @@ pub async fn update_machine_egress(
             )));
         }
     };
+    let (record, _egress_lock) = if running {
+        let lock = crate::agent::lock_live_egress(&name)?;
+        let fresh = state
+            .lookup_vm(&name)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+        (fresh, Some(lock))
+    } else {
+        (record, None)
+    };
 
     // Normalize CIDRs with the CLI's parser, so a malformed entry is a 400
     // here instead of a silently narrower or wider policy later.
@@ -7210,6 +7220,13 @@ pub async fn update_machine_egress(
         cidrs
             .iter()
             .map(|c| crate::smolfile::parse_cidr(c))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::BadRequest)
+    };
+    let parse_udp = |specs: &[String]| -> Result<Vec<smolvm_protocol::EgressRule>, ApiError> {
+        specs
+            .iter()
+            .map(|spec| crate::smolfile::parse_allow_udp(spec))
             .collect::<Result<Vec<_>, _>>()
             .map_err(ApiError::BadRequest)
     };
@@ -7222,8 +7239,9 @@ pub async fn update_machine_egress(
         outbound_localhost_only: req.outbound_localhost_only,
         allow_all: req.allow_all,
         reset_allow_list: req.reset_allow_list,
+        allow_udp: parse_udp(&req.allow_udp)?,
+        remove_allow_udp: parse_udp(&req.remove_allow_udp)?,
     };
-
     let next = record
         .updated_egress(&update)
         .map_err(|error| match error {
@@ -7231,12 +7249,13 @@ pub async fn update_machine_egress(
             other => ApiError::from(other),
         })?
         .ok_or_else(|| ApiError::BadRequest("request contains no egress changes".into()))?;
+    let rules_change = next.egress_rules != record.egress_rules;
 
     if running {
         record
             .check_live_egress(&next)
             .map_err(|error| ApiError::Conflict(error.to_string()))?;
-        crate::agent::apply_live_egress_policy(&name, &next)?;
+        crate::agent::apply_live_egress_policy(&name, &next, rules_change)?;
     }
     let updated = {
         let next = next.clone();
@@ -7245,6 +7264,7 @@ pub async fn update_machine_egress(
                 r.network = next.network;
                 r.allowed_cidrs = next.allowed_cidrs.clone();
                 r.dns_filter_hosts = next.dns_filter_hosts.clone();
+                r.egress_rules = next.egress_rules.clone();
             })
             .await
     };
@@ -7258,7 +7278,7 @@ pub async fn update_machine_egress(
         Err(error) => {
             // The record keeps the old allow list, so the running machine must too.
             if running {
-                let _ = crate::agent::apply_live_egress_policy(&name, &record);
+                let _ = crate::agent::apply_live_egress_policy(&name, &record, rules_change);
             }
             return Err(error);
         }
@@ -8788,6 +8808,52 @@ mod tests {
         let req = SetPortsRequest { ports: vec![] };
         let result = set_machine_ports(State(state), Path("nope".into()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn update_egress_adds_and_removes_udp_allows_on_a_stopped_machine() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "udp-vm", Some(20), Some(5));
+        let request = |body: serde_json::Value| -> UpdateEgressRequest {
+            serde_json::from_value(body).unwrap()
+        };
+
+        let info = update_machine_egress(
+            State(state.clone()),
+            Path("udp-vm".into()),
+            Json(request(
+                serde_json::json!({"allowUdp": ["192.0.2.0/24:3478-3480"]}),
+            )),
+        )
+        .await
+        .unwrap();
+        let rule = crate::smolfile::parse_allow_udp("192.0.2.0/24:3478-3480").unwrap();
+        assert_eq!(info.egress_rules, vec![rule.clone()]);
+        let saved = state.db().get_vm("udp-vm").unwrap().unwrap();
+        assert_eq!(saved.egress_rules, vec![rule]);
+        assert!(saved.network);
+        assert!(saved.allowed_cidrs.is_none());
+
+        let result = update_machine_egress(
+            State(state.clone()),
+            Path("udp-vm".into()),
+            Json(request(serde_json::json!({"allowUdp": ["192.0.2.0/24:0"]}))),
+        )
+        .await;
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+
+        let info = update_machine_egress(
+            State(state.clone()),
+            Path("udp-vm".into()),
+            Json(request(
+                serde_json::json!({"removeAllowUdp": ["192.0.2.0/24:3478-3480"]}),
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(info.egress_rules.is_empty());
+        let saved = state.db().get_vm("udp-vm").unwrap().unwrap();
+        assert!(saved.egress_rules.is_empty());
     }
 
     #[test]

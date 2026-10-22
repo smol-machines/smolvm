@@ -536,19 +536,58 @@ pub fn egress_denials_log_file(name: &str) -> PathBuf {
 }
 
 /// Replace a running machine's allow list with `record`'s, through the egress
-/// control socket its network runtime serves. Returns once the runtime has the
-/// new list in force.
-pub fn apply_live_egress_policy(name: &str, record: &crate::config::VmRecord) -> Result<()> {
-    let rendered = smolvm_network::egress::render_live_policy(
+/// control socket its network runtime serves. With `with_rules`, the message
+/// also carries a `rules <json>` line that replaces the runtime's whole ordered
+/// rule list with `record.egress_rules` (deny rules included; the runtime keeps
+/// its `--allow-private` exceptions); without it the rules stay as they are.
+/// Returns once the runtime has the new policy in force.
+pub fn apply_live_egress_policy(
+    name: &str,
+    record: &crate::config::VmRecord,
+    with_rules: bool,
+) -> Result<()> {
+    let mut rendered = smolvm_network::egress::render_live_policy(
         record.allowed_cidrs.as_deref().unwrap_or(&[]),
         record.dns_filter_hosts.as_deref().unwrap_or(&[]),
     );
+    if with_rules {
+        let rules = smolvm_network::egress::render_live_rules(&record.egress_rules)
+            .map_err(|reason| Error::config("egress policy", reason))?;
+        rendered.push_str(&rules);
+    }
     send_live_change(name, smolvm_network::EGRESS_SOCKET, &rendered).map_err(|reason| {
+        let reason = live_egress_refusal(reason, with_rules);
         Error::config(
             "egress policy",
             format!("could not change machine '{name}''s allow list while it runs: {reason}"),
         )
     })
+}
+
+#[allow(missing_docs)]
+pub fn lock_live_egress(name: &str) -> Result<std::fs::File> {
+    lock_live_egress_at(&vm_data_dir(name).join("egress-update.lock"))
+}
+
+fn lock_live_egress_at(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| Error::agent("egress update lock", error.to_string()))?;
+    super::fork::lock_file_exclusive(&file)
+        .map_err(|error| Error::agent("egress update lock", error.to_string()))?;
+    Ok(file)
+}
+
+fn live_egress_refusal(reason: String, with_rules: bool) -> String {
+    if with_rules && reason.contains("expected `cidr <range>` or `host <name>`") {
+        return format!(
+            "{reason}; this machine was started before live UDP allow changes were supported and needs a restart"
+        );
+    }
+    reason
 }
 
 /// Publish exactly `ports` on a running machine through the ports control
@@ -4186,6 +4225,61 @@ fn boot_failure_reason(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_egress_updates_of_one_machine_run_one_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("egress-update.lock");
+        let held = super::lock_live_egress_at(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let second = super::lock_live_egress_at(&path).unwrap();
+                sender.send(()).unwrap();
+                drop(second);
+            })
+        };
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err());
+        drop(held);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn a_runtime_that_predates_live_rules_asks_for_a_restart() {
+        let record = crate::config::VmRecord::new("worker".into(), 1, 512, vec![], vec![], true);
+        let mut rendered = smolvm_network::egress::render_live_policy(&["10.0.0.0/8".into()], &[]);
+        rendered
+            .push_str(&smolvm_network::egress::render_live_rules(&record.egress_rules).unwrap());
+        let older_runtime_reply = rendered
+            .lines()
+            .enumerate()
+            .find(|(_, line)| !line.starts_with("cidr ") && !line.starts_with("host "))
+            .map(|(index, _)| {
+                format!(
+                    "line {}: expected `cidr <range>` or `host <name>`",
+                    index + 1
+                )
+            })
+            .unwrap();
+
+        let explained = super::live_egress_refusal(older_runtime_reply.clone(), true);
+        assert!(explained.contains("restart"), "{explained}");
+        assert!(explained.contains("UDP allow"), "{explained}");
+        assert_eq!(
+            super::live_egress_refusal(older_runtime_reply.clone(), false),
+            older_runtime_reply
+        );
+        assert_eq!(
+            super::live_egress_refusal("line 2: invalid rules: eof".into(), true),
+            "line 2: invalid rules: eof"
+        );
+    }
+
     #[test]
     fn console_tail_keeps_whole_last_lines() {
         assert_eq!(super::console_tail("a\nb\n", 100), "a\nb\n");

@@ -555,7 +555,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_udp", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -690,6 +690,9 @@ pub struct RunCmd {
     /// Deny egress to a CIDR range, checked before anything is allowed (can be used multiple times, implies --net)
     #[arg(long = "deny-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub deny_cidr: Vec<String>,
+
+    #[arg(long = "allow-udp", value_parser = smolvm::smolfile::parse_allow_udp, value_name = "CIDR[:PORT[-END]]", help_heading = "Network", help = "Allow UDP to a CIDR, optionally on one port or a range, also under an egress interceptor; checked after every deny, DNS keeps its own path (can be used multiple times, implies --net)")]
+    pub allow_udp: Vec<smolvm_protocol::EgressRule>,
 
     /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
@@ -1518,6 +1521,7 @@ impl RunCmd {
         params.dns_options = self.dns_option.clone();
         params.shm_size = self.shm_size.clone();
         params.prepend_deny_cidrs(&self.deny_cidr);
+        params.append_allow_udp(&self.allow_udp);
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -3614,6 +3618,114 @@ mod tests {
     }
 
     #[test]
+    fn allow_udp_is_parsed_on_run_create_and_update() {
+        use smolvm::config::VmRecord;
+        let rule = smolvm::smolfile::parse_allow_udp("192.0.2.0/24:3478-3480").unwrap();
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--allow-udp",
+            "192.0.2.0/24:3478-3480",
+            "--",
+            "true",
+        ]);
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert_eq!(cmd.allow_udp, vec![rule.clone()]);
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "u",
+            "--allow-udp",
+            "192.0.2.0/24:3478-3480",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.allow_udp, vec![rule.clone()]);
+
+        let rejected: [&[&str]; 4] = [
+            &["machine", "run", "--allow-udp", "10.0.0.0/8:0"],
+            &["machine", "create", "--allow-udp", "example.com:53"],
+            &[
+                "machine",
+                "update",
+                "--name",
+                "u",
+                "--allow-udp",
+                "1.1.1.1:9-1",
+            ],
+            &[
+                "machine",
+                "update",
+                "--name",
+                "u",
+                "--remove-allow-udp",
+                "1.1.1.1:9-1",
+            ],
+        ];
+        for argv in rejected {
+            assert!(TestMachineCli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "update",
+            "--name",
+            "u",
+            "--allow-udp",
+            "1.1.1.1:1-9",
+        ])
+        .is_ok());
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "update",
+            "--name",
+            "u",
+            "--no-net",
+            "--allow-udp",
+            "1.1.1.1",
+        ])
+        .is_err());
+
+        let parse_update = |argv: &[&str]| {
+            let cli = TestMachineCli::parse_from(argv);
+            let MachineCmd::Update(cmd) = cli.command else {
+                panic!("expected machine update command");
+            };
+            cmd
+        };
+        let record = VmRecord::new("u".to_string(), 1, 512, vec![], vec![], false);
+        let cmd = parse_update(&[
+            "machine",
+            "update",
+            "--name",
+            "u",
+            "--allow-udp",
+            "192.0.2.0/24:3478-3480",
+        ]);
+        assert!(cmd.changes_only_egress());
+        let next = cmd.next_egress(&record).unwrap().unwrap();
+        assert_eq!(next.egress_rules, vec![rule.clone()]);
+        assert!(next.network);
+
+        let cmd = parse_update(&[
+            "machine",
+            "update",
+            "--name",
+            "u",
+            "--remove-allow-udp",
+            "192.0.2.0/24:3478-3480",
+        ]);
+        assert!(cmd.changes_only_egress());
+        let removed = cmd.next_egress(&next).unwrap().unwrap();
+        assert!(removed.egress_rules.is_empty());
+    }
+
+    #[test]
     fn update_outbound_localhost_only_adds_the_loopback_cidrs() {
         use smolvm::config::VmRecord;
 
@@ -4466,6 +4578,9 @@ pub struct CreateCmd {
     #[arg(long = "deny-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub deny_cidr: Vec<String>,
 
+    #[arg(long = "allow-udp", value_parser = smolvm::smolfile::parse_allow_udp, value_name = "CIDR[:PORT[-END]]", help = "Allow UDP to a CIDR, optionally on one port or a range, also under an egress interceptor; checked after every deny, DNS keeps its own path (can be used multiple times, implies --net)")]
+    pub allow_udp: Vec<smolvm_protocol::EgressRule>,
+
     /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME")]
     pub allow_host: Vec<String>,
@@ -4808,6 +4923,7 @@ impl CreateCmd {
         params.dns_options = self.dns_option.clone();
         params.shm_size = self.shm_size.clone();
         params.prepend_deny_cidrs(&self.deny_cidr);
+        params.append_allow_udp(&self.allow_udp);
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -5347,6 +5463,7 @@ impl CreateCmd {
             .then_some(canonical_path),
         };
         params.prepend_deny_cidrs(&self.deny_cidr);
+        params.append_allow_udp(&self.allow_udp);
         merge_cli_credentials(&mut params, &self.credential)?;
 
         let resources = VmResources {
@@ -6612,6 +6729,23 @@ pub struct UpdateCmd {
     #[arg(long = "remove-allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub remove_allow_cidr: Vec<String>,
 
+    #[arg(
+        long = "allow-udp",
+        value_parser = smolvm::smolfile::parse_allow_udp,
+        value_name = "CIDR[:PORT[-END]]",
+        conflicts_with = "no_net",
+        help = "Allow UDP to a CIDR, optionally on one port or a range, as `machine create --allow-udp` does, also under an egress interceptor (can be used multiple times). Applies live, like --allow-cidr, on a machine started with an allow list"
+    )]
+    pub allow_udp: Vec<smolvm_protocol::EgressRule>,
+
+    #[arg(
+        long = "remove-allow-udp",
+        value_parser = smolvm::smolfile::parse_allow_udp,
+        value_name = "CIDR[:PORT[-END]]",
+        help = "Remove a UDP allow, written as it was added. Applies live, like --remove-allow-cidr, on a machine started with an allow list"
+    )]
+    pub remove_allow_udp: Vec<smolvm_protocol::EgressRule>,
+
     /// Start from an empty allow list before applying this update's
     /// --allow-host, --allow-host-pattern and --allow-cidr entries, so the
     /// machine ends up with exactly those and nothing it allowed before. With
@@ -6702,6 +6836,8 @@ impl UpdateCmd {
             outbound_localhost_only: self.outbound_localhost_only,
             allow_all: self.net,
             reset_allow_list: self.reset_allow_list,
+            allow_udp: self.allow_udp.clone(),
+            remove_allow_udp: self.remove_allow_udp.clone(),
         })
     }
 
@@ -6736,6 +6872,8 @@ impl UpdateCmd {
             outbound_localhost_only,
             remove_allow_host,
             remove_allow_cidr,
+            allow_udp,
+            remove_allow_udp,
             reset_allow_list,
             env,
             remove_env,
@@ -6759,6 +6897,8 @@ impl UpdateCmd {
             || !allow_cidr.is_empty()
             || !remove_allow_host.is_empty()
             || !remove_allow_cidr.is_empty()
+            || !allow_udp.is_empty()
+            || !remove_allow_udp.is_empty()
             || *reset_allow_list;
         let ports = !port.is_empty() || !remove_port.is_empty();
         let other = !volume.is_empty()
@@ -6871,19 +7011,23 @@ impl UpdateCmd {
         db: &smolvm::db::SmolvmDb,
         record: &smolvm::config::VmRecord,
     ) -> smolvm::Result<()> {
+        let _egress_lock = smolvm::agent::lock_live_egress(&self.name)?;
+        let record = &db.get_vm(&self.name)?.unwrap_or_else(|| record.clone());
         let next = self
             .next_egress(record)?
             .ok_or_else(|| smolvm::Error::config("update", "no egress changes given"))?;
         record.check_live_egress(&next)?;
-        smolvm::agent::apply_live_egress_policy(&self.name, &next)?;
+        let rules_change = next.egress_rules != record.egress_rules;
+        smolvm::agent::apply_live_egress_policy(&self.name, &next, rules_change)?;
         let saved = db.update_vm(&self.name, |r| {
             r.network = next.network;
             r.allowed_cidrs = next.allowed_cidrs.clone();
             r.dns_filter_hosts = next.dns_filter_hosts.clone();
+            r.egress_rules = next.egress_rules.clone();
         });
         if !matches!(saved, Ok(Some(_))) {
             // The record keeps the old allow list, so the running machine must too.
-            let _ = smolvm::agent::apply_live_egress_policy(&self.name, record);
+            let _ = smolvm::agent::apply_live_egress_policy(&self.name, record, rules_change);
             saved?;
             return Err(smolvm::Error::config(
                 "update",
@@ -6896,6 +7040,19 @@ impl UpdateCmd {
         }
         for host in next.dns_filter_hosts.as_deref().unwrap_or(&[]) {
             println!("  allow host: {host}");
+        }
+        for rule in &next.egress_rules {
+            if !record.egress_rules.contains(rule) {
+                println!("  allow udp: {}", smolvm::smolfile::udp_allow_label(rule));
+            }
+        }
+        for rule in &record.egress_rules {
+            if !next.egress_rules.contains(rule) {
+                println!(
+                    "  removed udp allow: {}",
+                    smolvm::smolfile::udp_allow_label(rule)
+                );
+            }
         }
         if !self.remove_allow_host.is_empty() && next.allowed_cidrs.is_some() {
             println!(
@@ -7167,6 +7324,23 @@ impl UpdateCmd {
                             .map_or("any".into(), |h| h.join(", "))
                     ));
                 }
+                for rule in &next.egress_rules {
+                    if !r.egress_rules.contains(rule) {
+                        changes.push(format!(
+                            "  allow udp: {}",
+                            smolvm::smolfile::udp_allow_label(rule)
+                        ));
+                    }
+                }
+                for rule in &r.egress_rules {
+                    if !next.egress_rules.contains(rule) {
+                        changes.push(format!(
+                            "  removed udp allow: {}",
+                            smolvm::smolfile::udp_allow_label(rule)
+                        ));
+                    }
+                }
+                r.egress_rules = next.egress_rules.clone();
                 r.network = next.network;
                 r.allowed_cidrs = next.allowed_cidrs.clone();
                 r.dns_filter_hosts = next.dns_filter_hosts.clone();

@@ -328,6 +328,12 @@ pub struct UpdateEgressRequest {
     /// combined with removals. Mirrors `--reset-allow-list` on `machine update`.
     #[serde(default)]
     pub reset_allow_list: bool,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub allow_udp: Vec<String>,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub remove_allow_udp: Vec<String>,
 }
 
 /// Environment variable.

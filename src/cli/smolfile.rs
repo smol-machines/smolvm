@@ -367,7 +367,16 @@ pub fn build_create_params(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| smolvm::Error::config("smolfile [network] deny_cidrs", e))?;
     let net = net || !sf_deny_cidrs.is_empty();
-    let egress_rules = crate::cli::vm_common::deny_cidr_rules(&sf_deny_cidrs);
+    let mut egress_rules = crate::cli::vm_common::deny_cidr_rules(&sf_deny_cidrs);
+
+    let sf_allow_udp = network
+        .allow_udp
+        .iter()
+        .map(|s| smolvm::smolfile::parse_allow_udp(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| smolvm::Error::config("smolfile [network] allow_udp", e))?;
+    let net = net || !sf_allow_udp.is_empty();
+    egress_rules.extend(sf_allow_udp);
 
     // Restart policy from [restart] section
     let restart_policy = sf
@@ -895,6 +904,63 @@ init = ["echo init"]
             Err(error) => error.to_string(),
         };
         assert!(error.contains("deny_cidrs"), "{error}");
+    }
+
+    #[test]
+    fn allow_udp_becomes_udp_allow_rules_after_every_deny_and_implies_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[network]\ndeny_cidrs = [\"10.0.0.0/8\"]\nallow_udp = [\"192.0.2.0/24:3478-3480\", \"1.1.1.1\"]\n",
+        )
+        .unwrap();
+
+        let mut params = build_from_smolfile(path).unwrap();
+        assert!(params.net, "a UDP allow implies networking");
+        params.prepend_deny_cidrs(&["192.168.0.0/16".to_string()]);
+        params
+            .append_allow_udp(&[smolvm::smolfile::parse_allow_udp("203.0.113.0/24:443").unwrap()]);
+
+        let rules: Vec<_> = params
+            .egress_rules
+            .iter()
+            .map(|rule| {
+                (
+                    rule.transport,
+                    rule.cidr.as_deref().unwrap(),
+                    rule.ports.map(|ports| (ports.start, ports.end)),
+                    rule.action,
+                )
+            })
+            .collect();
+        use smolvm_protocol::{FlowTransport::Udp, RuleAction::Allow, RuleAction::Deny};
+        assert_eq!(
+            rules,
+            [
+                (None, "192.168.0.0/16", None, Deny),
+                (None, "10.0.0.0/8", None, Deny),
+                (Some(Udp), "192.0.2.0/24", Some((3478, 3480)), Allow),
+                (Some(Udp), "1.1.1.1/32", None, Allow),
+                (Some(Udp), "203.0.113.0/24", Some((443, 443)), Allow),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_allow_udp_is_rejected_at_parse_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[network]\nallow_udp = [\"10.0.0.0/8:0\"]\n",
+        )
+        .unwrap();
+        let error = match build_from_smolfile(path) {
+            Ok(_) => panic!("a malformed UDP allow must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("allow_udp"), "{error}");
     }
 
     /// An unusable value must be rejected where it is written, naming the flag

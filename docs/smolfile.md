@@ -67,6 +67,7 @@ allow_cidrs = ["10.0.0.0/8"]          # IP/CIDR ranges (implies net)
 block_private = true                  # public internet open; LAN, metadata, CGNAT, host loopback blocked
 allow_private = ["10.20.0.0/16"]      # private ranges re-opened under block_private (implies it)
 deny_cidrs = ["169.254.169.254"]      # denied before any allow (implies net)
+allow_udp = ["1.1.1.1:123", "192.0.2.0/24:3478-3480"]  # UDP to CIDR[:PORT[-END]], also under an egress interceptor (implies net)
 
 # Dev profile (used by `machine run` and `machine create`)
 [dev]

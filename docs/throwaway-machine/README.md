@@ -99,6 +99,17 @@ and can be used more than once. In a Smolfile they are `[network] block_private 
 address was reachable with `--net`, blocked with `--block-private`, and reachable again with
 `--allow-private <that address>/32`, while `example.com` stayed reachable throughout.
 
+`--deny-cidr <CIDR>` refuses a range before anything is allowed. `--allow-udp
+<CIDR>[:<PORT>[-<END>]]` admits UDP to a range, on every port or only the ones named, such as
+`--allow-udp 1.1.1.1:123` for NTP or `--allow-udp 192.0.2.0/24:3478-3480` for a TURN relay; write
+an IPv6 range with a prefix or in brackets (`[2001:db8::1]:443`). A machine started with an
+external egress interceptor denies every datagram but DNS, and `--allow-udp` is how it reaches a
+UDP service anyway. A deny CIDR still wins over it, cloud metadata stays blocked, `--block-private`
+keeps private ranges closed unless `--allow-private` re-opens them, and DNS on port 53 keeps its own
+path. It implies `--net`, the Smolfile form is `[network] allow_udp`, and `machine update
+--allow-udp` / `--remove-allow-udp` change it, live on a machine started with an allow list, as
+`--allow-cidr` does.
+
 ```console
 $ smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- \
     wget -q -O /dev/null https://registry.npmjs.org

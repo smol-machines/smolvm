@@ -231,8 +231,11 @@ const MAX_PORTS_REQUEST_BYTES: u64 = 64 * 1024;
 
 /// Serve the egress control socket in `vm_dir` for a machine whose guest may
 /// open outbound connections under an allow list: each connection sends a
-/// replacement list and gets back `ok` or `error: <reason>`. A machine with no
-/// allow list, or an inbound-only guest, gets no socket.
+/// replacement list, optionally followed by a `rules <json>` line that replaces
+/// the ordered rule list (deny rules included, `--allow-private` exceptions
+/// kept) and is absent when the rules have not changed, and gets back `ok` or
+/// `error: <reason>`. A machine with no allow list, or an inbound-only guest,
+/// gets no socket.
 pub fn serve_egress_control(
     egress: &smolvm_network::EgressPolicy,
     vm_dir: &std::path::Path,
@@ -250,7 +253,7 @@ pub fn serve_egress_control(
         MAX_EGRESS_REQUEST_BYTES,
         move |request| {
             egress.replace_allow_list(request)?;
-            tracing::info!("egress allow list replaced");
+            tracing::info!("egress allow list and any sent rules replaced");
             Ok(())
         },
     );

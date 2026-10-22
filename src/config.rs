@@ -392,9 +392,18 @@ pub struct EgressUpdate {
     /// egress; it cannot be combined with removals, which would have nothing
     /// to remove.
     pub reset_allow_list: bool,
+    #[allow(missing_docs)]
+    pub allow_udp: Vec<smolvm_protocol::EgressRule>,
+    #[allow(missing_docs)]
+    pub remove_allow_udp: Vec<smolvm_protocol::EgressRule>,
 }
 
 impl EgressUpdate {
+    #[allow(missing_docs)]
+    pub fn changes_udp_rules(&self) -> bool {
+        !self.allow_udp.is_empty() || !self.remove_allow_udp.is_empty()
+    }
+
     /// Whether this update changes nothing.
     pub fn is_empty(&self) -> bool {
         self.allow_hosts.is_empty()
@@ -404,6 +413,7 @@ impl EgressUpdate {
             && self.remove_allow_hosts.is_empty()
             && self.remove_allow_cidrs.is_empty()
             && !self.reset_allow_list
+            && !self.changes_udp_rules()
     }
 }
 
@@ -1380,10 +1390,23 @@ impl VmRecord {
         cidrs: Vec<String>,
         hosts: Vec<String>,
     ) -> Result<()> {
+        let rules = self.egress_rules.clone();
+        self.replace_egress_and_rules(network, cidrs, hosts, rules)
+    }
+
+    fn replace_egress_and_rules(
+        &mut self,
+        network: bool,
+        cidrs: Vec<String>,
+        hosts: Vec<String>,
+        rules: Vec<smolvm_protocol::EgressRule>,
+    ) -> Result<()> {
         let mut next = self.clone();
         next.network = network;
         next.allowed_cidrs = (!cidrs.is_empty()).then_some(cidrs);
         next.dns_filter_hosts = (!hosts.is_empty()).then_some(hosts);
+        let adds_rules = !rules.is_empty() && rules != self.egress_rules;
+        next.egress_rules = rules;
         if let Some(credentials) = next.credential_policy.as_ref() {
             credentials
                 .validate(next.dns_filter_hosts.as_deref())
@@ -1397,7 +1420,8 @@ impl VmRecord {
         // host-side stack only; on TSI it would be silently unenforced. A
         // machine pinned to TSI (explicitly, or by a checkpoint it resumes)
         // cannot take one.
-        let restricted = next.allowed_cidrs.is_some() || next.dns_filter_hosts.is_some();
+        let restricted =
+            next.allowed_cidrs.is_some() || next.dns_filter_hosts.is_some() || adds_rules;
         if restricted && after == crate::network::EffectiveNetworkBackend::Tsi {
             return Err(crate::Error::config(
                 "egress policy",
@@ -1505,6 +1529,37 @@ impl VmRecord {
             }
         }
 
+        let is_udp_allow = |rule: &smolvm_protocol::EgressRule| {
+            rule.transport == Some(smolvm_protocol::FlowTransport::Udp)
+                && rule.action == smolvm_protocol::RuleAction::Allow
+        };
+        let mut rules = self.egress_rules.clone();
+        for rule in &update.remove_allow_udp {
+            let before = rules.len();
+            rules.retain(|stored| !(is_udp_allow(stored) && stored == rule));
+            if rules.len() == before {
+                return Err(crate::Error::config(
+                    "update",
+                    format!(
+                        "'{}' is not in machine '{}''s UDP allows",
+                        crate::smolfile::udp_allow_label(rule),
+                        self.name
+                    ),
+                ));
+            }
+        }
+        for rule in &update.allow_udp {
+            if !is_udp_allow(rule) {
+                return Err(crate::Error::config(
+                    "allow udp",
+                    "a UDP allow must have the UDP transport and the allow action",
+                ));
+            }
+            if !rules.contains(rule) {
+                rules.push(rule.clone());
+            }
+        }
+
         if was_restricted && hosts.is_empty() && cidrs.is_empty() && !update.allow_all {
             return Err(crate::Error::config(
                 "update",
@@ -1514,7 +1569,7 @@ impl VmRecord {
             ));
         }
         let mut next = self.clone();
-        next.replace_egress(true, cidrs, hosts)?;
+        next.replace_egress_and_rules(true, cidrs, hosts, rules)?;
         Ok(Some(next))
     }
 
@@ -1712,6 +1767,105 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("replaces"), "{err}");
+    }
+
+    fn udp_allow(spec: &str) -> smolvm_protocol::EgressRule {
+        crate::smolfile::parse_allow_udp(spec).unwrap()
+    }
+
+    #[test]
+    fn updated_egress_appends_udp_allows_after_the_deny_rules_and_keeps_egress_open() {
+        let mut record = VmRecord::new("u".to_string(), 1, 512, vec![], vec![], false);
+        let deny = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        };
+        record.egress_rules = vec![deny.clone()];
+
+        let next = record
+            .updated_egress(&EgressUpdate {
+                allow_udp: vec![udp_allow("1.1.1.1:123"), udp_allow("1.1.1.1:123")],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.egress_rules,
+            vec![deny.clone(), udp_allow("1.1.1.1:123")]
+        );
+        assert!(next.network, "a UDP allow implies networking");
+        assert!(next.allowed_cidrs.is_none() && next.dns_filter_hosts.is_none());
+
+        let err = next
+            .updated_egress(&EgressUpdate {
+                remove_allow_udp: vec![udp_allow("1.1.1.1:53")],
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1.1.1.1/32:53"), "{err}");
+
+        let removed = next
+            .updated_egress(&EgressUpdate {
+                remove_allow_udp: vec![udp_allow("1.1.1.1:123")],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.egress_rules, vec![deny.clone()]);
+    }
+
+    #[test]
+    fn updated_egress_reset_leaves_the_rules_alone() {
+        let mut record = VmRecord::new("u".to_string(), 1, 512, vec![], vec![], true);
+        let deny = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        };
+        record.egress_rules = vec![deny.clone(), udp_allow("1.1.1.1:123")];
+        record.allowed_cidrs = Some(vec!["192.0.2.0/24".to_string()]);
+
+        let next = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                allow_cidrs: vec!["198.51.100.0/24".to_string()],
+                allow_udp: vec![udp_allow("8.8.8.8:443")],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.egress_rules,
+            vec![deny, udp_allow("1.1.1.1:123"), udp_allow("8.8.8.8:443")]
+        );
+        assert_eq!(
+            next.allowed_cidrs.as_deref(),
+            Some(["198.51.100.0/24".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn udp_allow_changes_are_flagged_and_refused_on_tsi() {
+        let update = EgressUpdate {
+            allow_udp: vec![udp_allow("1.1.1.1")],
+            ..Default::default()
+        };
+        assert!(!update.is_empty());
+        assert!(update.changes_udp_rules());
+        assert!(!EgressUpdate {
+            allow_cidrs: vec!["1.1.1.1/32".to_string()],
+            ..Default::default()
+        }
+        .changes_udp_rules());
+
+        let mut record = VmRecord::new("t".to_string(), 1, 512, vec![], vec![], true);
+        record.network_backend = Some(crate::network::NetworkBackend::Tsi);
+        let err = record.updated_egress(&update).unwrap_err().to_string();
+        assert!(err.contains("TSI"), "{err}");
     }
 
     #[test]
