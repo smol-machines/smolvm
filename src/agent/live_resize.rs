@@ -376,6 +376,14 @@ fn ensure_live_memory_platform() -> Result<()> {
     }
 }
 
+/// Whether `extra_bytes` more fits in the measured headroom, keeping a reserve of
+/// 5% of the bound (between 512 MiB and 4 GiB) for everything else on it.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn growth_fits(stats: &crate::process::HostMemoryStats, extra_bytes: u64) -> bool {
+    let reserve = (stats.total_bytes / 20).clamp(512 << 20, 4096 << 20);
+    extra_bytes == 0 || stats.available_bytes >= extra_bytes.saturating_add(reserve)
+}
+
 /// Live RAM growth. Host budget changes precede guest exposure; the runtime
 /// reports its boot layout and a durable intent allows interrupted retries.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -416,28 +424,31 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
         .ok_or_else(|| Error::agent("RAM resize", "VMM process identity is unavailable"))?;
     // Check enforcement before recording an intent, including partial retries.
     let available = crate::process::vmm_growth_memory_stats(pid, started)?;
-    if extra_bytes > 0 {
-        let reserve = (available.total_bytes / 20).clamp(512 << 20, 4096 << 20);
-        if available.available_bytes < extra_bytes.saturating_add(reserve) {
-            return Err(Error::agent_conflict(
-                "RAM resize",
-                "insufficient host or VMM parent memory headroom for requested growth",
-            ));
-        }
+    if !growth_fits(&available, extra_bytes) {
+        return Err(Error::agent_conflict(
+            "RAM resize",
+            "insufficient host or VMM parent memory headroom for requested growth",
+        ));
     }
     #[cfg(target_os = "linux")]
     let budget = fork::live_resize_memory_budget(db, name, &record, target_mib)?;
     let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Memory(target_mib))?;
     #[cfg(target_os = "linux")]
     if !crate::process::raise_managed_vmm_memory_budget(name, pid, started, budget)? {
-        // Refused before anything changed, and every earlier attempt on this
-        // VMM stopped at this same check, so no RAM was registered under the
-        // intent. Clear it: left behind, it refused every later checkpoint,
-        // pause and branch of the machine.
-        db.finish_resize(name, &intent)?;
-        // Do not silently resize a guest beyond an external/shared cgroup's
-        // allowance. External capacity negotiation is a separate integration.
-        return Err(Error::agent_conflict("RAM resize", "live RAM growth currently requires a runtime-managed VM memory scope; external limits were not changed"));
+        // Not SmolVM's own cgroup (a machine started from the CLI runs in the
+        // user's session scope). Its limits are never changed, but growth that
+        // fits under them, and under every ancestor's, needs no change: a desktop
+        // session has none, and refusing there left local machines unable to grow.
+        let enclosing = crate::process::vmm_enclosing_growth_memory_stats(pid, started);
+        if !matches!(enclosing.as_ref().map(|stats| growth_fits(stats, extra_bytes)), Ok(true)) {
+            // Refused before anything changed, and every earlier attempt on this
+            // VMM stopped at this same check, so no RAM was registered under the
+            // intent. Clear it: left behind, it refused every later checkpoint,
+            // pause and branch of the machine.
+            db.finish_resize(name, &intent)?;
+            enclosing?;
+            return Err(Error::agent_conflict("RAM resize", "the memory limit of the cgroup the machine runs in leaves no room for the requested growth; its limits were not changed"));
+        }
     }
     let reply = fork::control_socket_cmd(&socket, &format!("PROTOTYPE_GROW_MEMORY {added_mib}"))?;
     if reply.trim() != "OK RAM registered; guest onlining pending" {
@@ -890,6 +901,20 @@ mod tests {
             assert!(error.contains("Linux x86_64"));
             assert!(error.contains("RAM and disk growth are supported separately"));
         }
+    }
+
+    #[test]
+    fn growth_fits_an_unlimited_session_and_refuses_a_full_limit() {
+        use crate::process::HostMemoryStats;
+        const GIB: u64 = 1 << 30;
+        // a desktop session's cgroup has no limit: the host's headroom is the bound
+        let host = HostMemoryStats { total_bytes: 58 * GIB, available_bytes: 47 * GIB };
+        assert!(growth_fits(&host, 16 * GIB));
+        assert!(!growth_fits(&host, 45 * GIB), "the reserve stays free");
+        // a 20 GiB limit with 18 GiB in use leaves no room for 4 GiB more
+        let capped = HostMemoryStats { total_bytes: 20 * GIB, available_bytes: 2 * GIB };
+        assert!(!growth_fits(&capped, 4 * GIB));
+        assert!(growth_fits(&capped, 0), "nothing more asked: fits");
     }
 
     #[test]

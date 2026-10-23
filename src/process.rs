@@ -3017,6 +3017,20 @@ fn constrain_memory_to_ancestors(
 /// slice. This is a preflight, not a reservation against concurrent consumers.
 #[cfg(target_os = "linux")]
 pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMemoryStats> {
+    growth_memory_stats(pid, started, false)
+}
+
+/// Capacity for growth when the VMM runs in a cgroup SmolVM does not own (a
+/// machine started from the CLI runs in the user's session scope): that cgroup's
+/// own limit counts too, since it is never raised. With no limit anywhere up the
+/// chain (`memory.max` = max, as in a desktop session) only the host bounds it.
+#[cfg(target_os = "linux")]
+pub fn vmm_enclosing_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMemoryStats> {
+    growth_memory_stats(pid, started, true)
+}
+
+#[cfg(target_os = "linux")]
+fn growth_memory_stats(pid: Pid, started: Option<u64>, own_cgroup: bool) -> Result<HostMemoryStats> {
     let verify = || is_our_process_strict(pid, started);
     if !verify() {
         return Err(Error::agent("RAM resize", "VMM process identity changed"));
@@ -3029,8 +3043,8 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
         .and_then(|contents| parse_host_meminfo(&contents))
         .ok_or_else(|| Error::agent("RAM resize", "cannot verify host memory headroom"))?;
     let root = std::path::Path::new("/sys/fs/cgroup");
-    let parent = if dir == root {
-        root
+    let parent = if dir == root || own_cgroup {
+        dir.as_path()
     } else {
         dir.parent()
             .ok_or_else(|| Error::agent("RAM resize", "missing VMM cgroup parent"))?
