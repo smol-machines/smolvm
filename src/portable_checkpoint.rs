@@ -1443,8 +1443,10 @@ fn restored_record(
     if let Some(policy) = network.and_then(|network| network.credential_policy.clone()) {
         // The artifact is untrusted: hold its policy to the same rules create
         // enforces, so a hand-edited checkpoint cannot carry a shape the CLI
-        // would refuse. The policy holds no secrets — values are resolved from
-        // this host's environment at request time — and the placeholders come
+        // would refuse. The policy holds no secrets, and its values are never
+        // resolved from this host's environment: the artifact chose both the
+        // variable and the destination, so a host secret could go anywhere.
+        // They come only from `supply_credential_values`. The placeholders come
         // along unchanged so the captured workload's copies keep matching.
         policy
             .validate(record.dns_filter_hosts.as_deref())
@@ -1453,6 +1455,7 @@ fn restored_record(
             .map(|network| network.credential_placeholders.clone())
             .unwrap_or_default();
         record.credential_policy = Some(policy);
+        record.credentials_supplied_by_api = true;
     }
     record.network_backend = restored_network_backend(checkpoint)?;
     record.dns = network
@@ -9025,6 +9028,14 @@ mod tests {
         );
         let restored = restored_record("cred-restored", &manifest, &checkpoint).unwrap();
         assert_eq!(restored.credential_policy.as_ref(), Some(&policy));
+        // The artifact named the variables, so this host's environment is
+        // never read for them: values come only from supply_credential_values.
+        assert!(restored.credentials_supplied_by_api);
+        assert!(
+            crate::credentials::CredentialLaunch::for_record("cred-restored", &restored)
+                .unwrap()
+                .supplied_only
+        );
         assert_eq!(
             restored.credential_placeholders,
             record.credential_placeholders
