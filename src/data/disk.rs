@@ -53,6 +53,12 @@ pub struct AttachedDisk {
     /// Attach read-only. The guest sees a device it cannot write.
     #[serde(default)]
     pub read_only: bool,
+    /// Format the disk had when it was attached. Every start attaches it in
+    /// this format: re-reading the format from a writable disk would let the
+    /// guest turn it into a qcow2 image whose backing file is any host path.
+    /// `None` only in records written before formats were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<DiskFormat>,
 }
 
 impl AttachedDisk {
@@ -79,7 +85,34 @@ impl AttachedDisk {
                 "{raw}: disk path must be absolute (the VM is launched from a different working directory)"
             ));
         }
-        Ok(Self { path, read_only })
+        Ok(Self {
+            path,
+            read_only,
+            format: None,
+        })
+    }
+
+    /// Record the disk's format as it is now, when the operator attaches it.
+    pub fn pin_format(&mut self) {
+        self.format = Some(detect_disk_format(&self.path));
+    }
+
+    /// The format to attach the disk in at boot: the one recorded when it was
+    /// attached. A disk recorded before formats were, that now reads as a qcow2
+    /// image naming a backing file, is refused: the guest may have written that
+    /// header, and opening its backing file would hand the guest a host path.
+    pub fn boot_format(&self) -> Result<DiskFormat, String> {
+        if let Some(format) = self.format {
+            return Ok(format);
+        }
+        let detected = detect_disk_format(&self.path);
+        if detected == DiskFormat::Qcow2 && qcow2_has_backing_file(&self.path) {
+            return Err(format!(
+                "{}: attached before smolvm recorded disk formats, and now a qcow2 image with a backing file; recreate the machine with this --disk if that is intended",
+                self.path.display()
+            ));
+        }
+        Ok(detected)
     }
 
     /// Reject anything that cannot be attached, with the reason a caller can act
@@ -467,6 +500,20 @@ pub fn detect_disk_format(path: &std::path::Path) -> DiskFormat {
     }
 }
 
+/// Whether the qcow2 image at `path` names a backing file in its header.
+fn qcow2_has_backing_file(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    let read = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut header));
+    // A header that cannot be read is treated as naming one: refuse, not guess.
+    if read.is_err() {
+        return true;
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let size = u32::from_be_bytes(header[16..20].try_into().unwrap());
+    offset != 0 || size != 0
+}
+
 /// Marker type for the persistent rootfs overlay disk.
 #[derive(Debug, Clone, Copy)]
 pub enum Overlay {}
@@ -744,18 +791,67 @@ mod attached_disk_tests {
         assert!(AttachedDisk::parse(":ro").is_err());
     }
 
+    /// A qcow2 header naming `backing` as its backing file.
+    fn qcow2_header(backing: &str) -> Vec<u8> {
+        let mut h = vec![0u8; 512];
+        h[0..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
+        h[4..8].copy_from_slice(&3u32.to_be_bytes());
+        if !backing.is_empty() {
+            h[8..16].copy_from_slice(&256u64.to_be_bytes());
+            h[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+            h[256..256 + backing.len()].copy_from_slice(backing.as_bytes());
+        }
+        h
+    }
+
+    #[test]
+    fn a_disk_keeps_the_format_it_was_attached_in_after_the_guest_rewrites_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("data.img");
+        std::fs::write(&img, vec![0u8; 4096]).unwrap();
+        let mut disk = AttachedDisk::parse(&img.to_string_lossy()).unwrap();
+        disk.pin_format();
+        assert_eq!(disk.format, Some(DiskFormat::Raw));
+        // The guest owns the disk's bytes and writes a qcow2 header naming a
+        // host file: the disk is still attached raw, never as that image.
+        std::fs::write(&img, qcow2_header("/etc/shadow")).unwrap();
+        assert_eq!(disk.boot_format().unwrap(), DiskFormat::Raw);
+        // The record survives a round trip with its format.
+        let json = serde_json::to_string(&disk).unwrap();
+        let back: AttachedDisk = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.format, Some(DiskFormat::Raw));
+    }
+
+    #[test]
+    fn a_disk_recorded_without_a_format_is_refused_once_it_names_a_backing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("legacy.img");
+        // A record from before formats were recorded deserializes without one.
+        let disk: AttachedDisk =
+            serde_json::from_str(&format!(r#"{{"path":{:?}}}"#, img.to_string_lossy())).unwrap();
+        assert_eq!(disk.format, None);
+        std::fs::write(&img, vec![0u8; 4096]).unwrap();
+        assert_eq!(disk.boot_format().unwrap(), DiskFormat::Raw);
+        std::fs::write(&img, qcow2_header("")).unwrap();
+        assert_eq!(disk.boot_format().unwrap(), DiskFormat::Qcow2);
+        std::fs::write(&img, qcow2_header("/etc/shadow")).unwrap();
+        assert!(disk.boot_format().unwrap_err().contains("backing file"));
+    }
+
     #[test]
     fn validate_rejects_a_missing_path_and_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         let missing = AttachedDisk {
             path: dir.path().join("nope.img"),
             read_only: false,
+            format: None,
         };
         assert!(missing.validate().unwrap_err().contains("cannot stat"));
 
         let as_dir = AttachedDisk {
             path: dir.path().to_path_buf(),
             read_only: false,
+            format: None,
         };
         assert!(as_dir.validate().unwrap_err().contains("is a directory"));
     }
@@ -768,6 +864,7 @@ mod attached_disk_tests {
         AttachedDisk {
             path: img,
             read_only: false,
+            format: None,
         }
         .validate()
         .expect("a writable regular file is a valid disk");
@@ -787,6 +884,7 @@ mod attached_disk_tests {
         AttachedDisk {
             path: img.clone(),
             read_only: true,
+            format: None,
         }
         .validate()
         .expect("read-only attach only needs read access");
@@ -797,6 +895,7 @@ mod attached_disk_tests {
             let err = AttachedDisk {
                 path: img,
                 read_only: false,
+                format: None,
             }
             .validate()
             .unwrap_err();

@@ -4825,10 +4825,11 @@ fn parse_attached_disks(specs: &[String]) -> smolvm::Result<Vec<smolvm::data::di
     specs
         .iter()
         .map(|spec| {
-            let disk = smolvm::data::disk::AttachedDisk::parse(spec)
+            let mut disk = smolvm::data::disk::AttachedDisk::parse(spec)
                 .map_err(|e| smolvm::Error::agent("attach disk", e))?;
             disk.validate()
                 .map_err(|e| smolvm::Error::agent("attach disk", e))?;
+            disk.pin_format();
             Ok(disk)
         })
         .collect()

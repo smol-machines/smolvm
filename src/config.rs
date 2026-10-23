@@ -2611,10 +2611,12 @@ mod tests {
             crate::data::disk::AttachedDisk {
                 path: std::path::PathBuf::from("/dev/nvme1n1"),
                 read_only: false,
+                format: None,
             },
             crate::data::disk::AttachedDisk {
                 path: std::path::PathBuf::from("/srv/golden.img"),
                 read_only: true,
+                format: None,
             },
         ];
         let decoded: VmRecord =

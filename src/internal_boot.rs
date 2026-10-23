@@ -794,7 +794,15 @@ fn boot_disk_backing_paths(
 ) -> Vec<PathBuf> {
     [storage, overlay]
         .into_iter()
-        .chain(extra_disks.iter().map(|(path, _, _)| path.as_path()))
+        // An attached disk is opened in the format it was attached in: only a
+        // qcow2 one has a backing chain to grant, and a raw one whose bytes the
+        // guest made look like qcow2 must not widen what the VMM may read.
+        .chain(
+            extra_disks
+                .iter()
+                .filter(|(_, _, format)| *format == DiskFormat::Qcow2)
+                .map(|(path, _, _)| path.as_path()),
+        )
         .chain(cache_layer)
         .flat_map(qcow2_backing_chain)
         .collect()

@@ -646,7 +646,11 @@ pub fn launch_agent_vm_dynamic(
         );
         let attached_path =
             try_or_free_ctx!(path_to_cstring(&disk.path), "disk path contains null byte");
-        let format = crate::data::disk::detect_disk_format(&disk.path).to_krun_u32();
+        let format = try_or_free_ctx!(
+            disk.boot_format(),
+            "attached disk refused: re-read its format from a guest-writable disk"
+        )
+        .to_krun_u32();
         let result = if disk.read_only {
             unsafe {
                 (krun.add_disk2)(

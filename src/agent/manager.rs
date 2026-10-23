@@ -2971,7 +2971,8 @@ impl AgentManager {
                     __d.push((
                         disk.path.clone(),
                         disk.read_only,
-                        crate::data::disk::detect_disk_format(&disk.path),
+                        disk.boot_format()
+                            .map_err(|e| crate::Error::agent("attach disk", e))?,
                     ));
                 }
                 if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
