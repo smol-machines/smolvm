@@ -271,6 +271,10 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
     if meta.len() > max_archive_bytes() {
         return Err(too_large(meta.len()));
     }
+    // Stage the file a symlink points at, not the link: a hardlink to a
+    // symlink is itself a symlink to a host path, which the guest cannot
+    // follow through the share.
+    let path = &path.canonicalize()?;
     let hash = hash_file(path)?;
     let archive_path = cache_base.join(&hash).join(ARCHIVE_FILE);
     // A cache hit is trusted only if the staged file is still the size we just
@@ -728,6 +732,25 @@ mod tests {
         // Identical content → identical hash, idempotent (no error, reused).
         let h2 = stage_from_file(src.path(), cache.path()).unwrap();
         assert_eq!(h1, h2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_from_file_stages_the_file_behind_a_symlink() {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("image.tar");
+        std::fs::write(&real, b"fake docker save archive").unwrap();
+        let link = dir.path().join("link.tar");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let hash = stage_from_file(&link, cache.path()).unwrap();
+        let staged = cache.path().join(&hash).join(ARCHIVE_FILE);
+        assert!(
+            std::fs::symlink_metadata(&staged).unwrap().is_file(),
+            "staged archive must be a regular file, not a link to the host path"
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), b"fake docker save archive");
     }
 
     #[test]
