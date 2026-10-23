@@ -1533,6 +1533,12 @@ pub(crate) fn archive_scratch_dir() -> PathBuf {
             warn!(dir = %p.display(), "{ARCHIVE_SCRATCH_DIR_ENV} unusable, falling back to the storage disk");
         }
     }
+    // Unit tests never stage on the machine they run on. On a smol machine the
+    // real /storage/tmp exists, owned by root, and a non-root test cannot write
+    // in it.
+    if cfg!(test) {
+        return std::env::temp_dir();
+    }
     let dir = Path::new(STORAGE_ROOT).join("tmp");
     if std::fs::create_dir_all(&dir).is_ok() {
         dir
