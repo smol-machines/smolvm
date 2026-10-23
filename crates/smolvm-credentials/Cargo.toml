@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-credentials"
-version = "1.31.3"
+version = "1.31.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Credential substitution for Smol machines: policy, resolvers and the transparent HTTPS interceptor"
