@@ -750,6 +750,9 @@ pub struct CreateMachineRequest {
     #[serde(default)]
     #[schema(example = "my-vm")]
     pub name: Option<String>,
+    /// Opaque owner metadata, persisted and returned for resource discovery.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
     /// Number of vCPUs.
     #[serde(default)]
     #[schema(example = 4)]
@@ -926,6 +929,9 @@ pub struct MachineInfo {
     /// Machine name.
     #[schema(example = "my-vm")]
     pub name: String,
+    /// Opaque owner metadata; omitted for machines without labels.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
     /// Resolved workload image, used to bind registry credentials to its host.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "registry.example.com/team/app:latest")]
