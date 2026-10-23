@@ -25,6 +25,7 @@ pub(crate) mod test_guest;
 pub mod video;
 pub(crate) mod virtiofs;
 pub use virtiofs::legacy_packed_layers_dax_window;
+mod vm_root_migrate;
 /// Encoded browser video is unavailable on non-Unix hosts because the helper
 /// transport uses a mode-restricted Unix socket.
 #[cfg(not(unix))]
@@ -105,9 +106,9 @@ pub use manager::{
     apply_live_egress_policy, apply_live_published_ports, cleanup_dead_vm_runtime, lock_live_egress,
 };
 pub use manager::{
-    bind_ready_listener, disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir,
-    machine_layers_cache_dir, prune_orphaned_ready_markers, read_egress_denials,
-    read_egress_signals, read_egress_telemetry, read_mediation_machine_id,
+    bind_ready_listener, cache_root, data_root, disk_used_mb, docker_config_dir,
+    docker_config_mount, ensure_vm_dir, machine_layers_cache_dir, prune_orphaned_ready_markers,
+    read_egress_denials, read_egress_signals, read_egress_telemetry, read_mediation_machine_id,
     read_shared_pack_pointer, resolve_disk_image, restore_base_dir, shared_pack_cache_root,
     shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir,
     AgentManager, AgentState, EgressDenial, EgressSignal, SHARED_PACK_POINTER,
