@@ -474,7 +474,9 @@ pub fn launch_agent_vm_dynamic(
                 smolvm_network::EgressPolicy::deny_all()
             };
             if let Some(dir) = config.vsock_socket.parent() {
-                egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
+                egress = egress
+                    .with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG))
+                    .with_network_log(dir.join(smolvm_network::NETWORK_LOG));
                 egress = egress.with_watchlist(
                     dir.join(smolvm_network::watchlist::EGRESS_WATCHLIST_FILE),
                     dir.join(smolvm_network::EGRESS_SIGNALS_LOG),

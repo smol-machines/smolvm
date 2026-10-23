@@ -422,6 +422,9 @@ pub enum MachineCmd {
     /// Show egress denials — outbound connections the machine's egress policy refused
     EgressEvents(EgressEventsCmd),
 
+    /// Show the hosts a machine looked up and connected to, allowed or refused
+    NetLog(NetLogCmd),
+
     /// List all machines
     #[command(visible_alias = "list")]
     Ls(LsCmd),
@@ -497,6 +500,7 @@ impl MachineCmd {
             MachineCmd::Stats(cmd) => cmd.run(),
             MachineCmd::Logs(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
+            MachineCmd::NetLog(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
             MachineCmd::Resize(cmd) => cmd.run(),
             MachineCmd::Update(cmd) => cmd.run(),
@@ -6551,6 +6555,177 @@ impl EgressEventsCmd {
             Ok(()) => Ok(()),
         }
     }
+}
+
+// ============================================================================
+// NetLog Command
+// ============================================================================
+
+/// Show the hosts a machine looked up and connected to.
+///
+/// Every name the machine resolved and every destination it reached or was
+/// refused, as the host saw it, oldest first. A connection is shown with the
+/// name its address was looked up as. Datagram flows, pings and refusals that
+/// repeat are recorded once every ten seconds.
+///
+/// The log is kept by the virtio-net network, which a machine uses when it has
+/// --allow-host, --allow-cidr, published ports or --net-backend virtio-net. A
+/// machine on the TSI backend (plain --net) makes its connections inside the
+/// VMM, out of the log's sight.
+#[derive(Args, Debug)]
+pub struct NetLogCmd {
+    /// Machine to inspect (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Maximum number of entries to show (newest kept)
+    #[arg(long, default_value_t = 200)]
+    pub limit: usize,
+
+    /// List each host once, with how often it was reached or refused
+    #[arg(long)]
+    pub hosts: bool,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// One row of `net-log --hosts`.
+#[derive(Debug, serde::Serialize)]
+struct NetLogHost {
+    host: String,
+    allowed: usize,
+    denied: usize,
+    last_seen_ms: u64,
+}
+
+impl NetLogCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::resolve_vm_name(self.name)?.unwrap_or_else(|| "default".into());
+        if smolvm::db::SmolvmDb::open()?.get_vm(&name)?.is_none() {
+            return Err(smolvm::Error::vm_not_found(&name));
+        }
+        let events = smolvm::agent::read_network_log(&name, self.limit);
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let Some(events) = events else {
+                if self.json {
+                    return writeln!(out, "[]");
+                }
+                return writeln!(
+                    out,
+                    "No network log for '{name}'. One is kept for machines on the virtio-net \
+                     network: started with --allow-host, --allow-cidr, -p, or \
+                     --net-backend virtio-net."
+                );
+            };
+            if self.hosts {
+                let mut hosts: Vec<NetLogHost> = Vec::new();
+                for event in &events {
+                    let host = event.host.clone().unwrap_or_else(|| {
+                        if event.transport == "dns" {
+                            event.destination.clone()
+                        } else {
+                            // An address the guest did not look up: group by IP.
+                            event
+                                .destination
+                                .parse::<std::net::SocketAddr>()
+                                .map(|addr| addr.ip().to_string())
+                                .unwrap_or_else(|_| event.destination.clone())
+                        }
+                    });
+                    let row = match hosts.iter_mut().position(|row| row.host == host) {
+                        Some(index) => &mut hosts[index],
+                        None => {
+                            hosts.push(NetLogHost {
+                                host,
+                                allowed: 0,
+                                denied: 0,
+                                last_seen_ms: 0,
+                            });
+                            hosts.last_mut().expect("just pushed")
+                        }
+                    };
+                    if event.action == "deny" {
+                        row.denied += 1;
+                    } else {
+                        row.allowed += 1;
+                    }
+                    row.last_seen_ms = row.last_seen_ms.max(event.timestamp_ms);
+                }
+                if self.json {
+                    return writeln!(
+                        out,
+                        "{}",
+                        serde_json::to_string_pretty(&hosts).unwrap_or_default()
+                    );
+                }
+                if hosts.is_empty() {
+                    return writeln!(out, "No network activity recorded for '{name}'.");
+                }
+                writeln!(
+                    out,
+                    "{:<20} {:<8} {:<8} HOST",
+                    "LAST SEEN", "ALLOWED", "DENIED"
+                )?;
+                for row in &hosts {
+                    writeln!(
+                        out,
+                        "{:<20} {:<8} {:<8} {}",
+                        clock_time(row.last_seen_ms),
+                        row.allowed,
+                        row.denied,
+                        row.host
+                    )?;
+                }
+                return Ok(());
+            }
+            if self.json {
+                return writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&events).unwrap_or_default()
+                );
+            }
+            if events.is_empty() {
+                return writeln!(out, "No network activity recorded for '{name}'.");
+            }
+            writeln!(
+                out,
+                "{:<20} {:<6} {:<5} DESTINATION",
+                "TIME", "ACTION", "PROTO"
+            )?;
+            for event in &events {
+                let destination = match &event.host {
+                    Some(host) => format!("{} ({host})", event.destination),
+                    None => event.destination.clone(),
+                };
+                writeln!(
+                    out,
+                    "{:<20} {:<6} {:<5} {}",
+                    clock_time(event.timestamp_ms),
+                    event.action,
+                    event.transport,
+                    destination
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(smolvm::Error::config("net-log", e.to_string())),
+            Ok(()) => Ok(()),
+        }
+    }
+}
+
+/// RFC 3339 UTC, to the second, for a Unix epoch milliseconds timestamp.
+fn clock_time(timestamp_ms: u64) -> String {
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(timestamp_ms);
+    humantime::format_rfc3339_seconds(at).to_string()
 }
 
 // ============================================================================

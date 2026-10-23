@@ -1110,6 +1110,17 @@ pub struct EgressEventsResponse {
     pub events: Vec<EgressDenialInfo>,
 }
 
+/// A machine's network log.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NetworkLogResponse {
+    /// Whether the machine keeps a network log: false for a machine that has
+    /// not booted on the virtio-net network (TSI makes its connections inside
+    /// the VMM, out of the host's sight).
+    pub recorded: bool,
+    /// Entries oldest-first, capped by the `limit` query parameter.
+    pub events: Vec<crate::agent::NetworkEvent>,
+}
+
 /// One host-observed mediated egress decision.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

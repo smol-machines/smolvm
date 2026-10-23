@@ -107,10 +107,10 @@ pub use manager::{
 pub use manager::{
     bind_ready_listener, disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir,
     machine_layers_cache_dir, prune_orphaned_ready_markers, read_egress_denials,
-    read_egress_signals, read_egress_telemetry, read_mediation_machine_id,
+    read_egress_signals, read_egress_telemetry, read_mediation_machine_id, read_network_log,
     read_shared_pack_pointer, resolve_disk_image, restore_base_dir, shared_pack_cache_root,
     shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir,
-    AgentManager, AgentState, EgressDenial, EgressSignal, SHARED_PACK_POINTER,
+    AgentManager, AgentState, EgressDenial, EgressSignal, NetworkEvent, SHARED_PACK_POINTER,
 };
 
 /// Agent VM name.

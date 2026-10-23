@@ -1082,6 +1082,7 @@ fn deliver_dns_responses(
     while let Ok(response) = from_relay.try_recv() {
         if let Some(pending) = gateway.pending_udp.remove(&response.id) {
             if let Some(answer) = response.answer {
+                egress.note_dns_answer(&answer);
                 if pending.learn {
                     egress.learn_dns_answer(&answer);
                 }
@@ -1102,6 +1103,7 @@ fn deliver_dns_responses(
                 Some(pending) if pending.id == response.id => {
                     conn.awaiting = None;
                     if let Some(answer) = response.answer {
+                        egress.note_dns_answer(&answer);
                         if pending.learn {
                             egress.learn_dns_answer(&answer);
                         }

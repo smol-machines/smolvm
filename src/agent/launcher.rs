@@ -1422,6 +1422,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // The operator's watchlist copy, written by `serve
                 // --egress-watchlist` before boot; absent means none for this VM.
                 if let Some(dir) = vsock_socket.parent() {
+                    egress = egress.with_network_log(dir.join(smolvm_network::NETWORK_LOG));
                     egress = egress.with_watchlist(
                         dir.join(smolvm_network::watchlist::EGRESS_WATCHLIST_FILE),
                         dir.join(smolvm_network::EGRESS_SIGNALS_LOG),
