@@ -2,5 +2,5 @@
 # The libkrun/libkrunfw submodule commits the bundled libs in this dir were
 # built from. Verified against the pinned submodules by
 # scripts/check-libkrun-provenance.sh (run in CI).
-libkrun=1ca08aacdccf3aafcaa583f31ecfec12c54b8d3f
+libkrun=93b8d977bb82ee368a9823091246071532ff4092
 libkrunfw=8ba5fe2219b5c407ce1824d1c2dcf39adff84d8e
