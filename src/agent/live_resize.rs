@@ -440,7 +440,12 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
         // fits under them, and under every ancestor's, needs no change: a desktop
         // session has none, and refusing there left local machines unable to grow.
         let enclosing = crate::process::vmm_enclosing_growth_memory_stats(pid, started);
-        if !matches!(enclosing.as_ref().map(|stats| growth_fits(stats, extra_bytes)), Ok(true)) {
+        if !matches!(
+            enclosing
+                .as_ref()
+                .map(|stats| growth_fits(stats, extra_bytes)),
+            Ok(true)
+        ) {
             // Refused before anything changed, and every earlier attempt on this
             // VMM stopped at this same check, so no RAM was registered under the
             // intent. Clear it: left behind, it refused every later checkpoint,
@@ -908,11 +913,17 @@ mod tests {
         use crate::process::HostMemoryStats;
         const GIB: u64 = 1 << 30;
         // a desktop session's cgroup has no limit: the host's headroom is the bound
-        let host = HostMemoryStats { total_bytes: 58 * GIB, available_bytes: 47 * GIB };
+        let host = HostMemoryStats {
+            total_bytes: 58 * GIB,
+            available_bytes: 47 * GIB,
+        };
         assert!(growth_fits(&host, 16 * GIB));
         assert!(!growth_fits(&host, 45 * GIB), "the reserve stays free");
         // a 20 GiB limit with 18 GiB in use leaves no room for 4 GiB more
-        let capped = HostMemoryStats { total_bytes: 20 * GIB, available_bytes: 2 * GIB };
+        let capped = HostMemoryStats {
+            total_bytes: 20 * GIB,
+            available_bytes: 2 * GIB,
+        };
         assert!(!growth_fits(&capped, 4 * GIB));
         assert!(growth_fits(&capped, 0), "nothing more asked: fits");
     }
