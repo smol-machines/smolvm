@@ -1131,18 +1131,28 @@ fn prepare_running_disk_generation(
     Ok(())
 }
 
-/// Whether the VM process `pid` runs a different smolvm binary than this server.
-/// A worker roll replaces the binary under running VMs, which keep the one they
-/// started with; branching such a VM from the new engine gave children whose
-/// workload died at once (one customer's batch of 7 on 2026-10-22). The VM
-/// process is this binary run as `_boot-vm`, so the two files compare directly.
+/// Whether the VM process `pid` runs a different smolvm binary than this engine
+/// boots VMs with. A worker roll replaces the binary under running VMs, which
+/// keep the one they started with; branching such a VM from the new engine gave
+/// children whose workload died at once (one customer's batch of 7 on
+/// 2026-10-22). VMs boot as [`super::manager::vm_boot_executable`] run as
+/// `_boot-vm`, which for an embedding SDK is its helper, not the host process.
 /// Linux only; a process or file that cannot be read is not refused.
 #[cfg(target_os = "linux")]
 fn source_runs_another_engine(pid: i32) -> bool {
+    match super::manager::vm_boot_executable() {
+        Ok(boot) => process_runs_another_binary(pid, &boot),
+        Err(_) => false,
+    }
+}
+
+/// Whether process `pid` runs a file other than `binary`.
+#[cfg(target_os = "linux")]
+fn process_runs_another_binary(pid: i32, binary: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (
         std::fs::metadata(format!("/proc/{pid}/exe")),
-        std::fs::metadata("/proc/self/exe"),
+        std::fs::metadata(binary),
     ) {
         (Ok(vm), Ok(own)) => (vm.dev(), vm.ino()) != (own.dev(), own.ino()),
         _ => false,
@@ -4693,9 +4703,17 @@ mod tests {
             .spawn()
             .unwrap();
         let differs = source_runs_another_engine(other.id() as i32);
+        let sleep_bin = std::fs::read_link(format!("/proc/{}/exe", other.id())).unwrap();
+        // An embedding SDK boots VMs with its helper, not the host process: a
+        // VM running that helper is this engine's, whatever the host runs.
+        let helper_is_this_engine = !process_runs_another_binary(other.id() as i32, &sleep_bin);
+        let host_is_not_the_helper =
+            process_runs_another_binary(std::process::id() as i32, &sleep_bin);
         let _ = other.kill();
         let _ = other.wait();
         assert!(differs);
+        assert!(helper_is_this_engine);
+        assert!(host_is_not_the_helper);
         assert!(
             !source_runs_another_engine(i32::MAX),
             "an unreadable process is not refused"

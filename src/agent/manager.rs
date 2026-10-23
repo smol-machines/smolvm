@@ -3024,8 +3024,6 @@ impl AgentManager {
         );
 
         // Spawn fresh subprocess (posix_spawn on macOS — safe for multi-threaded parents)
-        let exe = crate::process::self_exe_for_spawn()
-            .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
         // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
@@ -3045,7 +3043,8 @@ impl AgentManager {
         // `features.watch_parent = Some(false)` — otherwise its persistent
         // machines die the moment the CLI process exits.
         let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
-        let boot_exe = boot_binary.unwrap_or_else(|| exe.clone());
+        let boot_exe =
+            vm_boot_executable().map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let mut cmd = std::process::Command::new(&boot_exe);
         if let Some(service) = crate::network::launch::guest_host_service()
             .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
@@ -4220,6 +4219,16 @@ fn boot_failure_reason(
         (Some(err), None) => format!("{err} ({code_note})"),
         (None, Some(guest)) => format!("guest console: {guest} ({code_note})"),
         (None, None) => code_note,
+    }
+}
+
+/// The binary a VM boots as (`<it> _boot-vm`): the embedder's registered boot
+/// helper or `SMOLVM_BOOT_BINARY`, else this executable. An embedding SDK's host
+/// process (`node`, `python`) cannot boot a VM itself, so its VMs run the helper.
+pub(crate) fn vm_boot_executable() -> std::io::Result<PathBuf> {
+    match crate::embedded::bundle::boot_binary() {
+        Some(helper) => Ok(helper),
+        None => crate::process::self_exe_for_spawn(),
     }
 }
 
