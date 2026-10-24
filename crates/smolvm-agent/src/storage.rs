@@ -4121,7 +4121,6 @@ impl OverlaySetup {
             }
         }
 
-        std::fs::create_dir_all(&self.upper_path)?;
         std::fs::create_dir_all(&self.work_path)?;
         std::fs::create_dir_all(&self.merged_path)?;
 
@@ -4295,16 +4294,26 @@ impl OverlaySetup {
     /// Execute the full overlay setup pipeline with the given lower directories.
     fn execute(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
         self.prepare_directories()?;
-        self.setup_upper_layer(&lowerdirs)?;
-        self.verify_layers(&lowerdirs)?;
-        self.mount(&lowerdirs)?;
+        let upper_path = self.upper_path.clone();
+        let staged = Self {
+            upper_path: self.overlay_root.join("upper.initializing"),
+            ..self
+        };
+        staged.setup_upper_layer(&lowerdirs)?;
+        staged.verify_layers(&lowerdirs)?;
+        std::fs::rename(&staged.upper_path, &upper_path)?;
+        let setup = Self {
+            upper_path,
+            ..staged
+        };
+        setup.mount(&lowerdirs)?;
 
-        let entry_count = self.verify_mount();
-        info!(workload_id = %self.workload_id, entry_count = entry_count, "overlay mounted");
+        let entry_count = setup.verify_mount();
+        info!(workload_id = %setup.workload_id, entry_count = entry_count, "overlay mounted");
 
-        refresh_overlay_hostname(&self.merged_path);
-        self.create_bundle()?;
-        Ok(self.into_overlay_info())
+        refresh_overlay_hostname(&setup.merged_path);
+        setup.create_bundle()?;
+        Ok(setup.into_overlay_info())
     }
 
     /// Reuse an existing persistent overlay or create a new one.
@@ -4419,13 +4428,28 @@ fn write_overlay_resolver(root: &Path) -> std::io::Result<bool> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let root_dir = std::fs::File::open(root)?;
     // SAFETY: `root_dir` is open and the path is a NUL-terminated literal.
-    let etc = unsafe {
+    let mut etc = unsafe {
         libc::openat(
             root_dir.as_raw_fd(),
             c"etc".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
+    if etc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        if unsafe { libc::mkdirat(root_dir.as_raw_fd(), c"etc".as_ptr(), 0o755) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error);
+            }
+        }
+        etc = unsafe {
+            libc::openat(
+                root_dir.as_raw_fd(),
+                c"etc".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+    }
     if etc < 0 {
         let error = std::io::Error::last_os_error();
         return match error.raw_os_error() {
@@ -8032,6 +8056,21 @@ mod tests {
             .ends_with("127.0.1.1\tworker-2\n"));
     }
 
+    #[test]
+    fn refresh_overlay_resolver_restores_missing_upper_etc() {
+        let _guard = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let upper = tmp.path().join("upper");
+        std::fs::create_dir(&upper).unwrap();
+
+        refresh_overlay_resolver(&upper).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(upper.join("etc/resolv.conf")).unwrap(),
+            overlay_resolv_conf_contents()
+        );
+    }
+
     // An image's symlinked hosts, or a symlinked resolv.conf that resolves
     // inside the image (systemd-resolved's stub once it runs), is kept and
     // never written through: the agent would resolve the link against its own
@@ -8160,6 +8199,26 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "127.0.0.1 localhost\n127.0.1.1\tworker-2\n"
         );
+    }
+
+    #[test]
+    fn first_setup_does_not_publish_an_incomplete_upper_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let overlay_root = tmp.path().join("overlay");
+        let setup = OverlaySetup {
+            workload_id: "first-setup-test".to_string(),
+            upper_path: overlay_root.join("upper"),
+            work_path: overlay_root.join("work"),
+            merged_path: overlay_root.join("merged"),
+            overlay_root,
+        };
+
+        setup.prepare_directories().unwrap();
+        assert!(!setup.upper_path.exists());
+        std::fs::create_dir(setup.overlay_root.join("upper.initializing")).unwrap();
+        setup.prepare_directories().unwrap();
+        assert!(!setup.overlay_root.join("upper.initializing").exists());
+        assert!(!setup.upper_path.exists());
     }
 
     #[test]
