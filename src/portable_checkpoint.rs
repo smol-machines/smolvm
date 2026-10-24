@@ -4466,11 +4466,14 @@ impl LayerPins {
             Ok(source) if !source.starts_with(&self.vm_data) => {}
             _ => return Ok(false),
         }
-        if self.layers.is_empty() {
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&self.dir)
-                .map_err(|error| Error::agent("pin paused layers", error.to_string()))?;
+        // Created on the first attempt, not the first success: a layer that cannot
+        // be linked (another filesystem, as an install's templates on the boot
+        // disk are beside an XFS data disk) leaves no pin, and the next layer must
+        // reuse the directory rather than fail creating it again.
+        match std::fs::DirBuilder::new().mode(0o700).create(&self.dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(Error::agent("pin paused layers", error.to_string())),
         }
         let pin = archive_path.replace('/', "-");
         if let Err(error) = std::fs::hard_link(source, self.dir.join(&pin)) {
@@ -6944,6 +6947,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn a_layer_that_cannot_be_pinned_does_not_fail_the_next_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let vm_data = root.path().join("vm");
+        std::fs::create_dir(&vm_data).unwrap();
+        // Another machine's layers, outside this machine's data directory.
+        let owner = root.path().join("owner");
+        std::fs::create_dir(&owner).unwrap();
+        let unlinkable = owner.join("dir-layer");
+        std::fs::create_dir(&unlinkable).unwrap(); // hard_link of a directory fails
+        let layer = owner.join("overlay-template.ext4");
+        std::fs::write(&layer, b"template").unwrap();
+
+        let mut pins = LayerPins::new(&vm_data).unwrap();
+        assert!(!pins.pin(&unlinkable, "disks/storage/1", None).unwrap());
+        assert!(pins.pin(&layer, "disks/overlay/1", None).unwrap());
+        assert_eq!(pins.layers.len(), 1);
+    }
+
     #[test]
     fn pinned_verification_covers_only_the_unchanged_inode() {
         let dir = tempfile::tempdir().unwrap();
