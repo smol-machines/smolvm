@@ -47,18 +47,21 @@ cargo make test
 
 # Run specific test suites
 cargo make test-cli        # CLI tests only
-cargo make test-sandbox    # Sandbox tests only
-cargo make test-machine    # MicroVM tests only
 cargo make test-pack       # Pack tests only
 cargo make test-lib        # Unit tests (no VM required)
+./tests/run_tests.sh bare network   # Specific VM suites (names in tests/run_tests.sh)
 ```
 
 ## Agent Rootfs
 
 The agent rootfs resolution order is:
 1. `SMOLVM_AGENT_ROOTFS` env var (explicit override)
-2. `./target/agent-rootfs` (local development)
-3. Platform data directory (`~/.local/share/smolvm/` on Linux, `~/Library/Application Support/smolvm/` on macOS)
+2. A rootfs tarball from an SDK bundle or `SMOLVM_AGENT_ROOTFS_TAR`, extracted once to a cache directory
+3. `agent-rootfs` next to the `smolvm` executable (distribution layout)
+4. Platform data directory (`~/.local/share/smolvm/` on Linux, `~/Library/Application Support/smolvm/` on macOS)
+
+`./target/agent-rootfs` is not searched. To use the one `cargo make agent-rootfs` builds, export
+`SMOLVM_AGENT_ROOTFS=$PWD/target/agent-rootfs`. `cargo make smolvm` sets it for you; `cargo make test` does not.
 
 ```bash
 # Build agent for Linux (size-optimized)
@@ -104,10 +107,10 @@ new features), see:
 
 ## Troubleshooting
 
-**Database lock errors** ("Database already open"):
+**Stuck machines**: each running machine is one `_boot-vm` process (`smolvm-bin _boot-vm` from an
+install, `target/release/smolvm _boot-vm` from a dev build). Stop all of them:
 ```bash
-pkill -f "smolvm serve"
-pkill -f "smolvm-bin machine start"
+pkill -f "_boot-vm"
 ```
 
 **Hung tests**: Check for stuck VM processes:
