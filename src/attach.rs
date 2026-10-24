@@ -97,6 +97,11 @@ fn connect(name: &str) -> Result<(AgentClient, bool)> {
     Ok((client, supported))
 }
 
+/// Whether one of two canonical directories is, or lies inside, the other.
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
 /// Directories attached to the running machine `name`.
 pub fn list(name: &str) -> Result<Vec<AttachedMount>> {
     let (mut client, supported) = connect(name)?;
@@ -144,14 +149,27 @@ pub fn attach(
     if !supported {
         return Err(Error::agent("attach mount", RESTART_HINT));
     }
-    if client
-        .attached_mounts()?
-        .iter()
-        .any(|m| m.target == target_str)
-    {
+    let attached = client.attached_mounts()?;
+    if attached.iter().any(|m| m.target == target_str) {
         return Err(Error::config(
             "attach mount",
             format!("{target_str} already has an attached mount"),
+        ));
+    }
+    // A live device serves each host inode under one share, so a directory
+    // cannot be attached twice, nor inside or around one already attached.
+    if let Some(m) = attached
+        .iter()
+        .find(|m| m.read_only == read_only && overlaps(&source, Path::new(&m.source)))
+    {
+        return Err(Error::config(
+            "attach mount",
+            format!(
+                "{} overlaps {}, already attached at {}; a directory can be attached once, and not inside or around another attached directory",
+                source.display(),
+                m.source,
+                m.target
+            ),
         ));
     }
 
@@ -201,6 +219,15 @@ pub fn detach(name: &str, target: &Path) -> Result<AttachedMount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_overlaps_itself_its_parents_and_its_children_only() {
+        assert!(overlaps(Path::new("/srv/a"), Path::new("/srv/a")));
+        assert!(overlaps(Path::new("/srv/a/sub"), Path::new("/srv/a")));
+        assert!(overlaps(Path::new("/srv"), Path::new("/srv/a")));
+        assert!(!overlaps(Path::new("/srv/ab"), Path::new("/srv/a")));
+        assert!(!overlaps(Path::new("/srv/b"), Path::new("/srv/a")));
+    }
 
     #[test]
     fn targets_are_normalized_and_get_stable_device_safe_share_names() {
