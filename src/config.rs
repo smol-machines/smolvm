@@ -758,10 +758,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub credential_placeholders: std::collections::BTreeMap<String, String>,
 
-    /// The credential bindings came in over the HTTP API, so their values come
-    /// only from that API (`PUT /machines/{name}/credential-values`) and never
-    /// from this host's environment: an API caller must not be able to route a
-    /// host variable to a host of its choosing.
+    /// The credential bindings came from someone other than this host's
+    /// operator (an HTTP API caller, an embedder, or a restored checkpoint), so
+    /// their values come only from `PUT /machines/{name}/credential-values` or
+    /// `supply_credential_values` and never from this host's environment: they
+    /// must not be able to route a host variable to a host of their choosing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credentials_supplied_by_api: bool,
 

@@ -5510,6 +5510,15 @@ impl CreateCmd {
         )?;
 
         let mut record = vm_common::build_vm_record_for(&params, checkpoint.is_some())?;
+        // Credential bindings that came with the artifact name host variables
+        // and destinations its author chose; resolving them from this host's
+        // environment would let a checkpoint send a host secret anywhere.
+        if checkpoint_network
+            .and_then(|captured| captured.credential_policy.as_ref())
+            .is_some_and(|policy| !policy.is_empty())
+        {
+            record.credentials_supplied_by_api = true;
+        }
         if self.keep_identity && checkpoint.is_none() {
             return Err(smolvm::Error::config(
                 "create machine",
