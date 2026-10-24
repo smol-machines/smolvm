@@ -3556,15 +3556,23 @@ impl AgentManager {
             inner.child.as_ref().map(|c| c.pid())
         };
 
+        // Whatever ends the VMM from here, smolvm asked for it.
+        let mark = |pid| {
+            if let Some(name) = self.name() {
+                crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+            }
+        };
         let killed_pid = match owned_child {
             Some(pid) => {
                 if process::is_alive(pid) {
+                    mark(pid);
                     process::kill(pid);
                 }
                 Some(pid)
             }
             None => match self.read_pid_file_with_start_time() {
                 Some((pid, start_time)) => {
+                    mark(pid);
                     if process::kill_verified(pid, start_time) {
                         Some(pid)
                     } else if process::cmdline_contains(

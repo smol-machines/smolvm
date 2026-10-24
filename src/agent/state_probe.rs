@@ -171,6 +171,7 @@ pub(crate) fn recover_unreachable_machine_in_db(
                     ),
                 ));
             }
+            crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(&record.name), pid);
             crate::process::stop_vm_process(
                 pid,
                 crate::process::VM_SIGTERM_TIMEOUT,

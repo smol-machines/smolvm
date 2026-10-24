@@ -2442,6 +2442,7 @@ fn shutdown_machine_process(
             } else {
                 Duration::ZERO
             };
+            crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(name), pid);
             let _ = stop_vm_process(pid, sigterm, VM_SIGKILL_TIMEOUT);
         } else {
             tracing::debug!(pid, name, "PID already dead");
