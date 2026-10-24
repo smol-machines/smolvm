@@ -116,6 +116,22 @@ are `net_backend`, `rosetta`, `cuda`, `auto_graph`, `docker_socket`,
 `block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
 tables; `machine create --help` describes the flag each one mirrors.
 
+## User names and numeric IDs
+
+The Smolfile `user`, the image's `USER`, and `machine exec --user` resolve
+names against the container image's `/etc/passwd` (and named groups against
+`/etc/group`). A name that exists only on the host or in the VM's base system
+does not work inside the image.
+
+Use a numeric UID and GID when the image has no matching passwd entry:
+
+```bash
+smolvm machine exec --name myvm --user 1001:1001 -- id
+```
+
+Numeric IDs do not require passwd or group entries. Specify the GID too:
+if an unknown numeric UID has no explicit GID, its default GID is `0`.
+
 ## Merge precedence
 
 CLI flags override Smolfile values. For `machine run` and `machine create`:
