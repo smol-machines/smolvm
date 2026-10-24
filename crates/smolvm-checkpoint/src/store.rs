@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use smolvm_pack::format::PackManifest;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
+#[cfg(not(unix))]
+use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -299,10 +301,14 @@ impl Writer {
                         pending.push(Some(None));
                         free.push(buffer);
                     }
-                    Ok(Some(Job::Data)) => {
+                    Ok(Some(job @ (Job::Data | Job::Read(_)))) => {
+                        let read = match job {
+                            Job::Read(read) => Some(read),
+                            _ => None,
+                        };
                         let seq = pending.len();
                         pending.push(None);
-                        if self.pool.submit(seq, buffer, done.clone()).is_err() {
+                        if self.pool.submit(seq, buffer, read, done.clone()).is_err() {
                             failure = Some(io::Error::other("checkpoint worker pool stopped"));
                             break;
                         }
@@ -563,6 +569,9 @@ impl Writer {
         let mut offset = 0;
         #[cfg(unix)]
         let mut seek_sparse = true;
+        // Workers read their own chunks: positional reads share no cursor.
+        #[cfg(unix)]
+        let shared = Arc::new(source.try_clone()?);
         let chunks = self.ingest_chunks(|buffer| {
             if offset >= size {
                 return Ok(None);
@@ -599,10 +608,20 @@ impl Writer {
             } else if hole {
                 Job::Hole(count as usize)
             } else {
-                buffer.resize(count as usize, 0);
-                source.seek(SeekFrom::Start(offset))?;
-                source.read_exact(buffer)?;
-                Job::Data
+                #[cfg(unix)]
+                let job = Job::Read(ChunkRead {
+                    file: Arc::clone(&shared),
+                    offset,
+                    len: count as usize,
+                });
+                #[cfg(not(unix))]
+                let job = {
+                    buffer.resize(count as usize, 0);
+                    source.seek(SeekFrom::Start(offset))?;
+                    source.read_exact(buffer)?;
+                    Job::Data
+                };
+                job
             };
             offset += count;
             Ok(Some(job))
@@ -1111,6 +1130,33 @@ enum Job {
     Hole(usize),
     /// The reader filled the buffer it was handed with this chunk's bytes.
     Data,
+    /// A worker reads this chunk itself, into the buffer it is handed.
+    Read(ChunkRead),
+}
+
+/// A chunk a worker reads with a positional read instead of the reader thread.
+/// A sequential reader is bound by the latency of one read at a time: on a
+/// network disk with 128 KiB readahead that held a capture to about 330 MB/s
+/// on a disk that serves 2.3 GB/s to eight readers at once.
+struct ChunkRead {
+    file: Arc<File>,
+    offset: u64,
+    len: usize,
+}
+
+fn read_chunk(read: &ChunkRead, buffer: &mut Vec<u8>) -> io::Result<()> {
+    buffer.resize(read.len, 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        read.file.read_exact_at(buffer, read.offset)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = &*read.file;
+        file.seek(SeekFrom::Start(read.offset))?;
+        file.read_exact(buffer)
+    }
 }
 
 struct Done {
@@ -1122,7 +1168,7 @@ struct Done {
     result: io::Result<ChunkResult>,
 }
 
-type Submission = (usize, Vec<u8>, mpsc::Sender<Done>);
+type Submission = (usize, Vec<u8>, Option<ChunkRead>, mpsc::Sender<Done>);
 
 /// A stored chunk's object hash (`None` for zeros), its accounting, and, when
 /// object durability is deferred, the not yet published object file.
@@ -1210,8 +1256,15 @@ impl Pool {
             let objects = objects.to_path_buf();
             let worker = spawn(Box::new(move || loop {
                 let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok((seq, bytes, done)) = next else { break };
-                let result = worker_result(|| store_chunk(&cache, &objects, &bytes, options));
+                let Ok((seq, mut bytes, read, done)) = next else {
+                    break;
+                };
+                let result = worker_result(|| {
+                    if let Some(read) = &read {
+                        read_chunk(read, &mut bytes)?;
+                    }
+                    store_chunk(&cache, &objects, &bytes, options)
+                });
                 // The submitter may already have abandoned this file; its
                 // receiver being gone is not an error here.
                 let _ = done.send(Done { seq, bytes, result });
@@ -1237,9 +1290,18 @@ impl Pool {
         })
     }
 
-    fn submit(&self, seq: usize, bytes: Vec<u8>, done: mpsc::Sender<Done>) -> Result<(), ()> {
+    fn submit(
+        &self,
+        seq: usize,
+        mut bytes: Vec<u8>,
+        read: Option<ChunkRead>,
+        done: mpsc::Sender<Done>,
+    ) -> Result<(), ()> {
         if self.workers.is_empty() {
             let result = worker_result(|| {
+                if let Some(read) = &read {
+                    read_chunk(read, &mut bytes)?;
+                }
                 store_chunk(
                     &self.inline_paths.0,
                     &self.inline_paths.1,
@@ -1252,7 +1314,7 @@ impl Pool {
         self.jobs
             .as_ref()
             .expect("pool sender lives until drop")
-            .send((seq, bytes, done))
+            .send((seq, bytes, read, done))
             .map_err(|_| ())
     }
 }
@@ -3355,6 +3417,7 @@ mod tests {
         );
     }
     use super::*;
+    use std::io::{Seek, SeekFrom};
 
     fn test_budget(limit: usize) -> Arc<WorkerBudget> {
         Arc::new(WorkerBudget {
@@ -3451,7 +3514,7 @@ mod tests {
         let bytes = vec![31; CHUNK_SIZE];
         let hash = digest(&bytes);
         let (done, results) = mpsc::channel();
-        pool.submit(7, bytes.clone(), done).unwrap();
+        pool.submit(7, bytes.clone(), None, done).unwrap();
         let result = results
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -3460,7 +3523,7 @@ mod tests {
         verify_object_matches(&objects.join(&hash), &bytes).unwrap();
         fs::write(cache.join(&hash), b"invalid compressed object").unwrap();
         let (done, results) = mpsc::channel();
-        pool.submit(8, bytes, done).unwrap();
+        pool.submit(8, bytes, None, done).unwrap();
         assert!(results
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
@@ -4563,6 +4626,47 @@ mod tests {
         assert_eq!(
             fs::read(source_path).unwrap(),
             fs::read(root.path().join("restore/disk.bin")).unwrap()
+        );
+    }
+
+    #[test]
+    fn chunks_workers_read_themselves_restore_in_file_order() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("disk.bin");
+        let mut source = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        // Every chunk distinct, a hole in the middle and a short last chunk, so
+        // a chunk put back out of order or read at the wrong offset shows.
+        let chunks = 48;
+        for index in 0..chunks {
+            if (20..24).contains(&index) {
+                continue;
+            }
+            let bytes: Vec<u8> = (0..CHUNK_SIZE)
+                .map(|offset| (index * 31 + offset / 4096) as u8 | 1)
+                .collect();
+            source
+                .seek(SeekFrom::Start((index * CHUNK_SIZE) as u64))
+                .unwrap();
+            source.write_all(&bytes).unwrap();
+        }
+        source.write_all(b"short tail").unwrap();
+        let saved = root.path().join("saved");
+        fs::create_dir(&saved).unwrap();
+        let mut writer = Writer::new(&root.path().join("cache"), &saved).unwrap();
+        let entry = writer.ingest_file("disk.bin", 0o600, &mut source).unwrap();
+        assert_eq!(entry.chunks.len(), chunks + 1);
+        assert!(entry.chunks[20..24].iter().all(Option::is_none));
+        writer.finish(&saved, manifest(), vec![entry]).unwrap();
+        materialize(&saved, &root.path().join("restore")).unwrap();
+        assert!(
+            fs::read(&source_path).unwrap()
+                == fs::read(root.path().join("restore/disk.bin")).unwrap(),
+            "restored disk differs from its source"
         );
     }
 
