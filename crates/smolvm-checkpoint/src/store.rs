@@ -1130,7 +1130,9 @@ enum Job {
     Hole(usize),
     /// The reader filled the buffer it was handed with this chunk's bytes.
     Data,
-    /// A worker reads this chunk itself, into the buffer it is handed.
+    /// A worker reads this chunk itself, into the buffer it is handed. Only
+    /// unix files are read this way; elsewhere the reader keeps doing it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Read(ChunkRead),
 }
 
