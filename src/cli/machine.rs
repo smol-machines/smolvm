@@ -5525,26 +5525,28 @@ impl CreateCmd {
                 "--keep-identity needs --from a checkpoint",
             ));
         }
-        if checkpoint.is_some() {
+        if let Some(ref checkpoint) = checkpoint {
             record.keep_identity = self.keep_identity;
             record.host_uid_owner = Some(record.name.clone());
             // The restored RAM already contains the initialized guest and its
             // running workload. Re-running image pull/init after resume would
             // duplicate side effects and violate checkpoint semantics.
             record.init_completed = true;
+            record.packed_image_on_storage =
+                smolvm::portable_checkpoint::checkpoint_image_on_storage(checkpoint);
             record.user = checkpoint
+                .workload
                 .as_ref()
-                .and_then(|checkpoint| checkpoint.workload.as_ref())
                 .and_then(|workload| workload.user.clone());
             record.fork_overlay_owner = checkpoint
+                .workload
                 .as_ref()
-                .and_then(|checkpoint| checkpoint.workload.as_ref())
                 .map(|workload| workload.overlay_owner.clone());
             // The new machine continues the restored generation's history, so
             // its next checkpoint records that generation as parent.
             record.checkpoint_head = checkpoint
+                .lineage
                 .as_ref()
-                .and_then(|checkpoint| checkpoint.lineage.as_ref())
                 .map(|lineage| lineage.id.clone());
         }
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
