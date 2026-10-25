@@ -1,0 +1,26 @@
+name: No AI attribution
+
+# The author of a change is the person responsible for it, so commits, commit
+# authors and PR text must not credit an AI tool. Required on the default
+# branch; it re-runs when the PR title or body is edited.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  no-ai-attribution:
+    name: no-ai-attribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check commits and PR text
+        run: python3 .github/scripts/no-ai-attribution.py ${{ github.event_name == 'pull_request' && 'pr' || 'push' }}
