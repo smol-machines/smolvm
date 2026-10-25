@@ -683,6 +683,10 @@ pub struct CapacityResponse {
     pub branch_child_overhead_mb: Option<u64>,
     /// Real disk (GB) consumed by VM storage + overlay files.
     pub used_disk_gb: u64,
+    /// Disk space (bytes) the node's incremental checkpoint store held at its
+    /// last retention run. Omitted until one has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_store_bytes: Option<u64>,
     /// Opaque id minted once per serve process. It changes iff the serve restarts
     /// — the signal the control uses to detect that this node's warm pool (and any
     /// in-memory VM state) was wiped, so it can prune the now-stale pool records.

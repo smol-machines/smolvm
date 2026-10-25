@@ -1347,6 +1347,87 @@ pub async fn upload_held_checkpoint(
     ))
 }
 
+/// Options for forgetting a checkpoint.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ForgetCheckpointQuery {
+    /// Lineage id of the checkpoint in this node's incremental checkpoint
+    /// store, as the capture reported it.
+    pub lineage: Option<String>,
+}
+
+/// Remove what this node keeps of a checkpoint its owner deleted: the cached
+/// artifact filed under `key`, a capture still held for upload under it, and,
+/// with `lineage`, the stored checkpoint of that id in the node's incremental
+/// checkpoint store. A stored checkpoint a machine here continues from, or one
+/// a restore is reading, stays until that ends (`"lineage": "deferred"`);
+/// retention then removes it. Idempotent: forgetting what this node does not
+/// hold succeeds.
+pub async fn forget_checkpoint(
+    State(state): State<Arc<ApiState>>,
+    Path(key): Path<String>,
+    Query(query): Query<ForgetCheckpointQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cached = checkpoint_cache_path(&key)?;
+    let held = pending_checkpoint_upload_path(&key)?;
+    if let Some(lineage) = query.lineage.as_deref() {
+        if !crate::checkpoint_store::is_checkpoint_id(lineage) {
+            return Err(ApiError::BadRequest(format!(
+                "invalid checkpoint lineage id {lineage:?}"
+            )));
+        }
+    }
+    let db = state.db().clone();
+    tokio::task::spawn_blocking(move || -> Result<serde_json::Value, ApiError> {
+        let removed = |path: &std::path::Path| match std::fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(ApiError::internal(format!(
+                "remove {}: {error}",
+                path.display()
+            ))),
+        };
+        // Restores take their own link of a cached artifact under this lock,
+        // so removing the cache's name never disturbs one in progress.
+        let cache_removed = match cached.parent().map(lock_checkpoint_cache_namespace) {
+            Some(Ok(_lock)) => removed(&cached)?,
+            Some(Err(error)) => {
+                return Err(ApiError::internal(format!(
+                    "lock checkpoint cache: {error}"
+                )))
+            }
+            None => false,
+        };
+        let hold_removed = removed(&held)?;
+        let lineage = match query.lineage {
+            Some(id) => {
+                let store = crate::checkpoint_delta::node_store();
+                let keep = crate::checkpoint_retention::Keep::from_db(&db, &store)?;
+                let outcome = crate::checkpoint_retention::forget(&store, &id, &keep)
+                    .map_err(|error| ApiError::internal(format!("forget checkpoint: {error}")))?;
+                tracing::info!(key = %key, lineage = %id, ?outcome, "checkpoint forgotten");
+                Some(match outcome {
+                    crate::checkpoint_retention::Forgotten::Removed => "removed",
+                    crate::checkpoint_retention::Forgotten::Absent => "absent",
+                    crate::checkpoint_retention::Forgotten::Deferred => "deferred",
+                })
+            }
+            None => None,
+        };
+        if lineage == Some("removed") {
+            // Reclaim the objects only it held.
+            crate::checkpoint_retention::request();
+        }
+        Ok(serde_json::json!({
+            "cacheRemoved": cache_removed,
+            "holdRemoved": hold_removed,
+            "lineage": lineage,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("forget checkpoint task: {error}")))?
+    .map(Json)
+}
+
 /// An incremental capture's lineage in a JSON reply, which the streamed reply
 /// carries as `x-smolvm-checkpoint-*` headers: whether the artifact is a delta,
 /// the checkpoint's lineage id, and the base a delta needs imported first.

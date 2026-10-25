@@ -67,6 +67,19 @@ pub fn capture(
     let store = node_store();
     let published = published_dir(&store);
     std::fs::create_dir_all(&published).map_err(io("create checkpoint store"))?;
+    // The checkpoint this capture deltas against stays while it is read. The
+    // caller holds the machine's lifecycle lock, so the head cannot move.
+    let head = crate::db::SmolvmDb::open()
+        .and_then(|db| db.get_vm(name))
+        .ok()
+        .flatten()
+        .and_then(|record| record.checkpoint_head);
+    let _base_pin = match head.as_deref() {
+        Some(head) => {
+            crate::checkpoint_retention::pin(&store, head).map_err(io("pin checkpoint base"))?
+        }
+        None => None,
+    };
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -110,6 +123,7 @@ pub fn capture(
         export_ms = export_elapsed.as_millis() as u64,
         "incremental checkpoint exported"
     );
+    crate::checkpoint_retention::request();
     Ok(IncrementalCapture {
         result,
         base: base.and(lineage.parent),
@@ -164,6 +178,8 @@ pub fn known_files_for(_store: &Path, _parent: &str) -> store::KnownFiles {
 /// How a chunked checkpoint file became available on this node.
 #[derive(Debug, Clone, Default)]
 pub struct Imported {
+    /// Keeps the stored checkpoint from being forgotten while this is alive.
+    pub pin: Option<std::sync::Arc<crate::checkpoint_retention::Pin>>,
     /// Lineage id of the checkpoint.
     pub id: String,
     /// The stored directory holding it.
@@ -197,8 +213,15 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
         .map(|lineage| lineage.id.clone())
         .ok_or_else(|| Error::config("restore checkpoint", "chunked checkpoint has no id"))?;
     let store = node_store();
+    std::fs::create_dir_all(&store).map_err(io("create checkpoint store"))?;
+    // Pinned before it is looked up, so a forget either finished first or
+    // waits for this restore.
+    let pin = crate::checkpoint_retention::pin(&store, &id)
+        .map_err(io("pin checkpoint"))?
+        .map(std::sync::Arc::new);
     if let Some(directory) = held_checkpoint(&store, &id)? {
         return Ok(Some(Imported {
+            pin,
             id,
             directory,
             base: checkpoint.base.as_ref().map(|base| base.id.clone()),
@@ -206,8 +229,11 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
             ..Default::default()
         }));
     }
+    let mut _base_pin = None;
     let base = match checkpoint.base.as_ref() {
         Some(base) => {
+            _base_pin = crate::checkpoint_retention::pin(&store, &base.id)
+                .map_err(io("pin base checkpoint"))?;
             let Some(directory) = held_checkpoint(&store, &base.id)? else {
                 return Err(Error::agent_conflict(
                     "restore checkpoint",
@@ -275,6 +301,7 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
     )
     .map_err(io("record checkpoint lineage"))?;
     Ok(Some(Imported {
+        pin,
         id,
         directory,
         base_objects,
@@ -343,11 +370,14 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
     let store = node_store();
     // The nearest ancestor this node has materialized and still holds.
     let mut base_tree = None;
+    let mut _base_pin = None;
     let mut cursor = store::find_lineage(&store, &imported.id)
         .map_err(io("read checkpoint lineage"))?
         .and_then(|record| record.parent);
     for _ in 0..64 {
         let Some(id) = cursor else { break };
+        let pinned =
+            crate::checkpoint_retention::pin(&store, &id).map_err(io("pin checkpoint base"))?;
         if let (Ok(tree), Some(stored)) = (
             std::fs::read_to_string(materialized_record(&store, &id)),
             held_checkpoint(&store, &id)?,
@@ -355,6 +385,7 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
             let tree = PathBuf::from(tree.trim());
             if smolvm_pack::extract::is_extracted(&tree) {
                 base_tree = Some((stored, tree));
+                _base_pin = pinned;
                 break;
             }
         }
