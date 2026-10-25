@@ -142,6 +142,7 @@ fn now_ms() -> u64 {
 }
 
 /// Journal directory: `$SMOLVM_USAGE_DIR`, else `<data_local_dir>/smolvm/usage`.
+#[cfg(not(test))]
 pub fn journal_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("SMOLVM_USAGE_DIR") {
         if dir.is_empty() {
@@ -149,14 +150,23 @@ pub fn journal_dir() -> Option<PathBuf> {
         }
         return Some(PathBuf::from(dir));
     }
-    if cfg!(test) {
-        // Unit tests elsewhere in the crate create records; keep them out of
-        // the developer's real journal unless a test opts in with the env var.
-        return None;
-    }
     dirs::data_local_dir()
         .or_else(dirs::cache_dir)
         .map(|d| d.join("smolvm").join("usage"))
+}
+
+// In unit tests the journal belongs to one thread: other tests in the crate create
+// records while a usage test runs, and a process-wide directory gave that test
+// their events (an extra "branch" failed `journal_round_trips_and_summarizes`).
+#[cfg(test)]
+thread_local! {
+    static TEST_JOURNAL_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Journal directory in unit tests: the calling thread's, and none unless a test set one.
+#[cfg(test)]
+pub fn journal_dir() -> Option<PathBuf> {
+    TEST_JOURNAL_DIR.with(|d| d.borrow().clone())
 }
 
 /// The live journal file.
@@ -693,29 +703,23 @@ mod tests {
         record
     }
 
-    /// The journal directory comes from a process-wide env var, so tests that
-    /// set it must not overlap.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Runs `f` with a fresh journal that only this thread writes to.
     fn with_journal<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _serial = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
-        let _guard = EnvGuard::set("SMOLVM_USAGE_DIR", dir.path());
+        let _guard = JournalGuard::set(dir.path());
         f(dir.path())
     }
 
-    struct EnvGuard(&'static str);
-    impl EnvGuard {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
-            std::env::set_var(key, value);
-            Self(key)
+    struct JournalGuard;
+    impl JournalGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            TEST_JOURNAL_DIR.with(|d| *d.borrow_mut() = Some(dir.to_path_buf()));
+            Self
         }
     }
-    impl Drop for EnvGuard {
+    impl Drop for JournalGuard {
         fn drop(&mut self) {
-            std::env::remove_var(self.0);
+            TEST_JOURNAL_DIR.with(|d| *d.borrow_mut() = None);
         }
     }
 
@@ -856,10 +860,7 @@ mod tests {
 
     #[test]
     fn disabled_dir_records_nothing() {
-        let _serial = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = EnvGuard::set("SMOLVM_USAGE_DIR", std::path::Path::new(""));
+        // no journal set for this thread: records made here go nowhere
         assert!(journal_dir().is_none());
         on_insert("m", &record_named("m", None), &|_| None);
         assert!(read_events().is_empty());
