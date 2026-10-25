@@ -5744,6 +5744,13 @@ pub struct StartCmd {
     #[arg(long = "no-workload", hide = true)]
     pub no_workload: bool,
 
+    /// Read registry credentials for the first start's image pull as one JSON
+    /// line (`{"username":…,"password":…}`) on stdin. Used by the image seed
+    /// builder for a private image whose credentials came with an API start;
+    /// stdin keeps them off the command line and out of the VM's environment.
+    #[arg(long = "registry-auth-stdin", hide = true)]
+    pub registry_auth_stdin: bool,
+
     /// Reuse an image digest resolved at most this many seconds ago when
     /// seeding the first start, skipping the per-start registry check inside
     /// the window. Default: resolve and authorize at the registry every start.
@@ -5782,6 +5789,19 @@ impl StartCmd {
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let proxy = self.proxy_opts.resolved_proxy()?;
         let no_proxy = self.proxy_opts.no_proxy();
+        let registry_auth = if self.registry_auth_stdin {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| smolvm::Error::config("registry auth", e.to_string()))?;
+            Some(
+                serde_json::from_str::<smolvm::registry::RegistryAuth>(&line).map_err(|_| {
+                    smolvm::Error::config("registry auth", "stdin is not a credential JSON line")
+                })?,
+            )
+        } else {
+            None
+        };
         // Forkable start: memfd-back guest RAM and register a control socket at a
         // known path so `machine fork` can later freeze this machine as a CoW base.
         let fork = if self.forkable || self.fork_pool_size.is_some() {
@@ -5803,6 +5823,7 @@ impl StartCmd {
                 external_interceptor,
                 seed_digest_ttl: self.seed_digest_ttl,
                 mediated_egress: self.mediated_egress,
+                registry_auth,
             },
         ) {
             Ok(()) => Ok(()),

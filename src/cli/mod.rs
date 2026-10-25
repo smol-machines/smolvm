@@ -169,17 +169,27 @@ pub fn pull_with_progress(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
 ) -> smolvm::Result<smolvm_protocol::ImageInfo> {
+    pull_with_progress_as(client, image, oci_platform, proxy, no_proxy, None)
+}
+
+/// [`pull_with_progress`] with explicit registry credentials, which win over the
+/// registry config the same way they do for an API start.
+pub fn pull_with_progress_as(
+    client: &mut smolvm::agent::AgentClient,
+    image: &str,
+    oci_platform: Option<&str>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    auth: Option<smolvm::registry::RegistryAuth>,
+) -> smolvm::Result<smolvm_protocol::ImageInfo> {
     eprint!("Pulling image {}...", image);
     let _ = std::io::stderr().flush();
 
     let mut last_percent = 0u8;
     let mut syncing = false;
-    let result = client.pull_with_registry_config_and_progress(
-        image,
-        oci_platform,
-        proxy,
-        no_proxy,
-        |percent, _total, layer| {
+    let mut opts = smolvm::agent::PullOptions::new()
+        .use_registry_config(true)
+        .progress(|percent: usize, _total: usize, layer: &str| {
             if layer == "syncing" {
                 if !syncing {
                     eprint!(
@@ -208,8 +218,20 @@ pub fn pull_with_progress(
                 let _ = std::io::stderr().flush();
                 last_percent = percent;
             }
-        },
-    );
+        });
+    if let Some(p) = oci_platform {
+        opts = opts.oci_platform(p);
+    }
+    if let Some(p) = proxy {
+        opts = opts.proxy(p);
+    }
+    if let Some(np) = no_proxy {
+        opts = opts.no_proxy(np);
+    }
+    if let Some(auth) = auth {
+        opts = opts.auth(auth);
+    }
+    let result = client.pull(image, opts);
     eprintln!(
         "\rPulling image {}... done.                              ",
         image

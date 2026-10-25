@@ -859,7 +859,24 @@ mod imp {
             if let Some(no_proxy) = no_proxy {
                 start.extend(["--no-proxy", no_proxy]);
             }
-            run(exe, &start)?;
+            // The builder pulls with the caller's credentials, as the caller's own
+            // machine would, not with the host's registry config: a private image
+            // the start brought credentials for is otherwise refused here.
+            let credentials = match auth {
+                PullAuth::Basic { username, password } => {
+                    start.push("--registry-auth-stdin");
+                    let auth = crate::registry::RegistryAuth {
+                        username: username.clone(),
+                        password: password.clone(),
+                    };
+                    let mut line = serde_json::to_vec(&auth)
+                        .map_err(|e| Error::config("image seed", e.to_string()))?;
+                    line.push(b'\n');
+                    Some(line)
+                }
+                _ => None,
+            };
+            run_with_input(exe, &start, credentials.as_deref())?;
             // Compare the guest's stored config and layer digests to the
             // caller-authorized platform manifest. A second HEAD alone misses
             // tag ABA and a registry mirror serving different image bytes.
@@ -1262,15 +1279,33 @@ mod imp {
     /// Run one step of a seed build with this smolvm binary, capturing its output so
     /// the builder's chatter stays off the caller's terminal.
     fn run(exe: &Path, args: &[&str]) -> Result<()> {
-        let out = std::process::Command::new(exe)
+        run_with_input(exe, args, None)
+    }
+
+    /// [`run`], writing `input` to the step's stdin (and closing it) first.
+    fn run_with_input(exe: &Path, args: &[&str], input: Option<&[u8]>) -> Result<()> {
+        use std::io::Write;
+        let seed_error = |e: std::io::Error| Error::config("image seed", e.to_string());
+        let mut child = std::process::Command::new(exe)
             .args(args)
             .env("SMOLVM_IMAGE_SEEDS", "0")
             // An embedder's helper variable would tie the builder VM's life to
             // this short-lived CLI process, killing it as soon as `start` returns.
             .env_remove("SMOLVM_BOOT_BINARY")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| Error::config("image seed", e.to_string()))?;
+            .stdin(if input.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(seed_error)?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            // A step that exits before reading reports its own error below.
+            let _ = stdin.write_all(input);
+        }
+        let out = child.wait_with_output().map_err(seed_error)?;
         if out.status.success() {
             return Ok(());
         }

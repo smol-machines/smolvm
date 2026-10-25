@@ -1671,6 +1671,9 @@ pub struct StartOptions {
     /// seeding, instead of resolving at the registry on every first start.
     pub seed_digest_ttl: Option<u64>,
     pub mediated_egress: bool,
+    /// Credentials for the first start's image pull, ahead of the registry
+    /// config. Only the image seed builder passes them (over stdin).
+    pub registry_auth: Option<smolvm::registry::RegistryAuth>,
 }
 
 /// Start a named machine that has a config record.
@@ -1705,6 +1708,7 @@ fn start_vm_named_with_db(
         external_interceptor,
         seed_digest_ttl,
         mediated_egress,
+        registry_auth,
     } = options;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
@@ -2011,12 +2015,13 @@ fn start_vm_named_with_db(
             None
         } else if let Some(ref image) = record.image {
             eprintln!("Pulling {}...", image);
-            Some(crate::cli::pull_with_progress(
+            Some(crate::cli::pull_with_progress_as(
                 &mut client,
                 image,
                 None,
                 proxy,
                 no_proxy,
+                registry_auth,
             )?)
         } else {
             None
