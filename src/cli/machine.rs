@@ -5475,6 +5475,12 @@ impl CreateCmd {
         params.prepend_deny_cidrs(&self.deny_cidr);
         params.append_allow_udp(&self.allow_udp);
         merge_cli_credentials(&mut params, &self.credential)?;
+        // A pack may not carry secret refs (rejected above), so the CLI's are the only ones.
+        for (key, r) in
+            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?
+        {
+            params.secret_refs.insert(key, r);
+        }
 
         let resources = VmResources {
             cpus: params.cpus,
