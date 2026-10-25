@@ -4157,6 +4157,7 @@ pub async fn start_machine(
         && record.golden.is_none())
     .then(|| record.image.clone())
     .flatten();
+    let start_has_credentials = registry_auth.is_some();
     let seed_auth = match &registry_auth {
         Some(auth) => crate::registry::PullAuth::Basic {
             username: auth.username.clone(),
@@ -4179,10 +4180,16 @@ pub async fn start_machine(
                     seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
                 }
             }
-            // A fresh machine whose image the host fetched at this start still
-            // has the blank disk its create made; it holds nothing, so seed it.
+            // A fresh machine still has the blank disk its create made. When
+            // this start is what makes its image seedable (an archive the host
+            // fetched now, or a private image whose credentials only the start
+            // carries), the disk holds nothing, so drop it and seed instead.
             if seed_image.is_none()
-                && crate::image_seed::discard_unbooted_archive_storage(&name_clone, &image)
+                && crate::image_seed::discard_unbooted_storage(
+                    &name_clone,
+                    &image,
+                    start_has_credentials,
+                )
             {
                 seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
             }
