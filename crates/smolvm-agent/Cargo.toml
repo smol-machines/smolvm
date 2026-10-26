@@ -41,7 +41,7 @@ ruzstd = "0.9.1"
 # `zstd` (C-backed) is used ONLY to encode fixtures in unit tests; dev-deps are
 # excluded from the musl release binary, so it never hits the link issue above.
 [dev-dependencies]
-zstd = "0.13"
+zstd = "0.14.3"
 
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]

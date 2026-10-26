@@ -28,4 +28,4 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 # C-backed zstd is fine in tests (host-only, no musl link) for encoding fixtures.
-zstd = "0.13"
+zstd = "0.14.3"

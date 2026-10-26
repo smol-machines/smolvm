@@ -70,7 +70,7 @@ dirs = "5"
 sha1 = "0.10"
 sha2 = "0.10"
 ring = "0.17.14"
-zstd = "0.13"
+zstd = "0.14.3"
 hex = "0.4"
 getrandom = "0.3"
 # Host filesystem watcher (FSEvents on macOS, inotify on Linux) that drives
