@@ -320,10 +320,16 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     let warm_route = Router::new().route("/artifacts/warm", post(handlers::prewarm::warm_artifact));
     // Upload of a checkpoint captured with `defer_upload`: no request timeout,
     // as large as the capture it follows, and mTLS-gated like the routes above.
-    let held_checkpoint_route = Router::new().route(
-        "/checkpoints/{key}/upload",
-        post(handlers::machines::upload_held_checkpoint),
-    );
+    let held_checkpoint_route = Router::new()
+        .route(
+            "/checkpoints/{key}/upload",
+            post(handlers::machines::upload_held_checkpoint),
+        )
+        // The owner deleted the checkpoint: drop this node's copies of it.
+        .route(
+            "/checkpoints/{key}",
+            delete(handlers::machines::forget_checkpoint),
+        );
 
     // Long-lived streaming routes (no request timeout): SSE logs and the
     // interactive PTY WebSocket both outlive the 5-minute API timeout.

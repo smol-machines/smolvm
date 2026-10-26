@@ -1071,6 +1071,23 @@ pub fn find_generation_source(
     Ok(None)
 }
 
+/// Remove checkpoint `id` from the store's lineage index, so no later capture
+/// or restore finds it. Returns whether a record was removed.
+pub fn remove_lineage(store: &Path, id: &str) -> io::Result<bool> {
+    if !valid_generation_id(id) {
+        return Ok(false);
+    }
+    let dir = store.join(LINEAGE_DIR);
+    match fs::remove_file(dir.join(format!("{id}.json"))) {
+        Ok(()) => {
+            File::open(&dir)?.sync_all()?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Look up where a checkpoint id was published in `store`.
 pub fn find_lineage(store: &Path, id: &str) -> io::Result<Option<LineageRecord>> {
     if !valid_generation_id(id) {
@@ -1587,11 +1604,10 @@ fn cache_lock(cache: &Path, exclusive: bool) -> io::Result<File> {
     Ok(lock)
 }
 
-/// Remove cache objects that no retained checkpoint references. Captures hold
-/// a shared lock until all hard links are durable; pruning takes it exclusively.
+/// Remove unpublished capture directories left by a terminated capture. The
+/// caller holds the store's exclusive lock, so no capture can own one.
 #[cfg(unix)]
-pub fn prune(cache: &Path) -> io::Result<u64> {
-    let _lock = cache_lock(cache, true)?;
+fn remove_abandoned_captures(cache: &Path) -> io::Result<()> {
     let staging = cache.join("staging");
     if staging.is_dir() {
         for entry in fs::read_dir(&staging)? {
@@ -1611,6 +1627,15 @@ pub fn prune(cache: &Path) -> io::Result<u64> {
         }
         File::open(&staging)?.sync_all()?;
     }
+    Ok(())
+}
+
+/// Remove cache objects that no retained checkpoint references. Captures hold
+/// a shared lock until all hard links are durable; pruning takes it exclusively.
+#[cfg(unix)]
+pub fn prune(cache: &Path) -> io::Result<u64> {
+    let _lock = cache_lock(cache, true)?;
+    remove_abandoned_captures(cache)?;
     let objects = cache.join("objects");
     let mut removed = 0;
     for entry in fs::read_dir(&objects)? {
@@ -1625,11 +1650,7 @@ pub fn prune(cache: &Path) -> io::Result<u64> {
             fs::remove_file(entry.path())?;
             continue;
         }
-        if name.len() != 64
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !is_object_name(&name) {
             continue;
         }
         let meta = entry.metadata()?;
@@ -1644,6 +1665,180 @@ pub fn prune(cache: &Path) -> io::Result<u64> {
     }
     File::open(&objects)?.sync_all()?;
     Ok(removed)
+}
+
+/// How old an interrupted object write must be before a batched prune removes it.
+#[cfg(unix)]
+const ABANDONED_OBJECT_WRITE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// What [`prune_in_batches`] removed and what the store still holds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Objects removed: unreferenced ones and interrupted writes.
+    pub removed_objects: u64,
+    /// Disk space those objects occupied.
+    pub removed_bytes: u64,
+    /// Objects the store still holds.
+    pub kept_objects: u64,
+    /// Disk space the objects the store still holds occupy.
+    pub kept_bytes: u64,
+}
+
+/// Disk space a file occupies: its allocated blocks.
+#[cfg(unix)]
+fn allocated(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks().saturating_mul(512)
+}
+
+#[cfg(unix)]
+fn is_object_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// [`prune`] for a store too large to scan under one lock: the objects are
+/// scanned `batch` at a time without the lock, and the store's exclusive lock
+/// is taken only for a batch that has something to remove, and only while it
+/// re-checks and removes that batch's candidates. A capture therefore waits at
+/// most one batch, not the whole scan. An object is removed only when the
+/// store's own name is its last link, re-checked under the lock, which is the
+/// same rule [`prune`] applies. Interrupted object writes (staging-prefixed
+/// temporaries) are removed only once a day old: unlike [`prune`], this does
+/// not hold the lock across the whole store, so a younger one may belong to a
+/// capture that has not finished.
+#[cfg(unix)]
+pub fn prune_in_batches(cache: &Path, batch: usize) -> io::Result<PruneStats> {
+    use std::os::unix::fs::MetadataExt;
+    let batch = batch.max(1);
+    if !cache.is_dir() {
+        return Ok(PruneStats::default());
+    }
+    {
+        let _lock = cache_lock(cache, true)?;
+        remove_abandoned_captures(cache)?;
+    }
+    let objects = cache.join("objects");
+    let mut stats = PruneStats::default();
+    let mut entries = match fs::read_dir(&objects) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(stats),
+        Err(error) => return Err(error),
+    };
+    let mut removed_any = false;
+    loop {
+        let mut candidates = Vec::new();
+        let mut seen = 0;
+        for entry in entries.by_ref() {
+            let entry = entry?;
+            seen += 1;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let staging = name.starts_with(OBJECT_STAGING_PREFIX);
+            if !staging && !is_object_name(&name) {
+                if seen >= batch {
+                    break;
+                }
+                continue;
+            }
+            match entry.metadata() {
+                Ok(meta) if meta.is_file() => {
+                    let dead_staging = staging
+                        && meta.modified().is_ok_and(|at| {
+                            at.elapsed().unwrap_or_default() >= ABANDONED_OBJECT_WRITE
+                        });
+                    if staging && !dead_staging {
+                        // Not counted: not yet an object of the store.
+                    } else if staging || meta.nlink() == 1 {
+                        candidates.push((entry.path(), staging));
+                    } else {
+                        stats.kept_objects += 1;
+                        stats.kept_bytes += allocated(&meta);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if seen >= batch {
+                break;
+            }
+        }
+        if seen == 0 {
+            break;
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        let _lock = cache_lock(cache, true)?;
+        for (path, staging) in candidates {
+            // A capture may have linked it since the unlocked scan.
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() => meta,
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if staging || meta.nlink() == 1 {
+                fs::remove_file(&path)?;
+                stats.removed_objects += 1;
+                stats.removed_bytes += allocated(&meta);
+                removed_any = true;
+            } else {
+                stats.kept_objects += 1;
+                stats.kept_bytes += allocated(&meta);
+            }
+        }
+    }
+    if removed_any {
+        File::open(&objects)?.sync_all()?;
+    }
+    Ok(stats)
+}
+
+/// Stored checkpoint pruning requires Linux or macOS.
+#[cfg(not(unix))]
+pub fn prune_in_batches(_cache: &Path, _batch: usize) -> io::Result<PruneStats> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stored checkpoints require Linux or macOS",
+    ))
+}
+
+/// Objects of the stored checkpoint at `directory` that no other checkpoint
+/// links: removing the directory leaves the store's own name their last link,
+/// so a prune then reclaims them. Returns their count and disk space.
+#[cfg(unix)]
+pub fn exclusive_objects(directory: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut count = 0;
+    let mut bytes = 0;
+    let entries = match fs::read_dir(directory.join("objects")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let meta = match entry?.metadata() {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        // This checkpoint's link and the store's.
+        if meta.is_file() && meta.nlink() <= 2 {
+            count += 1;
+            bytes += allocated(&meta);
+        }
+    }
+    Ok((count, bytes))
+}
+
+/// Exclusive object accounting requires Linux or macOS.
+#[cfg(not(unix))]
+pub fn exclusive_objects(_directory: &Path) -> io::Result<(u64, u64)> {
+    Ok((0, 0))
 }
 
 /// Stored checkpoint creation and pruning require Linux or macOS.
@@ -1700,6 +1895,11 @@ fn read_index_from(path: &Path) -> io::Result<Index> {
 
 fn read_index(directory: &Path) -> io::Result<Index> {
     read_index_from(&directory.join(INDEX))
+}
+
+/// Whether `id` has the form of a checkpoint (lineage) id.
+pub fn is_checkpoint_id(id: &str) -> bool {
+    valid_generation_id(id)
 }
 
 fn valid_generation_id(id: &str) -> bool {
@@ -3631,6 +3831,95 @@ mod tests {
         assert!(!abandoned.exists());
         assert!(unrelated.join("keep").exists());
         assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn batched_prune_reclaims_only_what_a_removed_checkpoint_held_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let shared = vec![7u8; CHUNK_SIZE];
+        let mut first = shared.clone();
+        first.extend(vec![1u8; CHUNK_SIZE]);
+        first.extend(vec![2u8; CHUNK_SIZE]);
+        let mut second = shared.clone();
+        second.extend(vec![3u8; CHUNK_SIZE]);
+        let old = root.path().join("old");
+        let new = root.path().join("new");
+        capture(&cache, &old, &first);
+        capture(&cache, &new, &second);
+        assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 4);
+        // Two chunks only the old checkpoint holds; the shared one is linked
+        // by both and stays.
+        let (count, bytes) = exclusive_objects(&old).unwrap();
+        assert_eq!(count, 2);
+        assert!(bytes > 0);
+        let staged = |name: &str, age: std::time::Duration| {
+            let path = cache
+                .join("objects")
+                .join(format!("{OBJECT_STAGING_PREFIX}{name}"));
+            fs::write(&path, b"partial").unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+            path
+        };
+        let abandoned = staged("abandoned", ABANDONED_OBJECT_WRITE * 2);
+        let in_flight = staged("in-flight", std::time::Duration::ZERO);
+
+        let before = prune_in_batches(&cache, 1).unwrap();
+        assert_eq!(before.removed_objects, 1, "only the abandoned write");
+        assert!(!abandoned.exists());
+        assert!(
+            in_flight.exists(),
+            "a recent write may still be a capture's"
+        );
+        fs::remove_file(&in_flight).unwrap();
+        assert_eq!(before.kept_objects, 4);
+
+        fs::remove_dir_all(&old).unwrap();
+        let after = prune_in_batches(&cache, 1).unwrap();
+        assert_eq!(after.removed_objects, 2);
+        assert_eq!(after.removed_bytes, bytes);
+        assert_eq!(after.kept_objects, 2);
+        assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 2);
+
+        let restored = root.path().join("restored");
+        materialize(&new, &restored).unwrap();
+        assert_eq!(
+            fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+            second
+        );
+        // Nothing left to reclaim, and a missing store is empty.
+        assert_eq!(prune_in_batches(&cache, 1000).unwrap().removed_objects, 0);
+        assert_eq!(
+            prune_in_batches(&root.path().join("absent"), 10).unwrap(),
+            PruneStats::default()
+        );
+    }
+
+    #[test]
+    fn removing_lineage_forgets_only_that_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let record = |id: &str| LineageRecord {
+            id: id.into(),
+            parent: None,
+            machine: "vm".into(),
+            created_at: "2026-10-24T00:00:00Z".into(),
+            path: root.path().join(id).to_string_lossy().into_owned(),
+        };
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        record_lineage(root.path(), &record(&a)).unwrap();
+        record_lineage(root.path(), &record(&b)).unwrap();
+        assert!(remove_lineage(root.path(), &a).unwrap());
+        assert!(!remove_lineage(root.path(), &a).unwrap());
+        assert!(!remove_lineage(root.path(), "../escape").unwrap());
+        assert!(find_lineage(root.path(), &a).unwrap().is_none());
+        assert_eq!(find_lineage(root.path(), &b).unwrap(), Some(record(&b)));
     }
 
     fn manifest() -> PackManifest {

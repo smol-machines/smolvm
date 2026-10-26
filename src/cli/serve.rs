@@ -591,6 +591,10 @@ impl ServeStartCmd {
             state.clone(),
             shutdown_rx.clone(),
         ));
+        // Incremental captures publish into the node's checkpoint store; keep
+        // it bounded now and after each capture (see checkpoint_retention).
+        #[cfg(unix)]
+        smolvm::checkpoint_retention::start_background(state.db().clone());
 
         // A new smolvm version makes every image seed stale, so the first
         // machine of each image would wait for a seed build. Rebuild the seeds

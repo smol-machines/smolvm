@@ -963,7 +963,7 @@ fn write_pod_bundle(
         });
     }
 
-    spec.add_gpu_devices_if_available();
+    spec.add_vm_devices_if_available();
 
     // CRI mounts (volumes + generated /etc/resolv.conf, /etc/hosts) as bind mounts.
     // Added last so they layer on TOP of the default mounts (e.g. a volume at

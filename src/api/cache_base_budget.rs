@@ -132,7 +132,7 @@ fn scan(dir: &Path) -> Vec<Base> {
 }
 
 /// Capacity and free bytes of the filesystem holding `path` (unix).
-fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

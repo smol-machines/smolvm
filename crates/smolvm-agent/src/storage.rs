@@ -5003,7 +5003,7 @@ pub fn run_command(
         // execs join has the identical mount view as the exec itself.
         let build_spec = |cmd: &[String], spec_env: &[(String, String)]| {
             let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
-            spec.add_gpu_devices_if_available();
+            spec.add_vm_devices_if_available();
             add_volume_bind_mounts(&mut spec, mounts);
             add_workspace_fallback(&mut spec, mounts);
             add_storage_fallback(&mut spec, mounts, unprivileged);
@@ -5137,7 +5137,7 @@ pub fn spawn_in_overlay(
     crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
     crate::vulkan::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
     crate::credentials::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path), mounts);
-    spec.add_gpu_devices_if_available();
+    spec.add_vm_devices_if_available();
 
     spec.write_to(&bundle_path)
         .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;

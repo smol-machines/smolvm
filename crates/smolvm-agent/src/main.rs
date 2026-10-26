@@ -4252,10 +4252,9 @@ fn write_oci_bundle(
     }
 
     // Interactive and detached containers use this bundle writer instead of
-    // storage::run_command(). Mirror that path's GPU wiring so `-i`/`-t`
-    // shells see /dev/dri when the VM was started with --gpu.
-    spec.add_gpu_devices_if_available();
-    spec.add_kvm_device_if_available();
+    // storage::run_command(). Mirror that path's device wiring so `-i`/`-t`
+    // shells see the same /dev/dri, /dev/kvm and /dev/dma_heap.
+    spec.add_vm_devices_if_available();
 
     if container_init {
         const INIT_SOURCE: &str = "/usr/local/bin/smolvm-agent";
@@ -5921,8 +5920,7 @@ fn spawn_interactive_command(
     let workdir_str = workdir.unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
     let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
-    spec.add_gpu_devices_if_available();
-    spec.add_kvm_device_if_available();
+    spec.add_vm_devices_if_available();
 
     storage::add_volume_bind_mounts(&mut spec, mounts);
 

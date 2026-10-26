@@ -73,6 +73,7 @@ pub mod credentials;
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,
 // so the module (and its callers in cuda_host) are unix-only.
 pub mod checkpoint_delta;
+pub mod checkpoint_retention;
 pub mod checkpoint_store;
 /// The engine's command-line commands, usable by other front ends (the `smol` CLI
 /// flattens them so every engine flag is available without a second implementation).
