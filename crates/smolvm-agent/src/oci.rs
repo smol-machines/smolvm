@@ -738,6 +738,37 @@ impl OciSpec {
         });
     }
 
+    /// Expose the DMA-BUF heaps (/dev/dma_heap) to the container if the VM has them.
+    ///
+    /// Android allocates its graphics buffers from /dev/dma_heap/system, so the
+    /// Android emulator and Android containers fail without it. Like /dev/kvm,
+    /// the node lives in the VM's /dev, which crun's tmpfs hides, so it is
+    /// bind-mounted, the same as `--device /dev/dma_heap`.
+    pub fn add_dma_heap_devices_if_available(&mut self) {
+        if self.mounts.iter().any(|m| m.destination == "/dev/dma_heap") {
+            return;
+        }
+        if !std::path::Path::new("/dev/dma_heap").exists() {
+            return; // a guest kernel built without DMA-BUF heaps
+        }
+        self.mounts.push(OciMount {
+            destination: "/dev/dma_heap".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/dma_heap".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
+        });
+    }
+
+    /// Expose every device the VM offers its workloads: GPU render nodes,
+    /// /dev/kvm and the DMA-BUF heaps, each only when the VM has it. Every path
+    /// that builds a workload spec calls this, so `run`, `exec`, interactive
+    /// shells and pods all see the same devices.
+    pub fn add_vm_devices_if_available(&mut self) {
+        self.add_gpu_devices_if_available();
+        self.add_kvm_device_if_available();
+        self.add_dma_heap_devices_if_available();
+    }
+
     /// Expose GPU render nodes to the container if /dev/dri exists in the VM.
     ///
     /// Detects virtio-gpu devices at runtime and adds a bind mount to the OCI
@@ -2178,6 +2209,27 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn vm_devices_bind_the_dma_heaps_when_the_vm_has_them() {
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
+        spec.add_vm_devices_if_available();
+        spec.add_vm_devices_if_available();
+
+        let heaps: Vec<_> = spec
+            .mounts
+            .iter()
+            .filter(|m| m.destination == "/dev/dma_heap")
+            .collect();
+        if std::path::Path::new("/dev/dma_heap").exists() {
+            assert_eq!(heaps.len(), 1, "added once however often it is called");
+            assert_eq!(heaps[0].source, "/dev/dma_heap");
+            assert!(heaps[0].options.contains(&"bind".to_string()));
+        } else {
+            assert!(heaps.is_empty());
+        }
     }
 
     #[test]
