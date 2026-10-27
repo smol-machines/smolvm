@@ -89,6 +89,9 @@ jobs:
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins --target $TARGET
 
+      - name: Run K8s shim unit tests
+        run: cargo test -p smolvm-shim --target $TARGET
+
       - name: Report
         if: always()
         run: |
