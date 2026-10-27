@@ -4,6 +4,7 @@
 //! config.json files used by crun to execute containers.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -20,7 +21,15 @@ pub struct OciSpec {
     pub mounts: Vec<OciMount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
 }
+
+/// Annotation naming the workload's `uid:gid` in a bundle's `config.json`.
+/// The container's own process is the keep-alive init, which runs as root, so
+/// `process.user` no longer says who the workload is; uploads with no explicit
+/// owner read this instead.
+pub const WORKLOAD_USER_ANNOTATION: &str = "run.smolmachines.workload-user";
 
 /// Root filesystem configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +110,7 @@ impl ProcessIdentity {
             user: OciUser {
                 uid: 0,
                 gid: 0,
-                additional_gids: vec![],
+                additional_gids: vec![0],
             },
             home: Some("/root".to_string()),
             c_utf8: false,
@@ -265,20 +274,20 @@ pub fn apply_process_env(rootfs: &Path, user_spec: Option<&str>, env: &mut Vec<(
     }
 }
 
-/// Returns `Ok(None)` for an empty/absent spec so the exec keeps the container
-/// default. Names are resolved against the rootfs `/etc/passwd` via
-/// [`resolve_process_identity`], so this stays consistent with the `crun run`
-/// path's resolution (same uid/gid, home, groups).
-pub fn resolve_exec_user_spec(
-    rootfs: &Path,
-    user_spec: Option<&str>,
-) -> Result<Option<String>, String> {
-    let normalized = user_spec.map(str::trim).filter(|s| !s.is_empty());
-    if normalized.is_none() {
-        return Ok(None);
-    }
+/// Always returns a user, so an exec never falls back to the container's own:
+/// that is the keep-alive init, which runs as root whatever the workload's
+/// user is. An empty/absent spec is root, as on the `crun run` path. Names are
+/// resolved against the rootfs `/etc/passwd` via [`resolve_process_identity`],
+/// so this stays consistent with that path's resolution (same uid/gid, home,
+/// groups).
+pub fn resolve_exec_user_spec(rootfs: &Path, user_spec: Option<&str>) -> Result<String, String> {
     let identity = resolve_process_identity(rootfs, user_spec)?;
-    Ok(Some(format!("{}:{}", identity.user.uid, identity.user.gid)))
+    Ok(user_spec_of(&identity))
+}
+
+/// The numeric `uid:gid` of `identity`, the form `crun exec --user` takes.
+pub fn user_spec_of(identity: &ProcessIdentity) -> String {
+    format!("{}:{}", identity.user.uid, identity.user.gid)
 }
 
 fn parse_user_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
@@ -363,25 +372,35 @@ fn resolve_group_token(group: &str, group_entries: &[GroupEntry]) -> Result<u32,
         .ok_or_else(|| format!("group '{}' not found in container rootfs", group))
 }
 
+/// The groups a process for `username` holds, as `initgroups(3)` (a login, or
+/// `docker exec`) sets them: its primary group first, then every `/etc/group`
+/// entry that lists it as a member, each gid once. The primary group is part of
+/// the list as containerd puts it there (CVE-2023-25173), so dropping to it
+/// with `setgroups` keeps it. A numeric user with no passwd entry has no name
+/// to look up and holds only its primary group.
 fn supplemental_group_ids(
     group_entries: &[GroupEntry],
     username: Option<&str>,
     primary_gid: u32,
 ) -> Vec<u32> {
+    let mut gids = vec![primary_gid];
     let Some(username) = username else {
-        return Vec::new();
+        return gids;
     };
-
-    let mut gids = Vec::new();
     for entry in group_entries {
-        if entry.gid != primary_gid
-            && entry.members.iter().any(|member| member == username)
-            && !gids.contains(&entry.gid)
-        {
+        if entry.members.iter().any(|member| member == username) && !gids.contains(&entry.gid) {
             gids.push(entry.gid);
         }
     }
     gids
+}
+
+impl OciUser {
+    /// Whether this user holds a group besides its primary one, which
+    /// `crun exec --user uid:gid` cannot express (it sets uid and gid only).
+    pub fn has_supplementary_groups(&self) -> bool {
+        self.additional_gids.iter().any(|gid| *gid != self.gid)
+    }
 }
 
 fn load_passwd_entries(rootfs: &Path) -> Result<Vec<PasswdEntry>, String> {
@@ -682,6 +701,7 @@ impl OciSpec {
                 mounts
             },
             hostname: Some(container_hostname()),
+            annotations: BTreeMap::new(),
         }
     }
 
@@ -831,6 +851,13 @@ impl OciSpec {
     ///
     /// When the overlay next to the bundle has a [`WORKLOAD_TMP_DIR`], the
     /// written spec backs /tmp with it (see [`Self::back_tmp_with`]).
+    /// Record who the workload runs as ([`WORKLOAD_USER_ANNOTATION`]), for a
+    /// bundle whose own process may be the keep-alive init instead.
+    pub fn set_workload_user(&mut self, identity: &ProcessIdentity) {
+        self.annotations
+            .insert(WORKLOAD_USER_ANNOTATION.to_string(), user_spec_of(identity));
+    }
+
     pub fn write_to(&self, bundle_dir: &Path) -> std::io::Result<()> {
         let config_path = bundle_dir.join("config.json");
         let tmp_dir = bundle_dir
@@ -1786,8 +1813,59 @@ mod tests {
 
         assert_eq!(identity.user.uid, 1000);
         assert_eq!(identity.user.gid, 1000);
-        assert_eq!(identity.user.additional_gids, vec![29, 44]);
+        assert_eq!(identity.user.additional_gids, vec![1000, 29, 44]);
         assert_eq!(identity.home.as_deref(), Some("/home/steam"));
+    }
+
+    #[test]
+    fn test_supplementary_groups_come_from_etc_group_like_initgroups() {
+        let rootfs = tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/bash\n\
+             runner:x:1001:1001::/home/runner:/bin/bash\n\
+             loner:x:1002:1002::/home/loner:/bin/sh\n",
+        )
+        .unwrap();
+        // runner is in several groups, is listed in its own primary group, and
+        // is in two groups that share gid 123; loner is in none.
+        std::fs::write(
+            etc.join("group"),
+            "root:x:0:\n\
+             adm:x:4:syslog,runner\n\
+             users:x:100:someone,runner\n\
+             runner:x:1001:runner\n\
+             docker:x:123:runner\n\
+             dockerroot:x:123:runner\n\
+             loner:x:1002:\n",
+        )
+        .unwrap();
+        let gids = |user: &str| {
+            resolve_process_identity(rootfs.path(), Some(user))
+                .unwrap()
+                .user
+                .additional_gids
+        };
+
+        // Primary group first, then each membership once, in file order.
+        assert_eq!(gids("runner"), vec![1001, 4, 100, 123]);
+        // A numeric uid with a passwd entry is that user.
+        assert_eq!(gids("1001"), vec![1001, 4, 100, 123]);
+        assert_eq!(gids("1001:1001"), vec![1001, 4, 100, 123]);
+        // An explicit group becomes the primary; memberships still apply.
+        assert_eq!(gids("runner:docker"), vec![123, 4, 100, 1001]);
+        // A user listed in no group holds only its primary group.
+        assert_eq!(gids("loner"), vec![1002]);
+        // A numeric user with no passwd entry gets no extra groups.
+        assert_eq!(gids("5000:5000"), vec![5000]);
+        assert_eq!(gids("5000"), vec![0]);
+
+        let runner = resolve_process_identity(rootfs.path(), Some("runner")).unwrap();
+        assert!(runner.user.has_supplementary_groups());
+        let loner = resolve_process_identity(rootfs.path(), Some("loner")).unwrap();
+        assert!(!loner.user.has_supplementary_groups());
     }
 
     #[test]
@@ -1799,7 +1877,8 @@ mod tests {
 
         assert_eq!(identity.user.uid, 1234);
         assert_eq!(identity.user.gid, 2345);
-        assert!(identity.user.additional_gids.is_empty());
+        // No passwd entry, so no name to look up: only the primary group.
+        assert_eq!(identity.user.additional_gids, vec![2345]);
         assert!(identity.home.is_none());
     }
 
@@ -1820,23 +1899,24 @@ mod tests {
         // A username resolves to its uid:gid.
         assert_eq!(
             resolve_exec_user_spec(rootfs.path(), Some("nobody")).unwrap(),
-            Some("65534:65534".to_string())
+            "65534:65534"
         );
         // `root` is also a name — it must resolve to 0:0, not be rejected.
         assert_eq!(
             resolve_exec_user_spec(rootfs.path(), Some("root")).unwrap(),
-            Some("0:0".to_string())
+            "0:0"
         );
         // Numeric specs pass through unchanged.
         assert_eq!(
             resolve_exec_user_spec(rootfs.path(), Some("65534")).unwrap(),
-            Some("65534:65534".to_string())
+            "65534:65534"
         );
-        // No user / blank → None (exec keeps the container default).
-        assert_eq!(resolve_exec_user_spec(rootfs.path(), None).unwrap(), None);
+        // No user / blank → root, named explicitly: the container's own user
+        // is the keep-alive init's, so an exec never relies on it.
+        assert_eq!(resolve_exec_user_spec(rootfs.path(), None).unwrap(), "0:0");
         assert_eq!(
             resolve_exec_user_spec(rootfs.path(), Some("  ")).unwrap(),
-            None
+            "0:0"
         );
     }
 

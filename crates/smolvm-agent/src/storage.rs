@@ -4997,12 +4997,31 @@ pub fn run_command(
         let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
             .map_err(StorageError::new)?;
 
+        // The keep-alive is PID 1 and runs as root like the main keep-alive
+        // (`crate::KEEPALIVE_USER`); the command itself runs as `identity`.
+        let keepalive_identity = crate::oci::resolve_process_identity(
+            Path::new(&prepared.rootfs_path),
+            Some(crate::KEEPALIVE_USER),
+        )
+        .map_err(StorageError::new)?;
+
         // Build an OCI spec for `cmd` sharing this overlay's rootfs, virtiofs
         // mounts, workspace/storage fallbacks, and the same injections. Used for
         // both the one-shot exec spec and the keep-alive spec so a container the
-        // execs join has the identical mount view as the exec itself.
-        let build_spec = |cmd: &[String], spec_env: &[(String, String)]| {
-            let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
+        // execs join has the identical mount view as the exec itself. The spec
+        // runs as `process_identity` and records `identity` as the workload's.
+        let build_spec = |cmd: &[String],
+                          spec_env: &[(String, String)],
+                          process_identity: &crate::oci::ProcessIdentity| {
+            let mut spec = OciSpec::new(
+                cmd,
+                spec_env,
+                workdir_str,
+                false,
+                process_identity,
+                unprivileged,
+            );
+            spec.set_workload_user(&identity);
             spec.add_vm_devices_if_available();
             add_volume_bind_mounts(&mut spec, mounts);
             add_workspace_fallback(&mut spec, mounts);
@@ -5023,8 +5042,17 @@ pub fn run_command(
 
         // If a main workload container is running for this overlay, join it
         // via crun exec instead of creating a fresh isolated container.
+        // The command joins a keep-alive whose own user is root, so it names
+        // its user, and gets that user's environment (HOME and the rest),
+        // explicitly.
+        let exec_launch = crate::ResolvedLaunch {
+            command: command.to_vec(),
+            env: crate::oci::process_env_for(&identity, env),
+            workdir: workdir.map(str::to_string),
+            user: Some(crate::oci::user_spec_of(&identity)),
+        };
         if let Some(cid) = crate::resolve_main_container(persistent_overlay_id) {
-            let result = run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+            let result = run_exec_in_container(&cid, &exec_launch, timeout_ms, client_fd);
             let _ = mounted_paths;
             return result;
         }
@@ -5043,13 +5071,12 @@ pub fn run_command(
                 "/dev/null".to_string(),
             ];
             match establish_keepalive_container(
-                &build_spec(&keepalive, env),
+                &build_spec(&keepalive, env, &keepalive_identity),
                 &bundle_path,
                 overlay_id,
             ) {
                 Ok(cid) => {
-                    let result =
-                        run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+                    let result = run_exec_in_container(&cid, &exec_launch, timeout_ms, client_fd);
                     let _ = mounted_paths;
                     return result;
                 }
@@ -5060,7 +5087,7 @@ pub fn run_command(
         }
 
         // Ephemeral overlay (or keep-alive setup failed): one-shot fresh container.
-        let spec = build_spec(command, env);
+        let spec = build_spec(command, env, &identity);
         spec.write_to(&bundle_path)
             .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
         let container_id = generate_container_id();
@@ -5592,25 +5619,37 @@ fn establish_keepalive_container(
     Ok(container_id)
 }
 
-/// Join a running container via `crun exec` (non-interactive).
+/// Join a running container via `crun exec` (non-interactive) as
+/// `launch.user` (a resolved `uid:gid`) with that user's supplementary groups,
+/// the same exec the keep-alive paths in `main` run.
 fn run_exec_in_container(
     container_id: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
+    launch: &crate::ResolvedLaunch,
     timeout_ms: Option<u64>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
-    info!(container_id = %container_id, command = ?command, "joining container via crun exec");
+    info!(container_id = %container_id, command = ?launch.command, "joining container via crun exec");
 
     let exec_pid_file = crate::crun::ExecPidFile::new()
         .map_err(|e| StorageError::new(format!("create crun exec pid file failed: {}", e)))?;
-    let mut child = CrunCommand::exec(container_id, env, command, workdir, false)
-        .pid_file(exec_pid_file.path())
-        .stdin_null()
-        .capture_output()
-        .spawn()
-        .map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
+    #[cfg(target_os = "linux")]
+    let spawned = crate::spawn_crun_foreground_exec(container_id, launch, &exec_pid_file, None)
+        .map_err(|e| e.to_string());
+    #[cfg(not(target_os = "linux"))]
+    let spawned = CrunCommand::exec(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        false,
+    )
+    .user(launch.user.as_deref())
+    .pid_file(exec_pid_file.path())
+    .stdin_null()
+    .capture_output()
+    .spawn()
+    .map_err(|e| e.to_string());
+    let mut child = spawned.map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
 
     // On timeout/disconnect, kill only the exec'd process — NOT the main
     // container. The main container hosts the shared namespace for all execs;

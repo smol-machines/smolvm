@@ -304,6 +304,9 @@ fn main() {
     if process::container_init_requested() {
         std::process::exit(process::run_container_init());
     }
+    if process::exec_as_requested() {
+        std::process::exit(process::run_exec_as());
+    }
     if forkpoint::worker_ready_helper_requested() {
         std::process::exit(forkpoint::run_worker_ready_helper());
     }
@@ -3377,6 +3380,11 @@ fn install_file_atomic(
 /// An upload with no explicit owner is given to that user, so a non-root
 /// workload (an image with `USER`) can read and replace what was uploaded;
 /// root workloads and VM-level writes are left as written.
+///
+/// The workload's user is the bundle's [`oci::WORKLOAD_USER_ANNOTATION`]: the
+/// container's own `process.user` is the keep-alive init's, root. A bundle
+/// written before the annotation existed ran its init as the workload user, so
+/// `process.user` is the answer there.
 fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
     let Some(merged) = root.overlay_merged_root() else {
         return (None, None);
@@ -3393,8 +3401,17 @@ fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
     let Ok(spec) = serde_json::from_str::<serde_json::Value>(&text) else {
         return (None, None);
     };
-    let uid = spec["process"]["user"]["uid"].as_u64().map(|u| u as u32);
-    let gid = spec["process"]["user"]["gid"].as_u64().map(|g| g as u32);
+    let annotated = spec["annotations"][oci::WORKLOAD_USER_ANNOTATION]
+        .as_str()
+        .and_then(|user| user.split_once(':'))
+        .and_then(|(uid, gid)| Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?)));
+    let (uid, gid) = match annotated {
+        Some((uid, gid)) => (Some(uid), Some(gid)),
+        None => (
+            spec["process"]["user"]["uid"].as_u64().map(|u| u as u32),
+            spec["process"]["user"]["gid"].as_u64().map(|g| g as u32),
+        ),
+    };
     match uid {
         Some(0) | None => (None, None),
         Some(uid) => (Some(uid), gid),
@@ -4352,6 +4369,27 @@ impl ResolvedLaunch {
     }
 }
 
+/// The user the agent's keep-alive init runs as: root, like PID 1 on any Linux
+/// machine. The image's `USER` is the workload's user, not the init's, and
+/// every exec names its own user (see [`oci::resolve_exec_user_spec`]), so
+/// nothing inherits this one.
+pub(crate) const KEEPALIVE_USER: &str = "0:0";
+
+impl ResolvedLaunch {
+    /// The launch for the keep-alive init that is PID 1 in front of this
+    /// workload: the same env and workdir, the init as its command, and root
+    /// ([`KEEPALIVE_USER`]) as its user whatever user the workload runs as.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn keepalive(&self) -> Self {
+        Self {
+            command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
+            env: self.env.clone(),
+            workdir: self.workdir.clone(),
+            user: Some(KEEPALIVE_USER.to_string()),
+        }
+    }
+}
+
 /// Layer the request's env over an image's OCI `Env` (each `"KEY=VAL"`): the
 /// request wins on key conflicts, image entries fill in the rest — matching how
 /// a container runtime composes image + run-time environment.
@@ -4371,11 +4409,47 @@ fn merge_image_env(
     merged
 }
 
+/// The OCI spec for a container whose workload is `launch`. With
+/// `container_init` the container's own process is the keep-alive init
+/// ([`ResolvedLaunch::keepalive`], root) and the workload is exec'd into it
+/// later; otherwise the workload is the container's process. Either way the
+/// workload's `uid:gid` is recorded in [`oci::WORKLOAD_USER_ANNOTATION`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn container_spec(
+    rootfs_path: &std::path::Path,
+    launch: &ResolvedLaunch,
+    tty: bool,
+    unprivileged: bool,
+    container_init: bool,
+) -> Result<oci::OciSpec, String> {
+    let workload = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
+    let keepalive;
+    let (process, identity) = if container_init {
+        keepalive = launch.keepalive();
+        let identity = oci::resolve_process_identity(rootfs_path, keepalive.user.as_deref())?;
+        (&keepalive, identity)
+    } else {
+        (launch, workload.clone())
+    };
+    let mut spec = oci::OciSpec::new(
+        &process.command,
+        &process.env,
+        process.workdir.as_deref().unwrap_or("/"),
+        tty,
+        &identity,
+        unprivileged,
+    );
+    spec.set_workload_user(&workload);
+    Ok(spec)
+}
+
 /// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
 ///
 /// Shared by [`handle_run_detached`] and [`spawn_interactive_command`] to avoid
 /// duplicating the identity-resolve → spec-build → mount-wiring → write sequence.
-/// The only caller-controlled variation is `tty` (detached: always `false`).
+/// The caller-controlled variations are `tty` (detached: always `false`) and
+/// `container_init`, which puts the keep-alive init in front of `launch` (see
+/// [`container_spec`]).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn write_oci_bundle(
@@ -4387,16 +4461,7 @@ fn write_oci_bundle(
     unprivileged: bool,
     container_init: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let workdir_str = launch.workdir.as_deref().unwrap_or("/");
-    let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
-    let mut spec = oci::OciSpec::new(
-        &launch.command,
-        &launch.env,
-        workdir_str,
-        tty,
-        &identity,
-        unprivileged,
-    );
+    let mut spec = container_spec(rootfs_path, launch, tty, unprivileged, container_init)?;
 
     if tty {
         // Give the PTY a non-zero starting size. The host follows up with a
@@ -4639,22 +4704,12 @@ fn handle_run_detached(
     // tear down the PID namespace and SIGKILL every exec still running in the
     // machine. Init systems are the exception: they only work as PID 1.
     let workload_is_pid1 = workload_needs_pid1(&launch.command);
-    let container_launch = if workload_is_pid1 {
-        None
-    } else {
-        Some(ResolvedLaunch {
-            command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
-            env: launch.env.clone(),
-            workdir: launch.workdir.clone(),
-            user: launch.user.clone(),
-        })
-    };
 
     // Detached containers always run non-interactively (tty: false).
     let container_id = match write_oci_bundle(
         rootfs_path,
         &bundle_path,
-        container_launch.as_ref().unwrap_or(&launch),
+        &launch,
         &mounts,
         false,
         unprivileged,
@@ -4870,7 +4925,7 @@ fn exec_process_spec(
     terminal: bool,
 ) -> Result<Option<oci::OciProcess>, String> {
     let identity = oci::resolve_process_identity(rootfs, launch.user.as_deref())?;
-    if identity.user.additional_gids.is_empty() {
+    if !identity.user.has_supplementary_groups() {
         return Ok(None);
     }
     Ok(Some(oci::OciProcess {
@@ -4995,7 +5050,7 @@ fn launch_workload(
             Some(&pid_file),
             Some(&log),
         )
-        .user(user.as_deref())
+        .user(Some(&user))
         .stdin_null(),
     };
     let status = match workload::output_pipe() {
@@ -5554,30 +5609,33 @@ fn restored_container_exec_command(
     let environment = crun::augmented_exec_env(&environment, container_id);
 
     // The uid:gid plus the user's supplementary groups from the container's own
-    // passwd/group (a `runner` in `docker` keeps `docker`; this path used to call
-    // setgroups(0) and drop every extra group). A rootfs whose passwd cannot be
-    // read falls back to the resolved uid:gid alone.
-    let (uid, gid, groups): (u32, u32, Vec<libc::gid_t>) =
+    // passwd/group (a `runner` in `docker` keeps `docker`). A rootfs whose
+    // passwd cannot be read falls back to the resolved uid:gid alone.
+    let (uid, gid, groups): (u32, u32, Vec<u32>) =
         match oci::resolve_process_identity(&root, launch.user.as_deref()) {
             Ok(identity) => (
                 identity.user.uid,
                 identity.user.gid,
-                identity
-                    .user
-                    .additional_gids
-                    .iter()
-                    .map(|g| *g as libc::gid_t)
-                    .collect(),
+                identity.user.additional_gids,
             ),
             Err(_) => {
-                let user = launch.user.as_deref().unwrap_or("0:0");
+                let user = launch.user.as_deref().unwrap_or(KEEPALIVE_USER);
                 let (uid, gid) = user
                     .split_once(':')
                     .ok_or_else(|| format!("resolved container user is not uid:gid: {user}"))?;
-                (uid.parse()?, gid.parse()?, Vec::new())
+                let gid = gid.parse()?;
+                (uid.parse()?, gid, vec![gid])
             }
         };
 
+    // nsenter enters the namespaces as root and runs this agent's own binary,
+    // passed as an inherited descriptor (it is not inside the container), to
+    // take on the user: `nsenter --setgid` would drop the groups set here.
+    let exe = std::fs::File::open("/proc/self/exe")?;
+    let exe_fd = {
+        use std::os::unix::io::AsRawFd as _;
+        exe.as_raw_fd()
+    };
     let mut command = Command::new("/usr/bin/nsenter");
     command
         .arg("--target")
@@ -5585,19 +5643,25 @@ fn restored_container_exec_command(
         .args(["--mount", "--uts", "--ipc", "--pid"])
         .arg(format!("--root={}", root.display()))
         .arg(format!("--wd={}", host_workdir.display()))
-        .arg(format!("--setgid={gid}"))
-        .arg(format!("--setuid={uid}"))
         .arg("--")
-        .args(&launch.command)
+        .args(process::exec_as_args(
+            &format!("/proc/self/fd/{exe_fd}"),
+            uid,
+            gid,
+            &groups,
+            &launch.command,
+        ))
         .env_clear()
         .envs(environment);
 
     use std::os::unix::process::CommandExt as _;
-    // SAFETY: setgroups is async-signal-safe and touches only child credentials;
-    // `groups` is moved into the closure and outlives the call.
+    // SAFETY: fcntl is async-signal-safe and only clears close-on-exec on the
+    // child's copy of `exe`, which the closure owns, so it stays open until
+    // the command is spawned.
     unsafe {
         command.pre_exec(move || {
-            if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+            use std::os::unix::io::AsRawFd as _;
+            if libc::fcntl(exe.as_raw_fd(), libc::F_SETFD, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -5725,8 +5789,9 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 /// Establish the long-lived "main" container for a persistent overlay and return
 /// its id. PID 1 is smolvm's image-independent keepalive and child reaper, so
 /// processes a later `crun exec` backgrounds inside it survive across exec calls
-/// for the machine's lifetime without accumulating orphan zombies. Env / workdir /
-/// user are inherited from the image so exec'd commands see the right environment.
+/// for the machine's lifetime without accumulating orphan zombies. Env and workdir
+/// are inherited from the image; PID 1 runs as root, and each exec into it names
+/// its user (the image's, or the request's) explicitly.
 /// Uses the same two-step `crun create` + `crun start` as [`handle_run_detached`]
 /// (`crun run --detach` hangs in the smolvm VM environment).
 #[cfg(target_os = "linux")]
@@ -5741,13 +5806,6 @@ fn ensure_main_container(
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
-    let keepalive = ResolvedLaunch {
-        command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
-        env: base_launch.env.clone(),
-        workdir: base_launch.workdir.clone(),
-        user: base_launch.user.clone(),
-    };
-
     let rootfs_path = Path::new(rootfs);
     let bundle_path = rootfs_path
         .parent()
@@ -5760,7 +5818,7 @@ fn ensure_main_container(
     let container_id = write_oci_bundle(
         rootfs_path,
         &bundle_path,
-        &keepalive,
+        base_launch,
         mounts,
         false,
         unprivileged,
@@ -5843,7 +5901,10 @@ fn spawn_interactive_command(
         command: launch.command.clone(),
         env: exec_env,
         workdir: launch.workdir.clone(),
-        user: oci::resolve_exec_user_spec(Path::new(rootfs), launch.user.as_deref())?,
+        user: Some(oci::resolve_exec_user_spec(
+            Path::new(rootfs),
+            launch.user.as_deref(),
+        )?),
     };
     let launch = &launch_owned;
 
@@ -7194,8 +7255,10 @@ fn run_background_in_keepalive(
     // `crun exec --user` needs a numeric uid[:gid]; resolve any username
     // against the container's /etc/passwd, same as the foreground path.
     oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
-    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    launch.user = Some(
+        oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
 
     // Capture the detached process's PID via a pid-file so the response
     // honors the run-background contract (the host client parses a PID from
@@ -7404,8 +7467,10 @@ fn run_in_keepalive_container(
     // request user) is rejected with "invalid USERSPEC specified". Resolve it
     // against the container's /etc/passwd, matching the `crun run` path (#632).
     oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
-    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    launch.user = Some(
+        oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
 
     // Spawn the exec, wire stdin, then wait with the SAME timeout + client
     // liveness contract every other exec path uses. The keep-alive path
@@ -10994,6 +11059,163 @@ mod workload_owner_tests {
     }
 }
 
+#[cfg(test)]
+mod workload_owner_annotation_tests {
+    use super::*;
+
+    fn root_with_spec(dir: &std::path::Path, spec: &str) -> io_target::IoRoot {
+        let merged = dir.join("merged");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(dir.join("bundle")).unwrap();
+        std::fs::write(dir.join("bundle").join("config.json"), spec).unwrap();
+        io_target::IoRoot::Overlay {
+            workload_id: "persistent-test".into(),
+            merged,
+        }
+    }
+
+    #[test]
+    fn uploads_go_to_the_annotated_workload_user_not_the_root_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_with_spec(
+            dir.path(),
+            &format!(
+                r#"{{"process":{{"user":{{"uid":0,"gid":0}},"args":["/run/smolvm/init"]}},"annotations":{{"{}":"1001:123"}}}}"#,
+                oci::WORKLOAD_USER_ANNOTATION
+            ),
+        );
+        assert_eq!(workload_owner(&root), (Some(1001), Some(123)));
+    }
+
+    #[test]
+    fn an_annotated_root_workload_leaves_ownership_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_with_spec(
+            dir.path(),
+            &format!(
+                r#"{{"process":{{"user":{{"uid":0,"gid":0}},"args":["sh"]}},"annotations":{{"{}":"0:0"}}}}"#,
+                oci::WORKLOAD_USER_ANNOTATION
+            ),
+        );
+        assert_eq!(workload_owner(&root), (None, None));
+    }
+}
+
+/// The keep-alive init is root; the workload, and so every exec, is the
+/// image's (or the request's) user.
+#[cfg(test)]
+mod keepalive_user_tests {
+    use super::*;
+
+    fn rootfs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("etc")).unwrap();
+        std::fs::write(
+            dir.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nrunner:x:1001:1001::/home/runner:/bin/bash\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("etc/group"),
+            "root:x:0:\nrunner:x:1001:\ndocker:x:123:runner\nsudo:x:27:runner\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn launch(user: Option<&str>) -> ResolvedLaunch {
+        ResolvedLaunch {
+            command: vec!["./run.sh".into()],
+            env: vec![("RUNNER_ALLOW_RUNASROOT".into(), "0".into())],
+            workdir: Some("/home/runner".into()),
+            user: user.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_keepalive_launch_is_root_and_keeps_the_workload_env() {
+        let workload = launch(Some("runner"));
+        let init = workload.keepalive();
+        assert_eq!(init.user.as_deref(), Some(KEEPALIVE_USER));
+        assert_eq!(init.command, ["/run/smolvm/init", "container-init"]);
+        assert_eq!(init.env, workload.env);
+        assert_eq!(init.workdir, workload.workdir);
+        // the workload itself is untouched
+        assert_eq!(workload.user.as_deref(), Some("runner"));
+    }
+
+    #[test]
+    fn a_keepalive_container_runs_its_init_as_root_and_records_the_workload_user() {
+        let root = rootfs();
+        let spec =
+            container_spec(root.path(), &launch(Some("runner")), false, false, true).unwrap();
+        assert_eq!(spec.process.args, ["/run/smolvm/init", "container-init"]);
+        assert_eq!((spec.process.user.uid, spec.process.user.gid), (0, 0));
+        assert!(spec.process.env.iter().any(|e| e == "HOME=/root"));
+        assert_eq!(
+            spec.annotations
+                .get(oci::WORKLOAD_USER_ANNOTATION)
+                .map(String::as_str),
+            Some("1001:1001")
+        );
+    }
+
+    #[test]
+    fn a_workload_that_is_its_own_pid1_keeps_its_user_and_groups() {
+        let root = rootfs();
+        let spec =
+            container_spec(root.path(), &launch(Some("runner")), false, false, false).unwrap();
+        assert_eq!(spec.process.args, ["./run.sh"]);
+        assert_eq!((spec.process.user.uid, spec.process.user.gid), (1001, 1001));
+        assert_eq!(spec.process.user.additional_gids, vec![1001, 123, 27]);
+        assert!(spec.process.env.iter().any(|e| e == "HOME=/home/runner"));
+        assert_eq!(
+            spec.annotations
+                .get(oci::WORKLOAD_USER_ANNOTATION)
+                .map(String::as_str),
+            Some("1001:1001")
+        );
+    }
+
+    #[test]
+    fn an_image_without_a_user_is_root_everywhere() {
+        let root = rootfs();
+        for init in [true, false] {
+            let spec = container_spec(root.path(), &launch(None), false, false, init).unwrap();
+            assert_eq!((spec.process.user.uid, spec.process.user.gid), (0, 0));
+            assert_eq!(
+                spec.annotations
+                    .get(oci::WORKLOAD_USER_ANNOTATION)
+                    .map(String::as_str),
+                Some("0:0")
+            );
+        }
+        assert_eq!(
+            oci::resolve_exec_user_spec(root.path(), None).unwrap(),
+            "0:0"
+        );
+    }
+
+    #[test]
+    fn every_exec_names_its_user_whatever_the_container_runs_as() {
+        let root = rootfs();
+        // The image's USER, a request's numeric override and no user at all all
+        // resolve to an explicit uid:gid for `crun exec --user`.
+        for (user, expected) in [
+            (Some("runner"), "1001:1001"),
+            (Some("1001"), "1001:1001"),
+            (Some("root"), "0:0"),
+            (None, "0:0"),
+        ] {
+            assert_eq!(
+                oci::resolve_exec_user_spec(root.path(), user).unwrap(),
+                expected,
+                "{user:?}"
+            );
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod exec_process_spec_tests {
     use super::{exec_process_spec, ResolvedLaunch};
@@ -11033,17 +11255,17 @@ mod exec_process_spec_tests {
             .unwrap()
             .expect("runner is in docker and sudo");
         assert_eq!((spec.user.uid, spec.user.gid), (1001, 1001));
-        assert_eq!(spec.user.additional_gids, vec![999, 27]);
+        assert_eq!(spec.user.additional_gids, vec![1001, 999, 27]);
         assert_eq!(spec.cwd, "/home/runner");
         assert!(!spec.terminal);
         let json = serde_json::to_string(&spec).unwrap();
-        assert!(json.contains("\"additionalGids\":[999,27]"), "{json}");
+        assert!(json.contains("\"additionalGids\":[1001,999,27]"), "{json}");
         assert!(json.contains("\"env\":[\"PATH=/usr/bin\"]"), "{json}");
         let by_name = exec_process_spec(root.path(), &launch(Some("runner")), &env, true)
             .unwrap()
             .unwrap();
         assert!(by_name.terminal);
-        assert_eq!(by_name.user.additional_gids, vec![999, 27]);
+        assert_eq!(by_name.user.additional_gids, vec![1001, 999, 27]);
     }
 
     #[test]
