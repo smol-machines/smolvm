@@ -10,7 +10,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Every Linux job runs on smol machines (`runs-on: smol`, or `smol-arm64` on arm64 nodes; sized automatically,
-  # warm-started from a golden of the job's last run). macOS and native Windows stay on GitHub-hosted runners.
+  # warm-started from a golden of the job's last run). The macOS job runs on our own Mac mini; native Windows stays on GitHub-hosted runners.
   # CI builds the release profile only to check it compiles, warns nothing and passes its tests; that binary is never
   # shipped. Thin LTO with 16 codegen units keeps cross-crate optimisation but runs it in parallel: an incremental
   # release build of the main crate drops from ~300 s (fat LTO, 1 codegen unit, one core) to a fraction of that.
@@ -87,17 +87,25 @@ jobs:
   # ==========================================================================
   macos:
     name: macOS (arm64)
-    runs-on: macos-14
+    # Our own Mac mini: it keeps target/ between runs, so a build only recompiles what changed
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: ${{ runner.environment != 'self-hosted' }}
+
+      # Checkout's clean would delete target/; empty everything else, as it would
+      - name: Clean the workspace but keep target/
+        if: ${{ runner.environment == 'self-hosted' }}
+        run: git clean -ffdx -e /target
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
       - name: Cache cargo
-        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
-        if: ${{ env.SMOL_WARM != '1' }}
+        # a warm smol runner (SMOL_WARM=1) or our own Mac already holds this job's target/; a cold one restores the cache like GitHub's
+        if: ${{ env.SMOL_WARM != '1' && runner.environment != 'self-hosted' }}
         uses: actions/cache@v5
         with:
           path: |
