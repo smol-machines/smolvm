@@ -10,7 +10,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Every Linux job runs on smol machines (`runs-on: smol`, or `smol-arm64` on arm64 nodes; sized automatically,
-  # warm-started from a golden of the job's last run). The macOS job runs on our own Mac mini; native Windows stays on GitHub-hosted runners.
+  # warm-started from a golden of the job's last run), except Linux (x86_64), which runs on our own MS-A2 (msa2) for this
+  # repository's own commits. The macOS job runs on our own Mac mini; native Windows stays on GitHub-hosted runners.
   # CI builds the release profile only to check it compiles, warns nothing and passes its tests; that binary is never
   # shipped. Thin LTO with 16 codegen units keeps cross-crate optimisation but runs it in parallel: an incremental
   # release build of the main crate drops from ~300 s (fat LTO, 1 codegen unit, one core) to a fraction of that.
@@ -186,7 +187,9 @@ jobs:
   # ==========================================================================
   linux:
     name: Linux (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
+    # x86_64 runs on our own MS-A2 (msa2), which keeps target/ between runs; a pull request from a fork runs on a smol
+    # machine instead, so code from outside never shares that target/ with main's builds
+    runs-on: ${{ matrix.arch == 'x86_64' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'msa2' || matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -206,9 +209,14 @@ jobs:
           components: clippy
           targets: ${{ matrix.target }}
 
+      # msa2 keeps target/ on its work volume, outside the checkout
+      - name: Keep target/ between runs
+        if: ${{ runner.environment == 'self-hosted' }}
+        run: echo "CARGO_TARGET_DIR=$RUNNER_WORKSPACE/../msa2-target" >> "$GITHUB_ENV"
+
       - name: Cache cargo
-        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
-        if: ${{ env.SMOL_WARM != '1' }}
+        # a warm smol runner (SMOL_WARM=1) or msa2 already holds this job's target/; a cold one restores the cache like GitHub's
+        if: ${{ env.SMOL_WARM != '1' && runner.environment != 'self-hosted' }}
         uses: actions/cache@v5
         with:
           path: |
