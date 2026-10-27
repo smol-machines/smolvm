@@ -5845,15 +5845,15 @@ pub async fn stop_machine(
         let db = state.db().clone();
         let golden = name.clone();
         let clones = tokio::task::spawn_blocking(move || {
-            crate::agent::fork::restart_blocking_dependent_clones(&db, &golden)
+            crate::agent::fork::stop_blocking_dependent_clones(&db, &golden)
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
         .map_err(ApiError::database)?;
         if !clones.is_empty() {
             return Err(ApiError::Conflict(format!(
-                "machine '{}' is the fork base of {} dependent clone(s) ({}); they CoW-map its \
-                 memory and disks — delete those clones first",
+                "machine '{}' is the fork base of {} running clone(s) ({}); they CoW-map its \
+                 memory and disks — stop or delete those clones first",
                 name,
                 clones.len(),
                 clones.join(", ")

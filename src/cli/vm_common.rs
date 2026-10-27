@@ -2618,15 +2618,17 @@ pub fn stop_vm_named_with_timeout(
         }
         RecordState::Frozen => {
             let clones =
-                smolvm::agent::fork::restart_blocking_dependent_clones(&SmolvmDb::open()?, name)?;
+                smolvm::agent::fork::stop_blocking_dependent_clones(&SmolvmDb::open()?, name)?;
             if !clones.is_empty() {
-                // A snapshot-frozen fork base must outlive its clones: their
-                // disks CoW-back onto its disks and their RAM maps its memfd.
+                // A snapshot-frozen fork base must outlive its running clones:
+                // their disks CoW-back onto its disks and their RAM maps its
+                // memfd. Stopped clones map nothing, and the launch guard keeps
+                // the stopped source from running again under them.
                 return Err(smolvm::Error::agent(
                     "stop",
                     format!(
-                        "machine '{name}' is the fork base for {} dependent clone(s) ({}); \
-                         delete those clones first",
+                        "machine '{name}' is the fork base for {} running clone(s) ({}); \
+                         stop or delete those clones first",
                         clones.len(),
                         clones.join(", ")
                     ),

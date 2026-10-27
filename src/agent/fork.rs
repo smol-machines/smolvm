@@ -799,6 +799,37 @@ pub fn restart_blocking_dependent_clones(db: &SmolvmDb, golden: &str) -> Result<
     restart_blocking_dependent_clones_in(db, golden, &vm_data_dir(golden).join("s"))
 }
 
+/// The clones that keep a frozen source from stopping: those whose VMM is
+/// alive. A stopped clone maps none of the source's memory and boots from its
+/// own disk overlay, whose backing files a stop leaves in place (retained
+/// checkpoints and referenced generations are kept while any clone exists),
+/// and the launch guard still refuses to run the source again while any clone
+/// depends on it. Refusing the stop anyway left every ancestor of a stopped
+/// clone frozen and holding its vCPUs and memory on its node.
+pub fn stop_blocking_dependent_clones(db: &SmolvmDb, golden: &str) -> Result<Vec<String>> {
+    stop_blocking_dependent_clones_in(db, golden, &vm_data_dir(golden).join("s"))
+}
+
+pub(super) fn stop_blocking_dependent_clones_in(
+    db: &SmolvmDb,
+    golden: &str,
+    snapshot_root: &Path,
+) -> Result<Vec<String>> {
+    let mut live = Vec::new();
+    for clone in restart_blocking_dependent_clones_in(db, golden, snapshot_root)? {
+        // an unreadable record counts as live: never stop a source on a guess
+        let alive = db
+            .get_vm(&clone)
+            .ok()
+            .flatten()
+            .is_none_or(|record| record.is_process_alive());
+        if alive {
+            live.push(clone);
+        }
+    }
+    Ok(live)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fork_continue_snapshot(snapshot_dir: &Path) -> bool {
     snapshot_dir.join("generation-disks.tsv").is_file()
@@ -5307,6 +5338,42 @@ mod tests {
         assert!(
             !source_has_private_ram_backing(&record),
             "a restarted VMM must not inherit the previous process's RAM allowance"
+        );
+    }
+
+    #[test]
+    fn a_frozen_source_may_stop_once_its_clones_are_stopped() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let snapshot_root = temp.path().join("s");
+
+        let mut stopped = VmRecord::new("stopped".into(), 1, 128, vec![], vec![], false);
+        stopped.golden = Some("golden".into());
+        stopped.fork_generation = Some("22222222".into());
+        db.insert_vm("stopped", &stopped).unwrap();
+        assert_eq!(
+            restart_blocking_dependent_clones_in(&db, "golden", &snapshot_root).unwrap(),
+            vec!["stopped".to_string()],
+            "the source still may not run again under it"
+        );
+        assert!(
+            stop_blocking_dependent_clones_in(&db, "golden", &snapshot_root)
+                .unwrap()
+                .is_empty(),
+            "a stopped clone maps nothing of the source"
+        );
+
+        // a clone whose VMM is alive (this test process stands in for it)
+        let pid = std::process::id();
+        let mut running = VmRecord::new("running".into(), 1, 128, vec![], vec![], false);
+        running.golden = Some("golden".into());
+        running.fork_generation = Some("22222222".into());
+        running.pid = Some(pid as _);
+        running.pid_start_time = crate::process::process_start_time(pid as _);
+        db.insert_vm("running", &running).unwrap();
+        assert_eq!(
+            stop_blocking_dependent_clones_in(&db, "golden", &snapshot_root).unwrap(),
+            vec!["running".to_string()]
         );
     }
 
