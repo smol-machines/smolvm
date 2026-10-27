@@ -706,6 +706,17 @@ mod tests {
         f(dir.path())
     }
 
+    /// The journal's events for these machines only. The journal directory is process-wide (`SMOLVM_USAGE_DIR`), and
+    /// other tests in this binary create and branch machines while one of these runs: an extra "branch" from one of them
+    /// failed the release build on the shared runner.
+    fn events_of(names: &[&str]) -> Vec<Event> {
+        let tokens: Vec<String> = names.iter().map(|n| machine_token(n)).collect();
+        read_events()
+            .into_iter()
+            .filter(|e| tokens.contains(&e.machine))
+            .collect()
+    }
+
     struct EnvGuard(&'static str);
     impl EnvGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
@@ -801,7 +812,7 @@ mod tests {
             on_remove("child-2", &record_named("child-2", Some("root")));
 
             assert!(dir.join("events.jsonl").is_file());
-            let events = read_events();
+            let events = events_of(&["root", "child-1", "child-2", "grandchild"]);
             let kinds: Vec<&str> = events.iter().map(|e| e.event.as_str()).collect();
             assert_eq!(
                 kinds,
@@ -829,8 +840,7 @@ mod tests {
             assert_eq!(summary.machines, 4);
 
             clear().unwrap();
-            assert!(read_events().is_empty());
-            assert!(!dir.join("events.jsonl").exists());
+            assert!(events_of(&["root", "child-1", "child-2", "grandchild"]).is_empty());
         });
     }
 
@@ -849,7 +859,7 @@ mod tests {
             on_update("m", &paused, &running);
             on_update("m", &running, &stopped);
             on_update("m", &stopped, &stopped);
-            let kinds: Vec<String> = read_events().into_iter().map(|e| e.event).collect();
+            let kinds: Vec<String> = events_of(&["m"]).into_iter().map(|e| e.event).collect();
             assert_eq!(kinds, ["start", "pause", "resume", "stop"]);
         });
     }

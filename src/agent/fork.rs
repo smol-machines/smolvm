@@ -4733,6 +4733,15 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
+        // spawn() returns once the child exists, which can be before its exec: until then
+        // it is still a copy of this binary, and the check below read "same engine"
+        let own = std::fs::read_link("/proc/self/exe").unwrap();
+        for _ in 0..200 {
+            match std::fs::read_link(format!("/proc/{}/exe", other.id())) {
+                Ok(exe) if exe != own => break,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
         let differs = source_runs_another_engine(other.id() as i32);
         let sleep_bin = std::fs::read_link(format!("/proc/{}/exe", other.id())).unwrap();
         // An embedding SDK boots VMs with its helper, not the host process: a
