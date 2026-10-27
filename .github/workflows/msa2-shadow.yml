@@ -5,7 +5,7 @@ name: msa2 shadow
 # warm smol runner. Never runs for pull requests.
 on:
   push:
-    branches: [main, binbin-msa2-shadow]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
