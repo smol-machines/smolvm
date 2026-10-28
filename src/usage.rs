@@ -143,20 +143,27 @@ fn now_ms() -> u64 {
 
 /// Journal directory: `$SMOLVM_USAGE_DIR`, else `<data_local_dir>/smolvm/usage`.
 pub fn journal_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("SMOLVM_USAGE_DIR") {
-        if dir.is_empty() {
-            return None;
-        }
-        return Some(PathBuf::from(dir));
+    #[cfg(test)]
+    {
+        // Unit tests across the crate create records (every db write journals),
+        // in parallel threads: a test opts in per thread, so no other test's
+        // records land in its journal, and none reach the developer's real one.
+        tests::TEST_DIR.with(|d| d.borrow().clone())
     }
-    if cfg!(test) {
-        // Unit tests elsewhere in the crate create records; keep them out of
-        // the developer's real journal unless a test opts in with the env var.
-        return None;
+    #[cfg(not(test))]
+    {
+        dir_from(std::env::var_os("SMOLVM_USAGE_DIR")).unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .or_else(dirs::cache_dir)
+                .map(|d| d.join("smolvm").join("usage"))
+        })
     }
-    dirs::data_local_dir()
-        .or_else(dirs::cache_dir)
-        .map(|d| d.join("smolvm").join("usage"))
+}
+
+/// `$SMOLVM_USAGE_DIR` as a journal choice: unset defers to the default, empty
+/// disables recording, anything else is the directory.
+fn dir_from(var: Option<std::ffi::OsString>) -> Option<Option<PathBuf>> {
+    var.map(|dir| (!dir.is_empty()).then(|| PathBuf::from(dir)))
 }
 
 /// The live journal file.
@@ -693,30 +700,23 @@ mod tests {
         record
     }
 
-    /// The journal directory comes from a process-wide env var, so tests that
-    /// set it must not overlap.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    thread_local! {
+        /// This thread's journal directory (None: tests journal nothing).
+        pub(super) static TEST_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     fn with_journal<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _serial = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_DIR.with(|d| *d.borrow_mut() = None);
+            }
+        }
         let dir = tempfile::tempdir().expect("tempdir");
-        let _guard = EnvGuard::set("SMOLVM_USAGE_DIR", dir.path());
+        TEST_DIR.with(|d| *d.borrow_mut() = Some(dir.path().to_path_buf()));
+        let _reset = Reset;
         f(dir.path())
-    }
-
-    struct EnvGuard(&'static str);
-    impl EnvGuard {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
-            std::env::set_var(key, value);
-            Self(key)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.0);
-        }
     }
 
     #[test]
@@ -856,13 +856,24 @@ mod tests {
 
     #[test]
     fn disabled_dir_records_nothing() {
-        let _serial = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = EnvGuard::set("SMOLVM_USAGE_DIR", std::path::Path::new(""));
+        assert_eq!(dir_from(Some("".into())), Some(None));
+        assert_eq!(dir_from(None), None);
+        assert_eq!(dir_from(Some("/j".into())), Some(Some("/j".into())));
         assert!(journal_dir().is_none());
         on_insert("m", &record_named("m", None), &|_| None);
         assert!(read_events().is_empty());
+    }
+
+    #[test]
+    fn another_threads_records_stay_out_of_a_journal() {
+        with_journal(|_| {
+            std::thread::spawn(|| on_insert("other", &record_named("other", None), &|_| None))
+                .join()
+                .unwrap();
+            on_insert("mine", &record_named("mine", None), &|_| None);
+            let machines: Vec<String> = read_events().into_iter().map(|e| e.machine).collect();
+            assert_eq!(machines, [machine_token("mine")]);
+        });
     }
 
     #[test]
