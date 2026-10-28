@@ -15,6 +15,12 @@ concurrency:
 permissions:
   contents: read
 
+# Same as ci.yml: CI builds the release profile with thin LTO and 16 codegen units (shipped binaries keep fat LTO).
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
 jobs:
   linux:
     name: Linux (x86_64) on msa2
