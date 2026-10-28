@@ -111,6 +111,7 @@ use state::ApiState;
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
         handlers::machines::set_machine_ports,
+        handlers::machines::set_machine_cpu_limit,
         handlers::mounts::list_mounts,
         handlers::mounts::attach_mount,
         handlers::mounts::detach_mount,
@@ -156,6 +157,7 @@ use state::ApiState;
         types::LogsQuery,
         types::ResizeMachineRequest,
         types::SetPortsRequest,
+        types::SetCpuLimitRequest,
         types::CacheDiskSpec,
         types::PublishCacheDiskRequest,
         types::PublishCacheDiskResponse,
@@ -187,6 +189,7 @@ use state::ApiState;
         types::MachineInfo,
         types::EgressDenialInfo,
         crate::agent::EgressSignal,
+        crate::agent::EgressFlowSummary,
         types::EgressEventsResponse,
         types::MountInfo,
         types::ListMachinesResponse,
@@ -379,6 +382,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/ports", put(handlers::machines::set_machine_ports))
+        .route(
+            "/{id}/cpu-limit",
+            put(handlers::machines::set_machine_cpu_limit),
+        )
         .route(
             "/{id}/mounts",
             get(handlers::mounts::list_mounts)

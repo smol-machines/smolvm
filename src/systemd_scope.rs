@@ -337,6 +337,16 @@ pub fn set_scope_cpu_count(machine_id: &str, cpus: u8) -> Result<()> {
     if cpus == 0 {
         return Err(Error::config("CPU resize", "CPU count must be nonzero"));
     }
+    set_scope_cpu_quota(machine_id, u64::from(cpus) * 1_000_000)
+}
+
+/// Set an existing transient VM scope's CPU quota to `usec_per_sec` of CPU
+/// time per wall-clock second across all its threads (1_000_000 = one CPU),
+/// at runtime only, without restarting it.
+pub fn set_scope_cpu_quota(machine_id: &str, usec_per_sec: u64) -> Result<()> {
+    if usec_per_sec == 0 {
+        return Err(Error::config("CPU quota", "CPU quota must be nonzero"));
+    }
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot update CPU quota"))?;
     let mut cmd = Command::new(busctl);
@@ -352,7 +362,7 @@ pub fn set_scope_cpu_count(machine_id: &str, cpus: u8) -> Result<()> {
         "1",
         "CPUQuotaPerSecUSec",
         "t",
-        &(u64::from(cpus) * 1_000_000).to_string(),
+        &usec_per_sec.to_string(),
     ]);
     let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
     if !out.status.success() {

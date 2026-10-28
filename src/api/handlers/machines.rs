@@ -45,7 +45,7 @@ use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialValuesRequest, DeleteQuery, DeleteResponse,
     EgressEventsResponse, ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest,
     ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
-    ResourceSpec, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
+    ResourceSpec, SetCpuLimitRequest, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -141,6 +141,9 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // Watchlist matches from the signal log the network stack writes, so
         // the control plane reads them from the machine list it already polls.
         egress_signals: crate::agent::read_egress_signals(name),
+        // Set on the running VMM only, so a stopped machine has none.
+        cpu_limit_millicpus: crate::agent::cpu_limit::read_active_cpu_limit(name, pid),
+        egress_flows: crate::agent::read_egress_flows(name, actual_state == RecordState::Running),
         // Per-launch identity: stale once the process is gone, so only
         // reported while it runs.
         mediation_machine_id: pid
@@ -6585,6 +6588,50 @@ pub async fn set_machine_ports(
     .map_err(|error| ApiError::internal(format!("set ports task failed: {error}")))?
     .map_err(classify_set_ports_error)?;
     Ok(Json(record_to_info(&name, &saved)))
+}
+
+/// Set or clear a running machine's live CPU limit.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/cpu-limit",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = SetCpuLimitRequest,
+    responses(
+        (status = 200, description = "Limit applied to the running VMM", body = MachineInfo),
+        (status = 400, description = "millicpus is 0 or above vCPUs × 1000, or this host has no cgroup CPU control", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not running", body = ApiErrorResponse)
+    )
+)]
+pub async fn set_machine_cpu_limit(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetCpuLimitRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    // Under the lifecycle lock so a stop or restart cannot replace the VMM
+    // between reading the state and applying the quota.
+    let lifecycle = state.lifecycle_lock(&name);
+    let guard = lifecycle.lock_owned().await;
+    state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let db = state.db().clone();
+    let limit_name = name.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        crate::agent::cpu_limit::set_cpu_limit(&db, &limit_name, req.millicpus)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("CPU limit task failed: {error}")))?
+    .map_err(|error| match error {
+        crate::Error::Config { .. } => ApiError::BadRequest(error.to_string()),
+        other => ApiError::from(other),
+    })?;
+    Ok(Json(record_to_info(&name, &record)))
 }
 
 /// A host port something else holds is `PortConflict`, which the control plane

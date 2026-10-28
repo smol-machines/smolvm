@@ -96,6 +96,7 @@ use stack::{start_network_stack, VirtioPollConfig};
 use tcp_listeners::create_tcp_channel;
 pub use tcp_listeners::BoundPublishedPorts;
 use tcp_listeners::TcpPortListeners;
+pub use tcp_relay::FlowSummary;
 
 /// Default upstream DNS resolver used by the gateway runtime.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
@@ -677,6 +678,13 @@ impl VirtioNetworkRuntime {
     /// VM's runtime dir for the node API to read (the runtime is not `Clone`).
     pub fn egress_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.queues.egress_counter()
+    }
+
+    /// A cheap, cloneable read handle to this NIC's open-flow summary, which
+    /// the poll loop refreshes every few seconds, so the launcher can flush it
+    /// to the VM's runtime dir for the node API to read.
+    pub fn flow_summary_slot(&self) -> queues::FlowSummarySlot {
+        self.queues.flow_summary_slot()
     }
 
     pub fn published_ports(&self) -> PublishedPorts {

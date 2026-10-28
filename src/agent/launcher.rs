@@ -1433,6 +1433,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     );
                 }
                 let egress_path = egress_telemetry.map(|p| p.to_path_buf());
+                // The open-flow summary sits beside the egress counter. A
+                // previous boot's summary describes flows that are gone.
+                let flows_path = egress_telemetry
+                    .and_then(|p| p.parent())
+                    .map(|dir| dir.join(crate::agent::manager::EGRESS_FLOWS_FILE));
+                if let Some(path) = &flows_path {
+                    let _ = std::fs::remove_file(path);
+                }
 
                 // The host and guest ends of the virtio-net channel are an AF_UNIX
                 // stream. On Unix we hand libkrun one end of a socketpair fd and run
@@ -1525,6 +1533,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                     runtime.egress_counter(),
                                 );
                             }
+                            if let Some(path) = flows_path {
+                                crate::agent::manager::spawn_egress_flows_flush(
+                                    path,
+                                    runtime.flow_summary_slot(),
+                                );
+                            }
                             if let Some(dir) = vsock_socket.parent() {
                                 crate::network::launch::serve_ports_control(
                                     runtime.published_ports(),
@@ -1615,6 +1629,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                         crate::agent::manager::spawn_egress_flush(
                                             path,
                                             runtime.egress_counter(),
+                                        );
+                                    }
+                                    if let Some(path) = flows_path {
+                                        crate::agent::manager::spawn_egress_flows_flush(
+                                            path,
+                                            runtime.flow_summary_slot(),
                                         );
                                     }
                                     runtime.block_until_shutdown();

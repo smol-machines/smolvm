@@ -591,7 +591,13 @@ fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
         .pid_and_start_time()
         .ok_or_else(|| Error::agent("CPU resize", "VMM process identity is unavailable"))?;
     let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Cpus(target))?;
-    crate::process::set_managed_vmm_cpu_count(name, pid, started, target)?;
+    // An active live CPU limit stays the cap at the new vCPU count.
+    crate::process::set_managed_vmm_cpu_quota(
+        name,
+        pid,
+        started,
+        super::cpu_limit::resize_quota_usec(name, pid, target),
+    )?;
     let required_slots = target.max(created);
     let reply =
         fork::control_socket_cmd(&socket, &format!("PROTOTYPE_GROW_CPUS {required_slots}"))?;
@@ -657,7 +663,13 @@ fn shrink_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord>
     client.offline_cpus(target)?;
     // Quota is reduced only after the kernel has successfully offlined the
     // trailing CPUs and the agent has verified the complete resulting set.
-    crate::process::set_managed_vmm_cpu_count(name, pid, started, target)?;
+    // An active live CPU limit stays the cap at the new vCPU count.
+    crate::process::set_managed_vmm_cpu_quota(
+        name,
+        pid,
+        started,
+        super::cpu_limit::resize_quota_usec(name, pid, target),
+    )?;
     db.update_vm(name, |record| record.cpus = target)?
         .ok_or_else(|| Error::vm_not_found(name))?;
     finish_resize_intent(db, name, &intent)?;

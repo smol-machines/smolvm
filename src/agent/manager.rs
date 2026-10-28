@@ -525,6 +525,17 @@ pub fn egress_telemetry_file(name: &str) -> PathBuf {
     vm_data_dir(name).join("egress")
 }
 
+/// Per-VM open-flow summary file: `<vm_data_dir>/egress-flows`. The VM
+/// subprocess rewrites it (temp file + rename) from the network stack's flow
+/// table; serve reads it when building `MachineInfo`. Resolved from the name on
+/// both sides of the process boundary, like [`egress_telemetry_file`].
+pub fn egress_flows_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(EGRESS_FLOWS_FILE)
+}
+
+/// File name of the per-VM open-flow summary inside the VM data dir.
+pub const EGRESS_FLOWS_FILE: &str = "egress-flows";
+
 /// Per-VM egress denial audit log: `<vm_data_dir>/egress-denials.log`. The
 /// virtio-net runtime appends one line per denied connect/sendto/resolve
 /// (append mode, so prior boots survive; rotated once past 8 MiB). Dedicated
@@ -840,6 +851,96 @@ pub fn spawn_egress_flush(
         }
         std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
     });
+}
+
+/// Open TCP flows of a running machine, as last flushed by its network stack.
+/// Outbound flows are the guest's own connections; inbound ones arrived on a
+/// published port.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressFlowSummary {
+    /// Open guest-initiated TCP flows.
+    pub outbound_open: u32,
+    /// Open published-port TCP flows.
+    pub inbound_open: u32,
+    /// Distinct destination IPs among the open outbound flows.
+    pub distinct_outbound_peers: u32,
+    /// Age in seconds, as of `updatedAt`, of the longest-lived open outbound
+    /// flow; 0 when there is none.
+    pub oldest_outbound_secs: u64,
+    /// `ip:port` of the longest-lived open outbound flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_outbound_dest: Option<String>,
+    /// When the summary was taken (RFC 3339).
+    pub updated_at: String,
+}
+
+impl EgressFlowSummary {
+    fn from_network(at: std::time::SystemTime, summary: &smolvm_network::FlowSummary) -> Self {
+        Self {
+            outbound_open: summary.outbound_open,
+            inbound_open: summary.inbound_open,
+            distinct_outbound_peers: summary.distinct_outbound_peers,
+            oldest_outbound_secs: summary.oldest_outbound_secs,
+            oldest_outbound_dest: summary.oldest_outbound_dest.map(|dest| dest.to_string()),
+            updated_at: humantime::format_rfc3339_seconds(at).to_string(),
+        }
+    }
+}
+
+/// A flow summary older than this is stale: the network stack that wrote it
+/// stopped refreshing it, so it no longer describes the machine.
+const EGRESS_FLOWS_STALE_SECS: u64 = 120;
+
+/// Spawn a detached thread (in the VM subprocess) that rewrites the per-VM
+/// open-flow summary file from `slot` every [`EGRESS_FLUSH_SECS`]. Each write
+/// goes to a temp file renamed over the old one, so serve never reads a torn
+/// summary. Best-effort, like [`spawn_egress_flush`].
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn spawn_egress_flows_flush(
+    path: std::path::PathBuf,
+    slot: smolvm_network::queues::FlowSummarySlot,
+) {
+    std::thread::spawn(move || loop {
+        let latest = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some((at, summary)) = latest {
+            if let Err(e) =
+                write_egress_flows(&path, &EgressFlowSummary::from_network(at, &summary))
+            {
+                tracing::debug!(path = ?path, error = %e, "egress flow summary flush failed");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
+    });
+}
+
+fn write_egress_flows(path: &std::path::Path, summary: &EgressFlowSummary) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(summary)?)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Read a running machine's open-flow summary written by
+/// [`spawn_egress_flows_flush`]. `None` when the machine is not running, the
+/// file is absent (TSI machine, or not yet flushed) or unparseable, or the
+/// summary is stale.
+pub fn read_egress_flows(name: &str, running: bool) -> Option<EgressFlowSummary> {
+    if !running {
+        return None;
+    }
+    let text = std::fs::read_to_string(egress_flows_file(name)).ok()?;
+    parse_egress_flows(&text, std::time::SystemTime::now())
+}
+
+fn parse_egress_flows(text: &str, now: std::time::SystemTime) -> Option<EgressFlowSummary> {
+    let summary: EgressFlowSummary = serde_json::from_str(text).ok()?;
+    let at = humantime::parse_rfc3339(&summary.updated_at).ok()?;
+    // A summary from the future (clock step) is kept; one too old is not.
+    let age = now.duration_since(at).unwrap_or_default();
+    (age.as_secs() <= EGRESS_FLOWS_STALE_SECS).then_some(summary)
 }
 
 /// Read the per-VM egress telemetry file written by [`spawn_egress_flush`].
@@ -4243,6 +4344,55 @@ pub(crate) fn vm_boot_executable() -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn egress_flow_summary_round_trips_through_its_file_and_goes_stale() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EGRESS_FLOWS_FILE);
+        let taken = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let summary = EgressFlowSummary::from_network(
+            taken,
+            &smolvm_network::FlowSummary {
+                outbound_open: 3,
+                inbound_open: 1,
+                distinct_outbound_peers: 2,
+                oldest_outbound_secs: 7200,
+                oldest_outbound_dest: Some("198.51.100.7:3333".parse().unwrap()),
+            },
+        );
+        write_egress_flows(&path, &summary).unwrap();
+        assert!(!path.with_extension("tmp").exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"oldestOutboundDest\":\"198.51.100.7:3333\""));
+        assert!(text.contains("\"updatedAt\":\"2027-01-15T08:00:00Z\""));
+
+        let fresh = taken + std::time::Duration::from_secs(EGRESS_FLOWS_STALE_SECS);
+        assert_eq!(parse_egress_flows(&text, fresh), Some(summary.clone()));
+        let stale = fresh + std::time::Duration::from_secs(1);
+        assert_eq!(parse_egress_flows(&text, stale), None);
+        // A clock that stepped back keeps the summary rather than hiding it.
+        assert_eq!(
+            parse_egress_flows(&text, std::time::UNIX_EPOCH),
+            Some(summary)
+        );
+        assert_eq!(parse_egress_flows("not json", fresh), None);
+    }
+
+    #[test]
+    fn egress_flow_summary_without_an_outbound_flow_omits_the_destination() {
+        use super::*;
+        let summary = EgressFlowSummary::from_network(
+            std::time::UNIX_EPOCH,
+            &smolvm_network::FlowSummary::default(),
+        );
+        let text = serde_json::to_string(&summary).unwrap();
+        assert!(!text.contains("oldestOutboundDest"));
+        assert_eq!(
+            serde_json::from_str::<EgressFlowSummary>(&text).unwrap(),
+            summary
+        );
+    }
+
     #[test]
     fn live_egress_updates_of_one_machine_run_one_at_a_time() {
         let temp = tempfile::tempdir().unwrap();

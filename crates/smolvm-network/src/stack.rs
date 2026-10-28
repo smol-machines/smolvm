@@ -98,6 +98,9 @@ const DNS_TCP_TX_BYTES: usize = 8192;
 // and reject a guest that sends a bogus oversized prefix.
 const DNS_TCP_MAX_MSG: usize = 4096;
 const DEFAULT_IDLE_TIMEOUT_MS: i32 = 100;
+/// How often the poll loop refreshes the open-flow summary. Shorter than the
+/// launcher's 15 s file flush so a flushed summary is at most this stale.
+const FLOW_SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
 /// Packet slots per ICMP raw socket buffer (per direction).
 const ICMP_PACKET_SLOTS: usize = 16;
 /// Payload bytes per ICMP raw socket buffer (per direction).
@@ -297,6 +300,7 @@ fn run_network_stack(
     let mut relay_spawn_failures = 0_u64;
     let mut reported_relay_spawn_failures = 0_u64;
     let mut last_relay_stats = StdInstant::now();
+    let mut last_flow_summary: Option<StdInstant> = None;
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     // Published UDP ports: one gateway-side session per remote client.
     let mut published_udp = crate::udp_publish::PublishedUdpTable::new(
@@ -562,6 +566,14 @@ fn run_network_stack(
         }
 
         relays.cleanup_closed(&mut sockets);
+
+        // Open-flow telemetry for the machine list, taken from the relay
+        // table on a slow cadence so the per-packet path stays untouched.
+        if last_flow_summary.is_none_or(|at| at.elapsed() >= FLOW_SUMMARY_INTERVAL) {
+            let taken = StdInstant::now();
+            queues.publish_flow_summary(relays.flow_summary(taken));
+            last_flow_summary = Some(taken);
+        }
 
         let relay_table_under_pressure =
             relays.active_connections() >= relays.capacity().saturating_mul(3) / 4;

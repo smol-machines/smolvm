@@ -95,6 +95,49 @@ pub struct TcpRelayTable {
     unaccepted_guest_ports: HashSet<u16>,
 }
 
+/// Open TCP flows of one machine at a point in time. Outbound flows are the
+/// guest's own connections; inbound ones arrived on a published port.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlowSummary {
+    /// Open guest-initiated flows.
+    pub outbound_open: u32,
+    /// Open published-port flows.
+    pub inbound_open: u32,
+    /// Distinct destination IPs among the outbound flows.
+    pub distinct_outbound_peers: u32,
+    /// Age in seconds of the longest-lived open outbound flow, 0 when none.
+    pub oldest_outbound_secs: u64,
+    /// Destination of the longest-lived open outbound flow.
+    pub oldest_outbound_dest: Option<SocketAddr>,
+}
+
+/// Summarize `(destination, inbound, opened_at)` flow entries as of `now`.
+fn summarize_flows(
+    flows: impl Iterator<Item = (SocketAddr, bool, Instant)>,
+    now: Instant,
+) -> FlowSummary {
+    let mut summary = FlowSummary::default();
+    let mut peers = HashSet::new();
+    let mut oldest: Option<(Instant, SocketAddr)> = None;
+    for (destination, inbound, opened_at) in flows {
+        if inbound {
+            summary.inbound_open = summary.inbound_open.saturating_add(1);
+            continue;
+        }
+        summary.outbound_open = summary.outbound_open.saturating_add(1);
+        peers.insert(destination.ip());
+        if oldest.is_none_or(|(at, _)| opened_at < at) {
+            oldest = Some((opened_at, destination));
+        }
+    }
+    summary.distinct_outbound_peers = u32::try_from(peers.len()).unwrap_or(u32::MAX);
+    if let Some((at, destination)) = oldest {
+        summary.oldest_outbound_secs = now.saturating_duration_since(at).as_secs();
+        summary.oldest_outbound_dest = Some(destination);
+    }
+    summary
+}
+
 /// Destination port whose guest flows go through the credential interceptor.
 pub const INTERCEPTED_PORT: u16 = 443;
 
@@ -153,6 +196,8 @@ struct TrackedConnection {
     exit_state: RelayExitState,
     // reserved local source port for published inbound connections
     reserved_published_port: Option<u16>,
+    // when the guest-side flow entered the table, for the flow summary
+    opened_at: Instant,
 }
 
 #[derive(Debug)]
@@ -395,6 +440,21 @@ impl TcpRelayTable {
         self.max_connections
     }
 
+    /// Summarize the open flows for the machine's flow telemetry. Walks the
+    /// table once; the poll loop calls it on a slow cadence, never per packet.
+    pub(crate) fn flow_summary(&self, now: Instant) -> FlowSummary {
+        summarize_flows(
+            self.connections.values().map(|connection| {
+                (
+                    connection.destination,
+                    connection.reserved_published_port.is_some(),
+                    connection.opened_at,
+                )
+            }),
+            now,
+        )
+    }
+
     fn destination_allowed(&self, destination: SocketAddr) -> bool {
         if self.is_host_service_destination(destination) {
             return true;
@@ -582,6 +642,7 @@ impl TcpRelayTable {
                 guest_send_closed: false,
                 exit_state,
                 reserved_published_port: None,
+                opened_at: Instant::now(),
             },
         );
 
@@ -684,6 +745,7 @@ impl TcpRelayTable {
                 guest_send_closed: false,
                 exit_state,
                 reserved_published_port: Some(local_port),
+                opened_at: Instant::now(),
             },
         );
 
@@ -1560,6 +1622,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn flow_summary_splits_directions_and_finds_the_oldest_outbound_flow() {
+        let now = Instant::now();
+        let ago = |secs| now - Duration::from_secs(secs);
+        let pool: SocketAddr = "198.51.100.7:3333".parse().unwrap();
+        let web: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let web_other_port: SocketAddr = "203.0.113.9:80".parse().unwrap();
+        let guest: SocketAddr = "100.96.0.2:8080".parse().unwrap();
+        let summary = summarize_flows(
+            [
+                (web, false, ago(30)),
+                (pool, false, ago(7200)),
+                (web_other_port, false, ago(5)),
+                // An inbound flow older than every outbound one is not "oldest".
+                (guest, true, ago(9000)),
+                (guest, true, ago(1)),
+            ]
+            .into_iter(),
+            now,
+        );
+        assert_eq!(
+            summary,
+            FlowSummary {
+                outbound_open: 3,
+                inbound_open: 2,
+                distinct_outbound_peers: 2,
+                oldest_outbound_secs: 7200,
+                oldest_outbound_dest: Some(pool),
+            }
+        );
+    }
+
+    #[test]
+    fn flow_summary_of_only_inbound_flows_has_no_oldest_outbound() {
+        let now = Instant::now();
+        let guest: SocketAddr = "100.96.0.2:8080".parse().unwrap();
+        let summary = summarize_flows([(guest, true, now)].into_iter(), now);
+        assert_eq!(summary.inbound_open, 1);
+        assert_eq!(summary.outbound_open, 0);
+        assert_eq!(summary.oldest_outbound_secs, 0);
+        assert_eq!(summary.oldest_outbound_dest, None);
+        assert_eq!(
+            summarize_flows(std::iter::empty(), now),
+            FlowSummary::default()
+        );
+    }
+
+    #[test]
     fn guest_relay_sockets_disable_nagle_for_outbound_and_published_connections() {
         use smoltcp::iface::Config;
         use smoltcp::phy::{Loopback, Medium};
@@ -1681,6 +1790,7 @@ mod tests {
             guest_send_closed: false,
             exit_state: RelayExitState::new(),
             reserved_published_port: None,
+            opened_at: Instant::now(),
         }
     }
 

@@ -1028,6 +1028,17 @@ pub struct MachineInfo {
     /// guest cannot reach, for virtio-net machines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_signals: Option<Vec<crate::agent::EgressSignal>>,
+    /// Live CPU limit in milli-CPUs across all vCPUs, set with
+    /// `PUT /machines/{name}/cpu-limit` on the running VMM. Omitted when none
+    /// is set; a restart clears it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 200)]
+    pub cpu_limit_millicpus: Option<u32>,
+    /// Open TCP flows of a running virtio-net machine, from the host-side
+    /// network stack's flow table, refreshed about every 15 s. Omitted for TSI
+    /// machines, stopped machines, and a summary older than two minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_flows: Option<crate::agent::EgressFlowSummary>,
     /// Host-minted identity of this launch, as carried by mediated egress
     /// decisions (`machineId`), so a decider can map flows to the machine up
     /// front. Present only while a mediated-egress machine is running.
@@ -1210,6 +1221,17 @@ pub struct SetPortsRequest {
     /// them all. A running machine takes TCP changes now; its UDP ports stay
     /// as they are until it stops.
     pub ports: Vec<PortSpec>,
+}
+
+/// Request to set or clear a running machine's live CPU limit.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetCpuLimitRequest {
+    /// Host CPU the machine's VMM may use, in milli-CPUs across all its vCPUs
+    /// (200 = a fifth of one CPU), from 1 to vCPUs × 1000. `null` clears the
+    /// limit back to one CPU per vCPU. The guest still sees all its vCPUs.
+    #[schema(example = 200)]
+    pub millicpus: Option<u32>,
 }
 
 /// Query string for `POST /machines/{name}/start`.
