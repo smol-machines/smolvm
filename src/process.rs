@@ -2941,6 +2941,139 @@ pub fn process_memory_counters(pid: Pid) -> Option<ProcessMemoryStats> {
     })
 }
 
+/// How long a VMM's `smaps_rollup` sample is served before it is read again.
+/// The control plane integrates memory over minutes-long intervals, so a
+/// sample up to this old is an accurate enough gauge.
+#[cfg(any(target_os = "linux", test))]
+const MEMORY_SAMPLE_TTL: Duration = Duration::from_secs(30);
+/// Wall time the process may spend reading `smaps_rollup` per
+/// [`MEMORY_SAMPLE_WINDOW`]. The read walks the VMM's page tables (measured on
+/// a 7.1 x86_64 host: ~5 ms per resident GiB, ~9 ms per GiB when the pages are
+/// copy-on-write shared with a branch source), so 100 large VMMs read at once
+/// would take seconds; the budget keeps any machine list near-instant.
+#[cfg(any(target_os = "linux", test))]
+const MEMORY_SAMPLE_BUDGET: Duration = Duration::from_millis(100);
+/// The window [`MEMORY_SAMPLE_BUDGET`] is accounted over.
+#[cfg(any(target_os = "linux", test))]
+const MEMORY_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
+/// A cached sample not refreshed for this long belongs to a VMM that is gone.
+#[cfg(any(target_os = "linux", test))]
+const MEMORY_SAMPLE_EVICT_AFTER: Duration = Duration::from_secs(600);
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy)]
+struct CachedMemorySample {
+    start_time: Option<u64>,
+    sampled_at: Instant,
+    stats: ProcessMemoryStats,
+}
+
+/// Bounded-cost cache of per-VMM `smaps_rollup` samples: each VMM is read at
+/// most once per [`MEMORY_SAMPLE_TTL`], and all reads together spend at most
+/// [`MEMORY_SAMPLE_BUDGET`] per [`MEMORY_SAMPLE_WINDOW`]. Past the budget a
+/// stale sample is served, and a VMM never sampled reports no PSS.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Default)]
+struct MemorySampleCache {
+    samples: std::collections::HashMap<Pid, CachedMemorySample>,
+    window_start: Option<Instant>,
+    spent: Duration,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl MemorySampleCache {
+    /// Return the sample for `pid`, calling `read` only when the cached one is
+    /// missing or older than the TTL and the read budget allows. `read` returns
+    /// the sample and how long it took. `start_time` tells a reused pid from the
+    /// process that held it; `current_rss` caps a cached PSS so a sample can
+    /// never report more than the process holds now.
+    fn sample(
+        &mut self,
+        pid: Pid,
+        start_time: Option<u64>,
+        current_rss: Option<u64>,
+        now: Instant,
+        read: impl FnOnce() -> (Option<ProcessMemoryStats>, Duration),
+    ) -> Option<ProcessMemoryStats> {
+        let window_start = *self.window_start.get_or_insert(now);
+        if now.saturating_duration_since(window_start) >= MEMORY_SAMPLE_WINDOW {
+            self.window_start = Some(now);
+            self.spent = Duration::ZERO;
+            self.samples.retain(|_, cached| {
+                now.saturating_duration_since(cached.sampled_at) < MEMORY_SAMPLE_EVICT_AFTER
+            });
+        }
+        let cached = self
+            .samples
+            .get(&pid)
+            .filter(|cached| cached.start_time == start_time)
+            .copied();
+        let capped = |cached: CachedMemorySample| {
+            let mut stats = cached.stats;
+            if let Some(rss) = current_rss {
+                stats.pss_bytes = stats.pss_bytes.map(|pss| pss.min(rss));
+            }
+            stats
+        };
+        if let Some(cached) = cached {
+            if now.saturating_duration_since(cached.sampled_at) < MEMORY_SAMPLE_TTL {
+                return Some(capped(cached));
+            }
+        }
+        if self.spent < MEMORY_SAMPLE_BUDGET {
+            let (stats, took) = read();
+            self.spent = self.spent.saturating_add(took);
+            if let Some(stats) = stats {
+                self.samples.insert(
+                    pid,
+                    CachedMemorySample {
+                        start_time,
+                        sampled_at: now,
+                        stats,
+                    },
+                );
+                return Some(stats);
+            }
+            self.samples.remove(&pid);
+            return None;
+        }
+        cached.map(capped)
+    }
+}
+
+/// PSS/private/shared memory for a VMM, for paths that report every machine
+/// (the machine list and status). Linux serves a cached `smaps_rollup` sample
+/// under [`MemorySampleCache`]'s TTL and read budget, falling back to the cheap
+/// counters (no PSS) when none is available; `current_rss` is the caller's
+/// fresh RSS reading. Other hosts read the counters directly.
+pub fn process_memory_stats_cached(
+    pid: Pid,
+    current_rss: Option<u64>,
+) -> Option<ProcessMemoryStats> {
+    #[cfg(target_os = "linux")]
+    {
+        static CACHE: OnceLock<Mutex<MemorySampleCache>> = OnceLock::new();
+        let start_time = process_start_time(pid);
+        let sampled = CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sample(pid, start_time, current_rss, Instant::now(), || {
+                let began = Instant::now();
+                let stats = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+                    .ok()
+                    .and_then(|contents| parse_smaps_rollup(&contents));
+                (stats, began.elapsed())
+            });
+        if sampled.is_some() {
+            return sampled;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = current_rss;
+    process_memory_counters(pid)
+}
+
 #[cfg(target_os = "linux")]
 fn parse_host_meminfo(contents: &str) -> Option<HostMemoryStats> {
     Some(HostMemoryStats {
@@ -5585,6 +5718,143 @@ mod tests {
         assert_eq!(stats.private_bytes, Some(704 * 1024));
         assert_eq!(stats.shared_mapped_bytes, Some(320 * 1024));
         assert_eq!(stats.swap_pss_bytes, Some(16 * 1024));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn smaps_rollup_without_pss_reports_no_pss() {
+        let sample = "Rss:                1024 kB\n\
+                      Shared_Clean:          0 kB\n\
+                      Shared_Dirty:          0 kB\n\
+                      Private_Clean:         0 kB\n\
+                      Private_Dirty:      1024 kB\n";
+        let stats = parse_smaps_rollup(sample).expect("parse rollup");
+        assert_eq!(stats.rss_bytes, 1024 * 1024);
+        assert_eq!(stats.pss_bytes, None);
+    }
+
+    fn memory_sample(pss_mib: u64) -> ProcessMemoryStats {
+        ProcessMemoryStats {
+            rss_bytes: (2 * pss_mib) << 20,
+            pss_bytes: Some(pss_mib << 20),
+            private_bytes: None,
+            shared_mapped_bytes: None,
+            swap_pss_bytes: None,
+            anon_bytes: None,
+        }
+    }
+
+    fn pss_mib(stats: Option<ProcessMemoryStats>) -> Option<u64> {
+        stats.and_then(|s| s.pss_bytes).map(|b| b >> 20)
+    }
+
+    #[test]
+    fn memory_sample_cache_reads_each_vmm_at_most_once_per_ttl() {
+        let mut cache = MemorySampleCache::default();
+        let t0 = Instant::now();
+        let reads = std::cell::Cell::new(0);
+        let read = |mib| {
+            reads.set(reads.get() + 1);
+            (Some(memory_sample(mib)), Duration::from_millis(1))
+        };
+        assert_eq!(
+            pss_mib(cache.sample(7, Some(1), None, t0, || read(100))),
+            Some(100)
+        );
+        let within = t0 + MEMORY_SAMPLE_TTL - Duration::from_millis(1);
+        assert_eq!(
+            pss_mib(cache.sample(7, Some(1), None, within, || read(200))),
+            Some(100)
+        );
+        assert_eq!(reads.get(), 1, "a fresh sample is served without a read");
+        let after = t0 + MEMORY_SAMPLE_TTL;
+        assert_eq!(
+            pss_mib(cache.sample(7, Some(1), None, after, || read(300))),
+            Some(300)
+        );
+        assert_eq!(reads.get(), 2, "an expired sample is read again");
+    }
+
+    #[test]
+    fn memory_sample_cache_spends_at_most_its_budget_per_window() {
+        let mut cache = MemorySampleCache::default();
+        let t0 = Instant::now();
+        // Warm pid 2, then let it expire.
+        cache.sample(2, Some(1), None, t0, || {
+            (Some(memory_sample(512)), Duration::from_millis(1))
+        });
+        let t1 = t0 + MEMORY_SAMPLE_TTL + MEMORY_SAMPLE_WINDOW;
+        // One slow read uses up the whole window's budget.
+        let first = cache.sample(1, Some(1), None, t1, || {
+            (Some(memory_sample(64)), MEMORY_SAMPLE_BUDGET)
+        });
+        assert_eq!(pss_mib(first), Some(64));
+        // Past the budget, a stale sample is served (capped at the fresh RSS)
+        // and a never-sampled VMM reports none; neither reads.
+        let stale = cache.sample(2, Some(1), Some(256 << 20), t1, || {
+            panic!("over budget: must not read")
+        });
+        assert_eq!(
+            pss_mib(stale),
+            Some(256),
+            "stale PSS never exceeds current RSS"
+        );
+        let unseen = cache.sample(3, Some(1), None, t1, || {
+            panic!("over budget: must not read")
+        });
+        assert!(unseen.is_none());
+        // The next window has budget again.
+        let t2 = t1 + MEMORY_SAMPLE_WINDOW;
+        let refreshed = cache.sample(3, Some(1), None, t2, || {
+            (Some(memory_sample(32)), Duration::from_millis(1))
+        });
+        assert_eq!(pss_mib(refreshed), Some(32));
+    }
+
+    #[test]
+    fn memory_sample_cache_never_serves_a_reused_pid_the_old_sample() {
+        let mut cache = MemorySampleCache::default();
+        let t0 = Instant::now();
+        cache.sample(9, Some(1), None, t0, || {
+            (Some(memory_sample(900)), Duration::from_millis(1))
+        });
+        // Same pid, new process, budget spent: no sample rather than the old one.
+        cache.spent = MEMORY_SAMPLE_BUDGET;
+        assert!(cache
+            .sample(9, Some(2), None, t0, || panic!(
+                "over budget: must not read"
+            ))
+            .is_none());
+        cache.spent = Duration::ZERO;
+        let fresh = cache.sample(9, Some(2), None, t0, || {
+            (Some(memory_sample(10)), Duration::from_millis(1))
+        });
+        assert_eq!(pss_mib(fresh), Some(10));
+    }
+
+    #[test]
+    fn memory_sample_cache_drops_failed_reads_and_gone_vmms() {
+        let mut cache = MemorySampleCache::default();
+        let t0 = Instant::now();
+        cache.sample(4, Some(1), None, t0, || {
+            (Some(memory_sample(40)), Duration::from_millis(1))
+        });
+        cache.sample(5, Some(1), None, t0, || {
+            (Some(memory_sample(50)), Duration::from_millis(1))
+        });
+        // A failed read (process gone or smaps restricted) forgets the sample.
+        let t1 = t0 + MEMORY_SAMPLE_TTL;
+        assert!(cache
+            .sample(4, Some(1), None, t1, || (None, Duration::ZERO))
+            .is_none());
+        assert!(!cache.samples.contains_key(&4));
+        // A VMM nobody asks about is evicted once its sample is long dead.
+        let t2 = t0 + MEMORY_SAMPLE_EVICT_AFTER + MEMORY_SAMPLE_WINDOW;
+        cache.sample(6, Some(1), None, t2, || {
+            (Some(memory_sample(60)), Duration::from_millis(1))
+        });
+        assert!(!cache.samples.contains_key(&5));
+        assert!(cache.samples.contains_key(&6));
     }
 
     #[cfg(target_os = "linux")]

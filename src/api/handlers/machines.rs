@@ -76,7 +76,12 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         record.pid
     };
     let stats = pid.and_then(crate::process::process_stats);
-    let memory_stats = pid.and_then(crate::process::process_memory_stats);
+    // Cached and read-budgeted: the machine list maps every machine through
+    // here, and an uncached `smaps_rollup` walk per VMM costs milliseconds per
+    // resident GiB.
+    let memory_stats = pid.and_then(|pid| {
+        crate::process::process_memory_stats_cached(pid, stats.map(|s| s.rss_bytes))
+    });
     MachineInfo {
         disk_chain_depth: None,
         runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
