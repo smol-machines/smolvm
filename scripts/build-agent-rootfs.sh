@@ -36,8 +36,10 @@ export INSTALL_ROOTFS
 
 OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
 
-# Alpine version
-ALPINE_VERSION="3.19"
+# Alpine release: a supported branch, at its latest point release so the
+# minirootfs base packages carry that branch's fixes
+ALPINE_RELEASE="3.24.3"
+ALPINE_VERSION="${ALPINE_RELEASE%.*}"
 
 # Detect or override architecture
 DETECTED_ARCH="${OVERRIDE_ARCH:-$(uname -m)}"
@@ -59,7 +61,7 @@ case "$DETECTED_ARCH" in
 esac
 
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
-ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.0-${ALPINE_ARCH}.tar.gz"
+ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_RELEASE}-${ALPINE_ARCH}.tar.gz"
 ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_MINIROOTFS}"
 
 # Crane version
@@ -146,17 +148,10 @@ install_packages_apk_static() {
     local -a APK_STATIC_COMMAND=(/tmp/apk-static/sbin/apk.static)
     local -a APK_STATIC_OWNERSHIP_ARGS=()
     if [[ "$EUID" != "0" ]]; then
-        # apk reconciles package directory ownership even with --no-chown. In
-        # an ordinary user namespace, uid 0 maps back to the invoking user, so
-        # both file and directory metadata can be installed without spurious
-        # EPERM diagnostics or privileged host writes.
-        if command -v unshare &> /dev/null \
-            && unshare --user --map-root-user true 2>/dev/null; then
-            APK_STATIC_COMMAND=(unshare --user --map-root-user "${APK_STATIC_COMMAND[@]}")
-            APK_STATIC_OWNERSHIP_ARGS=(--no-chown)
-        else
-            echo "Warning: user namespaces are unavailable; apk may report ownership errors and retain invoking-user ownership"
-        fi
+        # Every file is owned by the invoking user, as a user-namespace install
+        # left them; apk 3 refuses to chown as a mapped root to groups the
+        # namespace cannot map (tty, shadow).
+        APK_STATIC_OWNERSHIP_ARGS=(--usermode)
     fi
     "${APK_STATIC_COMMAND[@]}" \
         --root "$OUTPUT_DIR" \
