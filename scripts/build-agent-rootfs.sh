@@ -44,12 +44,12 @@ DETECTED_ARCH="${OVERRIDE_ARCH:-$(uname -m)}"
 case "$DETECTED_ARCH" in
     arm64|aarch64)
         ALPINE_ARCH="aarch64"
-        CRANE_ARCH="arm64"
+        CRANE_GOARCH="arm64"
         RUST_TARGET="aarch64-unknown-linux-musl"
         ;;
     x86_64|amd64)
         ALPINE_ARCH="x86_64"
-        CRANE_ARCH="x86_64"
+        CRANE_GOARCH="amd64"
         RUST_TARGET="x86_64-unknown-linux-musl"
         ;;
     *)
@@ -62,13 +62,16 @@ ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.0-${ALPINE_ARCH}.tar.gz"
 ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_MINIROOTFS}"
 
-# Crane version
-CRANE_VERSION="0.19.0"
-CRANE_URL="https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz"
+# Crane version, built from source with a pinned Go: a Go binary carries the
+# standard library it was built with, so upstream's release binaries keep the
+# Go security fixes of the day they were cut. Go verifies every module it
+# fetches against the checksum database.
+CRANE_VERSION="0.22.1"
+CRANE_GO_VERSION="1.26.10"
 
 echo "Building agent rootfs..."
 echo "  Alpine: ${ALPINE_VERSION} (${ALPINE_ARCH})"
-echo "  Crane: ${CRANE_VERSION}"
+echo "  Crane: ${CRANE_VERSION} (go${CRANE_GO_VERSION})"
 echo "  Output: ${OUTPUT_DIR}"
 
 # Create output directory
@@ -86,17 +89,24 @@ fi
 echo "Extracting Alpine..."
 tar -xzf "$ALPINE_TAR" -C "$OUTPUT_DIR"
 
-# Download crane
-echo "Downloading crane..."
-CRANE_TAR="/tmp/crane-${CRANE_VERSION}-${CRANE_ARCH}.tar.gz"
-if [ ! -f "$CRANE_TAR" ]; then
-    curl -fsSL -o "$CRANE_TAR" "$CRANE_URL"
+# Build crane
+echo "Building crane..."
+if ! command -v go >/dev/null 2>&1; then
+    echo "Error: go is required to build crane (any go >= 1.21; it fetches go${CRANE_GO_VERSION} itself)"
+    exit 1
 fi
+CRANE_GOPATH="/tmp/crane-${CRANE_VERSION}-go${CRANE_GO_VERSION}"
+GOTOOLCHAIN="go${CRANE_GO_VERSION}" GOPATH="$CRANE_GOPATH" GOFLAGS=-modcacherw \
+    GOOS=linux GOARCH="$CRANE_GOARCH" CGO_ENABLED=0 \
+    go install -trimpath -ldflags="-s -w" \
+    "github.com/google/go-containerregistry/cmd/crane@v${CRANE_VERSION}"
+# A cross-compiled install lands in bin/<goos>_<goarch>, a native one in bin.
+CRANE_BIN="$CRANE_GOPATH/bin/linux_${CRANE_GOARCH}/crane"
+[ -f "$CRANE_BIN" ] || CRANE_BIN="$CRANE_GOPATH/bin/crane"
 
-# Extract crane to rootfs
 echo "Installing crane..."
 mkdir -p "$OUTPUT_DIR/usr/local/bin"
-tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
+install -m 0755 "$CRANE_BIN" "$OUTPUT_DIR/usr/local/bin/crane"
 
 # Install additional Alpine packages into the rootfs.
 # Strategies:
