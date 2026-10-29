@@ -248,15 +248,31 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         // when the env var is unset (no delegation) — never blocks boot.
         #[cfg(target_os = "linux")]
         if let Some(cgroup_root) = std::env::var_os("SMOLVM_CGROUP_ROOT") {
-            crate::process::place_in_cgroup(
+            // A CPU limit set on the machine holds for every VMM it launches.
+            let vm_dir = config.vsock_socket.parent();
+            let (cpu_limit, cpu_quota) = vm_dir.map_or(
+                (
+                    None,
+                    crate::agent::cpu_limit::effective_quota_usec(config.resources.cpus, None),
+                ),
+                |dir| crate::agent::cpu_limit::launch_limit(dir, config.resources.cpus),
+            );
+            let placed = crate::process::place_in_cgroup(
                 std::path::Path::new(&cgroup_root),
-                config.resources.cpus,
+                cpu_quota,
                 config.resources.memory_mib,
                 config.cuda,
                 // Match scope-mode accounting for both sources and restored clones.
                 std::env::var_os("SMOLVM_FORKABLE").is_some()
                     || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
             );
+            if let (true, Some(dir)) = (placed, vm_dir) {
+                crate::agent::cpu_limit::record_launch_limit(
+                    dir,
+                    std::process::id() as i32,
+                    cpu_limit,
+                );
+            }
         }
     }
 

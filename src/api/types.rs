@@ -1028,9 +1028,9 @@ pub struct MachineInfo {
     /// guest cannot reach, for virtio-net machines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_signals: Option<Vec<crate::agent::EgressSignal>>,
-    /// Live CPU limit in milli-CPUs across all vCPUs, set with
-    /// `PUT /machines/{name}/cpu-limit` on the running VMM. Omitted when none
-    /// is set; a restart clears it.
+    /// CPU limit in force on the running VMM, in milli-CPUs across all vCPUs,
+    /// set with `PUT /machines/{name}/cpu-limit` and reapplied on every later
+    /// launch until cleared. Omitted when none is set or the machine is stopped.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 200)]
     pub cpu_limit_millicpus: Option<u32>,
@@ -1229,9 +1229,22 @@ pub struct SetPortsRequest {
 pub struct SetCpuLimitRequest {
     /// Host CPU the machine's VMM may use, in milli-CPUs across all its vCPUs
     /// (200 = a fifth of one CPU), from 1 to vCPUs × 1000. `null` clears the
-    /// limit back to one CPU per vCPU. The guest still sees all its vCPUs.
-    #[schema(example = 200)]
+    /// limit back to one CPU per vCPU. Required: an empty body is refused.
+    /// The guest still sees all its vCPUs, and the limit holds for every later
+    /// launch of the machine until cleared.
+    #[schema(example = 200, required = true, nullable = true)]
+    #[serde(deserialize_with = "present_or_null")]
     pub millicpus: Option<u32>,
+}
+
+/// Deserialize a field that must be present but may be `null`. Unlike a plain
+/// `Option`, a missing field is an error rather than `None`.
+fn present_or_null<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// Query string for `POST /machines/{name}/start`.
@@ -1760,6 +1773,17 @@ pub type BranchLeaseInfo = ForkLeaseInfo;
 
 #[cfg(test)]
 mod deny_unknown_field_tests {
+    #[test]
+    fn cpu_limit_requires_millicpus_and_null_clears() {
+        let set: SetCpuLimitRequest = serde_json::from_str(r#"{"millicpus":200}"#).unwrap();
+        assert_eq!(set.millicpus, Some(200));
+        let clear: SetCpuLimitRequest = serde_json::from_str(r#"{"millicpus":null}"#).unwrap();
+        assert_eq!(clear.millicpus, None);
+        assert!(serde_json::from_str::<SetCpuLimitRequest>("{}").is_err());
+        assert!(serde_json::from_str::<SetCpuLimitRequest>(r#"{"millicpus":-1}"#).is_err());
+        assert!(serde_json::from_str::<SetCpuLimitRequest>(r#"{"millicpus":1,"cpus":2}"#).is_err());
+    }
+
     /// An exec boots a stopped machine unless the caller opts out; the opt-out
     /// is what lets a readiness probe reach a machine without waking it.
     #[test]

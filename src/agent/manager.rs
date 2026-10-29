@@ -901,20 +901,25 @@ pub fn spawn_egress_flows_flush(
     path: std::path::PathBuf,
     slot: smolvm_network::queues::FlowSummarySlot,
 ) {
-    std::thread::spawn(move || loop {
-        let latest = slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some((at, summary)) = latest {
-            if let Err(e) =
-                write_egress_flows(&path, &EgressFlowSummary::from_network(at, &summary))
-            {
-                tracing::debug!(path = ?path, error = %e, "egress flow summary flush failed");
+    let spawned = std::thread::Builder::new()
+        .name("smolvm-egress-flows".into())
+        .spawn(move || loop {
+            let latest = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some((at, summary)) = latest {
+                if let Err(e) =
+                    write_egress_flows(&path, &EgressFlowSummary::from_network(at, &summary))
+                {
+                    tracing::debug!(path = ?path, error = %e, "egress flow summary flush failed");
+                }
             }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
-    });
+            std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "egress flow summary flusher did not start");
+    }
 }
 
 fn write_egress_flows(path: &std::path::Path, summary: &EgressFlowSummary) -> std::io::Result<()> {
@@ -3328,12 +3333,13 @@ impl AgentManager {
                     config.cuda,
                     fork_memfd,
                 );
+                // A CPU limit set on the machine holds for every VMM it launches.
+                let (cpu_limit, cpu_quota) =
+                    super::cpu_limit::launch_limit(&vm_data_dir(name), resources_for_config.cpus);
                 let caps = crate::systemd_scope::ScopeCaps {
                     memory_max_bytes: Some(budget.max_bytes),
                     memory_high_bytes: Some(budget.high_bytes),
-                    cpu_quota_usec_per_sec: Some(
-                        u64::from(resources_for_config.cpus.max(1)) * 1_000_000,
-                    ),
+                    cpu_quota_usec_per_sec: Some(cpu_quota),
                     tasks_max: Some(1024),
                 };
                 if let Err(e) = crate::systemd_scope::adopt_into_scope(name, child_pid, &caps) {
@@ -3342,6 +3348,7 @@ impl AgentManager {
                     self.abort_failed_launch(child_pid)?;
                     return Err(Error::agent("adopt VM scope", e.to_string()));
                 }
+                super::cpu_limit::record_launch_limit(&vm_data_dir(name), child_pid, cpu_limit);
                 adopted_scope = Some(name);
             }
         }
