@@ -4223,6 +4223,8 @@ fn handle_interactive_run(
     // off; never overrides a user-supplied value.
     let mut env = env;
     ssh_agent::inject_into_env(&mut env);
+    x11::inject_into_env(&mut env);
+    waypipe::inject_into_env(&mut env);
 
     // Resolve the container's launch settings from the image's OCI config (with
     // request overrides). Required to call spawn_interactive_command, so the
