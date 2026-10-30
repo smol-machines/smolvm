@@ -754,7 +754,10 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // Egress telemetry lands in the per-VM dir (the vsock socket's parent), the
     // same dir serve resolves from the machine name — so no name needs threading
     // across the process boundary.
-    let egress_telemetry_path = config.vsock_socket.parent().map(|dir| dir.join("egress"));
+    let egress_telemetry_path = config
+        .vsock_socket
+        .parent()
+        .map(|dir| dir.join(crate::agent::EGRESS_TELEMETRY_FILE));
 
     let cache_layer = cache_disk_layer(&config);
     let result = launch_agent_vm(&LaunchConfig {

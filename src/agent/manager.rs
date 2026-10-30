@@ -522,7 +522,7 @@ pub fn read_shared_pack_pointer(layers_cache_dir: &std::path::Path) -> Option<Pa
 /// sockets and console between the two processes. Resolved from the name on both
 /// sides, so no path needs to be threaded across the process boundary.
 pub fn egress_telemetry_file(name: &str) -> PathBuf {
-    vm_data_dir(name).join("egress")
+    vm_data_dir(name).join(EGRESS_TELEMETRY_FILE)
 }
 
 /// Per-VM open-flow summary file: `<vm_data_dir>/egress-flows`. The VM
@@ -535,6 +535,9 @@ pub fn egress_flows_file(name: &str) -> PathBuf {
 
 /// File name of the per-VM open-flow summary inside the VM data dir.
 pub const EGRESS_FLOWS_FILE: &str = "egress-flows";
+
+/// File name of [`egress_telemetry_file`] inside the per-VM dir.
+pub const EGRESS_TELEMETRY_FILE: &str = "egress";
 
 /// Per-VM egress denial audit log: `<vm_data_dir>/egress-denials.log`. The
 /// virtio-net runtime appends one line per denied connect/sendto/resolve
@@ -846,7 +849,7 @@ pub fn spawn_egress_flush(
 ) {
     std::thread::spawn(move || loop {
         let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if let Err(e) = std::fs::write(&path, bytes.to_string()) {
+        if let Err(e) = write_egress_telemetry_at(&path, bytes) {
             tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
         }
         std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
@@ -948,15 +951,40 @@ fn parse_egress_flows(text: &str, now: std::time::SystemTime) -> Option<EgressFl
     (age.as_secs() <= EGRESS_FLOWS_STALE_SECS).then_some(summary)
 }
 
+/// Staging path the flusher writes before renaming over the telemetry file.
+fn egress_telemetry_staging(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+/// Replace the telemetry file with `bytes` atomically (write a staging file,
+/// then rename it over the target), so a concurrent reader sees either the
+/// previous value or the new one, never a truncated or partial file.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn write_egress_telemetry_at(path: &Path, bytes: u64) -> std::io::Result<()> {
+    let staging = egress_telemetry_staging(path);
+    std::fs::write(&staging, bytes.to_string())?;
+    std::fs::rename(&staging, path)
+}
+
+/// Drop the previous VMM process's egress total before a new one launches.
+/// The counter is cumulative since its VMM process started, so a value left by
+/// the last run must not be reported under the next run's pid: until the new
+/// VMM's first flush the machine reports no egress, and afterwards only its
+/// own. A missing file (TSI VM, never booted, non-Unix host) is a no-op.
+fn clear_egress_telemetry_at(path: &Path) {
+    let _ = std::fs::remove_file(egress_telemetry_staging(path));
+    let _ = std::fs::remove_file(path);
+}
+
 /// Read the per-VM egress telemetry file written by [`spawn_egress_flush`].
-/// Returns `None` if the file is absent (TSI VM, or not yet flushed) or
-/// unparseable — egress is simply unavailable for that machine.
+/// Returns `None` if the file is absent (TSI VM, or not yet flushed by the
+/// current VMM) or unparseable — egress is simply unavailable for that machine.
 pub fn read_egress_telemetry(name: &str) -> Option<u64> {
-    std::fs::read_to_string(egress_telemetry_file(name))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    read_egress_telemetry_at(&egress_telemetry_file(name))
+}
+
+fn read_egress_telemetry_at(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
@@ -2475,12 +2503,27 @@ impl AgentManager {
             });
         }
 
+        self.clear_previous_run_files();
+
+        Ok(())
+    }
+
+    /// Remove per-run files the previous VMM process left in the VM dir.
+    fn clear_previous_run_files(&self) {
         // Clean up old socket and this VM's stale (per-VM) readiness marker.
         let _ = std::fs::remove_file(&self.vsock_socket);
         let _ = std::fs::remove_file(self.ready_marker_path());
         let _ = std::fs::remove_file(&self.startup_error_log);
-
-        Ok(())
+        // The egress counter restarts with the VMM; never report the last
+        // run's total under the process about to be spawned.
+        if let Some(dir) = self.vsock_socket.parent() {
+            clear_egress_telemetry_at(&dir.join(EGRESS_TELEMETRY_FILE));
+            // Same for the open-flow summary: the last run's connections must
+            // not be read as the new process's.
+            let flows = dir.join(EGRESS_FLOWS_FILE);
+            let _ = std::fs::remove_file(flows.with_extension("tmp"));
+            let _ = std::fs::remove_file(&flows);
+        }
     }
 
     fn verify_no_persisted_process(&self) -> Result<()> {
@@ -4695,6 +4738,43 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn new_launch_never_reports_previous_vmm_egress() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
+        let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();
+        let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
+        manager.vsock_socket = temp.path().join("agent.sock");
+        let egress = temp.path().join(EGRESS_TELEMETRY_FILE);
+
+        // The previous VMM's final flush is still on disk after it stopped.
+        write_egress_telemetry_at(&egress, 1_000_000).unwrap();
+        assert_eq!(read_egress_telemetry_at(&egress), Some(1_000_000));
+
+        // A new launch clears it, so before the new VMM's first flush there is
+        // no reading to attribute to the new process.
+        manager.clear_previous_run_files();
+        assert_eq!(read_egress_telemetry_at(&egress), None);
+
+        // After the first flush, only the new run's bytes are reported.
+        write_egress_telemetry_at(&egress, 42).unwrap();
+        assert_eq!(read_egress_telemetry_at(&egress), Some(42));
+        assert!(!egress_telemetry_staging(&egress).exists());
+
+        // Clearing a VM dir with no telemetry (TSI, never flushed) is a no-op.
+        manager.clear_previous_run_files();
+        manager.clear_previous_run_files();
+        assert_eq!(read_egress_telemetry_at(&egress), None);
+
+        // The previous run's open-flow summary is cleared the same way.
+        let flows = temp.path().join(EGRESS_FLOWS_FILE);
+        std::fs::write(&flows, b"{}").unwrap();
+        std::fs::write(flows.with_extension("tmp"), b"{}").unwrap();
+        manager.clear_previous_run_files();
+        assert!(!flows.exists());
+        assert!(!flows.with_extension("tmp").exists());
+    }
 
     #[test]
     fn launch_refuses_live_persisted_pid_without_agent_reachability() {

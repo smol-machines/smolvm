@@ -111,7 +111,8 @@ pub use manager::{
     read_egress_signals, read_egress_telemetry, read_mediation_machine_id,
     read_shared_pack_pointer, resolve_disk_image, restore_base_dir, shared_pack_cache_root,
     shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir,
-    AgentManager, AgentState, EgressDenial, EgressFlowSummary, EgressSignal, SHARED_PACK_POINTER,
+    AgentManager, AgentState, EgressDenial, EgressFlowSummary, EgressSignal, EGRESS_TELEMETRY_FILE,
+    SHARED_PACK_POINTER,
 };
 
 /// Agent VM name.
