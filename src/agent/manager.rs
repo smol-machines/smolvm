@@ -630,6 +630,75 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
     }
 }
 
+/// One entry of a machine's network log: a name it looked up, or a
+/// destination it reached or was refused.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkEvent {
+    /// Unix epoch milliseconds when the host saw it.
+    pub timestamp_ms: u64,
+    /// `dns`, `tcp`, `udp` or `icmp`.
+    pub transport: String,
+    /// `allow` or `deny` (`redirect` for a brokered connection).
+    pub action: String,
+    /// The name looked up, or the `ip:port` reached.
+    pub destination: String,
+    /// The name the destination's address was looked up as, when the guest
+    /// found it through DNS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// The network log of `name`'s machine, kept by the virtio-net stack.
+pub fn network_log_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(smolvm_network::NETWORK_LOG)
+}
+
+/// How much of the network log's tail to read: a few thousand entries.
+const NETWORK_LOG_SCAN_BYTES: u64 = 512 * 1024;
+
+/// Read the newest `limit` entries of `name`'s network log, oldest first, or
+/// `None` when the machine has never kept one (it has not booted with a
+/// virtio-net network).
+pub fn read_network_log(name: &str, limit: usize) -> Option<Vec<NetworkEvent>> {
+    read_network_log_at(&network_log_file(name), limit)
+}
+
+fn read_network_log_at(path: &std::path::Path, limit: usize) -> Option<Vec<NetworkEvent>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut events = Vec::new();
+    let mut found = false;
+    for path in [path.with_extension("jsonl.1"), path.to_path_buf()] {
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        found = true;
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let start = len.saturating_sub(NETWORK_LOG_SCAN_BYTES);
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            continue;
+        }
+        let mut text = String::new();
+        if file.read_to_string(&mut text).is_err() {
+            continue;
+        }
+        // A tail read starting mid-file begins mid-line.
+        let text = if start > 0 {
+            text.split_once('\n').map_or("", |(_, rest)| rest)
+        } else {
+            &text
+        };
+        events.extend(
+            text.lines()
+                .filter_map(|line| serde_json::from_str(line).ok()),
+        );
+    }
+    if events.len() > limit {
+        events.drain(..events.len() - limit);
+    }
+    found.then_some(events)
+}
+
 /// One egress denial observed by the VMM: the policy refused a guest's
 /// connect or sendto toward `dest`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -5244,6 +5313,36 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(features.packed_layers_dir.is_none());
+    }
+}
+
+#[cfg(test)]
+mod network_log_tests {
+    use super::read_network_log_at;
+
+    #[test]
+    fn the_newest_entries_are_read_across_the_rotated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("network.jsonl");
+        assert!(read_network_log_at(&log, 10).is_none());
+        std::fs::write(
+            log.with_extension("jsonl.1"),
+            "{\"timestampMs\":1,\"transport\":\"dns\",\"action\":\"allow\",\"destination\":\"pypi.org\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &log,
+            "{\"timestampMs\":2,\"transport\":\"tcp\",\"action\":\"allow\",\"destination\":\"151.101.0.223:443\",\"host\":\"pypi.org\"}\n\
+             not json\n\
+             {\"timestampMs\":3,\"transport\":\"tcp\",\"action\":\"deny\",\"destination\":\"192.0.2.7:22\"}\n",
+        )
+        .unwrap();
+        let all = read_network_log_at(&log, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[1].host.as_deref(), Some("pypi.org"));
+        let newest = read_network_log_at(&log, 2).unwrap();
+        assert_eq!(newest[0].timestamp_ms, 2);
+        assert_eq!(newest[1].action, "deny");
     }
 }
 

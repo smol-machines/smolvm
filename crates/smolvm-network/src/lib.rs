@@ -344,6 +344,10 @@ impl StreamInterception {
 /// Filename of the per-VM egress denial audit log, created beside the vsock
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
+/// Filename of the per-VM network log: one JSON line per name the guest
+/// looked up and per destination it reached or was refused, read back by
+/// `smolvm machine net-log`. Kept by every virtio-net machine.
+pub const NETWORK_LOG: &str = "network.jsonl";
 /// Structured decisions for a VM running the mediated egress protocol.
 pub const EGRESS_DECISIONS_LOG: &str = "egress-decisions.jsonl";
 

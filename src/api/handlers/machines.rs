@@ -3808,6 +3808,40 @@ pub async fn get_machine_egress_events(
     Ok(Json(EgressEventsResponse { events }))
 }
 
+/// List the machine's network log: every name it looked up and every
+/// destination it reached or was refused, oldest first.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{name}/network-log",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name"),
+        EgressEventsQuery
+    ),
+    responses(
+        (status = 200, description = "Network log entries", body = crate::api::types::NetworkLogResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+    )
+)]
+pub async fn get_machine_network_log(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<EgressEventsQuery>,
+) -> Result<Json<crate::api::types::NetworkLogResponse>, ApiError> {
+    state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+    let limit = query.limit.unwrap_or(200).clamp(1, 5000);
+    let events = tokio::task::spawn_blocking(move || crate::agent::read_network_log(&name, limit))
+        .await
+        .map_err(|error| ApiError::internal(format!("network log read task failed: {error}")))?;
+    Ok(Json(crate::api::types::NetworkLogResponse {
+        recorded: events.is_some(),
+        events: events.unwrap_or_default(),
+    }))
+}
+
 /// Return the bounded host-side decision record for a mediated machine.
 #[utoipa::path(
     get,

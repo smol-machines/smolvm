@@ -516,7 +516,8 @@ impl TcpRelayTable {
         if self.egress.observe_destination(destination) {
             return false;
         }
-        if self.is_host_service_destination(destination)
+        let host_service = self.is_host_service_destination(destination);
+        if host_service
             && self
                 .egress
                 .record_decision("tcp", "allow", &destination, "internal_service")
@@ -526,11 +527,12 @@ impl TcpRelayTable {
                 .record_denial("connect", &format_args!("to {destination}"));
             return false;
         }
-        if self.egress.rule_action(
+        let static_allow = self.egress.rule_action(
             FlowTransport::Tcp,
             destination.ip(),
             Some(destination.port()),
-        ) == Some(RuleAction::Allow)
+        ) == Some(RuleAction::Allow);
+        if static_allow
             && self
                 .egress
                 .record_decision("tcp", "allow", &destination, "static_rule")
@@ -584,6 +586,9 @@ impl TcpRelayTable {
                 reserved_published_port: None,
             },
         );
+        if !host_service && !static_allow {
+            self.egress.log_network("tcp", "allow", &destination);
+        }
 
         true
     }

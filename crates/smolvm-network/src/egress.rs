@@ -422,6 +422,9 @@ pub struct EgressPolicy {
     /// signal only.
     signal_log: Option<Arc<std::path::PathBuf>>,
     decision_log: Option<Arc<DecisionLog>>,
+    /// The machine's network log: every name it looked up and every
+    /// destination it reached or was refused, for the user to read back.
+    network_log: Option<Arc<NetworkLog>>,
 }
 
 /// Append one timestamped line to an audit file, rotating it once past 8 MiB
@@ -462,6 +465,110 @@ struct DecisionLog {
     lock: Mutex<()>,
 }
 
+/// The most addresses the network log remembers a looked-up name for.
+const MAX_LOGGED_NAMES: usize = 4096;
+
+/// Rotate the network log once past this size (`.1` suffix).
+const NETWORK_LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How long a repeated datagram flow, ping or refusal stays out of the network
+/// log, so a workload sending at packet rate writes one line, not thousands.
+const NETWORK_LOG_REPEAT_QUIET: Duration = Duration::from_secs(10);
+
+struct NetworkLog {
+    path: std::path::PathBuf,
+    /// The name each recently answered address was looked up as, so a
+    /// connection is logged with the host the guest meant.
+    names: Mutex<HashMap<IpAddr, String>>,
+    /// When each datagram flow, ping and refusal was last logged.
+    recent: Mutex<HashMap<(String, String, String), Instant>>,
+}
+
+impl NetworkLog {
+    /// Whether this event repeats one logged within the quiet window. Each TCP
+    /// connection and DNS lookup is logged; datagrams, pings and refusals,
+    /// which a guest repeats at packet rate, once per window.
+    fn repeats(&self, transport: &str, action: &str, destination: &str) -> bool {
+        if action != "deny" && (transport == "tcp" || transport == "dns") {
+            return false;
+        }
+        let Ok(mut recent) = self.recent.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        let key = (
+            transport.to_string(),
+            action.to_string(),
+            destination.to_string(),
+        );
+        if recent
+            .get(&key)
+            .is_some_and(|at| now.duration_since(*at) < NETWORK_LOG_REPEAT_QUIET)
+        {
+            return true;
+        }
+        if recent.len() >= MAX_LOGGED_NAMES {
+            recent.clear();
+        }
+        recent.insert(key, now);
+        false
+    }
+
+    fn append(&self, transport: &str, action: &str, destination: &str) {
+        let destination = destination.strip_prefix("to ").unwrap_or(destination);
+        if self.repeats(transport, action, destination) {
+            return;
+        }
+        let host = destination
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .and_then(|addr| {
+                let names = self.names.lock().ok()?;
+                names.get(&addr.ip()).cloned()
+            });
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let mut event = serde_json::json!({
+            "timestampMs": timestamp_ms,
+            "transport": transport,
+            "action": action,
+            "destination": destination,
+        });
+        if let Some(host) = host {
+            event["host"] = host.into();
+        }
+        // Best effort: the log is for reading back, never a reason to refuse.
+        let Ok(_guard) = self.names.lock() else {
+            return;
+        };
+        if std::fs::metadata(&self.path).is_ok_and(|m| m.len() >= NETWORK_LOG_ROTATE_BYTES) {
+            let _ = std::fs::rename(&self.path, self.path.with_extension("jsonl.1"));
+        }
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = writeln!(file, "{event}");
+        }
+    }
+
+    fn remember(&self, name: &str, records: &[(IpAddr, u32)]) {
+        let Ok(mut names) = self.names.lock() else {
+            return;
+        };
+        if names.len() + records.len() > MAX_LOGGED_NAMES {
+            names.clear();
+        }
+        for (ip, _) in records {
+            names.insert(*ip, name.to_string());
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CompiledRule {
     transport: Option<FlowTransport>,
@@ -482,6 +589,7 @@ impl EgressPolicy {
             watchlist: None,
             signal_log: None,
             decision_log: None,
+            network_log: None,
         }
     }
 
@@ -504,6 +612,7 @@ impl EgressPolicy {
             watchlist: None,
             signal_log: None,
             decision_log: None,
+            network_log: None,
         }
     }
 
@@ -667,6 +776,9 @@ impl EgressPolicy {
         destination: &dyn std::fmt::Display,
         reason: &str,
     ) -> std::io::Result<()> {
+        if !reason.starts_with("internal_") {
+            self.log_network(transport, action, destination);
+        }
         let Some(log) = &self.decision_log else {
             return Ok(());
         };
@@ -704,6 +816,35 @@ impl EgressPolicy {
             .open(&log.path)?;
         serde_json::to_writer(&mut file, &event)?;
         file.write_all(b"\n")
+    }
+
+    /// Keep the machine's network log in `path` (see [`crate::NETWORK_LOG`]).
+    pub fn with_network_log(mut self, path: std::path::PathBuf) -> Self {
+        self.network_log = Some(Arc::new(NetworkLog {
+            path,
+            names: Mutex::new(HashMap::new()),
+            recent: Mutex::new(HashMap::new()),
+        }));
+        self
+    }
+
+    /// Append one lookup or connection to the network log, if one is kept.
+    /// Callers going through [`Self::record_decision`] are logged already.
+    pub fn log_network(&self, transport: &str, action: &str, destination: &dyn std::fmt::Display) {
+        if let Some(log) = &self.network_log {
+            log.append(transport, action, &destination.to_string());
+        }
+    }
+
+    /// Remember which name a DNS `answer`'s addresses were looked up as, so
+    /// later connections to them are logged with that name.
+    pub fn note_dns_answer(&self, answer: &[u8]) {
+        let Some(log) = &self.network_log else {
+            return;
+        };
+        if let Some(name) = dns::question_name(answer).and_then(|n| dns::normalize_hostname(&n)) {
+            log.remember(&name, &dns::answer_ip_records(answer));
+        }
     }
 
     /// Record one denial: a stderr line for anyone tailing the boot log, and —
@@ -834,6 +975,7 @@ impl EgressPolicy {
             watchlist: self.watchlist.clone(),
             signal_log: self.signal_log.clone(),
             decision_log: self.decision_log.clone(),
+            network_log: self.network_log.clone(),
         }
     }
 
@@ -959,6 +1101,41 @@ impl EgressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_network_log_names_connections_and_quiets_repeated_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::NETWORK_LOG);
+        let policy = EgressPolicy::unrestricted().with_network_log(path.clone());
+        let ip: IpAddr = "151.101.0.223".parse().unwrap();
+        policy
+            .network_log
+            .as_ref()
+            .unwrap()
+            .remember("pypi.org", &[(ip, 300)]);
+        policy
+            .record_decision("dns", "allow", &"pypi.org", "local_policy")
+            .unwrap();
+        policy.log_network("tcp", "allow", &"151.101.0.223:443");
+        policy.log_network("tcp", "allow", &"151.101.0.223:443");
+        for _ in 0..3 {
+            policy.record_denial("connect", &format_args!("to 192.0.2.7:22"));
+        }
+        policy
+            .record_decision("icmp", "allow", &"10.0.2.2", "internal_gateway")
+            .unwrap();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0]["destination"], "pypi.org");
+        assert_eq!(lines[1]["host"], "pypi.org");
+        assert_eq!(lines[2]["host"], "pypi.org");
+        assert_eq!(lines[3]["action"], "deny");
+        assert_eq!(lines[3]["destination"], "192.0.2.7:22");
+    }
 
     #[test]
     fn a_replaced_allow_list_grants_and_revokes_for_every_clone() {

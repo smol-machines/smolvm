@@ -99,6 +99,7 @@ use state::ApiState;
         handlers::machines::list_machines,
         handlers::machines::get_machine,
         handlers::machines::get_machine_egress_events,
+        handlers::machines::get_machine_network_log,
         handlers::machines::get_machine_mediation_events,
         handlers::machines::start_machine,
         handlers::machines::branch_machine,
@@ -188,6 +189,8 @@ use state::ApiState;
         types::EgressDenialInfo,
         crate::agent::EgressSignal,
         types::EgressEventsResponse,
+        types::NetworkLogResponse,
+        crate::agent::NetworkEvent,
         types::MountInfo,
         types::ListMachinesResponse,
         types::ExecResponse,
@@ -354,6 +357,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route(
             "/{id}/egress-events",
             get(handlers::machines::get_machine_egress_events),
+        )
+        .route(
+            "/{id}/network-log",
+            get(handlers::machines::get_machine_network_log),
         )
         .route(
             "/{id}/mediation-events",

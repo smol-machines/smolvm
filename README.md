@@ -127,6 +127,8 @@ Use `--allow-host-pattern '*.example.com'` to allow subdomains only; `--allow-ho
 its subdomains. `smolvm machine update` adds (`--allow-host`, `--allow-host-pattern`, `--allow-cidr`) and removes
 (`--remove-allow-host`, a host or pattern as it was added; `--remove-allow-cidr`) entries, also on a running machine
 started with an allow list: a grant applies to the next connection or lookup, and a removed host's learned addresses go with it.
+`smolvm machine net-log --name <machine>` lists every host such a machine looked up or connected to, allowed or
+refused (`--hosts` for one line per host); the same log is at `GET /api/v1/machines/{name}/network-log`.
 
 How It Works
 ------------
