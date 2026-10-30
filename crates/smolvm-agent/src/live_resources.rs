@@ -492,6 +492,27 @@ pub(crate) fn grow_filesystem(
     }
 }
 
+/// Grow a mounted managed filesystem to fill its block device, for a boot
+/// after the host grew the disk of a stopped machine. Returns the
+/// filesystem's size in bytes afterwards.
+///
+/// resize2fs refuses to grow a filesystem unmounted once it has been mounted
+/// since its last forced check; the kernel grows the mounted filesystem in
+/// place, never moving or rewriting existing data.
+#[cfg(target_os = "linux")]
+pub(crate) fn grow_mounted_to_device(disk: ManagedDisk) -> io::Result<u64> {
+    let _guard = RESIZE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let capacity = File::open(device_path(disk))?.seek(SeekFrom::End(0))?;
+    online_resize(disk, capacity)?;
+    let mut sb = [0; 1024];
+    File::open(device_path(disk))?.read_exact_at(&mut sb, 1024)?;
+    let (bytes, block_size) = filesystem_bytes(&sb)?;
+    verify_filesystem_capacity(bytes, block_size, capacity)?;
+    Ok(bytes)
+}
+
 fn filesystem_mount(disk: ManagedDisk, expected: u64) -> io::Result<String> {
     let device = device_path(disk);
     let mut file = File::open(device)?;
