@@ -185,6 +185,8 @@ fn execute(
         .ok_or("selected image environment has no running container")?;
     let mut env = session.env;
     crate::ssh_agent::inject_into_env(&mut env);
+    crate::x11::inject_into_env(&mut env);
+    crate::waypipe::inject_into_env(&mut env);
     let launch = crate::ResolvedLaunch::resolve(
         image,
         session
