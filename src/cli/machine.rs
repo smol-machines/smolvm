@@ -631,6 +631,9 @@ pub struct RunCmd {
     /// A container path alone (`-v /var/lib/docker`) is a directory on the
     /// machine's own disk instead of its overlay root, which nested container
     /// runtimes need; it persists across stop and start.
+    /// `-v /data:uid=1000,gid=1000,mode=750` also sets that directory's owner
+    /// and mode when it is created or they change, like `machine cp --uid
+    /// --gid --mode`.
     #[arg(
         short = 'v',
         long = "volume",
@@ -4533,6 +4536,9 @@ pub struct CreateCmd {
     /// A container path alone (`-v /var/lib/docker`) is a directory on the
     /// machine's own disk instead of its overlay root, which nested container
     /// runtimes need; it persists across stop and start.
+    /// `-v /data:uid=1000,gid=1000,mode=750` also sets that directory's owner
+    /// and mode when it is created or they change, like `machine cp --uid
+    /// --gid --mode`.
     #[arg(
         short = 'v',
         long = "volume",
@@ -6713,7 +6719,9 @@ pub struct UpdateCmd {
     /// Add volume mount. A staged mount is guest-local until sync or graceful stop,
     /// which mirror it onto the host source, deleting host files the copy lacks.
     /// A guest path alone adds a
-    /// directory on the machine's own disk.
+    /// directory on the machine's own disk; `/data:uid=1000,gid=1000,mode=750`
+    /// also sets its owner and mode, and re-adding the path with changed ones
+    /// applies them on the next start.
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     pub volume: Vec<String>,
 
@@ -7232,17 +7240,11 @@ impl UpdateCmd {
         // on the machine's disk, so adding the path back restores it.
         let (_, removed_disk_volumes) =
             smolvm::data::storage::split_disk_volume_specs(&self.remove_volume)?;
-        let mut final_disk_volumes: Vec<String> = record
-            .disk_volumes
-            .iter()
-            .filter(|target| !removed_disk_volumes.contains(target))
-            .cloned()
-            .collect();
-        for target in &new_disk_volumes {
-            if !final_disk_volumes.contains(target) {
-                final_disk_volumes.push(target.clone());
-            }
-        }
+        let final_disk_volumes = smolvm::data::storage::merge_disk_volumes(
+            &record.disk_volumes,
+            &removed_disk_volumes,
+            &new_disk_volumes,
+        );
         smolvm::data::storage::ensure_disk_volumes_distinct(
             &final_disk_volumes,
             final_mounts.iter().filter_map(|m| m.target.to_str()),
@@ -7289,8 +7291,8 @@ impl UpdateCmd {
                 r.staged_mounts = final_staged_mounts.clone();
             }
             if r.disk_volumes != final_disk_volumes {
-                for target in &new_disk_volumes {
-                    changes.push(format!("  added disk volume: {target}"));
+                for volume in &new_disk_volumes {
+                    changes.push(format!("  added disk volume: {volume}"));
                 }
                 r.disk_volumes = final_disk_volumes.clone();
             }

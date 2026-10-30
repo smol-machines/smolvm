@@ -412,6 +412,65 @@ test_disk_volume_takes_image_ownership() {
     fi
 }
 
+# A disk volume given uid=, gid= or mode= (#1858) gets them when it is created,
+# over the image's ownership (/var/cache/nginx is 101:0 775 in this image, and
+# keeps the owner it was not given). A chown inside the machine then survives a
+# restart, as it does without options (#1870). Changing them with machine update
+# applies only what the new spec names on the next start. Options on a host
+# directory are refused as disk-volume-only.
+test_disk_volume_requested_owner_and_mode() {
+    local vm_name="test-vm-diskvol-requested"
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+
+    local host_dir host_err
+    host_dir=$(mktemp -d)
+    host_err=$($SMOLVM machine create --name "$vm_name" --image alpine \
+        -v "$host_dir:/data:uid=1000" 2>&1)
+    rm -rf "$host_dir"
+    if [[ "$host_err" != *"only apply to disk volumes"* ]]; then
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        log_fail "options on a host directory: $host_err"
+        return 1
+    fi
+
+    $SMOLVM machine create --name "$vm_name" --net \
+        --image nginxinc/nginx-unprivileged:stable-alpine \
+        -v /var/cache/nginx:mode=700 -v /data:uid=1000,gid=1000,mode=750 >/dev/null 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1
+        return 1
+    }
+
+    local stat_cmd='stat -c "%n %u:%g %a" /var/cache/nginx /data'
+    local fresh restarted updated
+    fresh=$($SMOLVM machine exec --name "$vm_name" --user root -- sh -c "$stat_cmd" 2>&1)
+    $SMOLVM machine exec --name "$vm_name" --user root -- sh -c 'chown 0:0 /data && chmod 755 /data' >/dev/null 2>&1
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1
+    restarted=$($SMOLVM machine exec --name "$vm_name" --user root -- sh -c "$stat_cmd" 2>&1)
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1
+    $SMOLVM machine update --name "$vm_name" -v /data:uid=1001 >/dev/null 2>&1
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1
+    updated=$($SMOLVM machine exec --name "$vm_name" --user root -- sh -c "$stat_cmd" 2>&1)
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+
+    local expected=$'/var/cache/nginx 101:0 700\n/data 1000:1000 750'
+    local expected_restarted=$'/var/cache/nginx 101:0 700\n/data 0:0 755'
+    local expected_updated=$'/var/cache/nginx 101:0 700\n/data 1001:0 755'
+    if [[ "$fresh" != "$expected" ]]; then
+        log_fail "fresh ownership: $fresh"
+        return 1
+    fi
+    if [[ "$restarted" != "$expected_restarted" ]]; then
+        log_fail "ownership after restart: $restarted"
+        return 1
+    fi
+    if [[ "$updated" != "$expected_updated" ]]; then
+        log_fail "ownership after update: $updated"
+        return 1
+    fi
+}
+
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true
 run_test "Volume: -v host:/workspace is virtiofs not symlink" test_volume_mount_workspace_is_virtiofs_not_symlink || true
 run_test "Volume: arbitrary mount path (/data)" test_volume_mount_arbitrary_path || true
@@ -423,5 +482,6 @@ run_test "Create with --image: Smolfile volumes visible to exec" test_image_exec
 run_test "Create with --image: volume targets at/below /workspace resolve in guest" test_image_volume_targets_resolve_inside_guest || true
 run_test "Volume: staged sync and restart persistence" test_staged_volume_sync_and_restart || true
 run_test "Volume: new disk volume takes the image's ownership" test_disk_volume_takes_image_ownership || true
+run_test "Volume: disk volume takes its requested owner and mode once" test_disk_volume_requested_owner_and_mode || true
 
 print_summary "Volume Tests"

@@ -1,7 +1,34 @@
 # Volumes
 
-Besides host directories (`-v HOST:GUEST[:ro]`), a volume can be an S3 bucket
-or a staged copy of a host directory.
+Besides host directories (`-v HOST:GUEST[:ro]`), a volume can be an S3 bucket,
+a staged copy of a host directory, or a directory on the machine's own disk.
+
+## Disk volumes
+
+`-v GUEST` with no host side, as in `-v /var/lib/docker`, is a directory on the
+machine's storage disk instead of its overlay root. It persists across stop and
+start. A new one takes the owner and mode the image has at that path, or the
+owner of the nearest directory above it; a new top-level path is `root:root`
+`0755`.
+
+To choose the owner and mode yourself, add them after the path, as
+`machine cp --uid --gid --mode` does for a file:
+
+```sh
+smolvm machine create --name app --image alpine -v /data:uid=1000,gid=1000,mode=750
+```
+
+Any of `uid`, `gid` and `mode` (octal) can be given, in any order. The agent
+applies them to the volume's directory, not its contents, when the volume is
+created and again whenever they change, so a `chown` or `chmod` inside the
+machine survives a restart, as it does for a volume without them. The ones
+left out come from the image as above. `machine update --name app -v
+/data:uid=1001` replaces them on a stopped machine and applies them on its next
+start, and `-v /data` alone stops setting them.
+
+These options only apply to disk volumes. On a host directory
+(`-v ./src:/data:uid=1000`) they are refused: its owner is whatever the host's
+file server presents.
 
 ## S3 buckets
 

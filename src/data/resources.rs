@@ -132,9 +132,10 @@ pub struct VmResources {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<crate::data::disk::CacheDisk>,
     /// Guest paths backed by the machine's storage disk (`-v /var/lib/docker`),
-    /// normalized. See `smolvm_protocol::disk_volume`.
+    /// normalized, with any owner and mode given for them. See
+    /// `smolvm_protocol::disk_volume`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disk_volumes: Vec<String>,
+    pub disk_volumes: Vec<smolvm_protocol::disk_volume::DiskVolume>,
     /// `Some(exceptions)` blocks private, internal and link-local destinations
     /// (`--block-private`) while the public internet stays open; each exception
     /// CIDR (`--allow-private`) re-opens its range. Cloud metadata stays closed.
