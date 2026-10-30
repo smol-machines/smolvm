@@ -1500,6 +1500,7 @@ fn restored_record(
     }
     // The live guest already contains the initialized workload. Re-running
     // image pull/init on its first start would duplicate side effects.
+    record.packed_image_on_storage = checkpoint_image_on_storage(checkpoint);
     record.init_completed = true;
     record.forkable = true;
     record.host_uid_owner = Some(name.to_string());
@@ -3421,15 +3422,7 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
 /// virtio-fs device: a `.smolmachine`'s layers, or a local image archive or
 /// directory (including a registry image the host fetched for it).
 fn mounts_image_layers(vm: &VmRecord) -> bool {
-    if vm.packed_image_on_storage {
-        return false;
-    }
-    vm.source_smolmachine.is_some()
-        || vm
-            .image
-            .as_deref()
-            .and_then(crate::data::image_source::packed_layers_dir_for_ref)
-            .is_some()
+    vm.packed_layer_source().is_some() || vm.local_image_layers_dir().is_some()
 }
 
 /// Identify the registry image a machine boots from a host-fetched archive, if
@@ -3744,11 +3737,7 @@ pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> 
     // are not, so they stay unsupported.
     if vm.source_smolmachine.is_none()
         && vm.host_fetched_origin().is_none()
-        && vm
-            .image
-            .as_deref()
-            .and_then(crate::data::image_source::packed_layers_dir_for_ref)
-            .is_some()
+        && vm.local_image_layers_dir().is_some()
     {
         unsupported.push("host-backed image layers");
     }
@@ -5210,6 +5199,16 @@ fn max_checkpoint_memory_image(memory_mib: u32, packed_layers: bool) -> Result<u
 /// Whether a checkpoint's machine had the packed-layers virtio-fs device.
 fn mounts_checkpoint_image_layers(checkpoint: &PortableCheckpointManifest) -> bool {
     checkpoint.packed_layers.is_some() || checkpoint.host_image.is_some()
+}
+
+/// Whether a checkpoint's `local:` image is on its storage disk rather than
+/// mounted from a host pack or archive.
+pub fn checkpoint_image_on_storage(checkpoint: &PortableCheckpointManifest) -> bool {
+    !mounts_checkpoint_image_layers(checkpoint)
+        && checkpoint
+            .workload
+            .as_ref()
+            .is_some_and(|workload| crate::data::image_source::is_local_ref(&workload.image))
 }
 
 /// Validate that a checkpoint may be restored by this host and runtime.
@@ -8599,6 +8598,29 @@ mod tests {
         record.packed_image_on_storage = false;
         assert!(mounts_image_layers(&record));
         assert!(checkpoint_packed_layers(&record.name, &record).is_err());
+
+        // A pack prepared on the storage disk from a `local:` image keeps that
+        // reference across checkpoint capture and restore, without mounting the
+        // host's archive on restore or refusing a subsequent capture.
+        let mut local_seed = no_network_machine("local:abc");
+        local_seed.source_smolmachine = Some("missing-pack.smolmachine".into());
+        local_seed.packed_image_on_storage = true;
+        assert!(!mounts_image_layers(&local_seed));
+        validate_capture_profile(&local_seed, false).unwrap();
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.workload = Some(checkpoint_workload(&local_seed.name, &local_seed).unwrap());
+        assert!(checkpoint_image_on_storage(&checkpoint));
+        let manifest = PackManifest::new(
+            "local:abc".into(),
+            "sha256:0".into(),
+            "linux/arm64".into(),
+            "darwin/arm64".into(),
+        );
+        let restored = restored_record("restored", &manifest, &checkpoint).unwrap();
+        assert!(restored.packed_image_on_storage);
+        assert_eq!(restored.local_image_layers_dir(), None);
+        assert!(!mounts_image_layers(&restored));
+        validate_capture_profile(&restored, false).unwrap();
     }
 
     #[test]

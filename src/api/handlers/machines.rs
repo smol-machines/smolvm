@@ -3617,7 +3617,10 @@ async fn create_machine_to_end(
         } else {
             source_smolmachine
         },
-        packed_image_on_storage: packed_storage_gib.is_some(),
+        packed_image_on_storage: packed_storage_gib.is_some()
+            || manifest_checkpoint
+                .as_ref()
+                .is_some_and(crate::portable_checkpoint::checkpoint_image_on_storage),
         entrypoint,
         cmd,
         env: workload_env,
