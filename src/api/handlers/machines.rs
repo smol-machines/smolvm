@@ -86,6 +86,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         disk_chain_depth: None,
         runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name: name.to_string(),
+        labels: record.labels.clone(),
         image: record.display_image().map(str::to_string),
         state: actual_state.to_string(),
         state_reason: record.pause_reason.clone(),
@@ -2406,6 +2407,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
     let mounts = record.host_mounts().iter().map(MountSpec::from).collect();
     let ports = record.port_mappings().iter().map(PortSpec::from).collect();
     MachineEntry {
+        labels: record.labels.clone(),
         manager,
         cache_disk: record.cache_disk.clone(),
         image: record.image.clone(),
@@ -2811,6 +2813,9 @@ async fn create_machine_to_end(
     // cap are needed.
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
+    if req.labels.keys().any(|key| key.is_empty()) {
+        return Err(ApiError::BadRequest("label key cannot be empty".into()));
+    }
 
     // Split remote volumes (`s3://` sources) from host mounts,
     // mirroring the CLI's -v handling, then validate the host mount paths.
@@ -3548,6 +3553,7 @@ async fn create_machine_to_end(
 
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
+        labels: req.labels.clone(),
         manager,
         mounts: host_mount_specs,
         remote_volumes,
@@ -8014,6 +8020,27 @@ mod tests {
     }
 
     #[test]
+    fn machine_labels_survive_record_and_cached_list_responses() {
+        let mut record = VmRecord::new("labelled-vm".into(), 1, 512, vec![], vec![], false);
+        assert!(serde_json::to_value(record_to_info("labelled-vm", &record))
+            .unwrap()
+            .get("labels")
+            .is_none());
+        record.labels.insert("owner".into(), "oac".into());
+        record.labels.insert("allocation".into(), "a=b".into());
+        let from_record = record_to_info("labelled-vm", &record);
+        let entry =
+            machine_entry_from_record(&record, AgentManager::for_vm("labelled-vm").unwrap());
+        let from_cache = crate::api::state::machine_entry_to_info("labelled-vm".into(), &entry);
+        assert_eq!(from_record.labels, record.labels);
+        assert_eq!(from_cache.labels, record.labels);
+        assert_eq!(
+            serde_json::to_value(from_record).unwrap()["labels"]["allocation"],
+            "a=b"
+        );
+    }
+
+    #[test]
     fn checkpoint_ports_allow_host_rebinding_but_preserve_guest_topology() {
         let captured = vec![
             PortSpec {
@@ -8604,6 +8631,7 @@ mod tests {
 
     fn minimal_create_request() -> CreateMachineRequest {
         CreateMachineRequest {
+            labels: Default::default(),
             credentials: None,
             name: Some("test-vm".to_string()),
             cpus: None,
@@ -8696,6 +8724,13 @@ mod tests {
         assert_eq!(req.env[0].name, "FOO");
         assert_eq!(req.env[0].value, "bar");
         assert_eq!(req.workdir.as_deref(), Some("/app"));
+        assert!(req.labels.is_empty());
+        let labelled: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm",
+            "labels": {"owner": "oac", "allocation": "a=b"}
+        }))
+        .unwrap();
+        assert_eq!(labelled.labels["allocation"], "a=b");
     }
 
     #[test]
