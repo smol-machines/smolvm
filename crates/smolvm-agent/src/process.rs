@@ -60,6 +60,140 @@ pub fn run_container_init() -> i32 {
     1
 }
 
+const EXEC_AS_ARG: &str = "exec-as";
+
+/// Whether this agent invocation is the credential helper a command entering a
+/// snapshot-restored container runs through (see [`exec_as_args`]).
+pub fn exec_as_requested() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(EXEC_AS_ARG))
+}
+
+/// The arguments that make `exe` (this agent binary) become `command` as
+/// `uid:gid` holding `groups`: `exe exec-as UID GID GROUPS -- command...`, with
+/// GROUPS comma-separated (`-` for none).
+///
+/// `nsenter --setgid` drops every supplementary group (it calls
+/// `setgroups(0, NULL)` itself), so a command that enters a container through
+/// nsenter cannot keep its user's groups that way. nsenter enters the
+/// namespaces as root and runs this helper instead, which sets the groups,
+/// then the gid, then the uid, and execs the command, as `initgroups` and a
+/// login do.
+pub fn exec_as_args(
+    exe: &str,
+    uid: u32,
+    gid: u32,
+    groups: &[u32],
+    command: &[String],
+) -> Vec<String> {
+    let groups = if groups.is_empty() {
+        "-".to_string()
+    } else {
+        groups
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut args = vec![
+        exe.to_string(),
+        EXEC_AS_ARG.to_string(),
+        uid.to_string(),
+        gid.to_string(),
+        groups,
+        "--".to_string(),
+    ];
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// What an `exec-as` invocation asks for.
+#[derive(Debug, PartialEq, Eq)]
+struct ExecAs<'a> {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+    command: &'a [String],
+}
+
+/// Parse [`exec_as_args`] (without the executable) back into an [`ExecAs`].
+fn parse_exec_as(args: &[String]) -> Result<ExecAs<'_>, String> {
+    let [arg, uid, gid, groups, sep, command @ ..] = args else {
+        return Err("usage: exec-as UID GID GROUPS -- COMMAND...".to_string());
+    };
+    if arg != EXEC_AS_ARG || sep != "--" || command.is_empty() {
+        return Err("usage: exec-as UID GID GROUPS -- COMMAND...".to_string());
+    }
+    let id = |value: &str| {
+        value
+            .parse::<u32>()
+            .map_err(|_| format!("exec-as: invalid id '{value}'"))
+    };
+    let groups = if groups == "-" {
+        Vec::new()
+    } else {
+        groups.split(',').map(id).collect::<Result<_, _>>()?
+    };
+    Ok(ExecAs {
+        uid: id(uid)?,
+        gid: id(gid)?,
+        groups,
+        command,
+    })
+}
+
+/// Entry point for `smolvm-agent exec-as`: set the credentials, then exec the
+/// command (searching `PATH`). Returns only on failure, with the shell's exit
+/// codes: 127 for a command that does not exist, 126 otherwise.
+#[cfg(target_os = "linux")]
+pub fn run_exec_as() -> i32 {
+    use std::os::unix::process::CommandExt as _;
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let ExecAs {
+        uid,
+        gid,
+        groups,
+        command,
+    } = match parse_exec_as(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("smolvm: {error}");
+            return 126;
+        }
+    };
+    let groups: Vec<libc::gid_t> = groups.into_iter().map(|g| g as libc::gid_t).collect();
+    // SAFETY: plain credential syscalls on this single-threaded process; the
+    // pointer and length describe `groups`, which outlives the call.
+    unsafe {
+        if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+            eprintln!("smolvm: setgroups: {}", std::io::Error::last_os_error());
+            return 126;
+        }
+        if libc::setgid(gid) != 0 {
+            eprintln!("smolvm: setgid {gid}: {}", std::io::Error::last_os_error());
+            return 126;
+        }
+        if libc::setuid(uid) != 0 {
+            eprintln!("smolvm: setuid {uid}: {}", std::io::Error::last_os_error());
+            return 126;
+        }
+    }
+    let error = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .exec();
+    eprintln!("smolvm: exec {}: {error}", command[0]);
+    if error.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_exec_as() -> i32 {
+    126
+}
+
 /// Exit code used when a command is killed due to timeout.
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
 
@@ -521,6 +655,53 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_as_round_trips_the_user_its_groups_and_the_command() {
+        let command = vec!["sh".to_string(), "-c".to_string(), "id -G".to_string()];
+        let args = exec_as_args("/proc/self/fd/7", 1001, 1001, &[1001, 27, 123], &command);
+        assert_eq!(
+            args,
+            [
+                "/proc/self/fd/7",
+                "exec-as",
+                "1001",
+                "1001",
+                "1001,27,123",
+                "--",
+                "sh",
+                "-c",
+                "id -G"
+            ]
+        );
+        assert_eq!(
+            parse_exec_as(&args[1..]).unwrap(),
+            ExecAs {
+                uid: 1001,
+                gid: 1001,
+                groups: vec![1001, 27, 123],
+                command: command.as_slice(),
+            }
+        );
+
+        // No groups at all is spelled `-` and parses back to none.
+        let args = exec_as_args("exe", 0, 0, &[], &command);
+        assert_eq!(args[4], "-");
+        assert!(parse_exec_as(&args[1..]).unwrap().groups.is_empty());
+    }
+
+    #[test]
+    fn exec_as_refuses_malformed_arguments() {
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_exec_as(&args).map(|_| ())
+        };
+        assert!(parse(&["exec-as", "1001", "1001", "-", "--"]).is_err());
+        assert!(parse(&["exec-as", "1001", "1001", "-", "sh"]).is_err());
+        assert!(parse(&["exec-as", "runner", "1001", "-", "--", "sh"]).is_err());
+        assert!(parse(&["exec-as", "1001", "1001", "27,x", "--", "sh"]).is_err());
+        assert!(parse(&["exec-as", "1001", "1001", "-", "--", "sh"]).is_ok());
+    }
 
     #[test]
     fn stat_parsing_survives_odd_command_names() {
