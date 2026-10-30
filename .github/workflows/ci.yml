@@ -105,8 +105,8 @@ jobs:
           components: clippy
 
       - name: Cache cargo
-        # a warm smol runner (SMOL_WARM=1) or our own Mac already holds this job's target/; a cold one restores the cache like GitHub's
-        if: ${{ env.SMOL_WARM != '1' && runner.environment != 'self-hosted' }}
+        # our own Mac already holds this job's target/; any other runner restores the cache like GitHub's
+        if: ${{ runner.environment != 'self-hosted' }}
         uses: actions/cache@v5
         with:
           path: |
@@ -212,8 +212,7 @@ jobs:
         run: echo "CARGO_TARGET_DIR=$RUNNER_WORKSPACE/../cargo-target" >> "$GITHUB_ENV"
 
       - name: Cache cargo
-        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
-        if: ${{ env.SMOL_WARM != '1' }}
+        # on a warm smol runner the restore is served from the machine's own copy and keeps the newer files target/ holds
         uses: actions/cache@v5
         with:
           path: |
@@ -348,8 +347,7 @@ jobs:
           targets: x86_64-pc-windows-gnu
 
       - name: Cache cargo
-        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
-        if: ${{ env.SMOL_WARM != '1' }}
+        # on a warm smol runner the restore is served from the machine's own copy and keeps the newer files target/ holds
         uses: actions/cache@v5
         with:
           path: |
@@ -394,8 +392,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
-        if: ${{ env.SMOL_WARM != '1' }}
+        # on a warm smol runner the restore is served from the machine's own copy and keeps the newer files target/ holds
         uses: actions/cache@v5
         with:
           path: |
@@ -494,8 +491,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        # a warm smol runner (SMOL_WARM=1) already holds this job's target/; a cold one restores the cache like GitHub's
-        if: ${{ env.SMOL_WARM != '1' }}
+        # on a warm smol runner the restore is served from the machine's own copy and keeps the newer files target/ holds
         uses: actions/cache@v4
         with:
           path: |
