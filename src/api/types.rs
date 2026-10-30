@@ -230,6 +230,10 @@ pub struct ResourceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "10.200.0.0/30")]
     pub guest_subnet: Option<String>,
+    /// Guest paths kept on the machine's storage disk (see
+    /// `CreateMachineRequest::disk_volumes`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
 }
 
 // ============================================================================
@@ -765,6 +769,13 @@ pub struct CreateMachineRequest {
     /// Host mounts to attach.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    /// Guest paths kept on the machine's storage disk instead of its overlay
+    /// root, like Docker's anonymous volume `-v /var/lib/docker` (the CLI's
+    /// `-v PATH` with no host side). Put a nested container engine's data root
+    /// here so it can use overlayfs instead of falling back to vfs.
+    #[serde(default)]
+    #[schema(example = json!(["/var/lib/docker", "/var/lib/containerd"]))]
+    pub disk_volumes: Vec<String>,
     /// Port mappings (host:guest).
     #[serde(default)]
     pub ports: Vec<PortSpec>,
@@ -986,6 +997,9 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Guest paths kept on the machine's storage disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
     /// Host block I/O engine used by this machine.
     pub block_io: crate::data::resources::BlockIoEngine,
     /// When this machine's guest disk writes must reach the host's disk.

@@ -120,6 +120,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        disk_volumes: record.disk_volumes.clone(),
         block_io: record.block_io,
         disk_durability: record.disk_durability,
         cache_disk: record
@@ -2844,6 +2845,24 @@ async fn create_machine_to_end(
             }
         }
     }
+    // Disk volumes take the same lone guest paths as the CLI's `-v PATH`, and
+    // must not share a target with a mount.
+    let (not_guest_paths, disk_volumes) =
+        crate::data::storage::split_disk_volume_specs(&req.disk_volumes)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if let Some(spec) = not_guest_paths.first() {
+        return Err(ApiError::BadRequest(format!(
+            "diskVolumes: {spec} is not an absolute guest path"
+        )));
+    }
+    crate::data::storage::ensure_disk_volumes_distinct(
+        &disk_volumes,
+        remote_volumes
+            .iter()
+            .map(|v| v.target.as_str())
+            .chain(host_mount_specs.iter().map(|m| m.target.as_str())),
+    )
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Validate published ports, matching the CLI (which rejects these before
     // launch): port 0 is invalid for forwarding, and each host port may be
@@ -3122,6 +3141,7 @@ async fn create_machine_to_end(
         }
         if !host_mount_specs.is_empty()
             || !remote_volumes.is_empty()
+            || !disk_volumes.is_empty()
             || req.network
             || req.gpu
             || req.cuda
@@ -3195,6 +3215,7 @@ async fn create_machine_to_end(
                 .map_err(|error| ApiError::BadRequest(error.to_string()))?,
             None => guest_subnet,
         },
+        disk_volumes,
     };
     smolvm_network::EgressPolicy::unrestricted()
         .with_rules(&resources.egress_rules)
@@ -8541,6 +8562,7 @@ mod tests {
             cpus: None,
             mem: None,
             mounts: vec![],
+            disk_volumes: Vec::new(),
             ports: vec![],
             network: false,
             gpu: false,
@@ -8601,6 +8623,17 @@ mod tests {
                 ("NEW".to_string(), "request".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn create_request_accepts_disk_volumes() {
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm",
+            "diskVolumes": ["/var/lib/docker", "/var/lib/containerd"]
+        }))
+        .unwrap();
+
+        assert_eq!(req.disk_volumes, ["/var/lib/docker", "/var/lib/containerd"]);
     }
 
     #[test]

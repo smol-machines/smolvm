@@ -662,6 +662,7 @@ impl ApiState {
                 credentials: record.credential_policy.clone(),
                 network_backend: record.network_backend,
                 guest_subnet: record.guest_subnet.clone(),
+                disk_volumes: record.disk_volumes.clone(),
             };
 
             // Create AgentManager and try to reconnect
@@ -1273,6 +1274,7 @@ impl ApiState {
         }
         record.network_backend = reg.resources.network_backend;
         record.guest_subnet = reg.resources.guest_subnet.clone();
+        record.disk_volumes = reg.resources.disk_volumes.clone();
         // GPU flags (previously dropped here, so API-created machines
         // silently lost CUDA/GPU on restart).
         record.gpu = reg.resources.gpu;
@@ -2015,7 +2017,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         disk_durability: spec.disk_durability.unwrap_or_default(),
         disks: Vec::new(),
         cache_disk: None,
-        disk_volumes: Vec::new(),
+        disk_volumes: spec.disk_volumes.clone(),
         block_private: None,
         allowed_cidrs: spec.allowed_cidrs.clone(),
         egress_rules: spec.egress_rules.clone(),
@@ -2062,6 +2064,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         credentials: None,
         network_backend: res.network_backend,
         guest_subnet: res.guest_subnet,
+        disk_volumes: res.disk_volumes,
     }
 }
 
@@ -2148,6 +2151,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         allowed_hosts: entry.resources.allowed_hosts.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
+        disk_volumes: entry.resources.disk_volumes.clone(),
         block_io: entry.resources.block_io.unwrap_or_default(),
         disk_durability: entry.resources.disk_durability.unwrap_or_default(),
         cache_disk: entry.cache_disk.as_ref().map(cache_disk_spec),
@@ -2339,6 +2343,7 @@ mod tests {
             credentials: None,
             network_backend: None,
             guest_subnet: None,
+            disk_volumes: Vec::new(),
         };
         let res = resource_spec_to_vm_resources(&spec, false);
         assert_eq!(res.cpus, DEFAULT_MICROVM_CPU_COUNT);
@@ -2348,6 +2353,17 @@ mod tests {
         // Test with network enabled
         let res = resource_spec_to_vm_resources(&spec, true);
         assert!(res.network);
+        assert!(res.disk_volumes.is_empty());
+
+        // Disk volumes reach the launch, and come back from a launched config,
+        // so an implicit start (exec, files) boots with them too.
+        let spec = ResourceSpec {
+            disk_volumes: vec!["/var/lib/docker".into()],
+            ..spec
+        };
+        let res = resource_spec_to_vm_resources(&spec, true);
+        assert_eq!(res.disk_volumes, ["/var/lib/docker"]);
+        assert_eq!(vm_resources_to_spec(res).disk_volumes, ["/var/lib/docker"]);
     }
 
     #[test]
@@ -2428,6 +2444,7 @@ mod tests {
                     credentials: None,
                     network_backend: None,
                     guest_subnet: None,
+                    disk_volumes: Vec::new(),
                 },
                 restart: RestartConfig::default(),
                 network: false,
@@ -2490,6 +2507,7 @@ mod tests {
                 credentials: None,
                 network_backend: None,
                 guest_subnet: None,
+                disk_volumes: Vec::new(),
             },
             restart: RestartConfig::default(),
             network: false,
@@ -2555,6 +2573,7 @@ mod tests {
                     credentials: None,
                     network_backend: None,
                     guest_subnet: None,
+                    disk_volumes: Vec::new(),
                 },
                 restart: RestartConfig::default(),
                 network: false,
@@ -2634,6 +2653,7 @@ mod tests {
                     credentials: None,
                     network_backend: None,
                     guest_subnet: None,
+                    disk_volumes: Vec::new(),
                 },
                 restart: RestartConfig::default(),
                 network: false,
