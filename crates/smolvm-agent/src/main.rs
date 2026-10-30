@@ -1345,34 +1345,34 @@ fn setup_persistent_rootfs() {
     };
 
     if !mounted {
-        // First boot — format the disk
-        let _ = std::process::Command::new("mkfs.ext4")
-            .args([
-                "-F",
-                "-q",
-                "-O",
-                "^has_journal",
-                "-L",
-                "smolvm-overlay",
-                OVERLAY_DEVICE,
-            ])
-            .status();
+        // First boot — format the disk, but only a blank one: an overlay that
+        // holds a filesystem holds the machine's root changes.
+        let formatted = format_blank_ext4(
+            "mkfs.ext4",
+            OVERLAY_DEVICE,
+            &["-O", "^has_journal", "-L", "smolvm-overlay"],
+            "overlay",
+        );
 
         let dev = cstr(OVERLAY_DEVICE);
         let mnt = cstr(OVERLAY_MOUNT);
         let ext4 = cstr("ext4");
         // SAFETY: retry mount after formatting with noatime
-        if unsafe {
-            libc::mount(
-                dev.as_ptr(),
-                mnt.as_ptr(),
-                ext4.as_ptr(),
-                libc::MS_NOATIME,
-                std::ptr::null(),
-            )
-        } != 0
+        if !formatted
+            || unsafe {
+                libc::mount(
+                    dev.as_ptr(),
+                    mnt.as_ptr(),
+                    ext4.as_ptr(),
+                    libc::MS_NOATIME,
+                    std::ptr::null(),
+                )
+            } != 0
         {
-            boot_log("ERROR", "failed to mount overlay disk after formatting");
+            boot_log(
+                "ERROR",
+                "overlay disk NOT mounted — root filesystem changes will not persist this boot",
+            );
             // Clean up the parallel storage mount so mount_storage_disk() fallback
             // does not hit EBUSY from an already-mounted /dev/vda.
             if let Some(handle) = storage_handle {
@@ -1913,11 +1913,10 @@ fn try_mount_storage_ext4() -> bool {
 /// Three-attempt fallback chain:
 /// 1. resize + mount (works on subsequent boots with Linux-native FS)
 /// 2. fsck + resize + mount (may fix minor corruption)
-/// 3. mkfs + mount (first boot from macOS template, or unrecoverable)
+/// 3. mkfs + mount, only for a disk that holds no ext4 filesystem (a blank
+///    first-boot disk); a disk with a filesystem is never formatted
 #[cfg(target_os = "linux")]
 fn mount_storage_disk() -> bool {
-    use std::process::Command;
-
     const STORAGE_DEVICE: &str = "/dev/vda";
     const STORAGE_MOUNT: &str = "/storage";
 
@@ -1971,10 +1970,35 @@ fn mount_storage_disk() -> bool {
         warn!("resize failed, attempting fsck repair before mount");
     }
 
-    let fsck_ok = match Command::new("fsck.ext4")
-        .args(["-y", "-f", STORAGE_DEVICE])
-        .status()
-    {
+    // --- Attempt 3: format, only a blank disk ---
+    if recover_storage_disk(
+        STORAGE_DEVICE,
+        "fsck.ext4",
+        "mkfs.ext4",
+        try_mount_storage_ext4,
+    ) {
+        create_storage_dirs(STORAGE_MOUNT);
+        return true;
+    }
+
+    error!("CRITICAL: could not mount storage disk after all recovery attempts");
+    false
+}
+
+#[cfg(target_os = "linux")]
+/// Repair and mount a storage disk the first mount refused, formatting it only
+/// when it holds no ext4 filesystem at all. A disk that holds one keeps it
+/// unmounted when it cannot be repaired: its layers, container changes and
+/// workspace are worth more than a booting machine.
+fn recover_storage_disk(
+    device: &str,
+    fsck: &str,
+    mkfs: &str,
+    mut try_mount: impl FnMut() -> bool,
+) -> bool {
+    use std::process::Command;
+
+    let fsck_ok = match Command::new(fsck).args(["-y", "-f", device]).status() {
         Ok(status) => {
             let code = status.code().unwrap_or(-1);
             if code <= 1 {
@@ -1986,46 +2010,96 @@ fn mount_storage_disk() -> bool {
             }
         }
         Err(e) => {
-            warn!(error = %e, "fsck.ext4 not available");
+            warn!(error = %e, "fsck.ext4 could not run");
             false
         }
     };
 
     if fsck_ok {
-        let _ = resize_ext4_if_needed(STORAGE_DEVICE, "storage");
-        if try_mount_storage_ext4() {
+        let _ = resize_ext4_if_needed(device, "storage");
+        if try_mount() {
             info!("storage disk mounted after fsck repair");
-            create_storage_dirs(STORAGE_MOUNT);
             return true;
         }
-        warn!("mount still failed after fsck, will format");
+        warn!("mount still failed after fsck");
     }
 
-    // --- Attempt 3: mkfs (last resort, destroys data) ---
-    info!("formatting storage disk (first boot or unrecoverable)");
-    match Command::new("mkfs.ext4")
-        .args(["-F", "-q", "-O", "^has_journal", STORAGE_DEVICE])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            error!(exit_code = status.code().unwrap_or(-1), "mkfs.ext4 failed");
-            return false;
-        }
-        Err(e) => {
-            error!(error = %e, "mkfs.ext4 not available");
-            return false;
-        }
+    if !format_blank_ext4(mkfs, device, &["-O", "^has_journal"], "storage") {
+        return false;
     }
-
-    if try_mount_storage_ext4() {
+    if try_mount() {
         info!("storage disk mounted after format");
-        create_storage_dirs(STORAGE_MOUNT);
         return true;
     }
-
-    error!("CRITICAL: could not mount storage disk after all recovery attempts");
     false
+}
+
+#[cfg(target_os = "linux")]
+/// Whether a device holds an ext4 filesystem: the superblock magic 0xEF53 at
+/// byte 1080. A device too short to hold a superblock holds none.
+fn holds_ext4(device: &str) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+
+    let mut magic = [0u8; 2];
+    match std::fs::File::open(device)?.read_exact_at(&mut magic, 1024 + 56) {
+        Ok(()) => Ok(u16::from_le_bytes(magic) == 0xEF53),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Format a managed disk as ext4, but only a blank one (first boot). A disk
+/// that holds an ext4 filesystem holds the machine's data, so it is never
+/// formatted, whatever made it unmountable: it is left unmounted with an
+/// error instead. Returns whether the disk was formatted.
+fn format_blank_ext4(mkfs: &str, device: &str, options: &[&str], label: &str) -> bool {
+    match holds_ext4(device) {
+        Ok(false) => {}
+        Ok(true) => {
+            boot_log(
+                "ERROR",
+                &format!(
+                    "{label} disk holds an ext4 filesystem that could not be mounted or repaired; \
+                     refusing to format it, leaving it unmounted with its data intact"
+                ),
+            );
+            return false;
+        }
+        Err(error) => {
+            boot_log(
+                "ERROR",
+                &format!("{label} disk could not be read ({error}); refusing to format it"),
+            );
+            return false;
+        }
+    }
+    boot_log("INFO", &format!("formatting blank {label} disk"));
+    match std::process::Command::new(mkfs)
+        .args(["-F", "-q"])
+        .args(options)
+        .arg(device)
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            boot_log(
+                "ERROR",
+                &format!(
+                    "{label} disk: mkfs.ext4 failed (exit {})",
+                    status.code().unwrap_or(-1)
+                ),
+            );
+            false
+        }
+        Err(error) => {
+            boot_log(
+                "ERROR",
+                &format!("{label} disk: mkfs.ext4 could not run: {error}"),
+            );
+            false
+        }
+    }
 }
 
 /// Stub for non-Linux platforms.
@@ -8889,6 +8963,164 @@ mod ext4_growth_tests {
                 || String::from_utf8_lossy(&refused.stderr).contains("e2fsck -f"),
             "{refused:?}"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod format_guard_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn tool(name: &str) -> Option<PathBuf> {
+        ["/sbin", "/usr/sbin", "/bin", "/usr/bin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(name))
+            .find(|path| path.exists())
+    }
+
+    /// mkfs.ext4 and debugfs, or None (with a note) where e2fsprogs is absent.
+    fn e2fsprogs() -> Option<(PathBuf, PathBuf)> {
+        let found = tool("mkfs.ext4").zip(tool("debugfs"));
+        if found.is_none() {
+            eprintln!("skipping: e2fsprogs not installed");
+        }
+        found
+    }
+
+    fn blank(dir: &Path, name: &str) -> String {
+        let path = dir.join(name);
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    /// An ext4 image holding one file, like a disk after the machine ran.
+    fn with_data(dir: &Path, name: &str, mkfs: &Path, debugfs: &Path) -> String {
+        let image = blank(dir, name);
+        let made = Command::new(mkfs)
+            .args(["-F", "-q", &image])
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let source = dir.join("payload");
+        std::fs::write(&source, b"machine data").unwrap();
+        let written = Command::new(debugfs)
+            .args([
+                "-w",
+                "-R",
+                &format!("write {} keep", source.display()),
+                &image,
+            ])
+            .output()
+            .unwrap();
+        assert!(written.status.success(), "{written:?}");
+        image
+    }
+
+    fn read_keep(debugfs: &Path, image: &str) -> String {
+        let out = Command::new(debugfs)
+            .args(["-R", "cat /keep", image])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn failing_fsck(dir: &Path, code: i32) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("fsck-exit-{code}"));
+        std::fs::write(&path, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_blank_storage_disk_is_formatted() {
+        let Some((mkfs, _)) = e2fsprogs() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let disk = blank(dir.path(), "storage.raw");
+        assert!(!holds_ext4(&disk).unwrap());
+        let mut mounts = 0;
+        // fsck cannot even start on a blank disk; the format must still run.
+        let mounted = recover_storage_disk(
+            &disk,
+            "/nonexistent/fsck.ext4",
+            mkfs.to_str().unwrap(),
+            || {
+                mounts += 1;
+                true
+            },
+        );
+        assert!(mounted, "the formatted blank disk is mounted");
+        assert_eq!(mounts, 1, "mounted once, after the format");
+        assert!(holds_ext4(&disk).unwrap());
+    }
+
+    #[test]
+    fn a_storage_disk_with_data_is_never_formatted() {
+        let Some((mkfs, debugfs)) = e2fsprogs() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mkfs_path = mkfs.to_str().unwrap();
+        // fsck cannot start (the libblkid failure), fsck cannot repair, and
+        // fsck succeeds but the mount is still refused.
+        for fsck in [
+            "/nonexistent/fsck.ext4".to_owned(),
+            failing_fsck(dir.path(), 4),
+            failing_fsck(dir.path(), 8),
+            failing_fsck(dir.path(), 0),
+        ] {
+            let disk = with_data(dir.path(), "storage.raw", &mkfs, &debugfs);
+            let before = std::fs::read(&disk).unwrap();
+            assert!(
+                !recover_storage_disk(&disk, &fsck, mkfs_path, || false),
+                "{fsck}"
+            );
+            assert!(
+                std::fs::read(&disk).unwrap() == before,
+                "{fsck} changed the disk"
+            );
+            assert_eq!(read_keep(&debugfs, &disk), "machine data", "{fsck}");
+        }
+    }
+
+    #[test]
+    fn an_overlay_disk_is_formatted_only_when_blank() {
+        let Some((mkfs, debugfs)) = e2fsprogs() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mkfs_path = mkfs.to_str().unwrap();
+        let options = ["-O", "^has_journal", "-L", "smolvm-overlay"];
+
+        let fresh = blank(dir.path(), "fresh.raw");
+        assert!(format_blank_ext4(mkfs_path, &fresh, &options, "overlay"));
+        assert!(holds_ext4(&fresh).unwrap());
+
+        let used = with_data(dir.path(), "overlay.raw", &mkfs, &debugfs);
+        let before = std::fs::read(&used).unwrap();
+        assert!(!format_blank_ext4(mkfs_path, &used, &options, "overlay"));
+        assert!(std::fs::read(&used).unwrap() == before);
+        assert_eq!(read_keep(&debugfs, &used), "machine data");
+    }
+
+    #[test]
+    fn an_unreadable_disk_is_not_formatted_and_a_tiny_one_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.raw");
+        assert!(!format_blank_ext4(
+            "/bin/true",
+            missing.to_str().unwrap(),
+            &[],
+            "storage"
+        ));
+        let tiny = dir.path().join("tiny.raw");
+        std::fs::write(&tiny, [0u8; 100]).unwrap();
+        assert!(!holds_ext4(tiny.to_str().unwrap()).unwrap());
     }
 }
 
