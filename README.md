@@ -54,6 +54,8 @@ docker save myapp | smolvm machine run --image - -- ./app    # local image, no r
 
 Mount an S3, R2 or MinIO bucket with `-v s3://bucket/prefix:/data`, see [volumes](docs/volumes.md).
 
+Show guest GUI apps on the host desktop with `--waypipe` or `--x11`, see [GUI forwarding](docs/gui-forwarding.md).
+
 Declare a machine in a [Smolfile](docs/smolfile.md): image, resources, ports, mounts and network policy in one checked-in file.
 
 Embeddable
