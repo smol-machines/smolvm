@@ -5616,6 +5616,17 @@ impl CreateCmd {
                 }
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("shared pack extraction is Linux-only")
+            } else if let Some(checkpoint) = &checkpoint {
+                // The checkpoint installs into the machine directory and the
+                // pack is discarded, so only what install reads is written.
+                smolvm::portable_checkpoint::extract_for_install(
+                    sidecar_path,
+                    &cache_dir,
+                    footer.as_ref().expect("file artifact has a footer"),
+                    &manifest.assets,
+                    checkpoint,
+                )
+                .map(|()| (cache_dir.clone(), None::<String>))
             } else {
                 smolvm_pack::extract::extract_sidecar_for_machine(
                     sidecar_path,

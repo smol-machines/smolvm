@@ -960,12 +960,16 @@ pub fn restore_from_path_at(
             }
         }
         log_phase(name, "restore_prepare", &mut phase);
-        if footer.is_some() {
+        if footer.is_some() && smolvm_pack::extract::shared_extract_enabled() {
             // Extract into the host's shared store, as a server or CLI restore
             // does: once per artifact, under its lock, so concurrent and later
             // restores of one checkpoint share that extraction instead of each
             // unpacking and syncing the whole RAM image again.
             materialize_pack_layers(name, artifact)?;
+        } else if let Some(footer) = &footer {
+            // A private extraction is discarded right after install, so only
+            // what install reads is written.
+            extract_for_install(artifact, &cache_dir, footer, &manifest.assets, checkpoint)?;
         } else {
             materialize_for_restore_at(
                 artifact,
@@ -6233,6 +6237,59 @@ pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
     Ok(())
 }
 
+/// Archive paths a checkpoint carries only for hosts without this runtime: the
+/// libraries, the agent rootfs and the storage template. A restore boots this
+/// host's runtime, so [`install`] reads none of them.
+fn transport_only_assets(assets: &smolvm_pack::format::AssetInventory) -> Vec<PathBuf> {
+    let mut skip: Vec<PathBuf> = assets
+        .libraries
+        .iter()
+        .map(|asset| PathBuf::from(&asset.path))
+        .collect();
+    skip.push(PathBuf::from("lib"));
+    skip.push(PathBuf::from(&assets.agent_rootfs.path));
+    if let Some(template) = &assets.storage_template {
+        skip.push(PathBuf::from(&template.path));
+    }
+    skip
+}
+
+/// Extract a single-file checkpoint for [`install`].
+///
+/// The full extraction also wrote the libraries and the agent rootfs and
+/// unpacked the rootfs tar, all of which [`discard_transport_pack`] deletes
+/// right after install. Every byte of the artifact is still verified.
+pub fn extract_for_install(
+    artifact: &Path,
+    dest: &Path,
+    footer: &smolvm_pack::format::PackFooter,
+    assets: &smolvm_pack::format::AssetInventory,
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<()> {
+    let mut required: Vec<PathBuf> = expected_assets(checkpoint)
+        .into_iter()
+        .map(|(_, path)| PathBuf::from(path))
+        .collect();
+    if let Some(asset) = &checkpoint.credential_ca {
+        required.push(PathBuf::from(&asset.path));
+    }
+    required.extend(
+        checkpoint
+            .disks
+            .iter()
+            .flat_map(|disk| disk.files.iter())
+            .map(|file| PathBuf::from(&file.asset.path)),
+    );
+    smolvm_pack::extract::extract_verified_checkpoint_sidecar(
+        artifact,
+        dest,
+        footer,
+        &transport_only_assets(assets),
+        &required,
+    )
+    .map_err(|error| Error::agent("extract checkpoint", error.to_string()))
+}
+
 /// Prepare an explicit same-machine resume. The durable artifact stays intact
 /// if extraction, installation, or the subsequent boot fails.
 pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
@@ -6262,17 +6319,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
     let keep_disks = paused_disks_intact(&vm_data, artifact, &checkpoint.disks);
     // Resuming here uses this host's runtime, so the libraries, agent rootfs
     // and storage template the artifact carries for other hosts stay packed.
-    let mut skip: Vec<PathBuf> = manifest
-        .assets
-        .libraries
-        .iter()
-        .map(|asset| PathBuf::from(&asset.path))
-        .collect();
-    skip.push(PathBuf::from("lib"));
-    skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
-    if let Some(template) = &manifest.assets.storage_template {
-        skip.push(PathBuf::from(&template.path));
-    }
+    let mut skip = transport_only_assets(&manifest.assets);
     if keep_disks {
         skip.push(PathBuf::from("checkpoint/disks"));
     }
@@ -7314,6 +7361,49 @@ mod tests {
             cache_disk: None,
         };
         (extracted, metadata)
+    }
+
+    #[test]
+    fn extract_for_install_leaves_out_the_runtime_it_carries_for_other_hosts() {
+        let (staging, metadata) = installable_checkpoint();
+        std::fs::write(staging.path().join("agent-rootfs.tar"), b"rootfs").unwrap();
+        std::fs::create_dir(staging.path().join("lib")).unwrap();
+        std::fs::write(staging.path().join("lib").join("libkrun.dylib"), b"lib").unwrap();
+        let mut manifest = PackManifest::new(
+            "vm://extract-for-install".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        manifest.assets.agent_rootfs = smolvm_pack::format::AssetEntry {
+            path: "agent-rootfs.tar".into(),
+            size: 6,
+        };
+        manifest.assets.libraries = vec![smolvm_pack::format::AssetEntry {
+            path: "lib/libkrun.dylib".into(),
+            size: 3,
+        }];
+        manifest.checkpoint = Some(metadata.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("c.smolcheckpoint");
+        Packer::new(manifest.clone())
+            .with_asset_collector(AssetCollector::new(staging.path().to_path_buf()).unwrap())
+            .pack_artifact(&artifact)
+            .unwrap();
+        let footer = verified_sidecar_footer(&artifact).unwrap();
+
+        let pack = dir.path().join("pack");
+        extract_for_install(&artifact, &pack, &footer, &manifest.assets, &metadata).unwrap();
+        assert!(!pack.join("agent-rootfs.tar").exists());
+        assert!(!pack.join("lib").exists());
+
+        let machine = tempfile::tempdir().unwrap();
+        install(&pack, machine.path(), &metadata, None).unwrap();
+        assert_eq!(
+            std::fs::read(machine.path().join("storage.raw")).unwrap(),
+            b"storage-disk"
+        );
+        assert!(pending_dir(machine.path()).is_some());
     }
 
     #[test]
