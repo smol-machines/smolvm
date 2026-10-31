@@ -769,22 +769,13 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // the socket is missing, so a misconfigured host disables X11 rather than
     // aborting the boot.
     let x11_socket: Option<std::path::PathBuf> = if config.x11 {
-        match host_x11_socket() {
-            Some(path) if path.exists() => {
+        match host_x11_socket(std::env::var("DISPLAY").ok().as_deref()) {
+            Ok(path) => {
                 tracing::info!(path = %path.display(), "X11 bridge: using host X server socket");
                 Some(path)
             }
-            Some(path) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "X11 bridge requested but the host X server socket does not exist - X11 disabled"
-                );
-                None
-            }
-            None => {
-                tracing::warn!(
-                    "X11 bridge requested but $DISPLAY is unset or not a local display - X11 disabled"
-                );
+            Err(reason) => {
+                tracing::warn!("X11 bridge requested but {reason} - X11 disabled");
                 None
             }
         }
@@ -1112,24 +1103,29 @@ mod parent_death_tests {
     }
 }
 
-/// Resolve the host X server's Unix socket path from the host `$DISPLAY`.
+/// Resolve the host X server's Unix socket from the host `$DISPLAY`, or say why
+/// the X11 bridge cannot run. The boot subprocess and the CLI's notice both call
+/// this, so the CLI says "enabled" only when the boot side will bridge.
 ///
 /// Handles the common local forms `:N` and `:N.S` (screen suffix ignored),
-/// mapping display N to `/tmp/.X11-unix/XN`. Returns `None` for a network
-/// display (`host:N`, which has no local socket) or an unparseable value. The
-/// boot subprocess inherits `$DISPLAY` from the launching user's environment.
-fn host_x11_socket() -> Option<std::path::PathBuf> {
-    let display = std::env::var("DISPLAY").ok()?;
-    // Strip an optional host part before ':'. A non-empty host means a TCP
-    // display, which has no local Unix socket to bridge.
-    let (host, rest) = display.rsplit_once(':')?;
+/// mapping display N to `/tmp/.X11-unix/XN`. A network display (`host:N`) or a
+/// socket-path display (XQuartz's launchd `$DISPLAY`) has no such socket.
+pub fn host_x11_socket(display: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let display = display.ok_or_else(|| "$DISPLAY is unset".to_string())?;
+    let not_local = || format!("$DISPLAY={display} is not a local display (:N)");
+    // A non-empty part before ':' is a TCP host or a socket path, not `:N`.
+    let (host, rest) = display.rsplit_once(':').ok_or_else(not_local)?;
     if !host.is_empty() {
-        return None;
+        return Err(not_local());
     }
     // rest is "N" or "N.S"; take the display number before any screen suffix.
-    let num = rest.split('.').next()?;
+    let num = rest.split('.').next().unwrap_or_default();
     if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+        return Err(not_local());
     }
-    Some(std::path::PathBuf::from(format!("/tmp/.X11-unix/X{num}")))
+    let path = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{num}"));
+    if !path.exists() {
+        return Err(format!("no X server socket at {}", path.display()));
+    }
+    Ok(path)
 }
