@@ -371,13 +371,12 @@ impl TcpRelayTable {
             destination.ip(),
             Some(destination.port()),
         ) {
-            Some(RuleAction::Allow) => {
-                let address = self.host_connect_addr(destination);
-                return if matches!(self.intercept, Some(crate::StreamInterception::Mediated(_))) {
-                    RelayTarget::DirectMediated(address)
-                } else {
-                    RelayTarget::Connect(address)
-                };
+            // A static allow admits the flow but leaves the route to the
+            // interception mode. Only under mediation does it dial directly.
+            Some(RuleAction::Allow)
+                if matches!(self.intercept, Some(crate::StreamInterception::Mediated(_))) =>
+            {
+                return RelayTarget::DirectMediated(self.host_connect_addr(destination));
             }
             Some(RuleAction::Redirect) => {
                 if let Some(crate::StreamInterception::Mediated(binding)) = self.intercept {
@@ -2320,6 +2319,51 @@ mod tests {
                 RelayTarget::Intercept { endpoint: actual, destination }
                     if actual == endpoint && destination == requested));
         }
+    }
+
+    #[test]
+    fn allow_rule_keeps_an_intercepted_flow_intercepted() {
+        // `--block-private --allow-private` reopening a tailnet host and the gateway.
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let policy = EgressPolicy::unrestricted()
+            .with_private_floor(&["100.81.17.207/32".into(), "100.96.0.1/32".into()])
+            .unwrap();
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            token: [1; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let binding = crate::MediatedBinding {
+            endpoint,
+            machine_id: [7; 16],
+            parent_id: [0; 16],
+        };
+        let table = |mode| {
+            TcpRelayTable::new(None, policy.clone(), vec![gateway], None).with_intercept(Some(mode))
+        };
+        let https = table(crate::StreamInterception::Https(endpoint));
+        let all_tcp = table(crate::StreamInterception::AllTcp(endpoint));
+        let mediated = table(crate::StreamInterception::Mediated(binding));
+        let tailnet_443: SocketAddr = "100.81.17.207:443".parse().unwrap();
+        let tailnet_80: SocketAddr = "100.81.17.207:80".parse().unwrap();
+        assert!(https.destination_allowed(tailnet_443));
+
+        // A credential host on a reopened range would otherwise get the placeholder.
+        assert!(matches!(https.outbound_target(tailnet_443),
+            RelayTarget::Intercept { destination, .. } if destination == tailnet_443));
+        assert!(matches!(https.outbound_target(tailnet_80),
+            RelayTarget::Connect(addr) if addr == tailnet_80));
+        assert!(
+            matches!(https.outbound_target(SocketAddr::new(gateway, 443)),
+            RelayTarget::Connect(addr) if addr.ip().is_loopback())
+        );
+        // An external interceptor must see every admitted flow, on any port.
+        for requested in [tailnet_443, tailnet_80] {
+            assert!(matches!(all_tcp.outbound_target(requested),
+                RelayTarget::Intercept { destination, .. } if destination == requested));
+        }
+        // Under mediation a static allow still dials directly, without asking the decider.
+        assert!(matches!(mediated.outbound_target(tailnet_443),
+            RelayTarget::DirectMediated(addr) if addr == tailnet_443));
     }
 
     #[test]
