@@ -371,13 +371,15 @@ impl TcpRelayTable {
             destination.ip(),
             Some(destination.port()),
         ) {
-            Some(RuleAction::Allow) => {
-                let address = self.host_connect_addr(destination);
-                return if matches!(self.intercept, Some(crate::StreamInterception::Mediated(_))) {
-                    RelayTarget::DirectMediated(address)
-                } else {
-                    RelayTarget::Connect(address)
-                };
+            // A static allow admits the flow; it does not exempt it from a
+            // credential or egress interceptor, or a range reopened with
+            // `--allow-private` would carry a credential's placeholder to the
+            // origin verbatim. Only mediated egress gives allow the meaning
+            // "dial directly, without asking the decider".
+            Some(RuleAction::Allow)
+                if matches!(self.intercept, Some(crate::StreamInterception::Mediated(_))) =>
+            {
+                return RelayTarget::DirectMediated(self.host_connect_addr(destination));
             }
             Some(RuleAction::Redirect) => {
                 if let Some(crate::StreamInterception::Mediated(binding)) = self.intercept {
@@ -2297,6 +2299,48 @@ mod tests {
         assert!(
             matches!(plain.outbound_target(https), RelayTarget::Connect(addr) if addr == https)
         );
+    }
+
+    /// `--block-private --allow-private 100.81.17.207/32` with a `--credential`
+    /// bound to that host: the reopened range is admitted by a static allow
+    /// rule, and the flow must still reach the interceptor, or the guest's
+    /// placeholder goes to the origin verbatim (issue #2024).
+    #[test]
+    fn a_range_reopened_with_allow_private_is_still_intercepted() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            token: [0; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let gateway = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        let egress = EgressPolicy::unrestricted()
+            .with_private_floor(&["100.81.17.207/32".to_string()])
+            .unwrap();
+        let reopened_https = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 81, 17, 207)), 443);
+        let reopened_http = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 81, 17, 207)), 80);
+        let public_https = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)), 443);
+
+        let credential = TcpRelayTable::new(None, egress.clone(), vec![gateway], None)
+            .with_intercept(Some(crate::StreamInterception::Https(endpoint)));
+        assert!(credential.destination_allowed(reopened_https));
+        for https in [reopened_https, public_https] {
+            assert!(matches!(
+                credential.outbound_target(https),
+                RelayTarget::Intercept { destination, .. } if destination == https
+            ));
+        }
+        assert!(matches!(
+            credential.outbound_target(reopened_http),
+            RelayTarget::Connect(addr) if addr == reopened_http
+        ));
+
+        let all_tcp = TcpRelayTable::new(None, egress, vec![gateway], None)
+            .with_intercept(Some(crate::StreamInterception::AllTcp(endpoint)));
+        for destination in [reopened_https, reopened_http] {
+            assert!(matches!(
+                all_tcp.outbound_target(destination),
+                RelayTarget::Intercept { destination: actual, .. } if actual == destination
+            ));
+        }
     }
 
     #[test]

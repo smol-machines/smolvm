@@ -262,7 +262,13 @@ pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<Fet
     }
 
     let staging = crate::data::image_source::archive_staging_dir()?;
-    let blobs = std::iter::once(&manifest.config).chain(manifest.layers.iter());
+    // A manifest may name one layer twice (the 32-byte empty layer, often).
+    // Each digest is one file in staging, so fetch it once: two downloads
+    // of the same digest would truncate and write the same path at once.
+    let mut seen = std::collections::HashSet::new();
+    let blobs = std::iter::once(&manifest.config)
+        .chain(manifest.layers.iter())
+        .filter(|blob| seen.insert(blob.digest.clone()));
     futures_util::future::try_join_all(
         blobs.map(|blob| download_blob(&client, &repo, blob, staging.path().join(blob_file(blob)))),
     )
@@ -475,8 +481,15 @@ fn write_save_archive(
     header.set_mode(0o644);
     header.set_cksum();
     tar.append_data(&mut header, "manifest.json", manifest.as_slice())?;
+    let mut archived = std::collections::HashSet::new();
     for blob in std::iter::once(config).chain(layers) {
         let name = blob_file(blob);
+        // A layer the manifest names twice goes in once: `manifest.json`
+        // points at the same file for both positions, and the loose copy is
+        // gone after the first pass.
+        if !archived.insert(name.clone()) {
+            continue;
+        }
         // Fixed metadata, so the same image makes the same archive bytes on
         // every host rather than carrying this download's time and owner.
         let file = std::fs::File::open(dir.join(&name))?;
@@ -612,6 +625,62 @@ mod tests {
             !dir.path().join(blob_file(&layer)).exists(),
             "loose blobs are dropped once archived"
         );
+    }
+
+    /// `ghcr.io/tobi/wrap:desktop` names the empty layer twice; the archive
+    /// holds it once and `manifest.json` lists it at both positions (issue #2024).
+    #[test]
+    fn a_layer_the_manifest_names_twice_is_archived_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = descriptor(br#"{"architecture":"amd64"}"#);
+        let empty = descriptor(b"empty layer");
+        let other = descriptor(b"other layer");
+        std::fs::write(
+            dir.path().join(blob_file(&config)),
+            br#"{"architecture":"amd64"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(blob_file(&empty)), b"empty layer").unwrap();
+        std::fs::write(dir.path().join(blob_file(&other)), b"other layer").unwrap();
+        let archive = dir.path().join("image.tar");
+        write_save_archive(
+            dir.path(),
+            &archive,
+            &config,
+            &[
+                descriptor(b"empty layer"),
+                descriptor(b"other layer"),
+                descriptor(b"empty layer"),
+            ],
+        )
+        .unwrap();
+
+        // one entry per distinct file, each name once
+        let mut names = Vec::new();
+        for entry in tar::Archive::new(std::fs::File::open(&archive).unwrap())
+            .entries()
+            .unwrap()
+        {
+            let entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            if name == "manifest.json" {
+                let manifest: serde_json::Value = serde_json::from_reader(entry).unwrap();
+                let layers = manifest[0]["Layers"].as_array().unwrap();
+                assert_eq!(layers.len(), 3);
+                assert_eq!(layers[0], blob_file(&empty));
+                assert_eq!(layers[2], blob_file(&empty));
+            }
+            names.push(name);
+        }
+        names.sort();
+        let mut expected = vec![
+            blob_file(&config),
+            blob_file(&empty),
+            blob_file(&other),
+            "manifest.json".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
     }
 
     #[test]
