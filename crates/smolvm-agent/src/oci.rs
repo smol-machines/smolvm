@@ -801,45 +801,39 @@ impl OciSpec {
         });
     }
 
-    /// Back the workload's /tmp with `dir` on the storage disk instead of a
-    /// tmpfs. A tmpfs is sized from the RAM the machine booted with and never
-    /// grows with it, so a cold `yarn install` or a large build hit ENOSPC with
-    /// the disk mostly empty; GitHub's runners and most VMs keep /tmp on disk.
-    /// The directory sits outside the overlay's upper layer, so /tmp still
-    /// hides the image's own /tmp and never ends up in a packed or exported
-    /// machine, as with the tmpfs. Only the default tmpfs is replaced: a
-    /// caller's own /tmp mount is kept.
-    fn back_tmp_with(&mut self, dir: &Path) {
-        for mount in &mut self.mounts {
-            if mount.destination == "/tmp" && mount.mount_type.as_deref() == Some("tmpfs") {
-                *mount = OciMount {
-                    destination: "/tmp".to_string(),
-                    mount_type: Some("bind".to_string()),
-                    source: dir.display().to_string(),
-                    options: vec![
-                        "bind".to_string(),
-                        "rprivate".to_string(),
-                        "nosuid".to_string(),
-                        "nodev".to_string(),
-                    ],
-                };
-            }
+    /// Leave the workload's /tmp to its root filesystem: drop the default tmpfs
+    /// mount there. A separate /tmp mount, tmpfs or bind, made rename(2) from
+    /// /tmp into the rest of the filesystem fail with EXDEV, and a tmpfs sized
+    /// from boot RAM ran out of space with the disk mostly empty; GitHub's
+    /// runners and most VMs keep /tmp on the root filesystem. The overlay's
+    /// upper layer gets a fresh, opaque /tmp at each boot
+    /// (`storage::reset_workload_tmp`), and exports leave its contents out.
+    /// Only the default tmpfs goes: a caller's own /tmp mount is kept, and a
+    /// read-only root keeps the tmpfs, as it has no writable /tmp of its own.
+    fn tmp_on_root(&mut self) {
+        if self.root.readonly {
+            return;
         }
+        self.mounts.retain(|mount| {
+            !(mount.destination == "/tmp"
+                && mount.mount_type.as_deref() == Some("tmpfs")
+                && mount.source == "tmpfs")
+        });
     }
 
     /// Write the OCI spec to a config.json file in the bundle directory.
     ///
-    /// When the overlay next to the bundle has a [`WORKLOAD_TMP_DIR`], the
-    /// written spec backs /tmp with it (see [`Self::back_tmp_with`]).
+    /// When the bundle sits in an overlay (an [`OVERLAY_UPPER_DIR`] beside it),
+    /// the written spec leaves /tmp to the root filesystem (see
+    /// [`Self::tmp_on_root`]).
     pub fn write_to(&self, bundle_dir: &Path) -> std::io::Result<()> {
         let config_path = bundle_dir.join("config.json");
-        let tmp_dir = bundle_dir
+        let in_overlay = bundle_dir
             .parent()
-            .map(|overlay| overlay.join(WORKLOAD_TMP_DIR))
-            .filter(|dir| dir.is_dir());
+            .is_some_and(|overlay| overlay.join(OVERLAY_UPPER_DIR).is_dir());
         let mut spec = std::borrow::Cow::Borrowed(self);
-        if let Some(dir) = tmp_dir {
-            spec.to_mut().back_tmp_with(&dir);
+        if in_overlay {
+            spec.to_mut().tmp_on_root();
         }
         let json = serde_json::to_string_pretty(&*spec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1279,8 +1273,8 @@ fn tun_device_mount(guest_node: &Path) -> Option<OciMount> {
     })
 }
 
-/// Directory beside an overlay's `bundle` that backs the workload's /tmp.
-pub const WORKLOAD_TMP_DIR: &str = "tmp";
+/// The upper layer beside an overlay's `bundle`: a bundle with one is an overlay workload's.
+pub const OVERLAY_UPPER_DIR: &str = "upper";
 
 /// The workload's /dev/shm size: the machine's `--shm-size`, else half the
 /// guest's RAM, as on a Linux VM or a hosted CI runner rather than Docker's
@@ -2033,12 +2027,13 @@ mod tests {
         assert_eq!(spec.process.env, expected);
     }
 
-    /// /tmp is the disk directory beside the bundle when the overlay has one,
-    /// mounted where the tmpfs was so later mounts under /tmp still stack on
-    /// it, and stays a tmpfs for a bundle without one.
+    /// An overlay workload's /tmp is its root filesystem's (no /tmp mount, so a
+    /// rename from /tmp into the workspace stays on one filesystem) while later
+    /// mounts under /tmp still apply; a bundle outside an overlay and a
+    /// read-only root keep the tmpfs.
     #[test]
-    fn written_spec_backs_tmp_with_the_overlay_directory() {
-        let written_tmp = |overlay: &Path| {
+    fn an_overlay_workloads_tmp_is_on_its_root_filesystem() {
+        let written = |overlay: &Path, readonly: bool| {
             let bundle = overlay.join("bundle");
             std::fs::create_dir_all(&bundle).unwrap();
             let mut spec = OciSpec::new(
@@ -2049,37 +2044,33 @@ mod tests {
                 &ProcessIdentity::root(),
                 false,
             );
+            spec.root.readonly = readonly;
             spec.add_bind_mount("/storage/cache", "/tmp/cache", false);
             spec.write_to(&bundle).unwrap();
             let json: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap())
                     .unwrap();
-            let mounts = json["mounts"].as_array().unwrap().clone();
-            let at = |dest: &str| {
-                mounts
-                    .iter()
-                    .position(|m| m["destination"] == dest)
-                    .unwrap()
-            };
-            assert!(at("/tmp") < at("/tmp/cache"));
-            mounts[at("/tmp")].clone()
+            json["mounts"].as_array().unwrap().clone()
+        };
+        let tmp_mount = |mounts: &[serde_json::Value]| {
+            mounts.iter().find(|m| m["destination"] == "/tmp").cloned()
         };
 
-        let overlay = tempfile::tempdir().unwrap();
-        assert_eq!(written_tmp(overlay.path())["type"], "tmpfs");
-
-        std::fs::create_dir(overlay.path().join(WORKLOAD_TMP_DIR)).unwrap();
-        let tmp = written_tmp(overlay.path());
-        assert_eq!(tmp["type"], "bind");
+        let plain = tempfile::tempdir().unwrap();
         assert_eq!(
-            tmp["source"],
-            overlay.path().join(WORKLOAD_TMP_DIR).display().to_string()
+            tmp_mount(&written(plain.path(), false)).unwrap()["type"],
+            "tmpfs"
         );
-        assert!(tmp["options"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|o| o == "nosuid"));
+
+        let overlay = tempfile::tempdir().unwrap();
+        std::fs::create_dir(overlay.path().join(OVERLAY_UPPER_DIR)).unwrap();
+        let mounts = written(overlay.path(), false);
+        assert!(tmp_mount(&mounts).is_none(), "no /tmp mount: {mounts:?}");
+        assert!(mounts.iter().any(|m| m["destination"] == "/tmp/cache"));
+        assert_eq!(
+            tmp_mount(&written(overlay.path(), true)).unwrap()["type"],
+            "tmpfs"
+        );
     }
 
     /// LANG defaults to C.UTF-8 only for a rootfs that can load it, and never

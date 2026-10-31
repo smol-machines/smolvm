@@ -7849,6 +7849,7 @@ fn handle_streaming_flatten_layers(
     };
 
     let mut child = match std::process::Command::new("tar")
+        .args(storage::FLATTEN_TAR_EXCLUDES)
         .args(["-cf", "-", "-C"])
         .arg(tree.path())
         .arg(".")

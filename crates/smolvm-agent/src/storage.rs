@@ -4010,33 +4010,93 @@ fn is_volume_metadata(name: &std::ffi::OsStr) -> bool {
     )
 }
 
-/// Create the directory that backs a workload's /tmp (see
-/// [`crate::oci::OciSpec::write_to`]), world-writable and sticky like any /tmp.
-fn ensure_workload_tmp(overlay_root: &Path) -> Result<()> {
+/// The directory beside an overlay that backed its workload's /tmp through a
+/// bind mount, before /tmp moved into the root filesystem
+/// ([`reset_workload_tmp`] removes it).
+const LEGACY_WORKLOAD_TMP_DIR: &str = "tmp";
+
+/// Give a workload a fresh /tmp before its overlay mounts: an empty, sticky,
+/// world-writable directory in the upper layer, marked opaque so the image's
+/// own /tmp stays hidden as it was under the tmpfs. /tmp is part of the root
+/// filesystem, as on GitHub's runners and most VMs: a separate /tmp mount made
+/// rename(2) from /tmp into the workspace fail with EXDEV (@expo/repack-app
+/// moving its APK out of /tmp), and a tmpfs sized from boot RAM ran out of space
+/// with the disk mostly empty. Only the upper layer is written, never a mounted
+/// overlay's. Also removes the on-disk directory that backed /tmp through a bind
+/// mount before (`overlay_root/tmp`). Best effort: a /tmp that cannot be reset
+/// is still usable, so this never fails the boot.
+fn reset_workload_tmp(overlay_root: &Path, upper_path: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = overlay_root.join(crate::oci::WORKLOAD_TMP_DIR);
-    match std::fs::create_dir(&dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
-        Err(e) => return Err(e.into()),
+    let legacy = overlay_root.join(LEGACY_WORKLOAD_TMP_DIR);
+    if let Err(e) = std::fs::remove_dir_all(&legacy) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %legacy.display(), error = %e, "could not remove the old workload /tmp directory");
+        }
+    }
+    let dir = upper_path.join("tmp");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.is_dir() => {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                warn!(path = %dir.display(), error = %e, "could not clear workload /tmp");
+                return;
+            }
+        }
+        // a whiteout or a file where /tmp should be: replaced like the directory
+        Ok(_) => {
+            if let Err(e) = std::fs::remove_file(&dir) {
+                warn!(path = %dir.display(), error = %e, "could not clear workload /tmp");
+                return;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(path = %dir.display(), error = %e, "could not read workload /tmp");
+            return;
+        }
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(path = %dir.display(), error = %e, "could not create workload /tmp");
+        return;
     }
     // Set after creation: the process umask would drop the sticky and
     // world-writable bits from create_dir's mode.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
-    Ok(())
+    if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)) {
+        warn!(path = %dir.display(), error = %e, "could not make workload /tmp world-writable");
+    }
+    mark_opaque(&dir);
 }
 
-/// Empty a workload's /tmp before its machine boots, as a tmpfs /tmp was.
-/// Best effort: a /tmp that cannot be cleared is still usable, so this never
-/// fails the boot.
-fn reset_workload_tmp(overlay_root: &Path) {
-    let dir = overlay_root.join(crate::oci::WORKLOAD_TMP_DIR);
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(path = %dir.display(), error = %e, "could not clear workload /tmp");
-        }
+/// Mark an upper-layer directory opaque, in the xattr namespace the overlay is
+/// mounted with (see [`packed_layers_use_userxattr`]). Best effort: unmarked,
+/// the lower layers' entries show through.
+#[cfg(target_os = "linux")]
+fn mark_opaque(dir: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let name = if packed_layers_use_userxattr() {
+        c"user.overlay.opaque"
+    } else {
+        c"trusted.overlay.opaque"
+    };
+    let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return;
+    };
+    // SAFETY: path and name are NUL-terminated; the value is a valid 1-byte buffer.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            name.as_ptr(),
+            b"y".as_ptr() as *const libc::c_void,
+            1,
+            0,
+        )
+    };
+    if rc != 0 {
+        warn!(path = %dir.display(), error = %std::io::Error::last_os_error(), "could not mark workload /tmp opaque");
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn mark_opaque(_dir: &Path) {}
 
 /// Reject lower layers that cannot produce the image's filesystem.
 ///
@@ -4130,6 +4190,7 @@ impl OverlaySetup {
 
     /// Set up the upper layer with DNS resolution and /dev directory.
     fn setup_upper_layer(&self, lowerdirs: &[String]) -> Result<()> {
+        reset_workload_tmp(&self.overlay_root, &self.upper_path);
         // Set up DNS resolution BEFORE mounting. Image-backed workloads read
         // `/etc/resolv.conf` from the overlay upper layer, so this file must
         // match the active networking mode rather than always hardcoding
@@ -4277,8 +4338,6 @@ impl OverlaySetup {
             })?;
         }
 
-        ensure_workload_tmp(&self.overlay_root)?;
-
         debug!(bundle = %bundle_path.display(), "OCI bundle directory created");
         Ok(())
     }
@@ -4357,7 +4416,7 @@ impl OverlaySetup {
             // A boot starts with an empty /tmp, as it did on the tmpfs; a fork
             // clone keeps the golden's, like the rest of its state.
             if !restored_fork {
-                reset_workload_tmp(&self.overlay_root);
+                reset_workload_tmp(&self.overlay_root, &self.upper_path);
             }
             refresh_overlay_resolver(&self.upper_path)?;
 
@@ -6014,10 +6073,17 @@ pub(crate) fn tar_create_succeeded(status: std::process::ExitStatus) -> bool {
 }
 
 /// Tar `dir`'s contents (not the directory itself) into `output`.
+/// What a flattened tree leaves out: the contents of /tmp, which the machine
+/// gets fresh at each boot (`reset_workload_tmp`) and which never belonged in a
+/// pack or an export (the directory itself is kept). GNU tar: anchored, so only
+/// the tree's own top-level /tmp matches.
+pub const FLATTEN_TAR_EXCLUDES: &[&str] = &["--anchored", "--exclude=./tmp/*"];
+
 fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
     let status = std::process::Command::new("tar")
-        .arg("cf")
+        .arg("-cf")
         .arg(output)
+        .args(FLATTEN_TAR_EXCLUDES)
         .arg("-C")
         .arg(dir)
         .arg(".")
@@ -6662,24 +6728,33 @@ mod tests {
         assert_eq!(tags, ["data", "node", "npm", "cache"]);
     }
 
-    /// The workload's /tmp directory is a sticky, world-writable /tmp that a
-    /// boot empties and a second bundle setup leaves alone.
+    /// A boot gives the workload an empty, sticky, world-writable /tmp in the
+    /// upper layer, whatever was there (files, a whiteout), and removes the
+    /// directory that backed /tmp through a bind mount before.
     #[test]
-    fn workload_tmp_is_a_sticky_tmp_that_a_boot_empties() {
+    fn a_boot_gives_the_workload_an_empty_tmp_in_its_upper_layer() {
         use std::os::unix::fs::PermissionsExt as _;
         let overlay = tempfile::tempdir().unwrap();
-        let dir = overlay.path().join(crate::oci::WORKLOAD_TMP_DIR);
-        ensure_workload_tmp(overlay.path()).unwrap();
+        let upper = overlay.path().join("upper");
+        std::fs::create_dir_all(upper.join("tmp/sub")).unwrap();
+        std::fs::write(upper.join("tmp/left-over"), b"x").unwrap();
+        std::fs::create_dir_all(overlay.path().join(LEGACY_WORKLOAD_TMP_DIR)).unwrap();
+        std::fs::write(overlay.path().join("tmp/old"), b"x").unwrap();
+
+        reset_workload_tmp(overlay.path(), &upper);
+        let dir = upper.join("tmp");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o1777);
+        assert!(
+            !overlay.path().join("tmp/old").exists(),
+            "the old bind-mount directory is gone"
+        );
 
-        std::fs::write(dir.join("left-over"), b"x").unwrap();
-        ensure_workload_tmp(overlay.path()).unwrap();
-        assert!(dir.join("left-over").exists());
-
-        reset_workload_tmp(overlay.path());
-        ensure_workload_tmp(overlay.path()).unwrap();
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::write(&dir, b"").unwrap();
+        reset_workload_tmp(overlay.path(), &upper);
+        assert!(dir.is_dir(), "a file where /tmp belongs is replaced");
     }
 
     #[cfg(target_os = "linux")]
