@@ -1541,6 +1541,19 @@ impl EmbeddedRuntime {
     /// `smolvm machine create --from` does. Start it with
     /// [`Self::start_machine`].
     pub fn create_machine_from_pack(&self, name: &str, pack: &std::path::Path) -> Result<()> {
+        self.create_machine_from_pack_with_egress(name, pack, None)
+    }
+
+    /// Create the stopped machine `name` from a `.smolmachine` artifact,
+    /// optionally applying an explicit caller outbound network policy before
+    /// the machine can be started. If applying `egress` fails, the newly
+    /// created machine is deleted before returning the error.
+    pub fn create_machine_from_pack_with_egress(
+        &self,
+        name: &str,
+        pack: &std::path::Path,
+        egress: Option<&crate::data::network::EgressPolicy>,
+    ) -> Result<()> {
         self.with_name_lock(name, || {
             run_bundled_cli(&[
                 "machine".as_ref(),
@@ -1549,7 +1562,14 @@ impl EmbeddedRuntime {
                 name.as_ref(),
                 "--from".as_ref(),
                 pack.as_os_str(),
-            ])
+            ])?;
+            if let Some(policy) = egress {
+                if let Err(err) = control::set_egress_policy(&self.db, name, policy) {
+                    let _ = control::delete_vm(&self.db, name);
+                    return Err(err);
+                }
+            }
+            Ok(())
         })
     }
 
