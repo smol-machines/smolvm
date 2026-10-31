@@ -142,85 +142,11 @@ fn run_bridge() -> io::Result<()> {
 }
 
 /// Relay one X client connection (arriving on the local display socket) to the
-/// host X server over vsock, forwarding bytes in both directions with
-/// independent half-close.
-///
-/// X11 connections are long-lived and often idle (a window sits open waiting for
-/// events), so - like the Docker relay and unlike the short-lived SSH agent
-/// relay - this blocks on `poll` indefinitely and only exits once both
-/// directions have closed.
+/// host X server over vsock; see [`crate::relay::relay_half_close`]. X11
+/// connections sit idle while a window waits for events, so there is no timeout.
 #[cfg(target_os = "linux")]
 fn relay_to_host(local: std::os::unix::net::UnixStream) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    let mut host = crate::vsock::connect(ports::X11)?;
-    let mut local = local;
-
-    let local_fd = local.as_raw_fd();
-    let host_fd = host.as_raw_fd();
-
-    let mut buf = [0u8; 65536];
-
-    // Track each direction independently so a half-close is mirrored, not
-    // treated as a full teardown.
-    let mut local_read_open = true;
-    let mut host_read_open = true;
-
-    while local_read_open || host_read_open {
-        let mut poll_fds = [
-            libc::pollfd {
-                // A negative fd is ignored by poll(), so a closed read side
-                // stops waking the loop while the other direction drains.
-                fd: if local_read_open { local_fd } else { -1 },
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if host_read_open { host_fd } else { -1 },
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-
-        // Block until an open side is readable/closed (no idle timeout).
-        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, -1) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-
-        // local -> host
-        if local_read_open
-            && poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
-        {
-            let n = io::Read::read(&mut local, &mut buf)?;
-            if n == 0 {
-                local_read_open = false;
-                // SAFETY: host_fd is the valid, open fd owned by `host`.
-                unsafe { libc::shutdown(host_fd, libc::SHUT_WR) };
-            } else {
-                io::Write::write_all(&mut host, &buf[..n])?;
-            }
-        }
-
-        // host -> local
-        if host_read_open
-            && poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
-        {
-            let n = io::Read::read(&mut host, &mut buf)?;
-            if n == 0 {
-                host_read_open = false;
-                let _ = local.shutdown(std::net::Shutdown::Write);
-            } else {
-                io::Write::write_all(&mut local, &buf[..n])?;
-            }
-        }
-    }
-
-    Ok(())
+    crate::relay::relay_half_close(crate::vsock::connect(ports::X11)?, local)
 }
 
 #[cfg(not(target_os = "linux"))]
