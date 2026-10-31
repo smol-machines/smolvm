@@ -239,11 +239,9 @@ pub fn start_daemon_in_container(container_id: &str) -> DaemonStartOutcome {
                     binary = %bin,
                     "waypipe is present but its daemon exited without creating a display socket"
                 );
-                DaemonStartOutcome::Failed(format!(
-                    "the waypipe daemon ({bin}) is present but exited without creating a \
-                     display socket (in host-binary mode this is often a glibc mismatch \
-                     between host and guest image; try --waypipe=container with waypipe \
-                     installed in the image)"
+                DaemonStartOutcome::Failed(daemon_failure_reason(
+                    &bin,
+                    lacks_vsock(container_id, &bin),
                 ))
             } else {
                 tracing::info!(
@@ -300,7 +298,49 @@ fn binary_present(container_id: &str, bin: &str) -> bool {
     } else {
         format!("command -v {bin} >/dev/null 2>&1")
     };
-    let command = ["/bin/sh".to_string(), "-c".to_string(), probe];
+    sh_succeeds(container_id, probe)
+}
+
+/// Whether `bin` runs in the container but has no `--vsock` (waypipe before
+/// 0.9), the flag the daemon is started with. A binary that does not run at
+/// all (a glibc mismatch) is not reported as lacking it.
+#[cfg(target_os = "linux")]
+fn lacks_vsock(container_id: &str, bin: &str) -> bool {
+    let probe =
+        format!("{bin} --version >/dev/null 2>&1 && ! {bin} --help 2>&1 | grep -q -- --vsock");
+    sh_succeeds(container_id, probe)
+}
+
+/// Why a present `bin` failed to bring the daemon up. A waypipe without
+/// `--vsock` is too old; the glibc hint applies only to the shared host binary
+/// (an absolute path), the one mode where host and image libraries can differ.
+#[cfg(any(target_os = "linux", test))]
+fn daemon_failure_reason(bin: &str, lacks_vsock: bool) -> String {
+    let host_binary = bin.starts_with('/');
+    if lacks_vsock {
+        let whose = if host_binary {
+            "the shared host waypipe"
+        } else {
+            "the image's waypipe"
+        };
+        format!("{whose} ({bin}) is too old: it has no --vsock, and --waypipe needs waypipe 0.9 or later")
+    } else if host_binary {
+        format!(
+            "the waypipe daemon ({bin}) is present but exited without creating a display socket \
+             (in host-binary mode this is often a glibc mismatch between host and guest image; \
+             try --waypipe=container with waypipe installed in the image)"
+        )
+    } else {
+        format!(
+            "the waypipe daemon ({bin}) is present but exited without creating a display socket"
+        )
+    }
+}
+
+/// Whether `script` exits 0 under `/bin/sh -c` in the container.
+#[cfg(target_os = "linux")]
+fn sh_succeeds(container_id: &str, script: String) -> bool {
+    let command = ["/bin/sh".to_string(), "-c".to_string(), script];
     let env: [(String, String); 0] = [];
     crate::crun::CrunCommand::exec(container_id, &env, &command, None, false)
         .stdin_null()
@@ -516,6 +556,21 @@ mod tests {
             mounts_before,
             "container-PATH mode must not add a bind mount"
         );
+    }
+
+    /// A waypipe without `--vsock` is reported as too old, not as a glibc
+    /// mismatch; the glibc hint stays only for the shared host binary.
+    #[test]
+    fn a_waypipe_without_vsock_is_reported_too_old_not_glibc() {
+        let cases = [
+            ("waypipe", true, "the image's waypipe (waypipe) is too old: it has no --vsock, and --waypipe needs waypipe 0.9 or later"),
+            ("/mnt/waypipe/waypipe", true, "the shared host waypipe (/mnt/waypipe/waypipe) is too old: it has no --vsock, and --waypipe needs waypipe 0.9 or later"),
+            ("waypipe", false, "the waypipe daemon (waypipe) is present but exited without creating a display socket"),
+        ];
+        for (bin, lacks_vsock, expected) in cases {
+            assert_eq!(daemon_failure_reason(bin, lacks_vsock), expected);
+        }
+        assert!(daemon_failure_reason("/mnt/waypipe/waypipe", false).contains("glibc mismatch"));
     }
 
     #[test]

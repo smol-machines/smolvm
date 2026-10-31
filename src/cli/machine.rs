@@ -1382,6 +1382,19 @@ fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
     Ok(())
 }
 
+/// What `--x11` tells the user: the bridge is enabled only when the boot side
+/// will find the host X server socket, otherwise it is off, with the reason.
+fn x11_bridge_notice(display: Option<&str>) -> String {
+    match smolvm::internal_boot::host_x11_socket(display) {
+        Ok(_) => "X11 bridge enabled (host $DISPLAY -> guest display :10). \
+                  DISPLAY is set in the VM automatically, so just run an X app:\n  \
+                  smolvm machine exec -- xterm\n  \
+                  If clients are refused, run `xhost +local:` on the host first."
+            .to_string(),
+        Err(reason) => format!("X11 bridge off: {reason}, so the guest gets no DISPLAY."),
+    }
+}
+
 /// When an agent request fails because the VM process is gone, replace the
 /// bare transport error ("connection closed") with how the process ended.
 fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error) -> smolvm::Error {
@@ -2155,10 +2168,8 @@ impl RunCmd {
         // allow the guest with `xhost +local:` on the host (or copy the MIT cookie).
         if self.x11 || params.x11 {
             eprintln!(
-                "X11 bridge enabled (host $DISPLAY -> guest display :10). \
-                 DISPLAY is set in the VM automatically, so just run an X app:\n  \
-                 smolvm machine exec -- xterm\n  \
-                 If clients are refused, run `xhost +local:` on the host first."
+                "{}",
+                x11_bridge_notice(std::env::var("DISPLAY").ok().as_deref())
             );
         }
 
@@ -2655,6 +2666,26 @@ mod tests {
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME);
         guard
+    }
+
+    /// `--x11` reports the bridge off, with the reason, whenever the boot side
+    /// will not bridge, instead of claiming it is enabled.
+    #[test]
+    fn x11_notice_says_off_when_the_host_display_cannot_be_bridged() {
+        let cases = [
+            (None, "X11 bridge off: $DISPLAY is unset"),
+            (Some("otherhost:0"), "X11 bridge off: $DISPLAY=otherhost:0 is not a local display"),
+            (
+                Some("/private/tmp/com.apple.launchd.x/org.xquartz:0"),
+                "X11 bridge off: $DISPLAY=/private/tmp/com.apple.launchd.x/org.xquartz:0 is not a local display",
+            ),
+            (Some(":4242"), "X11 bridge off: no X server socket at /tmp/.X11-unix/X4242"),
+        ];
+        for (display, expected) in cases {
+            let notice = super::x11_bridge_notice(display);
+            assert!(notice.starts_with(expected), "{display:?}: {notice}");
+            assert!(!notice.contains("enabled"), "{display:?}: {notice}");
+        }
     }
 
     /// One test covers every SMOLVM_MACHINE_NAME behavior, because it mutates
