@@ -475,7 +475,13 @@ fn write_save_archive(
     header.set_mode(0o644);
     header.set_cksum();
     tar.append_data(&mut header, "manifest.json", manifest.as_slice())?;
+    let mut archived = std::collections::HashSet::new();
     for blob in std::iter::once(config).chain(layers) {
+        // A manifest may name one layer twice. The archive needs one copy, and
+        // the loose file is gone after the first.
+        if !archived.insert(&blob.digest) {
+            continue;
+        }
         let name = blob_file(blob);
         // Fixed metadata, so the same image makes the same archive bytes on
         // every host rather than carrying this download's time and owner.
@@ -611,6 +617,50 @@ mod tests {
         assert!(
             !dir.path().join(blob_file(&layer)).exists(),
             "loose blobs are dropped once archived"
+        );
+    }
+
+    #[test]
+    fn an_image_naming_one_layer_twice_archives_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = descriptor(br#"{"architecture":"arm64"}"#);
+        let layers = [descriptor(b"layer bytes"), descriptor(b"layer bytes")];
+        let layer = &layers[0];
+        std::fs::write(
+            dir.path().join(blob_file(&config)),
+            br#"{"architecture":"arm64"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(blob_file(layer)), b"layer bytes").unwrap();
+        let archive = dir.path().join("image.tar");
+        write_save_archive(dir.path(), &archive, &config, &layers).unwrap();
+
+        let mut names = Vec::new();
+        let mut manifest = Vec::new();
+        for entry in tar::Archive::new(std::fs::File::open(&archive).unwrap())
+            .entries()
+            .unwrap()
+        {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            if name == "manifest.json" {
+                std::io::Read::read_to_end(&mut entry, &mut manifest).unwrap();
+            }
+            names.push(name);
+        }
+        assert_eq!(
+            names,
+            [
+                "manifest.json".to_string(),
+                blob_file(&config),
+                blob_file(layer)
+            ]
+        );
+        // The image still stacks the layer twice, as `docker save` writes it.
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(
+            manifest[0]["Layers"],
+            serde_json::json!([blob_file(layer), blob_file(layer)])
         );
     }
 
