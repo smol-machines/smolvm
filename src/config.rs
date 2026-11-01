@@ -827,6 +827,14 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_head: Option<String>,
 
+    /// Content digest of the agent rootfs this machine's live state runs on,
+    /// recorded at each boot. A checkpoint or pause carries it, and a live
+    /// restore boots the rootfs with this digest (see `agent::rootfs_store`),
+    /// since the captured processes keep that userland mapped. A cold start
+    /// takes the host's installed rootfs and records its digest here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_rootfs_digest: Option<String>,
+
     /// Persistent container-overlay owner inherited from the root of a fork
     /// lineage. A clone's live overlay keeps its original on-disk name across
     /// every generation; descendants must continue addressing that root name.
@@ -1019,6 +1027,7 @@ impl VmRecord {
             image_origin_digest: None,
             golden: None,
             checkpoint_head: None,
+            agent_rootfs_digest: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
@@ -1120,6 +1129,7 @@ impl VmRecord {
             image_origin_digest: None,
             golden: None,
             checkpoint_head: None,
+            agent_rootfs_digest: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,

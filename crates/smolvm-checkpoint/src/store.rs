@@ -4131,6 +4131,7 @@ mod tests {
             clock: None,
             guest_cpu_features: None,
             cache_disk: None,
+            agent_rootfs_digest: None,
         });
         manifest
     }

@@ -3797,6 +3797,46 @@ pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
     ))
 }
 
+/// Confirm a restored guest that keeps its identity (a resume, a rewind) can
+/// run a program, before its restore is reported as done. The agent answers
+/// its ping from memory, so a guest whose agent rootfs changed under its frozen
+/// processes looks alive while every program it starts dies with a signal; a
+/// clone finds that out from its re-mint script, this is the same check for a
+/// guest that runs none.
+pub fn probe_restored_guest(name: &str) -> Result<()> {
+    let sock = vm_data_dir(name).join("agent.sock");
+    let failed = |detail: String| {
+        Error::agent(
+            "probe restored guest",
+            format!(
+                "the restored guest cannot run a program ({detail}); its live state was captured \
+                 on an agent rootfs this host does not boot it with, so stop the machine and \
+                 start it cold, or restore the checkpoint again"
+            ),
+        )
+    };
+    let mut client = AgentClient::connect_with_retry(&sock)
+        .map_err(|e| failed(format!("agent connect: {e}")))?;
+    match client.vm_exec(
+        vec!["/bin/true".into()],
+        vec![],
+        None,
+        Some(REJUVENATE_TIMEOUT),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, _, stderr)) => Err(failed(format!(
+            "/bin/true exited {code}{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", String::from_utf8_lossy(&stderr).trim())
+            }
+        ))),
+        Err(e) => Err(failed(format!("exec: {e}"))),
+    }
+}
+
 /// One attempt: connect to the clone's agent and run the re-mint script. Any
 /// connect error, exec error, or non-zero exit is a failure (fail-closed).
 fn rejuvenate_once(

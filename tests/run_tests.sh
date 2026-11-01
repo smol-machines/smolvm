@@ -20,6 +20,7 @@
 #   image           test_machine_image.sh
 #   local-image     test_machine_local_image.sh
 #   fork-base       test_fork_base_guards.sh
+#   rootfs-pin      test_rootfs_pin.sh
 #   packed          test_machine_packed.sh
 #
 # Extended suites (opt-in only, not run by default):
@@ -62,6 +63,7 @@ get_suite() {
         image)       echo "$SCRIPT_DIR/test_machine_image.sh" ;;
         local-image) echo "$SCRIPT_DIR/test_machine_local_image.sh" ;;
         fork-base)   echo "$SCRIPT_DIR/test_fork_base_guards.sh" ;;
+        rootfs-pin)  echo "$SCRIPT_DIR/test_rootfs_pin.sh" ;;
         packed)      echo "$SCRIPT_DIR/test_machine_packed.sh" ;;
         cli)         echo "$SCRIPT_DIR/test_cli.sh" ;;
         api)         echo "$SCRIPT_DIR/test_api.sh" ;;
@@ -126,7 +128,7 @@ if [[ $# -eq 0 ]]; then
     done
 
     # Sequential suites -- run one at a time.
-    for _name in bare db reliability storage run image local-image fork-base network volumes ports packed; do
+    for _name in bare db reliability storage run image local-image fork-base network volumes ports packed rootfs-pin; do
         run_suite "$_name"
     done
 

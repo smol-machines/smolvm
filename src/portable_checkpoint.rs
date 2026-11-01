@@ -1710,12 +1710,25 @@ fn checkpoint_lib_dir(options: &CaptureOptions) -> Result<PathBuf> {
         })
 }
 
-fn checkpoint_rootfs_dir(options: &CaptureOptions) -> Result<PathBuf> {
-    // The same resolver a machine boots with; see `AgentManager::resolve_rootfs_path`.
-    crate::agent::AgentManager::resolve_rootfs_path(
-        options.rootfs_dir.clone(),
-        "find checkpoint agent rootfs",
-    )
+/// The agent rootfs to pack with a checkpoint of `vm`: an explicit directory,
+/// else the rootfs the machine booted with, by the digest its record keeps
+/// (the host's installed rootfs while it still matches, else the store's
+/// copy), else the host's installed rootfs, for a record from before the
+/// digest was kept.
+fn checkpoint_rootfs_dir(options: &CaptureOptions, vm: &VmRecord) -> Result<PathBuf> {
+    if let Some(dir) = &options.rootfs_dir {
+        return crate::agent::AgentManager::resolve_rootfs_path(
+            Some(dir.clone()),
+            "find checkpoint agent rootfs",
+        );
+    }
+    match &vm.agent_rootfs_digest {
+        Some(digest) => crate::agent::rootfs_store::resolve(digest),
+        // The same resolver a machine boots with; see `AgentManager::resolve_rootfs_path`.
+        None => {
+            crate::agent::AgentManager::resolve_rootfs_path(None, "find checkpoint agent rootfs")
+        }
+    }
 }
 
 /// A checkpointable source and whether it is frozen as a branch base: paused
@@ -2083,9 +2096,6 @@ fn capture_with_completion(
         .collect_libraries(&checkpoint_lib_dir(options)?)
         .map_err(|error| Error::agent("collect checkpoint libraries", error.to_string()))?;
     collector
-        .collect_agent_rootfs(&checkpoint_rootfs_dir(options)?)
-        .map_err(|error| Error::agent("collect checkpoint rootfs", error.to_string()))?;
-    collector
         .create_storage_template()
         .map_err(|error| Error::agent("create checkpoint storage template", error.to_string()))?;
     log_phase(name, "capture_assets", &mut phase);
@@ -2108,6 +2118,14 @@ fn capture_with_completion(
         .vms
         .get(name)
         .expect("validated checkpoint source must remain in its loaded config");
+    // The rootfs the captured guest runs on, not whatever the host has
+    // installed since: its processes keep that userland mapped.
+    let rootfs_dir = checkpoint_rootfs_dir(options, vm)?;
+    let agent_rootfs_digest = smolvm_pack::assets::cached_agent_rootfs_digest(&rootfs_dir)
+        .map_err(|error| Error::agent("read checkpoint rootfs", error.to_string()))?;
+    collector
+        .collect_agent_rootfs(&rootfs_dir)
+        .map_err(|error| Error::agent("collect checkpoint rootfs", error.to_string()))?;
     // The cache disk's shared base is identified, not captured. Hashing it
     // happens here, before the source is paused; a base hashed once keeps its
     // digest beside it.
@@ -2598,6 +2616,7 @@ fn capture_with_completion(
         clock,
         guest_cpu_features,
         cache_disk: cache_disk.map(|(_, identity)| identity),
+        agent_rootfs_digest: Some(agent_rootfs_digest),
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
@@ -6140,6 +6159,7 @@ fn install_with(
                 }
             }
         }
+        pin_restore_rootfs(extracted, checkpoint, &partial)?;
         std::fs::write(partial.join(PENDING_MARKER), b"1\n")
             .map_err(|error| Error::agent("mark checkpoint pending", error.to_string()))?;
         std::fs::rename(&partial, &destination)
@@ -6217,10 +6237,16 @@ pub fn discard_transport_pack(vm_data_dir: &Path) -> Result<()> {
 /// workload instead of silently creating a second container.
 pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
     let mut phase = std::time::Instant::now();
-    // A clone gets its own identity; a resumed or rewound machine keeps its own.
+    // A clone gets its own identity; a resumed or rewound machine keeps its own,
+    // so nothing has run a program in it yet: confirm one runs before the
+    // restore is reported, since a guest whose userland changed under it
+    // answers the agent's ping and fails every exec.
     if record.paused_checkpoint.is_none() && !record.keep_identity {
         crate::agent::fork::rejuvenate_clone(name, record)?;
         log_phase(name, "restore_rejuvenate", &mut phase);
+    } else {
+        crate::agent::fork::probe_restored_guest(name)?;
+        log_phase(name, "restore_probe", &mut phase);
     }
     crate::agent::fork::release_forkpoint(name, &record.fork_env)?;
     log_phase(name, "restore_release_forkpoint", &mut phase);
@@ -6260,8 +6286,10 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
     // A pause leaves the machine's own disks exactly as captured unless
     // something wrote to them since; then they need not be installed again.
     let keep_disks = paused_disks_intact(&vm_data, artifact, &checkpoint.disks);
-    // Resuming here uses this host's runtime, so the libraries, agent rootfs
-    // and storage template the artifact carries for other hosts stay packed.
+    // Resuming here uses this host's runtime, so the libraries and storage
+    // template the artifact carries for other hosts stay packed. The agent
+    // rootfs too, unless the guest booted on one this host no longer has: then
+    // the carried copy is extracted and installed in the rootfs store.
     let mut skip: Vec<PathBuf> = manifest
         .assets
         .libraries
@@ -6269,7 +6297,10 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .map(|asset| PathBuf::from(&asset.path))
         .collect();
     skip.push(PathBuf::from("lib"));
-    skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
+    let rootfs_available = pinned_rootfs_available(checkpoint);
+    if rootfs_available {
+        skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
+    }
     if let Some(template) = &manifest.assets.storage_template {
         skip.push(PathBuf::from(&template.path));
     }
@@ -6284,6 +6315,9 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .collect();
     if let Some(asset) = &checkpoint.credential_ca {
         required.push(PathBuf::from(&asset.path));
+    }
+    if !rootfs_available {
+        required.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
     }
     // Layers the pause pinned rather than packed come from their pins.
     let pinned = if keep_disks {
@@ -6338,7 +6372,13 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
     // Pinned layers are not in the artifact's size, and link only on disk.
     #[cfg(target_os = "linux")]
     if let Some(root) = restore_tmpfs_root().filter(|_| pinned.is_empty()) {
-        let needed = paused_restore_staging_bytes(footer.assets_size, checkpoint, keep_disks);
+        let rootfs_bytes = if rootfs_available {
+            0
+        } else {
+            manifest.assets.agent_rootfs.size
+        };
+        let needed = paused_restore_staging_bytes(footer.assets_size, checkpoint, keep_disks)
+            .saturating_add(rootfs_bytes);
         let available = free_bytes(&root);
         tracing::info!(machine = %record.name, needed_bytes = needed, available_bytes = available, "paused resume tmpfs admission");
         if available.is_some_and(|free| free >= needed) {
@@ -6398,6 +6438,99 @@ fn clear_stale_restore_state(vm_data: &Path) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// The file in a pending restore naming the agent rootfs digest it boots with.
+const ROOTFS_PIN: &str = "agent-rootfs.sha256";
+
+/// The agent rootfs digest the pending restore in `vm_data_dir` must boot
+/// with, when the install pinned one (see [`pin_restore_rootfs`]).
+pub fn pinned_rootfs_digest(vm_data_dir: &Path) -> Option<String> {
+    let dir = pending_dir(vm_data_dir)?;
+    let digest = std::fs::read_to_string(dir.join(ROOTFS_PIN)).ok()?;
+    let digest = digest.trim();
+    (!digest.is_empty()).then(|| digest.to_string())
+}
+
+/// Pin the rootfs a restore from `extracted` boots with, writing its digest
+/// into the pending directory `partial`: the digest the checkpoint recorded,
+/// else that of the rootfs the artifact carries (a checkpoint from before the
+/// digest was recorded). When the host's installed rootfs has another digest,
+/// the carried copy goes into the rootfs store, where the launch finds it. The
+/// captured processes keep their userland mapped, so booting them on another
+/// one leaves every program they start dying with a signal. Returns the digest,
+/// or `None` for an artifact that neither recorded one nor carries a rootfs.
+fn pin_restore_rootfs(
+    extracted: &Path,
+    checkpoint: &PortableCheckpointManifest,
+    partial: &Path,
+) -> Result<Option<String>> {
+    pin_restore_rootfs_in(
+        extracted,
+        checkpoint,
+        partial,
+        &crate::agent::rootfs_store::host(),
+        crate::agent::rootfs_store::installed_default_digest(),
+    )
+}
+
+/// [`pin_restore_rootfs`] against `store`, where `default` is the digest of
+/// the host's installed rootfs.
+fn pin_restore_rootfs_in(
+    extracted: &Path,
+    checkpoint: &PortableCheckpointManifest,
+    partial: &Path,
+    store: &crate::agent::rootfs_store::Store,
+    default: Option<String>,
+) -> Result<Option<String>> {
+    let carried_dir = extracted.join("agent-rootfs");
+    let carried_tar = extracted.join("agent-rootfs.tar");
+    let digest = match &checkpoint.agent_rootfs_digest {
+        Some(digest) => digest.clone(),
+        None if carried_dir.is_dir() => smolvm_pack::assets::agent_rootfs_digest(&carried_dir)
+            .map_err(|e| Error::agent("read carried agent rootfs", e.to_string()))?,
+        None if carried_tar.is_file() => {
+            // Unpack to learn what it ran on; the tree is kept unless the
+            // host's installed rootfs turns out to be the same.
+            let (digest, path) = store.install_tar(&carried_tar)?;
+            if default.as_deref() == Some(digest.as_str()) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            digest
+        }
+        None => return Ok(None),
+    };
+    if default.as_deref() != Some(digest.as_str()) && store.installed(&digest).is_none() {
+        if carried_dir.is_dir() {
+            store.install_from_dir(&digest, &carried_dir)?;
+        } else if carried_tar.is_file() {
+            store.install_from_tar(&digest, &carried_tar)?;
+        } else {
+            tracing::warn!(
+                digest,
+                "the checkpoint carries no agent rootfs and the host's differs; its launch will refuse unless the store has one"
+            );
+        }
+    }
+    std::fs::write(partial.join(ROOTFS_PIN), format!("{digest}\n"))
+        .map_err(|error| Error::agent("pin checkpoint rootfs", error.to_string()))?;
+    Ok(Some(digest))
+}
+
+/// Whether a resume of `checkpoint` can boot without the rootfs its artifact
+/// carries: the host's installed rootfs or the store already has the digest.
+fn pinned_rootfs_available(checkpoint: &PortableCheckpointManifest) -> bool {
+    match &checkpoint.agent_rootfs_digest {
+        Some(digest) => {
+            crate::agent::rootfs_store::installed_default_digest().as_deref()
+                == Some(digest.as_str())
+                || crate::agent::rootfs_store::host()
+                    .installed(digest)
+                    .is_some()
+        }
+        // what it ran on is only known from the carried copy
+        None => false,
+    }
 }
 
 /// Return the pending one-shot checkpoint directory for a machine, if any.
@@ -7250,6 +7383,95 @@ mod tests {
     }
 
     /// An extracted checkpoint with raw storage and overlay disks, ready to install.
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_pins_the_rootfs_it_carries_and_keeps_a_copy_only_when_the_host_differs() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::agent::rootfs_store::Store::at(temp.path().join("store"));
+        let make = |name: &str, agent: &[u8]| {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(dir.join("sbin")).unwrap();
+            std::fs::create_dir_all(dir.join("usr/local/bin")).unwrap();
+            std::fs::write(dir.join("usr/local/bin/smolvm-agent"), agent).unwrap();
+            std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", dir.join("sbin/init"))
+                .unwrap();
+            dir
+        };
+        // what a `create --from` extraction looks like: the carried tar, unpacked
+        let extracted = temp.path().join("extracted");
+        let carried = make("extracted/agent-rootfs", b"agent v1");
+        let digest = smolvm_pack::assets::agent_rootfs_digest(&carried).unwrap();
+        let mut checkpoint = minimal_checkpoint_manifest();
+        let partial = temp.path().join("partial");
+        std::fs::create_dir(&partial).unwrap();
+
+        // an old artifact records no digest: the carried copy's counts, and the
+        // host's rootfs is another, so the copy is kept
+        assert_eq!(
+            pin_restore_rootfs_in(
+                &extracted,
+                &checkpoint,
+                &partial,
+                &store,
+                Some("sha256:other".into())
+            )
+            .unwrap()
+            .as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(partial.join(ROOTFS_PIN))
+                .unwrap()
+                .trim(),
+            digest
+        );
+        assert!(store.installed(&digest).is_some());
+
+        // a recorded digest the host still has: pinned, nothing installed
+        let store2 = crate::agent::rootfs_store::Store::at(temp.path().join("store2"));
+        checkpoint.agent_rootfs_digest = Some(digest.clone());
+        let partial2 = temp.path().join("partial2");
+        std::fs::create_dir(&partial2).unwrap();
+        pin_restore_rootfs_in(
+            &extracted,
+            &checkpoint,
+            &partial2,
+            &store2,
+            Some(digest.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(partial2.join(ROOTFS_PIN))
+                .unwrap()
+                .trim(),
+            digest
+        );
+        assert!(store2.installed(&digest).is_none());
+
+        // a recorded digest that names another rootfs than the one carried is refused
+        assert!(
+            std::fs::symlink_metadata(carried.join("sbin/init")).is_ok(),
+            "the carried tree is copied, not moved"
+        );
+        let partial3 = temp.path().join("partial3");
+        std::fs::create_dir(&partial3).unwrap();
+        checkpoint.agent_rootfs_digest = Some(format!("sha256:{}", "1".repeat(64)));
+        let err = pin_restore_rootfs_in(&extracted, &checkpoint, &partial3, &store2, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has digest"), "{err}");
+
+        // an artifact with neither a digest nor a carried rootfs pins nothing
+        let bare = temp.path().join("bare");
+        std::fs::create_dir(&bare).unwrap();
+        checkpoint.agent_rootfs_digest = None;
+        assert_eq!(
+            pin_restore_rootfs_in(&bare, &checkpoint, &partial3, &store2, None).unwrap(),
+            None
+        );
+        assert!(!partial3.join(ROOTFS_PIN).exists());
+    }
+
     fn installable_checkpoint() -> (tempfile::TempDir, PortableCheckpointManifest) {
         let extracted = tempfile::tempdir().unwrap();
         let source = extracted.path().join(ASSET_DIR);
@@ -7312,6 +7534,7 @@ mod tests {
             clock: None,
             guest_cpu_features: None,
             cache_disk: None,
+            agent_rootfs_digest: None,
         };
         (extracted, metadata)
     }
@@ -9011,6 +9234,7 @@ mod tests {
             clock: None,
             guest_cpu_features: None,
             cache_disk: None,
+            agent_rootfs_digest: None,
         }
     }
 
