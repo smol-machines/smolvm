@@ -67,8 +67,7 @@ RUN tini -s -- bash -c ' \
         || echo "WARNING: smolvm-agent unit tests reported failures") \
       && (timeout 900 cargo test --locked --offline -p smolvm-shim \
         || echo "WARNING: smolvm-shim unit tests reported failures")' \
-    && rm -rf "$HOME"/.cache/smolvm* "$HOME"/.local/share/smolvm* "$HOME"/.config/smolvm* \
-    && find /tmp -mindepth 1 -user scanner -delete
+    && rm -rf "$HOME"/.cache/smolvm* "$HOME"/.local/share/smolvm* "$HOME"/.config/smolvm*
 
 # Back to root for the scanner's own layer; /tmp is emptied so its runs do not meet
 # files another user left there.
