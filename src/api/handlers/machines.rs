@@ -2915,6 +2915,7 @@ async fn create_machine_to_end(
         manifest_cpus,
         manifest_mem,
         manifest_net,
+        manifest_egress,
         manifest_secret_refs,
         vm_seed,
         manifest_checkpoint,
@@ -2991,6 +2992,8 @@ async fn create_machine_to_end(
                 },
             )?;
         }
+        let manifest_egress = crate::pack_export::validated_manifest_egress(&manifest)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         // VM-mode packs carry disks, not layers — capture the templates so the
         // machine's overlay/storage disks can be seeded from them below.
         let vm_seed = if checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm
@@ -3048,6 +3051,7 @@ async fn create_machine_to_end(
             manifest.cpus,
             manifest.mem,
             manifest.network,
+            manifest_egress,
             manifest.secret_refs,
             vm_seed,
             checkpoint,
@@ -3063,6 +3067,11 @@ async fn create_machine_to_end(
             crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
             crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
             req.network,
+            crate::pack_export::ValidatedManifestEgress {
+                allowed_cidrs: None,
+                dns_filter_hosts: None,
+                egress_rules: Vec::new(),
+            },
             Default::default(),
             None,
             None,
@@ -3123,12 +3132,26 @@ async fn create_machine_to_end(
             .map_err(|error| ApiError::BadRequest(error.to_string()))?,
         None => req.network_backend,
     };
-    let restored_allowed_hosts = checkpoint_network
-        .and_then(|network| network.dns_filter_hosts.clone())
-        .or_else(|| req.allowed_hosts.clone());
+    let caller_overrides_egress = normalized_cidrs.is_some() || req.allowed_hosts.is_some();
+    let restored_allowed_hosts = if let Some(network) = checkpoint_network {
+        network.dns_filter_hosts.clone()
+    } else if caller_overrides_egress {
+        req.allowed_hosts.clone()
+    } else {
+        manifest_egress.dns_filter_hosts
+    };
     if let Some(network) = checkpoint_network {
         normalized_cidrs = network.allowed_cidrs.clone();
+    } else if !caller_overrides_egress {
+        normalized_cidrs = manifest_egress.allowed_cidrs;
     }
+    let restored_egress_rules = if let Some(network) = checkpoint_network {
+        network.egress_rules.clone()
+    } else if !req.egress_rules.is_empty() {
+        req.egress_rules.clone()
+    } else {
+        manifest_egress.egress_rules
+    };
 
     // Use explicit API resources when provided. Otherwise, preserve packed
     // artifact manifest defaults, or the high VM defaults for non-artifact
@@ -3164,7 +3187,7 @@ async fn create_machine_to_end(
     }
     crate::workload::validate_stop_settings(req.stop_signal.as_deref(), req.stop_timeout_secs)
         .map_err(ApiError::BadRequest)?;
-    // Reject invalid resources up front (as the CLI does at create time), so the
+    // Reject invalid resources up front (as the API does at create time), so the
     // API returns a clear 400 here instead of persisting an unbootable machine
     // that only fails with a deferred 500 when it is later started.
     crate::data::resources::VmResources {
@@ -3176,9 +3199,13 @@ async fn create_machine_to_end(
     }
     .validate()
     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let network = checkpoint_network
-        .map(|network| network.enabled)
-        .unwrap_or(req.network || manifest_net);
+    let network = checkpoint_network.map(|network| network.enabled).unwrap_or(
+        req.network
+            || manifest_net
+            || normalized_cidrs.is_some()
+            || restored_allowed_hosts.is_some()
+            || !restored_egress_rules.is_empty(),
+    );
 
     if manifest_checkpoint.is_some() {
         crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);
@@ -3199,10 +3226,7 @@ async fn create_machine_to_end(
         disk_durability: req.disk_durability,
         cache_disk: req.cache_disk.clone(),
         allowed_cidrs: normalized_cidrs,
-        egress_rules: checkpoint_network.map_or_else(
-            || req.egress_rules.clone(),
-            |network| network.egress_rules.clone(),
-        ),
+        egress_rules: restored_egress_rules,
         allowed_hosts: restored_allowed_hosts,
         // A restored checkpoint keeps the bindings its workload was captured
         // with unless the request names its own.

@@ -801,6 +801,22 @@ pub struct PackManifest {
     #[serde(default)]
     pub network: bool,
 
+    /// Outbound CIDR allow-list carried with the pack (`--allow-cidr` /
+    /// `--outbound-localhost-only` / resolved `--allow-host`). Absent means
+    /// no CIDR restriction (or unrestricted when `dns_filter_hosts` is also absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+
+    /// Hostnames and patterns permitted by the guest DNS filter (`--allow-host` /
+    /// `--allow-host-pattern`). Absent means no hostname filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_filter_hosts: Option<Vec<String>>,
+
+    /// Ordered outbound egress rules carried with the pack (`--deny-cidr` /
+    /// `--allow-udp`), deny rules first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
+
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
@@ -930,6 +946,9 @@ impl PackManifest {
             mem: 256,
             image_size: 0,
             network: false,
+            allowed_cidrs: None,
+            dns_filter_hosts: None,
+            egress_rules: Vec::new(),
             gpu: false,
             cuda: false,
             host_platform,
@@ -983,8 +1002,25 @@ mod tests {
             !json.contains("secret_refs"),
             "empty secret_refs must not be serialized"
         );
+        assert!(
+            !json.contains("allowed_cidrs")
+                && !json.contains("dns_filter_hosts")
+                && !json.contains("egress_rules"),
+            "absent egress fields must not be serialized"
+        );
 
         let mut m = empty;
+        m.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
+        m.dns_filter_hosts = Some(vec![
+            "pypi.org".to_string(),
+            "*.files.pythonhosted.org".to_string(),
+        ]);
+        m.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
         m.secret_refs.insert(
             "DB_PASSWORD".to_string(),
             smolvm_protocol::SecretRef {
@@ -999,6 +1035,9 @@ mod tests {
             restored.secret_refs["DB_PASSWORD"].from_env.as_deref(),
             Some("PGPASSWORD")
         );
+        assert_eq!(restored.allowed_cidrs, m.allowed_cidrs);
+        assert_eq!(restored.dns_filter_hosts, m.dns_filter_hosts);
+        assert_eq!(restored.egress_rules, m.egress_rules);
     }
 
     #[test]
