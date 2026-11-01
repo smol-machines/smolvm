@@ -107,4 +107,22 @@ sm machine exec --name "$NAME" -- true || fail "exec after second resume failed"
 [ "$(recorded_digest "$NAME")" = "$digest_b" ] || fail "second resume runs on $(recorded_digest "$NAME"), not B"
 pass "a second swap resumes on the pinned copy of B"
 
+echo "== a golden started on B stays branchable after the installed rootfs moves to C (a fleet roll)"
+ROOTFS_C="$WORK/rootfs-c"
+cp -a "$ROOTFS_B" "$ROOTFS_C"
+echo "rolled" > "$ROOTFS_C/etc/smolvm-rootfs-test-marker"
+sm machine stop --name "$NAME" >/dev/null
+sm machine start --name "$NAME" --branchable >/dev/null
+sm machine exec --name "$NAME" -- sh -c 'echo golden > /workspace/g'
+digest_g="$(recorded_digest "$NAME")"
+export SMOLVM_AGENT_ROOTFS="$ROOTFS_C"
+# a single --name branch waits for no branch point, which a bare machine never announces
+clone="$NAME-br"
+sm machine branch --from "$NAME" --name "$clone" >/dev/null
+out="$(sm machine exec --name "$clone" -- cat /workspace/g)" || fail "exec in branch failed (exit $?)"
+[ "$out" = "golden" ] || fail "branch exec returned '$out'"
+[ "$(recorded_digest "$clone")" = "$digest_g" ] || fail "branch runs on $(recorded_digest "$clone"), not its golden's $digest_g"
+pass "a branch taken after a roll boots its golden's rootfs and runs programs"
+sm machine delete --name "$clone" -f >/dev/null
+
 echo "all rootfs pin checks passed"

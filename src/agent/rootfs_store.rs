@@ -50,6 +50,23 @@ pub fn resolve(digest: &str) -> Result<PathBuf> {
     host().resolve_with(digest, &super::AgentManager::default_rootfs_path()?)
 }
 
+/// The rootfs a branch of a golden boots when the golden runs on `digest` and
+/// the installed rootfs differs: `booted`, the directory the golden's record
+/// says it booted from, checked against the digest (a fleet roll installs a
+/// new rootfs beside the old one and leaves running machines on theirs), else
+/// the store's copy. `None` when the host has neither.
+pub fn golden_rootfs(booted: Option<&Path>, digest: &str, store: &Store) -> Option<PathBuf> {
+    booted
+        .filter(|path| {
+            smolvm_pack::assets::cached_agent_rootfs_digest(path)
+                .ok()
+                .as_deref()
+                == Some(digest)
+        })
+        .map(Path::to_path_buf)
+        .or_else(|| store.installed(digest))
+}
+
 /// The hex part of a `sha256:<hex>` digest, refusing anything that could name
 /// a path outside the store.
 fn hex_of(digest: &str) -> Result<&str> {
@@ -349,6 +366,39 @@ mod tests {
         store.prune(&HashSet::from([digest.clone()]), None);
         assert!(store.installed(&digest).is_some());
         assert!(store.installed(&other_digest).is_none());
+    }
+
+    #[test]
+    fn a_branch_boots_the_directory_its_golden_booted_or_the_stores_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("store"));
+        // the old rootfs a roll left beside the new one, which the golden booted
+        let old = temp.path().join("agent-rootfs-old");
+        rootfs(&old, b"agent v1");
+        let digest = smolvm_pack::assets::agent_rootfs_digest(&old).unwrap();
+        assert_eq!(
+            golden_rootfs(Some(&old), &digest, &store),
+            Some(old.clone())
+        );
+
+        // the directory it booted was replaced in place: its digest no longer
+        // matches, and nothing else has the digest
+        std::fs::write(old.join("usr/local/bin/smolvm-agent"), b"agent v2").unwrap();
+        assert_eq!(golden_rootfs(Some(&old), &digest, &store), None);
+
+        // a copy in the store serves instead, with or without a recorded path
+        let source = temp.path().join("source");
+        rootfs(&source, b"agent v1");
+        let kept = store.install_from_dir(&digest, &source).unwrap();
+        assert_eq!(
+            golden_rootfs(Some(&old), &digest, &store),
+            Some(kept.clone())
+        );
+        assert_eq!(golden_rootfs(None, &digest, &store), Some(kept));
+        assert_eq!(
+            golden_rootfs(None, &format!("sha256:{}", "9".repeat(64)), &store),
+            None
+        );
     }
 
     #[test]

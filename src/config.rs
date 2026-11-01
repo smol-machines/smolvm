@@ -835,6 +835,12 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_rootfs_digest: Option<String>,
 
+    /// The directory that rootfs was booted from, so a branch of this machine's
+    /// live state can boot the same directory after the installed rootfs moved
+    /// on (a roll installs the new one beside the old).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_rootfs_path: Option<std::path::PathBuf>,
+
     /// Persistent container-overlay owner inherited from the root of a fork
     /// lineage. A clone's live overlay keeps its original on-disk name across
     /// every generation; descendants must continue addressing that root name.
@@ -1028,6 +1034,7 @@ impl VmRecord {
             golden: None,
             checkpoint_head: None,
             agent_rootfs_digest: None,
+            agent_rootfs_path: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
@@ -1130,6 +1137,7 @@ impl VmRecord {
             golden: None,
             checkpoint_head: None,
             agent_rootfs_digest: None,
+            agent_rootfs_path: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,

@@ -1205,6 +1205,9 @@ pub struct AgentManager {
     name: Option<String>,
     /// Path to the agent rootfs.
     rootfs_path: PathBuf,
+    /// A rootfs chosen at launch over `rootfs_path`: a branch boots its
+    /// golden's rootfs, which may not be the installed one after a roll.
+    rootfs_override: std::sync::Mutex<Option<PathBuf>>,
     /// Storage disk for OCI layers.
     storage_disk: StorageDisk,
     /// Overlay disk for persistent rootfs changes.
@@ -1375,6 +1378,7 @@ impl AgentManager {
         Ok(Self {
             name,
             rootfs_path,
+            rootfs_override: std::sync::Mutex::new(None),
             storage_disk,
             overlay_disk,
             vsock_socket,
@@ -1475,6 +1479,15 @@ impl AgentManager {
     /// refused. Launch paths use [`Self::for_vm_with_sizes`].
     pub fn for_vm(name: impl Into<String>) -> Result<Self> {
         Self::open(name, DiskAccess::Observe)
+    }
+
+    /// The agent rootfs this launch boots.
+    fn rootfs_path(&self) -> PathBuf {
+        self.rootfs_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.rootfs_path.clone())
     }
 
     /// Get the VM name if this is a named agent.
@@ -2363,7 +2376,7 @@ impl AgentManager {
 
     /// Host path of this VM's per-VM readiness marker.
     fn ready_marker_path(&self) -> PathBuf {
-        self.rootfs_path.join(self.ready_marker_name())
+        self.rootfs_path().join(self.ready_marker_name())
     }
 
     /// Common pre-launch setup: validate state, pre-format disks, clean markers.
@@ -2454,7 +2467,7 @@ impl AgentManager {
         }
 
         tracing::info!(
-            rootfs = %self.rootfs_path.display(),
+            rootfs = %self.rootfs_path().display(),
             storage = %self.storage_disk.path().display(),
             socket = %self.vsock_socket.display(),
             mount_count = mounts.len(),
@@ -2487,12 +2500,12 @@ impl AgentManager {
         }
 
         // Validate rootfs exists
-        if !self.rootfs_path.exists() {
+        if !self.rootfs_path().exists() {
             let mut inner = self.inner.lock();
             inner.state = AgentState::Stopped;
             return Err(Error::agent(
                 "verify rootfs",
-                format!("agent rootfs not found: {}", self.rootfs_path.display()),
+                format!("agent rootfs not found: {}", self.rootfs_path().display()),
             ));
         }
 
@@ -2708,30 +2721,52 @@ impl AgentManager {
             let db = crate::db::SmolvmDb::open()?;
             if let Some(record) = db.get_vm(name)? {
                 // The userland this boot runs on, for the checkpoints and pauses
-                // taken from it. A clone boots its golden's live snapshot, so it
-                // must run on the golden's rootfs: refuse a host whose rootfs
-                // moved on under a golden that is still running.
-                let rootfs_digest =
-                    smolvm_pack::assets::cached_agent_rootfs_digest(&self.rootfs_path)
+                // taken from it. A branch boots its golden's live snapshot, so
+                // it runs on the golden's rootfs: after a roll that installed a
+                // new rootfs beside the old one, that is the directory the golden
+                // booted, or the store's copy; a host with neither refuses.
+                let mut rootfs_digest =
+                    smolvm_pack::assets::cached_agent_rootfs_digest(&self.rootfs_path())
                         .map_err(|e| Error::agent("read agent rootfs", e.to_string()))?;
                 if let (Some(snapshot), Some(golden)) = (&features.snapshot_dir, &record.golden) {
                     if crate::portable_checkpoint::pending_dir(&vm_data_dir(name)).as_deref()
                         != Some(snapshot.as_path())
                     {
-                        let golden_digest = db.get_vm(golden)?.and_then(|g| g.agent_rootfs_digest);
+                        let golden_record = db.get_vm(golden)?;
+                        let golden_digest = golden_record
+                            .as_ref()
+                            .and_then(|g| g.agent_rootfs_digest.clone());
                         if let Some(golden_digest) = golden_digest.filter(|d| *d != rootfs_digest) {
-                            return Err(Error::agent(
-                                "branch machine",
-                                format!(
-                                    "golden '{golden}' runs on agent rootfs {golden_digest} and this host's installed rootfs is {rootfs_digest}; a branch of its live state must boot the same rootfs, so restart the golden before branching it"
-                                ),
-                            ));
+                            let Some(path) = crate::agent::rootfs_store::golden_rootfs(
+                                golden_record
+                                    .as_ref()
+                                    .and_then(|g| g.agent_rootfs_path.as_deref()),
+                                &golden_digest,
+                                &crate::agent::rootfs_store::host(),
+                            ) else {
+                                return Err(Error::agent(
+                                    "branch machine",
+                                    format!(
+                                        "golden '{golden}' runs on agent rootfs {golden_digest}, which this host no longer has (its installed rootfs is {rootfs_digest}); a branch of its live state must boot the same rootfs, so restart the golden before branching it"
+                                    ),
+                                ));
+                            };
+                            tracing::info!(machine = name, golden, digest = %golden_digest, rootfs = %path.display(), "branch boots its golden's agent rootfs");
+                            *self
+                                .rootfs_override
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(path);
+                            rootfs_digest = golden_digest;
                         }
                     }
                 }
-                if record.agent_rootfs_digest.as_deref() != Some(rootfs_digest.as_str()) {
+                let rootfs_path = self.rootfs_path();
+                if record.agent_rootfs_digest.as_deref() != Some(rootfs_digest.as_str())
+                    || record.agent_rootfs_path.as_deref() != Some(rootfs_path.as_path())
+                {
                     db.update_vm(name, |r| {
-                        r.agent_rootfs_digest = Some(rootfs_digest.clone())
+                        r.agent_rootfs_digest = Some(rootfs_digest.clone());
+                        r.agent_rootfs_path = Some(rootfs_path.clone());
                     })?;
                 }
                 if record.mediated_egress_required {
@@ -3047,7 +3082,7 @@ impl AgentManager {
                 if let Some(parent) = d.parent() {
                     crate::process::ensure_traversable(parent);
                 }
-                crate::process::ensure_traversable(&self.rootfs_path);
+                crate::process::ensure_traversable(&self.rootfs_path());
                 if let Some(home) = dirs::home_dir() {
                     crate::process::ensure_traversable(&home.join(".smolvm"));
                 }
@@ -3128,7 +3163,7 @@ impl AgentManager {
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
-            rootfs_path: self.rootfs_path.clone(),
+            rootfs_path: self.rootfs_path(),
             storage_disk_path: self.storage_disk.path().to_path_buf(),
             overlay_disk_path: self.overlay_disk.path().to_path_buf(),
             vsock_socket: self.vsock_socket.clone(),
