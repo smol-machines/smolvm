@@ -92,9 +92,13 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 `exec` and `stop` act on. `machine exec` changes persist in an overlay on the
 machine's storage disk, bare or image-based, across exec sessions and a stop and
 start. `pack run` starts fresh each time, while `pack start` + `exec` and
-`machine create --from .smolmachine` persist. `/tmp`, `/run` and `/dev/shm` are
-tmpfs and empty after a restart, so write what must survive to `/workspace`.
-Every mode, `--stop-on-exit` and the tmpfs details: `docs/dev-env/README.md`.
+`machine create --from .smolmachine` persist. `/run` and `/dev/shm` are tmpfs;
+`/tmp` is a directory on the machine's root filesystem, so it holds as much as the
+disk does and a `rename(2)` from it into `/root`, `/home` or `/opt` works as on a
+GitHub-hosted runner, while `/workspace` is its own mount and a rename into it
+returns EXDEV (`mv` copies instead). All three are empty after a restart and
+never enter a pack or export, so write what must survive to `/workspace`.
+Every mode, `--stop-on-exit` and the details: `docs/dev-env/README.md`.
 
 ## CLI Structure
 
