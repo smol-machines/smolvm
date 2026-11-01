@@ -55,7 +55,9 @@ RUN cargo test --locked --workspace --no-run
 
 # Run the unit tests CI runs on Linux as a smoke check. tini reaps the orphans the
 # process-cleanup tests leave, as an init would. smolvm-network's real-socket suite is
-# skipped as it is in CI. Failures do not abort the build.
+# skipped as it is in CI. Failures do not abort the build. The tests leave sparse machine
+# disks (hundreds of GiB apparent) under ~/.cache/smolvm, which an image layer would store
+# expanded, so the state they wrote is removed in the same step.
 RUN tini -s -- bash -c ' \
       (timeout 1800 cargo test --locked --offline --lib \
           -p smolvm -p smolvm-pack -p smolvm-registry -p smolvm-protocol \
@@ -64,7 +66,9 @@ RUN tini -s -- bash -c ' \
       && (timeout 900 cargo test --locked --offline -p smolvm-agent --bins \
         || echo "WARNING: smolvm-agent unit tests reported failures") \
       && (timeout 900 cargo test --locked --offline -p smolvm-shim \
-        || echo "WARNING: smolvm-shim unit tests reported failures")'
+        || echo "WARNING: smolvm-shim unit tests reported failures")' \
+    && rm -rf "$HOME"/.cache/smolvm* "$HOME"/.local/share/smolvm* "$HOME"/.config/smolvm* \
+    && find /tmp -mindepth 1 -user scanner -delete
 
 # Back to root for the scanner's own layer; /tmp is emptied so its runs do not meet
 # files another user left there.
