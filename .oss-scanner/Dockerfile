@@ -15,11 +15,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       musl-tools e2fsprogs file python3 curl tini \
     && rm -rf /var/lib/apt/lists/*
 
-# rust-toolchain.toml asks for stable with rustfmt and clippy; install them while the
-# network is still available so no later cargo call tries to.
-RUN rustup component add rustfmt clippy \
-    && rustup target add "$(uname -m)-unknown-linux-musl"
-
 # The build and the tests run as the unprivileged user CI runs them as: a root run takes
 # the service's shared-base checkpoint layout and one install test asserts the per-user
 # one (see threat_model.md). The checkout is copied already owned by that user, so no
@@ -29,6 +24,13 @@ RUN useradd --create-home --shell /bin/bash scanner
 # Scanner contract: the checkout lives inside the image, at /src.
 COPY --chown=scanner:scanner . /src
 WORKDIR /src
+
+# rust-toolchain.toml selects the stable toolchain, which is not the one the base image
+# ships, so install it with rustfmt, clippy and the musl target from inside the checkout
+# while the network is still available, and no later cargo call has to.
+RUN rustup show active-toolchain \
+    && rustup component add rustfmt clippy \
+    && rustup target add "$(uname -m)-unknown-linux-musl"
 
 # Where the prebuilt libkrun and libkrunfw for this architecture live, for anything that
 # needs to dlopen them (a few host-side tests create qcow2 overlays through libkrun).
