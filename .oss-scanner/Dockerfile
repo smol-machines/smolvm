@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Build image for Anthropic's OSS Scanner (https://github.com/anthropics/oss-scanner).
 # It sets smolvm up the way the Linux CI job does: the whole workspace compiles on a
 # glibc host, the guest agent additionally builds as a static musl binary, and the
