@@ -88,6 +88,28 @@ pub struct EmbeddedRuntime {
     inflight: super::inflight::Inflight,
 }
 
+/// Everything a fork can vary. [`Default`] is a plain copy-on-write child:
+/// not a checkpoint source, no CUDA weight sharing, cached in this runtime and
+/// gone with this process, a fresh identity, and a source that resumes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForkOptions {
+    /// Make the clone a checkpoint source in turn (one eager guest-memory copy
+    /// at clone boot).
+    pub checkpointable: bool,
+    /// Share the golden's loaded CUDA weights with the clone instead of copying
+    /// them. Only correct while the base weights stay frozen.
+    pub share_weights: bool,
+    /// Let the clone outlive this process instead of caching its handle here.
+    pub detached: bool,
+    /// Keep the golden's `/etc/machine-id` (and dbus id) in the clone. Hostname
+    /// and SSH host keys are still re-minted. For same-tenant fan-out whose
+    /// tools key a per-machine cache by machine id (Nx names its cache
+    /// database after it), so a warm golden's cache stays visible in the clone.
+    pub keep_machine_id: bool,
+    /// Whether `golden` resumes afterwards or stays paused as a branch base.
+    pub source_policy: ForkSourcePolicy,
+}
+
 impl EmbeddedRuntime {
     /// Create a runtime backed by the default smolvm database.
     pub fn new() -> Result<Self> {
@@ -667,13 +689,7 @@ impl EmbeddedRuntime {
     /// remaps the golden's forwards to fresh host ports. Supported hosts resume
     /// the source after publishing a consistent fork generation.
     pub fn fork_machine(&self, golden: &str, clone: &str, ports: &[(u16, u16)]) -> Result<()> {
-        self.fork_machine_with(
-            golden,
-            clone,
-            ports,
-            false,
-            ForkSourcePolicy::PlatformDefault,
-        )
+        self.fork_machine_opts(golden, clone, ports, ForkOptions::default())
     }
 
     /// Fork a machine, choosing whether the clone becomes a checkpoint source
@@ -687,18 +703,46 @@ impl EmbeddedRuntime {
         checkpointable: bool,
         source_policy: ForkSourcePolicy,
     ) -> Result<()> {
+        self.fork_machine_opts(
+            golden,
+            clone,
+            ports,
+            ForkOptions {
+                checkpointable,
+                source_policy,
+                ..ForkOptions::default()
+            },
+        )
+    }
+
+    /// Fork one clone with every option a front-end can vary. A detached clone
+    /// outlives this process instead of being cached in the runtime; all
+    /// preparation, retained snapshot reuse and fail-closed identity
+    /// rejuvenation are shared with the attached path.
+    pub fn fork_machine_opts(
+        &self,
+        golden: &str,
+        clone: &str,
+        ports: &[(u16, u16)],
+        options: ForkOptions,
+    ) -> Result<()> {
         self.with_name_locks(&[golden, clone], || {
             let handle = control::fork_vm_with_options(
                 &self.db,
                 golden,
                 clone,
                 ports,
-                checkpointable,
-                false,
-                None,
-                source_policy,
+                options.checkpointable,
+                options.share_weights,
+                if options.detached { Some(false) } else { None },
+                options.source_policy,
+                options.keep_machine_id,
             )?;
-            self.insert_handle(clone, handle)?;
+            if options.detached {
+                handle.detach();
+            } else {
+                self.insert_handle(clone, handle)?;
+            }
             Ok(())
         })
     }
@@ -731,13 +775,7 @@ impl EmbeddedRuntime {
         ports: &[(u16, u16)],
         parallel: usize,
     ) -> Result<()> {
-        self.fork_machines_with(
-            golden,
-            clones,
-            ports,
-            parallel,
-            ForkSourcePolicy::PlatformDefault,
-        )
+        self.fork_machines_opts(golden, clones, ports, parallel, ForkOptions::default())
     }
 
     /// [`Self::fork_machines`], choosing whether `golden` resumes afterwards
@@ -750,6 +788,30 @@ impl EmbeddedRuntime {
         parallel: usize,
         source_policy: ForkSourcePolicy,
     ) -> Result<()> {
+        self.fork_machines_opts(
+            golden,
+            clones,
+            ports,
+            parallel,
+            ForkOptions {
+                source_policy,
+                ..ForkOptions::default()
+            },
+        )
+    }
+
+    /// [`Self::fork_machines`] with every option. The group is prepared
+    /// transactionally from one generation. Batch children are plain leaves:
+    /// `checkpointable` and `share_weights` do not apply to them. Detached
+    /// children outlive this process instead of being cached in the runtime.
+    pub fn fork_machines_opts(
+        &self,
+        golden: &str,
+        clones: &[String],
+        ports: &[(u16, u16)],
+        parallel: usize,
+        options: ForkOptions,
+    ) -> Result<()> {
         let mut lock_names = Vec::with_capacity(clones.len() + 1);
         lock_names.push(golden);
         lock_names.extend(clones.iter().map(String::as_str));
@@ -758,8 +820,20 @@ impl EmbeddedRuntime {
                 .iter()
                 .map(|name| (name.clone(), ports.to_vec()))
                 .collect();
-            let mut started =
-                control::fork_vm_batch(&self.db, golden, &requests, parallel, source_policy)?;
+            let mut started = control::fork_vm_batch(
+                &self.db,
+                golden,
+                &requests,
+                parallel,
+                options.source_policy,
+                options.keep_machine_id,
+            )?;
+            if options.detached {
+                for (_, handle) in started {
+                    handle.detach();
+                }
+                return Ok(());
+            }
             let mut registry = match self.registry.write() {
                 Ok(registry) => registry,
                 Err(error) => {
@@ -787,25 +861,16 @@ impl EmbeddedRuntime {
         ports: &[(u16, u16)],
         parallel: usize,
     ) -> Result<()> {
-        let mut lock_names = Vec::with_capacity(clones.len() + 1);
-        lock_names.push(golden);
-        lock_names.extend(clones.iter().map(String::as_str));
-        self.with_name_locks(&lock_names, || {
-            let requests: Vec<_> = clones
-                .iter()
-                .map(|name| (name.clone(), ports.to_vec()))
-                .collect();
-            for (_, handle) in control::fork_vm_batch(
-                &self.db,
-                golden,
-                &requests,
-                parallel,
-                ForkSourcePolicy::PlatformDefault,
-            )? {
-                handle.detach();
-            }
-            Ok(())
-        })
+        self.fork_machines_opts(
+            golden,
+            clones,
+            ports,
+            parallel,
+            ForkOptions {
+                detached: true,
+                ..ForkOptions::default()
+            },
+        )
     }
 
     /// Fork a machine for a detached CLI operation. Unlike the SDK path, the
@@ -818,20 +883,16 @@ impl EmbeddedRuntime {
         ports: &[(u16, u16)],
         share_weights: bool,
     ) -> Result<()> {
-        self.with_name_locks(&[golden, clone], || {
-            let handle = control::fork_vm_with_options(
-                &self.db,
-                golden,
-                clone,
-                ports,
-                false,
+        self.fork_machine_opts(
+            golden,
+            clone,
+            ports,
+            ForkOptions {
                 share_weights,
-                Some(false),
-                ForkSourcePolicy::PlatformDefault,
-            )?;
-            handle.detach();
-            Ok(())
-        })
+                detached: true,
+                ..ForkOptions::default()
+            },
+        )
     }
 
     /// Fork a checkpointable child for a detached CLI operation. The child
@@ -842,20 +903,16 @@ impl EmbeddedRuntime {
         clone: &str,
         ports: &[(u16, u16)],
     ) -> Result<()> {
-        self.with_name_locks(&[source, clone], || {
-            let handle = control::fork_vm_with_options(
-                &self.db,
-                source,
-                clone,
-                ports,
-                true,
-                false,
-                Some(false),
-                ForkSourcePolicy::PlatformDefault,
-            )?;
-            handle.detach();
-            Ok(())
-        })
+        self.fork_machine_opts(
+            source,
+            clone,
+            ports,
+            ForkOptions {
+                checkpointable: true,
+                detached: true,
+                ..ForkOptions::default()
+            },
+        )
     }
 
     /// Connect to an already-running machine and cache its handle.

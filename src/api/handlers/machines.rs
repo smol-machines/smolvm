@@ -4875,6 +4875,7 @@ async fn prepare_and_boot_branches(
                     prep,
                     PreparedForkBoot {
                         share_weights: queued.req.share_weights,
+                        keep_machine_id: queued.req.keep_machine_id,
                         fork_env,
                         wait_ready,
                         hold: false,
@@ -4985,6 +4986,7 @@ async fn fork_machine_transaction(
     let clone = req.name.clone();
     let pinned_ports = branch_pins(&req.ports)?;
     let req_share_weights = req.share_weights;
+    let req_keep_machine_id = req.keep_machine_id;
     let req_forkable = req.forkable;
     let req_hold = req.hold;
     let source_policy = if req.freeze_source {
@@ -5128,6 +5130,7 @@ async fn fork_machine_transaction(
         prep,
         PreparedForkBoot {
             share_weights: req_share_weights,
+            keep_machine_id: req_keep_machine_id,
             fork_env,
             wait_ready,
             hold: req_hold,
@@ -5253,6 +5256,7 @@ pub(crate) async fn fork_held_machines_inner(
                         prep,
                         PreparedForkBoot {
                             share_weights,
+                            keep_machine_id: false,
                             fork_env: Vec::new(),
                             wait_ready: true,
                             hold: true,
@@ -5317,6 +5321,8 @@ where
 
 struct PreparedForkBoot {
     share_weights: bool,
+    /// Leave the source's machine-id in the clone (same-tenant cache affinity).
+    keep_machine_id: bool,
     fork_env: Vec<(String, String)>,
     wait_ready: bool,
     hold: bool,
@@ -5374,6 +5380,7 @@ async fn boot_prepared_fork_inner(
     };
     let PreparedForkBoot {
         share_weights,
+        keep_machine_id,
         fork_env,
         wait_ready,
         hold,
@@ -5440,7 +5447,7 @@ async fn boot_prepared_fork_inner(
             let _ = db.remove_vm(&clone_b);
         };
         crate::agent::fork::fail_closed_on_rejuvenation(
-            crate::agent::fork::rejuvenate_clone(&clone_b, &record),
+            crate::agent::fork::rejuvenate_clone_with(&clone_b, &record, keep_machine_id),
             teardown,
         )
         .map_err(|e| {

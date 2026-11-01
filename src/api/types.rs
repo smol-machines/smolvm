@@ -1458,6 +1458,13 @@ pub struct ForkRequest {
     /// Keep the source paused as a reusable branch base.
     #[serde(default)]
     pub freeze_source: bool,
+    /// Keep the source's `/etc/machine-id` (and dbus id) in the clone instead
+    /// of minting a fresh one. Hostname, SSH host keys and cloud-init state are
+    /// still re-minted. For same-tenant fan-out whose tools key a per-machine
+    /// cache by machine id (Nx names its cache database after it), so a warm
+    /// source's cache stays visible in every clone.
+    #[serde(default)]
+    pub keep_machine_id: bool,
     /// Maximum seconds to wait for the golden workload's forkpoint. Defaults
     /// to 240 when `waitReady` or `hold` is enabled.
     #[serde(default)]

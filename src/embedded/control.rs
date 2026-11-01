@@ -469,6 +469,7 @@ pub(crate) fn fork_vm_with_options(
     share_weights: bool,
     watch_parent: Option<bool>,
     source_policy: crate::agent::fork::ForkSourcePolicy,
+    keep_machine_id: bool,
 ) -> Result<VmHandle> {
     let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
     if get_record(db, golden)?.mediated_egress_required {
@@ -490,7 +491,15 @@ pub(crate) fn fork_vm_with_options(
         source_policy,
     )?;
 
-    boot_prepared_fork(db, clone, prep, share_weights, watch_parent, None)
+    boot_prepared_fork(
+        db,
+        clone,
+        prep,
+        share_weights,
+        watch_parent,
+        None,
+        keep_machine_id,
+    )
 }
 
 fn boot_prepared_fork(
@@ -500,6 +509,7 @@ fn boot_prepared_fork(
     share_weights: bool,
     watch_parent: Option<bool>,
     retry_gate: Option<&std::sync::Mutex<()>>,
+    keep_machine_id: bool,
 ) -> Result<VmHandle> {
     // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
     let features = LaunchFeatures {
@@ -523,7 +533,11 @@ fn boot_prepared_fork(
             // FAIL-CLOSED: if the reset can't be confirmed, stop the booted clone
             // and roll it back rather than leave it live with the golden's
             // per-machine secrets.
-            if let Err(error) = crate::agent::fork::rejuvenate_clone(clone, &prep.clone_record) {
+            if let Err(error) = crate::agent::fork::rejuvenate_clone_with(
+                clone,
+                &prep.clone_record,
+                keep_machine_id,
+            ) {
                 let _ = handle.stop();
                 return Err(error);
             }
@@ -589,6 +603,7 @@ pub fn fork_vm_batch(
     clones: &[(String, Vec<(u16, u16)>)],
     parallel: usize,
     source_policy: crate::agent::fork::ForkSourcePolicy,
+    keep_machine_id: bool,
 ) -> Result<Vec<(String, VmHandle)>> {
     if clones.is_empty() {
         return Err(Error::config(
@@ -655,7 +670,15 @@ pub fn fork_vm_batch(
                         };
                         let clone = prep.clone_record.name.clone();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            boot_prepared_fork(&db, &clone, prep, false, None, Some(retry_gate))
+                            boot_prepared_fork(
+                                &db,
+                                &clone,
+                                prep,
+                                false,
+                                None,
+                                Some(retry_gate),
+                                keep_machine_id,
+                            )
                         }))
                         .unwrap_or_else(|_| {
                             Err(Error::agent(
@@ -1333,18 +1356,20 @@ mod tests {
     #[test]
     fn embedded_batch_fork_rejects_empty_and_duplicate_groups_before_boot() {
         let db = test_db();
-        assert!(fork_vm_batch(&db, "missing", &[], 4, Default::default())
-            .err()
-            .expect("empty batch must fail")
-            .to_string()
-            .contains("at least one clone"));
+        assert!(
+            fork_vm_batch(&db, "missing", &[], 4, Default::default(), false)
+                .err()
+                .expect("empty batch must fail")
+                .to_string()
+                .contains("at least one clone")
+        );
 
         let clones = vec![
             ("duplicate".to_string(), Vec::new()),
             ("duplicate".to_string(), Vec::new()),
         ];
         assert!(
-            fork_vm_batch(&db, "missing", &clones, 4, Default::default())
+            fork_vm_batch(&db, "missing", &clones, 4, Default::default(), false)
                 .err()
                 .expect("duplicate batch must fail")
                 .to_string()

@@ -3540,6 +3540,7 @@ fn build_rejuvenation_script(
     seed: &str,
     host_epoch: u64,
     record: &VmRecord,
+    keep_machine_id: bool,
 ) -> String {
     // An image machine's identity files live in the workload container's
     // rootfs, NOT the VM rootfs the agent execs in — writing them unprefixed
@@ -3679,6 +3680,20 @@ fn build_rejuvenation_script(
         "echo 'rejuvenate-stage=clock-skipped' >&2".to_string()
     };
     let hosts_block = rejuvenation_hosts_script(&root, clone);
+    // `keep_machine_id` is the one opt-out of the fail-hard identity set: a
+    // same-tenant fan-out may keep the source's machine-id so per-machine caches
+    // keyed by it (Nx names its cache database after it) survive the fork. SSH
+    // host keys and the hostname are never kept.
+    let machine_id_block = if keep_machine_id {
+        "echo 'rejuvenate-stage=machine-id-kept' >&2; ".to_string()
+    } else {
+        format!(
+            "printf '%s\\n' \"$MID\" > {root}/etc/machine-id; \
+             if [ -f {root}/var/lib/dbus/machine-id ] && [ ! -L {root}/var/lib/dbus/machine-id ]; then \
+                 printf '%s\\n' \"$MID\" > {root}/var/lib/dbus/machine-id; \
+             fi; "
+        )
+    };
     format!(
         "set -e; \
          echo 'rejuvenate-stage=overlay' >&2; \
@@ -3694,10 +3709,7 @@ fn build_rejuvenation_script(
          MID=$(printf '%.32s' '{s}'); \
          printf '%s\\n' '{c}' > {root}/etc/hostname; \
          {hosts_block}; \
-         printf '%s\\n' \"$MID\" > {root}/etc/machine-id; \
-         if [ -f {root}/var/lib/dbus/machine-id ] && [ ! -L {root}/var/lib/dbus/machine-id ]; then \
-             printf '%s\\n' \"$MID\" > {root}/var/lib/dbus/machine-id; \
-         fi; \
+         {machine_id_block}\
          {ssh_block}; \
          rm -rf {root}/var/lib/cloud/instance {root}/var/lib/cloud/instances/* {root}/var/lib/cloud/data/instance-id 2>/dev/null || true; \
          umask 077; \
@@ -3708,6 +3720,7 @@ fn build_rejuvenation_script(
         s = seed,
         clock_block = clock_block,
         hosts_block = hosts_block,
+        machine_id_block = machine_id_block,
         runtime_hostname = runtime_hostname,
         restored_container = restored_container,
         state_dir = smolvm_protocol::forkpoint::STATE_DIR,
@@ -3768,12 +3781,20 @@ fn clock_reset_failed(stderr: &[u8]) -> bool {
 /// (no `RNDADDENTROPY`/VMGENID yet) and does not re-address the network
 /// (MAC/IP; safe under the default TSI backend) — both are follow-ups.
 pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
+    rejuvenate_clone_with(clone, record, false)
+}
+
+/// [`rejuvenate_clone`] with the machine-id opt-out: `keep_machine_id` leaves
+/// `/etc/machine-id` (and the dbus copy) as the source's. Everything else
+/// (hostname, SSH host keys, cloud-init state, clock, RNG) is still re-minted
+/// and still fail-closed. Only for clones that stay within the source's tenant.
+pub fn rejuvenate_clone_with(clone: &str, record: &VmRecord, keep_machine_id: bool) -> Result<()> {
     let sock = vm_data_dir(clone).join("agent.sock");
     let seed = host_random_hex(64)?;
 
     let mut last_err = String::from("unknown error");
     for attempt in 1..=REJUVENATE_ATTEMPTS {
-        match rejuvenate_once(&sock, clone, &seed, record) {
+        match rejuvenate_once(&sock, clone, &seed, record, keep_machine_id) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(
@@ -3844,6 +3865,7 @@ fn rejuvenate_once(
     clone: &str,
     seed: &str,
     record: &VmRecord,
+    keep_machine_id: bool,
 ) -> std::result::Result<(), String> {
     let mut client =
         AgentClient::connect_with_retry(sock).map_err(|e| format!("agent connect: {e}"))?;
@@ -3851,7 +3873,13 @@ fn rejuvenate_once(
     // keeps the Linux/KVM correction within the exec round-trip of host time
     // instead of reusing an epoch made stale by retries. Other hosts pass zero:
     // their libkrun time-sync pusher already owns CLOCK_REALTIME correction.
-    let script = build_rejuvenation_script(clone, seed, rejuvenation_host_epoch(), record);
+    let script = build_rejuvenation_script(
+        clone,
+        seed,
+        rejuvenation_host_epoch(),
+        record,
+        keep_machine_id,
+    );
     match client.vm_exec(
         rejuvenation_command(script),
         vec![],
@@ -5645,7 +5673,7 @@ mod tests {
     #[test]
     fn rejuvenation_runs_a_plain_shell_that_leaves_no_orphan() {
         let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record());
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record(), false);
         let command = rejuvenation_command(script.clone());
 
         // Anything that outlives the script is reparented to init.krun, and
@@ -5659,9 +5687,41 @@ mod tests {
     }
 
     #[test]
+    fn rejuvenation_script_keeps_machine_id_only_when_asked() {
+        let kept = build_rejuvenation_script(
+            "clone-a",
+            "deadbeef",
+            1_700_000_000,
+            &bare_vm_record(),
+            true,
+        );
+        assert!(
+            !kept.contains("/etc/machine-id") && !kept.contains("/var/lib/dbus/machine-id"),
+            "keep_machine_id must leave both machine-id files untouched: {kept}"
+        );
+        assert!(kept.contains("rejuvenate-stage=machine-id-kept"));
+        // Everything else is still re-minted: hostname, SSH host keys, cloud-init.
+        assert!(kept.contains("> /etc/hostname"));
+        assert!(kept.contains(r#""$KG" -A"#));
+        assert!(kept.contains("/var/lib/cloud/instance"));
+
+        let image =
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record(), true);
+        assert!(
+            !image.contains("machine-id;"),
+            "image clones keep it too: {image}"
+        );
+    }
+
+    #[test]
     fn rejuvenation_script_regenerates_per_machine_secrets() {
-        let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
+        let script = build_rejuvenation_script(
+            "clone-a",
+            "deadbeef",
+            1_700_000_000,
+            &bare_vm_record(),
+            false,
+        );
 
         // SSH host keys: delete the golden's, then regenerate fresh ones.
         assert!(
@@ -5709,7 +5769,7 @@ mod tests {
     #[test]
     fn rejuvenation_script_leaves_the_inherited_overlay_alone() {
         let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record());
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record(), false);
         // Writing files THROUGH the merged mount is how the workload's rootfs is
         // reached (same as `write_fork_env`); what breaks a live overlayfs is
         // renaming or removing its backing dirs.
@@ -5784,7 +5844,7 @@ mod tests {
     #[test]
     fn image_clones_rejuvenate_identity_inside_the_workload_rootfs() {
         let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record());
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record(), false);
         let merged = "/storage/overlays/persistent-clone-a/merged";
         assert!(
             script.contains(&format!("{merged}/etc/hostname")),
@@ -5827,8 +5887,13 @@ mod tests {
     // A bare VM has no workload container, so paths stay VM-rootfs relative.
     #[test]
     fn bare_vm_clones_keep_plain_vm_paths() {
-        let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
+        let script = build_rejuvenation_script(
+            "clone-a",
+            "deadbeef",
+            1_700_000_000,
+            &bare_vm_record(),
+            false,
+        );
         assert!(script.contains("> /etc/hostname"));
         assert!(!script.contains("/storage/overlays"));
         assert!(script.contains(r#""$KG" -A"#));
@@ -5844,8 +5909,13 @@ mod tests {
     // `notBefore` validation break inside every clone.
     #[test]
     fn rejuvenation_script_restamps_the_wall_clock() {
-        let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
+        let script = build_rejuvenation_script(
+            "clone-a",
+            "deadbeef",
+            1_700_000_000,
+            &bare_vm_record(),
+            false,
+        );
         assert!(
             script.contains("date -u -s @1700000000"),
             "script must re-stamp the wall clock from the host epoch: {script}"
@@ -5866,7 +5936,7 @@ mod tests {
         );
         // A zero / unavailable host epoch skips rather than setting the guest to
         // 1970 (which would be worse than a stale-but-plausible inherited clock).
-        let skip = build_rejuvenation_script("clone-a", "deadbeef", 0, &bare_vm_record());
+        let skip = build_rejuvenation_script("clone-a", "deadbeef", 0, &bare_vm_record(), false);
         assert!(skip.contains("rejuvenate-stage=clock-skipped"));
         assert!(!skip.contains("date -u -s @"));
     }

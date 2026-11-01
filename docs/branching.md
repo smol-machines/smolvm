@@ -19,6 +19,13 @@ source cannot run `machine exec` while frozen. The flag works with both single
 and batch branches. The HTTP branch request and automatic pool creation request
 accept `"freezeSource": true`; a pool retains this setting for refills.
 
+Every branch gets a fresh hostname, machine-id and SSH host keys. Build tools
+that key a per-machine cache by `/etc/machine-id` (Nx names its cache database
+after it) therefore see an empty cache in each child. For a fan-out that stays
+within one tenant, the HTTP branch request accepts `"keepMachineId": true` to
+leave the source's machine-id in the child; hostname and SSH host keys are still
+re-minted.
+
 ```bash
 smolvm machine branch --from source --name child --freeze-source
 smolvm machine branch --from source --name child-2  # reuses the frozen checkpoint
