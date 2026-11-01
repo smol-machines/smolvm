@@ -823,16 +823,18 @@ impl OciSpec {
 
     /// Write the OCI spec to a config.json file in the bundle directory.
     ///
-    /// When the bundle sits in an overlay (an [`OVERLAY_UPPER_DIR`] beside it),
-    /// the written spec leaves /tmp to the root filesystem (see
-    /// [`Self::tmp_on_root`]).
+    /// When the bundle sits in an overlay (an [`OVERLAY_UPPER_DIR`] beside it)
+    /// whose boot prepared the upper layer's /tmp (no [`TMP_KEEP_TMPFS_MARKER`]
+    /// beside it), the written spec leaves /tmp to the root filesystem (see
+    /// [`Self::tmp_on_root`]); otherwise the tmpfs stays.
     pub fn write_to(&self, bundle_dir: &Path) -> std::io::Result<()> {
         let config_path = bundle_dir.join("config.json");
-        let in_overlay = bundle_dir
-            .parent()
-            .is_some_and(|overlay| overlay.join(OVERLAY_UPPER_DIR).is_dir());
+        let tmp_on_root = bundle_dir.parent().is_some_and(|overlay| {
+            overlay.join(OVERLAY_UPPER_DIR).is_dir()
+                && !overlay.join(TMP_KEEP_TMPFS_MARKER).exists()
+        });
         let mut spec = std::borrow::Cow::Borrowed(self);
-        if in_overlay {
+        if tmp_on_root {
             spec.to_mut().tmp_on_root();
         }
         let json = serde_json::to_string_pretty(&*spec)
@@ -1275,6 +1277,12 @@ fn tun_device_mount(guest_node: &Path) -> Option<OciMount> {
 
 /// The upper layer beside an overlay's `bundle`: a bundle with one is an overlay workload's.
 pub const OVERLAY_UPPER_DIR: &str = "upper";
+
+/// A file beside the upper layer that a boot leaves when the upper layer's
+/// /tmp could not be prepared (cleared, created, made opaque): the bundle then
+/// keeps its tmpfs /tmp rather than show the image's /tmp or an earlier boot's
+/// files. See `storage::reset_workload_tmp`.
+pub const TMP_KEEP_TMPFS_MARKER: &str = "tmp-keep-tmpfs";
 
 /// The workload's /dev/shm size: the machine's `--shm-size`, else half the
 /// guest's RAM, as on a Linux VM or a hosted CI runner rather than Docker's
@@ -2069,6 +2077,12 @@ mod tests {
         assert!(mounts.iter().any(|m| m["destination"] == "/tmp/cache"));
         assert_eq!(
             tmp_mount(&written(overlay.path(), true)).unwrap()["type"],
+            "tmpfs"
+        );
+        // a boot that could not prepare the upper layer's /tmp keeps the tmpfs
+        std::fs::write(overlay.path().join(TMP_KEEP_TMPFS_MARKER), b"").unwrap();
+        assert_eq!(
+            tmp_mount(&written(overlay.path(), false)).unwrap()["type"],
             "tmpfs"
         );
     }

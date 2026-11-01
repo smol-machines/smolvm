@@ -259,7 +259,53 @@ test_packed_volume_targets_resolve_inside_guest() {
     return $rc
 }
 
+# The workload's /tmp is a directory on its root filesystem, emptied at each
+# boot and left out of every export, so a secret parked in /tmp never travels
+# with a pack made from the machine while a file renamed out of /tmp into
+# /root does. This is the one persistence rule a mount boundary no longer
+# enforces (see storage::reset_workload_tmp and FLATTEN_TAR_EXCLUDES).
+test_pack_from_vm_leaves_tmp_behind() {
+    local vm_name="tmp-pack-$$"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/tmp-pack"
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest --cpus 1 --mem 512 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine exec --name "$vm_name" -- sh -c '
+        echo TMPSECRET > /tmp/secret.txt && mkdir -p /tmp/sub && echo deep > /tmp/sub/d.txt
+        echo keep > /root/keep.txt
+        echo moved > /tmp/moved.txt && mv /tmp/moved.txt /root/moved.txt
+        grep -q " /tmp " /proc/self/mounts && { echo "FAIL: /tmp is a separate mount"; exit 1; }
+        true' 2>&1 || { echo "FAIL: setup in guest"; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+    # a restart empties /tmp and keeps /root
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
+    local after
+    after=$($SMOLVM machine exec --name "$vm_name" -- sh -c 'echo "tmp=$(ls -A /tmp | wc -l) root=$(cat /root/keep.txt /root/moved.txt | tr "\n" ,)"')
+    [[ "$after" == "tmp=0 root=keep,moved," ]] || {
+        echo "FAIL: after restart: $after"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo TMPSECRET > /tmp/secret.txt' 2>&1 || return 1
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || return 1
+    # a pack from the stopped machine carries /root and not /tmp
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || {
+        echo "FAIL: pack create --from-vm"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+    local packed
+    packed=$("$pack_output" run -- sh -c 'echo "tmp=$(ls -A /tmp | wc -l) root=$(cat /root/keep.txt /root/moved.txt | tr "\n" ,)"' 2>/dev/null | tail -1)
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
+    rm -rf "$tmpdir"
+    [[ "$packed" == "tmp=0 root=keep,moved," ]] || {
+        echo "FAIL: packed machine shows: $packed"
+        return 1
+    }
+    return 0
+}
+
 run_test "Create from .smolmachine" test_create_from_smolmachine || true
+run_test "Packed: a pack from a machine leaves /tmp behind and keeps /root" test_pack_from_vm_leaves_tmp_behind || true
 run_test "File cp preserves state on packed VM" test_cp_preserves_state_on_packed_vm || true
 run_test "Packed: volume targets at/below /workspace resolve in guest" test_packed_volume_targets_resolve_inside_guest || true
 run_test "Packed: symlinks keep owners and can be re-owned" test_packed_symlinks_keep_owners_and_rechown || true
