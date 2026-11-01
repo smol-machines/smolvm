@@ -525,6 +525,14 @@ pub struct CreateVmParams {
     pub cuda_vram_limit_mib: Option<u64>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
+    /// Enable waypipe Wayland forwarding over vsock (guest GUI apps on the host
+    /// compositor).
+    pub waypipe: bool,
+    /// Which `waypipe` binary the guest daemon runs: `None`/`"host"` shares the
+    /// host binary, `"container"` uses the image's own, or an absolute path.
+    pub waypipe_bin: Option<String>,
+    /// Bridge the guest X11 socket straight to the host X server over vsock.
+    pub x11: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     /// Expose host virtualization extensions so the guest can run KVM.
     pub nested_virt: bool,
@@ -875,6 +883,9 @@ pub(crate) fn build_vm_record_for(
     record.cuda_fork_pool_size = params.cuda_fork_pool_size;
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
+    record.waypipe = params.waypipe;
+    record.waypipe_bin = params.waypipe_bin.clone();
+    record.x11 = params.x11;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
         smolvm::credentials::require_host_sources(policy)?;
@@ -1912,6 +1923,9 @@ fn start_vm_named_with_db(
         cuda: record.cuda,
         expose_docker: record.docker_socket,
         published_sockets: record.published_sockets.clone(),
+        waypipe: record.waypipe,
+        waypipe_bin: record.waypipe_bin.clone(),
+        x11: record.x11,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
         external_interceptor,
@@ -2227,6 +2241,9 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.ssh_agent = o.ssh_agent;
     r.cuda = o.cuda;
     r.docker_socket = o.docker_socket;
+    r.waypipe = o.waypipe;
+    r.waypipe_bin = o.waypipe_bin.clone();
+    r.x11 = o.x11;
     r.dns_filter_hosts = o.dns_filter_hosts.clone();
     r.credential_policy = o.credential_policy.clone();
     r.credential_placeholders = o.credential_placeholders.clone();
@@ -2312,6 +2329,12 @@ pub struct DefaultVmOverrides {
     pub ssh_agent: bool,
     pub cuda: bool,
     pub docker_socket: bool,
+    /// Enable waypipe Wayland forwarding over vsock.
+    pub waypipe: bool,
+    /// Which `waypipe` binary the guest daemon runs (see [`CreateVmParams`]).
+    pub waypipe_bin: Option<String>,
+    /// Bridge the guest X11 socket straight to the host X server over vsock.
+    pub x11: bool,
     pub dns_filter_hosts: Option<Vec<String>>,
     pub credential_policy: Option<smolvm::credentials::CredentialPolicy>,
     pub credential_placeholders: BTreeMap<String, String>,
@@ -2402,6 +2425,9 @@ impl DefaultVmOverrides {
             ssh_agent: params.ssh_agent,
             cuda: params.cuda,
             docker_socket: params.docker_socket,
+            waypipe: params.waypipe,
+            waypipe_bin: params.waypipe_bin.clone(),
+            x11: params.x11,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             credential_policy: params.credential_policy.clone().filter(|p| !p.is_empty()),
             credential_placeholders: params.credential_placeholders.clone(),

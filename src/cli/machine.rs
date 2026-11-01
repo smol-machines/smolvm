@@ -887,6 +887,20 @@ pub struct RunCmd {
     )]
     pub mount_socket: Vec<String>,
 
+    /// Forward guest Wayland apps to the host compositor over vsock. Run a
+    /// `waypipe client` on the host socket next to your compositor; the guest
+    /// daemon and WAYLAND_DISPLAY are set up automatically. Optional value picks
+    /// the binary: `host` (default, share the host waypipe), `container` (use
+    /// the image's own), or a path to a host waypipe binary.
+    #[arg(long, help_heading = "Hardware", num_args = 0..=1, default_missing_value = "host", value_name = "host|container|PATH")]
+    pub waypipe: Option<String>,
+
+    /// Bridge the guest X11 socket straight to the host X server (no waypipe).
+    /// Resolves the host $DISPLAY at launch and bridges a guest vsock port to
+    /// that X server socket. Requires a running host X server.
+    #[arg(long, help_heading = "Hardware")]
+    pub x11: bool,
+
     /// Mount ~/.docker/ into the VM. Registry credentials from `docker login`
     /// (credential helpers included) are resolved on the host for every pull,
     /// so this is only needed for other contents of the directory.
@@ -1366,6 +1380,19 @@ fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// What `--x11` tells the user: the bridge is enabled only when the boot side
+/// will find the host X server socket, otherwise it is off, with the reason.
+fn x11_bridge_notice(display: Option<&str>) -> String {
+    match smolvm::internal_boot::host_x11_socket(display) {
+        Ok(_) => "X11 bridge enabled (host $DISPLAY -> guest display :10). \
+                  DISPLAY is set in the VM automatically, so just run an X app:\n  \
+                  smolvm machine exec -- xterm\n  \
+                  If clients are refused, run `xhost +local:` on the host first."
+            .to_string(),
+        Err(reason) => format!("X11 bridge off: {reason}, so the guest gets no DISPLAY."),
+    }
 }
 
 /// When an agent request fails because the VM process is gone, replace the
@@ -2022,10 +2049,27 @@ impl RunCmd {
 
         let uses_packed_layers = packed_layers_dir.is_some();
 
+        // Waypipe needs a workload container to host its daemon: the guest agent
+        // rootfs is musl Alpine and cannot exec a glibc `waypipe`, so the daemon
+        // runs inside the (glibc) container. A bare VM (no image) has no such
+        // container, so forwarding could never start. Reject up front rather than
+        // booting with SMOLVM_WAYPIPE set and silently doing nothing.
+        if (self.waypipe.is_some() || params.waypipe) && image.is_none() {
+            return Err(smolvm::Error::agent(
+                "waypipe",
+                "--waypipe requires an --image: the forwarding daemon runs inside the \
+                 workload container, which a bare VM does not have. Re-run with \
+                 --image <img> (the image must provide, or let you install, waypipe).",
+            ));
+        }
+
         let mut features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
+            waypipe: self.waypipe.is_some() || params.waypipe,
+            waypipe_bin: self.waypipe.clone().or_else(|| params.waypipe_bin.clone()),
+            x11: self.x11 || params.x11,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             credentials: params.credential_policy.as_ref().and_then(|policy| {
                 smolvm::credentials::CredentialLaunch::from_parts(
@@ -2095,6 +2139,37 @@ impl RunCmd {
                 "Docker socket exposed — once dockerd is running in the VM, reach it with:\n  \
                  DOCKER_HOST=unix://{} docker ps",
                 sock.display()
+            );
+        }
+
+        // Tell the user how to use the Wayland bridge. Both ends are wired up
+        // automatically: the guest agent runs `waypipe server` as a daemon and
+        // exports WAYLAND_DISPLAY, and on Linux smolvm starts the matching host
+        // `waypipe client` next to the compositor. The host client is skipped
+        // when $WAYLAND_DISPLAY is unset or no `waypipe` is on the host PATH; a
+        // manual fallback for that case is shown below.
+        if self.waypipe.is_some() || params.waypipe {
+            let sock = smolvm::agent::vm_data_dir(&vm_name).join("waypipe.sock");
+            eprintln!(
+                "Waypipe forwarding enabled (guest Wayland apps -> host compositor). \
+                 Both ends are set up automatically - just run a GUI app in the VM:\n  \
+                 smolvm machine exec -- weston-terminal\n\
+                 If the host client wasn't started (no $WAYLAND_DISPLAY, or no waypipe \
+                 on the host PATH), run one yourself:\n  \
+                 waypipe -s {} client",
+                sock.display()
+            );
+        }
+
+        // Tell the user how to use the raw X11 bridge. smolvm bridges the guest's
+        // outbound X11 vsock port straight to the host X server socket (resolved
+        // from $DISPLAY), and the guest agent exposes it as a local display and
+        // exports DISPLAY automatically - no socat needed. X11 auth still applies:
+        // allow the guest with `xhost +local:` on the host (or copy the MIT cookie).
+        if self.x11 || params.x11 {
+            eprintln!(
+                "{}",
+                x11_bridge_notice(std::env::var("DISPLAY").ok().as_deref())
             );
         }
 
@@ -2315,6 +2390,10 @@ impl RunCmd {
                                 o.ssh_agent = self.ssh_agent || o.ssh_agent;
                                 o.cuda = self.cuda || o.cuda;
                                 o.docker_socket = self.docker_socket || o.docker_socket;
+                                o.waypipe = self.waypipe.is_some() || o.waypipe;
+                                o.waypipe_bin =
+                                    self.waypipe.clone().or_else(|| o.waypipe_bin.clone());
+                                o.x11 = self.x11 || o.x11;
                                 o.gpu = self.gpu || o.gpu;
                                 o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
                                 o
@@ -2468,6 +2547,9 @@ impl RunCmd {
                             o.ssh_agent = self.ssh_agent || o.ssh_agent;
                             o.cuda = self.cuda || o.cuda;
                             o.docker_socket = self.docker_socket || o.docker_socket;
+                            o.waypipe = self.waypipe.is_some() || o.waypipe;
+                            o.waypipe_bin = self.waypipe.clone().or_else(|| o.waypipe_bin.clone());
+                            o.x11 = self.x11 || o.x11;
                             o.gpu = self.gpu || o.gpu;
                             o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
                             o
@@ -2584,6 +2666,26 @@ mod tests {
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME);
         guard
+    }
+
+    /// `--x11` reports the bridge off, with the reason, whenever the boot side
+    /// will not bridge, instead of claiming it is enabled.
+    #[test]
+    fn x11_notice_says_off_when_the_host_display_cannot_be_bridged() {
+        let cases = [
+            (None, "X11 bridge off: $DISPLAY is unset"),
+            (Some("otherhost:0"), "X11 bridge off: $DISPLAY=otherhost:0 is not a local display"),
+            (
+                Some("/private/tmp/com.apple.launchd.x/org.xquartz:0"),
+                "X11 bridge off: $DISPLAY=/private/tmp/com.apple.launchd.x/org.xquartz:0 is not a local display",
+            ),
+            (Some(":4242"), "X11 bridge off: no X server socket at /tmp/.X11-unix/X4242"),
+        ];
+        for (display, expected) in cases {
+            let notice = super::x11_bridge_notice(display);
+            assert!(notice.starts_with(expected), "{display:?}: {notice}");
+            assert!(!notice.contains("enabled"), "{display:?}: {notice}");
+        }
     }
 
     /// One test covers every SMOLVM_MACHINE_NAME behavior, because it mutates
@@ -4739,6 +4841,20 @@ pub struct CreateCmd {
     #[arg(long)]
     pub docker_socket: bool,
 
+    /// Forward guest Wayland apps to the host compositor over vsock. Run a
+    /// `waypipe client` on the host socket next to your compositor; the guest
+    /// daemon and WAYLAND_DISPLAY are set up automatically. Optional value picks
+    /// the binary: `host` (default, share the host waypipe), `container` (use
+    /// the image's own), or a path to a host waypipe binary.
+    #[arg(long, num_args = 0..=1, default_missing_value = "host", value_name = "host|container|PATH")]
+    pub waypipe: Option<String>,
+
+    /// Bridge the guest X11 socket straight to the host X server (no waypipe).
+    /// Resolves the host $DISPLAY at launch and bridges a guest vsock port to
+    /// that X server socket. Requires a running host X server.
+    #[arg(long)]
+    pub x11: bool,
+
     /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
     /// each launch. Only the reference is persisted, never the value.
     #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
@@ -5047,6 +5163,25 @@ impl CreateCmd {
         }
         if self.docker_socket {
             params.docker_socket = true;
+        }
+        if self.waypipe.is_some() {
+            params.waypipe = true;
+            params.waypipe_bin = self.waypipe.clone();
+        }
+        // Waypipe's daemon runs inside the workload container (the musl agent
+        // rootfs cannot exec a glibc waypipe). A bare VM has no container, so
+        // reject --waypipe without an image rather than persisting a machine
+        // whose forwarding can never start. See the same guard on `run`.
+        if params.waypipe && params.image.is_none() {
+            return Err(smolvm::Error::agent(
+                "waypipe",
+                "--waypipe requires an --image: the forwarding daemon runs inside the \
+                 workload container, which a bare VM does not have. Re-create with \
+                 --image <img> (the image must provide, or let you install, waypipe).",
+            ));
+        }
+        if self.x11 {
+            params.x11 = true;
         }
         if self.gpu {
             params.gpu = true;
@@ -5466,6 +5601,9 @@ impl CreateCmd {
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
+            waypipe: self.waypipe.is_some(),
+            waypipe_bin: self.waypipe.clone(),
+            x11: self.x11,
             dns_filter_hosts,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,
