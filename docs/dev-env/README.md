@@ -21,11 +21,16 @@ session are there in the second. That is the whole use case, and it turns on one
 | `machine create --from <artifact>.smolmachine` | a persistent named machine from a packed artifact, booting from pre-extracted layers (the agent ready in about 150 ms on v1.29.0 on macOS arm64, no image pull), with full `exec` persistence |
 
 `/run` and `/dev/shm` are tmpfs whatever the mode, except that `machine run --unprivileged`
-keeps only `/dev/shm`. `/tmp` is a directory on the machine's disk, so it holds as much as the disk
-does (`--unprivileged` uses the image's own `/tmp` instead). All three keep their contents while the
-machine runs, including across `exec` sessions, and are empty again after a stop and start. Write
-anything that must outlive a restart to `/workspace` or elsewhere on the storage disk, including
-credentials and configuration, which should not sit in `/tmp` or behind a symlink into it.
+keeps only `/dev/shm`. `/tmp` is a directory on the machine's root filesystem, so it holds as much
+as the disk does (`--unprivileged` uses the image's own `/tmp` instead), and a `rename(2)` from
+`/tmp` into `/root`, `/home`, `/opt` or anywhere else on the root filesystem succeeds, as it does on
+a GitHub-hosted runner. `/workspace` is its own mount, so a rename from `/tmp` into it returns
+EXDEV and `mv` falls back to a copy. All three keep their contents while the machine runs,
+including across `exec` sessions, are empty again after a stop and start, and never enter a pack
+made from the machine (verified on v1.33.0-pre on Linux x86_64: a file written to `/tmp` was gone
+from the pack while one renamed from `/tmp` into `/root` was in it). Write anything that must
+outlive a restart to `/workspace` or elsewhere on the storage disk, including credentials and
+configuration, which should not sit in `/tmp` or behind a symlink into it.
 
 The storage disk defaults to 20 GiB and the rootfs overlay to 10 GiB, as `machine list` showed on
 v1.22.2 and on v1.27.3. Both are sparse, so they cost what they hold.
