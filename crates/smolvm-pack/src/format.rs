@@ -661,6 +661,14 @@ pub struct PortableCheckpointManifest {
     /// attaches the same base, identified here, from the restoring host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<CheckpointCacheDisk>,
+    /// Content digest (`sha256:…`) of the agent rootfs the captured guest
+    /// booted with. Its processes keep that userland mapped, so a restore boots
+    /// the same rootfs, from the host's store or the copy this artifact
+    /// carries, never whatever the host has installed since. Absent on
+    /// checkpoints written before it was recorded; a restore then takes the
+    /// digest of the carried copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_rootfs_digest: Option<String>,
 }
 
 /// The shared base under a checkpointed machine's cache disk.

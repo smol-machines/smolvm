@@ -310,11 +310,100 @@ fn compression_slots(parallelism: usize) -> usize {
     (parallelism / MAX_COMPRESSION_WORKERS).max(1)
 }
 
-/// Where an agent rootfs tar built from `rootfs_dir` as it is now is kept, so
-/// later packs can reuse it. The name is a digest of every entry's path, type,
-/// size, mode, owner, inode and change time: any change to the tree, including
-/// a reinstall, gives a new name. `None` when the tree cannot be read.
-fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
+/// Content digest, `sha256:<hex>`, of the agent rootfs at `rootfs_dir`: every
+/// entry's path, type and permission bits, a regular file's bytes and a
+/// symlink's target, in sorted order. Owners and times are left out, so the
+/// tree a checkpoint's `agent-rootfs.tar` unpacks to has the digest of the tree
+/// it was packed from, and the host's per-boot ready markers are skipped as the
+/// tar skips them. This names the userland a guest booted with: a checkpoint
+/// records it and a restore boots the rootfs with that digest, since the
+/// captured processes keep that userland mapped.
+pub fn agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    fn walk(dir: &Path, relative: &Path, top: bool, hash: &mut Sha256) -> std::io::Result<()> {
+        let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            if top
+                && name
+                    .to_string_lossy()
+                    .starts_with(smolvm_protocol::AGENT_READY_MARKER)
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let relative = relative.join(&name);
+            hash.update(relative.to_string_lossy().as_bytes());
+            hash.update([0]);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                hash.update((metadata.mode() & 0o7777).to_le_bytes());
+            }
+            let kind = metadata.file_type();
+            if kind.is_symlink() {
+                hash.update(b"l");
+                hash.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
+            } else if kind.is_dir() {
+                hash.update(b"d");
+                walk(&path, &relative, false, hash)?;
+            } else if kind.is_file() {
+                hash.update(b"f");
+                hash.update(metadata.len().to_le_bytes());
+                let mut file = File::open(&path)?;
+                let mut content = Sha256::new();
+                std::io::copy(&mut file, &mut content)?;
+                hash.update(content.finalize());
+            } else {
+                // a device node or fifo in the tree: its kind and name count
+                hash.update(b"o");
+            }
+            hash.update([0]);
+        }
+        Ok(())
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"smolvm-agent-rootfs-v1\0");
+    walk(rootfs_dir, Path::new(""), true, &mut hash)?;
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+/// [`agent_rootfs_digest`], remembered beside the rootfs tar cache under the
+/// tree's metadata hash, so a tree that has not changed is not read again: a
+/// launch asks for the digest of the rootfs it boots, and reading a rootfs is
+/// a few hundred milliseconds. Any change to the tree misses the cache.
+pub fn cached_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    let cached = rootfs_metadata_hash(rootfs_dir).and_then(|hash| {
+        let dir = dirs::cache_dir()?
+            .join("smolvm")
+            .join("agent-rootfs-digests");
+        fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(hash))
+    });
+    if let Some(path) = &cached {
+        if let Ok(digest) = fs::read_to_string(path) {
+            let digest = digest.trim();
+            if digest.len() == "sha256:".len() + 64 && digest.starts_with("sha256:") {
+                return Ok(digest.to_string());
+            }
+        }
+    }
+    let digest = agent_rootfs_digest(rootfs_dir)?;
+    if let Some(path) = &cached {
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        if fs::write(&temporary, &digest).is_ok() && fs::rename(&temporary, path).is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+    }
+    Ok(digest)
+}
+
+/// A hash of every entry's path, type, size, mode, owner, inode and change
+/// time under `rootfs_dir`: any change to the tree, including a reinstall,
+/// gives a new value. `None` when the tree cannot be read.
+fn rootfs_metadata_hash(rootfs_dir: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -353,7 +442,14 @@ fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
                 }
             }
             #[cfg(not(unix))]
-            hash.update(metadata.len().to_le_bytes());
+            {
+                hash.update(metadata.len().to_le_bytes());
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        hash.update(since.as_nanos().to_le_bytes());
+                    }
+                }
+            }
             if metadata.file_type().is_symlink() {
                 hash.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
             } else if metadata.is_dir() {
@@ -365,9 +461,17 @@ fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
     let mut hash = Sha256::new();
     hash.update(b"agent-rootfs-tar-v1\0");
     walk(rootfs_dir, Path::new(""), true, &mut hash).ok()?;
+    Some(format!("{:x}", hash.finalize()))
+}
+
+/// Where an agent rootfs tar built from `rootfs_dir` as it is now is kept, so
+/// later packs can reuse it. The name is the tree's metadata hash, so any
+/// change to the tree gives a new name. `None` when the tree cannot be read.
+fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
+    let hash = rootfs_metadata_hash(rootfs_dir)?;
     let cache = dirs::cache_dir()?.join("smolvm").join("agent-rootfs-tars");
     fs::create_dir_all(&cache).ok()?;
-    Some(cache.join(format!("{:x}.tar", hash.finalize())))
+    Some(cache.join(format!("{hash}.tar")))
 }
 
 /// Keep the tar just built at `built` as `cached` for later packs, and drop
@@ -2009,6 +2113,65 @@ mod tests {
         // lib/ is only created when collect_libraries() is called
         assert!(!staging.join("lib").exists());
         assert!(staging.join("layers").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rootfs_digest_names_content_not_times_owners_or_markers() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let rootfs = temp.path().join(name);
+            fs::create_dir_all(rootfs.join("bin")).unwrap();
+            fs::create_dir_all(rootfs.join("sbin")).unwrap();
+            fs::write(rootfs.join("bin/sh"), b"#!/bin/sh\nexec busybox sh\n").unwrap();
+            fs::set_permissions(rootfs.join("bin/sh"), fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", rootfs.join("sbin/init"))
+                .unwrap();
+            rootfs
+        };
+        let a = make("a");
+        let b = make("b");
+        // a host's per-boot marker and a later modification time are not content
+        fs::write(
+            b.join(format!("{}.cafef00d", smolvm_protocol::AGENT_READY_MARKER)),
+            b"1",
+        )
+        .unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        File::open(b.join("bin/sh"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let digest = agent_rootfs_digest(&a).unwrap();
+        assert!(
+            digest.starts_with("sha256:") && digest.len() == 71,
+            "{digest}"
+        );
+        assert_eq!(agent_rootfs_digest(&b).unwrap(), digest);
+        assert_eq!(cached_agent_rootfs_digest(&a).unwrap(), digest);
+
+        // a byte, a permission bit and a link target each change it
+        fs::write(b.join("bin/sh"), b"#!/bin/sh\nexec busybox ash\n").unwrap();
+        let changed_bytes = agent_rootfs_digest(&b).unwrap();
+        assert_ne!(changed_bytes, digest);
+        fs::set_permissions(b.join("bin/sh"), fs::Permissions::from_mode(0o700)).unwrap();
+        let changed_mode = agent_rootfs_digest(&b).unwrap();
+        assert_ne!(changed_mode, changed_bytes);
+        fs::remove_file(b.join("sbin/init")).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", b.join("sbin/init")).unwrap();
+        assert_ne!(agent_rootfs_digest(&b).unwrap(), changed_mode);
+
+        // the tar a checkpoint carries unpacks to a tree with the same digest
+        let staging = temp.path().join("staging");
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        collector.collect_agent_rootfs(&a).unwrap();
+        let unpacked = temp.path().join("unpacked");
+        fs::create_dir_all(&unpacked).unwrap();
+        let mut archive = tar::Archive::new(File::open(staging.join("agent-rootfs.tar")).unwrap());
+        archive.set_preserve_permissions(true);
+        archive.unpack(&unpacked).unwrap();
+        assert_eq!(agent_rootfs_digest(&unpacked).unwrap(), digest);
     }
 
     #[test]

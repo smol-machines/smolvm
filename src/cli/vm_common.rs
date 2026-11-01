@@ -3565,6 +3565,7 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "cuda_vram_limit_mib": record.cuda_vram_limit_mib,
         "branchpoint_held": record.forkpoint_held,
         "forkpoint_held": record.forkpoint_held,
+        "agent_rootfs_digest": record.agent_rootfs_digest,
         "labels": record.labels,
         "restart_policy": record.restart.policy.to_string(),
         "restart_max_retries": record.restart.max_retries,

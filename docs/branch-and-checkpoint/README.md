@@ -62,6 +62,16 @@ branches.
 The restore path is `machine create --from`. **There is no `machine restore` subcommand.** A
 restored machine packs like any other, and carries its rootfs.
 
+A checkpoint, and a pause, carries the agent rootfs the guest booted with and records its content
+digest (`agent_rootfs_digest` in `machine ls --json`). A restore or resume boots that rootfs, not
+whatever smolvm has installed since: the installed one while its digest still matches, else a copy
+kept under `<cache dir>/smolvm/agent-rootfs-store/<digest>/`, installed from the artifact by the
+first restore that needs it. The captured processes keep their userland mapped, so a guest resumed
+under a different rootfs answers the agent but every program it starts dies with a signal; a resume
+now runs one program before it reports success and fails instead. A cold `machine stop` and `start`
+is how a machine moves onto an upgraded rootfs. Checkpoints written before the digest was recorded
+are pinned to the rootfs they carry.
+
 ## Packing a branch
 
 A branched machine packs from v1.16.1 once it is stopped; see [pack](../pack/README.md).

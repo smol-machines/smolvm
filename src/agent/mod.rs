@@ -18,6 +18,7 @@ pub mod live_ports;
 pub mod live_resize;
 mod manager;
 pub mod pod_net;
+pub mod rootfs_store;
 pub mod state_probe;
 pub mod terminal;
 #[cfg(all(test, unix))]

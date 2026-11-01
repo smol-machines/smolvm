@@ -1442,7 +1442,10 @@ impl AgentManager {
 
     fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
         let name = name.into();
-        let rootfs_path = Self::default_rootfs_path()?;
+        let rootfs_path = match access {
+            DiskAccess::Launch { .. } => Self::launch_rootfs_path(&name)?,
+            DiskAccess::Observe => Self::default_rootfs_path()?,
+        };
         // Named VMs get their own storage disk. A launch commits the name→hash
         // binding on first call and detects collisions on subsequent calls
         // (refusing to open a hash dir that belongs to a different name); an
@@ -1488,6 +1491,20 @@ impl AgentManager {
         };
         let db = crate::db::SmolvmDb::open()?;
         crate::agent::fork::restart_blocking_dependent_clones(&db, name)
+    }
+
+    /// The agent rootfs a launch of `name` boots. A pending live restore
+    /// boots the rootfs its checkpoint pinned (the host's installed one while
+    /// its digest matches, else the store's copy; see `rootfs_store`), since
+    /// the captured processes keep that userland mapped. Any other launch is a
+    /// cold boot on the installed rootfs.
+    fn launch_rootfs_path(name: &str) -> Result<PathBuf> {
+        if let Some(digest) = crate::portable_checkpoint::pinned_rootfs_digest(&vm_data_dir(name)) {
+            let path = crate::agent::rootfs_store::resolve(&digest)?;
+            tracing::info!(machine = name, digest, rootfs = %path.display(), "booting the agent rootfs the restore pinned");
+            return Ok(path);
+        }
+        Self::default_rootfs_path()
     }
 
     /// Get the default path for the agent rootfs.
@@ -2690,6 +2707,33 @@ impl AgentManager {
         if let Some(name) = self.name() {
             let db = crate::db::SmolvmDb::open()?;
             if let Some(record) = db.get_vm(name)? {
+                // The userland this boot runs on, for the checkpoints and pauses
+                // taken from it. A clone boots its golden's live snapshot, so it
+                // must run on the golden's rootfs: refuse a host whose rootfs
+                // moved on under a golden that is still running.
+                let rootfs_digest =
+                    smolvm_pack::assets::cached_agent_rootfs_digest(&self.rootfs_path)
+                        .map_err(|e| Error::agent("read agent rootfs", e.to_string()))?;
+                if let (Some(snapshot), Some(golden)) = (&features.snapshot_dir, &record.golden) {
+                    if crate::portable_checkpoint::pending_dir(&vm_data_dir(name)).as_deref()
+                        != Some(snapshot.as_path())
+                    {
+                        let golden_digest = db.get_vm(golden)?.and_then(|g| g.agent_rootfs_digest);
+                        if let Some(golden_digest) = golden_digest.filter(|d| *d != rootfs_digest) {
+                            return Err(Error::agent(
+                                "branch machine",
+                                format!(
+                                    "golden '{golden}' runs on agent rootfs {golden_digest} and this host's installed rootfs is {rootfs_digest}; a branch of its live state must boot the same rootfs, so restart the golden before branching it"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                if record.agent_rootfs_digest.as_deref() != Some(rootfs_digest.as_str()) {
+                    db.update_vm(name, |r| {
+                        r.agent_rootfs_digest = Some(rootfs_digest.clone())
+                    })?;
+                }
                 if record.mediated_egress_required {
                     // A persisted mediated boundary cannot be downgraded by
                     // a restart path that only supplies the broker binding.
