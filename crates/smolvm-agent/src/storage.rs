@@ -7800,6 +7800,10 @@ mod tests {
             header.set_size(body.len() as u64);
             header.set_entry_type(tar::EntryType::Regular);
             header.set_mode(0o644);
+            // Real layers carry an owner. Root preserves it, so an unset
+            // field would fail the test only when it runs as root.
+            header.set_uid(0);
+            header.set_gid(0);
             header.set_cksum();
             builder.append(&header, &body[..]).unwrap();
 
@@ -7810,6 +7814,8 @@ mod tests {
             wh.set_mode(0o644);
             wh.set_path("tmp/.wh.RPM-GPG-KEY-kojiv2").unwrap();
             wh.set_link_name("tmp/CERN.repo").unwrap();
+            wh.set_uid(0);
+            wh.set_gid(0);
             wh.set_cksum();
             builder.append(&wh, std::io::empty()).unwrap();
 
@@ -7819,6 +7825,8 @@ mod tests {
             opq.set_size(0);
             opq.set_mode(0o644);
             opq.set_path("etc/.wh..wh..opq").unwrap();
+            opq.set_uid(0);
+            opq.set_gid(0);
             opq.set_cksum();
             builder.append(&opq, std::io::empty()).unwrap();
 

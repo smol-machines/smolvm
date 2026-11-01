@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUST_BACKTRACE=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git build-essential clang pkg-config libssl-dev \
-      musl-tools e2fsprogs file python3 curl \
+      musl-tools e2fsprogs file python3 curl tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Scanner contract: the checkout lives inside the image, at /src.
@@ -39,13 +39,25 @@ RUN cargo build --locked --release --target "$(uname -m)-unknown-linux-musl" -p 
 # Compile (but do not run) every test so the suites are usable offline.
 RUN cargo test --locked --workspace --no-run
 
-# Run the unit tests CI runs on Linux as a smoke check. smolvm-network's real-socket
-# suite is skipped as it is in CI (see threat_model.md). Failures do not abort the build.
-RUN (timeout 1800 cargo test --locked --lib \
-      -p smolvm -p smolvm-pack -p smolvm-registry -p smolvm-protocol \
-      -p smolfile -p smolvm-cuda -p smolvm-s3fs \
-      || echo "WARNING: smolvm unit tests reported failures") \
-    && (timeout 900 cargo test --locked -p smolvm-agent --bins \
-      || echo "WARNING: smolvm-agent unit tests reported failures") \
-    && (timeout 900 cargo test --locked -p smolvm-shim \
-      || echo "WARNING: smolvm-shim unit tests reported failures")
+# Where the prebuilt libkrun and libkrunfw for this architecture live, for anything that
+# needs to dlopen them (a few host-side tests create qcow2 overlays through libkrun).
+RUN ln -s "/src/lib/linux-$(uname -m)" /opt/smolvm-lib
+ENV SMOLVM_LIB_DIR=/opt/smolvm-lib
+
+# Run the unit tests CI runs on Linux as a smoke check, as the unprivileged user CI
+# runs them as: a root run takes the service's shared-base checkpoint layout and the
+# install test asserts the per-user one (see threat_model.md). tini reaps the orphans the
+# process-cleanup tests leave, as an init would. smolvm-network's real-socket suite is
+# skipped as it is in CI. Failures do not abort the build. /tmp is emptied afterwards so
+# the scanner's own runs do not meet files another user left there.
+RUN useradd --create-home --shell /bin/bash scanner && chown -R scanner:scanner /src \
+    && tini -s -- runuser -u scanner -- bash -c ' \
+      (timeout 1800 cargo test --locked --offline --lib \
+          -p smolvm -p smolvm-pack -p smolvm-registry -p smolvm-protocol \
+          -p smolfile -p smolvm-cuda -p smolvm-s3fs \
+        || echo "WARNING: smolvm unit tests reported failures") \
+      && (timeout 900 cargo test --locked --offline -p smolvm-agent --bins \
+        || echo "WARNING: smolvm-agent unit tests reported failures") \
+      && (timeout 900 cargo test --locked --offline -p smolvm-shim \
+        || echo "WARNING: smolvm-shim unit tests reported failures")' \
+    && find /tmp -mindepth 1 -delete

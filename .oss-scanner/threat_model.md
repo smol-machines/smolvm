@@ -98,9 +98,13 @@ workspace with every test compiled, the guest agent also as a static musl binary
 
 - **Unit tests**: `cargo test --lib -p smolvm -p smolvm-pack -p smolvm-registry
   -p smolvm-protocol -p smolfile -p smolvm-cuda -p smolvm-s3fs`, plus
-  `cargo test -p smolvm-agent --bins` and `cargo test -p smolvm-shim`. The
-  `smolvm-network` suite opens real sockets and parts of it hang on a plain Linux runner;
-  run individual tests there by name.
+  `cargo test -p smolvm-agent --bins` and `cargo test -p smolvm-shim`. Run them as the
+  unprivileged `scanner` user (`runuser -u scanner -- cargo test …`), as CI does: as root,
+  checkpoint install takes the service's shared-base layout and
+  `portable_checkpoint::tests::install_verifies_and_consumes_checkpoint` asserts the
+  per-user one. The `smolvm-network` suite opens real sockets and parts of it hang on a
+  plain Linux runner; run individual tests there by name. `SMOLVM_LIB_DIR` points at the
+  prebuilt libkrun for this architecture.
 - **Booting a machine needs `/dev/kvm`**, which this image does not have. `tests/` holds the
   integration suites (`run_tests.sh` and the `test_*.sh` and `test_*.py` files) and they will
   not run here. Prefer a Rust test against the crate API, or a crafted file fed to a
