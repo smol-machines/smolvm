@@ -478,9 +478,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<crate::data::disk::CacheDisk>,
 
-    /// Guest paths backed by the machine's storage disk (`-v /var/lib/docker`).
+    /// Guest paths backed by the machine's storage disk (`-v /var/lib/docker`),
+    /// with any owner and mode given for them (`-v /data:uid=1000`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disk_volumes: Vec<String>,
+    pub disk_volumes: Vec<smolvm_protocol::disk_volume::DiskVolume>,
 
     /// Private-range egress block and its exceptions (`--block-private`,
     /// `--allow-private`). See `VmResources::block_private`.
@@ -2646,6 +2647,31 @@ mod tests {
             record.disks,
             "and they reach the launcher through vm_resources()"
         );
+    }
+
+    /// A disk volume's owner and mode must survive the record, since the agent
+    /// applies them on every start; a record from before they existed (bare
+    /// targets) must still read.
+    #[test]
+    fn disk_volume_owner_round_trips_and_bare_targets_still_read() {
+        use smolvm_protocol::disk_volume::DiskVolume;
+        let legacy = r#"{"name":"legacy","disk_volumes":["/var/lib/docker"]}"#;
+        let record: VmRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            record.disk_volumes,
+            vec![DiskVolume::new("/var/lib/docker".to_string())]
+        );
+
+        let mut record = VmRecord::new("owned".to_string(), 2, 512, vec![], vec![], false);
+        record.disk_volumes = vec![DiskVolume::parse("/data:uid=1000,gid=1000,mode=750").unwrap()];
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains(r#""disk_volumes":["/data:uid=1000,gid=1000,mode=0750"]"#),
+            "{json}"
+        );
+        let decoded: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.disk_volumes, record.disk_volumes);
+        assert_eq!(decoded.vm_resources().disk_volumes, record.disk_volumes);
     }
 
     #[test]
