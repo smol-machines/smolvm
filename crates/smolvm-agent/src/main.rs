@@ -8245,6 +8245,57 @@ fn handle_vm_exec_background(
     }
 }
 
+/// How long a killed exec waits for output still held open by a child that
+/// left its process group before replying without it.
+const KILLED_EXEC_OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Read `pipe` on its own thread, sending chunks as they arrive. Reads ONE byte
+/// past the cap so the handler can tell "exactly at cap" from "overflowed" and
+/// return a clear error instead of a silently truncated result (+ a SIGPIPE
+/// exit on the child). Bytes, not strings, so binary output (image bytes,
+/// tarballs, any non-UTF-8 data) is preserved through the protocol.
+fn spawn_exec_output_reader<R: Read + Send + 'static>(
+    name: &str,
+    pipe: R,
+) -> Option<std::sync::mpsc::Receiver<Vec<u8>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let mut pipe = pipe.take(crate::process::MAX_EXEC_OUTPUT as u64 + 1);
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break; // the handler already replied
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+        .ok()?;
+    Some(rx)
+}
+
+/// Collect a reader's chunks until EOF, or until `deadline` when given.
+fn collect_exec_output(
+    rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    deadline: Option<std::time::Instant>,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(rx) = rx {
+        match deadline {
+            Some(deadline) => process::drain_until_closed(&rx, &mut buf, deadline),
+            None => buf.extend(rx.iter().flatten()),
+        }
+    }
+    buf
+}
+
 fn handle_vm_exec(
     command: &[String],
     env: &[(String, String)],
@@ -8318,31 +8369,17 @@ fn handle_vm_exec(
     // long-term fix (streaming exec).
     const MAX_OUTPUT: usize = crate::process::MAX_EXEC_OUTPUT;
 
-    // Use read_to_end (not read_to_string) so binary output (image bytes,
-    // tarballs, any non-UTF-8 data) is preserved through the protocol.
-    // The protocol serializes Vec<u8> as base64 JSON string.
-    let stdout_handle = child.stdout.take().map(|out| {
-        std::thread::Builder::new()
-            .name("exec-stdout".into())
-            .spawn(move || {
-                // Read ONE byte past the cap so the handler can tell "exactly at
-                // cap" from "overflowed" and return a clear error instead of a
-                // silently truncated result (+ a SIGPIPE exit on the child).
-                let mut buf = Vec::new();
-                let _ = out.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
-                buf
-            })
-    });
-
-    let stderr_handle = child.stderr.take().map(|err| {
-        std::thread::Builder::new()
-            .name("exec-stderr".into())
-            .spawn(move || {
-                let mut buf = Vec::new();
-                let _ = err.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
-                buf
-            })
-    });
+    // Readers send chunks as they arrive instead of one buffer at EOF, so a
+    // timed-out or disconnected exec can reply with what it has: a child that
+    // left the process group (setsid) keeps the pipes open after killpg.
+    let stdout_rx = child
+        .stdout
+        .take()
+        .and_then(|out| spawn_exec_output_reader("exec-stdout", out));
+    let stderr_rx = child
+        .stderr
+        .take()
+        .and_then(|err| spawn_exec_output_reader("exec-stderr", err));
 
     // Write stdin on a separate thread after stdout/stderr drains are live.
     // This keeps the timeout/disconnect loop below active even when the child
@@ -8367,6 +8404,7 @@ fn handle_vm_exec(
     let exit_signal = process::ExitSignal::open(&child);
 
     let mut timed_out_ms = None;
+    let mut killed = false;
     let exit_code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break process::exit_code_from_status(&status),
@@ -8390,6 +8428,7 @@ fn handle_vm_exec(
                         }
                         let _ = child.kill();
                         let _ = child.wait();
+                        killed = true;
                         break 129; // SIGHUP convention: killed by disconnect
                     }
                 }
@@ -8402,6 +8441,7 @@ fn handle_vm_exec(
                         }
                         let _ = child.kill();
                         let _ = child.wait();
+                        killed = true;
                         timed_out_ms = timeout_ms;
                         break 124; // Standard timeout exit code
                     }
@@ -8422,16 +8462,12 @@ fn handle_vm_exec(
         }
     };
 
-    // Join reader threads — they return EOF because the child and all its
-    // descendants in the process group have been killed (pipes closed).
-    let stdout = stdout_handle
-        .and_then(|h| h.ok())
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-    let mut stderr = stderr_handle
-        .and_then(|h| h.ok())
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
+    // After a kill, the readers see EOF as soon as the group is gone, unless a
+    // child that left the group still holds a pipe: then reply with what
+    // arrived within a short grace instead of waiting for that child to exit.
+    let output_deadline = killed.then(|| std::time::Instant::now() + KILLED_EXEC_OUTPUT_GRACE);
+    let stdout = collect_exec_output(stdout_rx, output_deadline);
+    let mut stderr = collect_exec_output(stderr_rx, output_deadline);
 
     if let Some(Ok(handle)) = stdin_handle {
         if handle.is_finished() {
@@ -10059,6 +10095,46 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "closed child stdin must not hide a host disconnect: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vm_exec_timeout_is_not_blocked_by_a_child_that_left_the_group() {
+        // The escaped child prints its PID, then holds stdout open past the
+        // timeout: killpg cannot reach it (#2046).
+        let start = std::time::Instant::now();
+        let response = handle_vm_exec(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "setsid sh -c 'echo $$; exec sleep 30' & wait".to_string(),
+            ],
+            &[],
+            None,
+            Some(200),
+            None,
+            None,
+        );
+        let elapsed = start.elapsed();
+
+        let AgentResponse::Completed {
+            exit_code,
+            stdout,
+            stderr,
+        } = response
+        else {
+            panic!("expected completed response");
+        };
+        let escaped: i32 = String::from_utf8_lossy(&stdout).trim().parse().unwrap();
+        // SAFETY: plain signal delivery to the PID the escaped child printed.
+        unsafe { libc::kill(escaped, libc::SIGKILL) };
+
+        assert_eq!(exit_code, 124);
+        assert!(String::from_utf8_lossy(&stderr).contains("command timed out after 200ms"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a child holding stdout must not delay the timeout reply: {elapsed:?}"
         );
     }
 
