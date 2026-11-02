@@ -9030,6 +9030,18 @@ mod format_guard_tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// A disk's bytes with the two superblock fields a no-op `resize2fs`
+    /// rewrites blanked: the last write time and the superblock checksum.
+    /// resize2fs 1.47 stamps the write time whenever the clock has reached a
+    /// new second since the last write, so the raw bytes vary with timing.
+    fn without_write_time(mut bytes: Vec<u8>) -> Vec<u8> {
+        const WRITE_TIME: std::ops::Range<usize> = 1024 + 48..1024 + 52;
+        const CHECKSUM: std::ops::Range<usize> = 1024 + 1020..1024 + 1024;
+        bytes[WRITE_TIME].fill(0);
+        bytes[CHECKSUM].fill(0);
+        bytes
+    }
+
     fn failing_fsck(dir: &Path, code: i32) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(format!("fsck-exit-{code}"));
@@ -9076,13 +9088,13 @@ mod format_guard_tests {
             failing_fsck(dir.path(), 0),
         ] {
             let disk = with_data(dir.path(), "storage.raw", &mkfs, &debugfs);
-            let before = std::fs::read(&disk).unwrap();
+            let before = without_write_time(std::fs::read(&disk).unwrap());
             assert!(
                 !recover_storage_disk(&disk, &fsck, mkfs_path, || false),
                 "{fsck}"
             );
             assert!(
-                std::fs::read(&disk).unwrap() == before,
+                without_write_time(std::fs::read(&disk).unwrap()) == before,
                 "{fsck} changed the disk"
             );
             assert_eq!(read_keep(&debugfs, &disk), "machine data", "{fsck}");
