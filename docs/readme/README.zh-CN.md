@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <sub><a href="../../README.md">English</a> · <b>中文</b> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a></sub>
+  <sub><a href="../../README.md">English</a> · <b>中文</b> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a> · <a href="README.ru.md">Русский</a> · <a href="README.es.md">Español</a> · <a href="README.de.md">Deutsch</a></sub>
 </p>
 
 smolvm
