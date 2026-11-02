@@ -74,9 +74,8 @@ jobs:
   audit:
     name: Cargo Audit
     runs-on: smol
-    # Scans Cargo.lock for RustSec advisories — no engine/libkrun needed. Honors
-    # .cargo/audit.toml, which ignores documented unmaintained-transitive notices
-    # so a real vulnerability stands out instead of hiding in warning noise.
+    # Scans Cargo.lock for RustSec advisories — no engine/libkrun needed. No
+    # ignore list: an advisory is fixed by upgrading past it.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
