@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <sub><a href="../../README.md">English</a> · <a href="README.zh-CN.md">中文</a> · <a href="README.ja.md">日本語</a> · <b>한국어</b></sub>
+  <sub><a href="../../README.md">English</a> · <a href="README.zh-CN.md">中文</a> · <a href="README.ja.md">日本語</a> · <b>한국어</b> · <a href="README.ru.md">Русский</a> · <a href="README.es.md">Español</a> · <a href="README.de.md">Deutsch</a></sub>
 </p>
 
 smolvm
@@ -52,6 +52,8 @@ smolvm machine exec --name dev -- apk add git
 docker save myapp | smolvm machine run --image - -- ./app    # local image, no registry
 ```
 
+`-v s3://bucket/prefix:/data`로 S3, R2 또는 MinIO 버킷을 마운트할 수 있습니다. [볼륨](../volumes.md)을 참고하세요.
+
 [Smolfile](../smolfile.md)로 머신을 선언하세요. 이미지, 리소스, 포트, 마운트, 네트워크 정책을 저장소에 넣는 파일 하나에 담을 수 있습니다.
 
 내장형
@@ -63,6 +65,7 @@ docker save myapp | smolvm machine run --image - -- ./app    # local image, no r
 npm install smolmachines     # Node / TypeScript
 pip install smolmachines     # Python
 cargo add smolmachines       # Rust
+go get github.com/smol-machines/smol/sdk/go   # Go
 ```
 
 ```ts
@@ -135,11 +138,11 @@ NOTION_API_KEY=secret_… smolvm machine run --net --image alpine \
 |                     | smolvm | 컨테이너 | Colima | QEMU | Firecracker | Kata |
 |---------------------|--------|----------|--------|------|-------------|------|
 | 워크로드 경계       | VM + 게스트 커널 | 네임스페이스 + 공유 커널 | 공유 VM 안의 네임스페이스 | VM + 게스트 커널 | VM + 게스트 커널 | 컨테이너마다 VM |
-| 부팅 시간           | 에이전트 준비까지 200ms 미만 | ~100ms | 수 초 | ~15-30s | <125ms | ~500ms |
+| 부팅 시간           | 게스트 에이전트 준비까지 200ms 미만 | ~100ms | 수 초 | ~15-30s | <125ms | ~500ms |
 | 아키텍처            | 라이브러리(libkrun) | 데몬 | 데몬(VM 안) | 프로세스 | 프로세스 | 런타임 스택 |
 | 워크로드별 VM       | 예 | 아니요 | 아니요(공유) | 예 | 예 | 예 |
 | macOS 네이티브      | 예 | Docker VM 경유 | 예(krunkit) | 예 | 아니요 | 아니요 |
-| 내장 SDK            | 예 | 아니요 | 아니요 | 아니요 | 아니요 | 아니요 |
+| 내장 가능한 SDK     | 예 | 아니요 | 아니요 | 아니요 | 아니요 | 아니요 |
 | 이식 가능한 산출물  | `.smolmachine` | 이미지(데몬 필요) | 아니요 | 아니요 | 아니요 | 아니요 |
 
 지원 플랫폼
@@ -160,6 +163,9 @@ Windows는 이식 가능한 체크포인트, 일시 정지와 재개, `--freeze-
 
 * [Kubernetes](../kubernetes.md): `RuntimeClass`로 Pod를 마이크로 VM으로 실행합니다.
 * [GPU와 CUDA](../gpu.md): virtio-gpu / Venus를 통한 Vulkan과 CUDA API 원격 호출.
+* [이름 있는 네트워크](../named-networks.md): 머신끼리 IP로 통신할 수 있습니다.
+* [중첩된 가상화](../nested-virtualization.md): 머신 안에서 KVM, smolvm 또는 QEMU를 실행합니다.
+* [브라우저 디스플레이](../browser-display.md): 브라우저에서 머신의 데스크톱을 보고 키보드와 마우스로 조작합니다.
 * [예제](../../examples/): python, node, docker-in-vm, local-llm, headless-browser, doom.
 * [개발](../DEVELOPMENT.md) · 사용자 문서는 [smolmachines.com/docs](https://smolmachines.com/docs/)에 있고 [smol-machines/docs](https://github.com/smol-machines/docs)에서 작성됩니다(수정은 그쪽으로, 런타임 버그는 이 저장소로).
 

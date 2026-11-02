@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <sub><a href="../../README.md">English</a> · <b>中文</b> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a></sub>
+  <sub><a href="../../README.md">English</a> · <b>中文</b> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a> · <a href="README.ru.md">Русский</a> · <a href="README.es.md">Español</a> · <a href="README.de.md">Deutsch</a></sub>
 </p>
 
 smolvm
@@ -52,6 +52,8 @@ smolvm machine exec --name dev -- apk add git
 docker save myapp | smolvm machine run --image - -- ./app    # local image, no registry
 ```
 
+用 `-v s3://bucket/prefix:/data` 挂载 S3、R2 或 MinIO 存储桶，参见[卷](../volumes.md)。
+
 用 [Smolfile](../smolfile.md) 声明一台机器：镜像、资源、端口、挂载和网络策略，都写在一个纳入版本控制的文件里。
 
 可嵌入
@@ -63,6 +65,7 @@ docker save myapp | smolvm machine run --image - -- ./app    # local image, no r
 npm install smolmachines     # Node / TypeScript
 pip install smolmachines     # Python
 cargo add smolmachines       # Rust
+go get github.com/smol-machines/smol/sdk/go   # Go
 ```
 
 ```ts
@@ -127,7 +130,7 @@ NOTION_API_KEY=secret_… smolvm machine run --net --image alpine \
 
 每个工作负载都运行在一台硬件虚拟化的虚拟机里，拥有自己的客户机内核，底层是 [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor)（macOS）、KVM（Linux）或 [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/)（Windows）。[libkrun](https://github.com/containers/libkrun) 是虚拟机监视器（VMM），[libkrunfw](https://github.com/smol-machines/libkrunfw) 提供客户机内核。镜像使用 [OCI](https://opencontainers.org/) 格式，所以 Docker Hub、ghcr.io 或其他仓库里的任何镜像都能作为微型虚拟机启动，无需 Docker 守护进程。
 
-默认：4 个 vCPU、8 GiB 内存。内存通过 virtio balloon 弹性伸缩，空闲的 vCPU 在虚拟机监视器中休眠，因此超额分配几乎没有成本。可用 `--cpus` 和 `--mem` 覆盖。
+默认：4 个 vCPU、8 GiB 内存。内存通过 virtio balloon 弹性伸缩，空闲的 vCPU 在虚拟机监控程序（hypervisor）中休眠，因此超额分配几乎没有成本。可用 `--cpus` 和 `--mem` 覆盖。
 
 对比
 ----
@@ -135,7 +138,7 @@ NOTION_API_KEY=secret_… smolvm machine run --net --image alpine \
 |                     | smolvm | 容器 | Colima | QEMU | Firecracker | Kata |
 |---------------------|--------|------|--------|------|-------------|------|
 | 工作负载边界        | 虚拟机 + 客户机内核 | 命名空间 + 共享内核 | 共享虚拟机内的命名空间 | 虚拟机 + 客户机内核 | 虚拟机 + 客户机内核 | 每个容器一台虚拟机 |
-| 启动时间            | 不到 200ms 即可就绪 | ~100ms | 数秒 | ~15-30s | <125ms | ~500ms |
+| 启动时间            | 客户机代理不到 200ms 即可就绪 | ~100ms | 数秒 | ~15-30s | <125ms | ~500ms |
 | 架构                | 库（libkrun） | 守护进程 | 守护进程（在虚拟机中） | 进程 | 进程 | 运行时栈 |
 | 每个工作负载一台虚拟机 | 是 | 否 | 否（共享） | 是 | 是 | 是 |
 | macOS 原生          | 是 | 通过 Docker 虚拟机 | 是（krunkit） | 是 | 否 | 否 |
@@ -160,6 +163,9 @@ Windows 支持可移植检查点、暂停/恢复，以及使用 `--freeze-source
 
 * [Kubernetes](../kubernetes.md)：通过 `RuntimeClass` 把 Pod 作为微型虚拟机运行。
 * [GPU 与 CUDA](../gpu.md)：通过 virtio-gpu / Venus 使用 Vulkan，以及 CUDA API 远程调用。
+* [命名网络](../named-networks.md)：机器通过 IP 相互访问。
+* [嵌套虚拟化](../nested-virtualization.md)：在机器里运行 KVM、smolvm 或 QEMU。
+* [浏览器显示](../browser-display.md)：在浏览器里显示机器的桌面，支持键盘和鼠标。
 * [示例](../../examples/)：python、node、docker-in-vm、local-llm、headless-browser、doom。
 * [开发](../DEVELOPMENT.md) · 用户文档位于 [smolmachines.com/docs](https://smolmachines.com/docs/)，源文件在 [smol-machines/docs](https://github.com/smol-machines/docs)（欢迎在那里提交修正；运行时的问题请在本仓库提出）。
 
