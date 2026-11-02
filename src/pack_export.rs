@@ -1300,7 +1300,15 @@ fn export_flattened_from_artifact_sourced(
 ) -> crate::Result<()> {
     let cache_dir = machine_layers_cache_dir(vm_name);
     let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir.clone());
-    let mut layer_ids = ordered_cached_layer_ids(&pack_content_dir);
+    // Where this host unpacked the pack's layer trees: `layers/` on Linux, the
+    // case-sensitive volume on macOS. A streaming extraction never writes the
+    // tars, so the trees are the only form such an entry has, and the volume
+    // has to stay mounted while the export helper reads them through virtiofs.
+    // The lease releases it once the helper (declared below) is gone.
+    let layers_lease = smolvm_pack::extract::acquire_layers_lease(&pack_content_dir, false)
+        .map_err(|error| Error::agent("lease export layers", error.to_string()))?;
+    let store = layers_lease.path.clone();
+    let mut layer_ids = ordered_cached_layer_ids(&pack_content_dir, &store);
     // Self-heal a missing or damaged layer cache from the machine's source
     // artifact (a cache cleaner can delete the layer files while leaving the
     // extraction marker, in which case a start does NOT re-extract either —
@@ -1313,7 +1321,7 @@ fn export_flattened_from_artifact_sourced(
                 .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
             smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, true, false)
                 .map_err(|e| Error::agent("re-extract source artifact", e.to_string()))?;
-            layer_ids = ordered_cached_layer_ids(&pack_content_dir);
+            layer_ids = ordered_cached_layer_ids(&pack_content_dir, &store);
         }
     }
     let layer_ids = layer_ids.ok_or_else(|| {
@@ -1385,40 +1393,71 @@ fn export_flattened_from_artifact_sourced(
 }
 
 /// The cached layers of an imported pack, bottom -> top, as paths relative to
-/// the pack content dir. A layer is either an extracted dir (`layers/<id>`,
-/// hosts that can reproduce archived ownership) or a staged tar
-/// (`layers/<id>.tar`, hosts that leave extraction to the guest) — both forms
-/// are written by the artifact import, so both must be exportable. `None`
-/// when the cache (or its ordering) is gone.
-fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
+/// the pack content dir — the directory the export helper mounts as
+/// `/packed_layers`.
+///
+/// A layer is a staged tar (`layers/<id>.tar`, hosts that leave extraction to
+/// the guest), an extracted dir in the entry itself (`layers/<id>`), or a tree
+/// in this host's layer store (`store/<id>`; on macOS the store is the
+/// case-sensitive volume at `layers-cs/`, mounted by the caller). All three are
+/// written by the artifact import, so all three must be exportable: a
+/// streaming extraction writes only the last one.
+///
+/// The order comes from the extraction's own record — `layer-order` (every
+/// host) or `streamed-layers` (written beside it for an entry whose trees are
+/// in a store rather than in `layers/`). `None` when the cache, or its
+/// ordering, is gone.
+fn ordered_cached_layer_ids(pack_content_dir: &Path, store: &Path) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
-    let order_path = layers_dir.join("layer-order");
+    // Ids are returned relative to the content dir, so the store has to be
+    // reachable through it for the helper's single virtiofs share.
+    let store_prefix = store.strip_prefix(pack_content_dir).ok();
     let cached_form = |id: &str| -> Option<String> {
-        if layers_dir.join(id).is_dir() {
-            Some(format!("layers/{}", id))
-        } else if layers_dir.join(format!("{id}.tar")).is_file() {
-            Some(format!("layers/{}.tar", id))
-        } else {
-            None
+        if layers_dir.join(format!("{id}.tar")).is_file() {
+            return Some(format!("layers/{id}.tar"));
         }
+        if layers_dir.join(id).is_dir() {
+            return Some(format!("layers/{id}"));
+        }
+        let prefix = store_prefix?;
+        if store.join(id).is_dir() {
+            let rel = prefix.join(id);
+            return Some(rel.to_string_lossy().into_owned());
+        }
+        None
     };
-    if let Ok(contents) = std::fs::read_to_string(&order_path) {
+    for record in ["layer-order", "streamed-layers"] {
+        let Ok(contents) = std::fs::read_to_string(layers_dir.join(record)) else {
+            continue;
+        };
         let ids: Vec<&str> = contents
             .lines()
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .collect();
         if ids.is_empty() {
-            return None;
+            continue;
         }
         return ids.iter().map(|id| cached_form(id)).collect();
     }
-    // No order file: only unambiguous for a single cached layer.
-    let mut entries: Vec<String> = std::fs::read_dir(&layers_dir)
-        .ok()?
+    // No record: only unambiguous for a single cached layer, wherever it is.
+    let mut names: Vec<String> = std::fs::read_dir(&layers_dir)
+        .into_iter()
+        .flatten()
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter_map(|name| cached_form(name.strip_suffix(".tar").unwrap_or(&name)))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(store) {
+        names.extend(
+            entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string)),
+        );
+    }
+    let mut entries: Vec<String> = names
+        .iter()
+        .filter_map(|name| cached_form(name.strip_suffix(".tar").unwrap_or(name)))
         .collect();
     entries.sort();
     entries.dedup();
@@ -1911,6 +1950,75 @@ mod from_vm_manifest_tests {
         clone.golden = Some("orig".to_string());
         clone.fork_overlay_owner = Some("shared-owner".to_string());
         assert_eq!(export_overlay_owner("clone", &clone), "shared-owner");
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod cached_layer_lookup_tests {
+    use super::ordered_cached_layer_ids;
+    use std::fs;
+
+    /// A streaming extraction writes no tars at all: its record and the store
+    /// the trees were installed into are what an export has to read. On macOS
+    /// the store is the case-sensitive volume inside the entry (`layers-cs`),
+    /// which the helper's single virtiofs share of the entry can reach.
+    #[test]
+    fn a_streamed_entry_is_found_through_its_record_and_store() {
+        let root = tempfile::tempdir().unwrap();
+        let content = root.path();
+        let store = content.join("layers-cs");
+        fs::create_dir_all(content.join("layers")).unwrap();
+        for id in ["aaaa", "bbbb"] {
+            fs::create_dir_all(store.join(id)).unwrap();
+        }
+        fs::write(content.join("layers/streamed-layers"), "aaaa\nbbbb\n").unwrap();
+
+        assert_eq!(
+            ordered_cached_layer_ids(content, &store),
+            Some(vec!["layers-cs/aaaa".into(), "layers-cs/bbbb".into()]),
+            "the record orders the trees and they resolve inside the entry"
+        );
+    }
+
+    /// A staged entry keeps its tars; they win over any tree of the same id,
+    /// because a tar is the byte-exact layer the helper can extract, while a
+    /// tree is the extraction's own interpretation of it.
+    #[test]
+    fn staged_tars_win_over_a_tree_of_the_same_layer() {
+        let root = tempfile::tempdir().unwrap();
+        let content = root.path();
+        let store = content.join("layers-cs");
+        fs::create_dir_all(store.join("aaaa")).unwrap();
+        fs::create_dir_all(content.join("layers")).unwrap();
+        fs::write(content.join("layers/aaaa.tar"), b"tar").unwrap();
+        fs::write(content.join("layers/layer-order"), "aaaa\n").unwrap();
+
+        assert_eq!(
+            ordered_cached_layer_ids(content, &store),
+            Some(vec!["layers/aaaa.tar".into()]),
+        );
+    }
+
+    /// On Linux the store *is* `layers/`, so the ids keep the shape they always
+    /// had, and an entry with no record at all still resolves its one layer.
+    #[test]
+    fn the_entry_own_layers_dir_keeps_its_relative_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let content = root.path();
+        let store = content.join("layers");
+        fs::create_dir_all(store.join("aaaa")).unwrap();
+        fs::write(content.join("layers/aaaa.tar"), b"tar").unwrap();
+
+        assert_eq!(
+            ordered_cached_layer_ids(content, &store),
+            Some(vec!["layers/aaaa.tar".into()]),
+        );
+        // Without the tar, the tree in the entry itself resolves the same way.
+        fs::remove_file(content.join("layers/aaaa.tar")).unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(content, &store),
+            Some(vec!["layers/aaaa".into()]),
+        );
     }
 }
 
