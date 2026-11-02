@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::agent::fork::ForkSourcePolicy;
-use crate::agent::{AgentClient, ExecEvent, RunConfig, WorkloadTarget};
+use crate::agent::{
+    AgentClient, ExecEvent, InteractiveInputReceiver, InteractiveOutput, RunConfig, WorkloadTarget,
+};
 use crate::config::RecordState;
 use crate::db::SmolvmDb;
 use crate::embedded::control::{self, MachineSpec};
@@ -1087,6 +1089,7 @@ impl EmbeddedRuntime {
             timeout,
             user: None,
             stdin: None,
+            tty: false,
         };
         self.exec_with_options(name, command, options)
     }
@@ -1429,6 +1432,7 @@ impl EmbeddedRuntime {
             timeout,
             user: None,
             stdin: None,
+            tty: false,
         };
         self.exec_streaming_with_options(name, command, options, &ExecCancel::new(), on_event)
     }
@@ -1450,6 +1454,81 @@ impl EmbeddedRuntime {
     ) -> Result<()> {
         let op = self.inflight.begin(name, "exec")?;
         let result = self.exec_streaming_inner(name, command, options, cancel, on_event);
+        op.finish(result)
+    }
+
+    /// Execute a command in an interactive session driven by a channel.
+    ///
+    /// Bytes pushed into the paired [`crate::agent::InteractiveInputSender`]
+    /// reach the command's stdin, [`crate::agent::InteractiveInput::Resize`]
+    /// changes the PTY window (`options.tty`), and output arrives live via
+    /// `on_output`. Returns the command's exit code.
+    ///
+    /// This is the in-process counterpart of the HTTP API's interactive exec
+    /// endpoint (`GET /api/v1/machines/:name/exec/interactive`) and of the
+    /// CLI's `-i`/`-t`: the agent layer underneath is the same, so a session
+    /// runs over the machine's normal agent connection with the same egress,
+    /// interception and proxy behaviour as [`Self::exec_streaming_with_options`].
+    ///
+    /// Cancelling returns `Ok(-1)`: the caller asked for the stop and has no
+    /// use for the tail of the stream, matching the streaming variant's
+    /// `Ok(())` convention.
+    pub fn exec_interactive_with_options<F>(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        options: ExecOptions,
+        cancel: &ExecCancel,
+        input: InteractiveInputReceiver,
+        on_output: F,
+    ) -> Result<i32>
+    where
+        F: FnMut(InteractiveOutput),
+    {
+        let op = self.inflight.begin(name, "exec")?;
+        let result = (|| {
+            let options = self.with_machine_context(name, options)?;
+            let target = self.machine_target(name)?;
+            let config = self.command_run_config(name, target, &command, &options)?;
+            if cancel.is_cancelled() {
+                return Ok(-1);
+            }
+            let mut client = self.command_client(name)?;
+            // Attaching the connection lets a cancel close it, which is how the
+            // guest learns to kill the command's process group.
+            let connection = client
+                .clone_stream()
+                .map_err(|e| Error::agent("interactive connection", e.to_string()))?;
+            if !cancel.attach(connection) {
+                return Ok(-1);
+            }
+            // Drop output once cancelled: the caller is gone, and forwarding a
+            // tail to a dead listener is noise.
+            let mut on_output = on_output;
+            let on_output = |out: InteractiveOutput| {
+                if !cancel.is_cancelled() {
+                    on_output(out);
+                }
+            };
+            let result = match config {
+                Some(config) => {
+                    client.run_interactive_io(config.with_tty(options.tty), input, on_output)
+                }
+                None => client.vm_exec_interactive_io(
+                    command,
+                    options.env,
+                    options.workdir,
+                    options.tty,
+                    input,
+                    on_output,
+                ),
+            };
+            cancel.detach();
+            match result {
+                Err(_) if cancel.is_cancelled() => Ok(-1),
+                other => other,
+            }
+        })();
         op.finish(result)
     }
 
