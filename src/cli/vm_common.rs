@@ -3621,6 +3621,9 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     // Resolve via vsock probe so the JSON reflects truth (Unreachable vs
     // Running) instead of trusting the PID-only check.
     let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
+    // What the machine runs as when it is running, else what its next start
+    // launches: `machine start --branchable` is not on the record.
+    let branchable = smolvm::agent::branchable_now(record, &actual_state);
     // Expose the persisted health command as a single shell-friendly string
     // when it was stored as `["sh", "-c", "<cmd>"]`; otherwise a space-joined
     // argv so the field is always a string.
@@ -3655,8 +3658,8 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
         "cuda": record.cuda,
-        "branchable": record.forkable_on_start(),
-        "forkable": record.forkable_on_start(),
+        "branchable": branchable,
+        "forkable": branchable,
         "parent_machine": record.golden,
         "cuda_branch_pool_size": record.cuda_fork_pool_size,
         "cuda_fork_pool_size": record.cuda_fork_pool_size,
@@ -3875,7 +3878,7 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
                         None => println!("  GPU: enabled"),
                     }
                 }
-                if record.forkable_on_start() {
+                if smolvm::agent::branchable_now(record, &actual_state) {
                     println!("  Branchable: enabled");
                 }
                 if let Some(pool_size) = record.cuda_fork_pool_size {

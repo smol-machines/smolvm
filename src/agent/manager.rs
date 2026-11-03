@@ -382,6 +382,43 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Whether the VM named `name` is running as a branch source: what its running
+/// configuration (`agent.config.json` in its data directory, written at launch
+/// and removed at stop) says. `None` when there is none to read: the machine is
+/// not running, or an engine that predates the record started it.
+pub fn running_forkable(name: &str) -> Option<bool> {
+    forkable_in_running_config(&vm_data_dir(name).join("agent.config.json"))
+}
+
+fn forkable_in_running_config(path: &Path) -> Option<bool> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RunningVmConfig>(&content)
+        .ok()
+        .map(|config| config.forkable)
+}
+
+/// Whether `record`'s machine can be branched as it is now. A running machine is
+/// what it was launched as: `machine start --branchable` on a machine created
+/// without it makes a branch source that the record alone would deny, and the
+/// record alone would promise a source of a machine that was started plain.
+/// A machine that is not running is what its next ordinary start launches,
+/// [`VmRecord::forkable_on_start`].
+pub fn branchable_now(
+    record: &crate::config::VmRecord,
+    state: &crate::config::RecordState,
+) -> bool {
+    let running = (*state == crate::config::RecordState::Running)
+        .then(|| running_forkable(&record.name))
+        .flatten();
+    branchable_from(record, running)
+}
+
+/// [`branchable_now`] with the running configuration's answer already read:
+/// it decides for a running machine, the record for every other.
+fn branchable_from(record: &crate::config::VmRecord, running_forkable: Option<bool>) -> bool {
+    running_forkable.unwrap_or_else(|| record.forkable_on_start())
+}
+
 /// Reclaim CUDA transport state after a named VM process is confirmed dead.
 ///
 /// Some teardown paths terminate a VMM directly because its guest agent is
@@ -4711,6 +4748,48 @@ pub(crate) fn vm_boot_executable() -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_running_configuration_says_whether_the_vm_was_launched_forkable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.config.json");
+        assert_eq!(
+            super::forkable_in_running_config(&path),
+            None,
+            "no file: nothing is running"
+        );
+        std::fs::write(
+            &path,
+            r#"{"version":1,"mounts":[],"ports":[],"resources":{"cpus":1,"memory_mib":256,"network":false},"forkable":true}"#,
+        )
+        .unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), Some(true));
+        // an engine that predates the field launched it plain
+        std::fs::write(
+            &path,
+            r#"{"version":1,"mounts":[],"ports":[],"resources":{"cpus":1,"memory_mib":256,"network":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), Some(false));
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), None);
+    }
+
+    #[test]
+    fn a_running_machine_reports_how_it_was_launched_and_a_stopped_one_its_record() {
+        use crate::config::VmRecord;
+        let mut record = VmRecord::new("m".to_string(), 1, 256, vec![], vec![], false);
+        assert!(!record.forkable_on_start());
+        // created plain, started --branchable: branchable now
+        assert!(super::branchable_from(&record, Some(true)));
+        // created branchable, started plain by an older path: not branchable now
+        record.forkable = true;
+        assert!(!super::branchable_from(&record, Some(false)));
+        // nothing running: the record decides
+        assert!(super::branchable_from(&record, None));
+        record.forkable = false;
+        assert!(!super::branchable_from(&record, None));
+    }
+
     #[test]
     fn egress_flow_summary_round_trips_through_its_file_and_goes_stale() {
         use super::*;

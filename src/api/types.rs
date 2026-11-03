@@ -1007,7 +1007,10 @@ pub struct MachineInfo {
     /// The machine's shared cache disk, its base named by file name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<CacheDiskSpec>,
-    /// Whether ordinary starts launch this machine as a branch source.
+    /// Whether this machine can be branched as it is: how it was launched while
+    /// it runs (a plain-created machine started with `branchable` is one, a
+    /// branchable-created one started plain is not), else whether an ordinary
+    /// start launches it as a branch source.
     pub branchable: bool,
     /// Legacy alias for `branchable`.
     pub forkable: bool,

@@ -127,8 +127,8 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
             .cache_disk
             .as_ref()
             .map(crate::api::state::cache_disk_spec),
-        branchable: record.forkable_on_start(),
-        forkable: record.forkable_on_start(),
+        branchable: crate::agent::branchable_now(record, &actual_state),
+        forkable: crate::agent::branchable_now(record, &actual_state),
         parent_machine: record.golden.clone(),
         cuda_branch_pool_size: record.cuda_fork_pool_size,
         cuda_fork_pool_size: record.cuda_fork_pool_size,
