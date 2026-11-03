@@ -74,14 +74,20 @@ fn embed_git_commit() {
         .map(|commit| commit.trim().to_string())
         .filter(|commit| !commit.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    if let Ok(head) = std::process::Command::new("git")
-        .args(["rev-parse", "--git-path", "HEAD"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-    {
-        if head.status.success() {
-            if let Ok(head) = String::from_utf8(head.stdout) {
-                println!("cargo:rerun-if-changed={}", head.trim());
+    // `HEAD` changes on a checkout but, on a branch, holds only `ref: refs/heads/...`
+    // and keeps its content when a commit lands on that branch; the reflog
+    // `logs/HEAD` grows on every commit and checkout, so a dev rebuild after a
+    // commit embeds the new commit instead of keeping the previous one.
+    for path in ["HEAD", "logs/HEAD"] {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["rev-parse", "--git-path", path])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(path) = String::from_utf8(output.stdout) {
+                    println!("cargo:rerun-if-changed={}", path.trim());
+                }
             }
         }
     }
