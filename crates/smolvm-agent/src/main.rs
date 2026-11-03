@@ -7277,6 +7277,14 @@ fn run_crun_background_exec(
 /// under MAX_FRAME_SIZE for base64 of the byte fields (~4/3) plus the JSON envelope.
 fn oversized_output_error(stdout: &[u8], stderr: &[u8]) -> Option<AgentResponse> {
     const BUDGET: usize = 20 * 1024 * 1024; // ~20 MiB raw → ~27 MiB base64, under the 32 MiB frame
+
+    // A stream past the per-stream cap was cut short: its reader stopped, so the
+    // child likely took a SIGPIPE and this output is only part of what it wrote.
+    if stdout.len() > crate::process::MAX_EXEC_OUTPUT
+        || stderr.len() > crate::process::MAX_EXEC_OUTPUT
+    {
+        return Some(truncated_output_error());
+    }
     let total = stdout.len() + stderr.len();
     if total > BUDGET {
         return Some(AgentResponse::error(
@@ -7289,6 +7297,18 @@ fn oversized_output_error(stdout: &[u8], stderr: &[u8]) -> Option<AgentResponse>
         ));
     }
     None
+}
+
+/// The error for output cut short at `process::MAX_EXEC_OUTPUT`.
+fn truncated_output_error() -> AgentResponse {
+    AgentResponse::error(
+        format!(
+            "command output exceeded {} bytes and was truncated. \
+             Use streaming exec (exec_stream / execStream) for large output.",
+            crate::process::MAX_EXEC_OUTPUT
+        ),
+        error_codes::EXEC_FAILED,
+    )
 }
 
 /// Swap a `Completed` response whose captured output would overflow the wire
@@ -8450,13 +8470,7 @@ fn handle_vm_exec(
     // was truncated and the child likely took a SIGPIPE — return a clear error
     // instead of a silently-truncated success. Large output should stream.
     if stdout.len() > MAX_OUTPUT || stderr.len() > MAX_OUTPUT {
-        return AgentResponse::error(
-            format!(
-                "command output exceeded {MAX_OUTPUT} bytes and was truncated. \
-                 Use streaming exec (exec_stream / execStream) for large output."
-            ),
-            error_codes::EXEC_FAILED,
-        );
+        return truncated_output_error();
     }
     if let Some(timeout_ms) = timed_out_ms {
         stderr.extend_from_slice(format!("\ncommand timed out after {}ms", timeout_ms).as_bytes());
@@ -9030,6 +9044,18 @@ mod format_guard_tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// A disk's bytes with the two superblock fields a no-op `resize2fs`
+    /// rewrites blanked: the last write time and the superblock checksum.
+    /// resize2fs 1.47 stamps the write time whenever the clock has reached a
+    /// new second since the last write, so the raw bytes vary with timing.
+    fn without_write_time(mut bytes: Vec<u8>) -> Vec<u8> {
+        const WRITE_TIME: std::ops::Range<usize> = 1024 + 48..1024 + 52;
+        const CHECKSUM: std::ops::Range<usize> = 1024 + 1020..1024 + 1024;
+        bytes[WRITE_TIME].fill(0);
+        bytes[CHECKSUM].fill(0);
+        bytes
+    }
+
     fn failing_fsck(dir: &Path, code: i32) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(format!("fsck-exit-{code}"));
@@ -9076,13 +9102,13 @@ mod format_guard_tests {
             failing_fsck(dir.path(), 0),
         ] {
             let disk = with_data(dir.path(), "storage.raw", &mkfs, &debugfs);
-            let before = std::fs::read(&disk).unwrap();
+            let before = without_write_time(std::fs::read(&disk).unwrap());
             assert!(
                 !recover_storage_disk(&disk, &fsck, mkfs_path, || false),
                 "{fsck}"
             );
             assert!(
-                std::fs::read(&disk).unwrap() == before,
+                without_write_time(std::fs::read(&disk).unwrap()) == before,
                 "{fsck} changed the disk"
             );
             assert_eq!(read_keep(&debugfs, &disk), "machine data", "{fsck}");
@@ -10291,6 +10317,35 @@ mod tests {
         };
         assert!(matches!(
             cap_exec_response(ok),
+            AgentResponse::Completed { exit_code: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn cap_exec_response_reports_output_past_the_stream_cap() {
+        let cap = crate::process::MAX_EXEC_OUTPUT;
+        for (stdout, stderr) in [(cap + 1, 0), (0, cap + 1)] {
+            let response = cap_exec_response(AgentResponse::Completed {
+                exit_code: 141,
+                stdout: vec![b'A'; stdout],
+                stderr: vec![b'A'; stderr],
+            });
+            let AgentResponse::Error { message, .. } = response else {
+                panic!("output past the cap must become an error");
+            };
+            assert!(message.contains("was truncated"), "{message}");
+        }
+    }
+
+    #[test]
+    fn cap_exec_response_keeps_output_of_exactly_the_stream_cap() {
+        let response = cap_exec_response(AgentResponse::Completed {
+            exit_code: 7,
+            stdout: vec![b'A'; crate::process::MAX_EXEC_OUTPUT],
+            stderr: Vec::new(),
+        });
+        assert!(matches!(
+            response,
             AgentResponse::Completed { exit_code: 7, .. }
         ));
     }
