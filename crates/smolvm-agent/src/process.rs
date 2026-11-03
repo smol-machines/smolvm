@@ -252,7 +252,7 @@ pub fn is_peer_closed(_fd: std::os::unix::io::RawFd) -> bool {
 }
 
 /// Receive `rx` into `buf` until its sender is gone or `deadline` passes.
-fn drain_until_closed(
+pub(crate) fn drain_until_closed(
     rx: &std::sync::mpsc::Receiver<Vec<u8>>,
     buf: &mut Vec<u8>,
     deadline: Instant,
