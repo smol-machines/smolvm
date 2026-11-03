@@ -452,6 +452,12 @@ pub struct VmRecord {
     #[serde(default)]
     pub pid_start_time: Option<u64>,
 
+    /// The engine build ([`crate::ENGINE_BUILD`]) that started the running
+    /// process. A branch is refused from another build; absent on records
+    /// written by engines that did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_build: Option<String>,
+
     /// Number of vCPUs.
     #[serde(default = "default_cpus")]
     pub cpus: u8,
@@ -960,6 +966,7 @@ impl VmRecord {
             paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
+            engine_build: None,
             cpus,
             mem,
             block_io: Default::default(),
@@ -1063,6 +1070,7 @@ impl VmRecord {
             paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
+            engine_build: None,
             cpus,
             mem,
             block_io: Default::default(),

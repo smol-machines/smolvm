@@ -1162,15 +1162,30 @@ fn prepare_running_disk_generation(
     Ok(())
 }
 
-/// Whether the VM process `pid` runs a different smolvm binary than this engine
-/// boots VMs with. A worker roll replaces the binary under running VMs, which
-/// keep the one they started with; branching such a VM from the new engine gave
-/// children whose workload died at once (one customer's batch of 7 on
-/// 2026-10-22). VMs boot as [`super::manager::vm_boot_executable`] run as
-/// `_boot-vm`, which for an embedding SDK is its helper, not the host process.
-/// Linux only; a process or file that cannot be read is not refused.
+/// Whether the running VM process of a machine was started by a different
+/// smolvm engine build than this one. A worker roll replaces the engine under
+/// running VMs, which keep the one they started with; branching such a VM from
+/// the new engine gave children whose workload died at once (one customer's
+/// batch of 7 on 2026-10-22). The record names the build that started the VM
+/// ([`crate::ENGINE_BUILD`]), and only another build is refused: the same
+/// release installed as two files (a CLI's embedded engine and an SDK's cached
+/// one) is one build. A record from an engine that did not record its build
+/// falls back to comparing the process's executable with the one this engine
+/// boots VMs with ([`super::manager::vm_boot_executable`], run as `_boot-vm`,
+/// which for an embedding SDK is its helper, not the host process); that
+/// fallback is Linux only, and a process or file it cannot read is not refused.
+fn source_runs_another_engine(record: &VmRecord) -> bool {
+    let Some(pid) = record.pid else {
+        return false;
+    };
+    match record.engine_build.as_deref() {
+        Some(build) => build != crate::ENGINE_BUILD,
+        None => process_runs_another_boot_binary(pid),
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn source_runs_another_engine(pid: i32) -> bool {
+fn process_runs_another_boot_binary(pid: i32) -> bool {
     match super::manager::vm_boot_executable() {
         Ok(boot) => process_runs_another_binary(pid, &boot),
         Err(_) => false,
@@ -1191,7 +1206,7 @@ fn process_runs_another_binary(pid: i32, binary: &Path) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn source_runs_another_engine(_pid: i32) -> bool {
+fn process_runs_another_boot_binary(_pid: i32) -> bool {
     false
 }
 
@@ -2630,7 +2645,7 @@ pub(crate) fn prepare_forks_reusing(
             "CUDA fork descendants are not supported yet; create a leaf clone without `forkable`",
         ));
     }
-    if golden_rec.pid.is_some_and(source_runs_another_engine) {
+    if source_runs_another_engine(&golden_rec) {
         // A caller-fixable refusal: a restart puts the source on this engine.
         return Err(Error::agent_conflict(
             "fork",
@@ -4791,18 +4806,23 @@ mod tests {
         );
     }
 
-    /// A process running this very binary is this engine's; one running any other
-    /// binary, as a VM left over from before an upgrade does, is not.
+    /// A running record carrying a build id, as every engine now writes.
+    fn running_on_build(pid: u32, build: Option<&str>) -> VmRecord {
+        let mut record = VmRecord::new("golden".into(), 1, 128, vec![], vec![], false);
+        record.pid = Some(pid as i32);
+        record.engine_build = build.map(str::to_string);
+        record
+    }
+
+    /// Spawn a process that runs another binary than this test, waiting past
+    /// the window between spawn() and its exec in which it is still a copy of
+    /// this binary.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_source_on_another_engine_binary_is_told_apart() {
-        assert!(!source_runs_another_engine(std::process::id() as i32));
-        let mut other = std::process::Command::new("sleep")
+    fn spawn_another_binary() -> std::process::Child {
+        let other = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
-        // spawn() returns once the child exists, which can be before its exec: until then
-        // it is still a copy of this binary, and the check below read "same engine"
         let own = std::fs::read_link("/proc/self/exe").unwrap();
         for _ in 0..200 {
             match std::fs::read_link(format!("/proc/{}/exe", other.id())) {
@@ -4810,7 +4830,59 @@ mod tests {
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
-        let differs = source_runs_another_engine(other.id() as i32);
+        other
+    }
+
+    /// The build that started the source decides, not the file its process
+    /// runs: the same release installed twice (a CLI's embedded engine and an
+    /// SDK's cached copy) is one build, and a source on it is branched from
+    /// the other file; a source started by another build is refused.
+    #[test]
+    fn a_source_is_refused_by_its_recorded_engine_build() {
+        assert!(!source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            Some(crate::ENGINE_BUILD)
+        )));
+        assert!(source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            Some("0.0.0+0000000000000")
+        )));
+        #[cfg(target_os = "linux")]
+        {
+            let mut other = spawn_another_binary();
+            let same_build_other_file = source_runs_another_engine(&running_on_build(
+                other.id(),
+                Some(crate::ENGINE_BUILD),
+            ));
+            let other_build = source_runs_another_engine(&running_on_build(
+                other.id(),
+                Some("0.0.0+0000000000000"),
+            ));
+            let _ = other.kill();
+            let _ = other.wait();
+            assert!(!same_build_other_file);
+            assert!(other_build);
+        }
+        let mut stopped = running_on_build(std::process::id(), Some("0.0.0+0000000000000"));
+        stopped.pid = None;
+        assert!(
+            !source_runs_another_engine(&stopped),
+            "a record without a process is not refused here"
+        );
+    }
+
+    /// A record from an engine that did not record its build falls back to the
+    /// binary: a process running this very binary is this engine's; one running
+    /// any other binary, as a VM left over from before an upgrade does, is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_source_on_another_engine_binary_is_told_apart() {
+        assert!(!source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            None
+        )));
+        let mut other = spawn_another_binary();
+        let differs = source_runs_another_engine(&running_on_build(other.id(), None));
         let sleep_bin = std::fs::read_link(format!("/proc/{}/exe", other.id())).unwrap();
         // An embedding SDK boots VMs with its helper, not the host process: a
         // VM running that helper is this engine's, whatever the host runs.
@@ -4823,7 +4895,7 @@ mod tests {
         assert!(helper_is_this_engine);
         assert!(host_is_not_the_helper);
         assert!(
-            !source_runs_another_engine(i32::MAX),
+            !source_runs_another_engine(&running_on_build(i32::MAX as u32, None)),
             "an unreadable process is not refused"
         );
     }

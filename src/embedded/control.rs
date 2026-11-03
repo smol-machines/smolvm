@@ -297,6 +297,7 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<Sta
         record.state = RecordState::Running;
         record.pid = pid;
         record.pid_start_time = pid_start_time;
+        record.engine_build = Some(crate::ENGINE_BUILD.to_string());
         record.paused_checkpoint = None;
     })?
     .ok_or_else(|| Error::vm_not_found(name))?;
@@ -902,6 +903,7 @@ pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
         record.state = RecordState::Running;
         record.pid = pid;
         record.pid_start_time = pid_start_time;
+        record.engine_build = Some(crate::ENGINE_BUILD.to_string());
     })?
     .ok_or_else(|| Error::vm_not_found(name))?;
     Ok(())

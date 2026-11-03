@@ -927,6 +927,8 @@ impl ApiState {
     ) -> std::result::Result<(), crate::Error> {
         let pid_start_time = pid.and_then(crate::process::process_start_time);
         let result = self.db.update_vm(name, |record| {
+            record.engine_build =
+                (state == RecordState::Running).then(|| crate::ENGINE_BUILD.to_string());
             record.state = state;
             record.pid = pid;
             record.pid_start_time = pid_start_time;

@@ -59,7 +59,37 @@ fn has_library(name: &str) -> bool {
     pkg_config::Config::new().probe(name).is_ok()
 }
 
+/// Embed the git commit this engine is built from as `SMOLVM_GIT_COMMIT`, so two
+/// builds of one version can still be told apart (a running VM is only
+/// branched by the engine build that started it). A build without git, such
+/// as one from a crates.io tarball, records `unknown`.
+fn embed_git_commit() {
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|commit| commit.trim().to_string())
+        .filter(|commit| !commit.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Ok(head) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+    {
+        if head.status.success() {
+            if let Ok(head) = String::from_utf8(head.stdout) {
+                println!("cargo:rerun-if-changed={}", head.trim());
+            }
+        }
+    }
+    println!("cargo:rustc-env=SMOLVM_GIT_COMMIT={commit}");
+}
+
 fn main() {
+    embed_git_commit();
     // Build scripts run on the HOST: `cfg!(target_os)` here describes the
     // build machine, not the artifact. Cross-compiling smolvm from macOS to
     // Linux (zigbuild) must NOT emit macOS-only linker args (-sectcreate,
