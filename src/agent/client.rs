@@ -1120,6 +1120,9 @@ pub struct AgentClient {
     file_target: Option<WorkloadTarget>,
     /// The agent's advertised capabilities, read once per connection.
     capabilities: Option<Vec<String>>,
+    /// Cumulative output ceiling of a streaming exec on this connection; see
+    /// [`MAX_STREAMING_EXEC_OUTPUT`] and [`Self::set_streaming_output_cap`].
+    streaming_output_cap: Option<usize>,
 }
 
 fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
@@ -1316,6 +1319,7 @@ impl AgentClient {
             trace_id: None,
             file_target: None,
             capabilities: None,
+            streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
         }
     }
 }
@@ -1441,7 +1445,17 @@ impl AgentClient {
             trace_id: None,
             file_target: None,
             capabilities: None,
+            streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
         })
+    }
+
+    /// Change the cumulative output ceiling of streaming execs on this
+    /// connection (`None`: no ceiling). Only a caller that hands every event
+    /// straight to a consumer that pushes back, such as the CLI writing to its
+    /// own stdout, should lift it: the ceiling is what stops a guest that never
+    /// stops writing when nobody is reading any more.
+    pub fn set_streaming_output_cap(&mut self, cap: Option<usize>) {
+        self.streaming_output_cap = cap;
     }
 
     /// Set a trace ID for correlating this client session's requests with host API calls.
@@ -3647,6 +3661,7 @@ impl AgentClient {
             trace_id: self.trace_id.clone(),
             file_target: self.file_target.clone(),
             capabilities: self.capabilities.clone(),
+            streaming_output_cap: self.streaming_output_cap,
         };
         std::thread::scope(|scope| {
             let sender = scope.spawn(move || {
@@ -3926,7 +3941,9 @@ impl AgentClient {
 /// the collect loop) instead of growing unbounded.
 ///
 /// Semantics: this is a per-exec-session cap on the BUFFERED/relayed output of
-/// the streaming exec path. Interactive PTY sessions are long-lived by design
+/// the streaming exec path, the default for every connection. The CLI lifts
+/// it (see [`AgentClient::set_streaming_output_cap`]): it writes each frame to
+/// its own stdout and stops when that pipe closes, so nothing accumulates. Interactive PTY sessions are long-lived by design
 /// and do NOT flow through here — they use
 /// [`AgentClient::interactive_session_io`], which streams frame-by-frame to the
 /// WebSocket without accumulating — so a legitimate long interactive session is
@@ -3937,7 +3954,8 @@ fn collect_exec_events<F>(client: &mut AgentClient, op: &str, on_event: F) -> Re
 where
     F: FnMut(ExecEvent),
 {
-    collect_exec_events_inner(|| client.receive(), op, MAX_STREAMING_EXEC_OUTPUT, on_event)
+    let cap = client.streaming_output_cap;
+    collect_exec_events_inner(|| client.receive(), op, cap, on_event)
 }
 
 /// Cap-parameterized core of [`collect_exec_events`], pulling responses from a
@@ -3946,7 +3964,7 @@ where
 fn collect_exec_events_inner<N, F>(
     mut next_response: N,
     op: &str,
-    cap: usize,
+    cap: Option<usize>,
     mut on_event: F,
 ) -> Result<()>
 where
@@ -3992,7 +4010,7 @@ where
         // Cap check runs after relaying each frame (matching the buffered
         // path's "send chunk, then break at the cap" order): we relay at most
         // `cap` + one frame before terminating with a truncation signal.
-        if total >= cap {
+        if let Some(cap) = cap.filter(|cap| total >= *cap) {
             on_event(ExecEvent::Error(format!(
                 "streaming output exceeded {cap} byte cap; exec terminated (output truncated)"
             )));
@@ -4282,13 +4300,40 @@ mod collect_exec_cap_tests {
                     .ok_or_else(|| Error::agent("test", "no more responses"))
             },
             "test exec",
-            cap,
+            Some(cap),
             |e| events.push(e),
         );
         (events, res)
     }
 
     const TEST_CAP: usize = 1024;
+
+    #[test]
+    fn without_a_cap_every_frame_is_relayed_until_exit() {
+        // The CLI's --stream: far past any cap, all of it arrives, then the exit.
+        let mut responses = vec![AgentResponse::Started];
+        for _ in 0..1000 {
+            responses.push(stdout(TEST_CAP));
+        }
+        responses.push(AgentResponse::Exited {
+            exit_code: 0,
+            oom: false,
+        });
+        let mut iter = responses.into_iter();
+        let mut events = Vec::new();
+        collect_exec_events_inner(
+            || {
+                iter.next()
+                    .ok_or_else(|| Error::agent("test", "no more responses"))
+            },
+            "test exec",
+            None,
+            |e| events.push(e),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1001);
+        assert_eq!(events.last(), Some(&ExecEvent::Exit(0)));
+    }
 
     #[test]
     fn stops_at_cumulative_cap_with_truncation_signal() {

@@ -7305,7 +7305,8 @@ fn truncated_output_error() -> AgentResponse {
     AgentResponse::error(
         format!(
             "command output exceeded {} bytes and was truncated. \
-             Use streaming exec (exec_stream / execStream) for large output.",
+             Write large output to a file in the machine and copy it out \
+             (`smolvm machine cp`), or stream it with `smolvm machine exec --stream`.",
             crate::process::MAX_EXEC_OUTPUT
         ),
         error_codes::EXEC_FAILED,

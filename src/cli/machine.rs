@@ -4269,6 +4269,8 @@ impl ExecCmd {
                     .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner.clone()));
                 let mut printer = ExecEventPrinter::default();
+                // Written straight to stdout, so there is nothing to bound.
+                client.set_streaming_output_cap(None);
                 client.run_streaming_with(config, |event| printer.handle(event))?;
                 std::process::exit(printer.exit_code);
             }
@@ -4328,6 +4330,7 @@ impl ExecCmd {
 
             if self.stream {
                 let mut printer = ExecEventPrinter::default();
+                client.set_streaming_output_cap(None);
                 client.vm_exec_streaming_with(
                     self.command.clone(),
                     env.clone(),
@@ -4359,12 +4362,12 @@ impl ExecEventPrinter {
     fn handle(&mut self, event: smolvm::agent::ExecEvent) {
         match event {
             smolvm::agent::ExecEvent::Stdout(data) => {
-                let _ = std::io::stdout().write_all(&data);
-                let _ = std::io::stdout().flush();
+                let mut out = std::io::stdout();
+                exit_on_broken_pipe(out.write_all(&data).and_then(|()| out.flush()));
             }
             smolvm::agent::ExecEvent::Stderr(data) => {
-                let _ = std::io::stderr().write_all(&data);
-                let _ = std::io::stderr().flush();
+                let mut err = std::io::stderr();
+                exit_on_broken_pipe(err.write_all(&data).and_then(|()| err.flush()));
             }
             smolvm::agent::ExecEvent::Exit(code) => {
                 self.exit_code = code;
@@ -4373,6 +4376,18 @@ impl ExecEventPrinter {
                 eprintln!("error: {}", msg);
                 self.exit_code = 1;
             }
+        }
+    }
+}
+
+/// Stop when the reader of our output has gone (`exec --stream -- yes | head`),
+/// as a command killed by SIGPIPE would: exit 141. Closing the connection makes
+/// the agent kill the command; without this the CLI would relay its output into
+/// a closed pipe for as long as it runs.
+fn exit_on_broken_pipe(result: std::io::Result<()>) {
+    if let Err(e) = result {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(141);
         }
     }
 }
