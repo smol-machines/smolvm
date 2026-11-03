@@ -3,6 +3,7 @@
 pub mod cleanup_ephemeral;
 pub mod completion;
 pub mod config;
+pub mod cp_tree;
 pub mod host_network;
 pub mod machine;
 pub mod openapi;
@@ -74,6 +75,8 @@ pub struct ProgressBar {
     /// Set to true when at least one progress line has been printed,
     /// so `finish` knows to emit a leading `\r` to overwrite it.
     printed: bool,
+    /// `(done, total)` files for a directory copy, shown before the bytes.
+    files: Option<(usize, usize)>,
 }
 
 impl ProgressBar {
@@ -93,7 +96,14 @@ impl ProgressBar {
             // gives the user feedback that something started.
             last_print: now - std::time::Duration::from_millis(THROTTLE_INITIAL_MS),
             printed: false,
+            files: None,
         }
+    }
+
+    /// Show a file count ("3/17 files") on every line, for a transfer made
+    /// of many files. `done` is how many have landed so far.
+    pub fn set_files(&mut self, done: usize, total: usize) {
+        self.files = Some((done, total));
     }
 
     /// Report the running total of bytes transferred. Throttled —
@@ -135,12 +145,17 @@ impl ProgressBar {
         let elapsed = self.started_at.elapsed().as_secs_f64().max(0.001);
         let rate = bytes_so_far as f64 / elapsed;
         let rate_str = format!("{}/s", format_bytes(rate as u64));
+        let files = match self.files {
+            Some((done, total)) => format!("{done}/{total} files, "),
+            None => String::new(),
+        };
         match self.total {
             Some(total) if total > 0 => {
                 let pct = (bytes_so_far as f64 * 100.0 / total as f64).min(100.0);
                 format!(
-                    "{}: {} / {} ({:.1}%, {})",
+                    "{}: {}{} / {} ({:.1}%, {})",
                     self.label,
+                    files,
                     format_bytes(bytes_so_far),
                     format_bytes(total),
                     pct,
@@ -148,8 +163,9 @@ impl ProgressBar {
                 )
             }
             _ => format!(
-                "{}: {} ({})",
+                "{}: {}{} ({})",
                 self.label,
+                files,
                 format_bytes(bytes_so_far),
                 rate_str
             ),

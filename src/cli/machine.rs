@@ -7819,14 +7819,18 @@ impl PruneCmd {
 
 /// Copy files between host and a running machine.
 ///
-/// Uses `machine:path` syntax to specify the remote side.
+/// Uses `machine:path` syntax to specify the remote side. A host directory
+/// is uploaded recursively like `cp -r`: into an existing guest directory
+/// under its own name, or as the destination path itself. Symlinks are
+/// followed and each file keeps its permission bits unless --mode is given.
 ///
 /// Examples:
 ///   smolvm machine cp ./script.py myvm:/workspace/script.py    # upload
+///   smolvm machine cp ./src myvm:/workspace                     # upload a directory
 ///   smolvm machine cp myvm:/workspace/output.json ./output.json # download
 #[derive(Args, Debug)]
 pub struct CpCmd {
-    /// Source path (local file or machine:path)
+    /// Source path (local file or directory, or machine:path)
     #[arg(value_name = "SRC")]
     pub src: String,
 
@@ -7834,7 +7838,7 @@ pub struct CpCmd {
     #[arg(value_name = "DST")]
     pub dst: String,
 
-    /// Set the file's mode on upload (octal, e.g. 644)
+    /// Set the mode of every uploaded file (octal, e.g. 644)
     #[arg(long, value_name = "OCTAL")]
     pub mode: Option<String>,
 
@@ -7892,11 +7896,13 @@ impl CpCmd {
 
         // Copy into the filesystem the machine's commands run in: an image
         // machine's container overlay, or a bare machine's own root.
-        let target = smolvm::db::SmolvmDb::open()
+        let record = smolvm::db::SmolvmDb::open()
             .ok()
-            .and_then(|db| db.get_vm(&machine_name).ok().flatten())
+            .and_then(|db| db.get_vm(&machine_name).ok().flatten());
+        let target = record
+            .as_ref()
             .map_or(smolvm::agent::WorkloadTarget::Vm, |record| {
-                smolvm::workload::machine_target(&record)
+                smolvm::workload::machine_target(record)
             });
         client.use_target(target)?;
 
@@ -7906,6 +7912,16 @@ impl CpCmd {
                 uid: self.uid,
                 gid: self.gid,
             };
+            if Path::new(&local_path).is_dir() {
+                return upload_directory(
+                    &mut client,
+                    &machine_name,
+                    record.as_ref(),
+                    &local_path,
+                    &guest_path,
+                    meta,
+                );
+            }
             // Stream from file — only one chunk (~1 MiB) in memory at a time.
             let file = std::fs::File::open(&local_path).map_err(|e| {
                 smolvm::Error::agent("read local file", format!("{}: {}", local_path, e))
@@ -7934,6 +7950,113 @@ impl CpCmd {
         }
 
         Ok(())
+    }
+}
+
+/// Upload a host directory the way `cp -r` would: into `guest_path` under
+/// the source's basename when that is an existing directory, otherwise as
+/// `guest_path` itself. The protocol moves one file at a time, so the tree is
+/// planned on the host, every guest directory is created by one `mkdir -p`,
+/// and each file is then written with the single-file call. Host permission
+/// bits are kept unless `--mode` was given; `--uid`/`--gid` apply to the
+/// directories as well as the files.
+fn upload_directory(
+    client: &mut AgentClient,
+    machine_name: &str,
+    record: Option<&smolvm::config::VmRecord>,
+    local_path: &str,
+    guest_path: &str,
+    meta: smolvm::agent::FileWriteMeta,
+) -> smolvm::Result<()> {
+    use crate::cli::cp_tree;
+
+    let source = Path::new(local_path);
+    let basename = source
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .ok_or_else(|| {
+            smolvm::Error::config(
+                "cp",
+                format!("cannot copy '{local_path}': it has no directory name"),
+            )
+        })?;
+    let plan = cp_tree::plan_directory(source)
+        .map_err(|e| smolvm::Error::agent("read local directory", format!("{local_path}: {e}")))?;
+    for (path, reason) in &plan.skipped {
+        eprintln!("warning: skipping {local_path}/{path}: {reason}");
+    }
+
+    // An existing guest directory receives the copy inside it; a missing path
+    // (or anything a listing refuses) becomes the copy, and `mkdir -p` then
+    // reports a file in the way.
+    let dst_is_dir = client.list_directory(guest_path).is_ok();
+    let dest_root = cp_tree::resolve_destination(guest_path, &basename, dst_is_dir);
+
+    let owner = match (meta.uid, meta.gid) {
+        (None, None) => None,
+        (uid, gid) => Some((uid.unwrap_or(0), gid.unwrap_or(0))),
+    };
+    let mkdir = cp_tree::mkdir_command(&dest_root, &plan.dirs, owner);
+    let (code, _, stderr) = exec_in_machine(client, machine_name, record, mkdir)?;
+    if code != 0 {
+        return Err(smolvm::Error::agent(
+            "create guest directories",
+            String::from_utf8_lossy(&stderr).trim().to_string(),
+        ));
+    }
+
+    let total_files = plan.files.len();
+    let total_bytes = plan.total_bytes();
+    let mut bar = crate::cli::ProgressBar::new(
+        format!("Uploading {local_path} -> {dest_root}"),
+        Some(total_bytes),
+    );
+    bar.set_files(0, total_files);
+    let mut bytes_done = 0u64;
+    for (index, file) in plan.files.iter().enumerate() {
+        let guest_file = cp_tree::guest_join(&dest_root, &file.relative);
+        let handle = std::fs::File::open(&file.host).map_err(|e| {
+            smolvm::Error::agent("read local file", format!("{}: {}", file.host.display(), e))
+        })?;
+        let file_meta = smolvm::agent::FileWriteMeta {
+            mode: Some(meta.mode.unwrap_or(file.mode)),
+            ..meta
+        };
+        bar.set_files(index, total_files);
+        client.write_file_from_reader_with_progress(
+            &guest_file,
+            handle,
+            file.size,
+            file_meta,
+            |sent| bar.update(bytes_done + sent),
+        )?;
+        bytes_done += file.size;
+    }
+    bar.set_files(total_files, total_files);
+    bar.finish(total_bytes);
+    Ok(())
+}
+
+/// Run one shell command where the machine's files live: a bare machine's
+/// root, or the image machine's persistent overlay with its mounts in place.
+fn exec_in_machine(
+    client: &mut AgentClient,
+    machine_name: &str,
+    record: Option<&smolvm::config::VmRecord>,
+    script: String,
+) -> smolvm::Result<(i32, Vec<u8>, Vec<u8>)> {
+    let command = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+    let timeout = Some(Duration::from_secs(60));
+    match record.and_then(|r| r.image.as_deref().map(|image| (r, image))) {
+        Some((record, image)) => {
+            let config = RunConfig::new(image, command)
+                .in_machine(record, machine_name, &[])
+                .with_mounts(mounts_to_virtiofs_bindings(&record.host_mounts()))
+                .with_timeout(timeout);
+            client.run_non_interactive(config)
+        }
+        None => client.vm_exec(command, Vec::new(), None, timeout, None),
     }
 }
 
