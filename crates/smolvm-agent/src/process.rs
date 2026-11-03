@@ -392,8 +392,10 @@ where
                             if stdout_tx.send(chunk).is_err() {
                                 break; // receiver dropped
                             }
-                            if total >= MAX_EXEC_OUTPUT {
-                                break; // cap reached
+                            // Stop only once past the cap, so output of exactly
+                            // the cap is not mistaken for truncated output.
+                            if total > MAX_EXEC_OUTPUT {
+                                break;
                             }
                         }
                         Err(_) => break,
@@ -418,7 +420,7 @@ where
                             if stderr_tx.send(chunk).is_err() {
                                 break;
                             }
-                            if total >= MAX_EXEC_OUTPUT {
+                            if total > MAX_EXEC_OUTPUT {
                                 break;
                             }
                         }
