@@ -478,7 +478,14 @@ pub(crate) fn effective_pack_allow_list(
     let Some(policy) = egress else {
         return Ok(manifest_egress);
     };
-    if policy.network_override.is_some() {
+    if let Some(network) = policy.network_override {
+        if !network {
+            return Ok(smolvm::pack_export::ValidatedManifestEgress {
+                allowed_cidrs: None,
+                dns_filter_hosts: None,
+                egress_rules: Vec::new(),
+            });
+        }
         return Ok(smolvm::pack_export::ValidatedManifestEgress {
             allowed_cidrs: policy.allowed_cidrs.clone(),
             dns_filter_hosts: policy.dns_filter_hosts.clone(),
@@ -2951,7 +2958,23 @@ mod tests {
             smolvm::pack_export::ValidatedManifestEgress {
                 allowed_cidrs: None,
                 dns_filter_hosts: Some(vec!["*.example.com".to_string()]),
-                egress_rules: manifest.egress_rules,
+                egress_rules: manifest.egress_rules.clone(),
+            }
+        );
+
+        // Explicitly disabling networking (`network_override: Some(false)`) clears
+        // the manifest's deny rules as well as its allow-list so they do not
+        // re-enable networking at launch.
+        let disabled = ResolvedEgressPolicy {
+            network_override: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_pack_allow_list(Some(&disabled), &manifest).unwrap(),
+            smolvm::pack_export::ValidatedManifestEgress {
+                allowed_cidrs: None,
+                dns_filter_hosts: None,
+                egress_rules: Vec::new(),
             }
         );
     }
