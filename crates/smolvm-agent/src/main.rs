@@ -6192,15 +6192,36 @@ fn run_interactive_loop(
     child: &mut Child,
     timeout_ms: Option<u64>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+    let result = run_interactive_loop_io(
+        stream,
+        child,
+        timeout_ms,
+        &mut child_stdout,
+        &mut child_stderr,
+    );
+    // A pipe still open after the session is held by a process the command
+    // left running in the background: keep it drained, so that process is not
+    // killed by SIGPIPE the next time it writes.
+    process::drain_in_background(child_stdout);
+    process::drain_in_background(child_stderr);
+    result
+}
+
+fn run_interactive_loop_io(
+    stream: &mut impl ReadWrite,
+    child: &mut Child,
+    timeout_ms: Option<u64>,
+    child_stdout: &mut Option<std::process::ChildStdout>,
+    child_stderr: &mut Option<std::process::ChildStderr>,
+) -> Result<i32, Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::time::{Duration, Instant};
 
     let start = Instant::now();
     let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
 
-    // Get handles to child's stdio
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
     let mut child_stdin = child.stdin.take();
 
     // Never block the I/O loop writing into a child that may itself be
@@ -6215,12 +6236,12 @@ fn run_interactive_loop(
     let mut input_frame = InteractiveFrame::default();
 
     // Set non-blocking mode on stdout/stderr
-    if let Some(ref stdout) = child_stdout {
+    if let Some(ref stdout) = *child_stdout {
         if !set_nonblocking(stdout.as_raw_fd()) {
             warn!("failed to set stdout to non-blocking mode");
         }
     }
-    if let Some(ref stderr) = child_stderr {
+    if let Some(ref stderr) = *child_stderr {
         if !set_nonblocking(stderr.as_raw_fd()) {
             warn!("failed to set stderr to non-blocking mode");
         }
@@ -6238,8 +6259,8 @@ fn run_interactive_loop(
             // Drain any remaining output
             drain_remaining_output(
                 stream,
-                &mut child_stdout,
-                &mut child_stderr,
+                child_stdout,
+                child_stderr,
                 &mut stdout_buf,
                 &mut stderr_buf,
             )?;
@@ -6348,7 +6369,7 @@ fn run_interactive_loop(
         // exits.
         let mut stdout_closed = false;
         if poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            if let Some(ref mut stdout) = child_stdout {
+            if let Some(ref mut stdout) = *child_stdout {
                 loop {
                     match stdout.read(&mut stdout_buf) {
                         Ok(0) => {
@@ -6379,7 +6400,7 @@ fn run_interactive_loop(
             }
         }
         if stdout_closed {
-            child_stdout = None;
+            *child_stdout = None;
         }
 
         // Read available stderr. Same disconnection handling as stdout.
@@ -6389,7 +6410,7 @@ fn run_interactive_loop(
         // exits.
         let mut stderr_closed = false;
         if poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            if let Some(ref mut stderr) = child_stderr {
+            if let Some(ref mut stderr) = *child_stderr {
                 loop {
                     match stderr.read(&mut stderr_buf) {
                         Ok(0) => {
@@ -6420,7 +6441,7 @@ fn run_interactive_loop(
             }
         }
         if stderr_closed {
-            child_stderr = None;
+            *child_stderr = None;
         }
 
         // Read only bytes currently available; a partial frame must leave the
@@ -8265,31 +8286,37 @@ fn handle_vm_exec_background(
     }
 }
 
-/// How long a killed exec waits for output still held open by a child that
-/// left its process group before replying without it.
-const KILLED_EXEC_OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Read `pipe` on its own thread, sending chunks as they arrive. Reads ONE byte
-/// past the cap so the handler can tell "exactly at cap" from "overflowed" and
-/// return a clear error instead of a silently truncated result (+ a SIGPIPE
-/// exit on the child). Bytes, not strings, so binary output (image bytes,
-/// tarballs, any non-UTF-8 data) is preserved through the protocol.
+/// Read `pipe` on its own thread, sending chunks as they arrive. Forwards ONE
+/// byte past the cap so the handler can tell "exactly at cap" from "overflowed"
+/// and return a clear error instead of a silently truncated result, then stops
+/// reading (the child takes a SIGPIPE). Bytes, not strings, so binary output
+/// (image bytes, tarballs, any non-UTF-8 data) is preserved through the protocol.
+///
+/// Once the handler has replied, the pipe is still read to EOF and discarded: a
+/// process the command left running in the background that writes to it later
+/// is not killed by SIGPIPE.
 fn spawn_exec_output_reader<R: Read + Send + 'static>(
     name: &str,
-    pipe: R,
+    mut pipe: R,
 ) -> Option<std::sync::mpsc::Receiver<Vec<u8>>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            let mut pipe = pipe.take(crate::process::MAX_EXEC_OUTPUT as u64 + 1);
+            let mut left = crate::process::MAX_EXEC_OUTPUT + 1;
+            let mut attached = true;
             let mut chunk = vec![0u8; 64 * 1024];
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) => break,
+                    Ok(_) if !attached => {}
                     Ok(n) => {
-                        if tx.send(chunk[..n].to_vec()).is_err() {
-                            break; // the handler already replied
+                        let keep = n.min(left);
+                        left -= keep;
+                        if tx.send(chunk[..keep].to_vec()).is_err() {
+                            attached = false; // the handler already replied
+                        } else if left == 0 {
+                            break;
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -8301,17 +8328,14 @@ fn spawn_exec_output_reader<R: Read + Send + 'static>(
     Some(rx)
 }
 
-/// Collect a reader's chunks until EOF, or until `deadline` when given.
+/// Collect a reader's chunks until EOF or `deadline`.
 fn collect_exec_output(
     rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
-    deadline: Option<std::time::Instant>,
+    deadline: std::time::Instant,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     if let Some(rx) = rx {
-        match deadline {
-            Some(deadline) => process::drain_until_closed(&rx, &mut buf, deadline),
-            None => buf.extend(rx.iter().flatten()),
-        }
+        process::drain_until_closed(&rx, &mut buf, deadline);
     }
     buf
 }
@@ -8438,29 +8462,20 @@ fn handle_vm_exec(
                             pid = child.id(),
                             "client disconnected during VM exec, killing child group"
                         );
-                        // Kill the entire process group — `sh -c 'sleep 30'`
-                        // creates child processes that inherit the stdout pipe.
-                        // Killing just `sh` leaves `sleep` holding the pipe,
-                        // blocking the reader threads' EOF. killpg hits them all.
-                        #[cfg(target_os = "linux")]
-                        unsafe {
-                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-                        }
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        // Kill the whole command: its group, its descendants
+                        // (one that called setsid left the group) and any
+                        // process still writing to its output (one that was
+                        // re-parented). `sh -c 'sleep 30'` leaves `sleep`
+                        // holding the stdout pipe if only `sh` dies.
+                        process::kill_child_group_tree(&mut child);
                         killed = true;
                         break 129; // SIGHUP convention: killed by disconnect
                     }
                 }
                 if let Some(deadline) = deadline {
                     if std::time::Instant::now() >= deadline {
-                        warn!("VM exec command timed out, killing process group");
-                        #[cfg(target_os = "linux")]
-                        unsafe {
-                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-                        }
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        warn!("VM exec command timed out, killing it");
+                        process::kill_child_group_tree(&mut child);
                         killed = true;
                         timed_out_ms = timeout_ms;
                         break 124; // Standard timeout exit code
@@ -8482,10 +8497,16 @@ fn handle_vm_exec(
         }
     };
 
-    // After a kill, the readers see EOF as soon as the group is gone, unless a
-    // child that left the group still holds a pipe: then reply with what
-    // arrived within a short grace instead of waiting for that child to exit.
-    let output_deadline = killed.then(|| std::time::Instant::now() + KILLED_EXEC_OUTPUT_GRACE);
+    // After a kill, every process that held the output is dead and the readers
+    // see EOF at once. After an exit, a process the command left running in the
+    // background can hold the output for as long as it lives: reply with what
+    // arrived in a bounded wait, as the image path does, and leave it running.
+    let output_deadline = std::time::Instant::now()
+        + if killed {
+            process::KILLED_OUTPUT_GRACE
+        } else {
+            process::READER_JOIN_TIMEOUT
+        };
     let stdout = collect_exec_output(stdout_rx, output_deadline);
     let mut stderr = collect_exec_output(stderr_rx, output_deadline);
 
@@ -10124,21 +10145,36 @@ mod tests {
         );
     }
 
-    #[test]
+    /// Whether `pid` is gone (or a zombie) within two seconds.
     #[cfg(target_os = "linux")]
-    fn vm_exec_timeout_is_not_blocked_by_a_child_that_left_the_group() {
-        // The escaped child prints its PID, then holds stdout open past the
-        // timeout: killpg cannot reach it (#2046).
+    fn exits_soon(pid: i32) -> bool {
+        for _ in 0..100 {
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit(')')
+                        .next()
+                        .map(|r| r.trim_start().starts_with('Z'))
+                })
+                .is_some_and(|zombie| !zombie);
+            if !alive {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// A timed-out `sh -c <script>` (whose first line of stdout is a PID it
+    /// started) answers on time, and that PID is dead afterwards.
+    #[cfg(target_os = "linux")]
+    fn assert_timeout_kills_the_escapee(script: &str) {
         let start = std::time::Instant::now();
         let response = handle_vm_exec(
-            &[
-                "sh".to_string(),
-                "-c".to_string(),
-                "setsid sh -c 'echo $$; exec sleep 30' & wait".to_string(),
-            ],
+            &["sh".to_string(), "-c".to_string(), script.to_string()],
             &[],
             None,
-            Some(200),
+            Some(1000),
             None,
             None,
         );
@@ -10152,15 +10188,119 @@ mod tests {
         else {
             panic!("expected completed response");
         };
-        let escaped: i32 = String::from_utf8_lossy(&stdout).trim().parse().unwrap();
-        // SAFETY: plain signal delivery to the PID the escaped child printed.
-        unsafe { libc::kill(escaped, libc::SIGKILL) };
+        let escaped: i32 = String::from_utf8_lossy(&stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no PID in stdout: {stdout:?}"));
+        let gone = exits_soon(escaped);
+        if !gone {
+            // SAFETY: plain signal delivery to the PID the escaped child printed.
+            unsafe { libc::kill(escaped, libc::SIGKILL) };
+        }
 
         assert_eq!(exit_code, 124);
-        assert!(String::from_utf8_lossy(&stderr).contains("command timed out after 200ms"));
+        assert!(String::from_utf8_lossy(&stderr).contains("command timed out after 1000ms"));
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < std::time::Duration::from_secs(3),
             "a child holding stdout must not delay the timeout reply: {elapsed:?}"
+        );
+        assert!(gone, "{escaped} survived the timed-out command");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vm_exec_timeout_kills_a_child_that_left_the_group() {
+        // setsid takes the child out of the command's group: killpg cannot
+        // reach it, and it holds stdout open past the timeout (#2046).
+        assert_timeout_kills_the_escapee("setsid sh -c 'echo $$; exec sleep 30' & wait");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vm_exec_timeout_kills_a_reparented_child_that_still_holds_the_output() {
+        // The subshell exits at once, so the child is re-parented and is no
+        // longer a descendant of the command, but it still holds stdout.
+        assert_timeout_kills_the_escapee(
+            "(setsid sh -c 'echo $$; exec sleep 30' &); exec sleep 30",
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vm_exec_that_exits_neither_waits_for_nor_kills_a_background_writer() {
+        // The background job holds stdout and writes to it again after the
+        // reply. The reply does not wait for it, and its later writes do not
+        // kill it with SIGPIPE: it gets as far as the marker.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let script = format!(
+            "echo hi; (sleep 7; echo late; sleep 0.5; echo later; touch '{}') &",
+            marker.display()
+        );
+        let start = std::time::Instant::now();
+        let response = handle_vm_exec(
+            &["sh".to_string(), "-c".to_string(), script],
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        let elapsed = start.elapsed();
+        let AgentResponse::Completed {
+            exit_code, stdout, ..
+        } = response
+        else {
+            panic!("expected completed response");
+        };
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, b"hi\n");
+        assert!(
+            elapsed < std::time::Duration::from_secs(7),
+            "the reply waited for the background job: {elapsed:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            marker.exists(),
+            "the background job died writing to the drained pipe"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn streaming_exec_keeps_draining_a_background_writer_after_the_session() {
+        use std::os::unix::net::UnixStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let script = format!(
+            "echo hi; (sleep 1; echo late; sleep 0.5; echo later; touch '{}') &",
+            marker.display()
+        );
+        let (mut agent, _client) = UnixStream::pair().unwrap();
+        let (mut child, pty) = spawn_direct_interactive_command(
+            &["sh".to_string(), "-c".to_string(), script],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(pty.is_none());
+        assert_eq!(
+            run_interactive_loop(&mut agent, &mut child, None).unwrap(),
+            0
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            marker.exists(),
+            "the background job died writing to its closed output"
         );
     }
 
