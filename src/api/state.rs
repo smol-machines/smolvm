@@ -2099,6 +2099,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     let cpu_limit_millicpus =
         crate::agent::cpu_limit::read_active_cpu_limit(&name, entry.manager.child_pid());
     let egress_flows = crate::agent::read_egress_flows(&name, state == "running");
+    let pressure = crate::agent::read_guest_pressure(&name, state == "running");
     let mediation_machine_id = (state == "running")
         .then(|| crate::agent::read_mediation_machine_id(&name))
         .flatten();
@@ -2172,6 +2173,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         egress_signals,
         cpu_limit_millicpus,
         egress_flows,
+        pressure,
         mediation_machine_id,
         cpu_seconds,
         cpu_millis,

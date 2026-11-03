@@ -740,6 +740,12 @@ pub enum AgentRequest {
     /// occupies. Only the guest's allocator knows what the machine is using.
     MemoryStatus,
 
+    /// Report the guest's pressure stall information: the share of time
+    /// tasks spent waiting for CPU, memory and IO, from
+    /// `/proc/pressure/{cpu,memory,io}`. Only the guest knows this; the host
+    /// sees a VMM process, not the scheduler inside it.
+    PressureStatus,
+
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
     NetworkTest {
@@ -1219,6 +1225,7 @@ impl AgentRequest {
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
             AgentRequest::MemoryStatus => "MemoryStatus".into(),
+            AgentRequest::PressureStatus => "PressureStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
@@ -1615,6 +1622,49 @@ impl MemoryStatus {
     pub fn used_bytes(&self) -> u64 {
         self.total_bytes.saturating_sub(self.available_bytes)
     }
+}
+
+/// One resource's pressure stall information, as the guest kernel reports it
+/// in `/proc/pressure/<resource>`.
+///
+/// `some` is the share of wall time during which at least one task was stalled
+/// on the resource; `full` the share during which every runnable task was
+/// (zero for CPU at the system level). The averages are percentages over the
+/// last 10, 60 and 300 seconds; the totals are the stalled time since boot in
+/// microseconds, so a reader sampling them can compute the share over any
+/// window it likes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureStall {
+    /// `some avg10`, in percent.
+    pub some_avg10: f64,
+    /// `some avg60`, in percent.
+    pub some_avg60: f64,
+    /// `some avg300`, in percent.
+    pub some_avg300: f64,
+    /// `some total`: microseconds with at least one task stalled, since boot.
+    pub some_total_us: u64,
+    /// `full avg10`, in percent.
+    pub full_avg10: f64,
+    /// `full avg60`, in percent.
+    pub full_avg60: f64,
+    /// `full avg300`, in percent.
+    pub full_avg300: f64,
+    /// `full total`: microseconds with every task stalled, since boot.
+    pub full_total_us: u64,
+}
+
+/// The guest's pressure stall information for CPU, memory and IO
+/// (`PressureStatus` reply).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureStatus {
+    /// Time tasks waited for a CPU.
+    pub cpu: PressureStall,
+    /// Time tasks waited for memory (reclaim, swap, refault).
+    pub memory: PressureStall,
+    /// Time tasks waited for block IO.
+    pub io: PressureStall,
 }
 
 /// Storage status information.
