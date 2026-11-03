@@ -115,7 +115,7 @@ smolvm machine stop [--name NAME] [--timeout SECS]  # stop (workload gets SIGTER
 smolvm machine logs [--name NAME] [-f] [--tail N] # workload stdout/stderr, even when stopped
 smolvm machine delete --name NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
-smolvm machine stats [--name NAME] [--json]       # CPU % and guest memory
+smolvm machine stats [--name NAME] [--json]       # CPU %, guest memory and pressure stalls
 smolvm machine ls [--json]                        # list all
 smolvm machine update --name NAME [OPTIONS]              # modify stopped machine settings
 smolvm machine mount add --name NAME -v HOST:GUEST[:ro] # mount into a running machine (until it stops)

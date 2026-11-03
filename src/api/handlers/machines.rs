@@ -145,6 +145,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // Set on the running VMM only, so a stopped machine has none.
         cpu_limit_millicpus: crate::agent::cpu_limit::read_active_cpu_limit(name, pid),
         egress_flows: crate::agent::read_egress_flows(name, actual_state == RecordState::Running),
+        pressure: crate::agent::read_guest_pressure(name, actual_state == RecordState::Running),
         // Per-launch identity: stale once the process is gone, so only
         // reported while it runs.
         mediation_machine_id: pid

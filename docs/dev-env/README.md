@@ -68,7 +68,13 @@ rotated at 10 MiB, and readable while the machine is stopped. `-f` runs until
 interrupted.
 
 `stats` needs a running machine. CPU is the VM process on the host over half a
-second, where 100% is one busy CPU; memory is the guest's own account.
+second, where 100% is one busy CPU; memory is the guest's own account. The
+pressure lines are the guest kernel's stall information
+(`/proc/pressure/{cpu,memory,io}`): the share of the last 10 and 60 seconds
+that some task, or every task, spent waiting for that resource, which tells a
+starved machine from a busy one. The same sample reaches the API as `pressure`
+on `GET /api/v1/machines`, refreshed about every 15 seconds while the machine
+runs.
 
 ## `init` runs once
 

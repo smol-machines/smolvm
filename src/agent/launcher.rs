@@ -2649,6 +2649,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             ));
         }
 
+        // The guest's pressure stalls, sampled from its agent once it is up and
+        // left beside the egress counter for serve to read. Nothing here can
+        // fail the boot.
+        if let Some(dir) = vsock_socket.parent() {
+            crate::agent::manager::spawn_pressure_sampler(
+                vsock_socket.to_path_buf(),
+                dir.join(crate::agent::manager::PRESSURE_FILE),
+            );
+        }
+
         // Start VM (this replaces the process on success)
         boot_timing!("entering vm");
         let ret = krun_start_enter(ctx);

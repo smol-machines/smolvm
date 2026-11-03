@@ -190,6 +190,8 @@ use state::ApiState;
         types::EgressDenialInfo,
         crate::agent::EgressSignal,
         crate::agent::EgressFlowSummary,
+        crate::agent::GuestPressure,
+        crate::agent::PressureStall,
         types::EgressEventsResponse,
         types::MountInfo,
         types::ListMachinesResponse,

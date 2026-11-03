@@ -1411,6 +1411,14 @@ impl AgentClient {
         )
     }
 
+    /// Connect for a periodic sampler: one short timeout for the connect and
+    /// every read and write, so a sampler thread never waits long on a guest
+    /// that is paused or shutting down.
+    pub(crate) fn connect_for_sampling(socket_path: &Path, timeout: Duration) -> Result<Self> {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        Self::connect_with_timeouts_ms(socket_path, ms, ms)
+    }
+
     /// Connect to the agent socket and configure read/write timeouts (in seconds).
     fn connect_with_timeouts(socket_path: &Path, read_secs: u64, write_secs: u64) -> Result<Self> {
         Self::connect_with_timeouts_ms(socket_path, read_secs * 1000, write_secs * 1000)
@@ -2183,6 +2191,29 @@ impl AgentClient {
     pub fn memory_status(&mut self) -> Result<MemoryStatus> {
         let resp = self.request(&AgentRequest::MemoryStatus)?;
         expect_data(resp, "memory status")
+    }
+
+    /// Report the guest's pressure stall information from
+    /// `/proc/pressure/{cpu,memory,io}`.
+    ///
+    /// Agents older than this request reject it, and so does a guest kernel
+    /// without `CONFIG_PSI`; either is "not available", not a failure.
+    pub fn pressure_status(&mut self) -> Result<smolvm_protocol::PressureStatus> {
+        let resp = self.request(&AgentRequest::PressureStatus)?;
+        expect_data(resp, "pressure status")
+    }
+
+    /// [`Self::pressure_status`] for a periodic sampler, which must tell a
+    /// transport failure (outer `Err`: retry) from the agent's own refusal
+    /// (inner `Err`: it is older than the request, or the guest kernel has
+    /// no PSI, and every later answer would be the same).
+    pub(crate) fn pressure_status_or_refusal(
+        &mut self,
+    ) -> Result<std::result::Result<smolvm_protocol::PressureStatus, String>> {
+        match self.request(&AgentRequest::PressureStatus)? {
+            AgentResponse::Error { message, .. } => Ok(Err(message)),
+            resp => expect_data(resp, "pressure status").map(Ok),
+        }
     }
 
     /// Test network connectivity directly from the agent (not via chroot).
