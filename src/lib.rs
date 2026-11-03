@@ -164,3 +164,10 @@ pub use vm::{default_backend, VmBackend, VmHandle};
 
 /// Library version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// This engine build: the version plus the git commit it was built from
+/// (`unknown` for a build without git, such as one from a crates.io
+/// tarball). Recorded on a machine when it starts, and compared, not the
+/// executable's path or inode, when another engine asks to branch it: the
+/// same release installed as two files is one build.
+pub const ENGINE_BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SMOLVM_GIT_COMMIT"));

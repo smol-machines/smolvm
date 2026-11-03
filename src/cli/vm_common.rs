@@ -1556,6 +1556,7 @@ fn persist_batch_clones_running(db: &SmolvmDb, clones: &[String]) -> smolvm::Res
         record.state = RecordState::Running;
         record.pid = Some(pid);
         record.pid_start_time = pid_start_time;
+        record.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
     })?;
     Ok(())
 }
@@ -2159,6 +2160,7 @@ fn start_vm_named_with_db(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            r.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
         }) {
             tracing::warn!(error = %e, vm = %name, "failed to persist running state");
         }
@@ -2258,6 +2260,7 @@ pub fn persist_named_running(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            r.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
             if let Some(ref o) = overrides {
                 apply_overrides(r, o);
             }
@@ -4246,6 +4249,7 @@ pub fn register_ephemeral_vm(
     record.ephemeral = true;
     record.state = RecordState::Running;
     record.pid = pid;
+    record.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
     record.image = image;
 
     if let Ok(db) = SmolvmDb::open() {

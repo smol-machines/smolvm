@@ -4510,6 +4510,7 @@ pub async fn start_machine(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            r.engine_build = Some(crate::ENGINE_BUILD.to_string());
             if image_on_storage {
                 r.mark_image_on_storage();
             }
@@ -5542,6 +5543,7 @@ async fn boot_prepared_fork_inner(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            r.engine_build = Some(crate::ENGINE_BUILD.to_string());
         })
         .await?
         .ok_or_else(|| {

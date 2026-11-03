@@ -59,7 +59,43 @@ fn has_library(name: &str) -> bool {
     pkg_config::Config::new().probe(name).is_ok()
 }
 
+/// Embed the git commit this engine is built from as `SMOLVM_GIT_COMMIT`, so two
+/// builds of one version can still be told apart (a running VM is only
+/// branched by the engine build that started it). A build without git, such
+/// as one from a crates.io tarball, records `unknown`.
+fn embed_git_commit() {
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|commit| commit.trim().to_string())
+        .filter(|commit| !commit.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    // `HEAD` changes on a checkout but, on a branch, holds only `ref: refs/heads/...`
+    // and keeps its content when a commit lands on that branch; the reflog
+    // `logs/HEAD` grows on every commit and checkout, so a dev rebuild after a
+    // commit embeds the new commit instead of keeping the previous one.
+    for path in ["HEAD", "logs/HEAD"] {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["rev-parse", "--git-path", path])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(path) = String::from_utf8(output.stdout) {
+                    println!("cargo:rerun-if-changed={}", path.trim());
+                }
+            }
+        }
+    }
+    println!("cargo:rustc-env=SMOLVM_GIT_COMMIT={commit}");
+}
+
 fn main() {
+    embed_git_commit();
     // Build scripts run on the HOST: `cfg!(target_os)` here describes the
     // build machine, not the artifact. Cross-compiling smolvm from macOS to
     // Linux (zigbuild) must NOT emit macOS-only linker args (-sectcreate,
