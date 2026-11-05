@@ -180,6 +180,11 @@ fn state_dir_from_args(
 }
 
 fn main() {
+    cli::broken_pipe::install();
+    cli::broken_pipe::run(run_cli);
+}
+
+fn run_cli() {
     // Lets pack extraction pick host-side layers when this host's virtiofs
     // server can present their recorded ownership.
     smolvm_pack::extract::set_host_layers_probe(smolvm::agent::host_layers_supported);
