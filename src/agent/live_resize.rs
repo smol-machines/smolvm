@@ -264,6 +264,7 @@ fn previous_runtime_gone(
 /// took the RAM, and a restarted machine boots from the record, so the target
 /// is met; left in place, the intent refused every other size, branch and
 /// checkpoint. Returns whether it cleared the intent.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn clear_met_memory_intent(
     db: &SmolvmDb,
     name: &str,
