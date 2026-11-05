@@ -259,6 +259,35 @@ fn previous_runtime_gone(
     previous_boot_ended || !alive || observed_start.is_some_and(|start| start != intent.started)
 }
 
+/// Clear a RAM resize whose runtime is gone once the machine has booted again
+/// with at least its target. The resize raised the record before the guest
+/// took the RAM, and a restarted machine boots from the record, so the target
+/// is met; left in place, the intent refused every other size, branch and
+/// checkpoint. Returns whether it cleared the intent.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clear_met_memory_intent(
+    db: &SmolvmDb,
+    name: &str,
+    intent: &ResizeIntent,
+    boot_mib: u32,
+) -> Result<bool> {
+    let ResizeTarget::Memory(target) = intent.target else {
+        return Ok(false);
+    };
+    if boot_mib < target
+        || !previous_runtime_gone(
+            intent,
+            host_boot_id()?.as_deref(),
+            crate::process::is_alive(intent.pid),
+            crate::process::process_start_time(intent.pid),
+        )
+    {
+        return Ok(false);
+    }
+    db.finish_resize(name, intent)?;
+    Ok(true)
+}
+
 fn finish_resize_intent(db: &SmolvmDb, name: &str, intent: &ResizeIntent) -> Result<()> {
     validate_intent_boot(intent, host_boot_id()?.as_deref())?;
     if !crate::process::is_our_process_strict(intent.pid, Some(intent.started)) {
@@ -285,6 +314,9 @@ pub(crate) struct MemoryGrowthInfo {
     mapped: u64,
     plugged: u64,
     capacity: u64,
+    /// Whether the guest driver took the RAM growth device; `None` from a
+    /// runtime that does not report it.
+    driver: Option<bool>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -292,8 +324,13 @@ impl MemoryGrowthInfo {
     pub(crate) fn parse(reply: &str) -> Result<Self> {
         let invalid = || Error::agent("RAM resize", "runtime reported invalid RAM growth geometry");
         let words: Vec<_> = reply.split_whitespace().collect();
-        let ["OK", "boot_mib", boot, "base", base, "mapped", mapped, "plugged", plugged, "capacity", capacity] =
-            words.as_slice()
+        let (
+            ["OK", "boot_mib", boot, "base", base, "mapped", mapped, "plugged", plugged, "capacity", capacity],
+            driver,
+        ) = (match words.as_slice() {
+            [head @ .., "driver", driver] => (head, Some(*driver)),
+            all => (all, None),
+        })
         else {
             return Err(invalid());
         };
@@ -303,6 +340,12 @@ impl MemoryGrowthInfo {
             mapped: mapped.parse().map_err(|_| invalid())?,
             plugged: plugged.parse().map_err(|_| invalid())?,
             capacity: capacity.parse().map_err(|_| invalid())?,
+            driver: match driver {
+                None => None,
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                Some(_) => return Err(invalid()),
+            },
         };
         if info.boot_mib == 0
             || info.capacity == 0
@@ -416,6 +459,15 @@ fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRe
     let socket = fork::control_socket_path(name);
     let info =
         MemoryGrowthInfo::parse(&fork::control_socket_cmd(&socket, "PROTOTYPE_MEMORY_INFO")?)?;
+    if info.driver == Some(false) {
+        return Err(Error::agent_conflict(
+            "RAM resize",
+            "the guest did not take its RAM growth device at boot, so added RAM cannot reach it; no RAM changed. Stop the machine, set the size with `machine update --mem`, and start it",
+        ));
+    }
+    if let Some(previous) = db.pending_resize(name)? {
+        clear_met_memory_intent(db, name, &previous, info.boot_mib)?;
+    }
     let added_mib = info.target_added_mib(target_mib)?;
     let target_bytes = added_mib << 20;
     let extra_bytes = target_bytes - info.mapped;
@@ -872,6 +924,19 @@ pub(crate) fn reconcile_pending(db: &SmolvmDb, name: &str) -> Result<Option<VmRe
     let Some(intent) = db.pending_resize(name)? else {
         return Ok(None);
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if matches!(intent.target, ResizeTarget::Memory(_)) {
+        // A machine that is not running has no control socket to answer.
+        let info =
+            fork::control_socket_cmd(&fork::control_socket_path(name), "PROTOTYPE_MEMORY_INFO")
+                .ok()
+                .and_then(|reply| MemoryGrowthInfo::parse(&reply).ok());
+        if let Some(info) = info {
+            if clear_met_memory_intent(db, name, &intent, info.boot_mib)? {
+                return db.get_vm(name);
+            }
+        }
+    }
     validate_intent_boot(&intent, host_boot_id()?.as_deref())?;
     if !crate::process::is_our_process_strict(intent.pid, Some(intent.started)) {
         return Err(Error::agent_conflict("recover resize", "original VMM is no longer running; refusing to apply its resize to another machine incarnation"));
@@ -1057,6 +1122,58 @@ mod tests {
         ] {
             assert!(MemoryGrowthInfo::parse(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn memory_growth_info_reports_whether_the_guest_took_the_device() {
+        let info = |tail: &str| {
+            MemoryGrowthInfo::parse(&format!(
+                "OK boot_mib 4096 base 5905580032 mapped 0 plugged 0 capacity 62277025792{tail}\n"
+            ))
+        };
+        assert_eq!(info("").unwrap().driver, None);
+        assert_eq!(info(" driver 1").unwrap().driver, Some(true));
+        assert_eq!(info(" driver 0").unwrap().driver, Some(false));
+        for invalid in [" driver 2", " driver", " driver 1 extra"] {
+            assert!(info(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_memory_intent_is_cleared_once_a_new_runtime_booted_with_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("state.db")).unwrap();
+        db.insert_vm(
+            "vm",
+            &crate::config::VmRecord::new("vm".into(), 2, 6144, vec![], vec![], false),
+        )
+        .unwrap();
+        // A runtime that is gone, as after a restart.
+        let gone = 0x3fff_fff0;
+        assert!(!crate::process::is_alive(gone));
+        let intent = db
+            .begin_resize("vm", gone, 45, ResizeTarget::Memory(6144))
+            .unwrap();
+        assert!(!clear_met_memory_intent(&db, "vm", &intent, 4096).unwrap());
+        assert!(db.pending_resize("vm").unwrap().is_some());
+        assert!(clear_met_memory_intent(&db, "vm", &intent, 6144).unwrap());
+        assert!(db.pending_resize("vm").unwrap().is_none());
+
+        // The runtime that recorded it is still running: it may yet finish.
+        let me = std::process::id() as crate::process::Pid;
+        let started = crate::process::process_start_time(me).unwrap();
+        let live = db
+            .begin_resize("vm", me, started, ResizeTarget::Memory(6144))
+            .unwrap();
+        assert!(!clear_met_memory_intent(&db, "vm", &live, 8192).unwrap());
+        db.finish_resize("vm", &live).unwrap();
+
+        // Only RAM: a CPU target is not met by booting.
+        let cpus = db
+            .begin_resize("vm", gone, 45, ResizeTarget::Cpus(4))
+            .unwrap();
+        assert!(!clear_met_memory_intent(&db, "vm", &cpus, 8192).unwrap());
     }
 
     #[test]
