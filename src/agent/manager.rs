@@ -951,6 +951,244 @@ fn parse_egress_flows(text: &str, now: std::time::SystemTime) -> Option<EgressFl
     (age.as_secs() <= EGRESS_FLOWS_STALE_SECS).then_some(summary)
 }
 
+/// Per-VM guest pressure file: `<vm_data_dir>/pressure`. The VM subprocess
+/// rewrites it from the guest agent's `PressureStatus` answer; serve reads it
+/// when building `MachineInfo`, like [`egress_flows_file`].
+pub fn pressure_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(PRESSURE_FILE)
+}
+
+/// File name of the per-VM guest pressure sample inside the VM data dir.
+pub const PRESSURE_FILE: &str = "pressure";
+
+/// How often the VM subprocess asks the guest for its pressure stalls.
+const PRESSURE_SAMPLE_SECS: u64 = 15;
+
+/// How long the sampler waits for the guest before giving up on one sample.
+const PRESSURE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A guest pressure sample older than this is stale: the sampler that wrote it
+/// has stopped, so it no longer describes the machine.
+const PRESSURE_STALE_SECS: u64 = 120;
+
+/// The guest's pressure stall information, as last sampled from its kernel.
+///
+/// Each resource carries the kernel's `some` and `full` shares (percent over
+/// the last 10, 60 and 300 seconds) and the stalled time since boot in
+/// microseconds, so a reader keeping samples can compute the share over its
+/// own window from the totals.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureStall {
+    /// Share of the last 10 s with at least one task stalled, in percent.
+    pub some_avg10: f64,
+    /// Share of the last 60 s with at least one task stalled, in percent.
+    pub some_avg60: f64,
+    /// Share of the last 300 s with at least one task stalled, in percent.
+    pub some_avg300: f64,
+    /// Microseconds since boot with at least one task stalled.
+    pub some_total_us: u64,
+    /// Share of the last 10 s with every task stalled, in percent. Always 0
+    /// for CPU.
+    pub full_avg10: f64,
+    /// Share of the last 60 s with every task stalled, in percent.
+    pub full_avg60: f64,
+    /// Share of the last 300 s with every task stalled, in percent.
+    pub full_avg300: f64,
+    /// Microseconds since boot with every task stalled.
+    pub full_total_us: u64,
+}
+
+impl From<smolvm_protocol::PressureStall> for PressureStall {
+    fn from(s: smolvm_protocol::PressureStall) -> Self {
+        Self {
+            some_avg10: s.some_avg10,
+            some_avg60: s.some_avg60,
+            some_avg300: s.some_avg300,
+            some_total_us: s.some_total_us,
+            full_avg10: s.full_avg10,
+            full_avg60: s.full_avg60,
+            full_avg300: s.full_avg300,
+            full_total_us: s.full_total_us,
+        }
+    }
+}
+
+/// Pressure stall information of a running machine's guest, from
+/// `/proc/pressure/{cpu,memory,io}` inside it, refreshed about every 15 s.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestPressure {
+    /// Time tasks waited for a CPU.
+    pub cpu: PressureStall,
+    /// Time tasks waited for memory: reclaim, swap and refaults.
+    pub memory: PressureStall,
+    /// Time tasks waited for block IO.
+    pub io: PressureStall,
+    /// When the sample was taken (RFC 3339).
+    pub updated_at: String,
+}
+
+impl GuestPressure {
+    fn from_status(at: std::time::SystemTime, status: smolvm_protocol::PressureStatus) -> Self {
+        Self {
+            cpu: status.cpu.into(),
+            memory: status.memory.into(),
+            io: status.io.into(),
+            updated_at: humantime::format_rfc3339_seconds(at).to_string(),
+        }
+    }
+}
+
+/// Spawn a detached thread (in the VM subprocess) that asks the guest agent
+/// for its pressure stalls every [`PRESSURE_SAMPLE_SECS`] and rewrites `path`
+/// with the answer (temp file + rename, so serve never reads a torn sample).
+///
+/// Best-effort, like [`spawn_egress_flows_flush`]: a guest that is not up yet
+/// or is paused costs one short timeout and the sample is retried next tick.
+/// An agent that rejects the request (older than it, or a kernel without
+/// PSI) ends the thread, since every later answer would be the same.
+pub fn spawn_pressure_sampler(vsock_socket: PathBuf, path: PathBuf) {
+    let _ = std::fs::remove_file(&path);
+    let spawned = std::thread::Builder::new()
+        .name("smolvm-pressure".into())
+        .spawn(move || {
+            let mut client: Option<super::AgentClient> = None;
+            loop {
+                std::thread::sleep(Duration::from_secs(PRESSURE_SAMPLE_SECS));
+                let connected = match client.as_mut() {
+                    Some(c) => c,
+                    None => match super::AgentClient::connect_for_sampling(
+                        &vsock_socket,
+                        PRESSURE_SAMPLE_TIMEOUT,
+                    ) {
+                        Ok(c) => client.insert(c),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "pressure sampler could not reach the agent");
+                            continue;
+                        }
+                    },
+                };
+                match sample_pressure(connected) {
+                    Ok(status) => {
+                        let sample =
+                            GuestPressure::from_status(std::time::SystemTime::now(), status);
+                        if let Err(e) = write_pressure(&path, &sample) {
+                            tracing::debug!(path = ?path, error = %e, "pressure sample write failed");
+                        }
+                    }
+                    Err(PressureFailure::Transient) => client = None,
+                    Err(PressureFailure::Unsupported(reason)) => {
+                        tracing::debug!(reason = %reason, "guest reports no pressure; sampler stopped");
+                        let _ = std::fs::remove_file(&path);
+                        return;
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "pressure sampler did not start");
+    }
+}
+
+enum PressureFailure {
+    /// The socket failed; reconnect next tick.
+    Transient,
+    /// The agent refused the request; it will refuse every later one too.
+    Unsupported(String),
+}
+
+fn sample_pressure(
+    client: &mut super::AgentClient,
+) -> std::result::Result<smolvm_protocol::PressureStatus, PressureFailure> {
+    match client.pressure_status_or_refusal() {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(refusal)) => Err(PressureFailure::Unsupported(refusal)),
+        Err(_) => Err(PressureFailure::Transient),
+    }
+}
+
+fn write_pressure(path: &Path, sample: &GuestPressure) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(sample)?)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Read a running machine's guest pressure sample written by
+/// [`spawn_pressure_sampler`]. `None` when the machine is not running, the
+/// file is absent (guest not sampled yet, or without PSI) or unparseable, or
+/// the sample is stale.
+pub fn read_guest_pressure(name: &str, running: bool) -> Option<GuestPressure> {
+    if !running {
+        return None;
+    }
+    let text = std::fs::read_to_string(pressure_file(name)).ok()?;
+    parse_guest_pressure(&text, std::time::SystemTime::now())
+}
+
+fn parse_guest_pressure(text: &str, now: std::time::SystemTime) -> Option<GuestPressure> {
+    let sample: GuestPressure = serde_json::from_str(text).ok()?;
+    let at = humantime::parse_rfc3339(&sample.updated_at).ok()?;
+    let age = now.duration_since(at).unwrap_or_default();
+    (age.as_secs() <= PRESSURE_STALE_SECS).then_some(sample)
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+
+    fn status() -> smolvm_protocol::PressureStatus {
+        smolvm_protocol::PressureStatus {
+            cpu: smolvm_protocol::PressureStall {
+                some_avg10: 12.5,
+                some_total_us: 1_000_000,
+                ..Default::default()
+            },
+            memory: smolvm_protocol::PressureStall {
+                full_avg10: 3.0,
+                full_total_us: 20_000,
+                ..Default::default()
+            },
+            io: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_sample_round_trips_and_a_stale_one_is_dropped() {
+        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let sample = GuestPressure::from_status(at, status());
+        let text = serde_json::to_string(&sample).unwrap();
+        assert!(text.contains("\"someAvg10\":12.5"));
+        assert!(text.contains("\"fullTotalUs\":20000"));
+
+        let read = parse_guest_pressure(&text, at + Duration::from_secs(30)).expect("fresh");
+        assert_eq!(read, sample);
+        assert_eq!(
+            parse_guest_pressure(&text, at + Duration::from_secs(121)),
+            None
+        );
+        assert_eq!(parse_guest_pressure("{}", at), None);
+    }
+
+    #[test]
+    fn the_file_is_written_whole_and_only_read_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRESSURE_FILE);
+        let sample = GuestPressure::from_status(std::time::SystemTime::now(), status());
+        write_pressure(&path, &sample).unwrap();
+        assert!(!path.with_extension("tmp").exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            parse_guest_pressure(&text, std::time::SystemTime::now()),
+            Some(sample)
+        );
+        assert_eq!(
+            read_guest_pressure("no-such-machine-for-pressure", false),
+            None
+        );
+    }
+}
+
 /// Staging path the flusher writes before renaming over the telemetry file.
 fn egress_telemetry_staging(path: &Path) -> PathBuf {
     path.with_extension("tmp")

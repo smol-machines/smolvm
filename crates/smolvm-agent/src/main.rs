@@ -2724,6 +2724,7 @@ fn handle_request(
             expected_bytes,
         } => live_resources::grow_filesystem(disk, expected_bytes, client_fd),
         AgentRequest::MemoryStatus => handle_memory_status(),
+        AgentRequest::PressureStatus => handle_pressure_status(),
         AgentRequest::AttachMount {
             share,
             source,
@@ -7325,7 +7326,8 @@ fn truncated_output_error() -> AgentResponse {
     AgentResponse::error(
         format!(
             "command output exceeded {} bytes and was truncated. \
-             Use streaming exec (exec_stream / execStream) for large output.",
+             Write large output to a file in the machine and copy it out \
+             (`smolvm machine cp`), or stream it with `smolvm machine exec --stream`.",
             crate::process::MAX_EXEC_OUTPUT
         ),
         error_codes::EXEC_FAILED,
@@ -8172,6 +8174,85 @@ fn read_meminfo(path: &str) -> std::io::Result<smolvm_protocol::MemoryStatus> {
         status.available_bytes = status.free_bytes.saturating_add(status.cached_bytes);
     }
     Ok(status)
+}
+
+/// Report the guest's pressure stall information.
+///
+/// A kernel built without `CONFIG_PSI` has no `/proc/pressure`, and that is an
+/// error the caller should see rather than a status of zeros it would read as
+/// an idle machine.
+fn handle_pressure_status() -> AgentResponse {
+    AgentResponse::from_result(
+        read_pressure_dir("/proc/pressure"),
+        error_codes::STATUS_FAILED,
+    )
+}
+
+/// Read `cpu`, `memory` and `io` from a `/proc/pressure`-shaped directory.
+fn read_pressure_dir(dir: &str) -> std::io::Result<smolvm_protocol::PressureStatus> {
+    let read = |resource: &str| -> std::io::Result<smolvm_protocol::PressureStall> {
+        let text = std::fs::read_to_string(format!("{dir}/{resource}"))?;
+        parse_pressure(&text).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{dir}/{resource} is not in the pressure stall format"),
+            )
+        })
+    };
+    Ok(smolvm_protocol::PressureStatus {
+        cpu: read("cpu")?,
+        memory: read("memory")?,
+        io: read("io")?,
+    })
+}
+
+/// Parse one pressure file:
+///
+/// ```text
+/// some avg10=0.00 avg60=0.00 avg300=0.00 total=1143507836
+/// full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+/// ```
+///
+/// The `some` line is required. `full` is absent for CPU on kernels before
+/// 5.13 and stays zero then.
+fn parse_pressure(text: &str) -> Option<smolvm_protocol::PressureStall> {
+    let mut stall = smolvm_protocol::PressureStall::default();
+    let mut saw_some = false;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let kind = fields.next()?;
+        let mut avg10 = 0.0;
+        let mut avg60 = 0.0;
+        let mut avg300 = 0.0;
+        let mut total = 0;
+        for field in fields {
+            let (key, value) = field.split_once('=')?;
+            match key {
+                "avg10" => avg10 = value.parse().ok()?,
+                "avg60" => avg60 = value.parse().ok()?,
+                "avg300" => avg300 = value.parse().ok()?,
+                "total" => total = value.parse().ok()?,
+                _ => {}
+            }
+        }
+        match kind {
+            "some" => {
+                saw_some = true;
+                stall.some_avg10 = avg10;
+                stall.some_avg60 = avg60;
+                stall.some_avg300 = avg300;
+                stall.some_total_us = total;
+            }
+            "full" => {
+                stall.full_avg10 = avg10;
+                stall.full_avg60 = avg60;
+                stall.full_avg300 = avg300;
+                stall.full_total_us = total;
+            }
+            _ => return None,
+        }
+    }
+    saw_some.then_some(stall)
 }
 
 // ============================================================================
@@ -11068,6 +11149,68 @@ fn branchpoint_error(e: branchpoint::TypedError) -> AgentResponse {
     AgentResponse::Error {
         message: e.message,
         code: Some(e.code.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::{parse_pressure, read_pressure_dir};
+
+    #[test]
+    fn parses_some_and_full_lines() {
+        let stall = parse_pressure(
+            "some avg10=1.50 avg60=0.75 avg300=0.10 total=1143507836\n\
+             full avg10=0.20 avg60=0.05 avg300=0.00 total=3178945242\n",
+        )
+        .expect("parses");
+        assert_eq!(stall.some_avg10, 1.5);
+        assert_eq!(stall.some_avg60, 0.75);
+        assert_eq!(stall.some_avg300, 0.1);
+        assert_eq!(stall.some_total_us, 1_143_507_836);
+        assert_eq!(stall.full_avg10, 0.2);
+        assert_eq!(stall.full_total_us, 3_178_945_242);
+    }
+
+    /// CPU pressure on older kernels has no `full` line; that is still a
+    /// reading, with `full` at zero.
+    #[test]
+    fn a_some_line_alone_is_enough() {
+        let stall =
+            parse_pressure("some avg10=0.00 avg60=0.00 avg300=0.00 total=42\n").expect("parses");
+        assert_eq!(stall.some_total_us, 42);
+        assert_eq!(stall.full_total_us, 0);
+    }
+
+    #[test]
+    fn rejects_text_that_is_not_a_pressure_file() {
+        assert_eq!(parse_pressure(""), None);
+        assert_eq!(parse_pressure("full avg10=0.00 total=0\n"), None);
+        assert_eq!(parse_pressure("Name:   bash\n"), None);
+        assert_eq!(
+            parse_pressure("some avg10=x avg60=0 avg300=0 total=0\n"),
+            None
+        );
+    }
+
+    /// A kernel without PSI has no directory, and the request must fail
+    /// rather than report an idle machine.
+    #[test]
+    fn a_missing_directory_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("pressure");
+        assert!(read_pressure_dir(missing.to_str().unwrap()).is_err());
+
+        std::fs::create_dir(&missing).unwrap();
+        for name in ["cpu", "memory", "io"] {
+            std::fs::write(
+                missing.join(name),
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=7\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=3\n",
+            )
+            .unwrap();
+        }
+        let status = read_pressure_dir(missing.to_str().unwrap()).expect("reads");
+        assert_eq!(status.io.some_total_us, 7);
+        assert_eq!(status.memory.full_total_us, 3);
     }
 }
 

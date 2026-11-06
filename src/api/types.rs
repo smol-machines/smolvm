@@ -1053,6 +1053,14 @@ pub struct MachineInfo {
     /// machines, stopped machines, and a summary older than two minutes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_flows: Option<crate::agent::EgressFlowSummary>,
+    /// Pressure stall information from inside the guest
+    /// (`/proc/pressure/{cpu,memory,io}`), refreshed about every 15 s: how
+    /// much of the time tasks waited for CPU, memory or IO, which the host's
+    /// view of the VMM process cannot tell. Omitted for stopped machines,
+    /// before the first sample, for a guest kernel without PSI, and for a
+    /// sample older than two minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<crate::agent::GuestPressure>,
     /// Host-minted identity of this launch, as carried by mediated egress
     /// decisions (`machineId`), so a decider can map flows to the machine up
     /// front. Present only while a mediated-egress machine is running.

@@ -1556,6 +1556,7 @@ fn persist_batch_clones_running(db: &SmolvmDb, clones: &[String]) -> smolvm::Res
         record.state = RecordState::Running;
         record.pid = Some(pid);
         record.pid_start_time = pid_start_time;
+        record.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
     })?;
     Ok(())
 }
@@ -2159,6 +2160,7 @@ fn start_vm_named_with_db(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            r.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
         }) {
             tracing::warn!(error = %e, vm = %name, "failed to persist running state");
         }
@@ -2258,6 +2260,7 @@ pub fn persist_named_running(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            r.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
             if let Some(ref o) = overrides {
                 apply_overrides(r, o);
             }
@@ -3307,7 +3310,7 @@ mod stats_tests {
 
     #[test]
     fn json_reports_cpu_and_guest_memory_in_bytes() {
-        let json = machine_stats_json("web", 2, Some(37.5), Some(memory()));
+        let json = machine_stats_json("web", 2, Some(37.5), Some(memory()), None);
         assert_eq!(
             json,
             serde_json::json!({
@@ -3323,28 +3326,70 @@ mod stats_tests {
                     "swap_total_bytes": 0,
                     "swap_used_bytes": 0,
                 },
+                "pressure": null,
             })
         );
     }
 
     #[test]
     fn json_keeps_the_keys_when_a_figure_is_unavailable() {
-        let json = machine_stats_json("web", 1, None, None);
+        let json = machine_stats_json("web", 1, None, None, None);
         assert!(json["cpu_percent"].is_null());
         assert!(json["memory"].is_null());
+        assert!(json["pressure"].is_null());
+    }
+
+    fn pressure() -> smolvm_protocol::PressureStatus {
+        smolvm_protocol::PressureStatus {
+            cpu: smolvm_protocol::PressureStall {
+                some_avg10: 42.0,
+                some_avg60: 10.5,
+                some_total_us: 7_000_000,
+                ..Default::default()
+            },
+            memory: smolvm_protocol::PressureStall {
+                some_avg10: 1.0,
+                full_avg10: 0.5,
+                full_total_us: 250,
+                ..Default::default()
+            },
+            io: Default::default(),
+        }
+    }
+
+    #[test]
+    fn json_reports_pressure_per_resource() {
+        let json = machine_stats_json("web", 1, None, None, Some(pressure()));
+        assert_eq!(json["pressure"]["cpu"]["some_avg10"], 42.0);
+        assert_eq!(json["pressure"]["cpu"]["some_total_us"], 7_000_000);
+        assert_eq!(json["pressure"]["memory"]["full_total_us"], 250);
+        assert_eq!(json["pressure"]["io"]["some_avg300"], 0.0);
     }
 
     #[test]
     fn text_reads_like_status() {
         assert_eq!(
-            machine_stats_text("web", 2, Some(37.5), Some(memory())),
+            machine_stats_text("web", 2, Some(37.5), Some(memory()), None),
             "Machine 'web': running\n  \
              cpu: 37.5% of 200% (2 CPUs)\n  \
              memory: 0.50 GiB of 2.00 GiB used (25%), 1.50 GiB available\n"
         );
         assert_eq!(
-            machine_stats_text("web", 1, None, None),
+            machine_stats_text("web", 1, None, None, None),
             "Machine 'web': running\n  cpu: unavailable\n  memory: unavailable\n"
+        );
+    }
+
+    /// Pressure lines follow memory; CPU has no meaningful `full` share, so
+    /// only memory and IO print one.
+    #[test]
+    fn text_adds_a_pressure_line_per_resource() {
+        assert_eq!(
+            machine_stats_text("web", 1, None, None, Some(pressure())),
+            "Machine 'web': running\n  cpu: unavailable\n  memory: unavailable\n  \
+             cpu pressure: some 42.0% (10s) 10.5% (60s)\n  \
+             memory pressure: some 1.0% (10s) 0.0% (60s), full 0.5% (10s) 0.0% (60s)\n  \
+             io pressure: some 0.0% (10s) 0.0% (60s), full 0.0% (10s) 0.0% (60s)\n"
         );
     }
 }
@@ -3409,15 +3454,16 @@ pub fn stats_vm(name: &Option<String>, json: bool) -> smolvm::Result<()> {
         .map(|record| record.cpus)
         .unwrap_or(DEFAULT_MICROVM_CPU_COUNT);
     let memory = guest_memory(&mut client);
+    let pressure = client.pressure_status().ok();
     let cpu = manager.child_pid().and_then(sample_cpu_percent);
 
     let output = if json {
-        let value = machine_stats_json(&label, cpus, cpu, memory);
+        let value = machine_stats_json(&label, cpus, cpu, memory, pressure);
         let text = serde_json::to_string_pretty(&value)
             .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
         format!("{text}\n")
     } else {
-        machine_stats_text(&label, cpus, cpu, memory)
+        machine_stats_text(&label, cpus, cpu, memory, pressure)
     };
     write_status_output(&output)
 }
@@ -3446,11 +3492,58 @@ fn cpu_percent(
     Some(used_ns * 100.0 / elapsed.as_nanos() as f64)
 }
 
+/// Pressure stalls as `machine stats --json` reports them: per resource, the
+/// kernel's `some`/`full` averages in percent and totals in microseconds.
+fn pressure_json(status: &smolvm_protocol::PressureStatus) -> serde_json::Value {
+    let stall = |s: &smolvm_protocol::PressureStall| {
+        serde_json::json!({
+            "some_avg10": s.some_avg10,
+            "some_avg60": s.some_avg60,
+            "some_avg300": s.some_avg300,
+            "some_total_us": s.some_total_us,
+            "full_avg10": s.full_avg10,
+            "full_avg60": s.full_avg60,
+            "full_avg300": s.full_avg300,
+            "full_total_us": s.full_total_us,
+        })
+    };
+    serde_json::json!({
+        "cpu": stall(&status.cpu),
+        "memory": stall(&status.memory),
+        "io": stall(&status.io),
+    })
+}
+
+/// One line per resource: the share of the last 10 s and 60 s that tasks
+/// waited for it, and (memory, IO) the share that everything waited.
+fn format_pressure_lines(status: &smolvm_protocol::PressureStatus) -> String {
+    let mut out = String::new();
+    for (label, s, show_full) in [
+        ("cpu", &status.cpu, false),
+        ("memory", &status.memory, true),
+        ("io", &status.io, true),
+    ] {
+        out.push_str(&format!(
+            "  {label} pressure: some {:.1}% (10s) {:.1}% (60s)",
+            s.some_avg10, s.some_avg60
+        ));
+        if show_full {
+            out.push_str(&format!(
+                ", full {:.1}% (10s) {:.1}% (60s)",
+                s.full_avg10, s.full_avg60
+            ));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn machine_stats_json(
     name: &str,
     cpus: u8,
     cpu_percent: Option<f64>,
     memory: Option<smolvm_protocol::MemoryStatus>,
+    pressure: Option<smolvm_protocol::PressureStatus>,
 ) -> serde_json::Value {
     let memory = memory.map(|status| {
         serde_json::json!({
@@ -3468,6 +3561,7 @@ fn machine_stats_json(
         "cpus": cpus,
         "cpu_percent": cpu_percent,
         "memory": memory,
+        "pressure": pressure.as_ref().map(pressure_json),
     })
 }
 
@@ -3476,6 +3570,7 @@ fn machine_stats_text(
     cpus: u8,
     cpu_percent: Option<f64>,
     memory: Option<smolvm_protocol::MemoryStatus>,
+    pressure: Option<smolvm_protocol::PressureStatus>,
 ) -> String {
     let mut output = format!("Machine '{name}': running\n");
     match cpu_percent {
@@ -3489,6 +3584,9 @@ fn machine_stats_text(
     match memory {
         Some(status) => output.push_str(&format_memory_line(&status)),
         None => output.push_str("  memory: unavailable\n"),
+    }
+    if let Some(status) = pressure {
+        output.push_str(&format_pressure_lines(&status));
     }
     output
 }
@@ -4151,6 +4249,7 @@ pub fn register_ephemeral_vm(
     record.ephemeral = true;
     record.state = RecordState::Running;
     record.pid = pid;
+    record.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
     record.image = image;
 
     if let Ok(db) = SmolvmDb::open() {
