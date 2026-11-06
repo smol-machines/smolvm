@@ -5311,26 +5311,7 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
                 size_gib, total_tar_bytes
             );
         }
-        let output = std::process::Command::new("hdiutil")
-            .args([
-                "create",
-                "-size",
-                &size_arg,
-                "-fs",
-                "Case-sensitive APFS",
-                "-type",
-                "SPARSE",
-                "-volname",
-                "smolvm-layers",
-            ])
-            .arg(&image_path)
-            .output()?;
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "hdiutil create failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
+        create_cs_image(&image_path, &size_arg, debug)?;
     }
 
     // Mount it.
@@ -5354,6 +5335,102 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
         )));
     }
 
+    Ok(())
+}
+
+/// Create the case-sensitive sparse image at `image_path`.
+///
+/// `hdiutil create` formats a new APFS container every time, which takes about
+/// a second, and every machine created from a pack needs its own image. So the
+/// blank image for each size is made once and every machine gets an APFS clone
+/// of it, which attaches as an independent volume. Without a template the
+/// image is created directly, as before.
+#[cfg(target_os = "macos")]
+fn create_cs_image(image_path: &Path, size_arg: &str, debug: bool) -> std::io::Result<()> {
+    if let Some(template) = cs_image_template(size_arg, debug) {
+        if clone_file(&template, image_path).is_ok() {
+            return Ok(());
+        }
+        let _ = fs::remove_file(image_path);
+    }
+    hdiutil_create_cs_image(image_path, size_arg)
+}
+
+/// The blank image of `size_arg` in the shared cache, made on first use.
+#[cfg(target_os = "macos")]
+fn cs_image_template(size_arg: &str, debug: bool) -> Option<PathBuf> {
+    let dir = cs_template_dir()?;
+    let template = dir.join(format!("{size_arg}.sparseimage"));
+    if template.is_file() {
+        return Some(template);
+    }
+    fs::create_dir_all(&dir).ok()?;
+    // Built under a private name and renamed into place, so a concurrent
+    // creator or a crash never leaves a half-formatted template behind.
+    let staging = dir.join(format!(".{size_arg}.{}.sparseimage", std::process::id()));
+    let _ = fs::remove_file(&staging);
+    if debug {
+        eprintln!("debug: creating {size_arg} case-sensitive volume template...");
+    }
+    let built =
+        hdiutil_create_cs_image(&staging, size_arg).and_then(|()| fs::rename(&staging, &template));
+    if built.is_err() {
+        let _ = fs::remove_file(&staging);
+        return None;
+    }
+    Some(template)
+}
+
+/// Where blank images are kept. Tests use a private directory so they never
+/// write into the user's cache.
+#[cfg(target_os = "macos")]
+fn cs_template_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return Some(
+            std::env::temp_dir().join(format!("smolvm-cs-templates-{}", std::process::id())),
+        );
+    }
+    Some(
+        dirs::cache_dir()?
+            .join("smolvm")
+            .join("cs-volume-templates"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+    // Safety: both are valid NUL-terminated paths for the duration of the call.
+    if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn hdiutil_create_cs_image(image_path: &Path, size_arg: &str) -> std::io::Result<()> {
+    let output = std::process::Command::new("hdiutil")
+        .args([
+            "create",
+            "-size",
+            size_arg,
+            "-fs",
+            "Case-sensitive APFS",
+            "-type",
+            "SPARSE",
+            "-volname",
+            "smolvm-layers",
+        ])
+        .arg(image_path)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "hdiutil create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
     Ok(())
 }
 
@@ -8583,6 +8660,60 @@ mod tests {
             "staged tars are shared to the guest as-is"
         );
         assert!(!is_mount_point(&lease.path));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn case_sensitive_images_cloned_from_one_template_mount_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first, second) = (
+            temp.path().join("a.sparseimage"),
+            temp.path().join("b.sparseimage"),
+        );
+        if let Err(e) = create_cs_image(&first, "1g", false) {
+            eprintln!("SKIP: hdiutil unavailable: {}", e);
+            return;
+        }
+        let template = cs_template_dir().unwrap().join("1g.sparseimage");
+        let before = fs::read(&template).unwrap();
+        create_cs_image(&second, "1g", false).unwrap();
+
+        let mut mounts = Vec::new();
+        for (image, name) in [(&first, "ma"), (&second, "mb")] {
+            let mount = temp.path().join(name);
+            fs::create_dir_all(&mount).unwrap();
+            let ok = std::process::Command::new("hdiutil")
+                .args(["attach", "-mountpoint"])
+                .arg(&mount)
+                .args(["-nobrowse", "-noautoopen"])
+                .arg(image)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "attach {}", image.display());
+            mounts.push(mount);
+        }
+        // Both clones are attached at once, keep their own files, and are
+        // case-sensitive.
+        fs::write(mounts[0].join("lower"), "a").unwrap();
+        fs::write(mounts[0].join("LOWER"), "A").unwrap();
+        fs::write(mounts[1].join("lower"), "b").unwrap();
+        assert_eq!(fs::read_to_string(mounts[0].join("lower")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(mounts[0].join("LOWER")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(mounts[1].join("lower")).unwrap(), "b");
+        assert!(!mounts[1].join("LOWER").exists());
+        for mount in &mounts {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", "-quiet", "-force"])
+                .arg(mount)
+                .status();
+        }
+        assert_eq!(
+            fs::read(&template).unwrap(),
+            before,
+            "the template is never written"
+        );
+        let _ = fs::remove_dir_all(cs_template_dir().unwrap());
     }
 
     #[test]
