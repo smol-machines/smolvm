@@ -19,8 +19,20 @@ pub use smolvm_protocol::credentials::{
 };
 use smolvm_protocol::SecretRef;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// Socket in a running machine's data directory that takes new values for its
+/// bindings, so a rotated credential reaches a machine without a restart.
+pub const CREDENTIALS_SOCKET: &str = "credentials.sock";
+
+/// Largest request the credentials socket reads: every binding's value is at
+/// most a few KiB.
+const MAX_CREDENTIALS_REQUEST_BYTES: u64 = 1024 * 1024;
+
+/// Values handed to a running boot process through [`CREDENTIALS_SOCKET`], by
+/// binding name. A binding with one resolves to it instead of its reference.
+type LiveValues = Arc<Mutex<BTreeMap<String, zeroize::Zeroizing<String>>>>;
 
 /// Name of the directory inside a machine's data dir that holds its
 /// credential CA.
@@ -209,10 +221,15 @@ impl CredentialLaunch {
     }
 
     /// Start the interceptor for this machine. The returned handle must live
-    /// as long as the VM; dropping it stops substitution.
-    pub fn start_interceptor(&self) -> Result<Interceptor> {
+    /// as long as the VM; dropping it stops substitution. With the machine's
+    /// data directory, it also serves [`CREDENTIALS_SOCKET`] there.
+    pub fn start_interceptor(&self, vm_dir: Option<&Path>) -> Result<Interceptor> {
         let ca = MachineCa::load(&self.ca_dir, &self.ca_owner)
             .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?;
+        let live = LiveValues::default();
+        if let Some(dir) = vm_dir {
+            serve_live_values(dir, &self.policy, live.clone());
+        }
         Interceptor::spawn(
             InterceptorConfig {
                 machine: self.machine.clone(),
@@ -221,7 +238,10 @@ impl CredentialLaunch {
                 ca,
                 upstream_roots_pem: Vec::new(),
             },
-            Arc::new(SecretRefResolver(self.sources.clone())),
+            Arc::new(SecretRefResolver {
+                sources: self.sources.clone(),
+                live,
+            }),
         )
         .map_err(|e| Error::config("credentials", format!("start interceptor: {e:#}")))
     }
@@ -287,17 +307,69 @@ impl CredentialLaunch {
     }
 }
 
+/// Serve [`CREDENTIALS_SOCKET`] in `vm_dir`: each connection sends
+/// `{"values":{"<binding>":"<value>",…}}` and gets back `ok` or `error:
+/// <reason>`. The values replace those the machine resolves for the bindings
+/// named, from its next request on; a name that is not a binding changes
+/// nothing.
+fn serve_live_values(vm_dir: &Path, policy: &CredentialPolicy, live: LiveValues) {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        values: BTreeMap<String, String>,
+    }
+    let bindings: Vec<String> = policy.credentials.iter().map(|b| b.name.clone()).collect();
+    let path = vm_dir.join(CREDENTIALS_SOCKET);
+    let _ = std::fs::remove_file(&path);
+    crate::network::launch::serve_control_socket(
+        path,
+        "credentials-control",
+        MAX_CREDENTIALS_REQUEST_BYTES,
+        move |request| {
+            let request: Request =
+                serde_json::from_str(request).map_err(|_| "malformed request".to_string())?;
+            if let Some(unknown) = request.values.keys().find(|k| !bindings.contains(k)) {
+                return Err(format!("no credential binding '{unknown}'"));
+            }
+            let names: Vec<String> = request.values.keys().cloned().collect();
+            live.lock().unwrap_or_else(|e| e.into_inner()).extend(
+                request
+                    .values
+                    .into_iter()
+                    .map(|(name, value)| (name, zeroize::Zeroizing::new(value))),
+            );
+            tracing::info!(bindings = ?names, "credential values replaced");
+            Ok(())
+        },
+    );
+}
+
 /// Resolves each binding from its secret reference on every request, through
 /// the same reader (and audit trail) as every other machine secret, so a
-/// rotated file or variable takes effect on the next request.
-struct SecretRefResolver(BTreeMap<String, SecretRef>);
+/// rotated file or variable takes effect on the next request. A value handed
+/// to the running machine through [`CREDENTIALS_SOCKET`] takes precedence.
+struct SecretRefResolver {
+    sources: BTreeMap<String, SecretRef>,
+    live: LiveValues,
+}
 
 impl CredentialResolver for SecretRefResolver {
     fn resolve(
         &self,
         request: &CredentialRequest,
     ) -> std::result::Result<zeroize::Zeroizing<String>, ResolveError> {
-        let source = self.0.get(&request.binding).ok_or(ResolveError::Unknown)?;
+        if let Some(value) = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&request.binding)
+        {
+            return Ok(value.clone());
+        }
+        let source = self
+            .sources
+            .get(&request.binding)
+            .ok_or(ResolveError::Unknown)?;
         crate::secrets::resolve_secret_ref_classified(
             &request.binding,
             source,
@@ -448,12 +520,63 @@ mod tests {
         );
     }
 
+    /// A running machine takes a rotated value through its credentials socket
+    /// and resolves it from the next request, over the value it booted with.
+    #[test]
+    fn values_sent_to_a_running_machine_replace_the_ones_it_booted_with() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "booted").unwrap();
+        let policy = CredentialPolicy {
+            credentials: vec![parse_credential_flag("github=GH_TOKEN@github.com").unwrap()],
+        };
+        let live = LiveValues::default();
+        serve_live_values(dir.path(), &policy, live.clone());
+        let resolver = SecretRefResolver {
+            sources: [("github".into(), crate::secrets::file_ref(path))].into(),
+            live,
+        };
+        let request = CredentialRequest {
+            machine: "rotate-test".into(),
+            binding: "github".into(),
+            host: "github.com".into(),
+            port: 443,
+            method: "GET".into(),
+            path: "/".into(),
+        };
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "booted");
+
+        let send = |body: &str| {
+            let mut stream =
+                crate::platform::uds::UdsStream::connect(dir.path().join(CREDENTIALS_SOCKET))
+                    .unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            reply
+        };
+        assert_eq!(send(r#"{"values":{"github":"rotated"}}"#).trim(), "ok");
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "rotated");
+
+        let refused = send(r#"{"values":{"other":"x"}}"#);
+        assert!(
+            refused.contains("no credential binding 'other'"),
+            "{refused}"
+        );
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "rotated");
+    }
+
     #[test]
     fn file_backed_credential_uses_the_latest_host_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("refresh-token");
         let source = crate::secrets::file_ref(path.clone());
-        let resolver = SecretRefResolver([("refresh".into(), source)].into());
+        let resolver = SecretRefResolver {
+            sources: [("refresh".into(), source)].into(),
+            live: LiveValues::default(),
+        };
         let request = CredentialRequest {
             machine: "oauth-test".into(),
             binding: "refresh".into(),

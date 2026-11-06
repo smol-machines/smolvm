@@ -289,7 +289,7 @@ pub(crate) fn serve_ports_requests(
     );
 }
 
-fn serve_control_socket(
+pub(crate) fn serve_control_socket(
     path: std::path::PathBuf,
     thread_name: &str,
     max_request_bytes: u64,
