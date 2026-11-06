@@ -601,6 +601,13 @@ impl CacheCandidate {
             .cloned()
             .collect()
     }
+
+    /// Whether this artifact is extracted at `_shared/<checksum>`.
+    fn extracted_as(&self, checksum: &str) -> bool {
+        self.shared_dirs
+            .iter()
+            .any(|dir| dir.file_name().is_some_and(|name| name == checksum))
+    }
 }
 
 fn is_vm_dir_name(name: &str) -> bool {
@@ -713,6 +720,17 @@ fn add_candidate_path(
             .saturating_add(allocated_usage(path)?);
     }
     candidate.modified = candidate.modified.max(path_modified(path)?);
+    Ok(())
+}
+
+/// Fill in `allocated_bytes` for an entry listed without `measure`.
+fn measure_candidate(candidate: &mut CacheCandidate) -> io::Result<()> {
+    let paths = candidate.visible_paths();
+    for path in paths.iter().chain(&candidate.metadata_files) {
+        candidate.allocated_bytes = candidate
+            .allocated_bytes
+            .saturating_add(allocated_usage(path)?);
+    }
     Ok(())
 }
 
@@ -870,16 +888,31 @@ fn prune_artifact_caches_in(
     keep: usize,
     dry_run: bool,
 ) -> io::Result<ArtifactCachePruneReport> {
+    prune_selected_in(vm_root, None, keep, dry_run)
+}
+
+/// Remove unused artifacts past the `keep` most recent, looking only at the
+/// one extracted at `_shared/<only>` when `only` is set.
+fn prune_selected_in(
+    vm_root: &Path,
+    only: Option<&str>,
+    keep: usize,
+    dry_run: bool,
+) -> io::Result<ArtifactCachePruneReport> {
     let _lock = lock_artifact_cache(vm_root, true)?;
     let shared_root = vm_root.join("_shared");
     let cow_root = vm_root.join("_cow-bases");
     let (referenced_digests, referenced_shared) = collect_machine_leases(vm_root, &shared_root)?;
     // Finish the complete reference scan and candidate inventory before the
-    // first mutation. Any malformed live pointer therefore fails closed.
-    let candidates = inventory_candidates(&shared_root, &cow_root, &referenced_shared, true)?;
+    // first mutation. Any malformed live pointer therefore fails closed. The
+    // listing does not walk the extractions: only what goes is sized, below.
+    let candidates = inventory_candidates(&shared_root, &cow_root, &referenced_shared, false)?;
     let mut referenced_entries = 0usize;
     let mut unused = Vec::new();
     for candidate in candidates.into_values() {
+        if only.is_some_and(|checksum| !candidate.extracted_as(checksum)) {
+            continue;
+        }
         let referenced = candidate
             .digest
             .as_ref()
@@ -901,8 +934,14 @@ fn prune_artifact_caches_in(
             .then_with(|| left.artifact.cmp(&right.artifact))
     });
 
+    // Size everything before the first removal, so a failure removes nothing.
+    let mut selected: Vec<_> = unused.into_iter().skip(keep).collect();
+    for candidate in &mut selected {
+        measure_candidate(candidate)?;
+    }
+
     let mut entries = Vec::new();
-    for candidate in unused.into_iter().skip(keep) {
+    for candidate in selected {
         if !dry_run {
             remove_candidate(&candidate)?;
         }
@@ -925,6 +964,14 @@ fn prune_artifact_caches_in(
 /// returned report describes the selection without changing the filesystem.
 pub fn prune_artifact_caches(keep: usize, dry_run: bool) -> io::Result<ArtifactCachePruneReport> {
     prune_artifact_caches_in(&vm_cache_root(), keep, dry_run)
+}
+
+/// Prune the one artifact extracted at `_shared/<checksum>`, with its COW bases.
+///
+/// An artifact a machine references is retained and counted in
+/// `referenced_entries`, as in [`prune_artifact_caches`].
+pub fn prune_artifact_cache(checksum: &str, dry_run: bool) -> io::Result<ArtifactCachePruneReport> {
+    prune_selected_in(&vm_cache_root(), Some(checksum), 0, dry_run)
 }
 
 /// Bound the shared extractions no machine leases any more.
@@ -1734,6 +1781,102 @@ mod tests {
         assert_eq!(real.entries.len(), 1);
         assert!(!shared_a.exists() && !cow_a.exists());
         assert!(shared_b.exists() && cow_b.exists());
+    }
+
+    #[test]
+    fn targeted_prune_removes_only_the_named_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared_a, cow_a) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (shared_b, cow_b) = install_artifact(&root, "cafebabe", DIGEST_B);
+
+        let dry = prune_selected_in(&root, Some("deadbeef"), 0, true).unwrap();
+        assert_eq!(dry.entries.len(), 1);
+        assert_eq!(dry.entries[0].artifact, DIGEST_A);
+        assert!(dry.entries[0].allocated_bytes > 0);
+        assert!(shared_a.exists() && cow_a.exists());
+
+        let real = prune_selected_in(&root, Some("deadbeef"), 0, false).unwrap();
+        assert_eq!(real, dry);
+        assert!(!shared_a.exists() && !cow_a.exists());
+        assert!(shared_b.exists() && cow_b.exists());
+
+        let gone = prune_selected_in(&root, Some("deadbeef"), 0, false).unwrap();
+        assert!(gone.entries.is_empty());
+        assert_eq!(gone.referenced_entries, 0);
+    }
+
+    #[test]
+    fn targeted_prune_retains_an_artifact_a_machine_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared_a, cow_a) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (shared_b, _) = install_artifact(&root, "cafebabe", DIGEST_B);
+        publish_test_lease(&machine_dir(&root, "01"), &shared_a);
+        publish_test_lease(&machine_dir(&root, "02"), &shared_b);
+
+        let report = prune_selected_in(&root, Some("deadbeef"), 0, false).unwrap();
+        assert!(report.entries.is_empty());
+        assert_eq!(report.referenced_entries, 1);
+        assert!(shared_a.exists() && cow_a.exists());
+    }
+
+    #[test]
+    fn prune_sizes_only_the_artifacts_it_removes() {
+        // Root reads through the mode that would catch a walk of the kept entry.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared_a, _) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (shared_b, _) = install_artifact(&root, "cafebabe", DIGEST_B);
+        fs::OpenOptions::new()
+            .read(true)
+            .open(smolvm_pack::extract::shared_artifact_sha256_path(&shared_b))
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        let unreadable = shared_b.join("layers");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = prune_artifact_caches_in(&root, 1, false);
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = report.unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].artifact, DIGEST_A);
+        assert!(report.entries[0].allocated_bytes > 0);
+        assert!(!shared_a.exists());
+        assert!(shared_b.exists());
+    }
+
+    #[test]
+    fn a_sizing_failure_removes_nothing() {
+        // Root reads through the mode that makes sizing fail here.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared_a, _) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (shared_b, _) = install_artifact(&root, "cafebabe", DIGEST_B);
+        // The newer entry comes first, so the one that cannot be sized is second.
+        fs::OpenOptions::new()
+            .read(true)
+            .open(smolvm_pack::extract::shared_artifact_sha256_path(&shared_b))
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        let unreadable = shared_a.join("layers");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = prune_artifact_caches_in(&root, 0, false);
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(report.is_err());
+        assert!(shared_a.exists());
+        assert!(shared_b.exists());
     }
 
     #[test]
