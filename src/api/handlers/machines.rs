@@ -6545,9 +6545,10 @@ async fn delete_one_transaction(
     ),
     request_body = CredentialValuesRequest,
     responses(
-        (status = 204, description = "Values held for the machine's next boot"),
+        (status = 204, description = "Values held for the machine's next boot, and in use at once on a running machine"),
         (status = 400, description = "A value names no binding of the machine", body = ApiErrorResponse),
-        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "The machine runs but could not take the values; they still apply from its next boot", body = ApiErrorResponse)
     )
 )]
 pub async fn put_credential_values(
@@ -6569,13 +6570,25 @@ pub async fn put_credential_values(
             "machine '{name}' has no credential binding '{unknown}'"
         )));
     }
-    crate::credentials::supply_values(
-        &name,
-        req.values
-            .into_iter()
-            .map(|(k, v)| (k, zeroize::Zeroizing::new(v)))
-            .collect(),
-    );
+    let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> = req
+        .values
+        .into_iter()
+        .map(|(k, v)| (k, zeroize::Zeroizing::new(v)))
+        .collect();
+    // A running machine resolves from the values its boot was handed, so it
+    // gets the new ones directly; the held copy covers its next boot.
+    let running = record.actual_state() == RecordState::Running;
+    let live = running.then(|| values.clone());
+    crate::credentials::supply_values(&name, values);
+    if let Some(values) = live {
+        let machine = name.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::agent::apply_live_credential_values(&machine, &values)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("credential values task failed: {error}")))?
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

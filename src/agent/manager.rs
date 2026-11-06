@@ -620,6 +620,27 @@ pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()
     })
 }
 
+/// Hand running machine `name` new values for its credential bindings, by
+/// binding name: its next request to a bound host uses them.
+pub fn apply_live_credential_values(
+    name: &str,
+    values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+) -> Result<()> {
+    let values: std::collections::BTreeMap<&str, &str> = values
+        .iter()
+        .map(|(binding, value)| (binding.as_str(), value.as_str()))
+        .collect();
+    let request = zeroize::Zeroizing::new(serde_json::json!({ "values": values }).to_string());
+    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
+        Error::config(
+            "credentials",
+            format!(
+                "could not hand machine '{name}' its new credential values while it runs: {reason}"
+            ),
+        )
+    })
+}
+
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
     use std::io::{Read, Write};
     let path = vm_data_dir(name).join(socket);

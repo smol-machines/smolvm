@@ -1231,9 +1231,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                              use the default virtio-net backend or update libkrun",
                         ));
                     };
-                    let interceptor = credentials.start_interceptor().inspect_err(|_| {
-                        krun_free_ctx(ctx);
-                    })?;
+                    let interceptor = credentials
+                        .start_interceptor(vsock_socket.parent())
+                        .inspect_err(|_| {
+                            krun_free_ctx(ctx);
+                        })?;
                     let endpoint = interceptor.endpoint();
                     let addr = CString::new(endpoint.addr.to_string()).expect("socket address");
                     let token: String = endpoint.token.iter().map(|b| format!("{b:02x}")).collect();
@@ -1285,9 +1287,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // the relay dials it for every guest HTTPS flow the egress policy
                 // admits, so the guest cannot route around substitution.
                 if let Some(credentials) = credentials {
-                    let interceptor = credentials.start_interceptor().inspect_err(|_| {
-                        krun_free_ctx(ctx);
-                    })?;
+                    let interceptor = credentials
+                        .start_interceptor(vsock_socket.parent())
+                        .inspect_err(|_| {
+                            krun_free_ctx(ctx);
+                        })?;
                     guest_network.intercept = Some(smolvm_network::StreamInterception::Https(
                         interceptor.endpoint(),
                     ));
