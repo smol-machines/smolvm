@@ -531,9 +531,20 @@ pub struct CheckpointNetwork {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CheckpointCpuContract {
-    /// Stable Haswell-era Intel/KVM virtual CPU profile. The source VM ran
-    /// under this profile from its first instruction, so host-specific extended
-    /// state cannot leak into a live checkpoint.
+    /// libkrun's portable Intel/KVM CPU profile (`KRUN_CPU_TEMPLATE_PORTABLE`).
+    /// The source VM ran under it from its first instruction, so no feature
+    /// that adds XSAVE state beyond x87/SSE/AVX (AVX-512, AMX, PKU, MPX, ...)
+    /// can leak into a live checkpoint.
+    ///
+    /// The name stays `v1` although the profile has grown (it now includes
+    /// SHA, ADX, RDSEED, CLFLUSHOPT, CLWB and RDPID): the exact CPUID the guest
+    /// was given travels in the checkpoint's vCPU state, and libkrun refuses a
+    /// restore on a host whose KVM lacks an instruction set in it (or an XSAVE
+    /// component the guest enabled), naming what is missing. Speculation
+    /// controls and other kernel- or microcode-dependent bits are not
+    /// compared, so restores between identical CPUs on different host kernels
+    /// keep working. Checkpoints captured under the older, narrower mask keep
+    /// restoring, and nothing here has to enumerate the features.
     LinuxKvmIntelPortableV1,
     /// Platforms without a hypervisor-level compatibility check require the
     /// exact source CPU feature fingerprint.
@@ -966,6 +977,16 @@ impl PackManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_intel_portable_contract_keeps_its_wire_name() {
+        // Checkpoints captured before the portable profile gained SHA carry
+        // this exact tag; it must keep parsing as the same contract.
+        let json = r#"{"kind":"linux-kvm-intel-portable-v1"}"#;
+        let contract: CheckpointCpuContract = serde_json::from_str(json).unwrap();
+        assert_eq!(contract, CheckpointCpuContract::LinuxKvmIntelPortableV1);
+        assert_eq!(serde_json::to_string(&contract).unwrap(), json);
+    }
 
     #[test]
     fn test_manifest_secret_refs_roundtrip() {
