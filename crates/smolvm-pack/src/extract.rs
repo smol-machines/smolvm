@@ -337,8 +337,15 @@ const HOST_LAYER_SYMLINKS_MARKER: &str = ".smolvm-host-layer-symlinks";
 /// unprivileged host hand the guest an image's exact owners, setuid bits and
 /// device nodes without being able to create any of them itself.
 const OVERRIDE_STAT_XATTR: &str = "user.containers.override_stat";
+/// Overlayfs opaque-directory marker. `y` makes the directory opaque. `x`
+/// declares that it may contain xwhiteout entries, which makes a merged
+/// readdir verify its regular entries by lookup: a whiteout the host faked
+/// through [`OVERRIDE_STAT_XATTR`] is a regular file on disk, so virtiofs
+/// reports it as DT_REG and overlayfs would otherwise trust that type.
 const OVERLAY_OPAQUE_XATTR: &str = "user.overlay.opaque";
-/// Overlayfs whiteout: a character device with device number 0:0.
+/// Overlayfs whiteout: a character device with device number 0:0. A host that
+/// cannot `mknod` fakes it with [`OVERRIDE_STAT_XATTR`], which is why the
+/// directory also needs the `x` marker above.
 const WHITEOUT_MODE: u32 = 0o020000;
 
 /// Whether this host should extract a pack's layers itself and describe their
@@ -1030,6 +1037,11 @@ fn safe_unpack_skipping<R: Read>(
     // /usr/lib64/pm-utils/*.d directories).
     let mut deferred_dir_modes: Vec<(PathBuf, u32)> = Vec::new();
     let mut symlink_owners = PendingSymlinkOwners::default();
+    // Directories this layer marked opaque. Their lower content is hidden
+    // wholesale, so a whiteout inside one has nothing left to hide and the
+    // directory must keep `user.overlay.opaque=y` rather than being downgraded
+    // to the xwhiteouts marker below.
+    let mut opaque_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
@@ -1110,6 +1122,15 @@ fn safe_unpack_skipping<R: Read>(
         // (a from-VM export tars the overlay-mounted tree, an image pack is
         // pre-merged), so a `.wh.` name in it is a file the machine holds, such
         // as a container runtime's own overlay data, and is kept as one.
+        //
+        // A faked whiteout stays a *regular* file on the host, so virtiofs
+        // reports it to the guest as DT_REG. overlayfs looks for a whiteout in
+        // a merged readdir only on DT_CHR entries, and otherwise trusts the
+        // type: the deleted name would be listed while lookup (which does see
+        // the 0:0 device through the override xattr) hides it. Marking the
+        // parent as an xwhiteouts directory (`user.overlay.opaque=x`, not `y`:
+        // the directory is not opaque) makes overlayfs verify regular entries
+        // with a lookup, which drops the names that resolve to a whiteout.
         if owner_xattr && translate_whiteouts {
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 let parent_rel = entry_path.parent().unwrap_or(Path::new(""));
@@ -1125,6 +1146,7 @@ fn safe_unpack_skipping<R: Read>(
                         ));
                     }
                     fs::create_dir_all(&dir)?;
+                    opaque_dirs.insert(normalize_path(&dir));
                     set_user_xattr(&dir, OVERLAY_OPAQUE_XATTR, b"y")?;
                     report.entries += 1;
                     continue;
@@ -1140,16 +1162,22 @@ fn safe_unpack_skipping<R: Read>(
                             ),
                         ));
                     }
-                    if let Some(parent) = target.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    if let Some(parent) = target.parent() {
-                        set_mode(parent, 0o755);
-                    }
+                    let parent_dir = target
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| dest.join(parent_rel));
+                    fs::create_dir_all(&parent_dir)?;
+                    set_mode(&parent_dir, 0o755);
                     let _ = fs::remove_file(&target);
                     let _ = fs::remove_dir_all(&target);
                     File::create(&target)?;
                     record_override_stat(&target, 0, 0, WHITEOUT_MODE)?;
+                    // An opaque directory already hides every lower entry, so
+                    // its whiteouts are redundant and `y` must win over `x`
+                    // regardless of the order the tar lists them in.
+                    if !opaque_dirs.contains(&normalize_path(&parent_dir)) {
+                        set_user_xattr(&parent_dir, OVERLAY_OPAQUE_XATTR, b"x")?;
+                    }
                     report.entries += 1;
                     continue;
                 }
@@ -7786,6 +7814,14 @@ mod tests {
             fs::read(single.join("var/lib/docker/diff/etc/.wh.gone")).unwrap(),
             b"kept"
         );
+        assert_eq!(
+            read_user_xattr(
+                &single.join("var/lib/docker/diff/etc"),
+                OVERLAY_OPAQUE_XATTR
+            ),
+            None,
+            "a kept .wh. file must not turn its directory into xwhiteouts"
+        );
 
         let stacked = root.path().join("stacked");
         super::materialize_tar_dir(&tar_path, &stacked, false, true, true).unwrap();
@@ -7793,6 +7829,67 @@ mod tests {
         assert!(
             stacked.join("var/lib/docker/diff/etc/gone").exists(),
             "becomes the whiteout"
+        );
+        assert_eq!(
+            read_user_xattr(
+                &stacked.join("var/lib/docker/diff/etc"),
+                OVERLAY_OPAQUE_XATTR
+            )
+            .as_deref(),
+            Some("x"),
+            "the translated whiteout's directory must be marked xwhiteouts"
+        );
+    }
+
+    /// A translated whiteout is a regular file on the host, so virtiofs
+    /// reports it as DT_REG and overlayfs never confirms it during a merged
+    /// readdir: the deleted name leaked while lookup (which sees the faked 0:0
+    /// device) hid it. The extraction must mark the whiteout's directory as an
+    /// xwhiteouts directory, which makes overlayfs verify regular entries by
+    /// lookup. An opaque directory keeps `y` regardless of tar order.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_translated_whiteout_marks_its_directory_for_readdir() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append_data(&mut header, path, &b""[..]).unwrap();
+        };
+        add("plain/.wh.gone");
+        add(".wh.rootgone");
+        // The opaque marker comes first: the later whiteout must not downgrade
+        // the directory to `x`.
+        add("opaque/.wh..wh..opq");
+        add("opaque/.wh.gone");
+        let bytes = builder.into_inner().unwrap();
+
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let marker = |rel: &str| read_user_xattr(&dest.join(rel), OVERLAY_OPAQUE_XATTR);
+        assert_eq!(marker("plain").as_deref(), Some("x"));
+        assert_eq!(marker("").as_deref(), Some("x"));
+        assert_eq!(
+            marker("opaque").as_deref(),
+            Some("y"),
+            "an opaque directory must keep y, whichever marker the tar lists last"
         );
     }
 
@@ -7874,6 +7971,15 @@ mod tests {
             b"",
             None,
         );
+        add(
+            ".wh.rootgone",
+            tar::EntryType::Regular,
+            0o644,
+            0,
+            0,
+            b"",
+            None,
+        );
         add("ro/", tar::EntryType::Directory, 0o555, 0, 0, b"", None);
         add(
             "ro/readme",
@@ -7886,6 +7992,17 @@ mod tests {
         );
         add(
             "ro/.wh.old",
+            tar::EntryType::Regular,
+            0o644,
+            0,
+            0,
+            b"",
+            None,
+        );
+        // A whiteout inside a directory that this same layer marks opaque:
+        // `y` must survive no matter which marker the tar lists last.
+        add(
+            "private/.wh.gone-private",
             tar::EntryType::Regular,
             0o644,
             0,
@@ -7932,9 +8049,27 @@ mod tests {
         assert_eq!(fs::metadata(dest.join("bin/gone")).unwrap().len(), 0);
         assert!(!dest.join("bin/.wh.gone").exists());
         assert!(!dest.join("private/.wh..wh..opq").exists());
+        assert_eq!(xattr("private/gone-private").as_deref(), Some("0:0:020000"));
         assert_eq!(
             read_user_xattr(&dest.join("private"), OVERLAY_OPAQUE_XATTR).as_deref(),
             Some("y")
+        );
+        // A directory holding a translated whiteout is an xwhiteouts
+        // directory, so overlayfs verifies its regular entries by lookup
+        // during readdir instead of trusting the DT_REG virtiofs reports for
+        // the faked 0:0 device.
+        assert_eq!(
+            read_user_xattr(&dest.join("bin"), OVERLAY_OPAQUE_XATTR).as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            read_user_xattr(&dest.join("ro"), OVERLAY_OPAQUE_XATTR).as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            read_user_xattr(&dest, OVERLAY_OPAQUE_XATTR).as_deref(),
+            Some("x"),
+            "a whiteout at the layer root marks the root"
         );
         // The host copy is readable regardless of the archived mode.
         let host_mode =
