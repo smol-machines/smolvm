@@ -159,6 +159,8 @@ pub struct ApiState {
 
 /// Internal machine entry with manager and configuration.
 pub struct MachineEntry {
+    /// Persisted machine labels for cached list responses.
+    pub labels: std::collections::BTreeMap<String, String>,
     /// Resolved workload image, matching the persisted machine record.
     pub image: Option<String>,
     /// Credential policy launch description, when the machine has one.
@@ -207,6 +209,8 @@ pub struct MachineEntry {
 
 /// Parameters for registering a new machine.
 pub struct MachineRegistration {
+    /// Opaque labels assigned at create time.
+    pub labels: std::collections::BTreeMap<String, String>,
     /// The agent manager for this machine.
     pub manager: AgentManager,
     /// Host mounts to configure.
@@ -701,6 +705,7 @@ impl ApiState {
                     machines.insert(
                         name.clone(),
                         Arc::new(parking_lot::Mutex::new(MachineEntry {
+                            labels: record.labels.clone(),
                             cache_disk: record.cache_disk.clone(),
                             image: record.image.clone(),
                             credentials: crate::credentials::CredentialLaunch::for_record(
@@ -1254,6 +1259,7 @@ impl ApiState {
         );
         record.set_port_mappings(&reg.ports.iter().map(PortMapping::from).collect::<Vec<_>>());
         record.staged_mounts = staged_mounts;
+        record.labels = reg.labels.clone();
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
         record.block_io = reg.resources.block_io.unwrap_or_default();
@@ -1333,6 +1339,7 @@ impl ApiState {
                 machines.insert(
                     name,
                     Arc::new(parking_lot::Mutex::new(MachineEntry {
+                        labels: record.labels.clone(),
                         cache_disk: record.cache_disk.clone(),
                         image: record.image.clone(),
                         credentials: crate::credentials::CredentialLaunch::for_record(
@@ -2140,6 +2147,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
             .child_pid()
             .and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name,
+        labels: entry.labels.clone(),
         image: entry.image.clone(),
         state: state.to_string(),
         state_reason: None,
@@ -2440,6 +2448,7 @@ mod tests {
         state.insert_machine(
             name,
             MachineEntry {
+                labels: Default::default(),
                 credentials: None,
                 external_interceptor: None,
                 manager: AgentManager::for_vm(name).unwrap(),
@@ -2503,6 +2512,7 @@ mod tests {
         let (_dir, state) = temp_api_state();
         let name = "replace-entry-qa";
         let entry = |image: &str| MachineEntry {
+            labels: Default::default(),
             credentials: None,
             external_interceptor: None,
             manager: AgentManager::for_vm(name).unwrap(),
@@ -2569,6 +2579,7 @@ mod tests {
         state.insert_machine(
             "remove-test-m1",
             MachineEntry {
+                labels: Default::default(),
                 credentials: None,
                 external_interceptor: None,
                 manager,
@@ -2649,6 +2660,7 @@ mod tests {
         state.insert_machine(
             "busy-m1",
             MachineEntry {
+                labels: Default::default(),
                 credentials: None,
                 external_interceptor: None,
                 manager,
