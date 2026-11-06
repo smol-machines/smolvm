@@ -541,6 +541,10 @@ fn main() {
         );
     }
     attach::mount_devices_at_boot();
+    // A machine without an image runs its commands in this root, so the
+    // credential trust bundle its environment names is assembled here; an
+    // image machine gets its own when its container is created.
+    credentials::install_for_agent_root(boot_mounts);
 
     // Create /workspace symlink for bare VMs (no -v targeting /workspace).
     // Image-based VMs get /workspace via a bind mount in the container spec,
