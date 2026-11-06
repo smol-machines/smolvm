@@ -257,7 +257,7 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             rootfs_arch: aarch64
             agent_arch: aarch64
             lib_dir: lib
