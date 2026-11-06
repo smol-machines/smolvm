@@ -218,6 +218,21 @@ fn pack_sidecar_sentinel(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// `e` followed by the error at the bottom of its chain. The tar crate reports a
+/// failed entry as "failed to unpack `<path>`" and keeps the OS error (ENOSPC,
+/// EACCES, EIO) only as a source, so printing `e` alone turned a full disk into
+/// an unexplained "failed to unpack" with nothing to act on.
+fn with_causes(e: &std::io::Error) -> String {
+    let mut root = std::error::Error::source(e);
+    while let Some(next) = root.and_then(|inner| inner.source()) {
+        root = Some(next);
+    }
+    match root {
+        Some(root) => format!("{e}: {root}"),
+        None => e.to_string(),
+    }
+}
+
 /// Extract one OCI layer blob into `dest`, applying OCI whiteout semantics so the
 /// directory is a correct overlayfs lowerdir.
 ///
@@ -359,7 +374,7 @@ pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::
                 | tar::EntryType::Directory => {
                     return Err(std::io::Error::new(
                         e.kind(),
-                        format!("failed to unpack '{}': {}", path.display(), e),
+                        format!("failed to unpack '{}': {}", path.display(), with_causes(&e)),
                     ));
                 }
                 _ => {
