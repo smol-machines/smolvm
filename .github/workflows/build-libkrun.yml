@@ -160,7 +160,7 @@ jobs:
   macos-libkrun:
     name: libkrun macos-arm64
     if: ${{ inputs.macos_only }}
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
