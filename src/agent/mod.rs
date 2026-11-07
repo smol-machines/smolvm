@@ -108,13 +108,13 @@ pub use manager::{
     cleanup_dead_vm_runtime, lock_live_egress,
 };
 pub use manager::{
-    bind_ready_listener, disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir,
-    machine_layers_cache_dir, prune_orphaned_ready_markers, read_egress_denials, read_egress_flows,
-    read_egress_signals, read_egress_telemetry, read_guest_pressure, read_mediation_machine_id,
-    read_shared_pack_pointer, resolve_disk_image, restore_base_dir, shared_pack_cache_root,
-    shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir,
-    AgentManager, AgentState, EgressDenial, EgressFlowSummary, EgressSignal, GuestPressure,
-    PressureStall, EGRESS_TELEMETRY_FILE, SHARED_PACK_POINTER,
+    bind_ready_listener, branchable_now, disk_used_mb, docker_config_dir, docker_config_mount,
+    ensure_vm_dir, machine_layers_cache_dir, prune_orphaned_ready_markers, read_egress_denials,
+    read_egress_flows, read_egress_signals, read_egress_telemetry, read_guest_pressure,
+    read_mediation_machine_id, read_shared_pack_pointer, resolve_disk_image, restore_base_dir,
+    running_forkable, shared_pack_cache_root, shared_pack_pointer_path, vm_cache_root, vm_data_dir,
+    vm_dir_hash, vm_uid_registry_dir, AgentManager, AgentState, EgressDenial, EgressFlowSummary,
+    EgressSignal, GuestPressure, PressureStall, EGRESS_TELEMETRY_FILE, SHARED_PACK_POINTER,
 };
 
 /// Agent VM name.
