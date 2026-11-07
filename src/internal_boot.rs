@@ -748,6 +748,50 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
                 }
             }
         });
+    // Waypipe Wayland forwarding: bridge the guest's outbound waypipe vsock port
+    // to a Unix socket in the per-VM dir. Outbound (listen=false), so libkrun
+    // connects to this path when the guest opens the port; the user runs a
+    // `waypipe client` listening on it. Clear any stale socket first.
+    let waypipe_socket: Option<std::path::PathBuf> = if config.waypipe {
+        config.vsock_socket.parent().map(|dir| {
+            let path = dir.join("waypipe.sock");
+            let _ = std::fs::remove_file(&path);
+            path
+        })
+    } else {
+        None
+    };
+
+    // Raw X11 socket bridge: resolve the host X server socket from the host
+    // `$DISPLAY` and bridge the guest's outbound X11 vsock port straight to it.
+    // The path is the LIVE host X server socket, not smolvm-owned, so it is
+    // never removed. Skips (with a warning) if $DISPLAY is unset/unparseable or
+    // the socket is missing, so a misconfigured host disables X11 rather than
+    // aborting the boot.
+    let x11_socket: Option<std::path::PathBuf> = if config.x11 {
+        match host_x11_socket(std::env::var("DISPLAY").ok().as_deref()) {
+            Ok(path) => {
+                tracing::info!(path = %path.display(), "X11 bridge: using host X server socket");
+                Some(path)
+            }
+            Err(reason) => {
+                tracing::warn!("X11 bridge requested but {reason} - X11 disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Waypipe host client: when forwarding is enabled, start a `waypipe client`
+    // on the host that listens on `waypipe.sock` and forwards to the host
+    // compositor, so the user does not run it by hand. Held for the VM's
+    // lifetime (dropped when this process exits); `spawn_client` also arms
+    // PR_SET_PDEATHSIG so it dies with the boot process. No-op off Linux / with
+    // no compositor.
+    let _waypipe_client = waypipe_socket
+        .as_deref()
+        .and_then(smolvm::vm::waypipe::spawn_client);
 
     proc_timing!("ready to launch");
 
@@ -775,6 +819,9 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         docker_socket: docker_socket.as_deref(),
         workload_log_socket: workload_log_socket.as_deref(),
         published_sockets: &config.published_sockets,
+        waypipe_socket: waypipe_socket.as_deref(),
+        waypipe_bin: config.waypipe_bin.as_deref(),
+        x11_socket: x11_socket.as_deref(),
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         packed_layers_dax_window: config.packed_layers_dax_window,
         extra_disks: &config.extra_disks,
@@ -1054,4 +1101,31 @@ mod parent_death_tests {
         super::flush_guest_before_exit(&dir.path().join("absent.sock"));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
+}
+
+/// Resolve the host X server's Unix socket from the host `$DISPLAY`, or say why
+/// the X11 bridge cannot run. The boot subprocess and the CLI's notice both call
+/// this, so the CLI says "enabled" only when the boot side will bridge.
+///
+/// Handles the common local forms `:N` and `:N.S` (screen suffix ignored),
+/// mapping display N to `/tmp/.X11-unix/XN`. A network display (`host:N`) or a
+/// socket-path display (XQuartz's launchd `$DISPLAY`) has no such socket.
+pub fn host_x11_socket(display: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let display = display.ok_or_else(|| "$DISPLAY is unset".to_string())?;
+    let not_local = || format!("$DISPLAY={display} is not a local display (:N)");
+    // A non-empty part before ':' is a TCP host or a socket path, not `:N`.
+    let (host, rest) = display.rsplit_once(':').ok_or_else(not_local)?;
+    if !host.is_empty() {
+        return Err(not_local());
+    }
+    // rest is "N" or "N.S"; take the display number before any screen suffix.
+    let num = rest.split('.').next().unwrap_or_default();
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(not_local());
+    }
+    let path = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{num}"));
+    if !path.exists() {
+        return Err(format!("no X server socket at {}", path.display()));
+    }
+    Ok(path)
 }

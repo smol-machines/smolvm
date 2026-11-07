@@ -59,6 +59,21 @@ pub struct BootConfig {
     /// carried into the boot subprocess and applied by the launcher.
     #[serde(default)]
     pub published_sockets: Vec<crate::config::PublishedSocketConfig>,
+    /// Enable waypipe Wayland forwarding. When set, the boot subprocess derives
+    /// a `waypipe.sock` in the VM data dir and registers an outbound vsock port
+    /// (guest connects out); the user runs a `waypipe client` on the host socket.
+    #[serde(default)]
+    pub waypipe: bool,
+    /// Which `waypipe` binary the guest daemon runs: `None`/`"host"` shares the
+    /// host binary, `"container"` uses the image's own, or an absolute host
+    /// path. Ignored unless `waypipe` is set.
+    #[serde(default)]
+    pub waypipe_bin: Option<String>,
+    /// Enable the raw X11 socket bridge. When set, the boot subprocess resolves
+    /// the host X server socket from `$DISPLAY` and registers an outbound vsock
+    /// port bridged straight to it (guest connects out).
+    #[serde(default)]
+    pub x11: bool,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     #[serde(default)]
