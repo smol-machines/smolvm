@@ -1,6 +1,7 @@
 use crate::data::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use smolvm_protocol::disk_volume::DiskVolume;
 use std::path::{Path, PathBuf};
 
 /// Default size for the rootfs overlay disk (10 GiB sparse).
@@ -33,37 +34,101 @@ pub type StoredStagedMount = (usize, String, String);
 
 /// Split raw `-v` specs into the rest (returned untouched for the host and
 /// remote parsers) and disk volumes: a lone guest path with no host side, as in
-/// Docker's anonymous volume `-v /var/lib/docker`. Disk volume targets come back
-/// normalized, and must not repeat.
-pub fn split_disk_volume_specs(specs: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+/// Docker's anonymous volume `-v /var/lib/docker`, optionally followed by its
+/// owner and mode (`-v /data:uid=1000,gid=1000,mode=750`). Disk volume targets
+/// come back normalized, and must not repeat.
+pub fn split_disk_volume_specs(specs: &[String]) -> Result<(Vec<String>, Vec<DiskVolume>)> {
     let mut rest = Vec::new();
-    let mut disk = Vec::new();
+    let mut disk: Vec<DiskVolume> = Vec::new();
     for spec in specs {
-        if !spec.starts_with('/') || spec.contains(':') {
+        if !is_disk_volume_spec(spec) {
+            reject_owner_options(spec)?;
             rest.push(spec.clone());
             continue;
         }
-        let target = smolvm_protocol::disk_volume::normalize_target(spec)
+        let volume = DiskVolume::parse(spec)
             .map_err(|reason| Error::mount("validate disk volume", reason))?;
-        if disk.contains(&target) {
+        if disk.iter().any(|d| d.target == volume.target) {
             return Err(Error::mount(
                 "validate mounts",
-                format!("duplicate mount target: {target} is specified more than once"),
+                format!(
+                    "duplicate mount target: {} is specified more than once",
+                    volume.target
+                ),
             ));
         }
-        disk.push(target);
+        disk.push(volume);
     }
     Ok((rest, disk))
 }
 
+/// A guest path alone, or one followed by `key=value` options rather than a
+/// second path (`/host:/guest` is a host mount).
+fn is_disk_volume_spec(spec: &str) -> bool {
+    if !spec.starts_with('/') {
+        return false;
+    }
+    match spec.split_once(':') {
+        None => true,
+        Some((_, options)) => !options.starts_with('/') && options.contains('='),
+    }
+}
+
+/// Refuse `uid=`, `gid=` or `mode=` on a spec that is not a disk volume. The
+/// host and remote parsers would otherwise read `/src:/data:uid=1000` as a
+/// mount of the source `/src:/data`, and fail with a misleading
+/// "mount source not found".
+fn reject_owner_options(spec: &str) -> Result<()> {
+    let Some((_, last)) = spec.rsplit_once(':') else {
+        return Ok(());
+    };
+    let is_owner_option = |option: &str| {
+        option
+            .split_once('=')
+            .is_some_and(|(key, _)| matches!(key, "uid" | "gid" | "mode"))
+    };
+    if last.split(',').any(is_owner_option) {
+        return Err(Error::mount(
+            "validate mounts",
+            format!(
+                "uid=, gid= and mode= only apply to disk volumes (a guest path alone, \
+                 like -v /data:uid=1000), not to '{spec}'"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply a `machine update`'s disk volume changes: drop the removed targets,
+/// then add each new volume, replacing the one already at its target so its
+/// owner and mode can be changed.
+pub fn merge_disk_volumes(
+    current: &[DiskVolume],
+    removed: &[DiskVolume],
+    added: &[DiskVolume],
+) -> Vec<DiskVolume> {
+    let mut merged: Vec<DiskVolume> = current
+        .iter()
+        .filter(|volume| !removed.iter().any(|r| r.target == volume.target))
+        .cloned()
+        .collect();
+    for volume in added {
+        match merged.iter_mut().find(|v| v.target == volume.target) {
+            Some(existing) => *existing = volume.clone(),
+            None => merged.push(volume.clone()),
+        }
+    }
+    merged
+}
+
 /// Reject a disk volume whose target is also a host or remote mount target.
 pub fn ensure_disk_volumes_distinct<'a>(
-    disk_volumes: &[String],
+    disk_volumes: &[DiskVolume],
     other_targets: impl IntoIterator<Item = &'a str>,
 ) -> Result<()> {
     for target in other_targets {
         let target = target.trim_end_matches('/');
-        if disk_volumes.iter().any(|d| d == target) {
+        if disk_volumes.iter().any(|d| d.target == target) {
             return Err(Error::mount(
                 "validate mounts",
                 format!("duplicate mount target: {target} is specified more than once"),
@@ -202,6 +267,7 @@ impl HostMount {
     /// If no mode is provided, the mount defaults to writable.
     /// The source path is validated, required to be a directory, and canonicalized.
     fn _parse(spec: &str, allow_system_mounts: bool) -> Result<Self> {
+        reject_owner_options(spec)?;
         // Parse from the right so a Windows host path keeps its drive-letter
         // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
         // colon, and the optional trailing mode is `ro`/`rw`; everything before
@@ -453,7 +519,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let (rest, disk) = split_disk_volume_specs(&specs).unwrap();
-        assert_eq!(disk, vec!["/var/lib/docker".to_string()]);
+        assert_eq!(disk, vec![DiskVolume::new("/var/lib/docker".to_string())]);
         assert_eq!(rest, specs[1..].to_vec());
 
         let dup = [
@@ -464,6 +530,83 @@ mod tests {
         assert!(split_disk_volume_specs(&["/proc/x".to_string()]).is_err());
         assert!(ensure_disk_volumes_distinct(&disk, ["/var/lib/docker/"]).is_err());
         assert!(ensure_disk_volumes_distinct(&disk, ["/data"]).is_ok());
+    }
+
+    #[test]
+    fn a_disk_volume_can_carry_its_owner_and_mode() {
+        let specs: Vec<String> = [
+            "/data:uid=1000,gid=1000,mode=750",
+            "/host:/guest",
+            "/host:/guest:ro",
+            "/host:ro",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (rest, disk) = split_disk_volume_specs(&specs).unwrap();
+        assert_eq!(rest, specs[1..].to_vec());
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk[0].target, "/data");
+        assert_eq!(
+            (disk[0].uid, disk[0].gid, disk[0].mode),
+            (Some(1000), Some(1000), Some(0o750))
+        );
+
+        let err = split_disk_volume_specs(&["/data:user=1000".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("user=1000"), "{err}");
+        let dup = ["/data".to_string(), "/data:uid=1".to_string()];
+        assert!(split_disk_volume_specs(&dup).is_err());
+    }
+
+    /// The owner options belong to disk volumes; on a host directory or S3
+    /// mount they are refused as such, not read as part of the source path.
+    #[test]
+    fn owner_options_on_a_host_mount_are_refused_as_disk_volume_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().display().to_string();
+        for spec in [
+            format!("{host}:/data:uid=1000,gid=1000"),
+            format!("{host}:/data:mode=750"),
+            format!("{host}:/data:ro,uid=1000"),
+            "./src:/data:gid=50".to_string(),
+            "s3://bucket/prefix:/data:uid=1000".to_string(),
+        ] {
+            let err = split_disk_volume_specs(std::slice::from_ref(&spec)).unwrap_err();
+            assert!(
+                err.to_string().contains("only apply to disk volumes"),
+                "{spec}: {err}"
+            );
+        }
+        // `machine mount add` parses with HostMount directly.
+        let err = HostMount::parse(&[format!("{host}:/data:uid=1000")]).unwrap_err();
+        assert!(
+            err.to_string().contains("only apply to disk volumes"),
+            "{err}"
+        );
+
+        // Host mounts without the options still parse as before.
+        let (rest, disk) = split_disk_volume_specs(&[format!("{host}:/data:ro")]).unwrap();
+        assert!(disk.is_empty());
+        assert!(HostMount::parse(&rest).unwrap()[0].read_only);
+    }
+
+    #[test]
+    fn update_replaces_a_disk_volume_at_the_same_target() {
+        let volume = |spec: &str| DiskVolume::parse(spec).unwrap();
+        let current = vec![volume("/var/lib/docker"), volume("/data:uid=1")];
+        let merged = merge_disk_volumes(
+            &current,
+            &[volume("/var/lib/docker")],
+            &[volume("/data:uid=2,mode=700"), volume("/cache")],
+        );
+        assert_eq!(
+            merged,
+            vec![volume("/data:uid=2,mode=700"), volume("/cache")]
+        );
+
+        // Adding the bare path back clears the owner it was given.
+        let cleared = merge_disk_volumes(&merged, &[], &[volume("/data")]);
+        assert_eq!(cleared[0], volume("/data"));
     }
 
     #[test]
