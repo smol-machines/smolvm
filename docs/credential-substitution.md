@@ -240,6 +240,8 @@ restore. Values never travel: supply them again for the restored machine.
   saying so.
 - Interception covers port 443. Plaintext HTTP on port 80 and other ports are
   relayed without substitution.
+- HTTPS the workload routes through another interface than the machine's NIC
+  is covered too; see [Tailscale, WireGuard and other tunnels](#tailscale-wireguard-and-other-tunnels).
 - The guest side is HTTP/1.1 (the interceptor negotiates `http/1.1` only);
   upstream may be HTTP/2. WebSocket upgrades and `CONNECT` are refused on
   credential hosts.
@@ -247,6 +249,48 @@ restore. Values never travel: supply them again for the restored machine.
   not buffered.
 - An upstream can still return a credential in its response body. This is
   substitution, not data-loss prevention.
+
+## Tailscale, WireGuard and other tunnels
+
+A workload can run its own VPN: Tailscale (a tailnet host, or every
+destination through an exit node), WireGuard, OpenVPN. Their traffic leaves
+the machine encrypted, so the host never sees the HTTPS inside it. On the
+`virtio-net` backend the guest agent therefore redirects TCP port 443 that
+leaves through any interface other than the machine's NIC (`tailscale0`,
+`wg0`, `tun0`, …) to the same interceptor, over vsock. The interceptor then
+opens the upstream connection from inside the guest, so it takes the route the
+workload chose (through the tunnel, to the tailnet host or the exit node). TLS
+to the upstream is still made and verified on the host; the guest relays
+ciphertext and never holds the value. Other hosts are relayed untouched, with
+their own certificates.
+
+```sh
+GITHUB_TOKEN=ghp_… smolvm machine create --name agent --image debian:12 \
+  --credential github=GITHUB_TOKEN@api.github.com
+smolvm machine start --name agent
+smolvm machine exec --name agent -- sh -c 'tailscaled & tailscale up --authkey … --exit-node …'
+smolvm machine exec --name agent -- sh -c \
+  'curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/user'
+# substituted, and sent through the exit node
+```
+
+Limits:
+
+- IPv4 only. HTTPS to an IPv6 address through a tunnel is not redirected.
+- Connections the guest itself opens. Traffic it forwards (from containers or
+  namespaces inside the machine) through a tunnel is not redirected.
+- A kernel TUN device. Tailscale's `--tun=userspace-networking` mode and its
+  SOCKS5/HTTP proxy never put the connection on a guest interface, so they are
+  not covered; run `tailscaled` with `/dev/net/tun` (its default as root).
+- The redirect is one nftables rule in table `ip smolvm_credentials`. A workload
+  that deletes it, or flushes the whole ruleset (`nft flush ruleset`), turns
+  this off until the machine restarts; the placeholder is then sent as is and
+  the value still never leaves the host.
+- A tunnel that hands the connection back out through the machine's NIC
+  unencrypted (a local proxy namespace, say) meets the interceptor twice; the
+  request then fails with `502` rather than going out without the value.
+- It needs the agent from the same release as `smolvm`; an older agent rootfs
+  leaves tunnelled HTTPS unsubstituted, as before.
 
 ## Comparison with `--secret-env` / `--secret-file`
 

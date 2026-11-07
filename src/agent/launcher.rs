@@ -1171,6 +1171,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         );
         // Lives until the VM exits: dropping it would stop substitution.
         let mut _credential_interceptor: Option<smolvm_credentials::Interceptor> = None;
+        // Host ends of the credential tunnel, for HTTPS the guest routes
+        // through another interface than its NIC (virtio-net only).
+        let mut credential_tunnel: Option<crate::credentials::GuestTunnel> = None;
 
         // `mut` is only needed on unix (the VirtioNet arm assigns it); on
         // Windows the runtime is owned by the accept thread, so the launcher's
@@ -1232,7 +1235,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         ));
                     };
                     let interceptor = credentials
-                        .start_interceptor(vsock_socket.parent())
+                        .start_interceptor(vsock_socket.parent(), None)
                         .inspect_err(|_| {
                             krun_free_ctx(ctx);
                         })?;
@@ -1287,8 +1290,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // the relay dials it for every guest HTTPS flow the egress policy
                 // admits, so the guest cannot route around substitution.
                 if let Some(credentials) = credentials {
+                    credential_tunnel = vsock_socket
+                        .parent()
+                        .and_then(crate::credentials::guest_tunnel_in);
                     let interceptor = credentials
-                        .start_interceptor(vsock_socket.parent())
+                        .start_interceptor(vsock_socket.parent(), credential_tunnel.as_ref())
                         .inspect_err(|_| {
                             krun_free_ctx(ctx);
                         })?;
@@ -1878,6 +1884,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             docker_socket: docker_socket.as_deref(),
             port_forward_socket: port_forward_socket.as_deref(),
             workload_log_socket: workload_log_socket.as_deref(),
+            credential_tunnel: credential_tunnel.as_ref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()
             .iter()
