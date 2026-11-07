@@ -397,7 +397,10 @@ install_smolvm() {
 
     # Extract
     info "Extracting archive..."
-    tar -xzf "$archive" -C "$tmp_dir" || {
+    # --no-same-owner: as root, tar would otherwise give every file the uid/gid
+    # stored in the archive (the release builder's), and `cp -a` below carries
+    # that owner into the installed agent-rootfs.
+    tar --no-same-owner -xzf "$archive" -C "$tmp_dir" || {
         error "Failed to extract archive"
         rm -rf "$tmp_dir"
         exit 1
@@ -617,7 +620,9 @@ install_smolvm() {
     fi
 
     # Everything a dropped VM uid loads must be readable and traversable by it.
+    # Only root may change it: the agent-rootfs holds the init every VM boots.
     if [[ "$SYSTEM_INSTALL" == true ]]; then
+        chown -R 0:0 "$prefix"
         chmod -R a+rX "$prefix"
         # An earlier install under root's home would otherwise shadow this one
         # through its ~/.local/bin symlink.
