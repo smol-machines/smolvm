@@ -302,6 +302,15 @@ pub mod ports {
     /// on this port, reads the target guest port as one decimal line, then
     /// relays the connection to `127.0.0.1:<port>` inside the guest.
     pub const PORT_FORWARD: u32 = 6005;
+    /// Credential tunnel, guest to host: the guest agent hands the host's
+    /// credential interceptor each HTTPS connection a workload routes through
+    /// an interface other than the machine's own NIC (a Tailscale or WireGuard
+    /// TUN), prefixed with its destination. Outbound (guest connects in).
+    pub const CREDENTIAL_TUNNEL: u32 = 6006;
+    /// Credential tunnel, host to guest: the interceptor asks the guest agent
+    /// to open the upstream connection for such a flow, so it leaves through
+    /// the route the workload chose. Inbound (host connects in).
+    pub const CREDENTIAL_DIAL: u32 = 6007;
     /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
     /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
     pub const CUDA: u32 = 7000;

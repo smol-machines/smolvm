@@ -87,6 +87,8 @@ fn boot_log(level: &str, msg: &str) {
 }
 mod attach;
 mod branchpoint;
+#[cfg(target_os = "linux")]
+mod credential_tunnel;
 mod credentials;
 mod cuda;
 mod dirwatch;
@@ -592,6 +594,13 @@ fn main() {
     // Forward ports published while the machine runs (no virtio-net).
     if port_forward::is_enabled() {
         port_forward::start();
+    }
+
+    // HTTPS a workload routes through a TUN (Tailscale, WireGuard) instead of
+    // the NIC still reaches the host's credential interceptor.
+    #[cfg(target_os = "linux")]
+    if credential_tunnel::is_enabled() {
+        credential_tunnel::start();
     }
 
     // Start any user-published Unix-socket bridges (`--expose-socket` /
