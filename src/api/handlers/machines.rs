@@ -7169,6 +7169,40 @@ pub(crate) fn cache_base_fetch_lock(base: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// Fetch a requested cache base this server does not have yet from its signed
 /// source URL, verified against its SHA-256 before it appears under its name.
 /// A base already present is used as is: bases are immutable by name.
+/// Fetch a cache base into this server ahead of any machine needing it: the
+/// control plane sends a just-published version to the nodes its tenant runs
+/// on, so the first machine of that version there does not wait on tens of GiB.
+/// The same download as a create's (one per base, verified as it arrives, kept
+/// within the cache budget); a base already here answers at once.
+#[utoipa::path(
+    put,
+    path = "/api/v1/cache-bases/{base}",
+    tag = "Machines",
+    params(
+        ("base" = String, Path, description = "Cache base file name")
+    ),
+    request_body = crate::api::types::FetchCacheBaseRequest,
+    responses(
+        (status = 204, description = "Cache base is here"),
+        (status = 400, description = "Invalid name, URL or digest, cache disks disabled, or the download did not match", body = ApiErrorResponse),
+    )
+)]
+pub async fn fetch_cache_base_ahead(
+    State(state): State<Arc<ApiState>>,
+    Path(base): Path<String>,
+    Json(req): Json<crate::api::types::FetchCacheBaseRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let spec = crate::api::types::CacheDiskSpec {
+        base,
+        mount_path: String::new(),
+        source_url: Some(req.source_url),
+        sha256: Some(req.sha256),
+        slot: false,
+    };
+    fetch_cache_base(&state, &spec).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 async fn fetch_cache_base(
     state: &Arc<ApiState>,
     spec: &crate::api::types::CacheDiskSpec,
@@ -7899,6 +7933,42 @@ mod tests {
             validate_pinned_ports(&[(31028, 4318), (31028, 8080)]),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    /// Fetching ahead answers at once for a base already here, and refuses a
+    /// bad name or a digest that is not a sha256, before any download.
+    #[tokio::test]
+    async fn fetching_a_cache_base_ahead_is_a_noop_when_present_and_checks_its_input() {
+        let (db_dir, state) = setup_test_state();
+        let cache_dir = db_dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        state.set_cache_disk_dir(Some(cache_dir.clone()));
+        std::fs::write(cache_dir.join("cd-v3.qcow2"), b"base").unwrap();
+        let fetch = |base: &str, sha: &str| {
+            fetch_cache_base_ahead(
+                State(state.clone()),
+                Path(base.to_string()),
+                Json(crate::api::types::FetchCacheBaseRequest {
+                    source_url: "https://storage.googleapis.com/b/o".to_string(),
+                    sha256: sha.to_string(),
+                }),
+            )
+        };
+        let sha = "a".repeat(64);
+        assert_eq!(
+            fetch("cd-v3.qcow2", &sha).await.unwrap(),
+            axum::http::StatusCode::NO_CONTENT
+        );
+        assert!(matches!(
+            fetch("../escape.qcow2", &sha).await,
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            fetch("cd-v4.qcow2", "not-a-digest").await,
+            Err(ApiError::BadRequest(_))
+        ));
+        // Nothing was created for the refused requests.
+        assert!(!cache_dir.join("cd-v4.qcow2").exists());
     }
 
     #[tokio::test]
