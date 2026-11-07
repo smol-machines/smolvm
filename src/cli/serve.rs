@@ -301,6 +301,18 @@ impl ServeStartCmd {
         if smolvm::systemd_scope::is_available() {
             std::env::set_var("SMOLVM_VM_USE_SCOPE", "1");
             tracing::info!("per-VM systemd transient scopes enabled (lossless serve restart)");
+            // VMs run in their own slice so they can never starve this API; on
+            // big hosts a few CPUs are kept free of VMs altogether.
+            match smolvm::systemd_scope::configure_vm_slice() {
+                Ok(reserved) => tracing::info!(
+                    slice = smolvm::systemd_scope::VM_SLICE,
+                    reserved_cpus = reserved,
+                    "VM slice ready"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "could not limit the VM slice's CPUs; VMs may use every CPU")
+                }
+            }
         } else if let Some(root) = smolvm::process::setup_cgroup_delegation_root() {
             tracing::info!(cgroup_root = %root.display(), "per-VM cgroup resource caps enabled");
             std::env::set_var("SMOLVM_CGROUP_ROOT", &root);

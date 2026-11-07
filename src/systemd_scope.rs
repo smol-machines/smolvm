@@ -79,6 +79,127 @@ fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
         .map_err(|e| Error::agent("vm scope", format!("busctl output failed: {e}")))
 }
 
+/// The slice every VM scope runs in, a top-level sibling of `system.slice`.
+///
+/// Without it each VM scope sat directly in `system.slice` beside
+/// `smolvm-node.service`, every one at the default CPU weight, so a node with
+/// 87 busy VMs gave its own API about 1/88 of the contended CPU and stopped
+/// answering (the 2026-11-04 x86-xfs-worker-0 saturation). In a slice of their
+/// own, all VMs together weigh the same as all host services together, so the
+/// node keeps at least half the CPU however many VMs it runs. systemd creates
+/// the slice on demand the first time a scope names it.
+pub const VM_SLICE: &str = "smolvm.slice";
+
+/// Online CPUs on hosts at least this large keep a few CPUs free of VMs by
+/// default (see [`host_reserved_cpus`]). Smaller hosts (laptops, CI runners)
+/// cannot spare a whole core.
+const RESERVE_CPUS_MIN_HOST: usize = 32;
+
+/// How many host CPUs to keep free of VMs, so the node's own services always
+/// have a core no guest can run on. `SMOLVM_HOST_RESERVED_CPUS` wins when it is
+/// a number (`0` turns the reservation off); otherwise hosts with at least
+/// [`RESERVE_CPUS_MIN_HOST`] CPUs reserve one per 64, and smaller hosts none.
+/// Always leaves VMs at least one CPU.
+pub fn host_reserved_cpus(online: usize, configured: Option<&str>) -> usize {
+    let wanted = match configured.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n,
+        None if online >= RESERVE_CPUS_MIN_HOST => (online / 64).max(1),
+        None => 0,
+    };
+    wanted.min(online.saturating_sub(1))
+}
+
+/// Parse a kernel CPU list such as `0-191` or `0-3,8,10-11` into CPU ids.
+fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+                if a > b {
+                    return None;
+                }
+                cpus.extend(a..=b);
+            }
+            None => cpus.push(part.parse().ok()?),
+        }
+    }
+    Some(cpus)
+}
+
+/// The `AllowedCPUs` mask for [`VM_SLICE`]: every online CPU except the
+/// `reserved` lowest-numbered ones (CPU 0 also takes most interrupts, so the
+/// host is better off keeping it). Bit `i % 8` of byte `i / 8` is CPU `i`, as
+/// systemd encodes a CPU set on the bus. Empty means no restriction.
+fn vm_slice_cpu_mask(online: &[usize], reserved: usize) -> Vec<u8> {
+    if reserved == 0 {
+        return Vec::new();
+    }
+    let mut sorted = online.to_vec();
+    sorted.sort_unstable();
+    let mut mask = Vec::new();
+    for &cpu in sorted.iter().skip(reserved) {
+        if mask.len() <= cpu / 8 {
+            mask.resize(cpu / 8 + 1, 0);
+        }
+        mask[cpu / 8] |= 1 << (cpu % 8);
+    }
+    mask
+}
+
+fn slice_cpus_args(mask: &[u8]) -> Vec<String> {
+    // SetUnitProperties(name: s, runtime: b, properties: a(sv)). Runtime only:
+    // serve sets it again on every start, so a changed reservation takes effect
+    // on the next restart and nothing stale outlives a reboot.
+    let mut args: Vec<String> = [
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "SetUnitProperties",
+        "sba(sv)",
+        VM_SLICE,
+        "true",
+        "1",
+        "AllowedCPUs",
+        "ay",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    args.push(mask.len().to_string());
+    args.extend(mask.iter().map(u8::to_string));
+    args
+}
+
+/// Keep [`host_reserved_cpus`] CPUs free of VMs by limiting [`VM_SLICE`] to the
+/// rest. Called once by `serve` when it runs VMs in scopes; VMs already running
+/// in the slice move off the reserved CPUs at once. Returns how many CPUs are
+/// reserved.
+pub fn configure_vm_slice() -> Result<usize> {
+    let online = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|list| parse_cpu_list(&list))
+        .ok_or_else(|| Error::agent("vm slice", "cannot read the online CPU list"))?;
+    let configured = std::env::var("SMOLVM_HOST_RESERVED_CPUS").ok();
+    let reserved = host_reserved_cpus(online.len(), configured.as_deref());
+    let busctl = busctl_path()
+        .ok_or_else(|| Error::agent("vm slice", "busctl not found; cannot set up the VM slice"))?;
+    let mut cmd = Command::new(&busctl);
+    cmd.args(slice_cpus_args(&vm_slice_cpu_mask(&online, reserved)));
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if !out.status.success() {
+        return Err(Error::agent(
+            "vm slice",
+            format!(
+                "SetUnitProperties {VM_SLICE} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    Ok(reserved)
+}
+
 /// Resource caps applied to the VM's scope (as systemd unit properties).
 ///
 /// Mirrors the per-VM cgroup limits set by [`crate::process::place_in_cgroup`]:
@@ -243,6 +364,8 @@ fn scope_start_args(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Vec<String>
         "s".into(),
         format!("smolvm VM {machine_id}"),
     ]);
+    nprops += 1;
+    props.extend(["Slice".into(), "s".into(), VM_SLICE.into()]);
     nprops += 1;
     if let Some(m) = caps.memory_high_bytes {
         props.extend(["MemoryHigh".into(), "t".into(), m.to_string()]);
@@ -557,6 +680,72 @@ mod tests {
                 "mask {mask}: malformed auxiliary array"
             );
         }
+    }
+
+    #[test]
+    fn every_vm_scope_runs_in_the_vm_slice() {
+        let args = scope_start_args("m", 1, &ScopeCaps::default());
+        let at = args.iter().position(|a| a == "Slice").expect("Slice set");
+        assert_eq!(&args[at + 1..at + 3], &["s", VM_SLICE]);
+    }
+
+    #[test]
+    fn big_hosts_reserve_cpus_and_small_ones_do_not() {
+        assert_eq!(host_reserved_cpus(192, None), 3);
+        assert_eq!(host_reserved_cpus(96, None), 1);
+        assert_eq!(host_reserved_cpus(32, None), 1);
+        assert_eq!(host_reserved_cpus(16, None), 0);
+        assert_eq!(host_reserved_cpus(8, None), 0);
+        // An explicit count wins, 0 turns it off, junk falls back to the default.
+        assert_eq!(host_reserved_cpus(192, Some("8")), 8);
+        assert_eq!(host_reserved_cpus(192, Some("0")), 0);
+        assert_eq!(host_reserved_cpus(8, Some("2")), 2);
+        assert_eq!(host_reserved_cpus(192, Some("lots")), 3);
+        // VMs always keep at least one CPU.
+        assert_eq!(host_reserved_cpus(4, Some("9")), 3);
+        assert_eq!(host_reserved_cpus(1, Some("1")), 0);
+    }
+
+    #[test]
+    fn cpu_lists_parse_like_the_kernel_prints_them() {
+        assert_eq!(parse_cpu_list("0-3\n"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(parse_cpu_list("0,2,4-5"), Some(vec![0, 2, 4, 5]));
+        assert_eq!(parse_cpu_list("7"), Some(vec![7]));
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("a-b"), None);
+    }
+
+    #[test]
+    fn the_vm_slice_mask_leaves_out_the_lowest_cpus() {
+        let online: Vec<usize> = (0..16).collect();
+        // CPUs 0-2 reserved: byte 0 keeps bits 3-7, byte 1 all of 8-15.
+        assert_eq!(vm_slice_cpu_mask(&online, 3), vec![0b1111_1000, 0xff]);
+        assert!(vm_slice_cpu_mask(&online, 0).is_empty());
+        // Gaps in the online list are honored: reserve the two lowest present.
+        assert_eq!(vm_slice_cpu_mask(&[0, 2, 9, 10], 2), vec![0, 0b0000_0110]);
+    }
+
+    #[test]
+    fn slice_cpus_args_encode_the_mask_as_a_byte_array() {
+        let args = slice_cpus_args(&[0b1111_1000, 0xff]);
+        assert_eq!(
+            &args[4..],
+            &[
+                "SetUnitProperties",
+                "sba(sv)",
+                VM_SLICE,
+                "true",
+                "1",
+                "AllowedCPUs",
+                "ay",
+                "2",
+                "248",
+                "255"
+            ]
+        );
+        // An empty mask clears any earlier restriction.
+        let cleared = slice_cpus_args(&[]);
+        assert_eq!(&cleared[cleared.len() - 2..], &["ay", "0"]);
     }
 
     // A wedged busctl (systemd stuck on a dying cgroup) must not pin the thread:
