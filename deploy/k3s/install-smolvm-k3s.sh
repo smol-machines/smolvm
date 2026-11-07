@@ -70,7 +70,8 @@ echo "==> writing k3s containerd template (base + smolvm runtime, no [options])"
 # mirror config breaks image pulls cluster-wide and the cause is hard to trace.
 TMPL="$K3S_CTD_DIR/config.toml.tmpl"
 SMOLVM_BLOCK="$SMOLVM_HDR
-  runtime_type = \"io.containerd.smolvm.v2\""
+  runtime_type = \"io.containerd.smolvm.v2\"
+  pod_annotations = [\"smolvm.io/*\"]"
 
 if [ ! -f "$TMPL" ]; then
   printf '{{ template "base" . }}\n\n%s\n' "$SMOLVM_BLOCK" > "$TMPL"

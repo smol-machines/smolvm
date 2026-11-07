@@ -99,6 +99,7 @@ else
       [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.smolvm]
         runtime_type = 'io.containerd.smolvm.v2'
         sandboxer = 'podsandbox'
+        pod_annotations = ['smolvm.io/*']
 
     Then restart containerd:
 

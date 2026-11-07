@@ -37,8 +37,9 @@ if [ -f "$TMPL" ]; then
     echo "    restoring $BACKUP"
     mv "$BACKUP" "$TMPL"
   else
-    # Drop the smolvm table header and its runtime_type line.
-    sed -i '/runtimes\.smolvm\]/,+1d' "$TMPL"
+    # Drop the smolvm table header, its runtime_type line, and the
+    # pod_annotations line that an install from before it does not have.
+    sed -i '/runtimes\.smolvm\]/,+1d; /^  pod_annotations = \["smolvm\.io\/\*"\]$/d' "$TMPL"
     # A template that is now nothing but the base include is what k3s generates
     # by default, so remove it rather than leave a no-op file behind.
     if [ "$(grep -cvE '^[[:space:]]*($|\{\{ template "base" \. \}\})' "$TMPL")" = 0 ]; then
