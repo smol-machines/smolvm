@@ -3430,9 +3430,12 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     }
 
     // The durable vCPU state contains the exact guest CPUID and MSR contract.
-    // KVM validates those values when libkrun applies the checkpoint, so a
-    // destination missing any required architectural feature still fails
-    // closed even though host model/stepping differences are accepted here.
+    // libkrun compares the instruction sets and XCR0 components in that CPUID
+    // with this host's KVM_GET_SUPPORTED_CPUID before applying it
+    // (KVM_SET_CPUID2 itself accepts features the host lacks), and
+    // KVM_SET_MSRS refuses MSRs it cannot hold, so a destination missing a
+    // required architectural feature fails closed with it named, even though
+    // host model/stepping differences are accepted here.
     Ok(())
 }
 

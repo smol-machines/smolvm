@@ -37,14 +37,18 @@ pub struct NodeUtilization {
     pub disk_gb: u64,
 }
 
-/// Records whose disk state must survive startup reconciliation. A stopped or
-/// live clone keeps every ancestor in its qcow2 lineage alive even when an
-/// ancestor VMM process died; deleting that ancestor's data directory would
-/// silently break the child's backing chain.
+/// Records whose disk state must survive startup reconciliation. Every
+/// persistent machine survives, as does every stopped or live one, and each of
+/// them keeps every ancestor in its qcow2 lineage alive even when an ancestor
+/// VMM process died; deleting that ancestor's data directory would silently
+/// break the child's backing chain. Only a dead ephemeral machine that nothing
+/// depends on is left out.
 fn retained_fork_lineage(vms: &[(String, VmRecord)]) -> HashSet<String> {
     let mut retained = vms
         .iter()
-        .filter(|(_, record)| record.pid.is_none() || record.is_process_alive())
+        .filter(|(_, record)| {
+            !record.ephemeral || record.pid.is_none() || record.is_process_alive()
+        })
         .map(|(name, _)| name.clone())
         .collect::<HashSet<_>>();
 
@@ -586,19 +590,27 @@ impl ApiState {
         let mut loaded = Vec::new();
 
         for (name, mut record) in vms {
-            // Only clean up machines that have a PID (were started) but whose
-            // process is no longer alive.  Machines in "created" state (pid=None)
-            // have never been started and must be preserved — they are valid
-            // configs waiting for a start call.
+            // A machine that was started but whose process is gone (a host
+            // reboot, a crash, a kill -9) is kept as stopped with its disks, so
+            // a start boots it again. Only a dead ephemeral machine that no
+            // retained clone depends on is removed. Machines in "created" state
+            // (pid=None) have never been started and are preserved as they are.
             if record.paused_checkpoint.is_none()
                 && record.pid.is_some()
                 && !record.is_process_alive()
             {
                 if retained_lineage.contains(&name) {
-                    tracing::warn!(
-                        machine = %name,
-                        "machine process died but a retained fork descendant still depends on its disks; preserving it as stopped"
-                    );
+                    if record.ephemeral {
+                        tracing::warn!(
+                            machine = %name,
+                            "machine process died but a retained fork descendant still depends on its disks; preserving it as stopped"
+                        );
+                    } else {
+                        tracing::warn!(
+                            machine = %name,
+                            "machine process died while the server was down; keeping it as stopped"
+                        );
+                    }
                     record.pid = None;
                     record.pid_start_time = None;
                     record.state = RecordState::Stopped;
@@ -609,16 +621,16 @@ impl ApiState {
                     }) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            tracing::warn!(machine = %name, "fork ancestor disappeared during startup reconciliation");
+                            tracing::warn!(machine = %name, "dead machine disappeared during startup reconciliation");
                             continue;
                         }
                         Err(e) => {
-                            tracing::warn!(machine = %name, error = %e, "failed to preserve dead fork ancestor; leaving its data untouched");
+                            tracing::warn!(machine = %name, error = %e, "failed to mark dead machine stopped; leaving its data untouched");
                             continue;
                         }
                     }
                 } else {
-                    tracing::info!(machine = %name, "cleaning up dead machine from database");
+                    tracing::info!(machine = %name, "cleaning up dead ephemeral machine from database");
                     if let Err(e) = self.db.remove_vm(&name) {
                         tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
                     }
@@ -626,9 +638,8 @@ impl ApiState {
                     // machine's storage + overlay images (multi-GB sparse files) — and
                     // since the record is gone, nothing will ever clean them up later.
                     // On a long-lived node that churns/crashes machines this is a slow
-                    // disk-fill across server restarts. The `pid.is_some()` guard above
-                    // means we only touch machines that were started and then died, not
-                    // intentionally-stopped (pid=None) machines whose disks must persist.
+                    // disk-fill across server restarts. Only ephemeral machines reach
+                    // here: a persistent machine's disks are its data and are kept.
                     let dir = crate::agent::vm_data_dir(&name);
                     if dir.exists() {
                         if let Err(e) = std::fs::remove_dir_all(&dir) {
@@ -2718,13 +2729,14 @@ mod tests {
     }
 
     #[test]
-    fn test_load_persisted_machines_removes_dead_records() {
+    fn test_load_persisted_machines_removes_dead_ephemeral_records() {
         let (_dir, state) = temp_api_state();
 
         // Insert a record with a PID that doesn't exist (dead process)
         let mut record = VmRecord::new("dead-machine".into(), 1, 512, vec![], vec![], false);
         record.pid = Some(i32::MAX); // PID that certainly doesn't exist
         record.state = RecordState::Running;
+        record.ephemeral = true;
         state.db.insert_vm("dead-machine", &record).unwrap();
 
         // Give it a data dir with a marker file — reconciliation must reclaim it,
@@ -2755,6 +2767,58 @@ mod tests {
         // Name should be available for reuse
         let token = SmolvmDb::create_reservation_token();
         assert!(state.reserve_machine_name("dead-machine", &token).is_ok());
+    }
+
+    #[test]
+    fn test_load_keeps_a_dead_persistent_machine_as_stopped_with_its_disks() {
+        let (_dir, state) = temp_api_state();
+
+        let mut record = VmRecord::new("dead-persistent".into(), 1, 512, vec![], vec![], false);
+        record.pid = Some(i32::MAX);
+        record.pid_start_time = Some(1);
+        record.state = RecordState::Running;
+        state.db.insert_vm("dead-persistent", &record).unwrap();
+        let data_dir = crate::agent::vm_data_dir("dead-persistent");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("storage.raw"), b"data").unwrap();
+
+        let loaded = state.load_persisted_machines();
+
+        assert!(loaded.contains(&"dead-persistent".to_string()));
+        let kept = state.db.get_vm("dead-persistent").unwrap().unwrap();
+        assert_eq!(kept.state, RecordState::Stopped);
+        assert_eq!(kept.pid, None);
+        assert_eq!(kept.pid_start_time, None);
+        assert_eq!(
+            std::fs::read(data_dir.join("storage.raw")).unwrap(),
+            b"data"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn test_load_keeps_a_dead_ephemeral_ancestor_of_a_dead_persistent_clone() {
+        let (_dir, state) = temp_api_state();
+
+        let mut base = VmRecord::new("dead-eph-base".into(), 1, 512, vec![], vec![], false);
+        base.pid = Some(i32::MAX);
+        base.state = RecordState::Running;
+        base.ephemeral = true;
+        state.db.insert_vm("dead-eph-base", &base).unwrap();
+        let mut child = VmRecord::new("dead-kept-child".into(), 1, 512, vec![], vec![], false);
+        child.pid = Some(i32::MAX - 1);
+        child.state = RecordState::Running;
+        child.golden = Some("dead-eph-base".to_string());
+        state.db.insert_vm("dead-kept-child", &child).unwrap();
+
+        let loaded = state.load_persisted_machines();
+
+        assert!(loaded.contains(&"dead-eph-base".to_string()));
+        assert!(loaded.contains(&"dead-kept-child".to_string()));
+        assert_eq!(
+            state.db.get_vm("dead-eph-base").unwrap().unwrap().state,
+            RecordState::Stopped
+        );
     }
 
     #[test]
@@ -2790,10 +2854,12 @@ mod tests {
         let mut base = VmRecord::new("dead-tree-base".into(), 1, 512, vec![], vec![], false);
         base.pid = Some(i32::MAX);
         base.state = RecordState::Running;
+        base.ephemeral = true;
         state.db.insert_vm("dead-tree-base", &base).unwrap();
         let mut child = VmRecord::new("dead-tree-child".into(), 1, 512, vec![], vec![], false);
         child.pid = Some(i32::MAX - 1);
         child.state = RecordState::Running;
+        child.ephemeral = true;
         child.golden = Some("dead-tree-base".to_string());
         state.db.insert_vm("dead-tree-child", &child).unwrap();
 

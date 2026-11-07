@@ -113,9 +113,18 @@ fn agent_ready_timeout(is_cuda_clone: bool) -> Duration {
 // Re-use shared polling constants from process module.
 use crate::process::FAST_POLL_INTERVAL;
 
-/// Timeout for agent to stop gracefully before force kill.
+/// How long a stop whose shutdown handshake failed waits for the VM to have
+/// exited on its own before reporting it left alive for a retry.
 /// Reduced from 5s - VMs typically exit within 100ms after shutdown signal.
 const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a VM whose guest acknowledged shutdown gets after SIGTERM before
+/// SIGKILL. The VMM writes each disk image out on exit: the qcow2 metadata
+/// that keeps the image consistent takes about a millisecond, but the fsync
+/// that makes it durable against a host crash takes seconds on a large image
+/// (4.8 s measured for 4 GiB of scattered new clusters), and SIGKILL would
+/// cut it short. A VMM that exits sooner ends the wait sooner.
+const VM_EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -653,6 +662,27 @@ pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()
         Error::config(
             "published ports",
             format!("could not change machine '{name}''s published ports while it runs: {reason}"),
+        )
+    })
+}
+
+/// Hand running machine `name` new values for its credential bindings, by
+/// binding name: its next request to a bound host uses them.
+pub fn apply_live_credential_values(
+    name: &str,
+    values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+) -> Result<()> {
+    let values: std::collections::BTreeMap<&str, &str> = values
+        .iter()
+        .map(|(binding, value)| (binding.as_str(), value.as_str()))
+        .collect();
+    let request = zeroize::Zeroizing::new(serde_json::json!({ "values": values }).to_string());
+    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
+        Error::config(
+            "credentials",
+            format!(
+                "could not hand machine '{name}' its new credential values while it runs: {reason}"
+            ),
         )
     })
 }
@@ -3953,7 +3983,8 @@ impl AgentManager {
             // child. On macOS kill(pid, 0) can still see an exited child until
             // it is reaped, so a second liveness probe must not override that
             // confirmed exit (or mistake a recycled PID for this VM).
-            process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT).is_ok()
+            process::stop_vm_process(pid, VM_EXIT_FLUSH_TIMEOUT, process::VM_SIGKILL_TIMEOUT)
+                .is_ok()
         } else {
             false
         };

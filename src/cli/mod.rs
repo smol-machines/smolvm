@@ -1,5 +1,6 @@
 //! CLI command implementations.
 
+pub mod broken_pipe;
 pub mod cleanup_ephemeral;
 pub mod completion;
 pub mod config;
