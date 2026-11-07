@@ -304,7 +304,40 @@ test_pack_from_vm_leaves_tmp_behind() {
     return 0
 }
 
+# #1986: `machine create --from` must keep the flags `--image` keeps; it
+# dropped --secret-file/--secret-env/--secret-keychain and --workdir.
+test_create_from_smolmachine_keeps_secrets_and_workdir() {
+    local vm_name="from-sm-secrets-$$"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/secrets-pack"
+    printf %s value-from-file > "$tmpdir/secret"
+
+    $SMOLVM pack create --image alpine:latest -o "$pack_output" --cpus 1 --mem 512 2>&1 || {
+        echo "SKIP: pack create failed"
+        rm -rf "$tmpdir"; return 0
+    }
+    $SMOLVM machine create --name "$vm_name" --from "$pack_output.smolmachine" \
+        --secret-file PACK_SECRET="$tmpdir/secret" --workdir /tmp -- sleep infinity 2>&1 || {
+        rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        echo "FAIL: start failed"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    local seen
+    seen=$($SMOLVM machine exec --name "$vm_name" -- sh -c 'echo "$PACK_SECRET $(pwd)"' 2>&1 | tail -1)
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
+    rm -rf "$tmpdir"
+    [[ "$seen" == "value-from-file /tmp" ]] || {
+        echo "FAIL: packed machine saw: $seen"
+        return 1
+    }
+    return 0
+}
+
 run_test "Create from .smolmachine" test_create_from_smolmachine || true
+run_test "Create from .smolmachine keeps --secret-file and --workdir" test_create_from_smolmachine_keeps_secrets_and_workdir || true
 run_test "Packed: a pack from a machine leaves /tmp behind and keeps /root" test_pack_from_vm_leaves_tmp_behind || true
 run_test "File cp preserves state on packed VM" test_cp_preserves_state_on_packed_vm || true
 run_test "Packed: volume targets at/below /workspace resolve in guest" test_packed_volume_targets_resolve_inside_guest || true

@@ -3009,6 +3009,123 @@ mod tests {
         command: MachineCmd,
     }
 
+    /// Params as the `--from` path builds them before CLI settings apply:
+    /// whatever the artifact recorded, here one packed secret ref and a
+    /// workdir.
+    fn pack_params() -> vm_common::CreateVmParams {
+        let mut params = crate::cli::smolfile::build_create_params(
+            "packed".to_string(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some("/from-pack".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Default::default(),
+        )
+        .expect("params");
+        params
+            .secret_refs
+            .insert("PACKED".to_string(), smolvm::secrets::env_ref("PACKED"));
+        params
+    }
+
+    fn create_cmd(args: &[&str]) -> CreateCmd {
+        let mut argv = vec![
+            "machine",
+            "create",
+            "--name",
+            "packed",
+            "--from",
+            "x.smolmachine",
+        ];
+        argv.extend_from_slice(args);
+        let MachineCmd::Create(cmd) = TestMachineCli::try_parse_from(argv).unwrap().command else {
+            panic!("expected machine create");
+        };
+        cmd
+    }
+
+    /// #1986: `machine create --from` accepted these flags and dropped them,
+    /// so a `--credential` fed by `--secret-file` resolved from the host
+    /// environment instead and failed with `credential unavailable`.
+    #[test]
+    fn create_from_pack_keeps_the_settings_create_from_image_keeps() {
+        let cmd = create_cmd(&[
+            "--secret-file",
+            "TOKEN=/run/secrets/token",
+            "--secret-env",
+            "PACKED=HOST_PACKED",
+            "--workdir",
+            "/work",
+            "--block-private",
+            "--allow-private",
+            "100.81.17.207/32",
+            "--gpu",
+            "--gpu-vram",
+            "2048",
+        ]);
+        let mut params = pack_params();
+        cmd.apply_settings_to_pack_params(&mut params).unwrap();
+
+        assert_eq!(
+            params.secret_refs["TOKEN"].from_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/token"))
+        );
+        // A flag wins over a packed reference of the same name.
+        assert_eq!(
+            params.secret_refs["PACKED"].from_env.as_deref(),
+            Some("HOST_PACKED")
+        );
+        assert_eq!(params.workdir.as_deref(), Some("/work"));
+        assert_eq!(
+            params.block_private.as_deref(),
+            Some(&["100.81.17.207/32".to_string()][..])
+        );
+        assert!(params.net, "--block-private implies --net");
+        assert!(params.gpu);
+        assert_eq!(params.gpu_vram_mib, Some(2048));
+
+        let record = vm_common::build_vm_record(&params).unwrap();
+        assert!(record.secret_refs.contains_key("TOKEN"));
+        assert_eq!(record.workdir.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn create_from_pack_without_flags_keeps_what_the_pack_recorded() {
+        let mut params = pack_params();
+        create_cmd(&[])
+            .apply_settings_to_pack_params(&mut params)
+            .unwrap();
+        assert_eq!(params.secret_refs.len(), 1);
+        assert_eq!(params.workdir.as_deref(), Some("/from-pack"));
+        assert!(params.block_private.is_none());
+        assert!(!params.net && !params.gpu && !params.rosetta);
+        assert_eq!(params.gpu_vram_mib, None);
+    }
+
+    #[test]
+    fn create_from_pack_rejects_a_bad_secret_flag() {
+        let mut params = pack_params();
+        assert!(create_cmd(&["--secret-file", "TOKEN"])
+            .apply_settings_to_pack_params(&mut params)
+            .is_err());
+    }
+
     #[test]
     fn create_takes_repeatable_dns_options_in_order_and_refuses_unknown_ones() {
         let cli = TestMachineCli::try_parse_from([
@@ -5078,6 +5195,33 @@ impl CreateCmd {
         vm_common::create_vm(params)
     }
 
+    /// Apply the create flags that `--from` takes the same way `--image` does,
+    /// over what the artifact recorded: `--secret-env`/`--secret-file`/
+    /// `--secret-keychain` (a flag wins over a packed reference of the same
+    /// name), `--workdir`, `--block-private`/`--allow-private`, `--gpu`,
+    /// `--gpu-vram` and `--rosetta`. A live checkpoint refuses the
+    /// device-changing ones before this runs.
+    fn apply_settings_to_pack_params(
+        &self,
+        params: &mut vm_common::CreateVmParams,
+    ) -> smolvm::Result<()> {
+        for (key, r) in
+            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?
+        {
+            params.secret_refs.insert(key, r);
+        }
+        if let Some(workdir) = &self.workdir {
+            params.workdir = Some(workdir.clone());
+        }
+        params.apply_block_private(self.block_private, self.allow_private.clone());
+        params.gpu = params.gpu || self.gpu;
+        if let Some(vram) = self.gpu_vram_mib {
+            params.gpu_vram_mib = Some(vram);
+        }
+        params.rosetta = params.rosetta || self.rosetta;
+        Ok(())
+    }
+
     /// Create a machine from a .smolmachine artifact.
     fn run_from_smolmachine(&self, sidecar_path: &std::path::Path) -> smolvm::Result<()> {
         if !sidecar_path.exists() {
@@ -5156,7 +5300,11 @@ impl CreateCmd {
                 || self.docker_socket
                 || self.storage.is_some()
                 || self.overlay.is_some()
-                || !self.disk.is_empty();
+                || !self.disk.is_empty()
+                // Blocking private destinations turns networking on, and a
+                // restored guest keeps the devices it was captured with.
+                || self.block_private
+                || !self.allow_private.is_empty();
             // The captured workload holds the checkpoint's placeholders; a new
             // binding would mint ones it never received.
             if !self.credential.is_empty() {
@@ -5499,6 +5647,7 @@ impl CreateCmd {
         };
         params.prepend_deny_cidrs(&self.deny_cidr);
         params.append_allow_udp(&self.allow_udp);
+        self.apply_settings_to_pack_params(&mut params)?;
         merge_cli_credentials(&mut params, &self.credential)?;
 
         let resources = VmResources {
