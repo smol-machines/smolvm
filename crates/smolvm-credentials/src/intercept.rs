@@ -494,7 +494,7 @@ async fn terminate<S: Io>(
     // Through the guest, this connection gets a client of its own pinned to a
     // relay that dials the destination from inside the guest; the relay goes
     // away with the connection.
-    let (relay, client) = match route {
+    let (relay, client): (Option<GuestRelay>, _) = match route {
         Route::Direct => (None, state.client_for(&host, destination)?),
         #[cfg(unix)]
         Route::Guest(dial) => {
