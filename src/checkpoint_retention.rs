@@ -1010,6 +1010,9 @@ mod tests {
 
     #[test]
     fn forget_skips_pinned_and_kept_checkpoints_and_finishes_later() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let store = root.path();
         let (pinned, head, plain) = ("1".repeat(32), "2".repeat(32), "3".repeat(32));
@@ -1048,6 +1051,9 @@ mod tests {
 
     #[test]
     fn a_pin_taken_after_a_forget_sees_the_checkpoint_gone() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let store = root.path();
         let id = "4".repeat(32);
@@ -1108,6 +1114,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn forgetting_ancestors_reclaims_their_objects_and_the_head_still_restores() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         const MIB: usize = 1 << 20;
         let root = tempfile::tempdir().unwrap();
         let store = root.path().join("store");
