@@ -99,6 +99,9 @@ pub(crate) struct MountRecord {
     /// Fill a new volume from the image (volume mounts).
     #[serde(default)]
     pub copy_up: bool,
+    /// A host socket made reachable at `destination` instead of a share.
+    #[serde(default)]
+    pub socket: bool,
 }
 
 /// One network a container is attached to.
@@ -344,7 +347,7 @@ pub(crate) async fn create(
         );
     }
 
-    let (mounts, shares) = resolve_mounts(engine, &req, &image, &id)?;
+    let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
     let ports = resolve_ports(engine, &mut config, &host_config)?;
     let networks = super::network::attach_at_create(engine, &id, &name, &req)?;
 
@@ -356,6 +359,7 @@ pub(crate) async fn create(
         network_backend: (host_config.network_mode != "none")
             .then_some(crate::network::NetworkBackend::VirtioNet),
         mounts: shares,
+        published_sockets: sockets,
         ports: ports
             .iter()
             .map(|p| {
@@ -585,7 +589,11 @@ fn resolve_mounts(
     req: &CreateRequest,
     image: &ImageRecord,
     id: &str,
-) -> ApiResult<(Vec<MountRecord>, Vec<crate::data::storage::HostMount>)> {
+) -> ApiResult<(
+    Vec<MountRecord>,
+    Vec<crate::data::storage::HostMount>,
+    Vec<crate::config::PublishedSocketConfig>,
+)> {
     let mut mounts: Vec<MountRecord> = Vec::new();
     let mut add = |m: MountRecord| -> ApiResult<()> {
         if mounts.iter().any(|o| o.destination == m.destination) {
@@ -615,9 +623,10 @@ fn resolve_mounts(
         }
         let read_only = mode.split(',').any(|o| o == "ro");
         if source.starts_with('/') {
-            // `-v` creates a missing host directory, as Docker does.
+            // `-v` creates a missing host directory, as Docker does, unless
+            // the path stands for a socket (the Docker socket's own path).
             let path = std::path::Path::new(source);
-            if !path.exists() {
+            if !path.exists() && socket_source(path, &engine.config.socket).is_none() {
                 std::fs::create_dir_all(path)
                     .map_err(|e| ApiError::internal(format!("create bind source {source}: {e}")))?;
             }
@@ -757,20 +766,28 @@ fn resolve_mounts(
     }
     let _ = (image, id);
 
-    // Turn binds and volumes into machine shares. A bind of one file shares
-    // its directory and binds the file from it.
+    // Turn binds and volumes into machine shares. A bind of a host socket
+    // becomes a socket bridge (the Docker socket included); a bind of one
+    // file shares its directory and binds the file from it.
+    let engine_socket = engine.config.socket.clone();
     let mut shares: Vec<crate::data::storage::HostMount> = Vec::new();
+    let mut sockets = Vec::new();
     for m in mounts.iter_mut() {
         let host_path: PathBuf = match m.kind.as_str() {
             "bind" => PathBuf::from(&m.source),
             "volume" => engine.volumes.mountpoint(&m.source),
             _ => continue,
         };
-        if m.kind == "bind" && is_unix_socket(&host_path) {
-            return Err(ApiError::bad_request(format!(
-                "{}: mounting a Unix socket into a container is not supported yet",
-                m.source
-            )));
+        if m.kind == "bind" {
+            if let Some(socket) = socket_source(&host_path, &engine_socket) {
+                m.socket = true;
+                sockets.push(crate::config::PublishedSocketConfig {
+                    direction: smolvm_protocol::publish_socket::SocketDirection::Mount,
+                    guest_path: m.destination.clone(),
+                    host_path: Some(socket.to_string_lossy().into_owned()),
+                });
+                continue;
+            }
         }
         let (dir, subpath) = if m.kind == "volume" {
             (host_path, m.subpath.clone())
@@ -813,7 +830,7 @@ fn resolve_mounts(
         m.share = Some(index);
         m.subpath = subpath;
     }
-    Ok((mounts, shares))
+    Ok((mounts, shares, sockets))
 }
 
 fn default_mount() -> MountRecord {
@@ -827,15 +844,35 @@ fn default_mount() -> MountRecord {
         mode: String::new(),
         options: Vec::new(),
         copy_up: false,
+        socket: false,
     }
 }
 
-/// Whether `path` is a Unix socket, which a share cannot carry.
-fn is_unix_socket(path: &std::path::Path) -> bool {
+/// The host socket a bind of `path` stands for: the path itself when it is a
+/// Unix socket, and the engine's own socket for `/var/run/docker.sock` (the
+/// path containers conventionally mount) when nothing else listens there.
+fn socket_source(path: &std::path::Path, engine_socket: &std::path::Path) -> Option<PathBuf> {
     use std::os::unix::fs::FileTypeExt;
-    std::fs::metadata(path)
-        .map(|m| m.file_type().is_socket())
-        .unwrap_or(false)
+    let is_socket = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+    };
+    if path == engine_socket
+        || std::fs::canonicalize(path).ok().as_deref()
+            == std::fs::canonicalize(engine_socket).ok().as_deref()
+    {
+        return Some(engine_socket.to_path_buf());
+    }
+    if path == std::path::Path::new("/var/run/docker.sock")
+        || path == std::path::Path::new("/run/docker.sock")
+    {
+        if is_socket(path) && std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return Some(path.to_path_buf());
+        }
+        return Some(engine_socket.to_path_buf());
+    }
+    is_socket(path).then(|| path.to_path_buf())
 }
 
 /// Host ports for the container's published ports, allocating free ones for
@@ -1152,7 +1189,7 @@ fn remove_after_failed_start(engine: &Arc<Engine>, c: &Arc<Container>) {
 /// The agent request that runs the container's command.
 fn start_spec(engine: &Engine, record: &ContainerRecord) -> smolvm_protocol::ContainerStartSpec {
     use smolvm_protocol::ContainerMount;
-    let mut mounts: Vec<&MountRecord> = record.mounts.iter().collect();
+    let mut mounts: Vec<&MountRecord> = record.mounts.iter().filter(|m| !m.socket).collect();
     mounts.sort_by_key(|m| std::path::Path::new(&m.destination).components().count());
     let mounts = mounts
         .into_iter()

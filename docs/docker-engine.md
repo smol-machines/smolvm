@@ -1,8 +1,8 @@
 # The Docker Engine API from smolvm
 
-`smolvm engine` answers the Docker Engine API on a Unix socket. The docker CLI and Docker Compose
-talk to it as they talk to a Docker daemon, and nothing runs Docker: every container is a smol
-machine booted from its image.
+`smolvm engine` answers the Docker Engine API on a Unix socket. The docker CLI, Docker Compose,
+Testcontainers and VS Code Dev Containers talk to it as they talk to a Docker daemon, and nothing
+runs Docker: every container is a smol machine booted from its image.
 
 ## Start it
 
@@ -22,6 +22,9 @@ Without the context, point a client at the socket yourself:
 ```bash
 export DOCKER_HOST=unix://$HOME/.smolvm/run/docker.sock
 ```
+
+Testcontainers needs nothing else: with `DOCKER_HOST` set (or the properties file), the Node,
+Python, Go and Java libraries start their containers and their Ryuk reaper in machines.
 
 Some tools only look at `/var/run/docker.sock`. `smolvm engine link-socket` links that path to the
 engine's socket, through `sudo`; `--print` shows the command instead, and an existing
@@ -90,6 +93,18 @@ engine connects those stacks with a switch:
 container is a machine and cannot share the host's network. `--network container:<name>` is
 refused for the same reason.
 
+## The Docker socket inside a container
+
+A container that mounts the engine's socket, or `/var/run/docker.sock`, at any path reaches the
+engine through it, so a tool in a container can start sibling containers as it would with Docker:
+
+```bash
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli docker ps
+```
+
+No environment variable is needed. This works whether or not `/var/run/docker.sock` exists on
+the host.
+
 ## Building images
 
 The engine does not build images. `POST /build` (`DOCKER_BUILDKIT=0 docker build`, `docker
@@ -114,7 +129,6 @@ What the clients send, for whoever adds builds:
 ## Not yet
 
 - IPv6 networks, other network drivers than `bridge`, and `--network container:<name>`.
-- Binding a Unix socket into a container, the Docker socket included.
 - `docker save`, `docker load`, `docker push` and `docker commit`.
 - A listening address per published port (`-p 0.0.0.0:8080:80`).
 - A volume for each `VOLUME` an image declares: that path stays in the container's own filesystem.

@@ -2,8 +2,8 @@
 #
 # The Docker Engine API that `smolvm engine` serves, driven by the docker CLI
 # and Docker Compose exactly as users run them: containers, images, ports,
-# volumes, exec, logs, networks between containers, and Compose with
-# health-check dependencies.
+# volumes, exec, logs, networks between containers, Compose with health-check
+# dependencies, and the Docker socket inside a container.
 #
 # Needs the docker CLI with the compose plugin. With DOCKER_HOST set, the
 # suite uses that engine; otherwise it starts `smolvm engine serve` on a
@@ -373,6 +373,23 @@ EOF
     (cd "$WORK/stack" && docker compose down -v) >/dev/null 2>&1
 }
 
+# --- the Docker socket inside a container --------------------------------------------
+
+test_socket_inside_container() {
+    run --rm -v "$SOCKET_PATH:/var/run/docker.sock" alpine sh -c \
+        'apk add -q curl >/dev/null 2>&1; curl -s --unix-socket /var/run/docker.sock http://d/_ping' | has -x OK || return 1
+    # The conventional path names the engine's socket too.
+    run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine sh -c \
+        'apk add -q curl >/dev/null 2>&1; curl -s --unix-socket /var/run/docker.sock http://d/version' | has ApiVersion
+}
+
+test_container_starts_a_sibling_through_the_socket() {
+    local out
+    out=$(run --rm -v "$SOCKET_PATH:/var/run/docker.sock" alpine sh -c \
+        "apk add -q docker-cli >/dev/null 2>&1; docker run --rm --label $PREFIX alpine echo from-sibling") || return 1
+    [[ "$out" == from-sibling ]]
+}
+
 run_test "ping, version, info" test_ping_version_info || true
 run_test "versioned API paths" test_versioned_paths || true
 run_test "run echo and exit codes" test_run_echo_and_exit_codes || true
@@ -400,5 +417,7 @@ run_test "network connect and disconnect while running" test_network_connect_and
 run_test "default bridge: by address, no names" test_default_bridge_by_address_without_names || true
 run_test "host.docker.internal reaches the host" test_host_docker_internal || true
 run_test "compose: health-check dependency, two networks" test_compose_healthcheck_dependency_two_networks || true
+run_test "docker socket inside a container" test_socket_inside_container || true
+run_test "container starts a sibling through the socket" test_container_starts_a_sibling_through_the_socket || true
 
 print_summary "engine"

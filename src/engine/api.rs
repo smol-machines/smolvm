@@ -75,9 +75,98 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
         .merge(super::network::routes())
         .fallback(not_found)
         .with_state(engine);
-    Router::new()
+    let mut outer = Router::new()
         .fallback_service(api)
-        .layer(axum::middleware::map_request(strip_version))
+        .layer(axum::middleware::map_request(strip_version));
+    if let Some(path) = std::env::var_os("SMOLVM_ENGINE_RECORD") {
+        let recorder = Arc::new(Recorder {
+            file: parking_lot::Mutex::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .ok(),
+            ),
+        });
+        outer = outer.layer(axum::middleware::from_fn(move |req, next| {
+            let recorder = recorder.clone();
+            record_request(recorder, req, next)
+        }));
+    }
+    outer
+}
+
+/// Appends every request to a file as one JSON line (`SMOLVM_ENGINE_RECORD`),
+/// which is how the conformance fixtures were captured from real clients.
+struct Recorder {
+    file: parking_lot::Mutex<Option<std::fs::File>>,
+}
+
+async fn record_request(
+    recorder: Arc<Recorder>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use std::io::Write as _;
+    let (parts, body) = req.into_parts();
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let json = content_type.contains("json")
+        || (content_type.is_empty() && !parts.uri.path().ends_with("/archive"));
+    let (body, recorded) = if json && parts.method != Method::GET {
+        match axum::body::to_bytes(body, 4 << 20).await {
+            Ok(bytes) => {
+                let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .unwrap_or(serde_json::Value::Null);
+                (Body::from(bytes), value)
+            }
+            Err(_) => (Body::empty(), serde_json::Value::Null),
+        }
+    } else {
+        (body, serde_json::Value::Null)
+    };
+    let mut line = serde_json::json!({
+        "method": parts.method.as_str(),
+        "path": parts.uri.path(),
+        "query": parts.uri.query().unwrap_or(""),
+        "upgrade": parts.headers.contains_key(header::UPGRADE),
+        "contentType": content_type,
+        "userAgent": parts.headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or(""),
+        "body": recorded,
+    });
+    let response = next.run(Request::from_parts(parts.clone(), body)).await;
+    // The answer goes with the request: its status, and its body when it is
+    // a complete JSON document rather than a stream.
+    use http_body::Body as _;
+    let (rparts, rbody) = response.into_parts();
+    let complete = rbody.size_hint().exact().is_some();
+    let json_answer = rparts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json"));
+    line["status"] = serde_json::json!(rparts.status.as_u16());
+    line["streaming"] = serde_json::json!(!complete);
+    let rbody = if complete && json_answer {
+        match axum::body::to_bytes(rbody, 16 << 20).await {
+            Ok(bytes) => {
+                line["response"] = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .unwrap_or(serde_json::Value::Null);
+                Body::from(bytes)
+            }
+            Err(_) => Body::empty(),
+        }
+    } else {
+        rbody
+    };
+    if let Some(file) = recorder.file.lock().as_mut() {
+        let _ = writeln!(file, "{line}");
+    }
+    Response::from_parts(rparts, rbody)
 }
 
 /// Drop a `/v1.NN` prefix so every route matches with or without it.

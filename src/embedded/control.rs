@@ -381,6 +381,11 @@ fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures)
     if features.dns_filter_hosts.is_none() {
         features.dns_filter_hosts = record.dns_filter_hosts.clone();
     }
+    // Socket bridges are part of the machine, as on the CLI start path; a
+    // launch that dropped them left the guest path empty.
+    if features.published_sockets.is_empty() {
+        features.published_sockets = record.published_sockets.clone();
+    }
     // A detached machine stays detached on every launch — a plain start after
     // a stop, a resume, a fork clone (which copies the golden's record) — not
     // only the one that created it. A caller that decides explicitly still
