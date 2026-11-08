@@ -27,12 +27,13 @@ use crate::agent::AgentClient;
 use crate::data::storage::HostMount;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use smolvm_protocol::{fsnotify_mask, FsNotifyEvent};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 
 /// Guest mountpoint root for virtiofs devices. MUST match the agent's
@@ -205,6 +206,7 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         mounts = targets.len(),
         "host→guest fsnotify propagation active (hot-reload)"
     );
+    let mut announced = Announced::default();
 
     while !stop.load(Ordering::SeqCst) {
         // Block briefly so we notice `stop` without a busy loop.
@@ -216,13 +218,14 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         };
 
         let mut batch = Vec::new();
-        collect_events(&first, &targets, &mut batch);
+        announced.prune();
+        collect_events(&first, &targets, &mut announced, &mut batch);
 
         // Coalesce the rest of the burst (a save fans out into several events).
-        let deadline = std::time::Instant::now() + COALESCE_WINDOW;
-        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let deadline = Instant::now() + COALESCE_WINDOW;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(remaining) {
-                Ok(Ok(ev)) => collect_events(&ev, &targets, &mut batch),
+                Ok(Ok(ev)) => collect_events(&ev, &targets, &mut announced, &mut batch),
                 Ok(Err(_)) => {}
                 Err(_) => break,
             }
@@ -269,6 +272,69 @@ const MAX_DIR_SCAN_EVENTS: usize = 64;
 
 /// Time window within which a file's mtime is considered to match the event.
 const RECENT_MTIME_WINDOW: Duration = Duration::from_secs(2);
+/// More files than this remembered at once means an event storm; the memory is
+/// cleared rather than grown, at the cost of a few repeated announcements.
+const ANNOUNCED_MAX: usize = 8192;
+
+/// The host's modification time of a file and, where the host keeps one, its
+/// change time: together they move with any write, truncate, rename, chmod or
+/// chown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    mtime: Option<SystemTime>,
+    ctime: Option<(i64, i64)>,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let ctime = {
+            use std::os::unix::fs::MetadataExt;
+            Some((meta.ctime(), meta.ctime_nsec()))
+        };
+        #[cfg(not(unix))]
+        let ctime = None;
+        Stamp {
+            mtime: meta.modified().ok(),
+            ctime,
+        }
+    }
+}
+
+/// Files already announced to the guest, by guest path, with the host stamp
+/// they carried then. On macOS a burst of writes arrives mostly as events on the
+/// directory, each of which makes the watcher scan for recently modified files,
+/// and the same files turn up scan after scan while the burst lasts. Every
+/// announcement makes the guest kernel expire its cached entry for the file and
+/// look it up again on next use, so during a build or an install the guest paid
+/// two or more extra round trips per file it had itself just written. A file is
+/// announced once per change: again only when its stamp has moved.
+#[derive(Default)]
+struct Announced {
+    files: HashMap<String, (Stamp, Instant)>,
+}
+
+impl Announced {
+    /// Whether `path` carrying `stamp` is news to the guest; records it so.
+    fn is_news(&mut self, path: &str, stamp: Stamp) -> bool {
+        if matches!(self.files.get(path), Some((seen, _)) if *seen == stamp) {
+            return false;
+        }
+        if self.files.len() >= ANNOUNCED_MAX {
+            self.files.clear();
+        }
+        self.files.insert(path.to_string(), (stamp, Instant::now()));
+        true
+    }
+
+    /// Forget files a scan can no longer turn up: one modified before the
+    /// window was announced at least that long ago.
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.files
+            .retain(|_, (_, at)| now.duration_since(*at) <= RECENT_MTIME_WINDOW);
+    }
+}
 
 /// Directories that should not be traversed during directory rescans.
 fn is_ignored_dir(name: &str) -> bool {
@@ -292,7 +358,7 @@ fn find_recent_files(
     dir: &Path,
     threshold: Duration,
     max_depth: usize,
-    results: &mut Vec<PathBuf>,
+    results: &mut Vec<(PathBuf, Stamp)>,
 ) {
     if max_depth == 0 || results.len() >= MAX_DIR_SCAN_EVENTS {
         return;
@@ -333,7 +399,7 @@ fn find_recent_files(
                     };
 
                     if is_recent {
-                        results.push(entry.path());
+                        results.push((entry.path(), Stamp::of(&meta)));
                     }
                 }
             }
@@ -342,7 +408,12 @@ fn find_recent_files(
 }
 
 /// Translate one host event into guest-side [`FsNotifyEvent`]s, appended to `out`.
-fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotifyEvent>) {
+fn collect_events(
+    event: &Event,
+    targets: &[WatchTarget],
+    announced: &mut Announced,
+    out: &mut Vec<FsNotifyEvent>,
+) {
     for host_path in &event.paths {
         let Some(t) = matching_target(host_path, targets) else {
             continue;
@@ -367,12 +438,15 @@ fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotify
                     &mut recent_files,
                 );
 
-                for child_path in recent_files {
+                for (child_path, stamp) in recent_files {
                     if let Ok(child_rel) = child_path.strip_prefix(&t.host_source) {
-                        out.push(FsNotifyEvent {
-                            path: join_guest(&t.guest_base, child_rel),
-                            mask: mask_for(&event.kind, &child_path),
-                        });
+                        let path = join_guest(&t.guest_base, child_rel);
+                        if announced.is_news(&path, stamp) {
+                            out.push(FsNotifyEvent {
+                                path,
+                                mask: mask_for(&event.kind, &child_path),
+                            });
+                        }
                     }
                 }
 
@@ -387,11 +461,20 @@ fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotify
             } else {
                 // Regular file: fire directly on it. fsnotify_dentry() in the
                 // guest propagates to the parent dir's watchers with the child
-                // name, so both file- and dir-watches fire.
-                out.push(FsNotifyEvent {
-                    path: join_guest(&t.guest_base, rel),
-                    mask: mask_for(&event.kind, host_path),
-                });
+                // name, so both file- and dir-watches fire. Remembered with
+                // its stamp so the directory scans that follow the same
+                // change do not announce it a second time.
+                let path = join_guest(&t.guest_base, rel);
+                let news = match std::fs::metadata(host_path) {
+                    Ok(meta) => announced.is_news(&path, Stamp::of(&meta)),
+                    Err(_) => true,
+                };
+                if news {
+                    out.push(FsNotifyEvent {
+                        path,
+                        mask: mask_for(&event.kind, host_path),
+                    });
+                }
             }
         } else if let Some(parent) = rel.parent() {
             // The guest may still cache the removed path. Send the exact name
@@ -450,9 +533,18 @@ fn mask_for(kind: &EventKind, path: &Path) -> u32 {
 }
 
 /// Sort + drop duplicate (path, mask) pairs produced within one burst.
+/// One event per path, carrying every mask the batch had for it: the guest
+/// fires all of them from a single write, and expires the entry once.
 fn dedup(batch: &mut Vec<FsNotifyEvent>) {
-    batch.sort_by(|a, b| a.path.cmp(&b.path).then(a.mask.cmp(&b.mask)));
-    batch.dedup_by(|a, b| a.path == b.path && a.mask == b.mask);
+    batch.sort_by(|a, b| a.path.cmp(&b.path));
+    batch.dedup_by(|later, kept| {
+        if later.path == kept.path {
+            kept.mask |= later.mask;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 #[cfg(test)]
@@ -487,7 +579,7 @@ mod tests {
             attrs: Default::default(),
         };
         let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut out);
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].path, "/run/smolvm/virtiofs/smolvm0/src/gone.js");
         assert_eq!(out[0].mask, fsnotify_mask::FS_DELETE);
@@ -509,7 +601,7 @@ mod tests {
             attrs: Default::default(),
         };
         let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut out);
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
         assert!(out.is_empty());
     }
 
@@ -527,6 +619,84 @@ mod tests {
         ];
         dedup(&mut batch);
         assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn dedup_merges_the_masks_of_one_path() {
+        let mut batch = vec![
+            FsNotifyEvent {
+                path: "/a".into(),
+                mask: fsnotify_mask::FS_CREATE,
+            },
+            FsNotifyEvent {
+                path: "/b".into(),
+                mask: fsnotify_mask::FS_MODIFY,
+            },
+            FsNotifyEvent {
+                path: "/a".into(),
+                mask: fsnotify_mask::FS_MODIFY,
+            },
+        ];
+        dedup(&mut batch);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].path, "/a");
+        assert_eq!(
+            batch[0].mask,
+            fsnotify_mask::FS_CREATE | fsnotify_mask::FS_MODIFY
+        );
+    }
+
+    #[test]
+    fn a_scanned_file_is_announced_once_until_it_changes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp_dir.path().to_path_buf();
+        let file = project_dir.join("out.txt");
+        std::fs::write(&file, "one").expect("write");
+        let targets = vec![WatchTarget {
+            host_source: project_dir.clone(),
+            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+        }];
+        let dir_event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![project_dir.clone()],
+            attrs: Default::default(),
+        };
+        let mut announced = Announced::default();
+        let file_path = "/run/smolvm/virtiofs/smolvm0/out.txt";
+
+        let mut first = Vec::new();
+        collect_events(&dir_event, &targets, &mut announced, &mut first);
+        assert!(first.iter().any(|e| e.path == file_path), "{first:?}");
+
+        // the same burst, another directory event: the file is not news
+        let mut second = Vec::new();
+        collect_events(&dir_event, &targets, &mut announced, &mut second);
+        assert!(second.is_empty(), "{second:?}");
+
+        // nor is a file event for the unchanged file
+        let file_event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![file.clone()],
+            attrs: Default::default(),
+        };
+        let mut third = Vec::new();
+        collect_events(&file_event, &targets, &mut announced, &mut third);
+        assert!(third.is_empty(), "{third:?}");
+
+        // a change moves the stamp, and the file is announced again
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&file, "two").expect("rewrite");
+        let mut fourth = Vec::new();
+        collect_events(&dir_event, &targets, &mut announced, &mut fourth);
+        assert!(fourth.iter().any(|e| e.path == file_path), "{fourth:?}");
+
+        // pruning within the window keeps the memory
+        announced.prune();
+        let mut fifth = Vec::new();
+        collect_events(&dir_event, &targets, &mut announced, &mut fifth);
+        assert!(fifth.is_empty(), "{fifth:?}");
     }
 
     #[test]
@@ -564,7 +734,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut out);
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
 
         // Should contain both the child file event (for Vite/Chokidar) and the directory event
         assert!(
@@ -601,7 +771,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut out);
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
 
         assert!(
             out.iter()
@@ -632,7 +802,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut out);
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
 
         assert!(
             !out.iter().any(|e| e.path.contains("node_modules")),
