@@ -1867,10 +1867,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         };
         if let (Some(socket), Some(dir)) = (&port_forward_socket, vsock_socket.parent()) {
             let _ = std::fs::remove_file(socket);
-            crate::network::port_forward::serve_forwarded_ports_control(
-                crate::network::port_forward::PortForwarder::new(socket),
-                dir,
-            );
+            match crate::network::port_forward::PortForwarder::new(socket) {
+                Ok(forwarder) => {
+                    crate::network::port_forward::serve_forwarded_ports_control(forwarder, dir)
+                }
+                Err(e) => tracing::warn!("live port forwarding disabled: {e}"),
+            }
         }
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),

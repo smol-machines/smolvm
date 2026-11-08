@@ -5,8 +5,6 @@ pub mod cleanup_ephemeral;
 pub mod completion;
 pub mod config;
 pub mod cp_tree;
-pub mod docker;
-pub mod docker_integration;
 pub mod host_network;
 pub mod machine;
 pub mod openapi;

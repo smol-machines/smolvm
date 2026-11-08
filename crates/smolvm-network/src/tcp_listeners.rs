@@ -24,25 +24,22 @@
 //!
 //! ```text
 //! host client connects to 127.0.0.1:HOST (or [::1]:HOST)
-//!   -> TcpPortListeners accepts TcpStream
+//!   -> TcpPortListeners accepts TcpStream (one thread for every port)
 //!   -> AcceptedTcpConnection sent over a bounded channel
 //!   -> relay_wake wakes the smoltcp poll loop
 //!   -> poll loop creates a guest-facing TCP socket to guest_ip:GUEST
 //!   -> once Established, tcp_relay uses the accepted host TcpStream directly
 //! ```
 
+use crate::acceptor::{AcceptedConnection, BoundTcpPorts, TcpAcceptorSet};
+use crate::publish_bind::BoundSockets;
 use crate::queues::WakePipe;
 use crate::{PortMapping, PortProtocol};
-use polling::{Event, Events, Poller};
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::sync::Mutex;
 
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(25);
 /// Maximum number of accepted published sockets queued for the poll loop.
 pub const DEFAULT_PUBLISH_QUEUE_CAPACITY: usize = 64;
 
@@ -58,55 +55,10 @@ pub struct AcceptedTcpConnection {
     pub peer_addr: SocketAddr,
 }
 
-/// Running published-port listener set for one guest NIC.
+/// Running published-port listener set for one guest NIC: every listener is
+/// accepted on one shared thread ([`TcpAcceptorSet`]).
 pub struct TcpPortListeners {
-    tcp_sender: SyncSender<AcceptedTcpConnection>,
-    publish_wake: WakePipe,
-    ports: Vec<PublishedPort>,
-    closed: bool,
-}
-
-struct PublishedPort {
-    host: u16,
-    guest: Arc<AtomicU16>,
-    shutdown: Arc<AtomicBool>,
-    handles: Vec<ListenerThread>,
-}
-
-impl Drop for PublishedPort {
-    fn drop(&mut self) {
-        shutdown_all(&self.shutdown, &mut self.handles);
-    }
-}
-
-struct ListenerThread {
-    handle: JoinHandle<()>,
-    poller: Arc<Poller>,
-}
-
-// Deregister before closing the socket, including on spawn failure and unwind.
-struct ReadyListener {
-    listener: TcpListener,
-    poller: Arc<Poller>,
-}
-
-impl ReadyListener {
-    fn new(listener: TcpListener) -> io::Result<Self> {
-        listener.set_nonblocking(true)?;
-        let poller = Arc::new(Poller::new()?);
-        // SAFETY: ReadyListener owns the socket and removes it in Drop before
-        // the socket closes. No borrowed source outlives its registration.
-        unsafe {
-            poller.add(&listener, Event::readable(0))?;
-        }
-        Ok(Self { listener, poller })
-    }
-}
-
-impl Drop for ReadyListener {
-    fn drop(&mut self) {
-        let _ = self.poller.delete(&self.listener);
-    }
+    acceptor: TcpAcceptorSet,
 }
 
 /// Published host ports, bound before the listener threads start.
@@ -114,79 +66,33 @@ impl Drop for ReadyListener {
 /// Binding is separate so a launcher that starts the runtime only after the VM
 /// is booting (Windows) can still fail the launch on a port already in use.
 pub struct BoundPublishedPorts {
-    tcp: Vec<(PortMapping, TcpListener, Option<TcpListener>)>,
-    pub(crate) udp: Vec<(PortMapping, UdpSocket, Option<UdpSocket>)>,
+    tcp: BoundTcpPorts,
+    pub(crate) udp: Vec<(PortMapping, BoundSockets<UdpSocket>)>,
 }
 
 impl BoundPublishedPorts {
     /// Bind every published host port, releasing any already bound on failure.
+    ///
+    /// Ports bind loopback (see [`crate::publish_bind`]); `SMOLVM_PUBLISH_ADDR` widens
+    /// that for fleet nodes whose ingress proxy connects from another host
+    /// (the control plane): `0.0.0.0` (or any address) makes the cross-host hop
+    /// possible — pair it with a firewall on the port range, since whatever can
+    /// reach the address can reach the port.
     pub fn bind(port_mappings: &[PortMapping]) -> io::Result<Self> {
-        // Published ports bind loopback by default. `SMOLVM_PUBLISH_ADDR`
-        // widens that for fleet nodes whose ingress proxy connects from
-        // another host (the control plane): `0.0.0.0` (or any address) makes
-        // the cross-host hop possible — pair it with a firewall on the port
-        // range, since whatever can reach the address can reach the port.
-        let publish_addr: Ipv4Addr = std::env::var("SMOLVM_PUBLISH_ADDR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(Ipv4Addr::LOCALHOST);
-        let publish_v6 = if publish_addr == Ipv4Addr::UNSPECIFIED {
-            Ipv6Addr::UNSPECIFIED
-        } else {
-            Ipv6Addr::LOCALHOST
-        };
-
-        let mut bound = Vec::with_capacity(port_mappings.len());
+        let tcp_mappings: Vec<PortMapping> = port_mappings
+            .iter()
+            .filter(|m| m.protocol == PortProtocol::Tcp)
+            .copied()
+            .collect();
         let mut udp = Vec::new();
-        for mapping in port_mappings {
-            if mapping.protocol == PortProtocol::Udp {
-                // Same rule as TCP: IPv4 required, IPv6 best-effort.
-                let socket = UdpSocket::bind((publish_addr, mapping.host)).map_err(|err| {
-                    io::Error::new(
-                        err.kind(),
-                        format!(
-                            "cannot publish host UDP {publish_addr}:{} to guest UDP {}: {err}",
-                            mapping.host, mapping.guest,
-                        ),
-                    )
-                })?;
-                let socket_v6 = UdpSocket::bind((publish_v6, mapping.host))
-                    .inspect_err(|err| {
-                        tracing::debug!(
-                            host_port = mapping.host,
-                            error = %err,
-                            "skipping IPv6 socket for published UDP port"
-                        );
-                    })
-                    .ok();
-                udp.push((*mapping, socket, socket_v6));
-                continue;
-            }
-            // The IPv4 listener is required; the IPv6 one is best-effort so
-            // hosts without IPv6 still publish normally.
-            let listener = TcpListener::bind((publish_addr, mapping.host)).map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!(
-                        "cannot publish host TCP {publish_addr}:{} to guest TCP {}: {err}",
-                        mapping.host, mapping.guest,
-                    ),
-                )
-            })?;
-            let listener_v6 = match TcpListener::bind((publish_v6, mapping.host)) {
-                Ok(listener) => Some(listener),
-                Err(err) => {
-                    tracing::debug!(
-                        host_port = mapping.host,
-                        error = %err,
-                        "skipping IPv6 listener for published port"
-                    );
-                    None
-                }
-            };
-            bound.push((*mapping, listener, listener_v6));
+        for mapping in port_mappings
+            .iter()
+            .filter(|m| m.protocol == PortProtocol::Udp)
+        {
+            udp.push((*mapping, crate::udp_publish::bind_udp_port(mapping)?));
         }
-        Ok(Self { tcp: bound, udp })
+        let tcp = BoundTcpPorts::bind(&tcp_mappings)?;
+        Ok(Self { tcp, udp })
     }
 
     /// True when no host port is published.
@@ -202,155 +108,28 @@ impl BoundPublishedPorts {
 }
 
 impl TcpPortListeners {
-    /// Start one non-blocking listener thread per bound published port.
-    ///
-    /// The CLI caps published mappings because every mapping creates this thread
-    /// and normally a second IPv6 thread. Raise that cap only after replacing
-    /// this per-listener model with multiplexed listeners or a bounded worker pool.
+    /// Start accepting on the bound published TCP ports, handing each
+    /// connection to the poll loop through `tcp_sender` and `publish_wake`.
     pub fn start(
         ports: BoundPublishedPorts,
         tcp_sender: SyncSender<AcceptedTcpConnection>,
         publish_wake: WakePipe,
     ) -> io::Result<Self> {
-        let mut listeners = Self {
-            tcp_sender,
-            publish_wake,
-            ports: Vec::new(),
-            closed: false,
-        };
-        listeners.ports = listeners.spawn(ports)?;
-        Ok(listeners)
-    }
-
-    pub fn mappings(&self) -> Vec<PortMapping> {
-        self.ports
-            .iter()
-            .map(|port| PortMapping::new(port.host, port.guest.load(Ordering::SeqCst)))
-            .collect()
-    }
-
-    pub fn replace(&mut self, next: &[PortMapping]) -> io::Result<()> {
-        if self.closed {
-            return Err(io::Error::other("the network runtime is shutting down"));
-        }
-        if let Some(udp) = next.iter().find(|m| m.protocol == PortProtocol::Udp) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{}:{}/udp is not a TCP listener", udp.host, udp.guest),
-            ));
-        }
-        for (index, mapping) in next.iter().enumerate() {
-            if next[..index].iter().any(|other| other.host == mapping.host) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("host port {} is published twice", mapping.host),
-                ));
-            }
-        }
-        let added: Vec<PortMapping> = next
-            .iter()
-            .filter(|mapping| !self.ports.iter().any(|port| port.host == mapping.host))
-            .copied()
-            .collect();
-        let started = self.spawn(BoundPublishedPorts::bind(&added)?)?;
-        self.ports.retain(|port| {
-            next.iter()
-                .find(|mapping| mapping.host == port.host)
-                .inspect(|mapping| port.guest.store(mapping.guest, Ordering::SeqCst))
-                .is_some()
-        });
-        self.ports.extend(started);
-        Ok(())
-    }
-
-    pub fn close(&mut self) {
-        self.closed = true;
-        self.ports.clear();
-    }
-
-    fn spawn(&self, bound: BoundPublishedPorts) -> io::Result<Vec<PublishedPort>> {
-        let mut started = Vec::with_capacity(bound.tcp.len());
-        for (mapping, listener, listener_v6) in bound.tcp {
-            let mut port = PublishedPort {
-                host: mapping.host,
-                guest: Arc::new(AtomicU16::new(mapping.guest)),
-                shutdown: Arc::new(AtomicBool::new(false)),
-                handles: Vec::with_capacity(2),
-            };
-            for listener in std::iter::once(listener).chain(listener_v6) {
-                let listener = ReadyListener::new(listener)?;
-                let poller = listener.poller.clone();
-                let tcp_sender = self.tcp_sender.clone();
-                let publish_wake = self.publish_wake.clone();
-                let shutdown_flag = port.shutdown.clone();
-                let host_port = mapping.host;
-                let guest_port = port.guest.clone();
-
-                let handle = thread::Builder::new()
-                    .name(format!("smolvm-tcp-{host_port}"))
-                    .spawn(move || {
-                        run_tcp_port_listener(
-                            listener,
-                            host_port,
-                            guest_port,
-                            tcp_sender,
-                            publish_wake,
-                            shutdown_flag,
-                        )
-                    })
-                    .map_err(|err| {
-                        io::Error::other(format!(
-                            "failed to spawn published-port listener thread for {host_port}: {err}"
-                        ))
-                    })?;
-                port.handles.push(ListenerThread { handle, poller });
-            }
-            started.push(port);
-        }
-        Ok(started)
-    }
-}
-
-impl Drop for TcpPortListeners {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-fn shutdown_all(shutdown: &Arc<AtomicBool>, handles: &mut Vec<ListenerThread>) {
-    shutdown.store(true, Ordering::SeqCst);
-    for listener in handles.iter() {
-        let _ = listener.poller.notify();
-    }
-    for listener in handles.drain(..) {
-        let _ = listener.handle.join();
-    }
-}
-
-fn run_tcp_port_listener(
-    listener: ReadyListener,
-    host_port: u16,
-    guest_port: Arc<AtomicU16>,
-    tcp_sender: SyncSender<AcceptedTcpConnection>,
-    publish_wake: WakePipe,
-    shutdown: Arc<AtomicBool>,
-) {
-    let mut events = Events::new();
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return;
-        }
-
-        match listener.listener.accept() {
-            Ok((stream, peer_addr)) => {
+        let tcp_sender = Mutex::new(tcp_sender);
+        let acceptor = TcpAcceptorSet::start(
+            ports.tcp,
+            Box::new(move |connection: AcceptedConnection| {
                 let accepted = AcceptedTcpConnection {
-                    stream,
-                    host_port,
-                    guest_port: guest_port.load(Ordering::SeqCst),
-                    peer_addr,
+                    stream: connection.stream,
+                    host_port: connection.host_port,
+                    guest_port: connection.guest_port,
+                    peer_addr: connection.peer_addr,
                 };
-
-                match tcp_sender.try_send(accepted) {
+                let sent = tcp_sender
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .try_send(accepted);
+                match sent {
                     Ok(()) => publish_wake.wake(),
                     Err(TrySendError::Full(accepted)) => {
                         tracing::warn!(
@@ -360,38 +139,26 @@ fn run_tcp_port_listener(
                             "dropping published TCP connection because the accept queue is full"
                         );
                     }
-                    Err(TrySendError::Disconnected(_)) => return,
+                    Err(TrySendError::Disconnected(_)) => {}
                 }
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                // Rearm after draining. Readiness arriving between accept and
-                // modify is retained; shutdown also wakes this wait explicitly.
-                if let Err(err) = listener
-                    .poller
-                    .modify(&listener.listener, Event::readable(0))
-                {
-                    tracing::warn!(host_port, error = %err, "published port readiness failed");
-                    return;
-                }
-                events.clear();
-                if let Err(err) = listener.poller.wait(&mut events, None) {
-                    if err.kind() != io::ErrorKind::Interrupted {
-                        tracing::warn!(host_port, error = %err, "published port readiness failed");
-                        return;
-                    }
-                }
-            }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                tracing::warn!(
-                    host_port,
-                    guest_port = guest_port.load(Ordering::SeqCst),
-                    error = %err,
-                    "published port listener accept failed"
-                );
-                thread::sleep(ACCEPT_ERROR_BACKOFF);
-            }
+            }),
+        )?;
+        Ok(Self { acceptor })
+    }
+
+    pub fn mappings(&self) -> Vec<PortMapping> {
+        self.acceptor.mappings()
+    }
+
+    pub fn replace(&mut self, next: &[PortMapping]) -> io::Result<()> {
+        if self.acceptor.is_closed() {
+            return Err(io::Error::other("the network runtime is shutting down"));
         }
+        self.acceptor.replace(next)
+    }
+
+    pub fn close(&mut self) {
+        self.acceptor.close();
     }
 }
 
@@ -411,6 +178,9 @@ pub fn create_tcp_channel() -> (
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread;
+    use std::time::Duration;
 
     fn listener_fixture(
         capacity: usize,

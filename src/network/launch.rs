@@ -227,7 +227,7 @@ pub fn plan_launch_network_with(
 /// The longest replacement allow list the egress control socket reads.
 const MAX_EGRESS_REQUEST_BYTES: u64 = 1024 * 1024;
 
-const MAX_PORTS_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_PORTS_REQUEST_BYTES: u64 = 256 * 1024;
 
 /// Serve the egress control socket in `vm_dir` for a machine whose guest may
 /// open outbound connections under an allow list: each connection sends a

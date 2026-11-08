@@ -282,10 +282,10 @@ pub struct PortMapping {
 
 /// Maximum concrete mappings permitted for one machine.
 ///
-/// The current forwarding implementation starts listener thread(s) per mapping,
-/// so raising this limit requires multiplexing listeners or bounding the worker
-/// pool in `smolvm-network` first.
-pub const MAX_PORT_MAPPINGS: usize = 64;
+/// Published listeners share one accept thread (`smolvm_network::acceptor`),
+/// so a mapping costs only its sockets: two (IPv4 and IPv6) each, which keeps
+/// the maximum well inside macOS's default 10240 open files per process.
+pub const MAX_PORT_MAPPINGS: usize = 4096;
 
 /// A CLI or Smolfile port mapping before range expansion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,12 +924,15 @@ mod tests {
     #[test]
     fn port_mapping_spec_limits_total_expanded_mappings() {
         let specs = [
-            PortMappingSpec::parse("1-32").unwrap(),
-            PortMappingSpec::parse("33-64").unwrap(),
+            PortMappingSpec::parse("1-2048").unwrap(),
+            PortMappingSpec::parse("32768-34815").unwrap(),
         ];
-        assert_eq!(PortMappingSpec::expand_all(&specs).unwrap().len(), 64);
+        assert_eq!(
+            PortMappingSpec::expand_all(&specs).unwrap().len(),
+            MAX_PORT_MAPPINGS
+        );
 
-        let too_many = [PortMappingSpec::parse("1-65").unwrap()];
+        let too_many = [PortMappingSpec::parse("1-4097").unwrap()];
         assert!(PortMappingSpec::expand_all(&too_many).is_err());
     }
 
