@@ -453,6 +453,8 @@ pub struct RestoredState {
     /// The captured machine keeps a `local:` image on its storage disk rather
     /// than mounting host-backed layers.
     pub packed_image_on_storage: bool,
+    /// The captured boot mounted the credential CA as a boot device.
+    pub credential_ca_device: Option<bool>,
 }
 
 /// A [`CreateSpec`] with every rule applied: the machine's settings, ready to
@@ -1510,6 +1512,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                             .is_some_and(|policy| !policy.is_empty()),
                     packed_image_on_storage:
                         crate::portable_checkpoint::checkpoint_image_on_storage(checkpoint),
+                    credential_ca_device: captured_net.credential_ca_device,
                 }),
             }
         }
@@ -1789,6 +1792,10 @@ impl ResolvedSpec {
             mediated_egress_required: restored.mediated_egress_required,
             credential_placeholders,
             credentials_supplied_by_api,
+            // A fresh boot decides; a restore recreates the captured devices.
+            credential_ca_device: restored.credential_ca_device,
+            // Unknown for a restore: its guest is handed the CA once it runs.
+            credential_ca_trusted: None,
             ephemeral,
             source_smolmachine: None,
             packed_image_on_storage: restored.packed_image_on_storage,

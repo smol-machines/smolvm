@@ -6654,12 +6654,14 @@ impl ResizeCmd {
 // Update Command
 // ============================================================================
 
-/// Modify settings on a stopped machine, or the allow list of a running one.
+/// Modify settings on a stopped machine, or the allow list or credential
+/// bindings of a running one.
 ///
 /// Changes are applied to the DB record and take effect on the next
 /// `machine start`. The machine must be stopped, except to add or remove
 /// allowed hosts and CIDRs on a machine started with an allow list: those take
-/// effect on its next connection or DNS lookup.
+/// effect on its next connection or DNS lookup. Credential bindings change in
+/// any state, and a running machine enforces them from its next request.
 ///
 /// Examples:
 ///   smolvm machine update --name myvm -v ./src:/app -p 8080:8080
@@ -6668,6 +6670,8 @@ impl ResizeCmd {
 ///   smolvm machine update --name myvm --net -e DEBUG=1
 ///   smolvm machine update --name myvm --allow-host pypi.org   # while running
 ///   smolvm machine update --name myvm --auto-ports
+///   smolvm machine update --name myvm --credential gh=GH_TOKEN@api.github.com
+///   smolvm machine update --name myvm --remove-credential gh
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
@@ -6795,6 +6799,20 @@ pub struct UpdateCmd {
     )]
     pub reset_allow_list: bool,
 
+    /// Add or replace a credential binding, as `machine create --credential`
+    /// takes it; a binding of the same name is replaced (can be used multiple
+    /// times). Applies at once on a running machine.
+    #[arg(
+        long = "credential",
+        value_name = "NAME=ENV_VAR@HOST[,HOST...][:body][:set-header=HEADER]"
+    )]
+    pub credential: Vec<String>,
+
+    /// Remove a credential binding by name (can be used multiple times).
+    /// Applies at once on a running machine.
+    #[arg(long = "remove-credential", value_name = "NAME")]
+    pub remove_credential: Vec<String>,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -6892,13 +6910,13 @@ impl UpdateCmd {
     /// Whether this update changes the allow list and nothing else, one of the
     /// changes a running machine takes.
     fn changes_only_egress(&self) -> bool {
-        let (egress, ports, labels, other) = self.changed_settings();
-        egress && !ports && !labels && !other
+        let (egress, ports, labels, credentials, other) = self.changed_settings();
+        egress && !ports && !labels && !credentials && !other
     }
 
     fn changes_only_labels(&self) -> bool {
-        let (egress, ports, labels, other) = self.changed_settings();
-        labels && !egress && !ports && !other
+        let (egress, ports, labels, credentials, other) = self.changed_settings();
+        labels && !egress && !ports && !credentials && !other
     }
 
     /// Apply this update's label changes to `labels`: `--remove-label` keys
@@ -6951,13 +6969,14 @@ impl UpdateCmd {
     }
 
     fn changes_only_ports(&self) -> bool {
-        let (egress, ports, labels, other) = self.changed_settings();
-        ports && !egress && !labels && !other
+        let (egress, ports, labels, credentials, other) = self.changed_settings();
+        ports && !egress && !labels && !credentials && !other
     }
 
     /// Which kinds of setting this update changes: the allow list, published
-    /// ports, labels, and anything else (which needs a stopped machine).
-    fn changed_settings(&self) -> (bool, bool, bool, bool) {
+    /// ports, labels, credential bindings, and anything else (which needs a
+    /// stopped machine).
+    fn changed_settings(&self) -> (bool, bool, bool, bool, bool) {
         let Self {
             name: _,
             volume,
@@ -6982,6 +7001,8 @@ impl UpdateCmd {
             allow_udp,
             remove_allow_udp,
             reset_allow_list,
+            credential,
+            remove_credential,
             env,
             remove_env,
             workdir,
@@ -7010,6 +7031,7 @@ impl UpdateCmd {
             || !remove_allow_udp.is_empty()
             || *reset_allow_list;
         let ports = !port.is_empty() || !remove_port.is_empty();
+        let credentials = !credential.is_empty() || !remove_credential.is_empty();
         let other = !volume.is_empty()
             || !remove_volume.is_empty()
             || *auto_ports
@@ -7034,7 +7056,111 @@ impl UpdateCmd {
             || *clear_dns_options
             || shm_size.is_some();
         let labels = !labels.is_empty() || !remove_labels.is_empty();
-        (egress, ports, labels, other)
+        (egress, ports, labels, credentials, other)
+    }
+
+    /// The machine's bindings after this update's `--credential` and
+    /// `--remove-credential` flags.
+    fn next_credentials(
+        &self,
+        record: &smolvm::config::VmRecord,
+    ) -> smolvm::Result<smolvm::credentials::CredentialPolicy> {
+        let mut policy = record.credential_policy.clone().unwrap_or_default();
+        for name in &self.remove_credential {
+            if policy.binding(name).is_none() {
+                return Err(smolvm::Error::config(
+                    "--remove-credential",
+                    format!("machine '{}' has no credential binding '{name}'", self.name),
+                ));
+            }
+            policy.credentials.retain(|binding| &binding.name != name);
+        }
+        for spec in &self.credential {
+            let binding = smolvm::credentials::parse_credential_flag(spec)
+                .map_err(|e| smolvm::Error::config("--credential", e))?;
+            match policy
+                .credentials
+                .iter_mut()
+                .find(|existing| existing.name == binding.name)
+            {
+                Some(existing) => *existing = binding,
+                None => policy.credentials.push(binding),
+            }
+        }
+        Ok(policy)
+    }
+
+    /// Replace the machine's credential bindings, in any state; a running
+    /// machine enforces them at once.
+    fn update_credentials(
+        &self,
+        db: &smolvm::db::SmolvmDb,
+        record: &smolvm::config::VmRecord,
+    ) -> smolvm::Result<()> {
+        let running = record.actual_state() == smolvm::config::RecordState::Running;
+        let policy = self.next_credentials(record)?;
+        let saved = smolvm::credentials::set_bindings(
+            db,
+            &self.name,
+            policy,
+            smolvm::machine_spec::Caller::Cli,
+        )?;
+        let before: Vec<&str> = record
+            .credential_policy
+            .iter()
+            .flat_map(|p| p.credentials.iter().map(|b| b.name.as_str()))
+            .collect();
+        let after = saved.credential_policy.clone().unwrap_or_default();
+        // The running boot process reads a binding's variable from the
+        // environment it started with, which has no variable for a binding
+        // added now: hand it the value this command can read.
+        if running && !saved.credentials_supplied_by_api {
+            let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> = after
+                .credentials
+                .iter()
+                .filter(|binding| !before.contains(&binding.name.as_str()))
+                .filter(|binding| {
+                    !saved
+                        .secret_refs
+                        .contains_key(&binding.environment_variable)
+                })
+                .filter_map(|binding| {
+                    std::env::var(&binding.environment_variable)
+                        .ok()
+                        .map(|value| (binding.name.clone(), zeroize::Zeroizing::new(value)))
+                })
+                .collect();
+            if !values.is_empty() {
+                smolvm::agent::apply_live_credential_values(&self.name, &values)?;
+            }
+        }
+        println!(
+            "Updated machine '{}'{}:",
+            self.name,
+            if running {
+                " (running; applies now)"
+            } else {
+                ""
+            }
+        );
+        for name in &before {
+            if after.binding(name).is_none() {
+                println!("  removed credential: {name}");
+            }
+        }
+        for binding in &after.credentials {
+            let verb = if before.contains(&binding.name.as_str()) {
+                "credential"
+            } else {
+                "added credential"
+            };
+            println!(
+                "  {verb}: {} -> {}",
+                binding.name,
+                binding.allowed_hosts.join(",")
+            );
+        }
+        Ok(())
     }
 
     fn next_ports(&self, record: &smolvm::config::VmRecord) -> smolvm::Result<Vec<PortMapping>> {
@@ -7187,7 +7313,25 @@ impl UpdateCmd {
 
         let set_labels = smolvm::util::parse_labels(&self.labels)?;
         let state = record.actual_state();
-        if self.changes_only_labels() {
+        let (egress, ports, labels, credentials, other) = self.changed_settings();
+        let mut record = record;
+        if credentials {
+            if state == RecordState::Running && (egress || ports || other) {
+                return Err(smolvm::Error::config(
+                    "update",
+                    "a running machine takes credential binding changes on their own; \
+                     run the other changes separately",
+                ));
+            }
+            self.update_credentials(&db, &record)?;
+            if !(egress || ports || labels || other) {
+                return Ok(());
+            }
+            record = db.get_vm(&self.name)?.ok_or_else(|| {
+                smolvm::Error::config("update", format!("machine '{}' not found", self.name))
+            })?;
+        }
+        if labels && !egress && !ports && !other {
             return self.update_labels(&db, &set_labels);
         }
         if state == RecordState::Running && self.changes_only_egress() {

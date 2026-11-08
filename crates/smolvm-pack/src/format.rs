@@ -530,6 +530,11 @@ pub struct CheckpointNetwork {
     /// restored interceptor; placeholders are opaque tokens, not secrets.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub credential_placeholders: std::collections::BTreeMap<String, String>,
+    /// Whether the captured boot mounted the credential CA as a boot device,
+    /// which the restore must recreate. Absent on checkpoints captured before
+    /// it was recorded, where the device follows `credential_policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ca_device: Option<bool>,
 }
 
 /// Versioned host CPU compatibility contract for a live checkpoint.
