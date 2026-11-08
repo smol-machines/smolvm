@@ -688,6 +688,45 @@ pub fn apply_live_credential_values(
 }
 
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    let reply = send_live_request(name, socket, rendered)?;
+    match reply.trim() {
+        "ok" => Ok(()),
+        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+    }
+}
+
+pub(crate) fn allocate_live_port(name: &str, guest: u16) -> Result<u16> {
+    let reply = send_live_request(
+        name,
+        smolvm_network::PORTS_SOCKET,
+        &format!("allocate {guest}\n"),
+    )
+    .map_err(|reason| Error::config("atomic port publication", reason))?;
+    let mapping = reply
+        .trim()
+        .strip_prefix("ok ")
+        .and_then(|ports| ports.split_once(':'))
+        .and_then(|(host, returned_guest)| {
+            Some((
+                host.parse::<u16>().ok()?,
+                returned_guest.parse::<u16>().ok()?,
+            ))
+        })
+        .filter(|(host, returned_guest)| *host != 0 && *returned_guest == guest)
+        .ok_or_else(|| {
+            Error::config(
+                "atomic port publication",
+                "machine does not support atomic port allocation",
+            )
+        })?;
+    Ok(mapping.0)
+}
+
+fn send_live_request(
+    name: &str,
+    socket: &str,
+    rendered: &str,
+) -> std::result::Result<String, String> {
     use std::io::{Read, Write};
     let path = vm_data_dir(name).join(socket);
     let mut stream =
@@ -705,10 +744,7 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
     stream
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
-    match reply.trim() {
-        "ok" => Ok(()),
-        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
-    }
+    Ok(reply)
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's

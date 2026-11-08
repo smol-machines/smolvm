@@ -1647,6 +1647,49 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Publish one TCP guest port on an OS-allocated, continuously owned loopback listener.
+    pub fn publish_atomic(&self, name: &str, guest: u16) -> Result<u16> {
+        if guest == 0 {
+            return Err(Error::config(
+                "atomic port publication",
+                "guest port must be positive",
+            ));
+        }
+        self.with_name_lock(name, || {
+            let record = control::get_record(&self.db, name)?;
+            if crate::agent::state_probe::resolve_state(name, &record) != RecordState::Running {
+                return Err(Error::config(
+                    "atomic port publication",
+                    "machine must be running",
+                ));
+            }
+            if record.ports.len() + record.udp_ports.len()
+                >= crate::data::network::MAX_PORT_MAPPINGS
+            {
+                return Err(Error::config(
+                    "atomic port publication",
+                    "too many published ports",
+                ));
+            }
+            let host = match crate::agent::allocate_live_port(name, guest) {
+                Ok(host) => host,
+                Err(error) => {
+                    // The engine may have bound before its reply was lost.
+                    let _ = crate::agent::apply_live_published_ports(name, &record.ports);
+                    return Err(error);
+                }
+            };
+            match self.db.update_vm(name, |r| r.ports.push((host, guest))) {
+                Ok(Some(_)) => Ok(host),
+                result => {
+                    let _ = crate::agent::apply_live_published_ports(name, &record.ports);
+                    result?;
+                    Err(Error::vm_not_found(name))
+                }
+            }
+        })
+    }
+
     /// Pack the stopped machine `name` into a `.smolmachine` at `output`
     /// (a `.smolmachine` extension is added when missing): its disks and
     /// configuration flattened into an artifact new machines boot from with

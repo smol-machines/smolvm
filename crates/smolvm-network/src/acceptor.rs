@@ -216,6 +216,31 @@ impl TcpAcceptorSet {
         self.shared.registry().mappings()
     }
 
+    /// Bind an OS-allocated loopback TCP port and keep its listener owned.
+    pub fn publish_atomic(&self, guest: u16) -> io::Result<PortMapping> {
+        if guest == 0 || self.is_closed() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid guest port or closed publisher",
+            ));
+        }
+        let _replacing = self
+            .shared
+            .replacing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let v4 = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let mapping = PortMapping::new(v4.local_addr()?.port(), guest);
+        let sockets = BoundSockets {
+            v4,
+            v6: None,
+            loopback_only: true,
+        };
+        let mut registry = self.shared.registry();
+        registry.add(&self.shared.poller, BoundTcpPorts(vec![(mapping, sockets)]))?;
+        Ok(mapping)
+    }
+
     /// Make `next` the published set (TCP mappings only).
     pub fn replace(&self, next: &[PortMapping]) -> io::Result<()> {
         if let Some(udp) = next.iter().find(|m| m.protocol == PortProtocol::Udp) {
@@ -375,6 +400,30 @@ fn accept_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn atomic_allocations_remain_owned_across_concurrent_publishers() {
+        use super::*;
+        let publisher = Arc::new(
+            TcpAcceptorSet::start(BoundTcpPorts::bind(&[]).unwrap(), Box::new(|_| {})).unwrap(),
+        );
+        let workers: Vec<_> = (0..32)
+            .map(|i| {
+                let publisher = publisher.clone();
+                std::thread::spawn(move || publisher.publish_atomic(8000 + i).unwrap())
+            })
+            .collect();
+        let mappings: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        let mut ports: Vec<_> = mappings.iter().map(|m| m.host).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 32);
+        for mapping in mappings {
+            assert!(mapping.host > 0);
+            assert!(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, mapping.host)).is_err());
+        }
+        assert_eq!(publisher.mappings().len(), 32);
+    }
+
     use super::*;
     use std::net::Ipv4Addr;
     use std::sync::mpsc;
