@@ -34,6 +34,10 @@ waits until the engine answers (about 1.3 s on a restart). Then:
   Testcontainers' Ryuk.
 - **Home directory.** It is shared at the same path, so `docker run -v "$PWD:$PWD"`, Compose
   relative binds and Dev Containers work unchanged. `--no-home` turns this off.
+- **The host from a container.** `host.docker.internal` (and `gateway.docker.internal`) resolve
+  in every container, on every network. They reach services on the host, including ones bound
+  only to `127.0.0.1`. `host-gateway` in `--add-host` or Compose `extra_hosts` maps there too.
+  The machine uses the virtio-net backend, whose gateway answers these names.
 - **Resources.** The machine gets every host CPU and half the host's memory, at most 8 GiB
   (`--cpus`, `--mem`). Its disk for images, containers and volumes is 64 GiB, sparse (`--disk`).
   `--registry-mirror URL` gives dockerd a mirror, and `--image` another engine image.
