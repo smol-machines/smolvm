@@ -4102,7 +4102,7 @@ fn qcow2_head_with_backing(path: &Path, backing: &str) -> Result<Option<Vec<u8>>
     Ok(Some(head))
 }
 
-fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
+pub(crate) fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

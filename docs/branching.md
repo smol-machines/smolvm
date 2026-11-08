@@ -110,6 +110,19 @@ writable layer is never flattened; existing children retain their disk contents.
 A compaction failure fails the branch before capture instead of proceeding toward
 the limit. This does not remove the separate logical branch-ancestry safety limit.
 
+The layers a checkpoint restore installs under a machine's writable disk are
+compacted like branch layers, so a machine restored from a deep checkpoint, or
+branched from one, is shortened at its first branch instead of keeping every
+captured layer. A branch of a frozen source sits on that source's disk, which is
+never replaced while branches read it; once that disk is eight or more layers
+deep, the next branch first folds the layers beneath it, and if that is not
+enough copies it once into a standalone disk that the source keeps and every
+later branch of it shares. A chain of frozen sources, each the previous one's
+branch, therefore stays short as well. A live branch of a machine that is still
+deeper than 32 layers goes ahead and flattens the generation it creates before
+its children open it; only a chain of 64 layers, which takes that flatten failing
+again and again, is refused.
+
 `GET /api/v1/machines/{name}` reports `diskChainDepth`: the maximum number of backing
 layers across the machine's storage, overlay and cache disks. A standalone disk
 has depth zero. The field is omitted when depth cannot be measured, and on bulk
