@@ -280,23 +280,15 @@ install_packages_apk_static() {
     # code 127. The minirootfs already ships busybox symlinks, and seatd runs
     # as root in the VM so the 'seat' group creation is not required.
     local -a APK_STATIC_COMMAND=("$WORK_DIR/apk-static/sbin/apk.static")
-    local -a APK_STATIC_OWNERSHIP_ARGS=()
     local -a APK_STATIC_INITDB_ARGS=()
     if [[ "$EUID" != "0" ]]; then
-        # apk reconciles package directory ownership even with --no-chown. In
-        # an ordinary user namespace, uid 0 maps back to the invoking user, so
-        # both file and directory metadata can be installed without spurious
-        # EPERM diagnostics or privileged host writes.
-        if command -v unshare &> /dev/null \
-            && unshare --user --map-root-user true 2>/dev/null; then
-            APK_STATIC_COMMAND=(unshare --user --map-root-user "${APK_STATIC_COMMAND[@]}")
-            APK_STATIC_OWNERSHIP_ARGS=(--no-chown)
-        else
-            # apk-tools 3 refuses to create a database as non-root unless
-            # --usermode is given; files keep the invoking user's ownership.
-            echo "Warning: user namespaces are unavailable; apk runs in --usermode and files retain invoking-user ownership"
-            APK_STATIC_INITDB_ARGS=(--usermode)
-        fi
+        # apk-tools 3 refuses to create a database as non-root unless
+        # --usermode is given; files keep the invoking user's ownership, as
+        # they would from any non-root build. (A user namespace mapping only
+        # root cannot do better: apk then fails to chown setgid binaries to
+        # their groups, and from apk-tools 3.0.9 --no-chown means --usermode,
+        # which apk refuses as root.)
+        APK_STATIC_INITDB_ARGS=(--usermode)
     fi
     "${APK_STATIC_COMMAND[@]}" \
         --root "$OUTPUT_DIR" \
@@ -305,7 +297,6 @@ install_packages_apk_static() {
         --no-cache \
         --allow-untrusted \
         --no-scripts \
-        "${APK_STATIC_OWNERSHIP_ARGS[@]}" \
         --arch "$ALPINE_ARCH" \
         add $APK_PACKAGES
     if [[ "$NO_UPGRADE" != "1" ]]; then
@@ -315,7 +306,6 @@ install_packages_apk_static() {
             --no-cache \
             --allow-untrusted \
             --no-scripts \
-            "${APK_STATIC_OWNERSHIP_ARGS[@]}" \
             --arch "$ALPINE_ARCH" \
             upgrade
     fi
