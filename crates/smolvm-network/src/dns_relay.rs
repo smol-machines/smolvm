@@ -38,9 +38,9 @@
 //! DNS is low-volume and its answers are quick, so the tables here are small and
 //! loss under saturation just makes a guest see a normal DNS timeout.
 
-use crate::dns_forward::{Forwarder, DNS_MAX_MSG};
 #[cfg(test)]
 use crate::dns_forward::start_udp_query;
+use crate::dns_forward::{Forwarder, DNS_MAX_MSG};
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use polling::{Event, Events};

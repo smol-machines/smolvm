@@ -2878,7 +2878,10 @@ pub(crate) fn start_tsi_dns_forwarder(
     // that outlives the call.
     let ret = unsafe { set_dns_forwarder(ctx, c_addr.as_ptr()) };
     if ret < 0 {
-        tracing::warn!(ret, "krun_set_dns_forwarder failed; TSI guest DNS goes direct");
+        tracing::warn!(
+            ret,
+            "krun_set_dns_forwarder failed; TSI guest DNS goes direct"
+        );
     } else {
         tracing::info!(%addr, %upstream, "TSI guest DNS answered by the host forwarder");
     }
