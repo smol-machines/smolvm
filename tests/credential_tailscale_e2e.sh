@@ -94,7 +94,8 @@ unix_socket: $tmp/headscale.sock
 unix_socket_permission: "0700"
 EOF
 hs() { "$headscale" -c "$tmp/headscale.yaml" "$@"; }
-hs serve >"$tmp/headscale.log" 2>&1 &
+# Started directly, not through hs, so $! is the server itself.
+"$headscale" -c "$tmp/headscale.yaml" serve >"$tmp/headscale.log" 2>&1 &
 headscale_pid=$!
 for _ in $(seq 1 30); do hs users list >/dev/null 2>&1 && break; sleep 1; done
 hs users create e2e >/dev/null
@@ -192,6 +193,12 @@ current=userspace
 start_tailscaled "$user_vm" "--tun=userspace-networking --socks5-server=localhost:1055 --outbound-http-proxy-listen=localhost:1056"
 in_vm "$user_vm" "$ts_up --hostname tsuser-$suffix --exit-node=$exit_v4 >/dev/null"
 in_vm "$user_vm" "! ip link show tailscale0 2>/dev/null" || fail "userspace mode created a TUN"
+# The exit path can take a moment after tailscale up returns; wait for a plain
+# HTTP request through the proxy before measuring.
+for _ in $(seq 1 60); do
+  in_vm "$user_vm" "curl -s -4 -m 5 -o /dev/null --proxy socks5h://localhost:1055 http://$echo_host/get" && break
+  sleep 1
+done
 # socks5:// has curl resolve the name itself; -4 keeps it to an address the
 # exit node can reach (this host has no IPv6 route to the internet).
 for proxy in socks5h://localhost:1055 socks5://localhost:1055 http://localhost:1056; do
