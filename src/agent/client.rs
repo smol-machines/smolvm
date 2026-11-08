@@ -198,7 +198,7 @@ impl InteractiveInputReceiver {
         }
     }
 
-    fn try_recv(
+    pub(crate) fn try_recv(
         &mut self,
     ) -> std::result::Result<InteractiveInput, tokio::sync::mpsc::error::TryRecvError> {
         self.rx.try_recv()
@@ -2962,12 +2962,30 @@ impl AgentClient {
     fn interactive_session_io<F>(
         &mut self,
         request: AgentRequest,
+        input: InteractiveInputReceiver,
+        on_output: F,
+        op: &str,
+        poll_timeout_ms: i32,
+    ) -> Result<i32>
+    where
+        F: FnMut(InteractiveOutput),
+    {
+        self.interactive_session_io_started(request, input, || {}, on_output, op, poll_timeout_ms)
+    }
+
+    /// [`Self::interactive_session_io`], calling `on_started` once the agent
+    /// has spawned the command and before any of its output is delivered.
+    fn interactive_session_io_started<S, F>(
+        &mut self,
+        request: AgentRequest,
         mut input: InteractiveInputReceiver,
+        on_started: S,
         mut on_output: F,
         op: &str,
         poll_timeout_ms: i32,
     ) -> Result<i32>
     where
+        S: FnOnce(),
         F: FnMut(InteractiveOutput),
     {
         use crate::agent::terminal::poll_io;
@@ -2984,6 +3002,7 @@ impl AgentClient {
             AgentResponse::Error { message, .. } => return Err(Error::agent(op, message)),
             _ => return Err(Error::agent(op, "expected Started response")),
         }
+        on_started();
 
         let socket_fd = self.stream_raw_fd();
         let mut wake_fd = input.wake_fd();
@@ -3157,6 +3176,91 @@ impl AgentClient {
             input,
             on_output,
             "run interactive (io)",
+            POLL_TIMEOUT_MS,
+        )
+    }
+
+    /// Run a command in the VM for a node-owned exec session: stdin, resize
+    /// and end of input arrive on `input`, output goes to `on_output`, and
+    /// `on_started` runs once the command is running. Unlike
+    /// [`Self::vm_exec_interactive_io`] it passes the command's timeout to the
+    /// agent, which kills the command and reports exit code 124 when it passes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vm_exec_session_io<S, F>(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        tty: bool,
+        input: InteractiveInputReceiver,
+        on_started: S,
+        on_output: F,
+    ) -> Result<i32>
+    where
+        S: FnOnce(),
+        F: FnMut(InteractiveOutput),
+    {
+        let env = with_term_default(env, tty);
+        self.interactive_session_io_started(
+            AgentRequest::VmExec {
+                command,
+                env,
+                workdir,
+                timeout_ms: timeout.map(|t| t.as_millis() as u64),
+                interactive: true,
+                tty,
+                background: false,
+                stdin_data: None,
+            },
+            input,
+            on_started,
+            on_output,
+            "vm exec session",
+            POLL_TIMEOUT_MS,
+        )
+    }
+
+    /// [`Self::vm_exec_session_io`] for an image machine: the command runs in
+    /// the machine's container, as the configured user, with its timeout.
+    pub fn run_session_io<S, F>(
+        &mut self,
+        config: RunConfig,
+        input: InteractiveInputReceiver,
+        on_started: S,
+        on_output: F,
+    ) -> Result<i32>
+    where
+        S: FnOnce(),
+        F: FnMut(InteractiveOutput),
+    {
+        let tty = config.tty;
+        let env = with_term_default(config.env, tty);
+        self.interactive_session_io_started(
+            AgentRequest::Run {
+                image: config.image,
+                command: config.command,
+                env,
+                workdir: config.workdir,
+                user: config.user,
+                mounts: config.mounts,
+                timeout_ms: config.timeout.map(|t| t.as_millis() as u64),
+                interactive: true,
+                tty,
+                detached: false,
+                unprivileged: config.unprivileged,
+                persistent_overlay_id: config.persistent_overlay_id,
+                stdin_data: None,
+                background: false,
+                s3_volumes: config.s3_volumes.clone(),
+                stop_vm_on_exit: false,
+                stop_signal: None,
+                stop_timeout_secs: None,
+            },
+            input,
+            on_started,
+            on_output,
+            "run session",
             POLL_TIMEOUT_MS,
         )
     }

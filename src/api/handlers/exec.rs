@@ -25,7 +25,7 @@ use crate::data::storage::HostMount;
 use tokio::sync::Semaphore;
 
 /// Refuse, rather than boot, a machine that is not already running.
-async fn require_running(
+pub(crate) async fn require_running(
     entry: &std::sync::Arc<parking_lot::Mutex<crate::api::state::MachineEntry>>,
 ) -> Result<(), ApiError> {
     let entry = entry.clone();
@@ -877,7 +877,12 @@ pub async fn stream_logs(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
     let log_path = match query.source.as_deref() {
         None | Some("console") => console_log_path(&state, &id)?,
         Some("workload") => workload_log_path(&state, &id).await?,
@@ -887,7 +892,7 @@ pub async fn stream_logs(
             )))
         }
     };
-    stream_log_file(&id, log_path, query).await
+    stream_log_file(&id, log_path, query, last_event_id).await
 }
 
 /// A machine's workload log. It lives in the machine's data directory and is
@@ -937,6 +942,7 @@ async fn stream_log_file(
     id: &str,
     log_path: PathBuf,
     query: LogsQuery,
+    last_event_id: Option<u64>,
 ) -> Result<axum::response::Response, ApiError> {
     // Check if file exists (blocking check is acceptable here since it's fast)
     let path_check = log_path.clone();
@@ -958,6 +964,11 @@ async fn stream_log_file(
     let follow = query.follow;
     let tail = query.tail;
     let json_only = query.format.as_deref() == Some("json");
+    // A resumed read starts at the offset the client last received (`after`,
+    // or the SSE `Last-Event-ID` its client library sends on reconnect), and
+    // every event then carries the offset just past its line as its `id`.
+    let resume_from = query.after.or(last_event_id);
+    let with_ids = query.ids || resume_from.is_some();
 
     // Validate tail value upfront
     const MAX_TAIL_LINES: usize = 10_000;
@@ -983,24 +994,29 @@ async fn stream_log_file(
         None
     };
 
-    // For tail, read last N lines upfront using spawn_blocking with bounded memory
-    let (initial_lines, start_pos) = if let Some(n) = tail {
-        let path = log_path.clone();
-        tokio::task::spawn_blocking(move || read_last_n_lines_bounded(&path, n))
-            .await
-            .map_err(ApiError::internal)?
-            .map_err(ApiError::internal)?
-    } else {
-        (Vec::new(), 0)
+    // For tail, read last N lines upfront using spawn_blocking with bounded
+    // memory. A resumed read has no tail: it continues where it left off.
+    let (initial_lines, start_pos) = match (tail, resume_from) {
+        (Some(n), None) => {
+            let path = log_path.clone();
+            tokio::task::spawn_blocking(move || read_last_n_lines_bounded(&path, n))
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(ApiError::internal)?
+        }
+        _ => (Vec::new(), 0),
     };
 
     let stream = log_event_stream(
         log_path,
-        follow,
-        tail,
-        start_pos,
+        LogRead {
+            follow,
+            tail: tail.filter(|_| resume_from.is_none()),
+            start_pos: resume_from.unwrap_or(start_pos),
+            json_only,
+            with_ids,
+        },
         initial_lines,
-        json_only,
         follow_permit,
     );
 
@@ -1015,18 +1031,44 @@ async fn stream_log_file(
         .into_response())
 }
 
-/// The console log at `log_path` as an SSE body: the `tail` lines already read
-/// (`initial_lines`, ending at `start_pos`), then the file from there, to its
-/// end or, with `follow`, as it grows.
+/// How to read a log for [`log_event_stream`].
+#[derive(Debug, Clone, Copy)]
+struct LogRead {
+    /// Keep reading as the file grows.
+    follow: bool,
+    /// The read began with this many tail lines (already read).
+    tail: Option<usize>,
+    /// The file offset to read from: where the tail lines end, or where a
+    /// resumed read left off; 0 for a read of the whole file.
+    start_pos: u64,
+    /// Only lines that parse as JSON.
+    json_only: bool,
+    /// Give every event the offset just past its line as its SSE `id`.
+    with_ids: bool,
+}
+
+/// The log at `log_path` as an SSE body: the `tail` lines already read
+/// (`initial_lines`, each with the offset just past it), then the file from
+/// `start_pos`, to its end or, with `follow`, as it grows.
+///
+/// The live log is rotated by copying it to `<log>.1` and truncating it. A
+/// read whose offset is past the end of the file therefore lost the race
+/// with a rotation: it finishes the copied part from `<log>.1` and goes on
+/// from the start of the live file, instead of waiting for the file to grow
+/// back past its old offset.
 fn log_event_stream(
     log_path: PathBuf,
-    follow: bool,
-    tail: Option<usize>,
-    start_pos: u64,
-    initial_lines: Vec<String>,
-    json_only: bool,
+    read: LogRead,
+    initial_lines: Vec<(String, u64)>,
     follow_permit: Option<tokio::sync::SemaphorePermit<'static>>,
 ) -> impl tokio_stream::Stream<Item = Result<axum::body::Bytes, Infallible>> {
+    let LogRead {
+        follow,
+        tail,
+        start_pos,
+        json_only,
+        with_ids,
+    } = read;
     // One SSE event per line, as before, but many lines per write. Each write
     // reaches an HTTP/2 client as its own DATA frame, and a client that receives
     // too many small frames faster than it reads them (h2 counts them per
@@ -1036,13 +1078,14 @@ fn log_event_stream(
         // when the client disconnects or the stream ends.
         let _permit = follow_permit;
         let mut batch = LogEvents::default();
+        let keep = |line: &str| !json_only || serde_json::from_str::<serde_json::Value>(line).is_ok();
 
         // Emit initial tail lines first
-        for line in initial_lines {
-            if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
+        for (line, end) in initial_lines {
+            if !keep(&line) {
                 continue; // skip non-JSON lines in json mode
             }
-            batch.push(&line);
+            batch.push_event(&line, with_ids.then_some(end));
             if batch.is_full() {
                 yield Ok::<_, Infallible>(batch.take());
             }
@@ -1055,14 +1098,23 @@ fn log_event_stream(
             return;
         }
 
+        // A resumable read names where it stands before any line arrives, so a
+        // client that loses the stream before the first line still resumes
+        // from here (an event of an id alone sets the client's last id).
+        if with_ids {
+            yield Ok(axum::body::Bytes::from(format!("id: {start_pos}\n\n")));
+        }
+
         // For following or full read, poll the file for new content
-        let mut pos = if tail.is_some() { start_pos } else { 0 };
-        let mut partial_line = String::new();
+        let mut pos = start_pos;
+        let mut partial: Vec<u8> = Vec::new();
         let mut last_write = tokio::time::Instant::now();
+        // A read from the copy of a rotated log, then the live file from 0.
+        let mut reading_rotated = false;
 
         loop {
             // Read new content in spawn_blocking
-            let path = log_path.clone();
+            let path = if reading_rotated { rotated_log_path(&log_path) } else { log_path.clone() };
             let current_pos = pos;
 
             let result = tokio::task::spawn_blocking(move || {
@@ -1072,34 +1124,71 @@ fn log_event_stream(
             .unwrap_or_else(|e| Err(std::io::Error::other(e)));
 
             let read_more = match result {
-                Ok((new_data, new_pos)) => {
-                    let advanced = new_pos > pos;
-                    pos = new_pos;
-                    if !new_data.is_empty() {
-                        partial_line.push_str(&new_data);
-                        // Queue complete lines
-                        while let Some(newline_pos) = partial_line.find('\n') {
-                            let line = partial_line[..newline_pos].trim_end_matches('\r').to_string();
-                            partial_line = partial_line[newline_pos + 1..].to_string();
-                            if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
-                                continue; // skip non-JSON lines in json mode
-                            }
-                            batch.push(&line);
+                Ok(ReadAt::Data(data)) => {
+                    let chunk_start = pos;
+                    pos += data.len() as u64;
+                    let mut line_start = 0;
+                    for (i, b) in data.iter().enumerate() {
+                        if *b != b'\n' {
+                            continue;
                         }
-                        // Flush partial line if it exceeds the safety cap
-                        if partial_line.len() > MAX_PARTIAL_LINE {
-                            batch.push(&partial_line);
-                            partial_line.clear();
+                        partial.extend_from_slice(&data[line_start..i]);
+                        line_start = i + 1;
+                        let line = String::from_utf8_lossy(&partial).trim_end_matches('\r').to_string();
+                        partial.clear();
+                        if keep(&line) {
+                            batch.push_event(&line, with_ids.then_some(chunk_start + i as u64 + 1));
                         }
                     }
-                    advanced
+                    partial.extend_from_slice(&data[line_start..]);
+                    // Flush partial line if it exceeds the safety cap
+                    if partial.len() > MAX_PARTIAL_LINE {
+                        let line = String::from_utf8_lossy(&partial).into_owned();
+                        partial.clear();
+                        batch.push_event(&line, with_ids.then_some(pos));
+                    }
+                    true
+                }
+                Ok(ReadAt::End) => false,
+                Ok(ReadAt::PastEnd) if !reading_rotated => {
+                    // Rotated since this offset: finish the copy, if it is
+                    // the generation the offset belongs to.
+                    reading_rotated = true;
+                    true
+                }
+                Ok(ReadAt::PastEnd) => {
+                    // The copy is shorter too: it was rotated more than once.
+                    // Go on from the start of the live file.
+                    reading_rotated = false;
+                    pos = 0;
+                    partial.clear();
+                    true
+                }
+                Err(e) if reading_rotated && e.kind() == std::io::ErrorKind::NotFound => {
+                    reading_rotated = false;
+                    pos = 0;
+                    true
                 }
                 Err(e) => {
-                    batch.push(&format!("error: {}", e));
+                    batch.push_event(&format!("error: {}", e), None);
                     yield Ok(batch.take());
                     break;
                 }
             };
+            if reading_rotated && !read_more {
+                // The copy is read to its end: its last line is complete (a
+                // rotation copies whole writes). Continue with the live file.
+                if !partial.is_empty() {
+                    let line = String::from_utf8_lossy(&partial).into_owned();
+                    partial.clear();
+                    if keep(&line) {
+                        batch.push_event(&line, with_ids.then_some(pos));
+                    }
+                }
+                reading_rotated = false;
+                pos = 0;
+                continue;
+            }
             if !batch.is_empty() {
                 yield Ok(batch.take());
                 last_write = tokio::time::Instant::now();
@@ -1111,11 +1200,15 @@ fn log_event_stream(
                     continue;
                 }
                 // Yield any remaining partial line
-                if !partial_line.is_empty() {
-                    batch.push(&partial_line);
+                if !partial.is_empty() {
+                    let line = String::from_utf8_lossy(&partial).into_owned();
+                    batch.push_event(&line, with_ids.then_some(pos));
                     yield Ok(batch.take());
                 }
                 break;
+            }
+            if read_more {
+                continue;
             }
 
             // Keep an idle follower's connection open, as SSE keep-alive did.
@@ -1128,6 +1221,13 @@ fn log_event_stream(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+/// Where the log rotation copies the live log.
+fn rotated_log_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
 }
 
 /// How long a followed log stream may go quiet before it sends a keep-alive
@@ -1144,8 +1244,17 @@ impl LogEvents {
     /// `Event::default().data(line)`: a `data: ` field per `\r`- or
     /// `\n`-delimited piece, then a blank line; an empty line is the blank line
     /// alone.
+    #[cfg(test)]
     fn push(&mut self, line: &str) {
+        self.push_event(line, None)
+    }
+
+    /// [`Self::push`], with an `id: <offset>` field first when given.
+    fn push_event(&mut self, line: &str, id: Option<u64>) {
         let out = &mut self.0;
+        if let Some(id) = id {
+            out.extend_from_slice(format!("id: {id}\n").as_bytes());
+        }
         if !line.is_empty() {
             out.extend_from_slice(b"data: ");
             let bytes = line.as_bytes();
@@ -1161,6 +1270,10 @@ impl LogEvents {
             }
             out.extend_from_slice(&bytes[last..]);
             out.push(b'\n');
+        } else if id.is_some() {
+            // An event of an id alone is dispatched by no client; an empty
+            // line still has to reach it as an (empty) data field.
+            out.extend_from_slice(b"data: \n");
         }
         out.push(b'\n');
     }
@@ -1179,11 +1292,11 @@ impl LogEvents {
 }
 
 /// Read the last N lines from a file using a bounded ring buffer.
-/// Returns (lines, file_position_at_end) for follow mode.
+/// Returns each line with the offset just past it, and the file's length.
 fn read_last_n_lines_bounded(
     path: &std::path::Path,
     n: usize,
-) -> std::io::Result<(Vec<String>, u64)> {
+) -> std::io::Result<(Vec<(String, u64)>, u64)> {
     use std::collections::VecDeque;
 
     let file = std::fs::File::open(path)?;
@@ -1195,20 +1308,33 @@ fn read_last_n_lines_bounded(
         return Ok((Vec::new(), file_len));
     }
 
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     // Use a ring buffer to keep only the last N lines in memory
-    let mut ring: VecDeque<String> = VecDeque::with_capacity(n + 1);
-
-    for line in reader.lines() {
-        let line = line?;
+    let mut ring: VecDeque<(String, u64)> = VecDeque::with_capacity(n + 1);
+    let mut pos = 0u64;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        pos += read as u64;
+        let mut line = &buf[..];
+        if line.last() == Some(&b'\n') {
+            line = &line[..line.len() - 1];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+        }
         if ring.len() == n {
             ring.pop_front();
         }
-        ring.push_back(line);
+        ring.push_back((String::from_utf8_lossy(line).into_owned(), pos));
     }
 
-    Ok((ring.into_iter().collect(), file_len))
+    Ok((ring.into_iter().collect(), pos))
 }
 
 /// Maximum bytes to read per poll cycle (64 KiB).
@@ -1221,28 +1347,37 @@ const MAX_READ_CHUNK: u64 = 64 * 1024;
 /// buffer is flushed as-is to prevent unbounded memory growth.
 const MAX_PARTIAL_LINE: usize = BYTES_PER_MIB as usize;
 
+/// What a read at an offset found.
+enum ReadAt {
+    /// Up to [`MAX_READ_CHUNK`] new bytes.
+    Data(Vec<u8>),
+    /// Nothing past the offset yet.
+    End,
+    /// The file is shorter than the offset: it was rotated.
+    PastEnd,
+}
+
 /// Read new content from a file starting at a given position.
 /// Reads at most `MAX_READ_CHUNK` bytes per call.
-fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(String, u64)> {
+fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<ReadAt> {
     use std::io::Read as _;
 
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     let file_len = metadata.len();
 
-    if pos >= file_len {
-        // No new content
-        return Ok((String::new(), pos));
+    if pos > file_len {
+        return Ok(ReadAt::PastEnd);
+    }
+    if pos == file_len {
+        return Ok(ReadAt::End);
     }
 
     file.seek(SeekFrom::Start(pos))?;
     let to_read = std::cmp::min(file_len - pos, MAX_READ_CHUNK) as usize;
     let mut buf = vec![0u8; to_read];
     file.read_exact(&mut buf)?;
-    let new_pos = pos + to_read as u64;
-
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    Ok((text, new_pos))
+    Ok(ReadAt::Data(buf))
 }
 
 #[cfg(all(test, unix))]
@@ -1692,11 +1827,14 @@ mod log_stream_tests {
 
         let writes = read_all(log_event_stream(
             path,
-            false,
-            None,
-            0,
+            LogRead {
+                follow: false,
+                tail: None,
+                start_pos: 0,
+                json_only: false,
+                with_ids: false,
+            },
             Vec::new(),
-            false,
             None,
         ))
         .await;
@@ -1721,16 +1859,88 @@ mod log_stream_tests {
 
         let writes = read_all(log_event_stream(
             path,
-            false,
-            Some(2),
-            end,
+            LogRead {
+                follow: false,
+                tail: Some(2),
+                start_pos: end,
+                json_only: false,
+                with_ids: false,
+            },
             initial,
-            false,
             None,
         ))
         .await;
 
         assert_eq!(writes.len(), 1);
         assert_eq!(lines_of(&writes), ["two", "three"]);
+    }
+
+    /// Splits an SSE body of `id` + `data` events into (id, line) pairs.
+    fn events_of(writes: &[axum::body::Bytes]) -> Vec<(u64, String)> {
+        let body: Vec<u8> = writes.iter().flat_map(|w| w.to_vec()).collect();
+        String::from_utf8(body)
+            .unwrap()
+            .split("\n\n")
+            .filter(|event| !event.is_empty() && event.contains('\n'))
+            .map(|event| {
+                let (id, data) = event.split_once('\n').unwrap();
+                (
+                    id.strip_prefix("id: ").unwrap().parse().unwrap(),
+                    data.strip_prefix("data: ").unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn resumed(
+        path: PathBuf,
+        from: u64,
+    ) -> impl tokio_stream::Stream<Item = Result<axum::body::Bytes, Infallible>> {
+        log_event_stream(
+            path,
+            LogRead {
+                follow: false,
+                tail: None,
+                start_pos: from,
+                json_only: false,
+                with_ids: true,
+            },
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_read_resumed_from_an_event_id_continues_after_that_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        std::fs::write(&path, "one\r\ntwo\n\nfour\n").unwrap();
+        let all = events_of(&read_all(resumed(path.clone(), 0)).await);
+        assert_eq!(
+            all,
+            [
+                (5, "one".to_string()),
+                (9, "two".to_string()),
+                (10, String::new()),
+                (15, "four".to_string())
+            ]
+        );
+        let rest = events_of(&read_all(resumed(path.clone(), 9)).await);
+        assert_eq!(rest, [(10, String::new()), (15, "four".to_string())]);
+        let (tail, end) = read_last_n_lines_bounded(&path, 2).unwrap();
+        assert_eq!(tail, [(String::new(), 10), ("four".to_string(), 15)]);
+        assert_eq!(end, 15);
+    }
+
+    #[tokio::test]
+    async fn a_read_resumed_past_a_rotation_finishes_the_copy_then_reads_the_live_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        // Rotated by copy and truncate after "b": the copy holds a..c, the
+        // live log restarted with d.
+        std::fs::write(rotated_log_path(&path), "a\nb\nc\n").unwrap();
+        std::fs::write(&path, "d\n").unwrap();
+        let rest = events_of(&read_all(resumed(path.clone(), 4)).await);
+        assert_eq!(rest, [(6, "c".to_string()), (2, "d".to_string())]);
     }
 }

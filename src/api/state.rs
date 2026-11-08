@@ -103,6 +103,8 @@ pub struct ApiState {
     /// holds a source serves every compatible request queued by then in one
     /// transaction, so their children boot together (see `branch_machine`).
     branch_queues: parking_lot::Mutex<HashMap<String, Vec<QueuedBranch>>>,
+    /// Commands this node owns, which outlive the request that started them.
+    exec_sessions: crate::api::exec_sessions::ExecSessions,
     /// Database for persistent state.
     db: SmolvmDb,
     /// Previous CPU samples per VM PID, used to compute the fractional-CPU
@@ -331,6 +333,7 @@ impl ApiState {
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
             branch_queues: parking_lot::Mutex::new(HashMap::new()),
+            exec_sessions: Default::default(),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
@@ -355,6 +358,7 @@ impl ApiState {
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
             branch_queues: parking_lot::Mutex::new(HashMap::new()),
+            exec_sessions: Default::default(),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
@@ -741,6 +745,11 @@ impl ApiState {
             }
         }
         removed
+    }
+
+    /// The exec sessions this node owns.
+    pub fn exec_sessions(&self) -> &crate::api::exec_sessions::ExecSessions {
+        &self.exec_sessions
     }
 
     /// Get a machine entry by name.

@@ -25,6 +25,7 @@ pub(crate) mod cache_base_fetch;
 pub(crate) mod device_handoff;
 #[path = "errors.rs"]
 pub mod error;
+pub mod exec_sessions;
 pub mod guest_rollout;
 pub mod handlers;
 pub mod inflight;
@@ -88,6 +89,12 @@ use state::ApiState;
         handlers::exec::exec_stream,
         handlers::exec::run_command,
         handlers::exec::stream_logs,
+        handlers::exec_sessions::create_exec_session,
+        handlers::exec_sessions::list_exec_sessions,
+        handlers::exec_sessions::read_exec_session,
+        handlers::exec_sessions::exec_session_stdin,
+        handlers::exec_sessions::resize_exec_session,
+        handlers::exec_sessions::delete_exec_session,
         // Files
         handlers::files::upload_file,
         handlers::files::download_file,
@@ -150,6 +157,10 @@ use state::ApiState;
         types::PortSpec,
         types::ResourceSpec,
         types::ExecRequest,
+        types::CreateExecSessionRequest,
+        types::ExecSessionReadQuery,
+        types::ExecStdinRequest,
+        types::ExecResizeRequest,
         types::RunRequest,
         types::EnvVar,
         types::PullImageRequest,
@@ -196,6 +207,12 @@ use state::ApiState;
         types::MountInfo,
         types::ListMachinesResponse,
         types::ExecResponse,
+        types::ExecSessionResponse,
+        types::ExecOutputChunk,
+        types::ExecOutputGap,
+        types::ExecStdinResponse,
+        types::ListExecSessionsResponse,
+        exec_sessions::SessionSummary,
         types::ExportResponse,
         types::ImageInfo,
         types::ListImagesResponse,
@@ -348,6 +365,11 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route(
             "/{id}/exec/interactive",
             get(handlers::exec::exec_interactive),
+        )
+        // A terminal attached to an exec session; it lasts as long as the user.
+        .route(
+            "/{id}/execs/{exec}/attach",
+            get(handlers::exec_sessions::attach_exec_session),
         );
 
     // Bounded metadata and lifecycle routes. These have no caller-selected
@@ -437,6 +459,27 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/exec", post(handlers::exec::exec_command))
         .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
         .route("/{id}/run", post(handlers::exec::run_command))
+        // Exec sessions: a start answers once its command runs (it may boot the
+        // machine and pull its image first), and a read may wait up to a minute
+        // for output, so neither takes the five-minute request timeout.
+        .route(
+            "/{id}/execs",
+            post(handlers::exec_sessions::create_exec_session)
+                .get(handlers::exec_sessions::list_exec_sessions),
+        )
+        .route(
+            "/{id}/execs/{exec}",
+            get(handlers::exec_sessions::read_exec_session)
+                .delete(handlers::exec_sessions::delete_exec_session),
+        )
+        .route(
+            "/{id}/execs/{exec}/stdin",
+            post(handlers::exec_sessions::exec_session_stdin),
+        )
+        .route(
+            "/{id}/execs/{exec}/resize",
+            post(handlers::exec_sessions::resize_exec_session),
+        )
         .route("/{id}/images/pull", post(handlers::images::pull_image))
         // Flattening and uploading a cache disk scales with its size: a 32 GB
         // publish ran past the five-minute timeout every time and answered 408
