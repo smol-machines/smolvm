@@ -1219,6 +1219,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
                 }
 
+                start_tsi_dns_forwarder(ctx, krun.set_dns_forwarder, resources.dns);
+
                 // TSI terminates guest connects inside libkrun, so redirecting
                 // HTTPS flows to the interceptor needs the fork's hook; without
                 // it a credential policy cannot be enforced on this backend.
@@ -2842,6 +2844,57 @@ fn raise_fd_limits() {
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
     }
+}
+
+/// Answer a TSI guest's DNS from the host forwarder (cache, one upstream query
+/// per burst of a name, resends of a lost query), the same one a virtio-net
+/// guest's gateway uses. Best-effort: a libkrun without the hook, or a
+/// forwarder that cannot start, leaves the guest querying its resolver
+/// directly, as before.
+pub(crate) fn start_tsi_dns_forwarder(
+    ctx: u32,
+    set_dns_forwarder: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
+    dns_override: Option<std::net::Ipv4Addr>,
+) {
+    let Some(set_dns_forwarder) = set_dns_forwarder else {
+        tracing::debug!("libkrun has no krun_set_dns_forwarder; TSI guest DNS goes direct");
+        return;
+    };
+    let upstream = tsi_dns_upstream(dns_override);
+    let addr = match smolvm_network::dns_forward::serve_loopback(
+        std::net::SocketAddr::new(upstream.into(), 53),
+        std::sync::Arc::new(|| false),
+    ) {
+        Ok(addr) => addr,
+        Err(error) => {
+            tracing::warn!(%error, "could not start the DNS forwarder; TSI guest DNS goes direct");
+            return;
+        }
+    };
+    let Ok(c_addr) = CString::new(addr.to_string()) else {
+        return;
+    };
+    // SAFETY: `ctx` is a live context and `c_addr` a NUL-terminated string
+    // that outlives the call.
+    let ret = unsafe { set_dns_forwarder(ctx, c_addr.as_ptr()) };
+    if ret < 0 {
+        tracing::warn!(ret, "krun_set_dns_forwarder failed; TSI guest DNS goes direct");
+    } else {
+        tracing::info!(%addr, %upstream, "TSI guest DNS answered by the host forwarder");
+    }
+}
+
+/// The resolver a TSI guest would query itself: `--dns`, else the host's own
+/// resolver when the guest may reach it, else the first public default (the
+/// guest's resolv.conf names the same one).
+fn tsi_dns_upstream(dns_override: Option<std::net::Ipv4Addr>) -> std::net::Ipv4Addr {
+    crate::data::network::effective_dns(dns_override, EffectiveNetworkBackend::Tsi)
+        .addr
+        .unwrap_or_else(|| {
+            smolvm_protocol::resolv::DEFAULT_NAMESERVERS[0]
+                .parse()
+                .expect("default nameserver is an IPv4 address")
+        })
 }
 
 /// Idle-reclaim policy: once the whole VM process (vCPUs + I/O threads) has

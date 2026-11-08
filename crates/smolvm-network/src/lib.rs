@@ -60,6 +60,8 @@
 pub mod acceptor;
 pub mod device;
 pub mod dns;
+pub mod dns_cache;
+pub mod dns_forward;
 pub mod dns_relay;
 pub mod egress;
 pub mod fabric;

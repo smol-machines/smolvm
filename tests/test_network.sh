@@ -212,6 +212,10 @@ test_machine_network_multiple_dns_lookups() {
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
 }
 
+test_machine_network_dns_burst() {
+    dns_burst_in_machine
+}
+
 test_machine_egress_allow_cidr_permitted() {
     local vm_name="egress-allow-test-$$"
 
@@ -792,6 +796,7 @@ run_test "Network: DNS resolution" test_machine_network_dns_resolution || true
 run_test "Network: connect by hostname (not just by address)" test_machine_network_connect_by_hostname || true
 run_test "Network: datagram connect reports an unroutable destination" test_machine_dgram_connect_reports_unroutable || true
 run_test "Network: multiple DNS lookups" test_machine_network_multiple_dns_lookups || true
+run_test "Network: 128 concurrent DNS lookups all answer within a second" test_machine_network_dns_burst || true
 run_test "Egress: allow-cidr permits matching traffic" test_machine_egress_allow_cidr_permitted || true
 run_test "Egress: allow-cidr blocks non-matching traffic" test_machine_egress_allow_cidr_blocked || true
 run_test "Egress: --outbound-localhost-only blocks external" test_machine_egress_outbound_localhost_only || true

@@ -265,6 +265,10 @@ test_machine_create_virtio_net_policy_accepted_tsi_rejected() {
     }
 }
 
+test_virtio_net_dns_burst() {
+    dns_burst_in_machine --net-backend virtio-net
+}
+
 test_pack_run_virtio_net_works() {
     local output_path="$TEST_DIR/virtio-pack"
     local output
@@ -298,5 +302,6 @@ run_test "Machine run: virtio-net guest networking works" test_machine_run_virti
 run_test "Machine run: virtio-net published TCP ports work" test_machine_run_virtio_net_port_publishing_works || true
 run_test "Machine create: policy needs virtio-net (tsi rejected)" test_machine_create_virtio_net_policy_accepted_tsi_rejected || true
 run_test "Pack run: virtio-net guest networking works" test_pack_run_virtio_net_works || true
+run_test "virtio-net: 128 concurrent DNS lookups all answer within a second" test_virtio_net_dns_burst || true
 
 print_summary "Virtio-Net Tests"
