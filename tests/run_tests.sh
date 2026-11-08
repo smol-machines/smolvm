@@ -74,6 +74,7 @@ get_suite() {
         pack-quick)  echo "$SCRIPT_DIR/test_pack.sh --quick" ;;
         gpu)         echo "$SCRIPT_DIR/test_gpu.sh" ;;
         scale)       echo "$SCRIPT_DIR/test_scale.sh" ;;
+        connections) echo "$SCRIPT_DIR/test_connections.sh" ;;
         *)           return 1 ;;
     esac
 }

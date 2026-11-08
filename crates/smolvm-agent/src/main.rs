@@ -153,12 +153,20 @@ pub(crate) const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
 /// OpenSearch and some JVM and database workloads refuse to start below
 /// 262144 memory maps (default 65530). A watch or a map costs memory only once
 /// used, and a higher value already set is kept.
+///
+/// The system-wide open-file cap is lifted the way systemd lifts it on a
+/// hosted runner (the kernel's default scales with guest RAM, about 400k at
+/// 4 GiB), and the half-open SYN queue matches `somaxconn`, so a server in
+/// the guest accepting a burst of connections is bounded by its own listen
+/// backlog rather than by a small-RAM default of 256.
 #[cfg(target_os = "linux")]
 fn raise_kernel_limits() {
     for (path, wanted) in [
         ("/proc/sys/fs/inotify/max_user_watches", 655_360u64),
         ("/proc/sys/fs/inotify/max_user_instances", 1_280),
         ("/proc/sys/vm/max_map_count", 262_144),
+        ("/proc/sys/fs/file-max", i64::MAX as u64),
+        ("/proc/sys/net/ipv4/tcp_max_syn_backlog", 4_096),
     ] {
         let current = std::fs::read_to_string(path)
             .ok()

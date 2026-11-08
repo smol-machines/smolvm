@@ -43,6 +43,7 @@ These are not included in the default run. Pass the group name explicitly:
 ./tests/run_tests.sh pack
 ./tests/run_tests.sh pack-quick     # pack tests, skip large image pulls
 ./tests/run_tests.sh gpu            # requires GPU hardware
+./tests/run_tests.sh connections    # 10k concurrent + 100k churned guest connections per backend
 ```
 
 | Group | Suite file | Tests |
@@ -53,6 +54,7 @@ These are not included in the default run. Pass the group name explicitly:
 | `smolfile` | `test_smolfile.sh` | 49 |
 | `pack` / `pack-quick` | `test_pack.sh` | 39 |
 | `gpu` | `test_gpu.sh` | 14 |
+| `connections` | `test_connections.sh` | 4 |
 
 ### Environment variables
 

@@ -1298,22 +1298,10 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
-/// Raise file descriptor limits (required by libkrun).
+/// Raise the open-file limit: the VMM holds one host socket per guest
+/// connection, so this caps how many a guest can have open at once.
 fn raise_fd_limits() {
-    // rlimit is a unix concept; no-op on Windows. The function stays callable
-    // on all platforms so its (unconditional) call sites need no gating.
-    #[cfg(unix)]
-    unsafe {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur = limit.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
+    let _ = crate::process::raise_nofile_limit();
 }
 
 #[cfg(test)]

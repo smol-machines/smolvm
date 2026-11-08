@@ -40,8 +40,10 @@ use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Mutex;
 
-/// Maximum number of accepted published sockets queued for the poll loop.
-pub const DEFAULT_PUBLISH_QUEUE_CAPACITY: usize = 64;
+/// Maximum number of accepted published sockets queued for the poll loop: a
+/// burst of inbound connections waits here rather than being dropped while
+/// the poll loop takes them on.
+pub const DEFAULT_PUBLISH_QUEUE_CAPACITY: usize = 4096;
 
 /// Accepted host TCP connection waiting for the smoltcp poll loop.
 pub struct AcceptedTcpConnection {
