@@ -47,7 +47,7 @@ use crate::api::types::{
     ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
     ResourceSpec, SetCpuLimitRequest, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
 };
-use crate::config::{RecordState, RestartConfig, VmRecord};
+use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
 use crate::process::{
@@ -1632,25 +1632,6 @@ pub struct RestoreCheckpointQuery {
     pub cache_disk: Option<String>,
 }
 
-fn checkpoint_host_ports(
-    captured: &[PortSpec],
-    requested: &[PortSpec],
-) -> Result<Vec<PortSpec>, ApiError> {
-    if requested.is_empty() {
-        return Ok(captured.to_vec());
-    }
-    let mut old_guests: Vec<_> = captured.iter().map(|port| port.guest).collect();
-    let mut new_guests: Vec<_> = requested.iter().map(|port| port.guest).collect();
-    old_guests.sort_unstable();
-    new_guests.sort_unstable();
-    if old_guests != new_guests {
-        return Err(ApiError::BadRequest(
-            "checkpoint port overrides must preserve the captured guest ports".into(),
-        ));
-    }
-    Ok(requested.to_vec())
-}
-
 /// Object-store hosts a checkpoint may be fetched from.
 ///
 /// The node is being handed a URL by its control plane and asked to retrieve it,
@@ -2403,7 +2384,7 @@ pub async fn restore_portable_checkpoint(
 /// Used by `start_machine` to register a machine in ApiState after boot
 /// or during registry repair. Centralizes the record→entry conversion
 /// so the two branches don't drift.
-fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> MachineEntry {
+pub(crate) fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> MachineEntry {
     let mounts = record.host_mounts().iter().map(MountSpec::from).collect();
     let ports = record.port_mappings().iter().map(PortSpec::from).collect();
     MachineEntry {
@@ -2813,113 +2794,24 @@ async fn create_machine_to_end(
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
-    // Split remote volumes (`s3://` sources) from host mounts,
-    // mirroring the CLI's -v handling, then validate the host mount paths.
-    let mut remote_volumes = Vec::new();
-    let mut host_mount_specs: Vec<crate::api::types::MountSpec> = Vec::new();
-    for m in &req.mounts {
-        if crate::remote_volume::is_remote_source(&m.source) {
-            remote_volumes.push(
-                crate::remote_volume::from_parts(&m.source, &m.target, m.readonly)
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
-            );
-        } else {
-            host_mount_specs.push(m.clone());
+    // Fetch a cache disk base this node lacks before any other work, so a bad
+    // base is a 400 and not a half-made machine.
+    let cache_disk = match req.cache_disk.as_ref() {
+        Some(spec) => {
+            fetch_cache_base(&state, spec).await?;
+            Some(state.resolve_cache_disk(spec)?)
         }
-    }
-    let host_mounts: Vec<HostMount> = host_mount_specs
-        .iter()
-        .map(|m| HostMount::try_from(m).map_err(|e| ApiError::BadRequest(e.to_string())))
-        .collect::<Result<_, _>>()?;
-    // Reject duplicate guest targets, matching the CLI (HostMount::parse) so an
-    // ambiguous same-target mount is a clean 400 rather than a silent shadow.
-    HostMount::ensure_unique_targets(&host_mounts)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    {
-        let mut seen = std::collections::HashSet::new();
-        for target in remote_volumes
-            .iter()
-            .map(|v| v.target.as_str())
-            .chain(host_mount_specs.iter().map(|m| m.target.as_str()))
-        {
-            if !seen.insert(target) {
-                return Err(ApiError::BadRequest(format!(
-                    "duplicate mount target: {target} is specified more than once"
-                )));
-            }
-        }
-    }
-    // Disk volumes take the same lone guest paths as the CLI's `-v PATH`, and
-    // must not share a target with a mount.
-    let (not_guest_paths, disk_volumes) =
-        crate::data::storage::split_disk_volume_specs(&req.disk_volumes)
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if let Some(spec) = not_guest_paths.first() {
-        return Err(ApiError::BadRequest(format!(
-            "diskVolumes: {spec} is not an absolute guest path"
-        )));
-    }
-    crate::data::storage::ensure_disk_volumes_distinct(
-        &disk_volumes,
-        remote_volumes
-            .iter()
-            .map(|v| v.target.as_str())
-            .chain(host_mount_specs.iter().map(|m| m.target.as_str())),
-    )
-    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-
-    // Validate published ports, matching the CLI (which rejects these before
-    // launch): port 0 is invalid for forwarding, and each host port may be
-    // mapped only once — two guest ports on one host port can't both bind, so
-    // reject it as a clean 400 rather than an ambiguous mid-boot bind failure.
-    for p in &req.ports {
-        if p.host == 0 || p.guest == 0 {
-            return Err(ApiError::BadRequest(
-                "port 0 is not valid for VM port forwarding".to_string(),
-            ));
-        }
-    }
-    let port_mappings: Vec<PortMapping> = req.ports.iter().map(PortMapping::from).collect();
-    PortMapping::check_duplicates(&port_mappings).map_err(ApiError::BadRequest)?;
-
-    // Validate and normalize egress CIDRs, matching the CLI's --allow-cidr
-    // parser. Without this a malformed entry is silently dropped at launch
-    // (EgressPolicy::new filter_maps unparseable CIDRs, logging only a warn to
-    // the discarded boot log), leaving egress MORE restrictive than requested
-    // with no error. Normalizing (bare IP -> /32) keeps the stored policy
-    // identical to what the CLI persists.
-    let mut normalized_cidrs = match &req.allowed_cidrs {
-        Some(cidrs) => Some(
-            cidrs
-                .iter()
-                .map(|c| crate::smolfile::parse_cidr(c))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ApiError::BadRequest)?,
-        ),
         None => None,
     };
-    smolvm_network::EgressPolicy::unrestricted()
-        .with_rules(&req.egress_rules)
-        .map_err(ApiError::BadRequest)?;
+    let spec = create_spec_from_request(&req, cache_disk)?;
 
     // SHA-256 taken while a restored checkpoint was received, handed to the
     // shared extraction so it does not hash the artifact again.
     let mut received_digest: Option<smolvm_pack::extract::ArtifactDigestProof> = None;
-    // If --from is set, read manifest and extract sidecar
-    let (
-        image,
-        source_smolmachine,
-        entrypoint,
-        cmd,
-        env,
-        workdir,
-        manifest_cpus,
-        manifest_mem,
-        manifest_net,
-        manifest_secret_refs,
-        vm_seed,
-        manifest_checkpoint,
-    ) = if let Some(ref sidecar_path) = req.from {
+    let mut source_smolmachine: Option<String> = None;
+    let mut vm_seed: Option<VmModeSeed> = None;
+    // If `from` is set, verify the artifact and read its manifest.
+    let manifest = if let Some(ref sidecar_path) = req.from {
         let path = std::path::Path::new(sidecar_path);
         if !path.exists() {
             return Err(ApiError::BadRequest(format!(
@@ -2953,11 +2845,6 @@ async fn create_machine_to_end(
         }).await.map_err(|e| ApiError::internal(format!("checkpoint verification task: {e}")))??;
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
-        let checkpoint = manifest.checkpoint.clone();
-        if let Some(ref checkpoint) = checkpoint {
-            crate::portable_checkpoint::validate_compatibility(checkpoint)
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        }
         // Reject a cross-architecture artifact up front (400, not a mid-boot 500):
         // a packed VM/image carries native binaries that cannot run under a
         // different-arch guest kernel. Guest arch must match; host OS need not.
@@ -2965,38 +2852,16 @@ async fn create_machine_to_end(
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         // Extraction happens after the agent manager creates this machine's data
         // dir (below), so the layers land in the machine's own dir, not here.
-        let canonical = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .into_owned();
-        let env_parsed: Vec<(String, String)> = manifest
-            .env
-            .iter()
-            .filter_map(|e| {
-                e.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect();
-        // A .smolmachine is an untrusted, portable artifact: validate its secret
-        // refs Untrusted, which rejects every source kind, so a packed
-        // from_env/from_file can't read this host's env/files at exec time.
-        // Reject rather than carry/exfil.
-        for (key, r) in &manifest.secret_refs {
-            crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::Untrusted).map_err(
-                |e| {
-                    ApiError::BadRequest(format!(
-                        "packed secret '{}': {} (packs may not carry secret refs)",
-                        key, e
-                    ))
-                },
-            )?;
-        }
+        source_smolmachine = Some(
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .to_string_lossy()
+                .into_owned(),
+        );
         // VM-mode packs carry disks, not layers — capture the templates so the
         // machine's overlay/storage disks can be seeded from them below.
-        let vm_seed = if checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm
-        {
-            Some(VmModeSeed {
+        if manifest.checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm {
+            vm_seed = Some(VmModeSeed {
                 overlay_template: manifest
                     .assets
                     .overlay_template
@@ -3011,225 +2876,50 @@ async fn create_machine_to_end(
                 storage_logical_size: manifest.assets.storage_logical_size,
                 storage_gb: req.storage_gb,
                 overlay_gb: req.overlay_gb,
-            })
-        } else {
-            None
-        };
-        // A VM-mode pack is NOT a container/image machine: its `image` is the
-        // synthetic `vm://<name>` label, not a pullable ref. `record.image.is_some()`
-        // is the universal "container machine" signal (exec routing, workload
-        // launch, pull-on-start, re-pack), so storing the vm:// label would make
-        // exec run `crun` over a nonexistent image instead of `vm_exec` in the VM
-        // (the /bin/sh-not-found bug). Store None so every consumer treats it as a
-        // VM; provenance lives in `source_smolmachine`.
-        let image = if let Some(workload) = checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.workload.as_ref())
-        {
-            Some(workload.image.clone())
-        } else if vm_seed.is_some() || checkpoint.is_some() {
-            None
-        } else {
-            Some(manifest.image)
-        };
-        // CLI-parity precedence: a request-supplied workload overrides the
-        // artifact's baked (entrypoint, cmd).
-        let (ep, cmd) = if req.entrypoint.is_empty() && req.cmd.is_empty() {
-            (manifest.entrypoint, manifest.cmd)
-        } else {
-            (req.entrypoint.clone(), req.cmd.clone())
-        };
-        (
-            image,
-            Some(canonical),
-            ep,
-            cmd,
-            env_parsed,
-            manifest.workdir,
-            manifest.cpus,
-            manifest.mem,
-            manifest.network,
-            manifest.secret_refs,
-            vm_seed,
-            checkpoint,
-        )
-    } else {
-        (
-            req.image.clone(),
-            None,
-            req.entrypoint.clone(),
-            req.cmd.clone(),
-            vec![],
-            None,
-            crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
-            crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
-            req.network,
-            Default::default(),
-            None,
-            None,
-        )
-    };
-
-    let checkpoint_network = manifest_checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.network.as_ref());
-    let restored_storage_gb = manifest_checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.storage_gib)
-        .or(req.storage_gb);
-    let restored_overlay_gb = manifest_checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.overlay_gib)
-        .or(req.overlay_gb);
-    // Resolve before any work, so a bad base is a 400 and not a half-made machine.
-    let resolved_cache = match req.cache_disk.as_ref() {
-        Some(spec) => {
-            fetch_cache_base(&state, spec).await?;
-            Some(state.resolve_cache_disk(spec)?)
+            });
         }
-        None => None,
+        Some(manifest)
+    } else {
+        None
     };
+    let manifest_checkpoint = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.checkpoint.clone());
+
+    // Every option against what the source supplies or fixes, by the rules
+    // every creation path uses. Refusals happen here, before any disk work.
+    let source = match manifest.as_ref() {
+        Some(manifest) => crate::machine_spec::SpecSource::from_manifest(manifest),
+        None => crate::machine_spec::SpecSource::from_image(req.image.as_deref()),
+    };
+    let resolved = crate::machine_spec::resolve(source, spec, crate::machine_spec::Caller::Api)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    // A checkpoint can bring nested virtualization with it.
+    state.ensure_nested_virt_allowed(resolved.nested_virt)?;
     // A restored guest resumes with the devices it was captured with: a
     // checkpoint of a machine with a cache disk restores over the same base,
     // and one without takes none.
     let restore_cache_base = match manifest_checkpoint.clone() {
-        Some(checkpoint) => tokio::task::spawn_blocking(move || {
-            crate::portable_checkpoint::resolve_cache_base(&checkpoint, resolved_cache.as_ref())
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        Some(checkpoint) => {
+            let cache_disk = resolved.cache_disk.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::portable_checkpoint::resolve_cache_base(&checkpoint, cache_disk.as_ref())
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?
+        }
         None => None,
     };
-    let captured_ports: Vec<PortSpec> = checkpoint_network
-        .map(|network| {
-            network
-                .ports
-                .iter()
-                .map(|port| PortSpec {
-                    host: port.host,
-                    guest: port.guest,
-                    protocol: Default::default(),
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| req.ports.clone());
-    let restored_ports = if manifest_checkpoint.is_some() {
-        checkpoint_host_ports(&captured_ports, &req.ports)?
-    } else {
-        captured_ports
-    };
-    let restored_network_backend = match manifest_checkpoint.as_ref() {
-        Some(checkpoint) => crate::portable_checkpoint::restored_network_backend(checkpoint)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?,
-        None => req.network_backend,
-    };
-    let restored_allowed_hosts = checkpoint_network
-        .and_then(|network| network.dns_filter_hosts.clone())
-        .or_else(|| req.allowed_hosts.clone());
-    if let Some(network) = checkpoint_network {
-        normalized_cidrs = network.allowed_cidrs.clone();
-    }
-
-    // Use explicit API resources when provided. Otherwise, preserve packed
-    // artifact manifest defaults, or the high VM defaults for non-artifact
-    // machines. Memory is ballooned, so a generous default does not imply
-    // immediate host commitment.
-    let (cpus, mem) = resolve_create_resources(&req, manifest_cpus, manifest_mem);
-    if let Some(ref checkpoint) = manifest_checkpoint {
-        if cpus != checkpoint.cpus || mem != checkpoint.memory_mib {
-            return Err(ApiError::BadRequest(format!(
-                "checkpoint requires {} vCPU(s) and {} MiB memory (requested {cpus} and {mem})",
-                checkpoint.cpus, checkpoint.memory_mib
-            )));
-        }
-        if !host_mount_specs.is_empty()
-            || !remote_volumes.is_empty()
-            || !disk_volumes.is_empty()
-            || req.network
-            || req.gpu
-            || req.cuda
-            || req.auto_graph
-            || req.nested_virt
-            || req.storage_gb.is_some()
-            || req.overlay_gb.is_some()
-            || req.network_backend.is_some()
-            || req.guest_subnet.is_some()
-            || req.docker_socket
-        {
-            return Err(ApiError::BadRequest(
-                "a live checkpoint must restore its captured CPU, memory, disk, and device topology; topology-changing create fields are not supported"
-                    .to_string(),
-            ));
-        }
-    }
-    crate::workload::validate_stop_settings(req.stop_signal.as_deref(), req.stop_timeout_secs)
-        .map_err(ApiError::BadRequest)?;
-    // Reject invalid resources up front (as the CLI does at create time), so the
-    // API returns a clear 400 here instead of persisting an unbootable machine
-    // that only fails with a deferred 500 when it is later started.
-    crate::data::resources::VmResources {
-        cpus,
-        memory_mib: mem,
-        storage_gib: restored_storage_gb,
-        overlay_gib: restored_overlay_gb,
-        ..Default::default()
-    }
-    .validate()
-    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let network = checkpoint_network
-        .map(|network| network.enabled)
-        .unwrap_or(req.network || manifest_net);
+    let image = resolved.image.clone();
+    let restored_storage_gb = resolved.storage_gb;
+    let restored_overlay_gb = resolved.overlay_gb;
 
     if manifest_checkpoint.is_some() {
         crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);
     }
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
-
-    let mut resources = ResourceSpec {
-        cpus: Some(cpus),
-        memory_mb: Some(mem),
-        network: Some(network),
-        gpu: Some(req.gpu),
-        cuda: Some(req.cuda || req.auto_graph),
-        nested_virt: req.nested_virt.then_some(true),
-        storage_gb: restored_storage_gb,
-        overlay_gb: restored_overlay_gb,
-        block_io: req.block_io,
-        disk_durability: req.disk_durability,
-        cache_disk: req.cache_disk.clone(),
-        allowed_cidrs: normalized_cidrs,
-        egress_rules: checkpoint_network.map_or_else(
-            || req.egress_rules.clone(),
-            |network| network.egress_rules.clone(),
-        ),
-        allowed_hosts: restored_allowed_hosts,
-        // A restored checkpoint keeps the bindings its workload was captured
-        // with unless the request names its own.
-        credentials: req
-            .credentials
-            .clone()
-            .or_else(|| checkpoint_network.and_then(|network| network.credential_policy.clone())),
-        network_backend: restored_network_backend,
-        // A restored guest already has its captured address in memory, so the
-        // checkpoint's subnet wins over anything requested.
-        guest_subnet: match manifest_checkpoint.as_ref() {
-            Some(checkpoint) => crate::portable_checkpoint::restored_guest_subnet(checkpoint)
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
-            None => guest_subnet,
-        },
-        disk_volumes,
-    };
-    smolvm_network::EgressPolicy::unrestricted()
-        .with_rules(&resources.egress_rules)
-        .map_err(ApiError::BadRequest)?;
-    crate::network::validate_requested_network_backend(
-        &crate::api::state::resource_spec_to_vm_resources(&resources, network),
-        resources.allowed_hosts.as_deref(),
-        restored_ports.len(),
-    )
-    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
     // A machine without networking has its registry image fetched on the host
     // at start, which repoints it at the fetched archive and seeds from that.
@@ -3240,10 +2930,10 @@ async fn create_machine_to_end(
             crate::data::image_source::ImageSource::Registry(_)
         )
     }) && !crate::network::plan_launch_network_with(
-        &crate::api::state::resource_spec_to_vm_resources(&resources, network),
-        resources.allowed_hosts.as_deref(),
-        restored_ports.len(),
-        resources.credentials.is_some(),
+        &resolved.vm_resources(),
+        resolved.allowed_hosts.as_deref(),
+        resolved.ports.len(),
+        resolved.credentials.is_some(),
     )
     .has_network();
 
@@ -3349,10 +3039,6 @@ async fn create_machine_to_end(
             })
             .await
             .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
-    }
-
-    if let Some(size) = packed_storage_gib {
-        resources.storage_gb = Some(size);
     }
 
     if manifest_checkpoint.is_some() {
@@ -3536,71 +3222,11 @@ async fn create_machine_to_end(
         crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
     }
 
-    // Validate request-body secret refs before persisting. Untrusted
-    // scope rejects every source kind, so any non-empty `secrets` map on
-    // the API surface is refused regardless of server binding — secrets
-    // must be configured locally via the CLI.
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let mut workload_env = merge_request_env(env, &req.env);
-    if req.auto_graph {
-        crate::util::enable_cuda_auto_graph_env(&mut workload_env);
-    }
-
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
         manager,
-        mounts: host_mount_specs,
-        remote_volumes,
-        ports: restored_ports,
-        resources: resources.clone(),
-        restart: if let Some(workload) = manifest_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.workload.as_ref())
-        {
-            RestartConfig {
-                policy: workload
-                    .restart_policy
-                    .parse()
-                    .map_err(ApiError::BadRequest)?,
-                max_retries: workload.restart_max_retries,
-                max_backoff_secs: workload.restart_max_backoff_secs,
-                ..Default::default()
-            }
-        } else {
-            match req.restart {
-                Some(ref spec) => {
-                    let policy = spec
-                        .policy
-                        .as_deref()
-                        .unwrap_or("never")
-                        .parse()
-                        .map_err(|e: String| ApiError::BadRequest(e))?;
-                    RestartConfig {
-                        policy,
-                        max_retries: spec.max_retries.unwrap_or(0),
-                        ..Default::default()
-                    }
-                }
-                None => RestartConfig::default(),
-            }
-        },
-        network,
-        mediated_egress_required: checkpoint_network
-            .is_some_and(|network| network.mediated_egress_required),
-        forkable: manifest_checkpoint.is_some(),
-        init_completed: manifest_checkpoint.is_some(),
-        docker_socket: req.docker_socket,
-        stop_signal: req.stop_signal.clone(),
-        stop_timeout_secs: req.stop_timeout_secs,
-        image: match &restored_host_image {
-            Some(restored) => Some(restored.local.clone()),
-            None => image,
-        },
-        image_origin: restored_host_image
-            .as_ref()
-            .map(|restored| restored.origin.clone()),
-        image_origin_digest: restored_host_image.map(|restored| restored.digest),
+        resolved,
+        host_image: restored_host_image,
         source_registry_ref: if manifest_checkpoint.is_some() {
             restored_pack
                 .as_ref()
@@ -3618,50 +3244,8 @@ async fn create_machine_to_end(
         } else {
             source_smolmachine
         },
-        packed_image_on_storage: packed_storage_gib.is_some(),
-        entrypoint,
-        cmd,
-        env: workload_env,
-        workdir: req.workdir.clone().or(workdir),
-        user: manifest_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.workload.as_ref())
-            .and_then(|workload| workload.user.clone()),
-        fork_overlay_owner: manifest_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.workload.as_ref())
-            .map(|workload| workload.overlay_owner.clone()),
-        host_uid_owner: manifest_checkpoint.as_ref().map(|_| name.clone()),
-        // Record secrets = packed refs from --from (validated Untrusted above)
-        // merged with request refs (validated Untrusted at ~line 333); request
-        // refs win on key collision. Both sources are store-only, so RecordReplay
-        // resolution at exec time stays safe.
-        secret_refs: {
-            let mut s = manifest_secret_refs;
-            s.extend(req.secrets.clone());
-            s
-        },
-        credential_placeholders: match (&req.credentials, checkpoint_network) {
-            (None, Some(network)) => network.credential_placeholders.clone(),
-            _ => Default::default(),
-        },
+        packed_storage_gib,
     });
-    if complete_result.is_ok() {
-        if let Some(id) = manifest_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.lineage.as_ref())
-            .map(|lineage| lineage.id.clone())
-        {
-            // The next capture records this as its parent, which is what lets
-            // it be a delta of the checkpoint this machine was restored from.
-            if let Err(error) = state
-                .update_vm(&name, move |record| record.checkpoint_head = Some(id))
-                .await
-            {
-                tracing::warn!(machine = %name, ?error, "checkpoint head not recorded");
-            }
-        }
-    }
     if let Err(e) = complete_result {
         let data_dir = vm_data_dir(&name);
         smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(
@@ -7805,29 +7389,136 @@ fn registry_reference_tag_or_digest(parsed: &crate::registry::Reference) -> &str
         .unwrap_or("latest")
 }
 
-fn resolve_create_resources(
+/// The machine a create request asks for, as the spec every creation path
+/// resolves ([`crate::machine_spec::resolve`]). Every request field is named,
+/// so a new one does not compile until it reaches the spec or is named as
+/// something else (the source, the name). `cache_disk` is the request's cache
+/// disk, already fetched and resolved on this server.
+pub(crate) fn create_spec_from_request(
     req: &CreateMachineRequest,
-    manifest_cpus: u8,
-    manifest_mem: u32,
-) -> (u8, u32) {
-    (
-        req.cpus.unwrap_or(manifest_cpus),
-        req.mem.unwrap_or(manifest_mem),
-    )
-}
+    cache_disk: Option<crate::data::disk::CacheDisk>,
+) -> Result<crate::machine_spec::CreateSpec, ApiError> {
+    let CreateMachineRequest {
+        // The machine's name, not an option of it.
+        name: _,
+        cpus,
+        mem,
+        mounts,
+        disk_volumes,
+        ports,
+        network,
+        gpu,
+        cuda,
+        nested_virt,
+        auto_graph,
+        entrypoint,
+        cmd,
+        docker_socket,
+        stop_signal,
+        stop_timeout_secs,
+        storage_gb,
+        overlay_gb,
+        block_io,
+        disk_durability,
+        // Resolved by the caller into `cache_disk`.
+        cache_disk: _,
+        allowed_cidrs,
+        egress_rules,
+        allowed_hosts,
+        credentials,
+        network_backend,
+        guest_subnet,
+        restart,
+        // The source, and how to fetch it.
+        image: _,
+        from: _,
+        registry_ref: _,
+        registry_identity_token: _,
+        blob_peers: _,
+        secrets,
+        env,
+        workdir,
+    } = req;
 
-/// Manifest env is the baseline; request env layers on top and wins on name
-/// collision, so a control plane can override a packed default.
-fn merge_request_env(
-    manifest_env: Vec<(String, String)>,
-    request_env: &[crate::api::types::EnvVar],
-) -> Vec<(String, String)> {
-    let mut merged = manifest_env;
-    for (name, value) in crate::api::types::EnvVar::to_tuples(request_env) {
-        merged.retain(|(existing, _)| existing != &name);
-        merged.push((name, value));
+    // Remote volumes (`s3://` sources) apart from host mounts, mirroring the
+    // CLI's -v handling; host mount paths are validated here.
+    let mut remote_volumes = Vec::new();
+    let mut host_mounts = Vec::new();
+    for mount in mounts {
+        if crate::remote_volume::is_remote_source(&mount.source) {
+            remote_volumes.push(
+                crate::remote_volume::from_parts(&mount.source, &mount.target, mount.readonly)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+            );
+        } else {
+            host_mounts
+                .push(HostMount::try_from(mount).map_err(|e| ApiError::BadRequest(e.to_string()))?);
+        }
     }
-    merged
+    // Disk volumes take the same lone guest paths as the CLI's `-v PATH`.
+    let (not_guest_paths, disk_volumes) =
+        crate::data::storage::split_disk_volume_specs(disk_volumes)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if let Some(spec) = not_guest_paths.first() {
+        return Err(ApiError::BadRequest(format!(
+            "diskVolumes: {spec} is not an absolute guest path"
+        )));
+    }
+    // Untrusted scope rejects every source kind, so any non-empty `secrets`
+    // map on the API surface is refused; secrets are configured locally.
+    crate::api::handlers::validate_request_secrets(secrets)?;
+    crate::api::handlers::validate_request_env(env)?;
+    let mut env = crate::api::types::EnvVar::to_tuples(env);
+    if *auto_graph {
+        crate::util::enable_cuda_auto_graph_env(&mut env);
+    }
+    // A request workload replaces the source's entrypoint and command together.
+    let (entrypoint, cmd) = if entrypoint.is_empty() && cmd.is_empty() {
+        (None, None)
+    } else {
+        (Some(entrypoint.clone()), Some(cmd.clone()))
+    };
+    let restart_policy = restart
+        .as_ref()
+        .map(|spec| spec.policy.as_deref().unwrap_or("never").parse())
+        .transpose()
+        .map_err(|e: String| ApiError::BadRequest(e))?;
+    Ok(crate::machine_spec::CreateSpec {
+        entrypoint,
+        cmd,
+        env,
+        workdir: workdir.clone(),
+        secret_refs: secrets.clone(),
+        restart_policy,
+        restart_max_retries: restart.as_ref().map(|spec| spec.max_retries.unwrap_or(0)),
+        stop_signal: stop_signal.clone(),
+        stop_timeout_secs: *stop_timeout_secs,
+        cpus: *cpus,
+        mem: *mem,
+        storage_gb: *storage_gb,
+        overlay_gb: *overlay_gb,
+        block_io: *block_io,
+        disk_durability: *disk_durability,
+        cache_disk,
+        mounts: host_mounts,
+        remote_volumes,
+        disk_volumes,
+        net: *network,
+        network_backend: *network_backend,
+        guest_subnet: guest_subnet.clone(),
+        ports: ports.iter().map(PortMapping::from).collect(),
+        allowed_cidrs: allowed_cidrs.clone(),
+        allowed_hosts: allowed_hosts.clone(),
+        egress_rules: egress_rules.clone(),
+        credentials: credentials.clone(),
+        // Values arrive over the API, never from this server's environment.
+        credentials_supplied_only: true,
+        gpu: *gpu,
+        nested_virt: *nested_virt,
+        cuda: *cuda || *auto_graph,
+        docker_socket: *docker_socket,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -8034,52 +7725,6 @@ mod tests {
             .unwrap();
             assert_eq!(cached["image"], image);
         }
-    }
-
-    #[test]
-    fn checkpoint_ports_allow_host_rebinding_but_preserve_guest_topology() {
-        let captured = vec![
-            PortSpec {
-                host: 30001,
-                guest: 8080,
-                protocol: Default::default(),
-            },
-            PortSpec {
-                host: 30002,
-                guest: 3000,
-                protocol: Default::default(),
-            },
-        ];
-        let requested = vec![
-            PortSpec {
-                host: 31002,
-                guest: 3000,
-                protocol: Default::default(),
-            },
-            PortSpec {
-                host: 31001,
-                guest: 8080,
-                protocol: Default::default(),
-            },
-        ];
-        let ports = checkpoint_host_ports(&captured, &requested).unwrap();
-        assert_eq!(ports[0].host, 31002);
-        assert_eq!(ports[1].host, 31001);
-        assert_eq!(
-            checkpoint_host_ports(&captured, &[]).unwrap()[0].host,
-            30001
-        );
-        assert!(checkpoint_host_ports(&captured, &requested[..1]).is_err());
-        assert!(checkpoint_host_ports(
-            &captured,
-            &[PortSpec {
-                host: 31001,
-                guest: 9090,
-                protocol: Default::default(),
-            }]
-        )
-        .is_err());
-        assert!(checkpoint_host_ports(&[], &requested).is_err());
     }
 
     #[tokio::test]
@@ -8625,76 +8270,6 @@ mod tests {
         assert_eq!(registry_reference_tag_or_digest(&latest_ref), "latest");
     }
 
-    fn minimal_create_request() -> CreateMachineRequest {
-        CreateMachineRequest {
-            credentials: None,
-            name: Some("test-vm".to_string()),
-            cpus: None,
-            mem: None,
-            mounts: vec![],
-            disk_volumes: Vec::new(),
-            ports: vec![],
-            network: false,
-            gpu: false,
-            cuda: false,
-            nested_virt: false,
-            auto_graph: false,
-            entrypoint: vec![],
-            cmd: vec![],
-            docker_socket: false,
-            stop_signal: None,
-            stop_timeout_secs: None,
-            storage_gb: None,
-            overlay_gb: None,
-            block_io: None,
-            disk_durability: None,
-            cache_disk: None,
-            allowed_cidrs: None,
-            egress_rules: Vec::new(),
-            allowed_hosts: None,
-            network_backend: None,
-            guest_subnet: None,
-            restart: None,
-            image: None,
-            from: None,
-            registry_ref: None,
-            registry_identity_token: None,
-            blob_peers: vec![],
-            secrets: Default::default(),
-            env: vec![],
-            workdir: None,
-        }
-    }
-
-    #[test]
-    fn request_env_layers_over_manifest_env_and_wins_collisions() {
-        let manifest_env = vec![
-            ("KEEP".to_string(), "manifest".to_string()),
-            ("OVERRIDE".to_string(), "manifest".to_string()),
-        ];
-        let request_env = vec![
-            crate::api::types::EnvVar {
-                name: "OVERRIDE".to_string(),
-                value: "request".to_string(),
-            },
-            crate::api::types::EnvVar {
-                name: "NEW".to_string(),
-                value: "request".to_string(),
-            },
-        ];
-
-        let merged = merge_request_env(manifest_env, &request_env);
-
-        assert_eq!(
-            merged,
-            vec![
-                ("KEEP".to_string(), "manifest".to_string()),
-                ("OVERRIDE".to_string(), "request".to_string()),
-                ("NEW".to_string(), "request".to_string()),
-            ]
-        );
-    }
-
     #[test]
     fn create_request_accepts_disk_volumes() {
         let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
@@ -8739,21 +8314,18 @@ mod tests {
 
     #[test]
     fn auto_graph_policy_overrides_conflicting_request_env() {
-        let mut env = merge_request_env(
-            vec![(
-                crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
-                "0".to_string(),
-            )],
-            &[crate::api::types::EnvVar {
-                name: crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(),
-                value: "0".to_string(),
-            }],
-        );
-
-        crate::util::enable_cuda_auto_graph_env(&mut env);
-
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "autoGraph": true,
+            "env": [
+                {"name": crate::util::CUDA_AUTO_GRAPH_ENV, "value": "0"},
+                {"name": crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV, "value": "0"}
+            ]
+        }))
+        .unwrap();
+        let spec = create_spec_from_request(&req, None).unwrap();
+        assert!(spec.cuda, "autoGraph implies CUDA");
         assert_eq!(
-            env,
+            spec.env,
             vec![
                 (
                     crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
@@ -8766,40 +8338,6 @@ mod tests {
             ]
         );
     }
-
-    #[test]
-    fn create_resources_use_high_defaults_when_omitted() {
-        let req = minimal_create_request();
-
-        assert_eq!(
-            resolve_create_resources(
-                &req,
-                crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
-                crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
-            ),
-            (
-                crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
-                crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
-            )
-        );
-    }
-
-    #[test]
-    fn create_resources_preserve_manifest_defaults_when_omitted() {
-        let req = minimal_create_request();
-
-        assert_eq!(resolve_create_resources(&req, 6, 12_288), (6, 12_288));
-    }
-
-    #[test]
-    fn create_resources_explicit_api_values_override_manifest_defaults() {
-        let mut req = minimal_create_request();
-        req.cpus = Some(2);
-        req.mem = Some(2048);
-
-        assert_eq!(resolve_create_resources(&req, 6, 12_288), (2, 2048));
-    }
-
     #[test]
     fn create_request_deserialization_keeps_resource_omission_distinct() {
         let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({

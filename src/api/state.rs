@@ -209,62 +209,19 @@ pub struct MachineEntry {
 pub struct MachineRegistration {
     /// The agent manager for this machine.
     pub manager: AgentManager,
-    /// Host mounts to configure.
-    pub mounts: Vec<MountSpec>,
-    /// Remote volumes (`s3://`) to mount in the workload.
-    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
-    /// Port mappings to configure.
-    pub ports: Vec<PortSpec>,
-    /// VM resources to configure.
-    pub resources: ResourceSpec,
-    /// Restart configuration.
-    pub restart: RestartConfig,
-    /// Whether outbound network access is enabled.
-    pub network: bool,
-    /// A restored checkpoint cannot start until its host mediator is rebound.
-    pub mediated_egress_required: bool,
-    /// Whether ordinary starts should preserve file-backed, forkable RAM.
-    pub forkable: bool,
-    /// Whether image pull and init were already completed in captured state.
-    pub init_completed: bool,
-    /// Whether to expose the guest Docker daemon socket to the host.
-    pub docker_socket: bool,
-    /// Signal the workload is sent when the machine stops.
-    pub stop_signal: Option<String>,
-    /// Seconds the workload gets to exit after its stop signal.
-    pub stop_timeout_secs: Option<u64>,
-    /// OCI image reference (e.g., "alpine:latest").
-    pub image: Option<String>,
-    /// Path to .smolmachine sidecar this machine was created from.
+    /// Every setting of the machine, resolved by the rules every creation
+    /// path uses.
+    pub resolved: crate::machine_spec::ResolvedSpec,
+    /// The registry image the host fetched for a restored checkpoint, served
+    /// the way the captured guest read it.
+    pub host_image: Option<crate::portable_checkpoint::RestoredHostImage>,
+    /// Path to .smolmachine sidecar this machine mounts its layers from.
     pub source_smolmachine: Option<String>,
     /// Registry reference that sidecar was pulled from, if any.
     pub source_registry_ref: Option<String>,
-    /// The packed image was prepared on the machine's storage disk.
-    pub packed_image_on_storage: bool,
-    /// Registry reference a host-fetched `image` came from, if any.
-    pub image_origin: Option<String>,
-    /// Manifest digest of that host-fetched image.
-    pub image_origin_digest: Option<String>,
-    /// Container entrypoint (from manifest).
-    pub entrypoint: Vec<String>,
-    /// Container cmd (from manifest).
-    pub cmd: Vec<String>,
-    /// Environment variables (from manifest).
-    pub env: Vec<(String, String)>,
-    /// Working directory (from manifest).
-    pub workdir: Option<String>,
-    /// Container user captured with a live image workload.
-    pub user: Option<String>,
-    /// Persistent overlay identifier inherited by a restored image workload.
-    pub fork_overlay_owner: Option<String>,
-    /// Local UID lineage established by a portable restore.
-    pub host_uid_owner: Option<String>,
-    /// Secret refs to attach to this machine (from a Smolfile or
-    /// `CreateMachineRequest.secrets`).
-    pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
-    /// Placeholders a restored checkpoint's workload already holds for its
-    /// credential bindings. Empty mints fresh ones.
-    pub credential_placeholders: std::collections::BTreeMap<String, String>,
+    /// Size in GiB of the storage disk the packed image was prepared on, when
+    /// it was.
+    pub packed_storage_gib: Option<u64>,
 }
 
 /// RAII guard for machine name reservation.
@@ -1234,88 +1191,19 @@ impl ApiState {
         reg: MachineRegistration,
     ) -> Result<(), ApiError> {
         // Persist to database (with conflict detection)
-        let host_mounts = reg
-            .mounts
-            .iter()
-            .map(HostMount::try_from)
-            .collect::<Result<Vec<_>, _>>()
+        let mut record = reg
+            .resolved
+            .to_record(&name)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        let (mounts, staged_mounts) = HostMount::split_storage_tuples(&host_mounts);
-        let mut record = VmRecord::new_with_restart(
-            name.clone(),
-            reg.resources.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
-            reg.resources
-                .memory_mb
-                .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
-            mounts,
-            Vec::new(),
-            reg.network,
-            reg.restart.clone(),
-        );
-        record.set_port_mappings(&reg.ports.iter().map(PortMapping::from).collect::<Vec<_>>());
-        record.staged_mounts = staged_mounts;
-        record.storage_gb = reg.resources.storage_gb;
-        record.overlay_gb = reg.resources.overlay_gb;
-        record.block_io = reg.resources.block_io.unwrap_or_default();
-        record.disk_durability = reg.resources.disk_durability.unwrap_or_default();
-        record.cache_disk = reg
-            .resources
-            .cache_disk
-            .as_ref()
-            .map(|spec| self.resolve_cache_disk(spec))
-            .transpose()?;
-        // Persist egress policy + backend selection from the request (previously
-        // dropped here, so API-created machines silently lost both).
-        record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
-        record.egress_rules = reg.resources.egress_rules.clone();
-        record.mediated_egress_required = reg.mediated_egress_required;
-        record.external_interceptor_required = reg.mediated_egress_required;
-        record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
-        if let Some(policy) = reg.resources.credentials.clone().filter(|p| !p.is_empty()) {
-            record.credential_placeholders = if reg.credential_placeholders.is_empty() {
-                crate::credentials::prepare_policy(&policy, reg.resources.allowed_hosts.as_deref())?
-            } else {
-                policy
-                    .validate(reg.resources.allowed_hosts.as_deref())
-                    .map_err(|e| ApiError::BadRequest(format!("credentials: {e}")))?;
-                reg.credential_placeholders.clone()
-            };
-            record.credential_policy = Some(policy);
-            // Bindings from an API caller are never resolved from this host's
-            // environment; their values arrive over the API.
-            record.credentials_supplied_by_api = true;
+        record.source_smolmachine = reg.source_smolmachine;
+        record.source_registry_ref = reg.source_registry_ref;
+        if let Some(size) = reg.packed_storage_gib {
+            record.packed_image_on_storage = true;
+            record.storage_gb = Some(size);
         }
-        record.network_backend = reg.resources.network_backend;
-        record.guest_subnet = reg.resources.guest_subnet.clone();
-        record.disk_volumes = reg.resources.disk_volumes.clone();
-        // GPU flags (previously dropped here, so API-created machines
-        // silently lost CUDA/GPU on restart).
-        record.gpu = reg.resources.gpu;
-        record.cuda = reg.resources.cuda.unwrap_or(false);
-        record.nested_virt = reg.resources.nested_virt.filter(|on| *on);
-        record.forkable = reg.forkable;
-        record.init_completed = reg.init_completed;
-        record.docker_socket = reg.docker_socket;
-        record.stop_signal = reg.stop_signal;
-        record.stop_timeout_secs = reg.stop_timeout_secs;
-        record.image = reg.image;
-        record.source_smolmachine = reg.source_smolmachine.clone();
-        record.packed_image_on_storage = reg.packed_image_on_storage;
-        record.source_registry_ref = reg.source_registry_ref.clone();
-        record.image_origin = reg.image_origin;
-        record.image_origin_digest = reg.image_origin_digest;
-        record.entrypoint = reg.entrypoint;
-        record.cmd = reg.cmd;
-        record.env = reg.env;
-        record.workdir = reg.workdir;
-        record.user = reg.user;
-        record.fork_overlay_owner = reg.fork_overlay_owner;
-        record.host_uid_owner = reg.host_uid_owner;
-        record.secret_refs = reg.secret_refs.clone();
-        record.remote_volumes = reg.remote_volumes.clone();
-        record
-            .validate_remote_volumes()
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if let Some(image) = reg.host_image {
+            image.apply(&mut record);
+        }
 
         // Complete the cross-process create reservation and insert the VM row
         // atomically. Only after that succeeds do we publish the in-memory entry.
@@ -1332,28 +1220,12 @@ impl ApiState {
                 let mut machines = self.machines.write();
                 machines.insert(
                     name,
-                    Arc::new(parking_lot::Mutex::new(MachineEntry {
-                        cache_disk: record.cache_disk.clone(),
-                        image: record.image.clone(),
-                        credentials: crate::credentials::CredentialLaunch::for_record(
-                            &record.name,
+                    Arc::new(parking_lot::Mutex::new(
+                        crate::api::handlers::machines::machine_entry_from_record(
                             &record,
+                            reg.manager,
                         ),
-                        external_interceptor: None,
-                        manager: reg.manager,
-                        mounts: reg.mounts,
-                        ports: reg.ports,
-                        resources: reg.resources,
-                        restart: reg.restart,
-                        network: reg.network,
-                        secret_refs: reg.secret_refs,
-                        source_smolmachine: record.packed_layer_source().map(str::to_owned),
-                        packed_image_on_storage: record.packed_image_on_storage,
-                        forkable: reg.forkable,
-                        cuda_fork_pool_size: None,
-                        cuda_vram_limit_mib: None,
-                        forkpoint_held: false,
-                    })),
+                    )),
                 );
                 Ok(())
             }

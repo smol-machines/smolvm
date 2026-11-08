@@ -336,7 +336,114 @@ test_create_from_smolmachine_keeps_secrets_and_workdir() {
     return 0
 }
 
+# A Smolfile, labels and resource flags apply to a pack the way they do to an
+# image: one set of rules for every creation path.
+test_create_from_smolmachine_takes_a_smolfile_and_flags() {
+    local vm_name="from-sm-smolfile-$$"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/smolfile-pack"
+    $SMOLVM pack create --image alpine:latest -o "$pack_output" --cpus 1 --mem 512 2>&1 || {
+        echo "SKIP: pack create failed"
+        rm -rf "$tmpdir"; return 0
+    }
+    cat > "$tmpdir/Smolfile" <<'SMOLFILE'
+env = ["FROM_SMOLFILE=yes"]
+[restart]
+policy = "on-failure"
+SMOLFILE
+    $SMOLVM machine create --name "$vm_name" --from "$pack_output.smolmachine" \
+        -s "$tmpdir/Smolfile" --label suite=packed --cpus 2 --mem 768 -- sleep infinity 2>&1 || {
+        rm -rf "$tmpdir"; return 1
+    }
+    local listed
+    listed=$($SMOLVM machine ls --json)
+    local recorded
+    recorded=$(python3 -c '
+import json, sys
+m = next(m for m in json.loads(sys.argv[1]) if m["name"] == sys.argv[2])
+print(m["cpus"], m["memory_mib"], m["labels"].get("suite"), m["restart_policy"])
+' "$listed" "$vm_name")
+    [[ "$recorded" == "2 768 packed on-failure" ]] || {
+        echo "FAIL: packed machine recorded: $recorded"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        echo "FAIL: start failed"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    local seen
+    seen=$($SMOLVM machine exec --name "$vm_name" -- sh -c 'echo "$FROM_SMOLFILE"' 2>&1 | tail -1)
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
+    rm -rf "$tmpdir"
+    [[ "$seen" == "yes" ]] || { echo "FAIL: Smolfile env not seen: $seen"; return 1; }
+    return 0
+}
+
+# A checkpoint records --block-private, so its restore keeps it, and a restore
+# that asks for what the checkpoint fixes is refused by name.
+test_checkpoint_keeps_block_private_and_refuses_topology() {
+    local src="ckpt-src-$$"
+    local restored="ckpt-restored-$$"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/ckpt-pack"
+    $SMOLVM pack create --image alpine:latest -o "$pack_output" --cpus 1 --mem 512 2>&1 || {
+        echo "SKIP: pack create failed"
+        rm -rf "$tmpdir"; return 0
+    }
+    $SMOLVM machine create --name "$src" --from "$pack_output.smolmachine" \
+        --block-private --allow-private 10.99.0.0/16 -- sleep infinity 2>&1 || {
+        rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine start --name "$src" --branchable 2>&1 || {
+        echo "FAIL: start failed"
+        $SMOLVM machine delete --name "$src" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine checkpoint --name "$src" --output "$tmpdir/src.smolcheckpoint" 2>&1 || {
+        echo "FAIL: checkpoint failed"
+        $SMOLVM machine delete --name "$src" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine delete --name "$src" -f 2>/dev/null
+    local refused
+    if refused=$($SMOLVM machine create --name "$restored" --from "$tmpdir/src.smolcheckpoint" --cpus 3 2>&1); then
+        echo "FAIL: a restore with --cpus 3 was accepted"
+        $SMOLVM machine delete --name "$restored" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    fi
+    [[ "$refused" == *"cpus cannot be set when restoring a live checkpoint"* ]] || {
+        echo "FAIL: refusal does not name cpus: $refused"
+        rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine create --name "$restored" --from "$tmpdir/src.smolcheckpoint" 2>&1 || {
+        rm -rf "$tmpdir"; return 1
+    }
+    local listed block
+    listed=$($SMOLVM machine ls --json)
+    block=$(python3 -c '
+import json, sys
+m = next(m for m in json.loads(sys.argv[1]) if m["name"] == sys.argv[2])
+print(m.get("block_private"))
+' "$listed" "$restored")
+    [[ "$block" == "['10.99.0.0/16']" ]] || {
+        echo "FAIL: restored machine lost --block-private: $block"
+        $SMOLVM machine delete --name "$restored" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine start --name "$restored" 2>&1 || {
+        echo "FAIL: restored start failed"
+        $SMOLVM machine delete --name "$restored" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine exec --name "$restored" -- true 2>&1 || {
+        echo "FAIL: restored machine does not run commands"
+        $SMOLVM machine delete --name "$restored" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine delete --name "$restored" -f 2>/dev/null
+    rm -rf "$tmpdir"
+    return 0
+}
+
 run_test "Create from .smolmachine" test_create_from_smolmachine || true
+run_test "Create from .smolmachine takes a Smolfile, labels and resource flags" test_create_from_smolmachine_takes_a_smolfile_and_flags || true
+run_test "Checkpoint keeps --block-private and refuses topology changes by name" test_checkpoint_keeps_block_private_and_refuses_topology || true
 run_test "Create from .smolmachine keeps --secret-file and --workdir" test_create_from_smolmachine_keeps_secrets_and_workdir || true
 run_test "Packed: a pack from a machine leaves /tmp behind and keeps /root" test_pack_from_vm_leaves_tmp_behind || true
 run_test "File cp preserves state on packed VM" test_cp_preserves_state_on_packed_vm || true

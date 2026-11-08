@@ -204,6 +204,22 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Create a persisted machine from `spec`: an image machine from `image`,
+    /// or a bare VM without one. Every option in `spec` is applied, or refused
+    /// by name, by the rules every creation path uses
+    /// ([`crate::machine_spec`]); [`Self::create_machine_from_pack_with`] takes
+    /// the same spec for a `.smolmachine`.
+    pub fn create_machine_with_spec(
+        &self,
+        name: &str,
+        image: Option<&str>,
+        spec: &crate::machine_spec::CreateSpec,
+    ) -> Result<()> {
+        self.with_name_lock(name, || {
+            control::create_vm_from_spec(&self.db, name, image, spec.clone())
+        })
+    }
+
     /// Capture a running checkpointable machine into a portable artifact.
     ///
     /// The source resumes as soon as its consistent RAM/disk boundary is
@@ -481,14 +497,32 @@ impl EmbeddedRuntime {
         artifact: &std::path::Path,
         options: RestoreOptions,
     ) -> Result<()> {
+        self.restore_checkpoint_machine_with_spec(
+            name,
+            artifact,
+            options,
+            &crate::machine_spec::CreateSpec::default(),
+        )
+    }
+
+    /// [`Self::restore_checkpoint_machine_with`] with options for the restored
+    /// machine, resolved against what the checkpoint fixes by the rules every
+    /// creation path uses ([`crate::machine_spec`]). An option a live restore
+    /// cannot apply (a device, a resource size, the workload command) is
+    /// refused by name; host-side settings such as the egress policy, labels
+    /// or the stop signal replace the captured ones.
+    pub fn restore_checkpoint_machine_with_spec(
+        &self,
+        name: &str,
+        artifact: &std::path::Path,
+        options: RestoreOptions,
+        spec: &crate::machine_spec::CreateSpec,
+    ) -> Result<()> {
+        let RestoreOptions { keep_identity } = options;
+        let mut spec = spec.clone();
+        spec.keep_identity |= keep_identity;
         self.with_name_lock(name, || {
-            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)?;
-            if options.keep_identity {
-                self.db
-                    .update_vm(name, |record| record.keep_identity = true)?
-                    .ok_or_else(|| Error::vm_not_found(name))?;
-            }
-            Ok(())
+            crate::portable_checkpoint::restore_from_path_with(&self.db, name, artifact, None, spec)
         })
     }
 
@@ -500,8 +534,29 @@ impl EmbeddedRuntime {
         name: &str,
         artifact: &std::path::Path,
     ) -> Result<()> {
+        self.restore_checkpoint_machine_detached_with_spec(
+            name,
+            artifact,
+            &crate::machine_spec::CreateSpec::default(),
+        )
+    }
+
+    /// [`Self::restore_checkpoint_machine_detached`] with options for the
+    /// restored machine, as [`Self::restore_checkpoint_machine_with_spec`].
+    pub fn restore_checkpoint_machine_detached_with_spec(
+        &self,
+        name: &str,
+        artifact: &std::path::Path,
+        spec: &crate::machine_spec::CreateSpec,
+    ) -> Result<()> {
         self.with_name_lock(name, || {
-            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)?;
+            crate::portable_checkpoint::restore_from_path_with(
+                &self.db,
+                name,
+                artifact,
+                None,
+                spec.clone(),
+            )?;
             let start = (|| -> Result<VmHandle> {
                 let started = control::start_vm(&self.db, name)?;
                 let mut handle = started.handle;
@@ -1598,15 +1653,36 @@ impl EmbeddedRuntime {
     /// `smolvm machine create --from` does. Start it with
     /// [`Self::start_machine`].
     pub fn create_machine_from_pack(&self, name: &str, pack: &std::path::Path) -> Result<()> {
+        self.create_machine_from_pack_with(name, pack, &crate::machine_spec::CreateSpec::default())
+    }
+
+    /// [`Self::create_machine_from_pack`] with options for the machine. The
+    /// pack supplies defaults (resources, command, environment, ...) and
+    /// `spec` overrides them by the rules every creation path uses
+    /// ([`crate::machine_spec`]); a pack that is a live checkpoint fixes its
+    /// topology, and an option asking to change it is refused by name. A
+    /// branchable spec (`forkable`) starts the machine branchable every time.
+    pub fn create_machine_from_pack_with(
+        &self,
+        name: &str,
+        pack: &std::path::Path,
+        spec: &crate::machine_spec::CreateSpec,
+    ) -> Result<()> {
+        let spec = serde_json::to_vec(spec)
+            .map_err(|e| Error::config("create from pack", e.to_string()))?;
         self.with_name_lock(name, || {
-            run_bundled_cli(&[
-                "machine".as_ref(),
-                "create".as_ref(),
-                "--name".as_ref(),
-                name.as_ref(),
-                "--from".as_ref(),
-                pack.as_os_str(),
-            ])
+            run_bundled_cli_with_stdin(
+                &[
+                    "machine".as_ref(),
+                    "create".as_ref(),
+                    "--name".as_ref(),
+                    name.as_ref(),
+                    "--from".as_ref(),
+                    pack.as_os_str(),
+                    "--spec-stdin".as_ref(),
+                ],
+                &spec,
+            )
         })
     }
 
@@ -1742,6 +1818,11 @@ fn lock_name(lock: &Arc<Mutex<()>>) -> Result<MutexGuard<'_, ()>> {
 /// [`crate::embedded::bundle::boot_binary`]) with `args`, for the operations
 /// that live in the CLI. Fails, with the CLI's own message, when it does.
 fn run_bundled_cli(args: &[&std::ffi::OsStr]) -> Result<()> {
+    run_bundled_cli_with_stdin(args, &[])
+}
+
+/// Run the bundled CLI with `input` on its stdin (none when empty).
+fn run_bundled_cli_with_stdin(args: &[&std::ffi::OsStr], input: &[u8]) -> Result<()> {
     let exe = super::bundle::boot_binary().ok_or_else(|| {
         Error::config(
             "smolvm binary",
@@ -1749,12 +1830,28 @@ fn run_bundled_cli(args: &[&std::ffi::OsStr]) -> Result<()> {
         )
     })?;
     let mut command = std::process::Command::new(&exe);
-    command.args(args).stdin(std::process::Stdio::null());
+    command
+        .args(args)
+        .stdin(if input.is_empty() {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::piped()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     if let Some(lib_dir) = super::bundle::lib_dir() {
         command.env(crate::data::consts::ENV_SMOLVM_LIB_DIR, lib_dir);
     }
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
+        .map_err(|e| Error::agent("run smolvm", format!("{}: {e}", exe.display())))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        // A CLI that exits before reading reports why on stderr below.
+        let _ = stdin.write_all(input);
+    }
+    let output = child
+        .wait_with_output()
         .map_err(|e| Error::agent("run smolvm", format!("{}: {e}", exe.display())))?;
     if output.status.success() {
         return Ok(());
@@ -2076,7 +2173,7 @@ mod tests {
     #[test]
     fn reconnect_never_restarts_a_frozen_fork_base() {
         let db = test_db();
-        let mut record = test_spec("frozen-checkpoint", true).to_record();
+        let mut record = test_spec("frozen-checkpoint", true).to_record().unwrap();
         record.state = crate::config::RecordState::Frozen;
         db.insert_vm_if_not_exists("frozen-checkpoint", &record)
             .unwrap();
@@ -2112,7 +2209,7 @@ mod tests {
     #[test]
     fn a_clone_targets_its_golden_overlay() {
         let runtime = EmbeddedRuntime::with_db(test_db());
-        let mut record = test_spec("runtime-clone", true).to_record();
+        let mut record = test_spec("runtime-clone", true).to_record().unwrap();
         record.image = Some("example/image:latest".to_string());
         record.golden = Some("runtime-golden".to_string());
         runtime.db.insert_vm("runtime-clone", &record).unwrap();
@@ -2175,7 +2272,9 @@ mod tests {
     fn delete_already_stopped_staged_machine_does_not_reconnect() {
         let db = test_db();
         let runtime = EmbeddedRuntime::with_db(db.clone());
-        let mut record = test_spec("delete-stopped-staged", true).to_record();
+        let mut record = test_spec("delete-stopped-staged", true)
+            .to_record()
+            .unwrap();
         record.state = crate::config::RecordState::Stopped;
         record.staged_mounts = vec![(0, "/host/work".into(), "/work".into())];
         db.insert_vm("delete-stopped-staged", &record).unwrap();
@@ -2191,7 +2290,7 @@ mod tests {
         runtime
             .create_machine(test_spec("delete-parent", true))
             .unwrap();
-        let mut child = test_spec("delete-child", true).to_record();
+        let mut child = test_spec("delete-child", true).to_record().unwrap();
         child.golden = Some("delete-parent".to_string());
         db.insert_vm("delete-child", &child).unwrap();
 
@@ -2208,7 +2307,7 @@ mod tests {
         runtime
             .create_machine(test_spec("stop-parent", true))
             .unwrap();
-        let mut child = test_spec("stop-child", true).to_record();
+        let mut child = test_spec("stop-child", true).to_record().unwrap();
         child.golden = Some("stop-parent".to_string());
         db.insert_vm("stop-child", &child).unwrap();
 
@@ -2222,7 +2321,7 @@ mod tests {
     fn delete_machine_reaps_a_frozen_checkpoint_without_guest_shutdown() {
         let db = test_db();
         let runtime = EmbeddedRuntime::with_db(db.clone());
-        let mut record = test_spec("delete-frozen", true).to_record();
+        let mut record = test_spec("delete-frozen", true).to_record().unwrap();
         record.state = crate::config::RecordState::Frozen;
         db.insert_vm("delete-frozen", &record).unwrap();
 
