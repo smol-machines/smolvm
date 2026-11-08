@@ -68,6 +68,15 @@ pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// How long a waiting read lingers after output arrives, for more or the exit.
 const OUTPUT_LINGER: Duration = Duration::from_millis(20);
 
+/// A waiting reader that comes back sooner than this for less than
+/// [`PACE_BATCH`] bytes is held until this much time has passed since its last
+/// read: a chatty command is then read in at most ten answers a second, in
+/// larger pieces, instead of one per round trip.
+const PACE: Duration = Duration::from_millis(100);
+
+/// Output enough to answer a paced reader at once.
+const PACE_BATCH: u64 = 256 * 1024;
+
 /// Most sessions one node holds, running or not yet collected.
 pub const MAX_SESSIONS: usize = 4096;
 
@@ -244,6 +253,8 @@ struct Inner {
     last_access: Instant,
     /// Readers attached over a WebSocket right now.
     attached: usize,
+    /// When a reader last read (paces readers that come straight back).
+    last_read: Option<Instant>,
     exit: Option<Exit>,
     exited_at: Option<Instant>,
     /// When a reader was handed the exit.
@@ -311,6 +322,7 @@ impl ExecSession {
                 acked: 0,
                 last_access: Instant::now(),
                 attached: 0,
+                last_read: None,
                 exit: None,
                 exited_at: None,
                 collected_at: None,
@@ -466,6 +478,9 @@ impl ExecSession {
             return Err(inner.end);
         }
         inner.last_access = Instant::now();
+        if ack {
+            inner.last_read = Some(Instant::now());
+        }
         let mut pos = after;
         let mut lost = None;
         if pos < inner.floor {
@@ -547,6 +562,34 @@ impl ExecSession {
                 Ok(Ok(()))
             ) {
                 break;
+            }
+        }
+    }
+
+    /// Hold a reader that came straight back for a little output (see
+    /// [`PACE`]) until the pace allows, more output is waiting, or the
+    /// command ended.
+    pub async fn pace(&self, after: u64) {
+        let deadline = {
+            let inner = self.inner.lock();
+            match inner.last_read {
+                Some(t) if t.elapsed() < PACE => tokio::time::Instant::now() + (PACE - t.elapsed()),
+                _ => return,
+            }
+        };
+        let mut rx = self.changed.subscribe();
+        loop {
+            {
+                let inner = self.inner.lock();
+                if inner.exit.is_some() || inner.end.saturating_sub(after) >= PACE_BATCH {
+                    return;
+                }
+            }
+            if !matches!(
+                tokio::time::timeout_at(deadline, rx.changed()).await,
+                Ok(Ok(()))
+            ) {
+                return;
             }
         }
     }
@@ -1102,6 +1145,27 @@ mod tests {
         let b = s.read(2, 100, false).unwrap();
         assert_eq!(b.lost, Some((2, 10)));
         assert_eq!(bytes_of(&b), b"abc");
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_comes_straight_back_for_a_little_output_is_paced() {
+        let s = session(Limits::default(), false);
+        s.push_output(OutputStream::Stdout, b"a".to_vec());
+        let first = s.read(0, 10, true).unwrap();
+        s.push_output(OutputStream::Stdout, b"b".to_vec());
+        let t = std::time::Instant::now();
+        s.pace(first.next).await;
+        assert!(
+            t.elapsed() >= Duration::from_millis(80),
+            "{:?}",
+            t.elapsed()
+        );
+        // A lot waiting, or the end, answers at once.
+        s.read(first.next, 10, true).unwrap();
+        s.push_output(OutputStream::Stdout, vec![b'x'; PACE_BATCH as usize]);
+        let t = std::time::Instant::now();
+        s.pace(2).await;
+        assert!(t.elapsed() < Duration::from_millis(50));
     }
 
     #[test]

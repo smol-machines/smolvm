@@ -143,6 +143,7 @@ async fn read_waiting(
     // produce while this read waits.
     session.ack(after);
     if let Some(secs) = wait.filter(|s| *s > 0) {
+        session.pace(after).await;
         session
             .wait_for_output(after, Duration::from_secs(secs))
             .await;
