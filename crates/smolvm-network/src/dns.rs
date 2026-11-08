@@ -46,23 +46,6 @@ const DNS_MAX_LABEL_LEN: usize = 63;
 /// Mirrors Docker's `host.docker.internal`.
 pub const GATEWAY_HOSTNAME: &str = "host.smolvm.internal";
 
-/// Every name the gateway answers with its own address: its own name, and
-/// the names containers conventionally use for the host
-/// (`host.docker.internal`) and its gateway (`gateway.docker.internal`), so
-/// software that expects them reaches the host from a machine, or from a
-/// container inside one, unchanged.
-pub const GATEWAY_HOSTNAMES: [&str; 3] = [
-    GATEWAY_HOSTNAME,
-    "host.docker.internal",
-    "gateway.docker.internal",
-];
-
-/// Whether `name` (already normalized: lowercase, no trailing dot) is one of
-/// [`GATEWAY_HOSTNAMES`].
-pub fn is_gateway_hostname(name: &str) -> bool {
-    GATEWAY_HOSTNAMES.contains(&name)
-}
-
 /// TTL for the gateway's self-answer. Short so a stack restart with a
 /// different gateway address is picked up quickly.
 const GATEWAY_TTL_SECS: u32 = 60;
@@ -155,7 +138,7 @@ fn parse_answer_ip_records(packet: &[u8]) -> Option<Vec<(IpAddr, u32)>> {
     Some(ips)
 }
 
-/// A NOERROR answer for one of the gateway's names ([`GATEWAY_HOSTNAMES`]): an A
+/// A NOERROR answer for the gateway's own name ([`GATEWAY_HOSTNAME`]): an A
 /// query gets the gateway address, any other qtype an empty answer section
 /// (AAAA in particular — v6-first resolvers then settle on the A record).
 pub fn gateway_response(query: &[u8], gateway: Ipv4Addr) -> Vec<u8> {
@@ -352,20 +335,6 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, IpAddr::V4(gw));
         assert_eq!(records[0].1, GATEWAY_TTL_SECS);
-    }
-
-    #[test]
-    fn docker_names_for_the_host_are_gateway_names() {
-        for name in [
-            "host.smolvm.internal",
-            "host.docker.internal",
-            "gateway.docker.internal",
-        ] {
-            let normalized = normalize_hostname(&name.to_ascii_uppercase()).unwrap();
-            assert!(is_gateway_hostname(&normalized), "{name}");
-        }
-        assert!(!is_gateway_hostname("docker.internal"));
-        assert!(!is_gateway_hostname("evil.host.docker.internal"));
     }
 
     #[test]

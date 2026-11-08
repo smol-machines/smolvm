@@ -960,8 +960,8 @@ enum DnsDecision {
 /// names are forwarded and learned, others get NXDOMAIN and unparseable ones
 /// SERVFAIL. Identical policy to the old `filtered_dns_response`.
 ///
-/// The gateway's own names are answered before the filter runs: they name
-/// gateway-internal plumbing, not egress, so they must resolve even under a
+/// The gateway's own name is answered before the filter runs: it names
+/// gateway-internal plumbing, not egress, so it must resolve even under a
 /// strict allow-host policy.
 fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Addr) -> DnsDecision {
     // A watchlist match is recorded; a `block` entry also answers the name as
@@ -974,12 +974,12 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Add
             }
         }
     }
-    if let Some(name) = dns::question_name(query)
+    if dns::question_name(query)
         .and_then(|n| dns::normalize_hostname(&n))
-        .filter(|n| dns::is_gateway_hostname(n))
+        .is_some_and(|n| n == dns::GATEWAY_HOSTNAME)
     {
         if egress
-            .record_decision("dns", "allow", &name, "internal_gateway")
+            .record_decision("dns", "allow", &dns::GATEWAY_HOSTNAME, "internal_gateway")
             .is_err()
         {
             return DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL));
@@ -1452,42 +1452,6 @@ pub fn fuzz_classify_guest_frame(frame: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A DNS query for `name`, one A/IN question.
-    fn dns_query(name: &str) -> Vec<u8> {
-        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-        for label in name.split('.') {
-            query.push(label.len() as u8);
-            query.extend_from_slice(label.as_bytes());
-        }
-        query.extend_from_slice(&[0, 0, 1, 0, 1]);
-        query
-    }
-
-    #[test]
-    fn docker_host_names_resolve_to_the_gateway_even_under_allow_host() {
-        let gateway = Ipv4Addr::new(100, 96, 0, 1);
-        let strict = EgressPolicy::new(None, Some(&["example.com".to_string()]));
-        for name in [
-            "host.smolvm.internal",
-            "host.docker.internal",
-            "Gateway.Docker.Internal.",
-        ] {
-            match classify_dns_query(&dns_query(name.trim_end_matches('.')), &strict, gateway) {
-                DnsDecision::Immediate(answer) => assert_eq!(
-                    dns::answer_ip_records(&answer),
-                    [(std::net::IpAddr::V4(gateway), 60)],
-                    "{name}"
-                ),
-                DnsDecision::Forward { .. } => panic!("{name} was forwarded upstream"),
-            }
-        }
-        // Anything else still goes through the allow-host policy.
-        assert!(matches!(
-            classify_dns_query(&dns_query("example.com"), &strict, gateway),
-            DnsDecision::Forward { learn: true }
-        ));
-    }
 
     fn initial_tcp_sequence(seed: u64) -> i32 {
         let config = VirtioPollConfig {
