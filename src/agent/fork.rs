@@ -5129,6 +5129,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_held_lock_is_never_swept_even_without_its_machine() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".busy.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();

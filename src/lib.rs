@@ -122,6 +122,8 @@ pub mod smolfile;
 pub mod staged_mount;
 pub mod storage;
 pub mod systemd_scope;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod usage;
 pub mod util;
 pub mod vm;
