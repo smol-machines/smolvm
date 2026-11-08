@@ -1425,19 +1425,46 @@ impl EmbeddedRuntime {
     /// variable of the binding's name, except on a machine made with
     /// [`Self::create_machine_with_credentials`], which uses only what is
     /// supplied. A branch uses its golden's values until it is given its own.
-    /// Supply them before the start that should use them.
+    ///
+    /// A running machine also gets them at once: its next request to a bound
+    /// host carries the new value, with no restart. A value naming no binding
+    /// of the machine fails the call and holds nothing. When the running
+    /// machine cannot take them (one started before live values were
+    /// supported), the call fails, and the values still apply from its next
+    /// boot.
     pub fn supply_credential_values(
         &self,
         name: &str,
         values: std::collections::BTreeMap<String, String>,
-    ) {
-        crate::credentials::supply_values(
-            name,
-            values
+    ) -> Result<()> {
+        self.with_name_lock(name, || {
+            let record = control::get_record(&self.db, name)?;
+            let bindings: Vec<&str> = record
+                .credential_policy
+                .iter()
+                .flat_map(|policy| policy.credentials.iter().map(|b| b.name.as_str()))
+                .collect();
+            if let Some(unknown) = values.keys().find(|k| !bindings.contains(&k.as_str())) {
+                return Err(Error::config(
+                    "credentials",
+                    format!("machine '{name}' has no credential binding '{unknown}'"),
+                ));
+            }
+            let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> = values
                 .into_iter()
                 .map(|(binding, value)| (binding, zeroize::Zeroizing::new(value)))
-                .collect(),
-        );
+                .collect();
+            // A running machine resolves from the values its boot was handed,
+            // so it gets the new ones directly; the held copy covers its next boot.
+            let running =
+                crate::agent::state_probe::resolve_state(name, &record) == RecordState::Running;
+            let live = running.then(|| values.clone());
+            crate::credentials::supply_values(name, values);
+            match live {
+                Some(values) => crate::agent::apply_live_credential_values(name, &values),
+                None => Ok(()),
+            }
+        })
     }
 
     fn mount_bindings_for(&self, name: &str) -> Result<Vec<(String, String, bool)>> {
@@ -1975,6 +2002,46 @@ mod tests {
             // Spread the rest so a new spec field does not break the fixtures.
             ..MachineSpec::default()
         }
+    }
+
+    #[test]
+    fn credential_values_must_name_a_binding_of_an_existing_machine() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let one = |binding: &str| {
+            std::collections::BTreeMap::from([(binding.to_string(), "secret".to_string())])
+        };
+        assert!(runtime
+            .supply_credential_values("absent", one("github"))
+            .is_err());
+        let mut spec = test_spec("bound", true);
+        spec.allowed_hosts = vec!["github.com".into()];
+        runtime
+            .create_machine_with_credentials(
+                spec,
+                Vec::new(),
+                None,
+                None,
+                crate::credentials::CredentialPolicy {
+                    credentials: vec![crate::credentials::parse_credential_flag(
+                        "github=GH_TOKEN@github.com",
+                    )
+                    .unwrap()],
+                },
+            )
+            .unwrap();
+        let refused = runtime
+            .supply_credential_values("bound", one("notion"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("no credential binding 'notion'"),
+            "{refused}"
+        );
+        // A stopped machine holds the value for its next boot.
+        runtime
+            .supply_credential_values("bound", one("github"))
+            .unwrap();
+        crate::credentials::forget_values("bound");
     }
 
     #[test]
