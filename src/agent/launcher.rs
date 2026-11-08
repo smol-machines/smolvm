@@ -1172,7 +1172,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Lives until the VM exits: dropping it would stop substitution.
         let mut _credential_interceptor: Option<smolvm_credentials::Interceptor> = None;
         // Host ends of the credential tunnel, for HTTPS the guest routes
-        // through another interface than its NIC (virtio-net only).
+        // itself instead of handing it to the backend.
         let mut credential_tunnel: Option<crate::credentials::GuestTunnel> = None;
 
         // `mut` is only needed on unix (the VirtioNet arm assigns it); on
@@ -1234,8 +1234,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                              use the default virtio-net backend or update libkrun",
                         ));
                     };
+                    // HTTPS the guest kernel routes itself (through a VPN
+                    // TUN, for a container, to a local proxy) never reaches
+                    // the TSI hook; the credential tunnel covers it.
+                    credential_tunnel = vsock_socket
+                        .parent()
+                        .and_then(crate::credentials::guest_tunnel_in);
                     let interceptor = credentials
-                        .start_interceptor(vsock_socket.parent(), None)
+                        .start_interceptor(vsock_socket.parent(), credential_tunnel.as_ref())
                         .inspect_err(|_| {
                             krun_free_ctx(ctx);
                         })?;

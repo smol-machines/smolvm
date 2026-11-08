@@ -303,9 +303,9 @@ pub mod ports {
     /// relays the connection to `127.0.0.1:<port>` inside the guest.
     pub const PORT_FORWARD: u32 = 6005;
     /// Credential tunnel, guest to host: the guest agent hands the host's
-    /// credential interceptor each HTTPS connection a workload routes through
-    /// an interface other than the machine's own NIC (a Tailscale or WireGuard
-    /// TUN), prefixed with its destination. Outbound (guest connects in).
+    /// credential interceptor each HTTPS connection the machine's NIC would
+    /// not carry in the clear (a VPN route, a container's forwarded traffic, a
+    /// local proxy), prefixed with its target. Outbound (guest connects in).
     pub const CREDENTIAL_TUNNEL: u32 = 6006;
     /// Credential tunnel, host to guest: the interceptor asks the guest agent
     /// to open the upstream connection for such a flow, so it leaves through

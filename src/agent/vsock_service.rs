@@ -35,7 +35,7 @@ pub struct VsockServiceInputs<'a> {
     /// guest agent forwards a detached workload's stdout and stderr to it.
     pub workload_log_socket: Option<&'a Path>,
     /// Host ends of the credential tunnel. When set, the guest agent hands
-    /// the interceptor HTTPS the workload routes through another interface.
+    /// the interceptor HTTPS the NIC would not carry in the clear.
     pub credential_tunnel: Option<&'a crate::credentials::GuestTunnel>,
 }
 
@@ -153,7 +153,8 @@ impl VsockService for WorkloadLogService {
 }
 
 /// Credential tunnel, guest to host: the agent hands the interceptor each HTTPS
-/// connection the workload routes through another interface than its NIC.
+/// connection the NIC would not carry in the clear (a VPN, a container's
+/// forwarded traffic, a local proxy).
 struct CredentialTunnelService;
 impl VsockService for CredentialTunnelService {
     fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {

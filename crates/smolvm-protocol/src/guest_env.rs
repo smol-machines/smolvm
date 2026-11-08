@@ -119,8 +119,8 @@ pub const PORT_FORWARD: &str = "SMOLVM_PORT_FORWARD";
 
 /// Enables the guest side of the credential tunnel
 /// ([`crate::ports::CREDENTIAL_TUNNEL`] and [`crate::ports::CREDENTIAL_DIAL`]):
-/// HTTPS a workload routes through another interface than the machine's NIC
-/// reaches the credential interceptor too. See [`crate::intercept::tunnel`].
+/// HTTPS the machine's NIC would not carry in the clear reaches the
+/// credential interceptor too. See [`crate::intercept::tunnel`].
 pub const CREDENTIAL_TUNNEL: &str = "SMOLVM_CREDENTIAL_TUNNEL";
 
 /// Validate a `--shm-size` value and return it as a tmpfs `size=` value: a

@@ -187,68 +187,160 @@ impl InterceptEndpoint {
     }
 }
 
-/// The credential tunnel: how HTTPS that a workload routes through an
-/// interface other than the machine's NIC still reaches the interceptor.
+/// The credential tunnel: how HTTPS that a workload sends anywhere other than
+/// the machine's NIC still reaches the interceptor.
 ///
-/// The machine's network backend only sees traffic on the machine's own NIC. A
-/// workload that routes a host through a TUN device (Tailscale's `tailscale0`
-/// for a tailnet host or an exit node, a WireGuard interface) sends it out
-/// encrypted, so the backend cannot intercept it. The guest agent therefore
-/// redirects TCP port 443 leaving through any other interface to itself and
-/// hands each connection to the interceptor over vsock
-/// ([`crate::ports::CREDENTIAL_TUNNEL`]), and the interceptor opens the
-/// upstream connection back through the guest
-/// ([`crate::ports::CREDENTIAL_DIAL`]), so it takes the route the workload
-/// chose. TLS to the upstream is still made and verified on the host: the
-/// guest relays ciphertext and never sees a credential value.
+/// The machine's network backend only sees traffic on the machine's own NIC
+/// (or, with TSI, the sockets libkrun proxies). A workload that routes a host
+/// through a VPN (Tailscale's `tailscale0` for a tailnet host or an exit node,
+/// WireGuard, OpenVPN), forwards it for a container in its own network
+/// namespace, or hands it to a local proxy such as Tailscale's userspace
+/// SOCKS5/HTTP proxy sends it out encrypted, so the backend cannot intercept
+/// it. The guest agent therefore catches that HTTPS inside the guest and hands
+/// each connection to the interceptor over vsock
+/// ([`crate::ports::CREDENTIAL_TUNNEL`]); the interceptor opens the upstream
+/// connection back through the guest ([`crate::ports::CREDENTIAL_DIAL`]), from
+/// where the connection came from, so it takes the route the workload chose.
+/// TLS to the upstream is still made and verified on the host: the guest
+/// relays ciphertext and never sees a credential value.
 ///
-/// Both directions start with the destination as one text line, `IP:PORT\n`
-/// (`[IPv6]:PORT\n`). A dial is answered with one verdict byte, as
-/// [`connect_verdict`] encodes it, before the upstream bytes flow.
+/// Both directions start with one text line, `TARGET ROUTE\n`. `TARGET` is
+/// `IP:PORT`, `[IPv6]:PORT` or `NAME:PORT` (a proxy request names its
+/// destination); `ROUTE` is a token the guest agent chose to find its way back
+/// (a network namespace, a proxy session), opaque to the host, which only
+/// reads the port and sends the line back unchanged to dial. A dial is
+/// answered with one verdict byte, as [`connect_verdict`] encodes it, before
+/// the upstream bytes flow.
 pub mod tunnel {
     use std::io::{self, Read, Write};
     use std::net::SocketAddr;
 
-    /// `fwmark` on the guest agent's own upstream sockets, so the redirect
-    /// skips them. It sits outside the `0xff0000` bits Tailscale uses for its
-    /// own marks, so their routing is unchanged.
+    /// `fwmark` on the guest agent's own upstream sockets, so the redirect in
+    /// their network namespace skips them. It sits outside the `0xff0000`
+    /// bits Tailscale uses for its own marks, so their routing is unchanged.
     pub const DIAL_MARK: u32 = 0x534d;
 
-    /// Longest destination line: a bracketed IPv6 address, a port and `\n`.
-    pub const MAX_LINE: usize = 56;
+    /// DSCP on the guest agent's own upstream connections. A mark does not
+    /// survive a hop into another network namespace; the DSCP rides in the IP
+    /// header, so the redirect skips the connection wherever it is forwarded
+    /// next. From the pool RFC 2474 leaves for local use.
+    pub const DIAL_DSCP: u8 = 0x37;
 
-    /// Encode the destination line.
-    pub fn destination_line(destination: SocketAddr) -> String {
-        format!("{destination}\n")
+    /// Longest line: a DNS name, a port, a route token and `\n`.
+    pub const MAX_LINE: usize = 320;
+
+    /// Where a tunnelled connection was going.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Target {
+        /// An address the workload connected to.
+        Addr(SocketAddr),
+        /// A DNS name and port a proxy request named.
+        Name(String, u16),
     }
 
-    /// Write the destination line to a fresh stream.
-    pub fn write_destination<W: Write>(mut w: W, destination: SocketAddr) -> io::Result<()> {
-        w.write_all(destination_line(destination).as_bytes())
-    }
-
-    /// Read the destination line one byte at a time, so no byte of the stream
-    /// that follows is consumed.
-    pub fn read_destination<R: Read>(mut r: R) -> io::Result<SocketAddr> {
-        let mut line = Vec::with_capacity(MAX_LINE);
-        let mut byte = [0u8; 1];
-        while line.len() <= MAX_LINE {
-            r.read_exact(&mut byte)?;
-            if byte[0] == b'\n' {
-                return parse_destination(&line);
+    impl Target {
+        /// The destination port.
+        pub fn port(&self) -> u16 {
+            match self {
+                Target::Addr(addr) => addr.port(),
+                Target::Name(_, port) => *port,
             }
-            line.push(byte[0]);
         }
-        Err(invalid("credential tunnel destination line too long"))
     }
 
-    /// Parse a destination line without its newline.
-    pub fn parse_destination(line: &[u8]) -> io::Result<SocketAddr> {
-        std::str::from_utf8(line)
+    impl std::fmt::Display for Target {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Target::Addr(addr) => write!(f, "{addr}"),
+                Target::Name(name, port) => write!(f, "{name}:{port}"),
+            }
+        }
+    }
+
+    /// One tunnelled connection: its target and the agent's route token.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Flow {
+        /// Where the connection was going.
+        pub target: Target,
+        /// The guest agent's token for the way back.
+        pub route: String,
+    }
+
+    impl Flow {
+        /// Encode the line, newline included.
+        pub fn line(&self) -> String {
+            format!("{} {}\n", self.target, self.route)
+        }
+
+        /// Write the line to a fresh stream.
+        pub fn write<W: Write>(&self, mut w: W) -> io::Result<()> {
+            w.write_all(self.line().as_bytes())
+        }
+
+        /// Read a line one byte at a time, so no byte of the stream that
+        /// follows is consumed.
+        pub fn read<R: Read>(mut r: R) -> io::Result<Self> {
+            let mut line = Vec::with_capacity(64);
+            let mut byte = [0u8; 1];
+            while line.len() <= MAX_LINE {
+                r.read_exact(&mut byte)?;
+                if byte[0] == b'\n' {
+                    return Self::parse(&line);
+                }
+                line.push(byte[0]);
+            }
+            Err(invalid("credential tunnel line too long"))
+        }
+
+        /// Parse a line without its newline.
+        pub fn parse(line: &[u8]) -> io::Result<Self> {
+            let text = std::str::from_utf8(line).map_err(|_| invalid("credential tunnel line"))?;
+            let (target, route) = text
+                .split_once(' ')
+                .ok_or_else(|| invalid("credential tunnel line has no route"))?;
+            if route.is_empty()
+                || route.len() > 64
+                || !route
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b":._-".contains(&b))
+            {
+                return Err(invalid("credential tunnel route token"));
+            }
+            Ok(Self {
+                target: parse_target(target)?,
+                route: route.to_string(),
+            })
+        }
+    }
+
+    fn parse_target(text: &str) -> io::Result<Target> {
+        if let Ok(addr) = text.parse::<SocketAddr>() {
+            if addr.port() == 0 {
+                return Err(invalid("credential tunnel target port"));
+            }
+            return Ok(Target::Addr(addr));
+        }
+        let (name, port) = text
+            .rsplit_once(':')
+            .ok_or_else(|| invalid("credential tunnel target is not HOST:PORT"))?;
+        let port: u16 = port
+            .parse()
             .ok()
-            .and_then(|text| text.parse::<SocketAddr>().ok())
-            .filter(|destination| destination.port() != 0)
-            .ok_or_else(|| invalid("credential tunnel destination is not IP:PORT"))
+            .filter(|&p| p != 0)
+            .ok_or_else(|| invalid("credential tunnel target port"))?;
+        let valid_name = !name.is_empty()
+            && name.len() <= 253
+            && name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            });
+        if !valid_name {
+            return Err(invalid("credential tunnel target name"));
+        }
+        Ok(Target::Name(name.to_ascii_lowercase(), port))
     }
 
     fn invalid(message: &str) -> io::Error {
@@ -260,30 +352,43 @@ pub mod tunnel {
         use super::*;
 
         #[test]
-        fn a_destination_line_round_trips_and_leaves_the_stream_after_it() {
-            for destination in ["100.81.17.207:443", "[fd7a:115c:a1e0::1]:8443"] {
-                let destination: SocketAddr = destination.parse().unwrap();
-                let mut wire = destination_line(destination).into_bytes();
+        fn a_line_round_trips_and_leaves_the_stream_after_it() {
+            for (target, route) in [
+                ("100.81.17.207:443", "ns:1"),
+                ("[fd7a:115c:a1e0::1]:8443", "ns:4026531840"),
+                ("api.github.com:443", "px:17"),
+            ] {
+                let flow = Flow::parse(format!("{target} {route}").as_bytes()).unwrap();
+                assert_eq!(flow.target.to_string(), target);
+                let mut wire = flow.line().into_bytes();
                 wire.extend_from_slice(b"\x16\x03\x01");
                 let mut stream = &wire[..];
-                assert_eq!(read_destination(&mut stream).unwrap(), destination);
+                assert_eq!(Flow::read(&mut stream).unwrap(), flow);
                 assert_eq!(stream, b"\x16\x03\x01");
             }
+            assert_eq!(
+                Flow::parse(b"Example.COM:443 px:1").unwrap().target.port(),
+                443
+            );
         }
 
         #[test]
-        fn malformed_destination_lines_are_refused() {
-            let long = format!("{}\n", "1".repeat(MAX_LINE + 1));
+        fn malformed_lines_are_refused() {
+            let long = format!("{} ns:1\n", "a".repeat(MAX_LINE));
             for bad in [
-                &b"example.com:443\n"[..],
-                b"10.0.0.1\n",
-                b"10.0.0.1:0\n",
-                b"\n",
-                b"10.0.0.1:443",
+                &b"10.0.0.1:443\n"[..],
+                b"10.0.0.1:443 \n",
+                b"10.0.0.1 ns:1\n",
+                b"10.0.0.1:0 ns:1\n",
+                b"bad name:443 ns:1\n",
+                b"a..b:443 ns:1\n",
+                b"10.0.0.1:443 ns:1 extra\n",
+                b"10.0.0.1:443 ns/1\n",
+                b"10.0.0.1:443 ns:1",
                 long.as_bytes(),
             ] {
                 let mut stream = bad;
-                assert!(read_destination(&mut stream).is_err(), "{bad:?}");
+                assert!(Flow::read(&mut stream).is_err(), "{bad:?}");
             }
         }
     }

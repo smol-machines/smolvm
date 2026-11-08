@@ -240,7 +240,7 @@ restore. Values never travel: supply them again for the restored machine.
   saying so.
 - Interception covers port 443. Plaintext HTTP on port 80 and other ports are
   relayed without substitution.
-- HTTPS the workload routes through another interface than the machine's NIC
+- HTTPS a workload sends through its own VPN, a container, or a local proxy
   is covered too; see [Tailscale, WireGuard and other tunnels](#tailscale-wireguard-and-other-tunnels).
 - The guest side is HTTP/1.1 (the interceptor negotiates `http/1.1` only);
   upstream may be HTTP/2. WebSocket upgrades and `CONNECT` are refused on
@@ -252,45 +252,75 @@ restore. Values never travel: supply them again for the restored machine.
 
 ## Tailscale, WireGuard and other tunnels
 
-A workload can run its own VPN: Tailscale (a tailnet host, or every
-destination through an exit node), WireGuard, OpenVPN. Their traffic leaves
-the machine encrypted, so the host never sees the HTTPS inside it. On the
-`virtio-net` backend the guest agent therefore redirects TCP port 443 that
-leaves through any interface other than the machine's NIC (`tailscale0`,
-`wg0`, `tun0`, …) to the same interceptor, over vsock. The interceptor then
-opens the upstream connection from inside the guest, so it takes the route the
-workload chose (through the tunnel, to the tailnet host or the exit node). TLS
-to the upstream is still made and verified on the host; the guest relays
-ciphertext and never holds the value. Other hosts are relayed untouched, with
-their own certificates.
+A workload can run its own VPN or proxy: Tailscale (a tailnet host, or every
+destination through an exit node), WireGuard, OpenVPN, SSH dynamic forwarding.
+Their traffic leaves the machine encrypted, so the host never sees the HTTPS
+inside it. The guest agent therefore catches that HTTPS inside the guest and
+hands each connection to the same interceptor over vsock; the interceptor opens
+the upstream connection back through the guest, from where the connection came
+from, so it takes the route the workload chose (through the tunnel, to the
+tailnet host or the exit node, through the proxy). TLS to the upstream is still
+made and verified on the host; the guest relays ciphertext and never holds the
+value. Other hosts are relayed untouched, with their own certificates.
 
 ```sh
-GITHUB_TOKEN=ghp_… smolvm machine create --name agent --image debian:12 \
+GITHUB_TOKEN=ghp_… smolvm machine create --name agent --image alpine:3.23 \
   --credential github=GITHUB_TOKEN@api.github.com
 smolvm machine start --name agent
-smolvm machine exec --name agent -- sh -c 'tailscaled & tailscale up --authkey … --exit-node …'
+smolvm machine exec --name agent -- sh -c 'tailscaled & tailscale up --authkey … --exit-node=100.64.0.1'
 smolvm machine exec --name agent -- sh -c \
   'curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/user'
 # substituted, and sent through the exit node
 ```
 
-Limits:
+What is covered, on both the `virtio-net` and the TSI backends, over IPv4 and
+IPv6:
 
-- IPv4 only. HTTPS to an IPv6 address through a tunnel is not redirected.
-- Connections the guest itself opens. Traffic it forwards (from containers or
-  namespaces inside the machine) through a tunnel is not redirected.
-- A kernel TUN device. Tailscale's `--tun=userspace-networking` mode and its
-  SOCKS5/HTTP proxy never put the connection on a guest interface, so they are
-  not covered; run `tailscaled` with `/dev/net/tun` (its default as root).
-- The redirect is one nftables rule in table `ip smolvm_credentials`. A workload
-  that deletes it, or flushes the whole ruleset (`nft flush ruleset`), turns
-  this off until the machine restarts; the placeholder is then sent as is and
-  the value still never leaves the host.
-- A tunnel that hands the connection back out through the machine's NIC
-  unencrypted (a local proxy namespace, say) meets the interceptor twice; the
-  request then fails with `502` rather than going out without the value.
-- It needs the agent from the same release as `smolvm`; an older agent rootfs
-  leaves tunnelled HTTPS unsubstituted, as before.
+- **Connections leaving through a VPN interface**: any interface that does not
+  carry traffic in the clear to somewhere already covered (the NIC, loopback,
+  a bridge or veth into another namespace). A Tailscale, OpenVPN or WireGuard
+  TUN, a TAP, GRE, PPP. An interface created a moment ago is covered before
+  the agent has seen it.
+- **Containers and network namespaces**: HTTPS a namespace forwards for
+  another one (Docker's bridge networks, any veth or bridge) is caught where it
+  is forwarded and dialed from the namespace it came from, so it still follows
+  that namespace's routes. A VPN running inside a namespace (Tailscale in a
+  container, `ip netns exec … openvpn`) is covered in that namespace.
+- **Local proxies**: connections to Tailscale's userspace-networking SOCKS5
+  (`--socks5-server`) and HTTP (`--outbound-http-proxy-listen`) proxies, SSH
+  dynamic forwarding (`ssh -D`), the common proxy tunnels (sing-box, Xray,
+  V2Ray, Clash/Mihomo, wireproxy, Shadowsocks, cloudflared, Tor and others,
+  by program), and any loopback proxy a process's `ALL_PROXY`, `HTTPS_PROXY`
+  or `HTTP_PROXY` names. A `CONNECT` to port 443 (by name or by address) is
+  handed to the interceptor; the proxy still makes the connection, with the
+  client's own authentication. Every other request reaches the proxy
+  unchanged.
+- **A VPN whose far end sends the traffic back out the NIC in the clear**: the
+  connection meets the interceptor twice and the value is set once.
+- **Fallback**: when the address the client chose cannot be reached through
+  its route (an exit node without IPv6, say), the interceptor connects to the
+  TLS server name's other addresses through the same route, as the client's
+  own fallback would have.
+
+The redirect is a table `smolvm_credentials` (`ip` and `ip6`) in each
+namespace, owned by the agent: the kernel refuses a workload's attempt to
+delete or change it, and `nft flush ruleset` passes over it. A VPN's
+anti-spoofing rules (Tailscale's drop of its own range arriving anywhere but
+`tailscale0`, wg-quick's) would drop the redirected connections' replies, which
+come back on loopback; the agent puts an exemption for exactly those replies
+first in the chains that hook them, in nftables and in legacy iptables.
+
+A workload that sets out to evade the redirect (marking its own sockets as the
+agent's) can make a connection carry the placeholder unreplaced, which is a
+string it already holds and can send anywhere; it can never obtain the value.
+As on the NIC, interception covers TCP port 443. It needs the agent from the
+same release as `smolvm`; an older agent rootfs leaves tunnelled HTTPS
+unsubstituted.
+
+`tests/credential_tunnel_e2e.sh` runs each of these against OpenVPN peers,
+Docker and SSH on a Linux KVM host; `tests/credential_tailscale_e2e.sh` runs a
+real `tailscaled` (kernel and userspace modes, nftables and legacy iptables)
+against a local Headscale control server.
 
 ## Comparison with `--secret-env` / `--secret-file`
 

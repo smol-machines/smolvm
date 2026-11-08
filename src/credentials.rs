@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 pub const CREDENTIALS_SOCKET: &str = "credentials.sock";
 
 /// Socket in the machine's data directory where the interceptor takes HTTPS
-/// the guest routed through another interface (guest vsock
+/// the guest caught off the NIC: a VPN, a container, a local proxy (guest vsock
 /// [`ports::CREDENTIAL_TUNNEL`](smolvm_protocol::ports::CREDENTIAL_TUNNEL)).
 pub const CREDENTIAL_TUNNEL_SOCKET: &str = "cred-tunnel.sock";
 
@@ -279,7 +279,7 @@ pub fn guest_tunnel_in(vm_dir: &Path) -> Option<GuestTunnel> {
     for path in [&tunnel.flows, &tunnel.dial, &longest] {
         if let Err(e) = crate::agent::launcher_dynamic::check_socket_path_len(path) {
             tracing::warn!(
-                "credential tunnel disabled; HTTPS the guest routes through another interface \
+                "credential tunnel disabled; HTTPS the guest sends through its own VPN, a container or a local proxy \
                  will not have credentials substituted: {e}"
             );
             return None;
