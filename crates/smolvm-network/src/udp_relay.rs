@@ -45,10 +45,18 @@ use std::time::{Duration, Instant};
 
 /// Max in-flight datagrams per direction before drops (UDP may drop).
 const CHANNEL_CAPACITY: usize = 256;
-/// Max concurrent (guest, destination) flows with live host sockets.
-const MAX_FLOWS: usize = 1024;
-/// Max destination-keyed smoltcp sockets in the poll loop.
-const MAX_DST_SOCKETS: usize = 128;
+/// Max concurrent (guest, destination) flows with live host sockets: one host
+/// socket each, the same budget as the TCP relay's table.
+const MAX_FLOWS: usize = 65_536;
+/// Max destination-keyed smoltcp sockets in the poll loop. Each holds receive
+/// and send buffers; past [`FULL_BUFFER_DST_SOCKETS`] they are smaller.
+const MAX_DST_SOCKETS: usize = 8_192;
+/// Destination sockets that get full-size buffers.
+const FULL_BUFFER_DST_SOCKETS: usize = 128;
+/// Payload bytes per destination socket buffer beyond the first ones.
+const UDP_SMALL_BUFFER_BYTES: usize = 8 * 1024;
+/// The shortest gap between two warnings about the same full table.
+const FULL_WARNING_INTERVAL: Duration = Duration::from_secs(10);
 /// Packet slots per destination socket buffer.
 const UDP_PACKET_SLOTS: usize = 16;
 /// Payload bytes per destination socket buffer (per direction).
@@ -131,11 +139,25 @@ fn run_udp_relay(
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
-    let mut flows: HashMap<(SocketAddr, SocketAddr), UdpFlow> = HashMap::new();
+    // Each flow's socket stays registered in the wake's poller under its own
+    // key for the flow's whole life (re-armed after every event, deleted
+    // before the socket drops), so a wake costs work only for the sockets
+    // that are ready, however many flows are open.
+    let mut flows: HashMap<(SocketAddr, SocketAddr), (usize, UdpFlow)> = HashMap::new();
+    let mut by_key: HashMap<usize, (SocketAddr, SocketAddr)> = HashMap::new();
+    let mut next_key: usize = 0;
     let mut recv_buf = vec![0u8; MAX_DATAGRAM_BYTES];
+    let poller = wake.poller().clone();
+    let mut events = Events::new();
+    let mut full = FullWarning::default();
+    let mut socket_failures = FullWarning::default();
+    let mut last_expiry = Instant::now();
 
     loop {
         if shutdown() {
+            for (_, (_, flow)) in flows.drain() {
+                let _ = poller.delete(&flow.socket);
+            }
             return;
         }
 
@@ -146,37 +168,51 @@ fn run_udp_relay(
                     let key = (datagram.guest, datagram.destination);
                     if !flows.contains_key(&key) {
                         if flows.len() >= MAX_FLOWS {
-                            virtio_net_log!(
-                                "virtio-net: dropping UDP flow {} -> {} (flow table full)",
-                                datagram.guest,
-                                datagram.destination
-                            );
+                            full.note(|dropped| {
+                                virtio_net_log!(
+                                    "virtio-net: dropping UDP to new destinations: this machine already has {} UDP flows open, its limit; {} dropped since the last report",
+                                    MAX_FLOWS,
+                                    dropped
+                                )
+                            });
                             continue;
                         }
-                        match create_flow_socket(datagram.destination) {
-                            Ok(socket) => {
-                                flows.insert(
-                                    key,
-                                    UdpFlow {
-                                        socket,
-                                        guest: datagram.guest,
-                                        destination: datagram.destination,
-                                        last_active: Instant::now(),
-                                    },
-                                );
-                            }
+                        let socket = match create_flow_socket(datagram.destination) {
+                            Ok(socket) => socket,
                             Err(err) => {
-                                virtio_net_log!(
-                                    "virtio-net: failed to open host UDP socket for {} -> {}: {}",
-                                    datagram.guest,
-                                    datagram.destination,
-                                    err
-                                );
+                                socket_failures.note(|failed| {
+                                    virtio_net_log!(
+                                        "virtio-net: the host refused a UDP socket for a guest flow to {} ({}) with {} open; {} failed since the last report",
+                                        datagram.destination,
+                                        err,
+                                        flows.len(),
+                                        failed
+                                    )
+                                });
                                 continue;
                             }
+                        };
+                        next_key = next_key.wrapping_add(1);
+                        // SAFETY: deleted from the poller before the socket is
+                        // dropped (expiry and shutdown below).
+                        if unsafe { poller.add(&socket, Event::readable(next_key)) }.is_err() {
+                            continue;
                         }
+                        by_key.insert(next_key, key);
+                        flows.insert(
+                            key,
+                            (
+                                next_key,
+                                UdpFlow {
+                                    socket,
+                                    guest: datagram.guest,
+                                    destination: datagram.destination,
+                                    last_active: Instant::now(),
+                                },
+                            ),
+                        );
                     }
-                    let flow = flows.get_mut(&key).expect("flow inserted above");
+                    let (_, flow) = flows.get_mut(&key).expect("flow inserted above");
                     flow.last_active = Instant::now();
                     // Best-effort send; UDP loss is allowed.
                     let _ = flow.socket.send(&datagram.payload);
@@ -186,43 +222,19 @@ fn run_udp_relay(
             }
         }
 
-        // Inbound: poll all flow sockets for replies. The wake's poller blocks
-        // on "wake OR any flow socket readable" in a single call; the wake is a
-        // notify (no key), and each flow socket is registered at key `slot + 1`.
-        let poller = wake.poller();
-        let keys: Vec<(SocketAddr, SocketAddr)> = flows.keys().copied().collect();
-        for (slot, key) in keys.iter().enumerate() {
-            // SAFETY: the socket is owned by `flows` and is deleted from the
-            // poller below before the next iteration may drop it.
-            let _ = unsafe { poller.add(&flows[key].socket, Event::readable(slot + 1)) };
-        }
-
-        let mut events = Events::new();
+        events.clear();
+        // The wake is a notify (no key); flow sockets report their own keys.
         let _ = poller.wait(
             &mut events,
             Some(Duration::from_millis(RELAY_POLL_MAX_MS as u64)),
         );
 
-        // A pending notify is consumed by `wait`; nothing else to drain.
-        let mut ready: Vec<bool> = vec![false; keys.len()];
-        for event in events.iter() {
-            if event.key >= 1 && event.key - 1 < ready.len() {
-                ready[event.key - 1] = true;
-            }
-        }
-
-        // Deregister sockets before the next rebuild so a closed flow's socket
-        // is never left registered on the poller.
-        for key in &keys {
-            let _ = poller.delete(&flows[key].socket);
-        }
-
         let mut woke_reply = false;
-        for (slot, key) in keys.iter().enumerate() {
-            if !ready[slot] {
+        for event in events.iter() {
+            let Some(flow_key) = by_key.get(&event.key) else {
                 continue;
-            }
-            let Some(flow) = flows.get_mut(key) else {
+            };
+            let Some((poll_key, flow)) = flows.get_mut(flow_key) else {
                 continue;
             };
             // Drain everything ready on this socket. WouldBlock ends the drain;
@@ -238,22 +250,56 @@ fn run_udp_relay(
                 match inbound.try_send(reply) {
                     Ok(()) => woke_reply = true,
                     Err(TrySendError::Full(_)) => {
-                        virtio_net_log!(
-                            "virtio-net: dropping UDP reply for {} (inbound queue full)",
-                            flow.guest
-                        );
+                        tracing::debug!(guest = %flow.guest, "virtio-net: dropping UDP reply (inbound queue full)");
                     }
                     Err(TrySendError::Disconnected(_)) => return,
                 }
             }
+            let _ = poller.modify(&flow.socket, Event::readable(*poll_key));
         }
         if woke_reply {
             reply_wake.wake();
         }
 
-        // NAT-style idle expiry.
+        // NAT-style idle expiry, checked about once a second.
+        if last_expiry.elapsed() >= Duration::from_millis(RELAY_POLL_MAX_MS as u64) {
+            let now = Instant::now();
+            last_expiry = now;
+            flows.retain(|_, (poll_key, flow)| {
+                let keep = now.duration_since(flow.last_active) < FLOW_IDLE_TIMEOUT;
+                if !keep {
+                    let _ = poller.delete(&flow.socket);
+                    by_key.remove(poll_key);
+                }
+                keep
+            });
+        }
+    }
+}
+
+/// Rate-limits a warning about a full table or an exhausted host resource:
+/// the first occurrence is reported, then at most one line per interval with
+/// how many happened in between.
+#[derive(Default)]
+pub(crate) struct FullWarning {
+    total: u64,
+    reported: u64,
+    last: Option<Instant>,
+}
+
+impl FullWarning {
+    pub(crate) fn note(&mut self, report: impl FnOnce(u64)) {
+        self.total = self.total.saturating_add(1);
         let now = Instant::now();
-        flows.retain(|_, flow| now.duration_since(flow.last_active) < FLOW_IDLE_TIMEOUT);
+        if self
+            .last
+            .is_some_and(|at| now.duration_since(at) < FULL_WARNING_INTERVAL)
+        {
+            return;
+        }
+        report(self.total - self.reported);
+        self.reported = self.total;
+        self.last = Some(now);
     }
 }
 
@@ -282,6 +328,7 @@ fn create_flow_socket(destination: SocketAddr) -> std::io::Result<HostUdpSocket>
 pub struct UdpSocketTable {
     sockets: HashMap<SocketAddr, SocketHandle>,
     last_active: HashMap<SocketAddr, Instant>,
+    full: FullWarning,
 }
 
 impl UdpSocketTable {
@@ -289,6 +336,7 @@ impl UdpSocketTable {
         Self {
             sockets: HashMap::new(),
             last_active: HashMap::new(),
+            full: FullWarning::default(),
         }
     }
 
@@ -307,20 +355,28 @@ impl UdpSocketTable {
             return true;
         }
         if self.sockets.len() >= MAX_DST_SOCKETS {
-            virtio_net_log!(
-                "virtio-net: dropping UDP datagram to {} (destination socket table full)",
-                destination
-            );
+            self.full.note(|dropped| {
+                virtio_net_log!(
+                    "virtio-net: dropping UDP to new destinations: this machine already sends to {} destinations, its limit; {} dropped since the last report",
+                    MAX_DST_SOCKETS,
+                    dropped
+                )
+            });
             return false;
         }
 
+        let buffer_bytes = if self.sockets.len() < FULL_BUFFER_DST_SOCKETS {
+            UDP_BUFFER_BYTES
+        } else {
+            UDP_SMALL_BUFFER_BYTES
+        };
         let rx = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; UDP_PACKET_SLOTS],
-            vec![0u8; UDP_BUFFER_BYTES],
+            vec![0u8; buffer_bytes],
         );
         let tx = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; UDP_PACKET_SLOTS],
-            vec![0u8; UDP_BUFFER_BYTES],
+            vec![0u8; buffer_bytes],
         );
         let mut socket = UdpSocket::new(rx, tx);
         if socket
@@ -364,9 +420,9 @@ impl UdpSocketTable {
                 match to_relay.try_send(datagram) {
                     Ok(()) => forwarded = true,
                     Err(TrySendError::Full(_)) => {
-                        virtio_net_log!(
-                            "virtio-net: dropping guest UDP datagram to {} (relay queue full)",
-                            destination
+                        tracing::debug!(
+                            %destination,
+                            "virtio-net: dropping guest UDP datagram (relay queue full)"
                         );
                     }
                     Err(TrySendError::Disconnected(_)) => return forwarded,
@@ -399,9 +455,9 @@ impl UdpSocketTable {
                 meta: Default::default(),
             };
             if socket.send_slice(&reply.payload, metadata).is_err() {
-                virtio_net_log!(
-                    "virtio-net: dropping UDP reply to {} (guest socket buffer full)",
-                    reply.guest
+                tracing::debug!(
+                    guest = %reply.guest,
+                    "virtio-net: dropping UDP reply (guest socket buffer full)"
                 );
             }
         }

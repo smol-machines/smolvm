@@ -28,25 +28,44 @@
 
 use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
+use crate::tcp_reactor::{RelayReactor, RelayWaker};
 use crate::virtio_net_log;
 use polling::{Event, Events};
-use smoltcp::iface::{Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet};
+use smoltcp::phy::Device;
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpListenEndpoint;
 use smolvm_protocol::mediated_egress::{Decision, FlowPrelude, MAX_INITIAL_BYTES};
 use smolvm_protocol::{FlowTransport, RuleAction};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const TCP_RX_BUFFER_BYTES: usize = 64 * 1024;
 const TCP_TX_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_CONNECTIONS: usize = 512;
+/// Concurrent guest TCP flows one machine may hold by default: a whole
+/// ephemeral port range's worth, so a guest is limited by its own kernel the
+/// way a hosted CI runner is, not by the relay. `SMOLVM_TCP_RELAY_CAPACITY`
+/// overrides it.
+pub(crate) const MAX_CONNECTIONS: usize = 65_536;
+/// Flows beyond this many open at once get smaller guest-facing buffers, so a
+/// guest holding tens of thousands of mostly idle connections costs the host
+/// a quarter of the memory per flow. 16 KiB still moves hundreds of MB/s on a
+/// link whose round trip is microseconds.
+const FULL_BUFFER_CONNECTIONS: usize = 1024;
+const TCP_SMALL_BUFFER_BYTES: usize = 16 * 1024;
+/// Once the guest has closed its side and the relay waits on the remote,
+/// probe the guest this often: a guest that already forgot the socket answers
+/// with a reset, which frees the flow even if the remote never closes.
+const GUEST_CLOSED_KEEPALIVE: Duration = Duration::from_secs(60);
+/// The shortest gap between two "relay table is full" warnings.
+const FULL_WARNING_INTERVAL: Duration = Duration::from_secs(10);
 const CHANNEL_CAPACITY: usize = 32;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const CLOSE_RETRY_LIMIT: u16 = 64;
@@ -67,11 +86,30 @@ const PUBLISHED_PORT_END: u16 = 65_535;
 
 /// Track all active guest TCP connections bridged through host sockets.
 ///
-/// One entry corresponds to one `(guest source, destination)` tuple. The table
-/// lives in the smoltcp poll thread and owns all guest-facing socket handles.
+/// One entry corresponds to one `(guest endpoint, peer endpoint)` tuple. The
+/// table lives in the smoltcp poll thread and owns every guest-facing socket.
+///
+/// Each flow keeps its smoltcp socket in a socket set of its own. smoltcp
+/// finds the socket for an incoming segment, and asks every socket whether it
+/// has something to send, by walking the whole set, so one set holding every
+/// flow made each guest packet cost time in proportion to the connections
+/// open: with two thousand idle connections a single download fell from
+/// 600 MB/s to 40. The poll loop instead routes each segment to its flow's
+/// set by its addresses and services only the flows that have work: those a
+/// segment reached, those whose relay reported progress, and those whose
+/// smoltcp timer is due.
 pub struct TcpRelayTable {
-    connections: HashMap<SocketHandle, TrackedConnection>,
-    connection_keys: HashSet<(SocketAddr, SocketAddr)>,
+    connections: HashMap<u64, TrackedConnection>,
+    /// Flow by `(guest endpoint, peer endpoint)`.
+    by_tuple: HashMap<(SocketAddr, SocketAddr), u64>,
+    /// Flows to service on the next pass.
+    touched: Vec<u64>,
+    /// Flows' next smoltcp timer, earliest first, in milliseconds of the poll
+    /// loop's clock. Entries whose time no longer matches the flow's
+    /// `next_poll` are stale and skipped.
+    timers: BinaryHeap<Reverse<(i64, u64)>>,
+    /// Flows whose relay reported progress since the last pass.
+    poll_queue: Arc<PollQueue>,
     used_published_ports: HashSet<u16>,
     next_published_port: u16,
     max_connections: usize,
@@ -93,6 +131,17 @@ pub struct TcpRelayTable {
     /// client retrying in a loop produces one warning rather than one per
     /// attempt.
     unaccepted_guest_ports: HashSet<u16>,
+    /// Shared host-side relay that pumps every flow of this machine on one
+    /// thread. `None` (tests) gives each flow its own relay thread.
+    reactor: Option<RelayReactor>,
+    /// Identifies a flow to the reactor.
+    next_flow_id: u64,
+    /// Connections refused because the table was full, and when that was
+    /// last reported, so a guest hammering a full table logs one line per
+    /// interval rather than one per attempt.
+    refused_full: u64,
+    refused_full_reported: u64,
+    last_full_warning: Option<Instant>,
 }
 
 /// Open TCP flows of one machine at a point in time. Outbound flows are the
@@ -160,9 +209,9 @@ pub struct NewTcpConnection {
     pub to_smoltcp: SyncSender<Vec<u8>>,
     /// Shared relay exit state.
     pub exit_state: RelayExitState,
-    /// Wakes the relay thread when the poll loop hands it a guest payload or
+    /// Wakes the relay when the poll loop hands it a guest payload or
     /// closes the guest side.
-    pub proxy_wake: WakePipe,
+    pub proxy_wake: RelayWaker,
     /// The policy to show the guest's opening bytes to, for an outbound
     /// connection; `None` for a published port's inbound one.
     pub watch_opening: Option<EgressPolicy>,
@@ -170,8 +219,7 @@ pub struct NewTcpConnection {
 
 #[derive(Debug)]
 struct TrackedConnection {
-    // `source` and `destination` identify the guest-side flow.
-    source: SocketAddr,
+    // the peer the guest dialed, or the guest endpoint of a published flow
     destination: SocketAddr,
     // guest -> host relay payloads
     to_proxy: Option<ToProxy>,
@@ -198,6 +246,27 @@ struct TrackedConnection {
     reserved_published_port: Option<u16>,
     // when the guest-side flow entered the table, for the flow summary
     opened_at: Instant,
+    // wakes the host relay, e.g. after draining a host->guest channel it found full
+    relay_waker: RelayWaker,
+    // the flow's own smoltcp socket set and its one socket
+    set: SocketSet<'static>,
+    handle: SocketHandle,
+    // `(guest endpoint, peer endpoint)`, the key in `by_tuple`
+    key: (SocketAddr, SocketAddr),
+    // when this flow's smoltcp timer is next due (ms), as queued in `timers`
+    next_poll: Option<i64>,
+    // keep-alive toward the guest was armed after the guest closed its side
+    guest_closed_keepalive: bool,
+}
+
+impl Drop for TrackedConnection {
+    fn drop(&mut self) {
+        // The guest side is gone for good (closed or reset): let the relay
+        // close the host socket now rather than wait on a remote that may
+        // never close its side.
+        self.exit_state.guest_gone.store(true, Ordering::Release);
+        self.relay_waker.wake();
+    }
 }
 
 #[derive(Debug)]
@@ -205,7 +274,7 @@ struct PendingProxyEndpoints {
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_target: RelayTarget,
-    proxy_wake: WakePipe,
+    proxy_wake: RelayWaker,
     watch_opening: Option<EgressPolicy>,
 }
 
@@ -215,7 +284,7 @@ struct PendingProxyEndpoints {
 #[derive(Debug)]
 struct ToProxy {
     sender: Option<SyncSender<Vec<u8>>>,
-    wake: WakePipe,
+    wake: RelayWaker,
 }
 
 impl ToProxy {
@@ -238,14 +307,13 @@ impl Drop for ToProxy {
     }
 }
 
-/// A guest->host channel whose sender wakes the relay thread waiting on `WakePipe`.
-fn proxy_channel() -> (ToProxy, Receiver<Vec<u8>>, WakePipe) {
+/// A guest->host channel whose sender wakes the relay through `wake`.
+fn proxy_channel(wake: RelayWaker) -> (ToProxy, Receiver<Vec<u8>>, RelayWaker) {
     let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
-    let wake = WakePipe::new();
     (
         ToProxy {
             sender: Some(sender),
-            wake: wake.share(),
+            wake: wake.clone(),
         },
         receiver,
         wake,
@@ -277,6 +345,16 @@ pub enum RelayTarget {
     },
 }
 
+impl RelayTarget {
+    /// A flow under mediated egress, bounded by its idle and total lifetime.
+    pub(crate) fn is_mediated(&self) -> bool {
+        matches!(
+            self,
+            RelayTarget::Mediated { .. } | RelayTarget::DirectMediated(_)
+        )
+    }
+}
+
 /// Host relay termination state shared between the poll loop and the relay thread.
 ///
 /// The relay thread cannot mutate smoltcp sockets directly because those sockets
@@ -289,6 +367,32 @@ pub enum RelayTarget {
 #[derive(Clone, Debug)]
 pub struct RelayExitState {
     inner: Arc<AtomicU8>,
+    /// Set by the relay when the host->guest channel was full, so the poll
+    /// loop wakes it once it has drained that channel.
+    host_blocked: Arc<AtomicBool>,
+    /// Set when the poll loop dropped the guest side of the flow (the guest
+    /// closed or reset it): the host side then has no one left to talk to.
+    guest_gone: Arc<AtomicBool>,
+    /// Where to report this flow to the poll loop, and whether it is already
+    /// queued there.
+    poll: Option<(Arc<PollQueue>, u64)>,
+    queued: Arc<AtomicBool>,
+}
+
+/// Flows whose host relay made progress the poll loop should act on: data
+/// for the guest, room for more guest data, or an exit.
+#[derive(Debug, Default)]
+pub(crate) struct PollQueue {
+    ids: Mutex<Vec<u64>>,
+}
+
+impl PollQueue {
+    fn take(&self) -> Vec<u64> {
+        self.ids
+            .lock()
+            .map(|mut ids| std::mem::take(&mut *ids))
+            .unwrap_or_default()
+    }
 }
 
 /// How a host TCP relay thread terminated.
@@ -310,13 +414,37 @@ pub enum RelayExitMode {
 }
 
 impl RelayExitState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(AtomicU8::new(RelayExitMode::Running as u8)),
+            host_blocked: Arc::new(AtomicBool::new(false)),
+            guest_gone: Arc::new(AtomicBool::new(false)),
+            poll: None,
+            queued: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn load(&self) -> RelayExitMode {
+    /// State for flow `id`, which reports its progress through `queue`.
+    fn for_flow(queue: &Arc<PollQueue>, id: u64) -> Self {
+        Self {
+            poll: Some((queue.clone(), id)),
+            ..Self::new()
+        }
+    }
+
+    /// Tell the poll loop this flow has news for it, and wake it.
+    pub(crate) fn notify(&self, relay_wake: &WakePipe) {
+        if let Some((queue, id)) = &self.poll {
+            if !self.queued.swap(true, Ordering::AcqRel) {
+                if let Ok(mut ids) = queue.ids.lock() {
+                    ids.push(*id);
+                }
+            }
+        }
+        relay_wake.wake();
+    }
+
+    pub(crate) fn load(&self) -> RelayExitMode {
         match self.inner.load(Ordering::Relaxed) {
             1 => RelayExitMode::Graceful,
             2 => RelayExitMode::Abort,
@@ -325,7 +453,19 @@ impl RelayExitState {
         }
     }
 
-    fn store(&self, mode: RelayExitMode) {
+    /// What dropping the poll loop's entry for the flow does.
+    #[cfg(test)]
+    pub(crate) fn mark_guest_gone(&self) {
+        self.guest_gone.store(true, Ordering::Release);
+    }
+
+    /// Set by the relay while the host->guest channel is full.
+    #[cfg(test)]
+    pub(crate) fn host_blocked_flag(&self) -> &AtomicBool {
+        &self.host_blocked
+    }
+
+    pub(crate) fn store(&self, mode: RelayExitMode) {
         self.inner.store(mode as u8, Ordering::Relaxed);
     }
 }
@@ -340,7 +480,10 @@ impl TcpRelayTable {
     ) -> Self {
         Self {
             connections: HashMap::new(),
-            connection_keys: HashSet::new(),
+            by_tuple: HashMap::new(),
+            touched: Vec::new(),
+            timers: BinaryHeap::new(),
+            poll_queue: Arc::new(PollQueue::default()),
             used_published_ports: HashSet::new(),
             next_published_port: PUBLISHED_PORT_START,
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
@@ -349,7 +492,78 @@ impl TcpRelayTable {
             host_service,
             intercept: None,
             unaccepted_guest_ports: HashSet::new(),
+            reactor: None,
+            next_flow_id: 0,
+            refused_full: 0,
+            refused_full_reported: 0,
+            last_full_warning: None,
         }
+    }
+
+    /// Pump every flow on `reactor` instead of a thread per flow.
+    pub(crate) fn with_reactor(mut self, reactor: RelayReactor) -> Self {
+        self.reactor = Some(reactor);
+        self
+    }
+
+    /// Hand an established flow to its host relay: the shared reactor when
+    /// there is one, otherwise a dedicated thread.
+    pub(crate) fn start_relay(
+        &self,
+        connection: NewTcpConnection,
+        relay_wake: Arc<WakePipe>,
+    ) -> io::Result<()> {
+        match &self.reactor {
+            Some(reactor) => {
+                reactor.adopt(connection);
+                Ok(())
+            }
+            None => spawn_tcp_relay(connection, relay_wake),
+        }
+    }
+
+    /// Number a new flow and make the waker for its relay.
+    fn new_flow_id(&mut self) -> (u64, RelayWaker) {
+        self.next_flow_id = self.next_flow_id.wrapping_add(1);
+        let id = self.next_flow_id;
+        let waker = match &self.reactor {
+            Some(reactor) => reactor.waker(id),
+            None => RelayWaker::standalone(),
+        };
+        (id, waker)
+    }
+
+    /// Guest-facing buffer size for the next flow: full size for the first
+    /// [`FULL_BUFFER_CONNECTIONS`], smaller beyond.
+    fn next_buffer_bytes(&self) -> (usize, usize) {
+        if self.connections.len() < FULL_BUFFER_CONNECTIONS {
+            (TCP_RX_BUFFER_BYTES, TCP_TX_BUFFER_BYTES)
+        } else {
+            (TCP_SMALL_BUFFER_BYTES, TCP_SMALL_BUFFER_BYTES)
+        }
+    }
+
+    /// Note a connection refused because the table is full, and say so in the
+    /// machine log at most once per [`FULL_WARNING_INTERVAL`], naming the
+    /// limit and how to raise it.
+    fn refuse_full(&mut self, direction: &str) {
+        self.refused_full = self.refused_full.saturating_add(1);
+        let now = Instant::now();
+        if self
+            .last_full_warning
+            .is_some_and(|at| now.duration_since(at) < FULL_WARNING_INTERVAL)
+        {
+            return;
+        }
+        virtio_net_log!(
+            "virtio-net: refusing {} TCP connection: this machine already has {} open, its limit \
+             (set SMOLVM_TCP_RELAY_CAPACITY to change it); {} refused since the last report",
+            direction,
+            self.connections.len(),
+            self.refused_full - self.refused_full_reported
+        );
+        self.refused_full_reported = self.refused_full;
+        self.last_full_warning = Some(now);
     }
 
     /// Route selected guest streams through a host interceptor.
@@ -525,7 +739,145 @@ impl TcpRelayTable {
 
     /// Whether a relay socket already exists for the same guest source and destination.
     pub fn has_socket_for(&self, source: &SocketAddr, destination: &SocketAddr) -> bool {
-        self.connection_keys.contains(&(*source, *destination))
+        self.by_tuple.contains_key(&(*source, *destination))
+    }
+
+    /// The flow a guest segment from `guest` to `peer` belongs to.
+    pub(crate) fn flow_for(&self, guest: SocketAddr, peer: SocketAddr) -> Option<u64> {
+        self.by_tuple.get(&(guest, peer)).copied()
+    }
+
+    /// Hand the device's staged guest frame to flow `id`'s socket.
+    pub(crate) fn ingress<D: Device + ?Sized>(
+        &mut self,
+        id: u64,
+        interface: &mut Interface,
+        device: &mut D,
+        now: smoltcp::time::Instant,
+    ) -> PollIngressSingleResult {
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return PollIngressSingleResult::None;
+        };
+        let result = interface.poll_ingress_single(now, device, &mut connection.set);
+        self.touched.push(id);
+        result
+    }
+
+    /// Service every flow on the next pass. For neighbor discovery: a flow
+    /// whose output waited on the guest's link address only learns that it
+    /// arrived by being polled, and otherwise waits out smoltcp's one-second
+    /// retry. Address resolution happens about once a minute, so the walk is
+    /// cheap.
+    pub(crate) fn touch_all(&mut self) {
+        self.touched.extend(self.connections.keys().copied());
+    }
+
+    /// Earliest time (ms of the poll loop's clock) a flow's smoltcp timer is due.
+    pub(crate) fn next_timer(&mut self) -> Option<i64> {
+        while let Some(Reverse((at, id))) = self.timers.peek().copied() {
+            match self.connections.get(&id) {
+                Some(connection) if connection.next_poll == Some(at) => return Some(at),
+                _ => {
+                    self.timers.pop();
+                }
+            }
+        }
+        None
+    }
+
+    /// Service every flow with work: move bytes between its socket and its
+    /// relay, send what smoltcp has for the guest, start relays for flows the
+    /// guest finished opening (returned), reap finished flows, and schedule
+    /// each flow's next timer.
+    pub(crate) fn service<D: Device + ?Sized>(
+        &mut self,
+        interface: &mut Interface,
+        device: &mut D,
+        now: smoltcp::time::Instant,
+    ) -> Vec<NewTcpConnection> {
+        let mut ids = std::mem::take(&mut self.touched);
+        for id in self.poll_queue.take() {
+            if let Some(connection) = self.connections.get(&id) {
+                connection.exit_state.queued.store(false, Ordering::Release);
+            }
+            ids.push(id);
+        }
+        let now_ms = now.total_millis();
+        while let Some(Reverse((at, id))) = self.timers.peek().copied() {
+            if at > now_ms {
+                break;
+            }
+            self.timers.pop();
+            if let Some(connection) = self.connections.get_mut(&id) {
+                if connection.next_poll == Some(at) {
+                    connection.next_poll = None;
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+
+        let mut new_connections = Vec::new();
+        let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];
+        for id in ids {
+            let Some(connection) = self.connections.get_mut(&id) else {
+                continue;
+            };
+            relay_flow_data(connection, &mut read_buffer);
+            if let Some(new_connection) = take_if_established(connection) {
+                new_connections.push(new_connection);
+            }
+            loop {
+                if matches!(
+                    interface.poll_egress(now, device, &mut connection.set),
+                    PollResult::None
+                ) {
+                    break;
+                }
+            }
+            if flow_finished(connection) {
+                self.reap(id);
+                continue;
+            }
+            let next = interface
+                .poll_at(now, &connection.set)
+                .map(|at| at.total_millis());
+            if next != connection.next_poll {
+                connection.next_poll = next;
+                if let Some(at) = next {
+                    self.timers.push(Reverse((at, id)));
+                }
+            }
+        }
+        new_connections
+    }
+
+    /// Remove a finished flow.
+    fn reap(&mut self, id: u64) {
+        let Some(connection) = self.connections.remove(&id) else {
+            return;
+        };
+        self.by_tuple.remove(&connection.key);
+        if let Some(port) = connection.reserved_published_port {
+            self.used_published_ports.remove(&port);
+            // A published connection that closed before the guest handshake
+            // completed was refused (or reset) by the guest: nothing accepts
+            // connections on guest_ip:guest_port.
+            if !connection.relay_spawned
+                && first_refusal_of_guest_port(
+                    &mut self.unaccepted_guest_ports,
+                    connection.destination.port(),
+                )
+            {
+                tracing::warn!(
+                    "nothing inside the machine accepted a published-port connection on {}; \
+                     a server listening only on 127.0.0.1 inside the machine is not \
+                     reachable through a published port, so listen on 0.0.0.0",
+                    connection.destination
+                );
+            }
+        }
     }
 
     /// Create a smoltcp TCP socket for a guest SYN.
@@ -544,18 +896,9 @@ impl TcpRelayTable {
     /// smoltcp socket --to_proxy channel--> host relay thread
     /// host relay thread --from_proxy channel--> smoltcp socket
     /// ```
-    pub fn create_tcp_socket(
-        &mut self,
-        source: SocketAddr,
-        destination: SocketAddr,
-        sockets: &mut SocketSet<'_>,
-    ) -> bool {
+    pub fn create_tcp_socket(&mut self, source: SocketAddr, destination: SocketAddr) -> bool {
         if self.connections.len() >= self.max_connections {
-            virtio_net_log!(
-                "virtio-net: dropping outbound TCP connection because relay table is full active={} capacity={}",
-                self.connections.len(),
-                self.max_connections
-            );
+            self.refuse_full("outbound");
             return false;
         }
 
@@ -602,8 +945,9 @@ impl TcpRelayTable {
             return false;
         }
 
-        let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
-        let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
+        let (rx_bytes, tx_bytes) = self.next_buffer_bytes();
+        let rx_buffer = tcp::SocketBuffer::new(vec![0u8; rx_bytes]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0u8; tx_bytes]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
 
@@ -615,17 +959,21 @@ impl TcpRelayTable {
             return false;
         }
 
-        let handle = sockets.add(socket);
+        let mut set = SocketSet::new(Vec::with_capacity(1));
+        let handle = set.add(socket);
 
-        let (to_proxy_tx, to_proxy_rx, proxy_wake) = proxy_channel();
+        let (id, waker) = self.new_flow_id();
+        let (to_proxy_tx, to_proxy_rx, proxy_wake) = proxy_channel(waker);
+        let relay_waker = proxy_wake.clone();
         let (from_proxy_tx, from_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let exit_state = RelayExitState::new();
+        let exit_state = RelayExitState::for_flow(&self.poll_queue, id);
 
-        self.connection_keys.insert((source, destination));
+        let key = (source, destination);
+        self.by_tuple.insert(key, id);
+        self.touched.push(id);
         self.connections.insert(
-            handle,
+            id,
             TrackedConnection {
-                source,
                 destination,
                 to_proxy: Some(to_proxy_tx),
                 from_proxy: from_proxy_rx,
@@ -645,6 +993,12 @@ impl TcpRelayTable {
                 exit_state,
                 reserved_published_port: None,
                 opened_at: Instant::now(),
+                relay_waker,
+                guest_closed_keepalive: false,
+                set,
+                handle,
+                key,
+                next_poll: None,
             },
         );
 
@@ -672,14 +1026,9 @@ impl TcpRelayTable {
         gateway_ip: Ipv4Addr,
         destination: SocketAddr,
         host_stream: TcpStream,
-        sockets: &mut SocketSet<'_>,
     ) -> bool {
         if self.connections.len() >= self.max_connections {
-            virtio_net_log!(
-                "virtio-net: dropping published TCP connection because relay table is full active={} capacity={}",
-                self.connections.len(),
-                self.max_connections
-            );
+            self.refuse_full("published-port");
             return false;
         }
 
@@ -697,8 +1046,9 @@ impl TcpRelayTable {
             return false;
         };
 
-        let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
-        let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
+        let (rx_bytes, tx_bytes) = self.next_buffer_bytes();
+        let rx_buffer = tcp::SocketBuffer::new(vec![0u8; rx_bytes]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0u8; tx_bytes]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
         let local_endpoint = IpListenEndpoint {
@@ -717,18 +1067,23 @@ impl TcpRelayTable {
             return false;
         }
 
-        let handle = sockets.add(socket);
+        let mut set = SocketSet::new(Vec::with_capacity(1));
+        let handle = set.add(socket);
         let source = SocketAddr::new(std::net::IpAddr::V4(gateway_ip), local_port);
 
-        let (to_proxy_tx, to_proxy_rx, proxy_wake) = proxy_channel();
+        let (id, waker) = self.new_flow_id();
+        let (to_proxy_tx, to_proxy_rx, proxy_wake) = proxy_channel(waker);
+        let relay_waker = proxy_wake.clone();
         let (from_proxy_tx, from_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let exit_state = RelayExitState::new();
+        let exit_state = RelayExitState::for_flow(&self.poll_queue, id);
 
-        self.connection_keys.insert((source, destination));
+        // The guest answers from its own endpoint to the gateway's.
+        let key = (destination, source);
+        self.by_tuple.insert(key, id);
+        self.touched.push(id);
         self.connections.insert(
-            handle,
+            id,
             TrackedConnection {
-                source,
                 destination,
                 to_proxy: Some(to_proxy_tx),
                 from_proxy: from_proxy_rx,
@@ -748,160 +1103,16 @@ impl TcpRelayTable {
                 exit_state,
                 reserved_published_port: Some(local_port),
                 opened_at: Instant::now(),
+                relay_waker,
+                guest_closed_keepalive: false,
+                set,
+                handle,
+                key,
+                next_poll: None,
             },
         );
 
         true
-    }
-
-    /// Relay TCP payloads between smoltcp sockets and host relay threads.
-    ///
-    /// This runs in the poll thread. It is responsible for:
-    /// - draining bytes received from the guest-facing smoltcp socket and
-    ///   pushing them toward the host relay thread
-    /// - draining bytes received from the host relay thread and writing them
-    ///   back into the smoltcp socket
-    /// - interpreting relay exit state into guest-side `close()` or `abort()`
-    pub fn relay_data(&mut self, sockets: &mut SocketSet<'_>) {
-        let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];
-
-        for (&handle, connection) in &mut self.connections {
-            if !connection.relay_spawned {
-                continue;
-            }
-
-            let socket = sockets.get_mut::<tcp::Socket>(handle);
-
-            match connection.exit_state.load() {
-                RelayExitMode::Abort => {
-                    socket.abort();
-                    continue;
-                }
-                RelayExitMode::Graceful => {
-                    flush_proxy_data(socket, connection);
-                    if connection.buffered_proxy_data.is_none() {
-                        socket.close();
-                    } else {
-                        connection.close_attempts += 1;
-                        if connection.close_attempts >= CLOSE_RETRY_LIMIT {
-                            socket.abort();
-                        }
-                    }
-                    continue;
-                }
-                RelayExitMode::HalfClosed => {
-                    // Host closed its send half: flush any remaining host->guest
-                    // bytes, then send FIN to the guest exactly once. Crucially
-                    // we do NOT `continue` — fall through to the guest->host
-                    // drain below so the guest's in-flight response still
-                    // reaches the host. The thread flips to Graceful once the
-                    // guest closes too, and the connection is torn down then.
-                    flush_proxy_data(socket, connection);
-                    if connection.buffered_proxy_data.is_none() && !connection.guest_send_closed {
-                        socket.close();
-                        connection.guest_send_closed = true;
-                    }
-                }
-                RelayExitMode::Running => {}
-            }
-
-            flush_guest_data(connection);
-            while connection.buffered_guest_data.is_none() && socket.can_recv() {
-                match socket.recv_slice(&mut read_buffer) {
-                    Ok(bytes_read) if bytes_read > 0 => {
-                        let payload = read_buffer[..bytes_read].to_vec();
-                        if !send_guest_payload(connection, payload) {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-
-            if connection.buffered_guest_data.is_none() && !socket.may_recv() {
-                connection.to_proxy = None;
-            }
-
-            flush_proxy_data(socket, connection);
-        }
-    }
-
-    /// Collect connections that reached ESTABLISHED and need a host relay thread.
-    ///
-    /// The separation between `create_tcp_socket` and this method is important:
-    /// the guest TCP handshake is accepted first on the smoltcp side, and only
-    /// once that succeeds do we commit to opening the host-side `TcpStream`.
-    pub fn take_new_connections(&mut self, sockets: &mut SocketSet<'_>) -> Vec<NewTcpConnection> {
-        let mut new_connections = Vec::new();
-
-        for (&handle, connection) in &mut self.connections {
-            if connection.relay_spawned {
-                continue;
-            }
-
-            let socket = sockets.get::<tcp::Socket>(handle);
-            let state = socket.state();
-            if state == tcp::State::Established || state == tcp::State::CloseWait {
-                connection.relay_spawned = true;
-
-                if let Some(endpoints) = connection.pending_proxy_endpoints.take() {
-                    new_connections.push(NewTcpConnection {
-                        destination: connection.destination,
-                        relay_target: endpoints.relay_target,
-                        from_smoltcp: endpoints.from_smoltcp,
-                        to_smoltcp: endpoints.to_smoltcp,
-                        exit_state: connection.exit_state.clone(),
-                        proxy_wake: endpoints.proxy_wake,
-                        watch_opening: endpoints.watch_opening,
-                    });
-                }
-            }
-        }
-
-        new_connections
-    }
-
-    /// Remove closed sockets and drop their relay endpoints.
-    ///
-    /// This is the final ownership cleanup step for a guest TCP flow.
-    ///
-    /// An aborted socket reaches `Closed` synchronously, but its RST is only
-    /// emitted on the next interface dispatch — and smoltcp clears the
-    /// endpoint tuple right after sending it. Reaping on `Closed` alone
-    /// therefore destroys the queued RST and the guest never learns the
-    /// connection died (it hangs until its own timeout, which is how a failed
-    /// host-side connect used to black-hole every unreachable destination).
-    /// Wait for `remote_endpoint()` to clear so the RST is on the wire first.
-    pub fn cleanup_closed(&mut self, sockets: &mut SocketSet<'_>) {
-        let keys = &mut self.connection_keys;
-        let published_ports = &mut self.used_published_ports;
-        let unaccepted = &mut self.unaccepted_guest_ports;
-        self.connections.retain(|&handle, connection| {
-            let socket = sockets.get::<tcp::Socket>(handle);
-            if socket.state() == tcp::State::Closed && socket.remote_endpoint().is_none() {
-                keys.remove(&(connection.source, connection.destination));
-                if let Some(port) = connection.reserved_published_port {
-                    published_ports.remove(&port);
-                    // A published connection that closed before the guest
-                    // handshake completed was refused (or reset) by the guest:
-                    // nothing accepts connections on guest_ip:guest_port.
-                    if !connection.relay_spawned
-                        && first_refusal_of_guest_port(unaccepted, connection.destination.port())
-                    {
-                        tracing::warn!(
-                            "nothing inside the machine accepted a published-port connection on {}; \
-                             a server listening only on 127.0.0.1 inside the machine is not \
-                             reachable through a published port, so listen on 0.0.0.0",
-                            connection.destination
-                        );
-                    }
-                }
-                sockets.remove(handle);
-                false
-            } else {
-                true
-            }
-        });
     }
 
     fn allocate_published_port(&mut self) -> Option<u16> {
@@ -926,6 +1137,132 @@ impl TcpRelayTable {
     }
 }
 
+/// Move payloads between a flow's smoltcp socket and its host relay, and act
+/// on how the relay ended: close or abort the guest side.
+fn relay_flow_data(connection: &mut TrackedConnection, read_buffer: &mut [u8]) {
+    if !connection.relay_spawned {
+        return;
+    }
+    // The socket lives in the connection; lend it out so both can be borrowed.
+    let mut set = std::mem::replace(&mut connection.set, SocketSet::new(Vec::new()));
+    relay_socket_data(
+        set.get_mut::<tcp::Socket>(connection.handle),
+        connection,
+        read_buffer,
+    );
+    connection.set = set;
+}
+
+fn relay_socket_data(
+    socket: &mut tcp::Socket<'_>,
+    connection: &mut TrackedConnection,
+    read_buffer: &mut [u8],
+) {
+    match connection.exit_state.load() {
+        RelayExitMode::Abort => {
+            socket.abort();
+            return;
+        }
+        RelayExitMode::Graceful => {
+            flush_proxy_data(socket, connection);
+            if connection.buffered_proxy_data.is_none() {
+                socket.close();
+            } else {
+                connection.close_attempts += 1;
+                if connection.close_attempts >= CLOSE_RETRY_LIMIT {
+                    socket.abort();
+                }
+            }
+            return;
+        }
+        RelayExitMode::HalfClosed => {
+            // Host closed its send half: flush any remaining host->guest
+            // bytes, then send FIN to the guest exactly once. Crucially
+            // we do NOT `continue` — fall through to the guest->host
+            // drain below so the guest's in-flight response still
+            // reaches the host. The thread flips to Graceful once the
+            // guest closes too, and the connection is torn down then.
+            flush_proxy_data(socket, connection);
+            if connection.buffered_proxy_data.is_none() && !connection.guest_send_closed {
+                socket.close();
+                connection.guest_send_closed = true;
+            }
+        }
+        RelayExitMode::Running => {}
+    }
+
+    flush_guest_data(connection);
+    while connection.buffered_guest_data.is_none() && socket.can_recv() {
+        match socket.recv_slice(read_buffer) {
+            Ok(bytes_read) if bytes_read > 0 => {
+                let payload = read_buffer[..bytes_read].to_vec();
+                if !send_guest_payload(connection, payload) {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    if connection.buffered_guest_data.is_none() && !socket.may_recv() {
+        connection.to_proxy = None;
+        if !connection.guest_closed_keepalive {
+            // The guest closed its side; if it then forgets the socket
+            // while the remote never closes, a probe draws the guest's
+            // reset and the flow is freed rather than held forever.
+            socket.set_keep_alive(Some(GUEST_CLOSED_KEEPALIVE.into()));
+            connection.guest_closed_keepalive = true;
+        }
+    }
+
+    flush_proxy_data(socket, connection);
+}
+
+/// A flow the guest finished opening (`Established`, or already `CloseWait`
+/// for a guest that sent its FIN at once) gets its host relay now: the guest
+/// handshake is accepted first, and only then is the host side opened.
+fn take_if_established(connection: &mut TrackedConnection) -> Option<NewTcpConnection> {
+    if connection.relay_spawned {
+        return None;
+    }
+    let state = connection.set.get::<tcp::Socket>(connection.handle).state();
+    if state != tcp::State::Established && state != tcp::State::CloseWait {
+        return None;
+    }
+    connection.relay_spawned = true;
+    let endpoints = connection.pending_proxy_endpoints.take()?;
+    Some(NewTcpConnection {
+        destination: connection.destination,
+        relay_target: endpoints.relay_target,
+        from_smoltcp: endpoints.from_smoltcp,
+        to_smoltcp: endpoints.to_smoltcp,
+        exit_state: connection.exit_state.clone(),
+        proxy_wake: endpoints.proxy_wake,
+        watch_opening: endpoints.watch_opening,
+    })
+}
+
+/// Whether a flow is over and can be dropped.
+///
+/// An aborted socket reaches `Closed` synchronously, but its RST is only
+/// emitted on the next interface dispatch — and smoltcp clears the endpoint
+/// tuple right after sending it. Reaping on `Closed` alone would destroy the
+/// queued RST and the guest would never learn the connection died (it hangs
+/// until its own timeout, which is how a failed host-side connect used to
+/// black-hole every unreachable destination). So a `Closed` flow waits for
+/// `remote_endpoint()` to clear.
+///
+/// TIME-WAIT guards a reused 4-tuple against stray old segments on a real
+/// network; on this point-to-point link the guest keeps its own TIME-WAIT, so
+/// holding the flow for smoltcp's 10 s only ties up a table slot and its
+/// buffers. A late retransmitted FIN finds no socket and draws a reset, which
+/// the guest takes as closed.
+fn flow_finished(connection: &TrackedConnection) -> bool {
+    let socket = connection.set.get::<tcp::Socket>(connection.handle);
+    socket.state() == tcp::State::TimeWait
+        || (socket.state() == tcp::State::Closed && socket.remote_endpoint().is_none())
+}
+
 /// Record that a published connection to `guest_port` was refused by the
 /// guest. Returns `true` only the first time for each port, so the caller
 /// warns once per port rather than once per connection attempt.
@@ -944,7 +1281,7 @@ fn first_refusal_of_guest_port(reported: &mut HashSet<u16>, guest_port: u16) -> 
 pub fn spawn_tcp_relay(connection: NewTcpConnection, relay_wake: Arc<WakePipe>) -> io::Result<()> {
     let destination = connection.destination;
     let thread_name = format!("smolvm-tcp-{}", destination.port());
-    virtio_net_log!(
+    tracing::debug!(
         "virtio-net: host TCP relay thread spawn attempt destination={} thread={}",
         destination,
         thread_name
@@ -977,12 +1314,12 @@ fn handle_relay_spawn_result<T>(
             destination,
             err
         );
-        // `take_new_connections` has already marked this entry as having a
+        // `take_if_established` has already marked this entry as having a
         // relay. Without an explicit terminal state, a failed OS thread
         // creation leaves the entry in Running forever and eventually
         // exhausts the bounded relay table.
         exit_state.store(RelayExitMode::Abort);
-        relay_wake.wake();
+        exit_state.notify(relay_wake);
         err
     })
 }
@@ -992,13 +1329,13 @@ fn run_tcp_relay(connection: NewTcpConnection, relay_wake: Arc<WakePipe>) {
     let exit_state = connection.exit_state.clone();
     // The relay thread is intentionally isolated from smoltcp internals. Its
     // contract is just channels in, channels out, and an exit code back.
-    virtio_net_log!(
+    tracing::debug!(
         "virtio-net: host TCP relay thread started destination={}",
         destination
     );
-    match tcp_relay_loop(connection, relay_wake, &exit_state) {
+    match tcp_relay_loop(connection, relay_wake.clone(), &exit_state) {
         Ok(mode) => {
-            virtio_net_log!(
+            tracing::debug!(
                 "virtio-net: host TCP relay thread exited destination={} mode={:?}",
                 destination,
                 mode
@@ -1006,7 +1343,7 @@ fn run_tcp_relay(connection: NewTcpConnection, relay_wake: Arc<WakePipe>) {
             exit_state.store(mode)
         }
         Err(err) => {
-            virtio_net_log!(
+            tracing::debug!(
                 "virtio-net: host TCP relay failed destination={} error={}",
                 destination,
                 err
@@ -1014,67 +1351,38 @@ fn run_tcp_relay(connection: NewTcpConnection, relay_wake: Arc<WakePipe>) {
             exit_state.store(RelayExitMode::Abort);
         }
     }
+    exit_state.notify(&relay_wake);
 }
 
-fn tcp_relay_loop(
-    connection: NewTcpConnection,
-    relay_wake: Arc<WakePipe>,
+/// Guest bytes already read, with the offset written so far, that must reach
+/// the host before anything else.
+pub(crate) type PendingGuestData = Option<(Vec<u8>, usize)>;
+
+/// Open the host side of a flow, blocking until it is usable: dial the
+/// destination, an interceptor, or a decider and then the route it chose.
+/// Returns the connected stream and any guest bytes already read that must
+/// reach it first.
+pub(crate) fn open_relay_target(
+    relay_target: RelayTarget,
+    from_smoltcp: &Receiver<Vec<u8>>,
+    relay_wake: &WakePipe,
     exit_state: &RelayExitState,
-) -> io::Result<RelayExitMode> {
-    let NewTcpConnection {
-        destination,
-        relay_target,
-        from_smoltcp,
-        to_smoltcp,
-        proxy_wake,
-        watch_opening,
-        ..
-    } = connection;
-    // Host-side flow:
-    //
-    // 1. Connect a normal host TcpStream to the destination.
-    // 2. Non-blockingly drain guest payloads from the channel into the socket.
-    // 3. Non-blockingly read remote payloads from the socket into the channel.
-    // 4. If neither side made progress, wait until one can: the host socket
-    //    turns readable or writable, or the poll loop wakes `proxy_wake`.
-    let mediated = matches!(
-        &relay_target,
-        RelayTarget::Mediated { .. } | RelayTarget::DirectMediated(_)
-    );
+) -> io::Result<(TcpStream, PendingGuestData)> {
     let mut pending_guest_data: Option<(Vec<u8>, usize)> = None;
     let stream = match relay_target {
-        RelayTarget::Connect(destination) => {
-            virtio_net_log!(
-                "virtio-net: connecting host TCP relay socket destination={}",
-                destination
-            );
-            let stream = TcpStream::connect(destination)?;
-            virtio_net_log!(
-                "virtio-net: host TCP relay socket connected destination={}",
-                destination
-            );
-            stream
-        }
+        RelayTarget::Connect(destination) => TcpStream::connect(destination)?,
         RelayTarget::DirectMediated(destination) => {
             TcpStream::connect_timeout(&destination, INTERCEPT_VERDICT_TIMEOUT)?
         }
-        RelayTarget::Attached(stream) => {
-            virtio_net_log!(
-                "virtio-net: using accepted host TCP socket for published port guest_destination={} peer_addr={:?} local_addr={:?}",
-                destination,
-                stream.peer_addr().ok(),
-                stream.local_addr().ok()
-            );
-            stream
-        }
+        RelayTarget::Attached(stream) => stream,
         RelayTarget::Intercept {
             endpoint,
             destination,
         } => {
-            virtio_net_log!(
-                "virtio-net: redirecting guest flow to credential interceptor destination={} interceptor={}",
-                destination,
-                endpoint.addr
+            tracing::debug!(
+                %destination,
+                interceptor = %endpoint.addr,
+                "virtio-net: redirecting guest flow to credential interceptor"
             );
             // The preamble is written blocking, before any guest byte: it is a
             // few dozen bytes to a loopback listener and must precede the TLS
@@ -1099,9 +1407,9 @@ fn tcp_relay_loop(
             // dialed. Wait briefly for application bytes so a host decider can
             // inspect them before choosing a route. Server-speaks-first flows
             // continue after this bounded hold with an empty initial payload.
-            let first = collect_initial_bytes(&from_smoltcp, FIRST_PAYLOAD_HOLD);
+            let first = collect_initial_bytes(from_smoltcp, FIRST_PAYLOAD_HOLD);
             if first.is_some() {
-                relay_wake.wake();
+                exit_state.notify(relay_wake);
             }
             let first_len = first
                 .as_ref()
@@ -1171,22 +1479,41 @@ fn tcp_relay_loop(
             }
         }
     };
-    stream.set_nonblocking(true)?;
+    Ok((stream, pending_guest_data))
+}
 
-    let registered = RegisteredStream::new(stream, proxy_wake.poller().clone())?;
-    relay_stream(
-        &registered.stream,
-        &registered.poller,
+fn tcp_relay_loop(
+    connection: NewTcpConnection,
+    relay_wake: Arc<WakePipe>,
+    exit_state: &RelayExitState,
+) -> io::Result<RelayExitMode> {
+    let NewTcpConnection {
+        destination,
+        relay_target,
         from_smoltcp,
         to_smoltcp,
-        &relay_wake,
-        exit_state,
+        proxy_wake,
+        watch_opening,
+        ..
+    } = connection;
+    let mediated = relay_target.is_mediated();
+    let (stream, pending_guest_data) =
+        open_relay_target(relay_target, &from_smoltcp, &relay_wake, exit_state)?;
+    prepare_host_stream(&stream)?;
+    let pump = RelayPump::new(
+        stream,
+        from_smoltcp,
+        to_smoltcp,
         RelayFlow {
             mediated,
             pending_guest_data,
             opening: watch_opening.map(|egress| OpeningWatch::new(egress, destination)),
         },
-    )
+    )?;
+    let poller = proxy_wake
+        .standalone_poller()
+        .ok_or_else(|| io::Error::other("a relay thread needs its own wake poller"))?;
+    relay_stream(pump, &poller, &relay_wake, exit_state)
 }
 
 /// Whether `bytes` already hold what a decider needs to route a flow: one whole
@@ -1248,50 +1575,57 @@ fn collect_initial_bytes(from: &Receiver<Vec<u8>>, hold: Duration) -> Option<Vec
 /// A relay's host socket registered in the relay's poller. Owning both ties
 /// the registration to the socket's lifetime: `Drop` removes it before the
 /// socket closes, on every exit path, unwinding included.
-struct RegisteredStream {
-    stream: TcpStream,
+struct RegisteredPump {
+    pump: RelayPump,
     poller: Arc<polling::Poller>,
 }
 
-impl RegisteredStream {
-    fn new(stream: TcpStream, poller: Arc<polling::Poller>) -> io::Result<Self> {
-        stream.set_nodelay(true)?;
+impl RegisteredPump {
+    fn new(pump: RelayPump, poller: Arc<polling::Poller>) -> io::Result<Self> {
         // SAFETY: the stream is owned by the value returned here, whose Drop
         // removes it from the poller before the stream itself is dropped.
-        unsafe { poller.add(&stream, Event::none(HOST_STREAM_KEY))? };
-        Ok(Self { stream, poller })
+        unsafe { poller.add(&pump.stream, Event::none(HOST_STREAM_KEY))? };
+        Ok(Self { pump, poller })
     }
 }
 
-impl Drop for RegisteredStream {
+impl Drop for RegisteredPump {
     fn drop(&mut self) {
-        let _ = self.poller.delete(&self.stream);
+        let _ = self.poller.delete(&self.pump.stream);
     }
+}
+
+/// Make a connected host stream ready for a pump: non-blocking, and without
+/// Nagle's delay, which would hold back the small writes of an interactive
+/// flow the guest already decided to send.
+pub(crate) fn prepare_host_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(true)?;
+    stream.set_nodelay(true)
 }
 
 /// How a flow entered the relay.
-struct RelayFlow {
+pub(crate) struct RelayFlow {
     /// Bounded by the mediated connection lifetime.
-    mediated: bool,
+    pub(crate) mediated: bool,
     /// Guest bytes already read (with the offset written so far) that must
     /// reach the host before anything else.
-    pending_guest_data: Option<(Vec<u8>, usize)>,
+    pub(crate) pending_guest_data: Option<(Vec<u8>, usize)>,
     /// Shown the guest's opening bytes until it has seen enough of them.
-    opening: Option<OpeningWatch>,
+    pub(crate) opening: Option<OpeningWatch>,
 }
 
 /// Copies of the first bytes a guest sends on an outbound connection, held
 /// until they say what the connection is (a miner's stratum login, a TLS
 /// server name) and then shown to the egress policy once. Holding copies
 /// never delays the guest's bytes on their way to the host.
-struct OpeningWatch {
+pub(crate) struct OpeningWatch {
     egress: EgressPolicy,
     destination: SocketAddr,
     seen: Vec<u8>,
 }
 
 impl OpeningWatch {
-    fn new(egress: EgressPolicy, destination: SocketAddr) -> Self {
+    pub(crate) fn new(egress: EgressPolicy, destination: SocketAddr) -> Self {
         Self {
             egress,
             destination,
@@ -1310,30 +1644,79 @@ impl OpeningWatch {
     }
 }
 
-/// Copies bytes both ways between the host socket and the guest channels
-/// until the flow ends, waiting on `poller` whenever neither direction can
-/// make progress.
-fn relay_stream(
-    stream: &TcpStream,
-    poller: &polling::Poller,
+/// What one [`RelayPump::pump`] call left the flow in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PumpOutcome {
+    /// Neither direction can progress until the host socket turns readable
+    /// (`read`) or writable (`write`), or the poll loop wakes the relay.
+    Idle { read: bool, write: bool },
+    /// Still has work; the caller stopped it to be fair to other flows.
+    Busy,
+    /// The flow is over.
+    Finished(RelayExitMode),
+}
+
+/// The data path of one flow: copies bytes both ways between its host socket
+/// and the poll loop's channels without ever blocking, so one thread can pump
+/// any number of flows. A dedicated relay thread drives it with
+/// [`relay_stream`], the shared reactor with its own poller.
+pub(crate) struct RelayPump {
+    pub(crate) stream: TcpStream,
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
-    relay_wake: &WakePipe,
-    exit_state: &RelayExitState,
-    flow: RelayFlow,
-) -> io::Result<RelayExitMode> {
-    let RelayFlow {
-        mediated,
-        mut pending_guest_data,
-        mut opening,
-    } = flow;
-    // Shows a guest segment to the opening watch until it has a verdict, and
-    // ends the flow when that verdict is a watchlist `block`.
-    let mut watch = |segment: &[u8]| -> io::Result<()> {
-        let Some(verdict) = opening.as_mut().and_then(|watch| watch.feed(segment)) else {
+    /// Guest bytes read from the channel (with the offset written so far)
+    /// waiting on a full host send buffer.
+    pending_guest_data: Option<(Vec<u8>, usize)>,
+    /// Host bytes read from the socket waiting on a full host->guest channel.
+    pending_host_data: Option<Vec<u8>>,
+    opening: Option<OpeningWatch>,
+    mediated: bool,
+    started: Instant,
+    last_activity: Instant,
+    guest_write_closed: bool,
+    guest_channel_closed: bool,
+    host_read_closed: bool,
+}
+
+impl RelayPump {
+    pub(crate) fn new(
+        stream: TcpStream,
+        from_smoltcp: Receiver<Vec<u8>>,
+        to_smoltcp: SyncSender<Vec<u8>>,
+        flow: RelayFlow,
+    ) -> io::Result<Self> {
+        let now = Instant::now();
+        let mut pump = Self {
+            stream,
+            from_smoltcp,
+            to_smoltcp,
+            pending_guest_data: None,
+            pending_host_data: None,
+            opening: flow.opening,
+            mediated: flow.mediated,
+            started: now,
+            last_activity: now,
+            guest_write_closed: false,
+            guest_channel_closed: false,
+            host_read_closed: false,
+        };
+        // The whole first payload is the guest's opening, including any prefix
+        // a decider already forwarded.
+        if let Some((payload, _)) = &flow.pending_guest_data {
+            let payload = payload.clone();
+            pump.watch(&payload)?;
+        }
+        pump.pending_guest_data = flow.pending_guest_data;
+        Ok(pump)
+    }
+
+    /// Shows a guest segment to the opening watch until it has a verdict, and
+    /// ends the flow when that verdict is a watchlist `block`.
+    fn watch(&mut self, segment: &[u8]) -> io::Result<()> {
+        let Some(verdict) = self.opening.as_mut().and_then(|watch| watch.feed(segment)) else {
             return Ok(());
         };
-        opening = None;
+        self.opening = None;
         if verdict {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1341,144 +1724,230 @@ fn relay_stream(
             ));
         }
         Ok(())
-    };
-    // The whole first payload is the guest's opening, including any prefix a
-    // decider already forwarded.
-    if let Some((payload, _)) = &pending_guest_data {
-        watch(payload)?;
     }
-    let mut stream = stream;
-    let mut events = Events::new();
-    let mut guest_write_closed = false;
-    let mut guest_channel_closed = false;
-    let mut host_read_closed = false;
-    let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];
-    let started = Instant::now();
-    let mut last_activity = started;
 
-    loop {
-        if mediated
-            && (started.elapsed() >= MEDIATED_MAX_LIFETIME
-                || last_activity.elapsed() >= MEDIATED_IDLE_TIMEOUT)
-        {
+    /// A mediated flow past its idle or total lifetime.
+    pub(crate) fn expired(&self) -> bool {
+        self.mediated
+            && (self.started.elapsed() >= MEDIATED_MAX_LIFETIME
+                || self.last_activity.elapsed() >= MEDIATED_IDLE_TIMEOUT)
+    }
+
+    /// Nothing reads or writes the host socket any more (the host stopped
+    /// sending and every guest byte is written), so only an error or hang-up
+    /// on it is news.
+    pub(crate) fn only_waiting_for_guest(&self) -> bool {
+        self.host_read_closed && self.pending_guest_data.is_none()
+    }
+
+    /// Fail a flow whose host socket broke while nothing was reading it.
+    /// epoll reports EPOLLERR and EPOLLHUP whatever the interest (`hung_up`
+    /// says one arrived); kqueue reports nothing, so the error is read too.
+    pub(crate) fn check_host_error(&self, hung_up: bool) -> io::Result<()> {
+        if let Some(err) = self.stream.take_error()? {
+            return Err(err);
+        }
+        if hung_up {
             return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "mediated TCP flow lifetime expired",
+                io::ErrorKind::ConnectionReset,
+                "host TCP socket hung up",
             ));
         }
-        let mut did_work = false;
+        Ok(())
+    }
 
-        if pending_guest_data.is_none() && !guest_channel_closed {
-            match from_smoltcp.try_recv() {
-                Ok(payload) => {
-                    watch(&payload)?;
-                    pending_guest_data = Some((payload, 0));
-                    // Consuming from the bounded guest->host channel may free
-                    // capacity for a payload buffered in the smoltcp poll
-                    // thread. Wake it so backpressure clears promptly even for
-                    // one-way guest->host streams.
-                    relay_wake.wake();
-                    did_work = true;
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    guest_channel_closed = true;
-                }
+    /// Hand a host payload to the poll loop. `false` when the poll loop is
+    /// gone (the guest flow was torn down).
+    fn offer_host_data(
+        &mut self,
+        data: Vec<u8>,
+        relay_wake: &WakePipe,
+        exit_state: &RelayExitState,
+    ) -> bool {
+        match self.to_smoltcp.try_send(data) {
+            Ok(()) => {
+                exit_state.notify(relay_wake);
+                true
             }
-        }
-
-        if let Some((payload, offset)) = &mut pending_guest_data {
-            while *offset < payload.len() {
-                match stream.write(&payload[*offset..]) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "host TCP relay wrote zero bytes",
-                        ));
+            Err(TrySendError::Full(data)) => {
+                // Ask the poll loop to wake us once it drains the channel, then
+                // look again: a drain between the failed send and the flag
+                // would otherwise never be noticed.
+                exit_state.host_blocked.store(true, Ordering::Release);
+                match self.to_smoltcp.try_send(data) {
+                    Ok(()) => {
+                        exit_state.host_blocked.store(false, Ordering::Release);
                     }
-                    Ok(bytes_written) => {
-                        *offset += bytes_written;
+                    Err(TrySendError::Full(data)) => self.pending_host_data = Some(data),
+                    Err(TrySendError::Disconnected(_)) => return false,
+                }
+                exit_state.notify(relay_wake);
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Move bytes both ways until neither direction can progress, the flow
+    /// ends, or `budget` rounds have run.
+    pub(crate) fn pump(
+        &mut self,
+        read_buffer: &mut [u8],
+        relay_wake: &WakePipe,
+        exit_state: &RelayExitState,
+        budget: usize,
+    ) -> io::Result<PumpOutcome> {
+        for _ in 0..budget {
+            if self.expired() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "mediated TCP flow lifetime expired",
+                ));
+            }
+            let mut did_work = false;
+
+            // guest -> host
+            if self.pending_guest_data.is_none() && !self.guest_channel_closed {
+                match self.from_smoltcp.try_recv() {
+                    Ok(payload) => {
+                        self.watch(&payload)?;
+                        self.pending_guest_data = Some((payload, 0));
+                        // Consuming from the bounded guest->host channel may free
+                        // capacity for a payload buffered in the smoltcp poll
+                        // thread. Wake it so backpressure clears promptly even
+                        // for one-way guest->host streams.
+                        exit_state.notify(relay_wake);
                         did_work = true;
                     }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => self.guest_channel_closed = true,
+                }
+            }
+            if let Some((payload, offset)) = &mut self.pending_guest_data {
+                while *offset < payload.len() {
+                    match (&self.stream).write(&payload[*offset..]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "host TCP relay wrote zero bytes",
+                            ));
+                        }
+                        Ok(written) => {
+                            *offset += written;
+                            did_work = true;
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                if *offset >= payload.len() {
+                    self.pending_guest_data = None;
+                }
+            }
+            if self.guest_channel_closed
+                && self.pending_guest_data.is_none()
+                && !self.guest_write_closed
+            {
+                // The guest closed its write half. Mirror that toward the
+                // remote peer only after all buffered guest bytes were written.
+                let _ = self.stream.shutdown(Shutdown::Write);
+                self.guest_write_closed = true;
+            }
+            // Every guest byte reached the host and the guest side is gone
+            // for good (closed or reset): whatever the remote still sends has
+            // no one to reach, so end the flow instead of waiting on a remote
+            // that may never close its side.
+            if self.guest_write_closed && exit_state.guest_gone.load(Ordering::Acquire) {
+                return Ok(PumpOutcome::Finished(RelayExitMode::Graceful));
+            }
+            // Both directions are done: the host stopped sending and the guest
+            // stopped sending and was fully flushed. The poll loop tears the
+            // guest socket down.
+            if self.host_read_closed
+                && self.guest_channel_closed
+                && self.pending_guest_data.is_none()
+            {
+                return Ok(PumpOutcome::Finished(RelayExitMode::Graceful));
+            }
+
+            // host -> guest, only while the host's send half is still open. On
+            // host read-EOF the relay is NOT torn down: HalfClosed has the poll
+            // loop mirror the FIN to the guest while guest->host keeps draining.
+            // A hijacked docker attach half-closes here (`shutdown(SHUT_WR)`
+            // with no stdin) while the daemon is still streaming its response.
+            if let Some(data) = self.pending_host_data.take() {
+                if !self.offer_host_data(data, relay_wake, exit_state) {
+                    return Ok(PumpOutcome::Finished(RelayExitMode::Graceful));
+                }
+                if self.pending_host_data.is_none() {
+                    did_work = true;
+                }
+            }
+            if !self.host_read_closed && self.pending_host_data.is_none() {
+                match (&self.stream).read(read_buffer) {
+                    Ok(0) => {
+                        self.host_read_closed = true;
+                        exit_state.store(RelayExitMode::HalfClosed);
+                        exit_state.notify(relay_wake);
+                        did_work = true;
+                    }
+                    Ok(read) => {
+                        if !self.offer_host_data(
+                            read_buffer[..read].to_vec(),
+                            relay_wake,
+                            exit_state,
+                        ) {
+                            return Ok(PumpOutcome::Finished(RelayExitMode::Graceful));
+                        }
+                        did_work = true;
+                    }
+                    Err(err)
+                        if err.kind() == io::ErrorKind::WouldBlock
+                            || err.kind() == io::ErrorKind::Interrupted => {}
                     Err(err) => return Err(err),
                 }
             }
 
-            if *offset >= payload.len() {
-                pending_guest_data = None;
+            if !did_work {
+                // Read interest while the host may still send and the guest has
+                // room; write interest while a guest payload waits on a full
+                // host send buffer.
+                return Ok(PumpOutcome::Idle {
+                    read: !self.host_read_closed && self.pending_host_data.is_none(),
+                    write: self.pending_guest_data.is_some(),
+                });
             }
+            self.last_activity = Instant::now();
         }
+        Ok(PumpOutcome::Busy)
+    }
+}
 
-        if guest_channel_closed && pending_guest_data.is_none() && !guest_write_closed {
-            // The guest side closed its write half. Mirror that toward the
-            // remote peer only after all buffered guest bytes were written.
-            let _ = stream.shutdown(Shutdown::Write);
-            guest_write_closed = true;
-        }
-
-        // Both directions are done — the host stopped sending (host_read_closed)
-        // and the guest stopped sending and was fully flushed. Finish with a
-        // clean close; the poll loop tears the guest socket down.
-        if host_read_closed && guest_channel_closed && pending_guest_data.is_none() {
-            return Ok(RelayExitMode::Graceful);
-        }
-
-        // host -> guest, only while the host's send half is still open. On host
-        // read-EOF we do NOT tear the relay down: signal HalfClosed so the poll
-        // loop mirrors the FIN to the guest, then keep draining guest->host. A
-        // hijacked docker attach half-closes here (`shutdown(SHUT_WR)` with no
-        // stdin) while the daemon is still streaming its response back.
-        if !host_read_closed {
-            match stream.read(&mut read_buffer) {
-                Ok(0) => {
-                    host_read_closed = true;
-                    exit_state.store(RelayExitMode::HalfClosed);
-                    relay_wake.wake();
-                    did_work = true;
-                }
-                Ok(bytes_read) => {
-                    if to_smoltcp.send(read_buffer[..bytes_read].to_vec()).is_err() {
-                        return Ok(RelayExitMode::Graceful);
-                    }
-                    relay_wake.wake();
-                    did_work = true;
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                Err(err) => return Err(err),
-            }
-        }
-
-        if !did_work {
-            // Read interest while the host may still send; write interest
-            // while a guest payload waits on a full host send buffer.
-            let interest = Event::new(
-                HOST_STREAM_KEY,
-                !host_read_closed,
-                pending_guest_data.is_some(),
-            );
-            poller.modify(stream, interest)?;
-            events.clear();
-            poller.wait(&mut events, Some(RELAY_WAIT_BACKSTOP))?;
-            if host_read_closed && pending_guest_data.is_none() {
-                // Nothing reads or writes the host socket from here on, so
-                // nothing would notice it failing. epoll reports EPOLLERR and
-                // EPOLLHUP whatever the interest, so once the host resets, every
-                // wait returns at once and this loop spins until the guest
-                // closes. kqueue reports nothing, so the error is read as well.
-                if let Some(err) = stream.take_error()? {
-                    return Err(err);
-                }
-                if events.iter().any(|event| event.key == HOST_STREAM_KEY) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        "host TCP socket hung up",
-                    ));
+/// Drive one flow's pump on its own thread until the flow ends, waiting on
+/// `poller` whenever neither direction can make progress.
+fn relay_stream(
+    pump: RelayPump,
+    poller: &Arc<polling::Poller>,
+    relay_wake: &WakePipe,
+    exit_state: &RelayExitState,
+) -> io::Result<RelayExitMode> {
+    let mut registered = RegisteredPump::new(pump, poller.clone())?;
+    let pump = &mut registered.pump;
+    let mut events = Events::new();
+    let mut read_buffer = vec![0u8; RELAY_BUFFER_BYTES];
+    loop {
+        match pump.pump(&mut read_buffer, relay_wake, exit_state, usize::MAX)? {
+            PumpOutcome::Finished(mode) => return Ok(mode),
+            PumpOutcome::Busy => continue,
+            PumpOutcome::Idle { read, write } => {
+                poller.modify(&pump.stream, Event::new(HOST_STREAM_KEY, read, write))?;
+                events.clear();
+                poller.wait(&mut events, Some(RELAY_WAIT_BACKSTOP))?;
+                if pump.only_waiting_for_guest() {
+                    pump.check_host_error(events.iter().any(|event| event.key == HOST_STREAM_KEY))?;
                 }
             }
-        } else {
-            last_activity = Instant::now();
         }
     }
 }
@@ -1508,6 +1977,18 @@ fn send_guest_payload(connection: &mut TrackedConnection, payload: Vec<u8>) -> b
 }
 
 fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnection) {
+    flush_proxy_payloads(socket, connection);
+    // A relay that found the host->guest channel full waits for this drain.
+    if connection
+        .exit_state
+        .host_blocked
+        .swap(false, Ordering::AcqRel)
+    {
+        connection.relay_waker.wake();
+    }
+}
+
+fn flush_proxy_payloads(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnection) {
     // smoltcp send windows may accept only part of an inbound host payload.
     // `buffered_proxy_data` remembers the unwritten remainder so the next poll
     // iteration can continue where it left off instead of dropping bytes.
@@ -1686,28 +2167,22 @@ mod tests {
             &mut device,
             Instant::ZERO,
         );
-        let mut sockets = SocketSet::new(vec![]);
         let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
         let source = SocketAddr::from((Ipv4Addr::new(100, 96, 0, 2), 40_000));
         let destination = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 443));
-        assert!(table.create_tcp_socket(source, destination, &mut sockets));
-        let outbound_handle = *table.connections.keys().next().unwrap();
-        assert!(!sockets.get::<tcp::Socket>(outbound_handle).nagle_enabled());
+        assert!(table.create_tcp_socket(source, destination));
 
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (_accepted, _) = listener.accept().unwrap();
         let guest = SocketAddr::from((Ipv4Addr::new(100, 96, 0, 2), 8080));
-        assert!(table.create_published_socket(
-            &mut interface,
-            gateway,
-            guest,
-            client,
-            &mut sockets,
-        ));
+        assert!(table.create_published_socket(&mut interface, gateway, guest, client,));
         assert_eq!(table.connections.len(), 2);
-        for handle in table.connections.keys() {
-            assert!(!sockets.get::<tcp::Socket>(*handle).nagle_enabled());
+        for connection in table.connections.values() {
+            assert!(!connection
+                .set
+                .get::<tcp::Socket>(connection.handle)
+                .nagle_enabled());
         }
     }
 
@@ -1719,29 +2194,23 @@ mod tests {
 
         for stream in [outbound, accepted] {
             stream.set_nodelay(false).unwrap();
-            stream.set_nonblocking(true).unwrap();
-            let poller = Arc::new(polling::Poller::new().unwrap());
-            let registered = RegisteredStream::new(stream, poller).unwrap();
-            assert!(registered.stream.nodelay().unwrap());
+            prepare_host_stream(&stream).unwrap();
+            assert!(stream.nodelay().unwrap());
         }
     }
 
     #[test]
     fn relay_accepts_burst_beyond_old_256_limit_and_honors_configured_cap() {
         use super::*;
-        let mut sockets = SocketSet::new(vec![]);
         let mut table = TcpRelayTable::new(Some(320), EgressPolicy::unrestricted(), vec![], None);
         let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
         for port in 40_000..40_320 {
             let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)), port);
-            assert!(
-                table.create_tcp_socket(source, destination, &mut sockets),
-                "flow {port}"
-            );
+            assert!(table.create_tcp_socket(source, destination), "flow {port}");
         }
         assert_eq!(table.active_connections(), 320);
         let overflow = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)), 40_320);
-        assert!(!table.create_tcp_socket(overflow, destination, &mut sockets));
+        assert!(!table.create_tcp_socket(overflow, destination));
         assert_eq!(table.active_connections(), 320);
         assert!(
             TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None).capacity() >= 320
@@ -1775,13 +2244,27 @@ mod tests {
     }
 
     fn test_connection(to_proxy: SyncSender<Vec<u8>>) -> TrackedConnection {
+        test_connection_with(
+            to_proxy,
+            tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; 1024]),
+                tcp::SocketBuffer::new(vec![0; 1024]),
+            ),
+        )
+    }
+
+    fn test_connection_with(
+        to_proxy: SyncSender<Vec<u8>>,
+        socket: tcp::Socket<'static>,
+    ) -> TrackedConnection {
         let (_from_proxy_tx, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let mut set = SocketSet::new(Vec::new());
+        let handle = set.add(socket);
         TrackedConnection {
-            source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12_345),
             destination: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 80),
             to_proxy: Some(ToProxy {
                 sender: Some(to_proxy),
-                wake: WakePipe::new(),
+                wake: RelayWaker::standalone(),
             }),
             from_proxy,
             pending_proxy_endpoints: None,
@@ -1793,6 +2276,15 @@ mod tests {
             exit_state: RelayExitState::new(),
             reserved_published_port: None,
             opened_at: Instant::now(),
+            relay_waker: RelayWaker::standalone(),
+            guest_closed_keepalive: false,
+            set,
+            handle,
+            key: (
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12_345),
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 80),
+            ),
+            next_poll: None,
         }
     }
 
@@ -1836,7 +2328,7 @@ mod tests {
         destination: SocketAddr,
         watch_opening: Option<EgressPolicy>,
     ) -> (ToProxy, Receiver<Vec<u8>>, RelayExitState) {
-        let (to_proxy, from_smoltcp, proxy_wake) = proxy_channel();
+        let (to_proxy, from_smoltcp, proxy_wake) = proxy_channel(RelayWaker::standalone());
         let (to_smoltcp, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let exit_state = RelayExitState::new();
         spawn_tcp_relay(
@@ -2153,23 +2645,17 @@ mod tests {
     #[test]
     fn guest_fin_drops_to_proxy_channel() {
         let (to_proxy, from_smoltcp) = mpsc::sync_channel(1);
-        let connection = test_connection(to_proxy);
         let rx_buffer = tcp::SocketBuffer::new(vec![0; 1024]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0; 1024]);
         let socket = tcp::Socket::new(rx_buffer, tx_buffer);
         // A closed or FIN-received socket has may_recv() == false
         assert!(!socket.may_recv());
+        let mut connection = test_connection_with(to_proxy, socket);
 
-        let mut sockets = SocketSet::new(vec![]);
-        let handle = sockets.add(socket);
-
-        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
-        table.connections.insert(handle, connection);
-
-        table.relay_data(&mut sockets);
+        relay_flow_data(&mut connection, &mut [0u8; RELAY_BUFFER_BYTES]);
 
         // to_proxy in the connection must have been dropped (set to None)
-        assert!(table.connections.get(&handle).unwrap().to_proxy.is_none());
+        assert!(connection.to_proxy.is_none());
         // The receiver on the relay thread side must see Disconnected
         assert_eq!(from_smoltcp.try_recv(), Err(TryRecvError::Disconnected));
     }
@@ -2208,7 +2694,7 @@ mod tests {
                 from_smoltcp: from_smoltcp_rx,
                 to_smoltcp: to_smoltcp_tx,
                 exit_state: exit_state.clone(),
-                proxy_wake: WakePipe::new(),
+                proxy_wake: RelayWaker::standalone(),
                 watch_opening: None,
             },
             wake_pipe,
@@ -2260,7 +2746,7 @@ mod tests {
                 from_smoltcp: from_smoltcp_rx,
                 to_smoltcp: to_smoltcp_tx,
                 exit_state: exit_state.clone(),
-                proxy_wake: WakePipe::new(),
+                proxy_wake: RelayWaker::standalone(),
                 watch_opening: None,
             },
             wake_pipe,
@@ -2435,7 +2921,7 @@ mod tests {
                     from_smoltcp: guest_rx,
                     to_smoltcp: reply_tx,
                     exit_state: state.clone(),
-                    proxy_wake: WakePipe::new(),
+                    proxy_wake: RelayWaker::standalone(),
                     watch_opening: None,
                 },
                 Arc::new(WakePipe::new()),
@@ -2513,7 +2999,7 @@ mod tests {
                         from_smoltcp: guest_rx,
                         to_smoltcp: reply_tx,
                         exit_state: state.clone(),
-                        proxy_wake: WakePipe::new(),
+                        proxy_wake: RelayWaker::standalone(),
                         watch_opening: None,
                     },
                     Arc::new(WakePipe::new()),
@@ -2563,7 +3049,7 @@ mod tests {
                     from_smoltcp: receiver,
                     to_smoltcp: reply,
                     exit_state: RelayExitState::new(),
-                    proxy_wake: WakePipe::new(),
+                    proxy_wake: RelayWaker::standalone(),
                     watch_opening: None,
                 },
                 Arc::new(WakePipe::new()),
@@ -2578,20 +3064,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn aborted_connection_sends_rst_to_the_guest_before_cleanup() {
-        use smoltcp::iface::{Config, Interface};
-        use smoltcp::phy::{Loopback, Medium};
-        use smoltcp::time::Instant;
-        use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+    /// An Ethernet link both ends of a test flow share.
+    struct TestLink {
+        queue: std::collections::VecDeque<Vec<u8>>,
+    }
 
-        let mut device = Loopback::new(Medium::Ethernet);
+    struct TestRx(Vec<u8>);
+    struct TestTx<'a>(&'a mut std::collections::VecDeque<Vec<u8>>);
+
+    impl smoltcp::phy::RxToken for TestRx {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+            f(&self.0)
+        }
+    }
+
+    impl smoltcp::phy::TxToken for TestTx<'_> {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let mut frame = vec![0; len];
+            let result = f(&mut frame);
+            self.0.push_back(frame);
+            result
+        }
+    }
+
+    impl Device for TestLink {
+        type RxToken<'a>
+            = TestRx
+        where
+            Self: 'a;
+        type TxToken<'a>
+            = TestTx<'a>
+        where
+            Self: 'a;
+
+        fn receive(
+            &mut self,
+            _: smoltcp::time::Instant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            let frame = self.queue.pop_front()?;
+            Some((TestRx(frame), TestTx(&mut self.queue)))
+        }
+
+        fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+            Some(TestTx(&mut self.queue))
+        }
+
+        fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+            let mut caps = smoltcp::phy::DeviceCapabilities::default();
+            caps.medium = smoltcp::phy::Medium::Ethernet;
+            caps.max_transmission_unit = 1514;
+            caps
+        }
+    }
+
+    /// An interface like the production gateway's: 100.96.0.1/30, accepting
+    /// flows to any destination.
+    fn test_interface(link: &mut TestLink) -> Interface {
+        use smoltcp::iface::Config;
+        use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
         let mut interface = Interface::new(
             Config::new(HardwareAddress::Ethernet(EthernetAddress([
                 0x02, 0, 0, 0, 0, 1,
             ]))),
-            &mut device,
-            Instant::ZERO,
+            link,
+            smoltcp::time::Instant::ZERO,
         );
         interface.update_ip_addrs(|addresses| {
             addresses
@@ -2602,27 +3138,80 @@ mod tests {
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(100, 96, 0, 1))
             .unwrap();
-        // Same as the production interface: accept flows to arbitrary
-        // destinations so the relay's listen sockets can intercept them.
         interface.set_any_ip(true);
+        interface
+    }
 
-        let mut sockets = SocketSet::new(vec![]);
+    /// The `(source, destination)` of a TCP segment in an Ethernet frame.
+    fn tcp_tuple(frame: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+        use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, TcpPacket};
+        let ethernet = EthernetFrame::new_checked(frame).ok()?;
+        if ethernet.ethertype() != EthernetProtocol::Ipv4 {
+            return None;
+        }
+        let ip = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
+        if ip.next_header() != IpProtocol::Tcp {
+            return None;
+        }
+        let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+        Some((
+            SocketAddr::new(IpAddr::V4(ip.src_addr()), tcp.src_port()),
+            SocketAddr::new(IpAddr::V4(ip.dst_addr()), tcp.dst_port()),
+        ))
+    }
+
+    /// One pass of the poll loop: route every queued frame to its flow's set
+    /// (or the guest stand-in's), service the flows, let the guest send.
+    fn poll_round(
+        table: &mut TcpRelayTable,
+        interface: &mut Interface,
+        link: &mut TestLink,
+        guest: &mut SocketSet<'_>,
+        now_ms: i64,
+    ) -> Vec<NewTcpConnection> {
+        let now = smoltcp::time::Instant::from_millis(now_ms);
+        while let Some(frame) = link.queue.front() {
+            match tcp_tuple(frame)
+                .and_then(|(source, destination)| table.flow_for(source, destination))
+            {
+                Some(flow) => {
+                    table.ingress(flow, interface, link, now);
+                }
+                None => {
+                    let neighbor = tcp_tuple(frame).is_none();
+                    interface.poll_ingress_single(now, link, guest);
+                    if neighbor {
+                        table.touch_all();
+                    }
+                }
+            }
+        }
+        let new_connections = table.service(interface, link, now);
+        while !matches!(interface.poll_egress(now, link, guest), PollResult::None) {}
+        new_connections
+    }
+
+    #[test]
+    fn aborted_connection_sends_rst_to_the_guest_before_cleanup() {
+        use smoltcp::wire::IpAddress;
+        let mut link = TestLink {
+            queue: Default::default(),
+        };
+        let mut interface = test_interface(&mut link);
+        let mut guest = SocketSet::new(vec![]);
         let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
 
         // The "guest" dials an external destination; the relay pre-creates the
         // intercepting listen socket exactly like the poll loop does on SYN.
         let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
         let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1)), 40_000);
-        assert!(table.create_tcp_socket(source, destination, &mut sockets));
-
-        // Guest stand-in: a client socket running a real handshake against the
-        // intercepting socket over the loopback device.
-        let client_handle = sockets.add(tcp::Socket::new(
+        assert!(table.create_tcp_socket(source, destination));
+        let client = guest.add(tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; 4096]),
             tcp::SocketBuffer::new(vec![0u8; 4096]),
         ));
-        sockets
-            .get_mut::<tcp::Socket>(client_handle)
+        guest
+            .get_mut::<tcp::Socket>(client)
             .connect(
                 interface.context(),
                 (IpAddress::v4(192, 0, 2, 10), 443),
@@ -2630,69 +3219,85 @@ mod tests {
             )
             .unwrap();
 
-        let mut now_ms: i64 = 0;
-        let poll = |interface: &mut Interface,
-                    device: &mut Loopback,
-                    sockets: &mut SocketSet<'_>,
-                    now_ms: &mut i64| {
-            *now_ms += 10;
-            interface.poll(Instant::from_millis(*now_ms), device, sockets);
-        };
-
-        for _ in 0..10 {
-            poll(&mut interface, &mut device, &mut sockets, &mut now_ms);
-            if sockets.get::<tcp::Socket>(client_handle).state() == tcp::State::Established {
+        let mut now_ms = 0;
+        let mut new_connections = Vec::new();
+        for _ in 0..20 {
+            now_ms += 10;
+            new_connections.extend(poll_round(
+                &mut table,
+                &mut interface,
+                &mut link,
+                &mut guest,
+                now_ms,
+            ));
+            if !new_connections.is_empty()
+                && guest.get::<tcp::Socket>(client).state() == tcp::State::Established
+            {
                 break;
             }
         }
         assert_eq!(
-            sockets.get::<tcp::Socket>(client_handle).state(),
+            guest.get::<tcp::Socket>(client).state(),
             tcp::State::Established,
             "handshake must complete before the abort is simulated"
         );
-
-        // The host-side connect failed: the relay thread reports Abort. (The
-        // intercepting socket trails the client by the final ACK, so poll until
-        // the table observes it as Established.)
-        let mut new_connections = Vec::new();
-        for _ in 0..10 {
-            poll(&mut interface, &mut device, &mut sockets, &mut now_ms);
-            new_connections = table.take_new_connections(&mut sockets);
-            if !new_connections.is_empty() {
-                break;
-            }
-        }
         assert_eq!(new_connections.len(), 1);
+
+        // The host-side connect failed: the relay reports Abort. The aborted
+        // flow must keep its socket until the RST is on the wire, or the guest
+        // never learns and hangs until its own timeout.
         new_connections[0].exit_state.store(RelayExitMode::Abort);
-
-        // Poll-loop order under test: relay_data (abort) then cleanup_closed
-        // BEFORE the next egress flush. The aborted socket must survive cleanup
-        // with its RST still queued, or the guest never learns and hangs until
-        // its own timeout.
-        table.relay_data(&mut sockets);
-        table.cleanup_closed(&mut sockets);
-        assert!(
-            table.has_socket_for(&source, &destination),
-            "aborted socket was reaped before its RST was dispatched"
-        );
-
-        // The next flushes deliver the RST; the guest-side socket must observe
-        // the reset instead of staying Established.
-        for _ in 0..10 {
-            poll(&mut interface, &mut device, &mut sockets, &mut now_ms);
-            if sockets.get::<tcp::Socket>(client_handle).state() == tcp::State::Closed {
+        new_connections[0].exit_state.notify(&WakePipe::new());
+        for _ in 0..20 {
+            now_ms += 10;
+            poll_round(&mut table, &mut interface, &mut link, &mut guest, now_ms);
+            if guest.get::<tcp::Socket>(client).state() == tcp::State::Closed {
                 break;
             }
         }
         assert_eq!(
-            sockets.get::<tcp::Socket>(client_handle).state(),
+            guest.get::<tcp::Socket>(client).state(),
             tcp::State::Closed,
             "guest never received the RST for the aborted connection"
         );
-
-        // With the RST on the wire the connection is finally reaped.
-        table.cleanup_closed(&mut sockets);
         assert!(!table.has_socket_for(&source, &destination));
+    }
+
+    #[test]
+    fn idle_flows_are_not_serviced_on_every_pass() {
+        use smoltcp::wire::IpAddress;
+        let mut link = TestLink {
+            queue: Default::default(),
+        };
+        let mut interface = test_interface(&mut link);
+        let mut guest = SocketSet::new(vec![]);
+        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+        let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        for port in 40_000..40_050u16 {
+            let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1)), port);
+            assert!(table.create_tcp_socket(source, destination));
+            let client = guest.add(tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; 1024]),
+                tcp::SocketBuffer::new(vec![0u8; 1024]),
+            ));
+            guest
+                .get_mut::<tcp::Socket>(client)
+                .connect(
+                    interface.context(),
+                    (IpAddress::v4(192, 0, 2, 10), 443),
+                    port,
+                )
+                .unwrap();
+        }
+        let mut established = 0;
+        for now_ms in (10..400).step_by(10) {
+            established +=
+                poll_round(&mut table, &mut interface, &mut link, &mut guest, now_ms).len();
+        }
+        assert_eq!(established, 50);
+        // Every flow is open and quiet: nothing is queued for the next pass.
+        assert!(table.touched.is_empty());
+        assert!(table.poll_queue.take().is_empty());
     }
 
     #[test]
@@ -2706,25 +3311,11 @@ mod tests {
 
     #[test]
     fn published_connection_refused_by_the_guest_is_noted_for_its_port() {
-        use smoltcp::iface::{Config, Interface};
-        use smoltcp::phy::{Loopback, Medium};
-        use smoltcp::time::Instant;
-        use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
-
-        let mut device = Loopback::new(Medium::Ethernet);
-        let mut interface = Interface::new(
-            Config::new(HardwareAddress::Ethernet(EthernetAddress([
-                0x02, 0, 0, 0, 0, 1,
-            ]))),
-            &mut device,
-            Instant::ZERO,
-        );
+        let mut link = TestLink {
+            queue: Default::default(),
+        };
+        let mut interface = test_interface(&mut link);
         let gateway = Ipv4Addr::new(100, 96, 0, 1);
-        interface.update_ip_addrs(|addresses| {
-            addresses
-                .push(IpCidr::new(IpAddress::from(gateway), 30))
-                .unwrap();
-        });
 
         // Host side of the published connection: any connected stream will do.
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -2734,21 +3325,20 @@ mod tests {
         // Nothing listens on the "guest" port, so the SYN is answered with RST,
         // exactly as a guest kernel answers when the server is bound to
         // 127.0.0.1 only.
-        let mut sockets = SocketSet::new(vec![]);
+        let mut guest = SocketSet::new(vec![]);
         let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
-        let guest = SocketAddr::new(IpAddr::V4(gateway), 8888);
-        assert!(table.create_published_socket(
-            &mut interface,
-            gateway,
-            guest,
-            host_client,
-            &mut sockets
-        ));
+        let guest_port = SocketAddr::new(IpAddr::V4(gateway), 8888);
+        assert!(table.create_published_socket(&mut interface, gateway, guest_port, host_client));
 
         for now_ms in 1..=20 {
-            interface.poll(Instant::from_millis(now_ms * 10), &mut device, &mut sockets);
-            assert!(table.take_new_connections(&mut sockets).is_empty());
-            table.cleanup_closed(&mut sockets);
+            assert!(poll_round(
+                &mut table,
+                &mut interface,
+                &mut link,
+                &mut guest,
+                now_ms * 10
+            )
+            .is_empty());
             if table.active_connections() == 0 {
                 break;
             }

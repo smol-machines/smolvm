@@ -57,7 +57,7 @@ use crate::egress::EgressPolicy;
 use crate::icmp_relay;
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
-use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
+use crate::tcp_relay::TcpRelayTable;
 use crate::udp_relay;
 use crate::virtio_net_log;
 use smoltcp::iface::{
@@ -152,11 +152,15 @@ fn parse_tcp_relay_capacity(value: &str) -> Option<usize> {
     value
         .parse::<usize>()
         .ok()
-        .filter(|capacity| (1..=4096).contains(capacity))
+        .filter(|capacity| (1..=MAX_TCP_RELAY_CAPACITY).contains(capacity))
 }
 
-/// Bound the per-machine host socket, thread, and guest buffer budget even when
-/// an operator opts into more than the default 512 concurrent TCP relays.
+/// Upper bound on `SMOLVM_TCP_RELAY_CAPACITY`: each flow holds a host socket
+/// and guest-facing buffers, so even an operator override stays bounded.
+const MAX_TCP_RELAY_CAPACITY: usize = 1 << 20;
+
+/// Concurrent guest TCP flows one machine may hold when the operator sets
+/// `SMOLVM_TCP_RELAY_CAPACITY`; the default is the relay table's own.
 fn tcp_relay_capacity_from_env() -> Option<usize> {
     let value = match std::env::var("SMOLVM_TCP_RELAY_CAPACITY") {
         Ok(value) => value,
@@ -169,7 +173,7 @@ fn tcp_relay_capacity_from_env() -> Option<usize> {
     match parse_tcp_relay_capacity(&value) {
         Some(capacity) => Some(capacity),
         _ => {
-            tracing::warn!(%value, "SMOLVM_TCP_RELAY_CAPACITY must be between 1 and 4096; using default");
+            tracing::warn!(%value, max = MAX_TCP_RELAY_CAPACITY, "SMOLVM_TCP_RELAY_CAPACITY must be between 1 and the max; using default");
             None
         }
     }
@@ -181,7 +185,17 @@ enum FrameAction {
         source: SocketAddr,
         destination: SocketAddr,
     },
+    /// Any other guest TCP segment: delivered to its flow's own socket set
+    /// when it has one, otherwise to the shared set (DNS over TCP, or a
+    /// segment for no flow, which smoltcp answers with a reset).
+    Tcp {
+        source: SocketAddr,
+        destination: SocketAddr,
+    },
     DnsQuery,
+    /// ARP or IPv6 neighbor discovery: TCP flows waiting on the guest's link
+    /// address are polled again once it is known.
+    Neighbor,
     /// Non-DNS guest UDP, relayed to a host socket (see `udp_relay`).
     UdpFlow {
         destination: SocketAddr,
@@ -293,6 +307,14 @@ fn run_network_stack(
         IpAddr::V6(link_local_from_mac(config.gateway_mac)),
     ];
     let relay_wake = Arc::new(queues.relay_wake.clone());
+    // One host thread pumps every TCP flow; a flow costs only its host socket.
+    let reactor = {
+        let shutdown_queues = queues.clone();
+        crate::tcp_reactor::RelayReactor::start(
+            relay_wake.clone(),
+            Arc::new(move || shutdown_queues.is_shutting_down()),
+        )
+    };
     let mut relays = TcpRelayTable::new(
         tcp_relay_capacity_from_env(),
         egress.clone(),
@@ -301,6 +323,13 @@ fn run_network_stack(
     )
     .with_published_port_seed(port_seed)
     .with_intercept(config.intercept);
+    match reactor {
+        Ok(reactor) => relays = relays.with_reactor(reactor),
+        Err(error) => virtio_net_log!(
+            "virtio-net: could not start the shared TCP relay ({}); each connection gets its own thread",
+            error
+        ),
+    }
     let datagram_egress = if config.intercept.is_some_and(|mode| mode.all_tcp()) {
         egress.deny_all_datagrams()
     } else {
@@ -391,20 +420,44 @@ fn run_network_stack(
                     source,
                     destination,
                 } => {
-                    virtio_net_log!(
+                    tracing::debug!(
                         "virtio-net: guest TCP SYN source={} destination={}",
                         source,
                         destination
                     );
                     if !relays.has_socket_for(&source, &destination) {
-                        relays.create_tcp_socket(source, destination, &mut sockets);
+                        relays.create_tcp_socket(source, destination);
                     }
+                    // No flow (refused or denied): the shared set has no socket
+                    // for it either, so smoltcp answers the SYN with a reset.
+                    let result = match relays.flow_for(source, destination) {
+                        Some(flow) => relays.ingress(flow, &mut interface, &mut device, now),
+                        None => interface.poll_ingress_single(now, &mut device, &mut sockets),
+                    };
+                    if matches!(result, PollIngressSingleResult::None) {
+                        device.drop_staged_frame();
+                    }
+                }
+                FrameAction::Tcp {
+                    source,
+                    destination,
+                } => {
+                    let result = match relays.flow_for(source, destination) {
+                        Some(flow) => relays.ingress(flow, &mut interface, &mut device, now),
+                        None => interface.poll_ingress_single(now, &mut device, &mut sockets),
+                    };
+                    if matches!(result, PollIngressSingleResult::None) {
+                        device.drop_staged_frame();
+                    }
+                }
+                FrameAction::Neighbor => {
                     if matches!(
                         interface.poll_ingress_single(now, &mut device, &mut sockets),
                         PollIngressSingleResult::None
                     ) {
                         device.drop_staged_frame();
                     }
+                    relays.touch_all();
                 }
                 FrameAction::DnsQuery | FrameAction::Passthrough => {
                     if matches!(
@@ -474,7 +527,6 @@ fn run_network_stack(
             &mut tcp_receiver,
             &mut relays,
             &mut interface,
-            &mut sockets,
             config.gateway_ipv4,
             config.guest_ipv4,
         );
@@ -485,9 +537,10 @@ fn run_network_stack(
         interface.poll_maintenance(now);
         wake_guest_if_needed(&queues, &device);
 
-        // Move payloads between established smoltcp TCP sockets and host relay
-        // threads, and service the DNS gateway socket.
-        relays.relay_data(&mut sockets);
+        // Service the TCP flows with work: payloads to and from their host
+        // relays, their output to the guest, and their timers.
+        let new_connections = relays.service(&mut interface, &mut device, now);
+        wake_guest_if_needed(&queues, &device);
         // Enqueue guest DNS queries to the offload thread (or answer blocked
         // ones locally), then deliver any answers it has produced back to the
         // guest. Neither step blocks on the upstream resolver.
@@ -568,16 +621,14 @@ fn run_network_stack(
 
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
-        for connection in relays.take_new_connections(&mut sockets) {
+        for connection in new_connections {
             relay_spawn_attempts = relay_spawn_attempts.saturating_add(1);
-            if spawn_tcp_relay(connection, relay_wake.clone()).is_ok() {
+            if relays.start_relay(connection, relay_wake.clone()).is_ok() {
                 relay_spawn_successes = relay_spawn_successes.saturating_add(1);
             } else {
                 relay_spawn_failures = relay_spawn_failures.saturating_add(1);
             }
         }
-
-        relays.cleanup_closed(&mut sockets);
 
         // Open-flow telemetry for the machine list, taken from the relay
         // table on a slow cadence so the per-packet path stays untouched.
@@ -610,9 +661,17 @@ fn run_network_stack(
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
         wake_guest_if_needed(&queues, &device);
 
-        let timeout = interface
+        let shared_delay = interface
             .poll_delay(now, &sockets)
-            .map(|duration| Duration::from_millis(duration.total_millis().min(u32::MAX as u64)));
+            .map(|d| d.total_millis());
+        let flow_delay = relays
+            .next_timer()
+            .map(|at| at.saturating_sub(now.total_millis()).max(0) as u64);
+        let timeout = match (shared_delay, flow_delay) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+        .map(|millis| Duration::from_millis(millis.min(u32::MAX as u64)));
         let timeout = match timeout {
             Some(timeout) => Some(timeout),
             None => Some(Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64)),
@@ -861,7 +920,6 @@ fn relay_accepted_tcp_connection(
     tcp_receiver: &mut Option<Receiver<AcceptedTcpConnection>>,
     relays: &mut TcpRelayTable,
     interface: &mut Interface,
-    sockets: &mut SocketSet<'_>,
     gateway_ipv4: Ipv4Addr,
     guest_ipv4: Ipv4Addr,
 ) {
@@ -882,7 +940,7 @@ fn relay_accepted_tcp_connection(
                 Ok(connection) => {
                     let guest_destination =
                         SocketAddr::new(std::net::IpAddr::V4(guest_ipv4), connection.guest_port);
-                    virtio_net_log!(
+                    tracing::debug!(
                         "virtio-net: accepted published TCP connection peer={} host_port={} guest_destination={}",
                         connection.peer_addr,
                         connection.host_port,
@@ -893,7 +951,6 @@ fn relay_accepted_tcp_connection(
                         gateway_ipv4,
                         guest_destination,
                         connection.stream,
-                        sockets,
                     ) {
                         tracing::warn!(
                             host_port = connection.host_port,
@@ -1441,10 +1498,19 @@ fn classify_guest_frame(
                 ipv6.payload(),
             )
         }
+        EthernetProtocol::Arp => return FrameAction::Neighbor,
         _ => return FrameAction::Passthrough,
     };
 
     match protocol {
+        // Router/neighbor solicitation and advertisement, and redirect.
+        smoltcp::wire::IpProtocol::Icmpv6
+            if transport
+                .first()
+                .is_some_and(|kind| (133..=137).contains(kind)) =>
+        {
+            FrameAction::Neighbor
+        }
         smoltcp::wire::IpProtocol::Tcp => {
             let tcp = match TcpPacket::new_checked(transport) {
                 Ok(packet) => packet,
@@ -1465,7 +1531,10 @@ fn classify_guest_frame(
                     }
                 }
             } else {
-                FrameAction::Passthrough
+                FrameAction::Tcp {
+                    source: SocketAddr::new(src_ip, tcp.src_port()),
+                    destination: SocketAddr::new(dst_ip, tcp.dst_port()),
+                }
             }
         }
         smoltcp::wire::IpProtocol::Udp => {
@@ -1657,7 +1726,9 @@ mod relay_capacity_tests {
     fn relay_capacity_rejects_unbounded_or_invalid_values() {
         assert_eq!(parse_tcp_relay_capacity("320"), Some(320));
         assert_eq!(parse_tcp_relay_capacity("4096"), Some(4096));
-        for value in ["0", "4097", "-1", "100000000000000000000", "bad"] {
+        assert_eq!(parse_tcp_relay_capacity("200000"), Some(200_000));
+        assert_eq!(parse_tcp_relay_capacity("1048576"), Some(1_048_576));
+        for value in ["0", "1048577", "-1", "100000000000000000000", "bad"] {
             assert_eq!(parse_tcp_relay_capacity(value), None);
         }
     }

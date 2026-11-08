@@ -340,6 +340,70 @@ pub fn harden_self() {
     }
 }
 
+/// Raise this process's open-file soft limit as far as the host allows and
+/// return the limit now in force (`None` where there is no such limit).
+///
+/// A machine's VMM holds one host socket per guest connection (TSI and
+/// virtio-net alike), so this limit caps how many connections a guest can
+/// have open at once. The soft limit goes to the hard limit; macOS refuses
+/// an unlimited soft limit on older releases, so there it is capped at
+/// `kern.maxfilesperproc`, the per-process ceiling only root can raise.
+#[cfg(unix)]
+pub fn raise_nofile_limit() -> Option<libc::rlim_t> {
+    // SAFETY: getrlimit/setrlimit on a local struct.
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        let wanted = match macos_max_files_per_process() {
+            Some(per_process) => limit.rlim_max.min(per_process),
+            None => limit.rlim_max,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let wanted = limit.rlim_max;
+        if wanted > limit.rlim_cur {
+            let raised = libc::rlimit {
+                rlim_cur: wanted,
+                rlim_max: limit.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                limit.rlim_cur = wanted;
+            }
+        }
+        Some(limit.rlim_cur)
+    }
+}
+
+/// No per-process open-file limit to raise on this platform.
+#[cfg(not(unix))]
+pub fn raise_nofile_limit() -> Option<u64> {
+    None
+}
+
+/// `kern.maxfilesperproc`: the most files one macOS process may hold.
+#[cfg(target_os = "macos")]
+fn macos_max_files_per_process() -> Option<libc::rlim_t> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated and `value`/`size` describe a
+    // writable c_int.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value as libc::rlim_t)
+}
+
 /// `PR_SET_PTRACER` / `PR_SET_PTRACER_ANY` (yama LSM; absent from the `libc`
 /// crate). Opting in lets any same-uid process pread `/proc/<pid>/mem` under
 /// `ptrace_scope=1` — used so a forkable VM's CUDA clone workers (children of
@@ -6053,5 +6117,33 @@ mod oom_victim_order_tests {
         );
         assert_eq!(oom_score_adj_for(true, false), -500, "a branch source");
         assert_eq!(oom_score_adj_for(false, false), 0, "a plain machine");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod nofile_limit_tests {
+    use super::*;
+
+    #[test]
+    fn the_open_file_limit_rises_to_the_hard_limit_or_the_macos_cap() {
+        let raised = raise_nofile_limit().expect("getrlimit works");
+        // SAFETY: getrlimit on a local struct.
+        let hard = unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            assert_eq!(
+                limit.rlim_cur, raised,
+                "the returned limit is the one in force"
+            );
+            limit.rlim_max
+        };
+        #[cfg(target_os = "macos")]
+        let wanted = macos_max_files_per_process().map_or(hard, |cap| hard.min(cap));
+        #[cfg(not(target_os = "macos"))]
+        let wanted = hard;
+        assert_eq!(raised, wanted);
     }
 }

@@ -69,7 +69,8 @@ impl<S> BoundSockets<S> {
 pub fn bind_tcp(port: u16) -> io::Result<BoundSockets<TcpListener>> {
     bind_with(port, publish_addr(), |addr| {
         let socket = new_socket(addr, Type::STREAM, Protocol::TCP)?;
-        socket.listen(1024)?;
+        // The kernel caps this at somaxconn; ask for as much as it allows.
+        socket.listen(i32::MAX)?;
         Ok(socket.into())
     })
 }
