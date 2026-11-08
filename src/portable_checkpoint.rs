@@ -871,6 +871,20 @@ pub fn restore_from_path_at(
     artifact: &Path,
     at: Option<&str>,
 ) -> Result<()> {
+    restore_from_path_with(db, name, artifact, at, Default::default())
+}
+
+/// [`restore_from_path_at`] with options for the restored machine, resolved
+/// against what the checkpoint fixes by the rules every creation path uses
+/// ([`crate::machine_spec`]): an option a live restore cannot apply is
+/// refused by name.
+pub fn restore_from_path_with(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    artifact: &Path,
+    at: Option<&str>,
+    spec: crate::machine_spec::CreateSpec,
+) -> Result<()> {
     let mut phase = std::time::Instant::now();
     crate::data::validate_vm_name(name, "machine name")
         .map_err(|reason| Error::config("restore checkpoint", reason))?;
@@ -938,8 +952,7 @@ pub fn restore_from_path_at(
         committed: false,
     };
 
-    restored_host_mounts(checkpoint)?;
-    let mut record = restored_record(name, &manifest, checkpoint)?;
+    let mut record = restored_record_with(name, &manifest, checkpoint, spec)?;
     let vm_data = crate::agent::vm_data_dir(name);
     let cache_dir = crate::agent::machine_layers_cache_dir(name);
     let result = (|| -> Result<()> {
@@ -1400,110 +1413,29 @@ pub fn restored_dns_options(checkpoint: &PortableCheckpointManifest) -> Result<V
     Ok(options)
 }
 
+#[cfg(test)]
 fn restored_record(
     name: &str,
     manifest: &PackManifest,
     checkpoint: &PortableCheckpointManifest,
 ) -> Result<VmRecord> {
-    let network = checkpoint.network.as_ref();
-    let mut record = VmRecord::new(
-        name.to_string(),
-        checkpoint.cpus,
-        checkpoint.memory_mib,
-        checkpoint
-            .host_mounts
-            .iter()
-            .map(|mount| {
-                (
-                    mount.host_path.clone(),
-                    mount.guest_path.clone(),
-                    mount.read_only,
-                )
-            })
-            .collect(),
-        network
-            .into_iter()
-            .flat_map(|network| network.ports.iter())
-            .map(|port| (port.host, port.guest))
-            .collect(),
-        network.is_some_and(|network| network.enabled),
-    );
-    record.storage_gb = checkpoint.storage_gib;
-    record.overlay_gb = checkpoint.overlay_gib;
-    record.disk_durability = restored_disk_durability(checkpoint)?;
-    record.allowed_cidrs = network.and_then(|network| network.allowed_cidrs.clone());
-    record.egress_rules = network.map_or_else(Vec::new, |network| network.egress_rules.clone());
-    smolvm_network::EgressPolicy::unrestricted()
-        .with_rules(&record.egress_rules)
-        .map_err(|reason| Error::config("restore checkpoint egress rules", reason))?;
-    record.mediated_egress_required =
-        network.is_some_and(|network| network.mediated_egress_required);
-    record.external_interceptor_required = record.mediated_egress_required;
-    record.dns_filter_hosts = network.and_then(|network| network.dns_filter_hosts.clone());
-    if let Some(policy) = network.and_then(|network| network.credential_policy.clone()) {
-        // The artifact is untrusted: hold its policy to the same rules create
-        // enforces, so a hand-edited checkpoint cannot carry a shape the CLI
-        // would refuse. The policy holds no secrets, and its values are never
-        // resolved from this host's environment: the artifact chose both the
-        // variable and the destination, so a host secret could go anywhere.
-        // They come only from `supply_credential_values`. The placeholders come
-        // along unchanged so the captured workload's copies keep matching.
-        policy
-            .validate(record.dns_filter_hosts.as_deref())
-            .map_err(|error| Error::config("restore checkpoint credentials", error.to_string()))?;
-        record.credential_placeholders = network
-            .map(|network| network.credential_placeholders.clone())
-            .unwrap_or_default();
-        record.credential_policy = Some(policy);
-        record.credentials_supplied_by_api = true;
-    }
-    record.network_backend = restored_network_backend(checkpoint)?;
-    record.dns = network
-        .and_then(|network| network.dns.as_deref())
-        .map(str::parse)
-        .transpose()
-        .map_err(|error: std::net::AddrParseError| {
-            Error::config("restore checkpoint DNS", error.to_string())
-        })?;
-    record.dns_options = restored_dns_options(checkpoint)?;
-    record.network_name = network.and_then(|network| network.network_name.clone());
-    record.guest_subnet = restored_guest_subnet(checkpoint)?;
-    // The restored machine continues this checkpoint's history.
-    record.checkpoint_head = checkpoint
-        .lineage
-        .as_ref()
-        .map(|lineage| lineage.id.clone());
-    record.entrypoint = manifest.entrypoint.clone();
-    record.cmd = manifest.cmd.clone();
-    record.env = crate::util::parse_env_list(&manifest.env);
-    record.workdir = manifest.workdir.clone();
-    record.secret_refs = manifest.secret_refs.clone();
-    for (key, reference) in &record.secret_refs {
-        crate::secrets::validate_ref(reference, crate::secrets::ResolutionScope::Untrusted)
-            .map_err(|error| {
-                Error::config(
-                    "restore checkpoint",
-                    format!("secret '{key}': {error} (checkpoints may not carry host secret refs)"),
-                )
-            })?;
-    }
-    if let Some(workload) = &checkpoint.workload {
-        record.image = Some(workload.image.clone());
-        record.user = workload.user.clone();
-        record.fork_overlay_owner = Some(workload.overlay_owner.clone());
-        record.restart.policy = workload
-            .restart_policy
-            .parse()
-            .map_err(|error: String| Error::config("restore checkpoint restart policy", error))?;
-        record.restart.max_retries = workload.restart_max_retries;
-        record.restart.max_backoff_secs = workload.restart_max_backoff_secs;
-    }
-    // The live guest already contains the initialized workload. Re-running
-    // image pull/init on its first start would duplicate side effects.
-    record.init_completed = true;
-    record.forkable = true;
-    record.host_uid_owner = Some(name.to_string());
-    Ok(record)
+    restored_record_with(name, manifest, checkpoint, Default::default())
+}
+
+/// The record of a machine restored from `checkpoint`, by the rules every
+/// creation path uses.
+fn restored_record_with(
+    name: &str,
+    manifest: &PackManifest,
+    checkpoint: &PortableCheckpointManifest,
+    spec: crate::machine_spec::CreateSpec,
+) -> Result<VmRecord> {
+    crate::machine_spec::resolve(
+        crate::machine_spec::SpecSource::Checkpoint(manifest, checkpoint),
+        spec,
+        crate::machine_spec::Caller::Embedded,
+    )?
+    .to_record(name)
 }
 
 struct SavedVmPause {
@@ -2617,6 +2549,8 @@ fn capture_with_completion(
         guest_cpu_features,
         cache_disk: cache_disk.map(|(_, identity)| identity),
         agent_rootfs_digest: Some(agent_rootfs_digest),
+        nested_virt: vm.nested_virt.unwrap_or(false),
+        settings: checkpoint_settings(vm),
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
@@ -3795,6 +3729,11 @@ pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> 
     if vm.docker_socket {
         unsupported.push("Docker socket forwarding");
     }
+    // An attached host disk is a device the restored guest would find
+    // missing; its contents never travel with the checkpoint.
+    if !vm.disks.is_empty() {
+        unsupported.push("attached host disks");
+    }
     if unsupported.is_empty() {
         return Ok(());
     }
@@ -3852,7 +3791,7 @@ fn checkpoint_host_mounts(vm: &VmRecord) -> Vec<smolvm_pack::format::CheckpointH
 
 /// The disk durability a checkpoint was captured with. One captured before it
 /// was recorded restores with the default, `full`.
-fn restored_disk_durability(
+pub(crate) fn restored_disk_durability(
     checkpoint: &PortableCheckpointManifest,
 ) -> Result<crate::data::resources::DiskDurability> {
     match checkpoint.disk_durability.as_deref() {
@@ -3972,6 +3911,14 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
                 guest: *guest,
             })
             .collect(),
+        udp_ports: vm
+            .udp_ports
+            .iter()
+            .map(|(host, guest)| CheckpointPort {
+                host: *host,
+                guest: *guest,
+            })
+            .collect(),
         backend,
         dns: vm.dns.map(|dns| dns.to_string()),
         dns_options: vm.dns_options.clone(),
@@ -3981,6 +3928,9 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         egress_rules: vm.egress_rules.clone(),
         mediated_egress_required: vm.mediated_egress_required,
         dns_filter_hosts: vm.dns_filter_hosts.clone(),
+        // The block is enforced on the host, outside the guest, so a restore
+        // without it would quietly open the private ranges to the workload.
+        block_private: vm.block_private.clone(),
         // The captured workload holds its placeholders (in its environment and
         // possibly its RAM), so the policy and the exact placeholders must
         // travel with the checkpoint or the restored machine runs with no
@@ -3989,6 +3939,21 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         // resolved from the restore host's environment.
         credential_policy: vm.credential_policy.clone().filter(|p| !p.is_empty()),
         credential_placeholders: vm.credential_placeholders.clone(),
+    }
+}
+
+/// Host-side settings the restored machine keeps from the captured one.
+fn checkpoint_settings(vm: &VmRecord) -> smolvm_pack::format::CheckpointSettings {
+    smolvm_pack::format::CheckpointSettings {
+        stop_signal: vm.stop_signal.clone(),
+        stop_timeout_secs: vm.stop_timeout_secs,
+        stop_on_exit: vm.stop_on_exit,
+        shm_size: vm.shm_size.clone(),
+        health_cmd: vm.health_cmd.clone(),
+        health_interval_secs: vm.health_interval_secs,
+        health_timeout_secs: vm.health_timeout_secs,
+        health_retries: vm.health_retries,
+        health_startup_grace_secs: vm.health_startup_grace_secs,
     }
 }
 
@@ -6603,6 +6568,57 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
     Ok(())
 }
 
+/// A minimal checkpoint manifest this runtime accepts, for tests.
+#[cfg(test)]
+pub(crate) fn test_checkpoint_manifest() -> PortableCheckpointManifest {
+    PortableCheckpointManifest {
+        host_mounts: Vec::new(),
+        version: FORMAT_VERSION,
+        runtime_abi: RUNTIME_ABI.to_string(),
+        host_platform: crate::platform::Platform::current()
+            .host_oci_platform()
+            .to_string(),
+        cpu_contract: checkpoint_cpu_contract().unwrap(),
+        cpus: 1,
+        memory_mib: 512,
+        storage_gib: None,
+        overlay_gib: None,
+        disk_durability: None,
+        device_profile: DEVICE_PROFILE.to_string(),
+        state: CheckpointAsset {
+            path: "checkpoint/checkpoint.bin".to_string(),
+            size: 1,
+            sha256: "00".repeat(32),
+        },
+        memory: CheckpointAsset {
+            path: "checkpoint/memory.bin".to_string(),
+            size: 1,
+            sha256: "00".repeat(32),
+        },
+        layout: CheckpointAsset {
+            path: "checkpoint/manifest.bin".to_string(),
+            size: 1,
+            sha256: "00".repeat(32),
+        },
+        disks: Vec::new(),
+        workload: None,
+        network: Some(CheckpointNetwork::default()),
+        packed_layers: None,
+        host_image: None,
+        lineage: None,
+        payload: Default::default(),
+        history: Vec::new(),
+        base: None,
+        credential_ca: None,
+        clock: None,
+        guest_cpu_features: None,
+        cache_disk: None,
+        agent_rootfs_digest: None,
+        nested_virt: false,
+        settings: Default::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -7538,6 +7554,8 @@ mod tests {
             guest_cpu_features: None,
             cache_disk: None,
             agent_rootfs_digest: None,
+            nested_virt: false,
+            settings: Default::default(),
         };
         (extracted, metadata)
     }
@@ -9195,50 +9213,7 @@ mod tests {
 
     /// The smallest manifest this host accepts, for tests of the validator.
     fn minimal_checkpoint_manifest() -> PortableCheckpointManifest {
-        PortableCheckpointManifest {
-            host_mounts: Vec::new(),
-            version: FORMAT_VERSION,
-            runtime_abi: RUNTIME_ABI.to_string(),
-            host_platform: crate::platform::Platform::current()
-                .host_oci_platform()
-                .to_string(),
-            cpu_contract: checkpoint_cpu_contract().unwrap(),
-            cpus: 1,
-            memory_mib: 1,
-            storage_gib: None,
-            overlay_gib: None,
-            disk_durability: None,
-            device_profile: DEVICE_PROFILE.to_string(),
-            state: CheckpointAsset {
-                path: "checkpoint/checkpoint.bin".to_string(),
-                size: 1,
-                sha256: "00".repeat(32),
-            },
-            memory: CheckpointAsset {
-                path: "checkpoint/memory.bin".to_string(),
-                size: 1,
-                sha256: "00".repeat(32),
-            },
-            layout: CheckpointAsset {
-                path: "checkpoint/manifest.bin".to_string(),
-                size: 1,
-                sha256: "00".repeat(32),
-            },
-            disks: Vec::new(),
-            workload: None,
-            network: Some(CheckpointNetwork::default()),
-            packed_layers: None,
-            host_image: None,
-            lineage: None,
-            payload: Default::default(),
-            history: Vec::new(),
-            base: None,
-            credential_ca: None,
-            clock: None,
-            guest_cpu_features: None,
-            cache_disk: None,
-            agent_rootfs_digest: None,
-        }
+        super::test_checkpoint_manifest()
     }
 
     #[test]

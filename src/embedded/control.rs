@@ -75,44 +75,102 @@ pub struct MachineSpec {
 }
 
 impl MachineSpec {
-    /// Convert the embedded-machine spec into the canonical DB record.
-    pub fn to_record(&self) -> VmRecord {
-        let (mounts, staged_mounts) = HostMount::split_storage_tuples(&self.mounts);
-        let mut record = VmRecord::new(
-            self.name.clone(),
-            self.resources.cpus,
-            self.resources.memory_mib,
+    /// This spec as the machine spec every creation path resolves. Every
+    /// field is named, so a new one does not compile until it is carried.
+    pub fn to_create_spec(&self) -> crate::machine_spec::CreateSpec {
+        let MachineSpec {
+            // The machine's name and its source are not options of it.
+            name: _,
+            image: _,
             mounts,
-            Vec::new(),
-            self.resources.network,
-        );
-        record.set_port_mappings(&self.ports);
-        record.staged_mounts = staged_mounts;
-        record.storage_gb = self.resources.storage_gib;
-        record.overlay_gb = self.resources.overlay_gib;
-        record.block_io = self.resources.block_io;
-        record.disk_durability = self.resources.disk_durability;
-        record.allowed_cidrs = self.resources.allowed_cidrs.clone();
-        record.dns_filter_hosts = if self.allowed_hosts.is_empty() {
-            None
-        } else {
-            Some(self.allowed_hosts.clone())
-        };
-        record.network_backend = self.resources.network_backend;
-        record.gpu = Some(self.resources.gpu);
-        record.gpu_vram_mib = self.resources.gpu_vram_mib;
-        record.cuda = self.resources.cuda;
-        // Persisted like the CLI's `--nested-virt`, so a restart or a later
-        // process reconnecting boots the guest with the VMX it was created with.
-        record.nested_virt = self.resources.nested_virt.then_some(true);
-        record.image = self.image.clone();
-        record.labels = self.labels.clone();
-        record.ephemeral = !self.persistent;
-        record.forkable = self.forkable;
-        record.detached = self.detached;
-        record.runtime_managed = self.runtime_managed;
-        record.remote_volumes = self.remote_volumes.clone();
-        record
+            ports,
+            resources,
+            command,
+            allowed_hosts,
+            persistent,
+            forkable,
+            detached,
+            labels,
+            runtime_managed,
+            remote_volumes,
+            credentials,
+        } = self.clone();
+        let VmResources {
+            cpus,
+            memory_mib,
+            network,
+            network_backend,
+            gpu,
+            gpu_vram_mib,
+            cuda,
+            nested_virt,
+            rosetta,
+            storage_gib,
+            overlay_gib,
+            block_io,
+            disk_durability,
+            disks,
+            cache_disk,
+            disk_volumes,
+            block_private,
+            allowed_cidrs,
+            egress_rules,
+            dns,
+            dns_options,
+            shm_size,
+            network_name,
+            guest_subnet,
+        } = resources;
+        crate::machine_spec::CreateSpec {
+            cmd: (!command.is_empty()).then_some(command),
+            shm_size,
+            cpus: Some(cpus),
+            mem: Some(memory_mib),
+            storage_gb: storage_gib,
+            overlay_gb: overlay_gib,
+            block_io: Some(block_io),
+            disk_durability: Some(disk_durability),
+            disks,
+            cache_disk,
+            mounts,
+            remote_volumes,
+            disk_volumes,
+            net: network,
+            network_backend,
+            dns,
+            dns_options,
+            network_name,
+            guest_subnet,
+            ports,
+            allowed_cidrs,
+            allowed_hosts: (!allowed_hosts.is_empty()).then_some(allowed_hosts),
+            block_private,
+            egress_rules,
+            // A value comes from `supply_credential_values`, else from the
+            // embedding process's own variable of the binding's name.
+            credentials,
+            gpu,
+            gpu_vram_mib,
+            rosetta,
+            nested_virt,
+            cuda,
+            forkable,
+            ephemeral: !persistent,
+            detached,
+            runtime_managed,
+            labels,
+            ..Default::default()
+        }
+    }
+
+    /// The record this spec creates, by the rules every creation path uses.
+    pub fn to_record(&self) -> Result<VmRecord> {
+        crate::machine_spec::resolve(
+            crate::machine_spec::SpecSource::from_image(self.image.as_deref()),
+            self.to_create_spec(),
+            crate::machine_spec::Caller::Embedded,
+        )?
+        .to_record(&self.name)
     }
 }
 
@@ -133,67 +191,80 @@ pub(crate) fn create_vm_with_workload(
 ) -> Result<()> {
     validate_vm_name(&spec.name, "name")
         .map_err(|reason| Error::config("validate machine name", reason))?;
-    for port in &spec.ports {
-        if port.host == 0 || port.guest == 0 {
-            return Err(Error::config(
-                "validate published ports",
-                "port 0 is not valid for VM port forwarding",
-            ));
-        }
-    }
-    PortMapping::check_duplicates(&spec.ports)
-        .map_err(|reason| Error::config("validate published ports", reason))?;
-    let mut record = spec.to_record();
-    if let Some(policy) = credentials.filter(|p| !p.is_empty()) {
-        // A credential only ever travels over the network the machine has; it
-        // grants none. Refuse rather than create a machine whose requests
-        // could never be made.
-        let has_egress = spec.resources.network
-            || !spec.allowed_hosts.is_empty()
-            || spec
-                .resources
-                .allowed_cidrs
-                .as_ref()
-                .is_some_and(|cidrs| !cidrs.is_empty());
-        if !has_egress {
-            return Err(Error::config(
-                "credentials",
-                "credential bindings need network egress; enable network or allow the hosts",
-            ));
-        }
-        let allow_hosts = (!spec.allowed_hosts.is_empty()).then_some(spec.allowed_hosts.as_slice());
-        record.credential_placeholders = crate::credentials::prepare_policy(policy, allow_hosts)?;
-        record.credential_policy = Some(policy.clone());
-        // Values come only from `supply_credential_values`, never from this
-        // host's environment: an embedder decides what each machine may use.
-        record.credentials_supplied_by_api = true;
-    }
-    if let Some(cidrs) = &spec.resources.allowed_cidrs {
-        record.allowed_cidrs = Some(
-            cidrs
-                .iter()
-                .map(|cidr| crate::smolfile::parse_cidr(cidr))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|reason| Error::config("validate allowed CIDR", reason))?,
-        );
-    }
-    if let Some(policy) = spec.credentials.as_ref().filter(|p| !p.is_empty()) {
-        record.credential_placeholders =
-            crate::credentials::prepare_policy(policy, record.dns_filter_hosts.as_deref())?;
-        record.credential_policy = Some(policy.clone());
-        record.network = true;
-    }
-    record.cmd = spec.command.clone();
-    record.env = env;
-    record.workdir = workdir;
-    record.user = user;
-    if db.insert_vm_if_not_exists(&spec.name, &record)? {
+    let create = spec.create_spec_with(env, workdir, user, credentials)?;
+    create_vm_from_spec(db, &spec.name, spec.image.as_deref(), create)
+}
+
+/// Create a DB record for `name` from `spec`: an image machine from `image`,
+/// or a bare VM without one, by the rules every creation path uses.
+pub(crate) fn create_vm_from_spec(
+    db: &SmolvmDb,
+    name: &str,
+    image: Option<&str>,
+    spec: crate::machine_spec::CreateSpec,
+) -> Result<()> {
+    validate_vm_name(name, "name")
+        .map_err(|reason| Error::config("validate machine name", reason))?;
+    let record = crate::machine_spec::resolve(
+        crate::machine_spec::SpecSource::from_image(image),
+        spec,
+        crate::machine_spec::Caller::Embedded,
+    )?
+    .to_record(name)?;
+    if db.insert_vm_if_not_exists(name, &record)? {
         Ok(())
     } else {
         Err(Error::agent_conflict(
             "create machine",
-            format!("machine '{}' already exists", spec.name),
+            format!("machine '{name}' already exists"),
         ))
+    }
+}
+
+impl MachineSpec {
+    /// This spec with the workload settings and credential bindings an SDK
+    /// passes beside it, as the machine spec every creation path resolves.
+    /// Values for `credentials` come only from
+    /// [`supply_credential_values`](crate::embedded::runtime::EmbeddedRuntime::supply_credential_values).
+    pub fn create_spec_with(
+        &self,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        user: Option<String>,
+        credentials: Option<&crate::credentials::CredentialPolicy>,
+    ) -> Result<crate::machine_spec::CreateSpec> {
+        let spec = self;
+        let mut create = spec.to_create_spec();
+        create.env = env;
+        create.workdir = workdir;
+        create.user = user;
+        if let Some(policy) = credentials.filter(|p| !p.is_empty()) {
+            // A credential only ever travels over the network the machine has; it
+            // grants none. Refuse rather than create a machine whose requests
+            // could never be made.
+            let has_egress = spec.resources.network
+                || !spec.allowed_hosts.is_empty()
+                || spec
+                    .resources
+                    .allowed_cidrs
+                    .as_ref()
+                    .is_some_and(|cidrs| !cidrs.is_empty());
+            if !has_egress {
+                return Err(Error::config(
+                    "credentials",
+                    "credential bindings need network egress; enable network or allow the hosts",
+                ));
+            }
+            let mut merged = policy.clone();
+            if let Some(from_spec) = create.credentials.take() {
+                merged.credentials.extend(from_spec.credentials);
+            }
+            create.credentials = Some(merged);
+            // Values come only from `supply_credential_values`, never from this
+            // host's environment: an embedder decides what each machine may use.
+            create.credentials_supplied_only = true;
+        }
+        Ok(create)
     }
 }
 
@@ -1016,15 +1087,15 @@ mod tests {
 
     #[test]
     fn record_ephemeral_follows_persistent_flag() {
-        assert!(test_spec("ephemeral", false).to_record().ephemeral);
-        assert!(!test_spec("persistent", true).to_record().ephemeral);
+        assert!(test_spec("ephemeral", false).to_record().unwrap().ephemeral);
+        assert!(!test_spec("persistent", true).to_record().unwrap().ephemeral);
     }
 
     #[test]
     fn record_carries_durable_forkable_start() {
         let mut spec = test_spec("fork-base", true);
         spec.forkable = true;
-        let record = spec.to_record();
+        let record = spec.to_record().unwrap();
         assert!(record.forkable);
         assert!(record.forkable_on_start());
     }
@@ -1033,7 +1104,7 @@ mod tests {
     fn detached_record_disarms_the_parent_death_watchdog_on_every_launch() {
         let mut spec = test_spec("hostd-owned", true);
         spec.detached = true;
-        let record = spec.to_record();
+        let record = spec.to_record().unwrap();
         assert!(record.detached);
 
         // Every launch path that starts from the record — start, resume, a
@@ -1053,7 +1124,7 @@ mod tests {
 
         // A machine that did not ask keeps the default (armed under an
         // in-process embedder).
-        let plain = test_spec("owned", true).to_record();
+        let plain = test_spec("owned", true).to_record().unwrap();
         assert!(!plain.detached);
         assert_eq!(
             merge_record_launch_features(&plain, LaunchFeatures::default()).watch_parent,
@@ -1066,11 +1137,11 @@ mod tests {
         // Without this, an SDK machine created nested lost VMX on its next start.
         let mut spec = test_spec("nested", true);
         spec.resources.nested_virt = true;
-        let record = spec.to_record();
+        let record = spec.to_record().unwrap();
         assert_eq!(record.nested_virt, Some(true));
         assert!(record.vm_resources().nested_virt);
         // Off by default, and stored as absent rather than `Some(false)`.
-        let record = test_spec("flat", true).to_record();
+        let record = test_spec("flat", true).to_record().unwrap();
         assert_eq!(record.nested_virt, None);
         assert!(!record.vm_resources().nested_virt);
     }
@@ -1156,7 +1227,7 @@ mod tests {
         spec.resources.cuda = true;
         spec.resources.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]);
         spec.allowed_hosts = vec!["api.example.com".into()];
-        let record = spec.to_record();
+        let record = spec.to_record().unwrap();
         assert_eq!(record.gpu, Some(true));
         assert_eq!(record.gpu_vram_mib, Some(512));
         assert!(record.vm_resources().gpu);
@@ -1169,8 +1240,8 @@ mod tests {
         );
 
         // Default (no GPU) records leave gpu off.
-        let plain = test_spec("plain", false).to_record();
-        assert_eq!(plain.gpu, Some(false));
+        let plain = test_spec("plain", false).to_record().unwrap();
+        assert!(!plain.gpu.unwrap_or(false));
         assert!(!plain.vm_resources().gpu);
         assert!(!plain.cuda);
         assert!(!plain.vm_resources().cuda);
@@ -1279,7 +1350,7 @@ mod tests {
         let mut spec = test_spec("scoped", false);
         spec.image = Some("ghcr.io/acme/service:latest".into());
         spec.allowed_hosts = vec!["api.example.com".into()];
-        let mut record = spec.to_record();
+        let mut record = spec.to_record().unwrap();
 
         let features = merge_record_launch_features(&record, LaunchFeatures::default());
         assert_eq!(
@@ -1308,7 +1379,7 @@ mod tests {
 
     #[test]
     fn embedded_launch_restores_local_image_device_topology() {
-        let mut record = test_spec("local-image", true).to_record();
+        let mut record = test_spec("local-image", true).to_record().unwrap();
         record.image = Some("local-dir:/srv/prepared-rootfs".into());
 
         let features = record_launch_features(&record, LaunchFeatures::default()).unwrap();

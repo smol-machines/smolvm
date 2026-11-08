@@ -481,6 +481,10 @@ pub struct CheckpointNetwork {
     /// Host listeners to recreate around the restored VM.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<CheckpointPort>,
+    /// UDP forwards to recreate around the restored VM. Absent on checkpoints
+    /// captured before they were recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp_ports: Vec<CheckpointPort>,
     /// Effective backend used at capture: `tsi` or `virtio-net`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -511,6 +515,11 @@ pub struct CheckpointNetwork {
     /// Captured outbound DNS hostname allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Captured private-range block (`--block-private`) and its exceptions.
+    /// Absent on checkpoints captured before it was recorded, and on machines
+    /// without the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
     /// Captured credential bindings (`[[network.credentials]]`): binding names,
     /// env-var names and allowed hosts — never the values, which the restore
     /// host resolves from its own environment at request time.
@@ -672,6 +681,15 @@ pub struct PortableCheckpointManifest {
     /// attaches the same base, identified here, from the restoring host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<CheckpointCacheDisk>,
+    /// The captured guest was given the host's virtualization extensions. Its
+    /// vCPUs resume with them, so the restore must expose them again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nested_virt: bool,
+    /// Host-side settings of the captured machine that its restore keeps
+    /// unless the restore sets them. Absent on checkpoints captured before
+    /// they were recorded.
+    #[serde(default, skip_serializing_if = "CheckpointSettings::is_empty")]
+    pub settings: CheckpointSettings,
     /// Content digest (`sha256:…`) of the agent rootfs the captured guest
     /// booted with. Its processes keep that userland mapped, so a restore boots
     /// the same rootfs, from the host's store or the copy this artifact
@@ -680,6 +698,45 @@ pub struct PortableCheckpointManifest {
     /// digest of the carried copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_rootfs_digest: Option<String>,
+}
+
+/// Host-side settings a restored machine keeps from the captured one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CheckpointSettings {
+    /// Signal the workload is sent when the machine stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_secs: Option<u64>,
+    /// Stop the machine once its workload exits.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_on_exit: bool,
+    /// `/dev/shm` size the captured workload runs with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<String>,
+    /// Health check command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_cmd: Option<Vec<String>>,
+    /// Seconds between health checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_interval_secs: Option<u64>,
+    /// Seconds a health check may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_timeout_secs: Option<u64>,
+    /// Failed checks before the workload counts as unhealthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_retries: Option<u32>,
+    /// Seconds after boot before health checks start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_startup_grace_secs: Option<u64>,
+}
+
+impl CheckpointSettings {
+    /// Whether nothing was recorded.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// The shared base under a checkpointed machine's cache disk.

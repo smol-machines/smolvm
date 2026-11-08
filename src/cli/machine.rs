@@ -149,24 +149,6 @@ fn resolve_egress_flags(
     Ok((allow_cidr, net, dns_filter_hosts))
 }
 
-fn smolmachine_egress_fields(
-    manifest_network: bool,
-    allow_cidrs: Vec<String>,
-    cli_network: bool,
-    dns_filter_hosts: Option<Vec<String>>,
-) -> (bool, Option<Vec<String>>, Option<Vec<String>>) {
-    let allowed_cidrs = if allow_cidrs.is_empty() {
-        None
-    } else {
-        Some(allow_cidrs)
-    };
-    (
-        manifest_network || cli_network,
-        allowed_cidrs,
-        dns_filter_hosts,
-    )
-}
-
 /// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
 /// into validated [`SecretRef`]s keyed by the guest-side env var name.
 ///
@@ -560,7 +542,11 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_udp", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_udp", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain",
+            // The one-shot pack runner has no way to apply these, so they are
+            // refused by name rather than dropped; `machine create --from`
+            // takes every one of them.
+            "block_private", "allow_private", "allow_host_loopback", "nested_virt", "rosetta", "shm_size", "guest_subnet", "network_name", "disk_durability", "disk", "cache_disk", "docker_socket", "expose_socket", "mount_socket", "init"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -1565,6 +1551,11 @@ impl RunCmd {
         {
             params.secret_refs.insert(key, r);
         }
+        // A detached run leaves a machine behind, recorded by the rules
+        // `machine create` applies; refuse what they refuse before booting.
+        if self.detach {
+            vm_common::build_vm_record(&params)?;
+        }
 
         // A registry --image can name a smolmachine PACK artifact (e.g.
         // registry.smolmachines.com/library/alpine), whose single "layer" is a
@@ -2296,27 +2287,30 @@ impl RunCmd {
                                     mount_tuples,
                                     staged_mounts,
                                     port_tuples,
-                                );
+                                )?;
                                 // An image machine records what the image
                                 // resolved to: its env (minus secret values, which
                                 // stay as refs), workdir and user, the image itself
                                 // and the workload command.
-                                o.env = defaults
+                                let r = &mut o.record;
+                                r.env = defaults
                                     .env
                                     .iter()
                                     .filter(|(k, _)| !params.secret_refs.contains_key(k))
                                     .cloned()
                                     .collect();
-                                o.workdir = defaults.workdir.clone();
-                                o.user = defaults.user.clone();
-                                o.image = Some(img.clone());
-                                o.entrypoint = Vec::new();
-                                o.cmd = command.clone();
-                                o.ssh_agent = self.ssh_agent || o.ssh_agent;
-                                o.cuda = self.cuda || o.cuda;
-                                o.docker_socket = self.docker_socket || o.docker_socket;
-                                o.gpu = self.gpu || o.gpu;
-                                o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
+                                r.workdir = defaults.workdir.clone();
+                                r.user = defaults.user.clone();
+                                r.image = Some(img.clone());
+                                r.entrypoint = Vec::new();
+                                r.cmd = command.clone();
+                                r.ssh_agent |= self.ssh_agent;
+                                r.cuda |= self.cuda;
+                                r.docker_socket |= self.docker_socket;
+                                if self.gpu {
+                                    r.gpu = Some(true);
+                                }
+                                r.gpu_vram_mib = self.gpu_vram_mib.or(r.gpu_vram_mib);
                                 o
                             }),
                         )
@@ -2460,16 +2454,19 @@ impl RunCmd {
                                 mount_tuples,
                                 staged_mounts,
                                 port_tuples,
-                            );
+                            )?;
                             // A one-shot run keeps no image on its record; the
                             // command line flags may enable features on top of
                             // what the Smolfile asked for.
-                            o.image = None;
-                            o.ssh_agent = self.ssh_agent || o.ssh_agent;
-                            o.cuda = self.cuda || o.cuda;
-                            o.docker_socket = self.docker_socket || o.docker_socket;
-                            o.gpu = self.gpu || o.gpu;
-                            o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
+                            let r = &mut o.record;
+                            r.image = None;
+                            r.ssh_agent |= self.ssh_agent;
+                            r.cuda |= self.cuda;
+                            r.docker_socket |= self.docker_socket;
+                            if self.gpu {
+                                r.gpu = Some(true);
+                            }
+                            r.gpu_vram_mib = self.gpu_vram_mib.or(r.gpu_vram_mib);
                             o
                         }),
                     )?;
@@ -2914,24 +2911,6 @@ mod tests {
     }
 
     #[test]
-    fn smolmachine_egress_fields_preserve_resolved_cli_policy() {
-        let cidrs = vec!["192.0.2.10/32".to_string()];
-        let hosts = Some(vec!["provider.test".to_string()]);
-        assert_eq!(
-            smolmachine_egress_fields(false, cidrs.clone(), true, hosts.clone()),
-            (true, Some(cidrs), hosts)
-        );
-    }
-
-    #[test]
-    fn smolmachine_egress_fields_preserve_manifest_network_default() {
-        assert_eq!(
-            smolmachine_egress_fields(true, Vec::new(), false, None),
-            (true, None, None)
-        );
-    }
-
-    #[test]
     fn parse_published_sockets_rejects_bad_specs() {
         assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
         assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
@@ -3009,121 +2988,42 @@ mod tests {
         command: MachineCmd,
     }
 
-    /// Params as the `--from` path builds them before CLI settings apply:
-    /// whatever the artifact recorded, here one packed secret ref and a
-    /// workdir.
-    fn pack_params() -> vm_common::CreateVmParams {
-        let mut params = crate::cli::smolfile::build_create_params(
-            "packed".to_string(),
-            None,
-            None,
-            Vec::new(),
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            Some("/from-pack".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Default::default(),
-        )
-        .expect("params");
-        params
-            .secret_refs
-            .insert("PACKED".to_string(), smolvm::secrets::env_ref("PACKED"));
-        params
-    }
-
-    fn create_cmd(args: &[&str]) -> CreateCmd {
-        let mut argv = vec![
+    /// `machine run --from` hands the pack to the one-shot pack runner, which
+    /// cannot apply these; each is refused by name instead of dropped.
+    #[test]
+    fn run_from_a_pack_refuses_the_flags_it_cannot_apply() {
+        for flags in [
+            &["--block-private"][..],
+            &["--allow-private", "10.0.0.0/8"],
+            &["--allow-host-loopback"],
+            &["--nested"],
+            &["--rosetta"],
+            &["--shm-size", "1g"],
+            &["--guest-subnet", "10.200.0.0/30"],
+            &["--network", "fabric"],
+            &["--disk-durability", "deferred"],
+            &["--disk", "/tmp/disk.img"],
+            &["--cache-disk", "/tmp/base.img:/cache"],
+            &["--docker-socket"],
+            &["--expose-socket", "/run/app.sock"],
+            &["--mount-socket", "/run/h.sock:/run/g.sock"],
+            &["--init", "true"],
+        ] {
+            let mut argv = vec!["machine", "run", "--from", "x.smolmachine"];
+            argv.extend_from_slice(flags);
+            let error = TestMachineCli::try_parse_from(argv)
+                .expect_err("refused")
+                .to_string();
+            assert!(error.contains(flags[0]), "{flags:?}: {error}");
+        }
+        assert!(TestMachineCli::try_parse_from([
             "machine",
-            "create",
-            "--name",
-            "packed",
+            "run",
             "--from",
             "x.smolmachine",
-        ];
-        argv.extend_from_slice(args);
-        let MachineCmd::Create(cmd) = TestMachineCli::try_parse_from(argv).unwrap().command else {
-            panic!("expected machine create");
-        };
-        cmd
-    }
-
-    /// #1986: `machine create --from` accepted these flags and dropped them,
-    /// so a `--credential` fed by `--secret-file` resolved from the host
-    /// environment instead and failed with `credential unavailable`.
-    #[test]
-    fn create_from_pack_keeps_the_settings_create_from_image_keeps() {
-        let cmd = create_cmd(&[
-            "--secret-file",
-            "TOKEN=/run/secrets/token",
-            "--secret-env",
-            "PACKED=HOST_PACKED",
-            "--workdir",
-            "/work",
-            "--block-private",
-            "--allow-private",
-            "100.81.17.207/32",
-            "--gpu",
-            "--gpu-vram",
-            "2048",
-        ]);
-        let mut params = pack_params();
-        cmd.apply_settings_to_pack_params(&mut params).unwrap();
-
-        assert_eq!(
-            params.secret_refs["TOKEN"].from_file.as_deref(),
-            Some(std::path::Path::new("/run/secrets/token"))
-        );
-        // A flag wins over a packed reference of the same name.
-        assert_eq!(
-            params.secret_refs["PACKED"].from_env.as_deref(),
-            Some("HOST_PACKED")
-        );
-        assert_eq!(params.workdir.as_deref(), Some("/work"));
-        assert_eq!(
-            params.block_private.as_deref(),
-            Some(&["100.81.17.207/32".to_string()][..])
-        );
-        assert!(params.net, "--block-private implies --net");
-        assert!(params.gpu);
-        assert_eq!(params.gpu_vram_mib, Some(2048));
-
-        let record = vm_common::build_vm_record(&params).unwrap();
-        assert!(record.secret_refs.contains_key("TOKEN"));
-        assert_eq!(record.workdir.as_deref(), Some("/work"));
-    }
-
-    #[test]
-    fn create_from_pack_without_flags_keeps_what_the_pack_recorded() {
-        let mut params = pack_params();
-        create_cmd(&[])
-            .apply_settings_to_pack_params(&mut params)
-            .unwrap();
-        assert_eq!(params.secret_refs.len(), 1);
-        assert_eq!(params.workdir.as_deref(), Some("/from-pack"));
-        assert!(params.block_private.is_none());
-        assert!(!params.net && !params.gpu && !params.rosetta);
-        assert_eq!(params.gpu_vram_mib, None);
-    }
-
-    #[test]
-    fn create_from_pack_rejects_a_bad_secret_flag() {
-        let mut params = pack_params();
-        assert!(create_cmd(&["--secret-file", "TOKEN"])
-            .apply_settings_to_pack_params(&mut params)
-            .is_err());
+            "--net"
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -4895,9 +4795,17 @@ pub struct CreateCmd {
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
 
-    /// Create from a `.smolmachine` pack or restore a `.smolcheckpoint`.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
+    /// Create from a `.smolmachine` pack or restore a `.smolcheckpoint`. The
+    /// artifact supplies the defaults (a pack) or fixed state (a live
+    /// checkpoint); flags and a Smolfile override the defaults, and a setting
+    /// a checkpoint fixes is refused by name.
+    #[arg(long, value_name = "PATH", conflicts_with = "image")]
     pub from: Option<PathBuf>,
+
+    /// Read a machine spec (JSON) from stdin, as the embedded runtime hands
+    /// one over; flags given alongside apply on top.
+    #[arg(long, hide = true, conflicts_with = "smolfile")]
+    pub spec_stdin: bool,
 
     /// With --from <checkpoint>: restore an earlier generation the checkpoint
     /// retains — `~N` (N back along its history), a generation id, or an id
@@ -4978,7 +4886,16 @@ fn parse_attached_disks(specs: &[String]) -> smolvm::Result<Vec<smolvm::data::di
 }
 
 impl CreateCmd {
-    pub fn run(mut self) -> smolvm::Result<()> {
+    pub fn run(self) -> smolvm::Result<()> {
+        let record = self.create()?;
+        vm_common::print_created(&record);
+        Ok(())
+    }
+
+    /// Create the machine this command describes and return its record,
+    /// without reporting it. Front ends that wrap `machine create` (the `smol`
+    /// CLI) call this so every option takes the one path.
+    pub fn create(mut self) -> smolvm::Result<smolvm::VmRecord> {
         let host = crate::cli::host_network::HostNetwork::resolve(
             self.use_host_proxy,
             self.trust_host_certs,
@@ -5016,9 +4933,18 @@ impl CreateCmd {
         if let Some(bytes) = self.max_image_size {
             std::env::set_var("SMOLVM_MAX_IMAGE_BYTES", bytes.to_string());
         }
-        // Branch for --from: create machine from .smolmachine artifact.
+        let (image, spec, caller) = self.create_spec()?;
+
+        // --from: a .smolmachine pack or a live checkpoint.
         if let Some(ref sidecar_path) = self.from {
-            return self.run_from_smolmachine(sidecar_path);
+            if image.is_some() {
+                return Err(smolvm::Error::config(
+                    "create machine",
+                    "the Smolfile names an image, but --from already supplies the machine's \
+                     root filesystem; remove one of them",
+                ));
+            }
+            return self.run_from_smolmachine(sidecar_path, spec, caller);
         }
 
         // A registry --image can name a smolmachine PACK artifact (e.g.
@@ -5028,66 +4954,11 @@ impl CreateCmd {
         // disk). Probe the manifest on the host and, if so, pull the sidecar
         // and continue exactly as `--from`; a failed probe falls back to the
         // normal in-guest pull.
-        if let Some(img) = self.image.as_deref() {
+        if let Some(img) = image.as_deref() {
             if let Some(sidecar) = smolvm::data::pack_ref::resolve_pack_ref_blocking(img)? {
-                return self.run_from_smolmachine(&sidecar);
+                return self.run_from_smolmachine(&sidecar, spec, caller);
             }
         }
-
-        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
-            self.allow_cidr,
-            self.allow_host,
-            self.allow_host_pattern,
-            self.outbound_localhost_only,
-            self.net,
-        )?;
-
-        let name = self
-            .name
-            .unwrap_or_else(smolvm::util::generate_machine_name);
-
-        let mut params = crate::cli::smolfile::build_create_params(
-            name,
-            self.image,
-            None,         // entrypoint: from Smolfile only
-            self.command, // persistent-workload command (detached container on start)
-            self.cpus,
-            self.mem,
-            self.volume,
-            self.port,
-            net,
-            self.net_backend,
-            self.dns,
-            self.network_name.clone(),
-            self.init,
-            self.env,
-            self.workdir,
-            self.user,
-            self.smolfile.clone(),
-            self.storage,
-            self.overlay,
-            self.block_io,
-            cli_allow_cidrs,
-            smolvm::util::parse_labels(&self.labels)?,
-        )?;
-        params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
-        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
-        params.dns_options = self.dns_option.clone();
-        params.shm_size = self.shm_size.clone();
-        params.prepend_deny_cidrs(&self.deny_cidr);
-        params.append_allow_udp(&self.allow_udp);
-        // `build_create_params` fills resources from the Smolfile, so a CLI-only
-        // flag has to be merged here or it never reaches the record.
-        params.nested_virt = params.nested_virt || self.nested_virt;
-        params.guest_subnet = self.guest_subnet.clone();
-        if let Some(durability) = self.disk_durability {
-            params.disk_durability = durability;
-        }
-        // Attached host disks are validated at create, not at start: a machine
-        // recorded against an unreadable device would fail every start with a
-        // virtio-blk error that says nothing about which disk or why.
-        params.disks = parse_attached_disks(&self.disk)?;
-        params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
 
         // Resolve the image source on the host now, AFTER the CLI flag and the
         // Smolfile have been merged, so both take the same path: a registry
@@ -5097,19 +4968,198 @@ impl CreateCmd {
         // mount without a registry pull. Resolving only the flag here left a
         // Smolfile `image = "./x.tar"` stored verbatim, and `start` then asked
         // the registry for it.
-        if let Some(img) = params.image.as_deref() {
-            use smolvm::data::image_source::{classify, resolve, ResolvedImage};
-            params.image = Some(match resolve(classify(img))? {
-                ResolvedImage::Registry(reference) => reference,
-                ResolvedImage::Local { reference, .. } => reference,
-            });
+        let image = match image {
+            Some(img) => {
+                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                Some(match resolve(classify(&img))? {
+                    ResolvedImage::Registry(reference) => reference,
+                    ResolvedImage::Local { reference, .. } => reference,
+                })
+            }
+            None => None,
+        };
+        let resolved = smolvm::machine_spec::resolve(
+            smolvm::machine_spec::SpecSource::from_image(image.as_deref()),
+            spec,
+            caller,
+        )?;
+        let name = self
+            .name
+            .clone()
+            .unwrap_or_else(smolvm::util::generate_machine_name);
+        let record = resolved.to_record(&name)?;
+        let reservation = vm_common::CreateVmReservation::reserve(&name)?;
+        reservation.commit(&record)?;
+        Ok(record)
+    }
+
+    /// The machine this command asks for: its flags merged over a Smolfile,
+    /// or over the spec an embedder hands in on stdin (`--spec-stdin`), and
+    /// who is asking. The image is returned apart, since `--from` replaces it.
+    ///
+    /// Every field is named, so a new flag does not compile until it reaches
+    /// the spec or is named as something else (the source, the name).
+    pub(crate) fn create_spec(
+        &self,
+    ) -> smolvm::Result<(
+        Option<String>,
+        smolvm::machine_spec::CreateSpec,
+        smolvm::machine_spec::Caller,
+    )> {
+        let CreateCmd {
+            // How a stored checkpoint is fetched, not what the machine is.
+            restore_cache: _,
+            keep_identity,
+            // The machine's name is not an option of it.
+            name: _,
+            labels,
+            image,
+            // Applied by `run` for this invocation's image resolution.
+            max_image_size: _,
+            cpus,
+            mem,
+            storage,
+            overlay,
+            block_io,
+            disk_durability,
+            disk,
+            cache_disk,
+            volume,
+            allow_system_mounts,
+            port,
+            net,
+            net_backend,
+            dns,
+            dns_option,
+            shm_size,
+            guest_subnet,
+            network_name,
+            allow_cidr,
+            deny_cidr,
+            allow_udp,
+            allow_host,
+            allow_host_pattern,
+            // Folded into env, volume and net by `run` before this.
+            use_host_proxy: _,
+            trust_host_certs: _,
+            credential,
+            outbound_localhost_only,
+            block_private,
+            allow_private,
+            gpu,
+            nested_virt,
+            gpu_vram_mib,
+            rosetta,
+            expose_socket,
+            mount_socket,
+            init,
+            env,
+            workdir,
+            user,
+            ssh_agent,
+            stop_on_exit,
+            stop_signal,
+            stop_timeout,
+            cuda,
+            auto_graph,
+            docker_socket,
+            secret_env,
+            secret_file,
+            secret_keychain,
+            smolfile,
+            spec_stdin,
+            // The source.
+            from: _,
+            at: _,
+            command,
+        } = self;
+
+        let (cli_allow_cidrs, cli_net, cli_dns_filter_hosts) = resolve_egress_flags(
+            allow_cidr.clone(),
+            allow_host.clone(),
+            allow_host_pattern.clone(),
+            *outbound_localhost_only,
+            *net,
+        )?;
+        let crate::cli::smolfile::CliSpec {
+            image,
+            volumes,
+            spec: mut cli,
+        } = crate::cli::smolfile::build_create_spec(
+            image.clone(),
+            None, // entrypoint: from a Smolfile only
+            command.clone(),
+            *cpus,
+            *mem,
+            volume.clone(),
+            port.clone(),
+            cli_net,
+            *net_backend,
+            *dns,
+            network_name.clone(),
+            init.clone(),
+            env.clone(),
+            workdir.clone(),
+            user.clone(),
+            smolfile.clone(),
+            *storage,
+            *overlay,
+            *block_io,
+            cli_allow_cidrs,
+            smolvm::util::parse_labels(labels)?,
+        )?;
+
+        // Volume specs: storage-disk paths, remote volumes and host directories.
+        let (volume_specs, disk_volumes) =
+            smolvm::data::storage::split_disk_volume_specs(&volumes)?;
+        let (host_specs, remote_volumes) = smolvm::remote_volume::split_specs(&volume_specs)?;
+        cli.mounts = HostMount::parse_with_system_mounts(&host_specs, *allow_system_mounts)?;
+        cli.remote_volumes = remote_volumes;
+        cli.disk_volumes = disk_volumes;
+
+        // Flags a Smolfile has no key for, and flags that add to one.
+        if *block_private || !allow_private.is_empty() {
+            let exceptions = cli.block_private.get_or_insert_with(Vec::new);
+            for cidr in allow_private {
+                if !exceptions.contains(cidr) {
+                    exceptions.push(cidr.clone());
+                }
+            }
+            cli.net = true;
         }
-        params.allow_system_mounts = self.allow_system_mounts;
-        if self.auto_graph {
-            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
-            params.cuda = true;
+        if !dns_option.is_empty() {
+            cli.dns_options = dns_option.clone();
         }
-        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
+        if shm_size.is_some() {
+            cli.shm_size = shm_size.clone();
+        }
+        if !deny_cidr.is_empty() {
+            let mut rules = vm_common::deny_cidr_rules(deny_cidr);
+            rules.append(&mut cli.egress_rules);
+            cli.egress_rules = rules;
+            cli.net = true;
+        }
+        if !allow_udp.is_empty() {
+            cli.egress_rules.extend_from_slice(allow_udp);
+            cli.net = true;
+        }
+        cli.nested_virt |= *nested_virt;
+        if guest_subnet.is_some() {
+            cli.guest_subnet = guest_subnet.clone();
+        }
+        if disk_durability.is_some() {
+            cli.disk_durability = *disk_durability;
+        }
+        // Attached host disks are validated at create, not at start: a machine
+        // recorded against an unreadable device would fail every start with a
+        // virtio-blk error that says nothing about which disk or why.
+        cli.disks = parse_attached_disks(disk)?;
+        cli.cache_disk = parse_cache_disk(cache_disk.as_deref())?;
+        if *auto_graph {
+            smolvm::util::enable_cuda_auto_graph_env(&mut cli.env);
+            cli.cuda = true;
+        }
+        cli.allowed_hosts = match (cli.allowed_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
                 Some(from_smolfile)
@@ -5117,113 +5167,63 @@ impl CreateCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
-        merge_cli_credentials(&mut params, &self.credential)?;
-        params.published_sockets =
-            parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
-        // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
-        // `[secrets]` of the same name (CLI wins). Only refs are persisted.
-        for (key, r) in
-            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?
-        {
-            params.secret_refs.insert(key, r);
+        if !credential.is_empty() {
+            let policy = cli.credentials.get_or_insert_with(Default::default);
+            for spec in credential {
+                policy.credentials.push(
+                    smolvm::credentials::parse_credential_flag(spec)
+                        .map_err(|e| smolvm::Error::config("--credential", e))?,
+                );
+            }
+            cli.net = true;
         }
-        let resources = VmResources {
-            cpus: params.cpus,
-            memory_mib: params.mem,
-            network: params.net,
-            network_backend: params.network_backend,
-            dns: params.dns,
-            dns_options: params.dns_options.clone(),
-            shm_size: params.shm_size.clone(),
-            network_name: params.network_name.clone(),
-            guest_subnet: params.guest_subnet.clone(),
-            gpu: params.gpu,
-            nested_virt: params.nested_virt,
-            gpu_vram_mib: params.gpu_vram_mib,
-            cuda: params.cuda,
-            rosetta: params.rosetta,
-            storage_gib: params.storage_gb,
-            overlay_gib: params.overlay_gb,
-            allowed_cidrs: params.allowed_cidrs.clone(),
-            egress_rules: params.egress_rules.clone(),
-            block_io: params.block_io,
-            disk_durability: params.disk_durability,
-            disks: Vec::new(),
-            cache_disk: None,
-            disk_volumes: Vec::new(),
-            block_private: params.block_private.clone(),
-        };
-        // Reject zero-valued resources before the machine is persisted.
-        // Without this, `machine create` succeeds and the failure only
-        // surfaces later at `machine start` (see QA BUG-44).
-        resources.validate()?;
-        validate_requested_network_backend(
-            &resources,
-            params.dns_filter_hosts.as_deref(),
-            params.port.len(),
-        )?;
-        if self.ssh_agent {
-            params.ssh_agent = true;
+        cli.published_sockets = parse_published_sockets(expose_socket, mount_socket)?;
+        // CLI `--secret-*` refs win over Smolfile `[secrets]` of the same name.
+        for (key, r) in parse_cli_secret_refs(secret_env, secret_file, secret_keychain)? {
+            cli.secret_refs.insert(key, r);
         }
-        if self.stop_on_exit {
-            params.stop_on_exit = true;
+        cli.ssh_agent |= *ssh_agent;
+        cli.stop_on_exit |= *stop_on_exit;
+        if stop_signal.is_some() {
+            cli.stop_signal = stop_signal.clone();
         }
-        if self.stop_signal.is_some() {
-            params.stop_signal = self.stop_signal.clone();
+        if stop_timeout.is_some() {
+            cli.stop_timeout_secs = *stop_timeout;
         }
-        if self.stop_timeout.is_some() {
-            params.stop_timeout_secs = self.stop_timeout;
-        }
-        if self.cuda {
-            params.cuda = true;
-        }
-        if self.docker_socket {
-            params.docker_socket = true;
-        }
-        if self.gpu {
-            params.gpu = true;
-        }
-        if self.rosetta {
-            params.rosetta = true;
-        }
+        cli.cuda |= *cuda;
+        cli.docker_socket |= *docker_socket;
+        cli.gpu |= *gpu;
+        cli.rosetta |= *rosetta;
         // CLI --gpu-vram takes precedence over Smolfile gpu_vram.
-        if let Some(vram) = self.gpu_vram_mib {
-            params.gpu_vram_mib = Some(vram);
+        if gpu_vram_mib.is_some() {
+            cli.gpu_vram_mib = *gpu_vram_mib;
         }
-        PortMapping::check_duplicates(&params.port)
-            .map_err(|e| smolvm::Error::config("validate ports", e))?;
-        vm_common::create_vm(params)
+        cli.keep_identity |= *keep_identity;
+
+        if *spec_stdin {
+            // An embedder's spec, with any flags given alongside on top.
+            let mut json = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut json)
+                .map_err(|e| smolvm::Error::config("--spec-stdin", e.to_string()))?;
+            let base: smolvm::machine_spec::CreateSpec = serde_json::from_str(&json)
+                .map_err(|e| smolvm::Error::config("--spec-stdin", e.to_string()))?;
+            return Ok((
+                image,
+                base.overlay(cli),
+                smolvm::machine_spec::Caller::Embedded,
+            ));
+        }
+        Ok((image, cli, smolvm::machine_spec::Caller::Cli))
     }
 
-    /// Apply the create flags that `--from` takes the same way `--image` does,
-    /// over what the artifact recorded: `--secret-env`/`--secret-file`/
-    /// `--secret-keychain` (a flag wins over a packed reference of the same
-    /// name), `--workdir`, `--block-private`/`--allow-private`, `--gpu`,
-    /// `--gpu-vram` and `--rosetta`. A live checkpoint refuses the
-    /// device-changing ones before this runs.
-    fn apply_settings_to_pack_params(
+    /// Create a machine from a .smolmachine artifact: a pack, or a live
+    /// checkpoint to restore.
+    fn run_from_smolmachine(
         &self,
-        params: &mut vm_common::CreateVmParams,
-    ) -> smolvm::Result<()> {
-        for (key, r) in
-            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?
-        {
-            params.secret_refs.insert(key, r);
-        }
-        if let Some(workdir) = &self.workdir {
-            params.workdir = Some(workdir.clone());
-        }
-        params.apply_block_private(self.block_private, self.allow_private.clone());
-        params.gpu = params.gpu || self.gpu;
-        if let Some(vram) = self.gpu_vram_mib {
-            params.gpu_vram_mib = Some(vram);
-        }
-        params.rosetta = params.rosetta || self.rosetta;
-        Ok(())
-    }
-
-    /// Create a machine from a .smolmachine artifact.
-    fn run_from_smolmachine(&self, sidecar_path: &std::path::Path) -> smolvm::Result<()> {
+        sidecar_path: &std::path::Path,
+        spec: smolvm::machine_spec::CreateSpec,
+        caller: smolvm::machine_spec::Caller,
+    ) -> smolvm::Result<smolvm::VmRecord> {
         if !sidecar_path.exists() {
             return Err(smolvm::Error::config(
                 "create from .smolmachine",
@@ -5276,62 +5276,26 @@ impl CreateCmd {
                 .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?
         };
         let checkpoint = manifest.checkpoint.clone();
-        if let Some(ref checkpoint) = checkpoint {
-            smolvm::portable_checkpoint::validate_compatibility(checkpoint)?;
-            let topology_overridden = !self.volume.is_empty()
-                || !self.port.is_empty()
-                || self.net
-                || self.net_backend.is_some()
-                || self.dns.is_some()
-                || self.guest_subnet.is_some()
-                || self.network_name.is_some()
-                || !self.allow_cidr.is_empty()
-                || !self.allow_host.is_empty()
-                || !self.allow_host_pattern.is_empty()
-                || self.outbound_localhost_only
-                || self.gpu
-                || self.gpu_vram_mib.is_some()
-                || self.rosetta
-                || !self.expose_socket.is_empty()
-                || !self.mount_socket.is_empty()
-                || self.ssh_agent
-                || self.cuda
-                || self.auto_graph
-                || self.docker_socket
-                || self.storage.is_some()
-                || self.overlay.is_some()
-                || !self.disk.is_empty()
-                // Blocking private destinations turns networking on, and a
-                // restored guest keeps the devices it was captured with.
-                || self.block_private
-                || !self.allow_private.is_empty();
-            // The captured workload holds the checkpoint's placeholders; a new
-            // binding would mint ones it never received.
-            if !self.credential.is_empty() {
-                return Err(smolvm::Error::config(
-                    "create from .smolcheckpoint",
-                    "a live checkpoint keeps the credential bindings it was captured with; \
-                     --credential applies only to a machine created from an image or a pack",
-                ));
-            }
-            if topology_overridden {
-                return Err(smolvm::Error::config(
-                    "create from .smolcheckpoint",
-                    "a live checkpoint must restore its captured CPU, memory, disk, and device topology; topology-changing create flags are not supported",
-                ));
-            }
-        }
 
         // Reject a cross-architecture artifact up front: a packed VM/image carries
         // native binaries and cannot boot under a different-arch guest kernel. Only
         // the guest arch must match — the host OS does not (see the fn's docs).
         smolvm::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
 
+        // Every option, from the flags, a Smolfile or an embedder, against
+        // what the artifact supplies or fixes: one set of rules for every
+        // creation path. Refusals happen here, before any disk work.
+        let resolved = smolvm::machine_spec::resolve(
+            smolvm::machine_spec::SpecSource::from_manifest(&manifest),
+            spec,
+            caller,
+        )?;
+
         // A VM-mode pack (`--from-vm`) carries the source VM's overlay+storage
-        // DISKS (the real rootfs), not OCI layers. Capture the templates before
-        // `manifest` is moved into `params`; the disks are seeded from them after
-        // extraction below, or the machine boots the bare agent-rootfs with no
-        // /bin/sh (mirrors pack_run + the serve API create path).
+        // DISKS (the real rootfs), not OCI layers. The disks are seeded from
+        // the templates after extraction below, or the machine boots the bare
+        // agent-rootfs with no /bin/sh (mirrors pack_run + the serve API create
+        // path).
         struct VmModeSeed {
             overlay_template: Option<String>,
             storage_template: Option<String>,
@@ -5369,358 +5333,29 @@ impl CreateCmd {
             .name
             .clone()
             .unwrap_or_else(smolvm::util::generate_machine_name);
-        // `name` is moved into `params` below; keep a copy for the post-create
-        // extraction that targets this machine's own data dir.
         let name_for_layers = name.clone();
 
-        // Resource caps: an explicit flag overrides the pack's baked values,
-        // including when it equals the default.
-        let cpus = self.cpus.unwrap_or(manifest.cpus);
-        let mem = self.mem.unwrap_or(manifest.mem);
-        if let Some(ref checkpoint) = checkpoint {
-            if cpus != checkpoint.cpus || mem != checkpoint.memory_mib {
-                return Err(smolvm::Error::config(
-                    "create from .smolcheckpoint",
-                    format!(
-                        "checkpoint requires {} vCPU(s) and {} MiB memory (requested {cpus} and {mem})",
-                        checkpoint.cpus, checkpoint.memory_mib
-                    ),
-                ));
-            }
-        }
-
-        let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
-            self.allow_cidr.clone(),
-            self.allow_host.clone(),
-            self.allow_host_pattern.clone(),
-            self.outbound_localhost_only,
-            self.net,
-        )?;
-        let (network, allowed_cidrs, dns_filter_hosts) = smolmachine_egress_fields(
-            manifest.network,
-            cli_allow_cidrs,
-            cli_network,
-            cli_dns_filter_hosts,
-        );
-        let checkpoint_network = checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.network.as_ref());
-        let network = checkpoint_network
-            .map(|captured| captured.enabled)
-            .unwrap_or(network);
-        let allowed_cidrs = checkpoint_network
-            .and_then(|captured| captured.allowed_cidrs.clone())
-            .or(allowed_cidrs);
-        let dns_filter_hosts = checkpoint_network
-            .and_then(|captured| captured.dns_filter_hosts.clone())
-            .or(dns_filter_hosts);
-
-        // A .smolmachine is an untrusted, portable artifact: validate its secret
-        // refs under the Untrusted scope, which rejects every source kind. A
-        // packed `from_env`/`from_file` ref would otherwise read THIS host's
-        // env/files at exec time — reject at create rather than carry an exfil
-        // primitive. Configure secrets locally via the CLI instead.
-        for (key, r) in &manifest.secret_refs {
-            smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
-                |e| {
-                    smolvm::Error::config(
-                        "create from .smolmachine",
-                        format!("secret '{}': {} (packs may not carry secret refs)", key, e),
-                    )
-                },
-            )?;
-        }
-
-        // A checkpoint captured with --host-mounts re-attaches the same host
-        // directories; --volume is already refused as a topology override.
-        let volumes = match checkpoint.as_ref() {
-            Some(checkpoint) if !checkpoint.host_mounts.is_empty() => {
-                smolvm::portable_checkpoint::restored_host_mounts(checkpoint)?
-                    .into_iter()
-                    .map(|(host, guest, read_only)| {
-                        format!("{host}:{guest}:{}", if read_only { "ro" } else { "rw" })
-                    })
-                    .collect()
-            }
-            _ => self.volume.clone(),
-        };
-        let ports = if checkpoint.is_some() && self.port.is_empty() {
-            checkpoint_network
-                .into_iter()
-                .flat_map(|network| network.ports.iter())
-                .map(|port| PortMapping::new(port.host, port.guest))
-                .collect()
-        } else {
-            PortMappingSpec::expand_all(&self.port)
-                .map_err(|e| smolvm::Error::config("create from .smolmachine ports", e))?
-        };
-        let checkpoint_backend = match checkpoint.as_ref() {
-            Some(checkpoint) => smolvm::portable_checkpoint::restored_network_backend(checkpoint)?,
-            None => None,
-        };
-        let checkpoint_subnet = match checkpoint.as_ref() {
-            Some(checkpoint) => smolvm::portable_checkpoint::restored_guest_subnet(checkpoint)?,
-            None => None,
-        };
-        // The restored guest keeps the resolv.conf it wrote at boot, so its
-        // options are the checkpoint's; a different set would only be written
-        // to the record, never to the guest.
-        let dns_options = match checkpoint.as_ref() {
-            Some(checkpoint) => {
-                let captured = smolvm::portable_checkpoint::restored_dns_options(checkpoint)?;
-                if !self.dns_option.is_empty() && self.dns_option != captured {
-                    return Err(smolvm::Error::config(
-                        "create from .smolcheckpoint",
-                        format!(
-                            "a live checkpoint resumes with the resolver options it was captured with ({}); \
-                             set --dns-option on the source machine before checkpointing it",
-                            if captured.is_empty() {
-                                "none".to_string()
-                            } else {
-                                captured.join(" ")
-                            }
-                        ),
-                    ));
-                }
-                captured
-            }
-            None => self.dns_option.clone(),
-        };
-        let cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
         // A restored guest resumes with the devices it was captured with: a
         // checkpoint of a machine with a cache disk restores over the same
         // base, and one without takes none.
         let cache_base = match checkpoint.as_ref() {
-            Some(checkpoint) => {
-                smolvm::portable_checkpoint::resolve_cache_base(checkpoint, cache_disk.as_ref())?
-            }
+            Some(checkpoint) => smolvm::portable_checkpoint::resolve_cache_base(
+                checkpoint,
+                resolved.cache_disk.as_ref(),
+            )?,
             None => None,
         };
-        let mut params = vm_common::CreateVmParams {
-            // A checkpoint carries its credential bindings and the exact
-            // placeholders the captured workload holds; `build_vm_record`
-            // keeps pre-minted placeholders rather than minting fresh ones,
-            // so the workload's copies stay valid. Restore-side validation of
-            // the untrusted policy happens in `build_vm_record`'s
-            // `prepare_policy` only when minting, so validate here too.
-            credential_policy: match checkpoint_network
-                .and_then(|captured| captured.credential_policy.clone())
-            {
-                Some(policy) => {
-                    policy
-                        .validate(dns_filter_hosts.as_deref())
-                        .map_err(|error| {
-                            smolvm::Error::config(
-                                "create from .smolmachine credentials",
-                                error.to_string(),
-                            )
-                        })?;
-                    Some(policy)
-                }
-                None => None,
-            },
-            credential_placeholders: checkpoint_network
-                .map(|captured| captured.credential_placeholders.clone())
-                .unwrap_or_default(),
-            disks: parse_attached_disks(&self.disk)?,
-            cache_disk,
-            nested_virt: self.nested_virt,
-            secret_refs: manifest.secret_refs,
-            name,
-            // A VM-mode pack is a VM, not a container: its synthetic `vm://<name>`
-            // label would make exec/start/re-pack treat it as a pullable image
-            // (the /bin/sh-not-found bug). None routes every `image.is_some()`
-            // consumer to VM behavior; provenance is in `source_smolmachine`.
-            image: if let Some(workload) = checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.workload.as_ref())
-            {
-                Some(workload.image.clone())
-            } else if vm_seed.is_some() || checkpoint.is_some() {
-                None
-            } else {
-                Some(manifest.image)
-            },
-            // CLI trailing args override the artifact's baked (entrypoint, cmd),
-            // matching the --image create path's precedence — without this a
-            // `machine create --from art -- <workload>` silently never runs it.
-            entrypoint: if self.command.is_empty() {
-                manifest.entrypoint
-            } else {
-                Vec::new()
-            },
-            cmd: if self.command.is_empty() {
-                manifest.cmd
-            } else {
-                self.command.clone()
-            },
-            cpus,
-            mem,
-            volume: volumes,
-            allow_system_mounts: self.allow_system_mounts,
-            port: ports,
-            net: network,
-            network_backend: checkpoint_backend.or(self.net_backend),
-            dns: self.dns,
-            dns_options,
-            shm_size: self.shm_size.clone(),
-            network_name: self.network_name.clone(),
-            guest_subnet: checkpoint_subnet.or_else(|| self.guest_subnet.clone()),
-            init: self.init.clone(),
-            env: {
-                let mut env = manifest.env;
-                env.extend(self.env.iter().cloned());
-                if self.auto_graph {
-                    smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
-                }
-                env
-            },
-            workdir: manifest.workdir,
-            // The account the packed workload runs as travels in the manifest,
-            // the same way its entrypoint, env, and workdir do; `--user` still
-            // overrides it, as it does for an image.
-            user: self.user.clone().or_else(|| manifest.user.clone()),
-            storage_gb: checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.storage_gib)
-                .or(self.storage),
-            overlay_gb: checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.overlay_gib)
-                .or(self.overlay),
-            block_io: self.block_io.unwrap_or_default(),
-            disk_durability: self.disk_durability.unwrap_or_default(),
-            allowed_cidrs,
-            block_private: None,
-            // Captured rules first, as allowed_cidrs prefers the checkpoint's.
-            egress_rules: checkpoint_network
-                .map(|captured| captured.egress_rules.clone())
-                .unwrap_or_default(),
-            restart_policy: checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.workload.as_ref())
-                .map(|workload| workload.restart_policy.parse())
-                .transpose()
-                .map_err(|error: String| {
-                    smolvm::Error::config("restore checkpoint restart policy", error)
-                })?,
-            restart_max_retries: checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.workload.as_ref())
-                .map(|workload| workload.restart_max_retries),
-            restart_max_backoff_secs: checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.workload.as_ref())
-                .map(|workload| workload.restart_max_backoff_secs),
-            labels: smolvm::util::parse_labels(&self.labels)?,
-            health_cmd: None,
-            health_interval_secs: None,
-            health_timeout_secs: None,
-            health_retries: None,
-            health_startup_grace_secs: None,
-            ssh_agent: self.ssh_agent,
-            cuda: self.cuda || self.auto_graph,
-            // A restored durable checkpoint remains eligible to become a new
-            // fork/checkpoint source without a topology-changing restart.
-            forkable: checkpoint.is_some(),
-            stop_on_exit: self.stop_on_exit,
-            stop_signal: self.stop_signal.clone(),
-            stop_timeout_secs: self.stop_timeout,
-            cuda_fork_pool_size: None,
-            cuda_vram_limit_mib: None,
-            docker_socket: self.docker_socket,
-            dns_filter_hosts,
-            published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
-            gpu: manifest.gpu,
-            gpu_vram_mib: None,
-            rosetta: false,
-            // Build-time validation needs to know that a packed-layer
-            // checkpoint already has its image locally. This placeholder is
-            // replaced by the verified source pack before the record commits.
-            // For an ordinary checkpoint, the transport pack is never an
-            // OCI-layer source and must not add a virtiofs device.
-            source_smolmachine: (checkpoint.is_none()
-                || checkpoint
-                    .as_ref()
-                    .is_some_and(|checkpoint| checkpoint.packed_layers.is_some()))
-            .then_some(canonical_path),
-        };
-        params.prepend_deny_cidrs(&self.deny_cidr);
-        params.append_allow_udp(&self.allow_udp);
-        self.apply_settings_to_pack_params(&mut params)?;
-        merge_cli_credentials(&mut params, &self.credential)?;
 
-        let resources = VmResources {
-            cpus: params.cpus,
-            memory_mib: params.mem,
-            network: params.net,
-            network_backend: params.network_backend,
-            dns: params.dns,
-            dns_options: params.dns_options.clone(),
-            shm_size: params.shm_size.clone(),
-            network_name: params.network_name.clone(),
-            guest_subnet: params.guest_subnet.clone(),
-            gpu: params.gpu,
-            nested_virt: params.nested_virt,
-            gpu_vram_mib: params.gpu_vram_mib,
-            cuda: params.cuda,
-            rosetta: params.rosetta,
-            storage_gib: params.storage_gb,
-            overlay_gib: params.overlay_gb,
-            block_io: params.block_io,
-            disk_durability: params.disk_durability,
-            disks: params.disks.clone(),
-            cache_disk: params.cache_disk.clone(),
-            disk_volumes: Vec::new(),
-            block_private: params.block_private.clone(),
-            allowed_cidrs: params.allowed_cidrs.clone(),
-            egress_rules: params.egress_rules.clone(),
-        };
-        resources.validate()?;
-        validate_requested_network_backend(
-            &resources,
-            params.dns_filter_hosts.as_deref(),
-            params.port.len(),
-        )?;
-
-        let mut record = vm_common::build_vm_record_for(&params, checkpoint.is_some())?;
-        // Credential bindings that came with the artifact name host variables
-        // and destinations its author chose; resolving them from this host's
-        // environment would let a checkpoint send a host secret anywhere.
-        if checkpoint_network
-            .and_then(|captured| captured.credential_policy.as_ref())
-            .is_some_and(|policy| !policy.is_empty())
-        {
-            record.credentials_supplied_by_api = true;
-        }
-        if self.keep_identity && checkpoint.is_none() {
-            return Err(smolvm::Error::config(
-                "create machine",
-                "--keep-identity needs --from a checkpoint",
-            ));
-        }
-        if checkpoint.is_some() {
-            record.keep_identity = self.keep_identity;
-            record.host_uid_owner = Some(record.name.clone());
-            // The restored RAM already contains the initialized guest and its
-            // running workload. Re-running image pull/init after resume would
-            // duplicate side effects and violate checkpoint semantics.
-            record.init_completed = true;
-            record.user = checkpoint
+        let mut record = resolved.to_record(&name)?;
+        // The pack whose layers this machine mounts. An ordinary checkpoint's
+        // transport pack is never an OCI-layer source and must not add a
+        // virtiofs device; a packed-layer checkpoint's source pack is attached
+        // again below once it has been verified.
+        record.source_smolmachine = (checkpoint.is_none()
+            || checkpoint
                 .as_ref()
-                .and_then(|checkpoint| checkpoint.workload.as_ref())
-                .and_then(|workload| workload.user.clone());
-            record.fork_overlay_owner = checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.workload.as_ref())
-                .map(|workload| workload.overlay_owner.clone());
-            // The new machine continues the restored generation's history, so
-            // its next checkpoint records that generation as parent.
-            record.checkpoint_head = checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.lineage.as_ref())
-                .map(|lineage| lineage.id.clone());
-        }
+                .is_some_and(|checkpoint| checkpoint.packed_layers.is_some()))
+        .then_some(canonical_path);
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
 
         // Create the machine data dir while the DB reservation is held, then
@@ -5729,13 +5364,13 @@ impl CreateCmd {
         let create_result = (|| -> smolvm::Result<()> {
             let manager = AgentManager::for_vm_with_sizes(
                 &name_for_layers,
-                params.storage_gb,
-                params.overlay_gb,
+                record.storage_gb,
+                record.overlay_gb,
             )?;
 
             if checkpoint.is_none() {
                 if let Some(size) =
-                    smolvm::pack_seed::try_seed(&name_for_layers, sidecar_path, params.storage_gb)?
+                    smolvm::pack_seed::try_seed(&name_for_layers, sidecar_path, record.storage_gb)?
                 {
                     record.packed_image_on_storage = true;
                     record.storage_gb = Some(size);
@@ -5818,8 +5453,8 @@ impl CreateCmd {
                         storage_template: seed.storage_template.as_deref(),
                         overlay_logical_size: seed.overlay_logical_size,
                         storage_logical_size: seed.storage_logical_size,
-                        overlay_gb: params.overlay_gb,
-                        storage_gb: params.storage_gb,
+                        overlay_gb: record.overlay_gb,
+                        storage_gb: record.storage_gb,
                     },
                 )
                 .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
@@ -5872,8 +5507,7 @@ impl CreateCmd {
             return Err(e);
         }
 
-        vm_common::print_create_success(&params);
-        Ok(())
+        Ok(record)
     }
 }
 

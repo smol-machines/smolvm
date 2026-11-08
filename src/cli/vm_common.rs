@@ -10,7 +10,6 @@ use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
-use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
 use smolvm::secrets::SecretRef;
@@ -456,7 +455,8 @@ fn format_init_failure(index: usize, exit_code: i32, stdout: &str, stderr: &str)
 // Create
 // ============================================================================
 
-/// Parameters for [`create_vm`].
+/// Launch parameters of `machine run`, merged from its flags and a Smolfile.
+#[derive(Clone)]
 pub struct CreateVmParams {
     pub name: String,
     /// Caller metadata, passed through to [`VmRecord::labels`] verbatim.
@@ -616,15 +616,6 @@ pub fn prepare_params_credentials(params: &mut CreateVmParams) -> smolvm::Result
     Ok(())
 }
 
-/// Create a named machine configuration (does not start it).
-pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
-    let record = build_vm_record(&params)?;
-    let reservation = CreateVmReservation::reserve(&params.name)?;
-    reservation.commit(&record)?;
-    print_create_success(&params);
-    Ok(())
-}
-
 /// Cross-process reservation held while a create operation prepares any
 /// name-derived on-disk state. Dropping it releases the DB reservation unless
 /// it was committed.
@@ -705,220 +696,169 @@ impl CreateVmParams {
     }
 }
 
+/// The record `machine create` would write for these parameters, through
+/// the same rules as every other creation path.
 pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
-    build_vm_record_for(params, false)
+    smolvm::machine_spec::resolve(
+        smolvm::machine_spec::SpecSource::from_image(params.image.as_deref()),
+        params.to_create_spec()?,
+        smolvm::machine_spec::Caller::Cli,
+    )?
+    .to_record(&params.name)
 }
 
-/// [`build_vm_record`] for a machine that is (`restoring_checkpoint`) or isn't
-/// a live-checkpoint restore. A restore is marked before validation so checks
-/// that only make sense for a fresh boot (an image pull) don't reject it.
-pub(crate) fn build_vm_record_for(
-    params: &CreateVmParams,
-    restoring_checkpoint: bool,
-) -> smolvm::Result<VmRecord> {
-    // Validate name before touching the database. The on-disk layout uses
-    // a hash-derived directory (see `vm_data_dir`), so the name itself has
-    // no impact on socket path length — only character sanity + a generous
-    // length cap are needed here.
-    validate_vm_name(&params.name, "machine name")
-        .map_err(|reason| smolvm::Error::config("create machine", reason))?;
-
-    // Peel off remote volume specs (`s3://`) before the host-directory parse;
-    // they mount inside the guest at start instead of through virtiofs.
-    let (volume_specs, disk_volumes) =
-        smolvm::data::storage::split_disk_volume_specs(&params.volume)?;
-    let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&volume_specs)?;
-
-    // Parse and validate volume mounts
-    let parsed_mounts =
-        HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?;
-    let (mounts, staged_mounts) = HostMount::split_storage_tuples(&parsed_mounts);
-    for volume in &remote_volumes {
-        if mounts.iter().any(|(_, target, _)| target == &volume.target)
-            || staged_mounts
-                .iter()
-                .any(|(_, _, target)| target == &volume.target)
-        {
-            return Err(smolvm::Error::config(
-                "create machine",
-                format!(
-                    "duplicate mount target: {} is specified more than once",
-                    volume.target
-                ),
-            ));
-        }
+impl CreateVmParams {
+    /// These parameters as a machine spec, with their volume specs parsed.
+    pub(crate) fn to_create_spec(&self) -> smolvm::Result<smolvm::machine_spec::CreateSpec> {
+        // Destructured without `..`, so a new parameter has to be carried.
+        let CreateVmParams {
+            name: _,
+            labels,
+            image: _,
+            entrypoint,
+            cmd,
+            cpus,
+            mem,
+            volume,
+            allow_system_mounts,
+            port,
+            net,
+            network_backend,
+            dns,
+            dns_options,
+            shm_size,
+            network_name,
+            guest_subnet,
+            init,
+            env,
+            workdir,
+            user,
+            storage_gb,
+            overlay_gb,
+            block_io,
+            disk_durability,
+            disks,
+            cache_disk,
+            allowed_cidrs,
+            block_private,
+            egress_rules,
+            restart_policy,
+            restart_max_retries,
+            restart_max_backoff_secs,
+            health_cmd,
+            health_interval_secs,
+            health_timeout_secs,
+            health_retries,
+            health_startup_grace_secs,
+            ssh_agent,
+            cuda,
+            forkable,
+            stop_on_exit,
+            stop_signal,
+            stop_timeout_secs,
+            cuda_fork_pool_size,
+            cuda_vram_limit_mib,
+            docker_socket,
+            nested_virt,
+            gpu,
+            gpu_vram_mib,
+            rosetta,
+            dns_filter_hosts,
+            credential_policy,
+            // Minted when the record is written.
+            credential_placeholders: _,
+            published_sockets,
+            source_smolmachine: _,
+            secret_refs,
+        } = self.clone();
+        let (volume_specs, disk_volumes) = smolvm::data::storage::split_disk_volume_specs(&volume)?;
+        let (host_specs, remote_volumes) = smolvm::remote_volume::split_specs(&volume_specs)?;
+        Ok(smolvm::machine_spec::CreateSpec {
+            entrypoint: Some(entrypoint),
+            cmd: Some(cmd),
+            env: smolvm::util::parse_env_list(&env),
+            workdir,
+            user,
+            init,
+            secret_refs,
+            restart_policy,
+            restart_max_retries,
+            restart_max_backoff_secs,
+            health_cmd,
+            health_interval_secs,
+            health_timeout_secs,
+            health_retries,
+            health_startup_grace_secs,
+            stop_on_exit,
+            stop_signal,
+            stop_timeout_secs,
+            shm_size,
+            cpus: Some(cpus),
+            mem: Some(mem),
+            storage_gb,
+            overlay_gb,
+            block_io: Some(block_io),
+            disk_durability: Some(disk_durability),
+            disks,
+            cache_disk,
+            mounts: HostMount::parse_with_system_mounts(&host_specs, allow_system_mounts)?,
+            remote_volumes,
+            disk_volumes,
+            net,
+            network_backend,
+            dns,
+            dns_options,
+            network_name,
+            guest_subnet,
+            ports: port,
+            allowed_cidrs,
+            allowed_hosts: dns_filter_hosts,
+            block_private,
+            egress_rules,
+            credentials: credential_policy,
+            credentials_supplied_only: false,
+            published_sockets,
+            gpu,
+            gpu_vram_mib,
+            rosetta,
+            nested_virt,
+            cuda,
+            docker_socket,
+            ssh_agent,
+            forkable,
+            cuda_fork_pool_size,
+            cuda_vram_limit_mib,
+            keep_identity: false,
+            ephemeral: false,
+            detached: false,
+            runtime_managed: false,
+            labels,
+        })
     }
-
-    // Convert port mappings to tuple format for storage, TCP and UDP apart.
-    let (ports, udp_ports) = PortMapping::split_tuples(&params.port);
-
-    // Parse environment variables for init
-    let env = smolvm::util::parse_env_list(&params.env);
-
-    // Validate every ref against the CLI trust scope before persisting.
-    // The CLI caller is `TrustedLocal`, so all source kinds are allowed,
-    // but structural rules (exactly one source, absolute from_file paths)
-    // still apply and catch Smolfile typos before they reach the DB.
-    for (name, r) in &params.secret_refs {
-        smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::TrustedLocal).map_err(
-            |e| smolvm::Error::config("create machine", format!("secret '{}': {}", name, e)),
-        )?;
-    }
-
-    if params.cuda_fork_pool_size == Some(0) {
-        return Err(smolvm::Error::config(
-            "create machine",
-            "fork pool size must be greater than zero",
-        ));
-    }
-    if params.cuda_vram_limit_mib == Some(0) {
-        return Err(smolvm::Error::config(
-            "create machine",
-            "CUDA VRAM limit must be greater than zero",
-        ));
-    }
-    if params.cuda_fork_pool_size.is_some() && !params.cuda {
-        return Err(smolvm::Error::config(
-            "create machine",
-            "fork pool size requires a CUDA-enabled machine",
-        ));
-    }
-    if params.cuda_vram_limit_mib.is_some() && params.cuda_fork_pool_size.is_none() {
-        return Err(smolvm::Error::config(
-            "create machine",
-            "CUDA VRAM limit requires a fork pool size",
-        ));
-    }
-
-    // Create record with restart policy if configured
-    let restart = smolvm::config::RestartConfig {
-        policy: params
-            .restart_policy
-            .clone()
-            .unwrap_or(smolvm::config::RestartPolicy::Never),
-        max_retries: params.restart_max_retries.unwrap_or(0),
-        max_backoff_secs: params.restart_max_backoff_secs.unwrap_or(0),
-        ..Default::default()
-    };
-    let mut record = VmRecord::new_with_restart(
-        params.name.clone(),
-        params.cpus,
-        params.mem,
-        mounts,
-        ports,
-        params.net,
-        restart,
-    );
-    record.udp_ports = udp_ports;
-    record.staged_mounts = staged_mounts;
-    record.init = params.init.clone();
-    smolvm::data::storage::ensure_disk_volumes_distinct(
-        &disk_volumes,
-        record
-            .mounts
-            .iter()
-            .map(|(_, target, _)| target.as_str())
-            .chain(
-                record
-                    .staged_mounts
-                    .iter()
-                    .map(|(_, _, target)| target.as_str()),
-            )
-            .chain(remote_volumes.iter().map(|v| v.target.as_str())),
-    )?;
-    record.remote_volumes = remote_volumes;
-    record.disk_volumes = disk_volumes;
-    record.env = env;
-    record.secret_refs = params.secret_refs.clone();
-    record.workdir = params.workdir.clone();
-    record.user = params.user.clone();
-    record.storage_gb = params.storage_gb;
-    record.overlay_gb = params.overlay_gb;
-    record.block_io = params.block_io;
-    record.disk_durability = params.disk_durability;
-    record.disks = params.disks.clone();
-    record.cache_disk = params.cache_disk.clone();
-    record.allowed_cidrs = params.allowed_cidrs.clone();
-    record.block_private = params.block_private.clone();
-    record.egress_rules = params.egress_rules.clone();
-    record.network_backend = params.network_backend;
-    record.dns = params.dns;
-    record.dns_options = params.dns_options.clone();
-    record.shm_size = params.shm_size.clone();
-    record.network_name = params.network_name.clone();
-    record.guest_subnet = params.guest_subnet.clone();
-    record.gpu = if params.gpu { Some(true) } else { None };
-    // Persist nesting the same way: `machine start` rebuilds resources from the
-    // record, so a flag that only reaches the create-time launch is silently
-    // dropped on every later start.
-    record.nested_virt = if params.nested_virt { Some(true) } else { None };
-    record.rosetta = if params.rosetta { Some(true) } else { None };
-    // Same invariant the CLI enforces, applied again here because
-    // Smolfile values arrive through `params.gpu_vram_mib` without
-    // passing through the clap value_parser.
-    record.gpu_vram_mib = smolvm::data::resources::validate_gpu_vram_mib(params.gpu_vram_mib)
-        .map_err(|e| smolvm::Error::config("create machine", format!("gpu_vram: {}", e)))?;
-    record.image = params.image.clone();
-    record.entrypoint = params.entrypoint.clone();
-    record.cmd = params.cmd.clone();
-    record.health_cmd = params.health_cmd.clone();
-    record.health_interval_secs = params.health_interval_secs;
-    record.health_timeout_secs = params.health_timeout_secs;
-    record.health_retries = params.health_retries;
-    record.health_startup_grace_secs = params.health_startup_grace_secs;
-    record.ssh_agent = params.ssh_agent;
-    record.cuda = params.cuda;
-    record.forkable = params.forkable || params.cuda_fork_pool_size.is_some();
-    record.stop_on_exit = params.stop_on_exit;
-    record.stop_signal = params.stop_signal.clone();
-    record.stop_timeout_secs = params.stop_timeout_secs;
-    record.cuda_fork_pool_size = params.cuda_fork_pool_size;
-    record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
-    record.docker_socket = params.docker_socket;
-    record.dns_filter_hosts = params.dns_filter_hosts.clone();
-    if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
-        smolvm::credentials::require_host_sources(policy)?;
-        record.credential_placeholders = if params.credential_placeholders.is_empty() {
-            smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?
-        } else {
-            params.credential_placeholders.clone()
-        };
-        record.credential_policy = Some(policy.clone());
-    }
-    record.published_sockets = params.published_sockets.clone();
-    record.source_smolmachine = params.source_smolmachine.clone();
-    record.labels = params.labels.clone();
-    if restoring_checkpoint {
-        record.host_uid_owner = Some(record.name.clone());
-    }
-
-    // Remote volumes mount into the workload container's namespace, so an
-    // imageless machine has nowhere to put them, and they need network to
-    // reach the bucket. Refuse at create instead of failing every start.
-    record.validate_remote_volumes()?;
-
-    Ok(record)
 }
 
-pub(crate) fn print_create_success(params: &CreateVmParams) {
-    println!("Created machine: {}", params.name);
-    println!("  CPUs: {}, Memory: {} MiB", params.cpus, params.mem);
-    if !params.volume.is_empty() {
-        println!("  Mounts: {}", params.volume.len());
+/// Report a created machine.
+pub(crate) fn print_created(record: &VmRecord) {
+    println!("Created machine: {}", record.name);
+    println!("  CPUs: {}, Memory: {} MiB", record.cpus, record.mem);
+    let mounts = record.mounts.len() + record.staged_mounts.len();
+    if mounts > 0 {
+        println!("  Mounts: {mounts}");
     }
-    if !params.port.is_empty() {
-        println!("  Ports: {}", params.port.len());
+    let ports = record.ports.len() + record.udp_ports.len();
+    if ports > 0 {
+        println!("  Ports: {ports}");
     }
-    if !params.init.is_empty() {
-        println!("  Init commands: {}", params.init.len());
+    if !record.init.is_empty() {
+        println!("  Init commands: {}", record.init.len());
     }
     println!(
         "\nUse 'smolvm machine start --name {}' to start the machine",
-        params.name
+        record.name
     );
     println!(
         "Then use 'smolvm machine exec --name {} -- <command>' to run commands",
-        params.name
+        record.name
     );
 }
 
@@ -2196,45 +2136,9 @@ fn start_vm_named_with_db(
 /// one path and dropped on another. Covered by the launch-settings round-trip
 /// test in this module.
 pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
-    r.cpus = o.cpus;
-    r.mem = o.mem;
-    r.mounts = o.mounts.clone();
-    r.staged_mounts = o.staged_mounts.clone();
-    r.set_port_mappings(&o.ports);
-    r.network = o.network;
-    r.network_backend = o.network_backend;
-    r.dns = o.dns;
-    r.dns_options = o.dns_options.clone();
-    r.shm_size = o.shm_size.clone();
-    r.network_name = o.network_name.clone();
-    r.guest_subnet = o.guest_subnet.clone();
-    r.storage_gb = o.storage_gb;
-    r.overlay_gb = o.overlay_gb;
-    r.block_io = o.block_io;
-    r.disk_durability = o.disk_durability;
-    r.disks = o.disks.clone();
-    r.cache_disk = o.cache_disk.clone();
-    r.allowed_cidrs = o.allowed_cidrs.clone();
-    r.block_private = o.block_private.clone();
-    r.egress_rules = o.egress_rules.clone();
-    r.init = o.init.clone();
-    r.init_completed = false;
-    r.env = o.env.clone();
-    r.secret_refs = o.secret_refs.clone();
-    r.workdir = o.workdir.clone();
-    r.user = o.user.clone();
-    r.image = o.image.clone();
-    r.entrypoint = o.entrypoint.clone();
-    r.cmd = o.cmd.clone();
-    r.ssh_agent = o.ssh_agent;
-    r.cuda = o.cuda;
-    r.docker_socket = o.docker_socket;
-    r.dns_filter_hosts = o.dns_filter_hosts.clone();
-    r.credential_policy = o.credential_policy.clone();
-    r.credential_placeholders = o.credential_placeholders.clone();
-    r.gpu = if o.gpu { Some(true) } else { None };
-    r.gpu_vram_mib = o.gpu_vram_mib;
-    r.rosetta = if o.rosetta { Some(true) } else { None };
+    let name = std::mem::take(&mut r.name);
+    *r = o.record.clone();
+    r.name = name;
 }
 
 pub fn persist_named_running(
@@ -2257,13 +2161,15 @@ pub fn persist_named_running(
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
     config
         .update_vm(name, |r| {
+            // The settings first: they replace the whole record, and the
+            // running state below belongs to the process just started.
+            if let Some(ref o) = overrides {
+                apply_overrides(r, o);
+            }
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
             r.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
-            if let Some(ref o) = overrides {
-                apply_overrides(r, o);
-            }
         })
         .ok_or_else(|| smolvm::Error::config(
             "persist machine record",
@@ -2275,52 +2181,11 @@ pub fn persist_named_running(
     Ok(())
 }
 
-/// Config overrides for a VM record.
+/// The settings a `machine run -d` machine records: a whole record, written
+/// by the rules `machine create` uses, that the path then adjusts where it
+/// genuinely differs (the image-resolved env, workdir and user; the command).
 pub struct DefaultVmOverrides {
-    pub cpus: u8,
-    pub mem: u32,
-    pub mounts: Vec<(String, String, bool)>,
-    pub staged_mounts: Vec<(usize, String, String)>,
-    pub ports: Vec<PortMapping>,
-    pub network: bool,
-    pub network_backend: Option<NetworkBackend>,
-    pub dns: Option<std::net::Ipv4Addr>,
-    pub dns_options: Vec<String>,
-    /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
-    /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
-    pub shm_size: Option<String>,
-    pub network_name: Option<String>,
-    pub guest_subnet: Option<String>,
-    pub storage_gb: Option<u64>,
-    pub overlay_gb: Option<u64>,
-    pub block_io: smolvm::data::resources::BlockIoEngine,
-    /// When guest disk writes must reach the host's disk (`--disk-durability`).
-    pub disk_durability: smolvm::data::resources::DiskDurability,
-    /// Host disks attached beyond storage and overlay (`--disk`).
-    pub disks: Vec<smolvm::data::disk::AttachedDisk>,
-    /// Shared cache disk (`--cache-disk`).
-    pub cache_disk: Option<smolvm::data::disk::CacheDisk>,
-    pub allowed_cidrs: Option<Vec<String>>,
-    /// `--block-private` and its `--allow-private` exceptions.
-    pub block_private: Option<Vec<String>>,
-    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
-    pub init: Vec<String>,
-    pub env: Vec<(String, String)>,
-    pub secret_refs: BTreeMap<String, SecretRef>,
-    pub workdir: Option<String>,
-    pub user: Option<String>,
-    pub image: Option<String>,
-    pub entrypoint: Vec<String>,
-    pub cmd: Vec<String>,
-    pub ssh_agent: bool,
-    pub cuda: bool,
-    pub docker_socket: bool,
-    pub dns_filter_hosts: Option<Vec<String>>,
-    pub credential_policy: Option<smolvm::credentials::CredentialPolicy>,
-    pub credential_placeholders: BTreeMap<String, String>,
-    pub gpu: bool,
-    pub gpu_vram_mib: Option<u32>,
-    pub rosetta: bool,
+    pub record: VmRecord,
 }
 
 /// One `Deny` egress rule per CIDR, in order.
@@ -2359,59 +2224,23 @@ impl CreateVmParams {
 }
 
 impl DefaultVmOverrides {
-    /// The one projection of create parameters onto the settings a machine
-    /// record keeps. Both the image-machine and the one-shot `run` path build
-    /// their record through here and then adjust only what is genuinely
-    /// path-specific (the image-resolved env, workdir and user; the image and
-    /// command). Before this each path spelled the projection out by hand, and
-    /// the two copies drifted: one persisted `user` while the other silently
-    /// wrote `None`.
+    /// The record `machine create` would write for `params`, with the mounts
+    /// and ports this run launched with. Placeholders minted before boot are
+    /// kept, so the workload's copies stay valid.
     pub(crate) fn from_create_params(
         params: &CreateVmParams,
         mounts: Vec<(String, String, bool)>,
         staged_mounts: Vec<(usize, String, String)>,
         ports: Vec<PortMapping>,
-    ) -> Self {
-        Self {
-            secret_refs: params.secret_refs.clone(),
-            cpus: params.cpus,
-            mem: params.mem,
-            mounts,
-            staged_mounts,
-            ports,
-            network: params.net,
-            network_backend: params.network_backend,
-            dns: params.dns,
-            dns_options: params.dns_options.clone(),
-            shm_size: params.shm_size.clone(),
-            network_name: params.network_name.clone(),
-            guest_subnet: params.guest_subnet.clone(),
-            storage_gb: params.storage_gb,
-            overlay_gb: params.overlay_gb,
-            block_io: params.block_io,
-            disk_durability: params.disk_durability,
-            disks: params.disks.clone(),
-            cache_disk: params.cache_disk.clone(),
-            allowed_cidrs: params.allowed_cidrs.clone(),
-            block_private: params.block_private.clone(),
-            egress_rules: params.egress_rules.clone(),
-            init: params.init.clone(),
-            env: smolvm::util::parse_env_list(&params.env),
-            workdir: params.workdir.clone(),
-            user: params.user.clone(),
-            image: params.image.clone(),
-            entrypoint: params.entrypoint.clone(),
-            cmd: params.cmd.clone(),
-            ssh_agent: params.ssh_agent,
-            cuda: params.cuda,
-            docker_socket: params.docker_socket,
-            dns_filter_hosts: params.dns_filter_hosts.clone(),
-            credential_policy: params.credential_policy.clone().filter(|p| !p.is_empty()),
-            credential_placeholders: params.credential_placeholders.clone(),
-            gpu: params.gpu,
-            gpu_vram_mib: params.gpu_vram_mib,
-            rosetta: false,
+    ) -> smolvm::Result<Self> {
+        let mut record = build_vm_record(params)?;
+        record.mounts = mounts;
+        record.staged_mounts = staged_mounts;
+        record.set_port_mappings(&ports);
+        if !params.credential_placeholders.is_empty() {
+            record.credential_placeholders = params.credential_placeholders.clone();
         }
+        Ok(Self { record })
     }
 }
 
@@ -3688,6 +3517,10 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     }
     if let Some(cidrs) = &record.allowed_cidrs {
         fields.insert("allowed_cidrs".into(), serde_json::json!(cidrs));
+    }
+    // The private-range block and its exceptions, present only when set.
+    if let Some(exceptions) = &record.block_private {
+        fields.insert("block_private".into(), serde_json::json!(exceptions));
     }
     // The guest resolver and its options, present only when set (`--dns`,
     // `--dns-option`), so tooling can see what the guest resolv.conf gets.
