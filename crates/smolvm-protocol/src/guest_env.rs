@@ -168,6 +168,12 @@ pub const CACHE_DISK: &str = "SMOLVM_CACHE_DISK";
 /// disk at each one in every workload. Absent means none.
 pub const DISK_VOLUMES: &str = "SMOLVM_DISK_VOLUMES";
 
+/// Ceiling, in microseconds, for the guest kernel's poll before it parks an
+/// idle CPU (`/proc/smolvm-idle-poll-us`). The agent writes it at boot; absent
+/// means the kernel's default, no polling. The host sets it where the wake
+/// from a parked CPU has been measured to dominate a virtio-fs round trip.
+pub const IDLE_POLL_US: &str = "SMOLVM_IDLE_POLL_US";
+
 /// Enables forwarding a detached workload's stdout and stderr to the host over
 /// the `ports::WORKLOAD_LOGS` vsock port, where the host appends them to the
 /// machine's `workload.log`. Absent means the output is discarded.
