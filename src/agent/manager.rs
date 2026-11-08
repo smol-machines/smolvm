@@ -5207,6 +5207,9 @@ mod tests {
 
     #[test]
     fn launch_refuses_live_persisted_pid_without_agent_reachability() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
         let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();

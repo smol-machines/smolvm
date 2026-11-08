@@ -194,6 +194,9 @@ enum Stage {
 struct Flow {
     exit_state: RelayExitState,
     stage: Stage,
+    /// The host socket is armed with no interest, waiting only for an error
+    /// or hang-up: from then on, and only then, an event on it means one.
+    errors_only: bool,
 }
 
 struct Reactor {
@@ -297,6 +300,7 @@ impl Reactor {
                             Flow {
                                 exit_state: flow.exit_state,
                                 stage: Stage::Relaying(pump),
+                                errors_only: false,
                             },
                         );
                         self.ready.push_back(id);
@@ -368,6 +372,7 @@ impl Reactor {
                             mediated,
                             opening,
                         },
+                        errors_only: false,
                     },
                 );
                 let shared = self.shared.clone();
@@ -411,6 +416,7 @@ impl Reactor {
                     Flow {
                         exit_state,
                         stage: Stage::Relaying(pump),
+                        errors_only: false,
                     },
                 );
                 self.ready.push_back(id);
@@ -478,6 +484,7 @@ impl Reactor {
                     deadline,
                     waiting,
                 },
+                errors_only: false,
             },
         );
     }
@@ -535,6 +542,7 @@ impl Reactor {
                             Flow {
                                 exit_state: flow.exit_state,
                                 stage: Stage::Relaying(pump),
+                                errors_only: false,
                             },
                         );
                         self.drive(id, false);
@@ -543,6 +551,12 @@ impl Reactor {
                 }
             }
             Stage::Relaying(pump) => {
+                // Only an event that arrives while the socket waits for errors
+                // alone is a hang-up. The readable event that carried the
+                // host's FIN is not one: treating it as such reset the guest's
+                // connection while it was still reading the host's last bytes.
+                let hung_up = from_socket && flow.errors_only;
+                flow.errors_only = false;
                 let outcome = pump.pump(
                     &mut self.read_buffer,
                     &self.relay_wake,
@@ -554,7 +568,7 @@ impl Reactor {
                     Ok(PumpOutcome::Finished(mode)) => self.finish(id, mode),
                     Ok(PumpOutcome::Idle { read, write }) => {
                         if pump.only_waiting_for_guest() {
-                            if let Err(err) = pump.check_host_error(from_socket) {
+                            if let Err(err) = pump.check_host_error(hung_up) {
                                 return self.finish_with_error(id, &err);
                             }
                             // Armed with no interest: epoll still reports an
@@ -563,6 +577,7 @@ impl Reactor {
                                 .shared
                                 .poller
                                 .modify(&pump.stream, Event::none(id as usize));
+                            flow.errors_only = true;
                         } else if read || write {
                             let _ = self
                                 .shared
@@ -874,9 +889,35 @@ mod tests {
         }
     }
 
+    /// Descriptors of this process that are TCP sockets with `port` at
+    /// either end. Other tests run in this process too, so a count of every
+    /// descriptor would include theirs.
     #[cfg(target_os = "linux")]
-    fn open_fds() -> usize {
-        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    fn sockets_on_port(port: u16) -> usize {
+        let wanted = format!(":{port:04X}");
+        let mut inodes = std::collections::HashSet::new();
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            for line in std::fs::read_to_string(table)
+                .unwrap_or_default()
+                .lines()
+                .skip(1)
+            {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() > 9
+                    && (fields[1].ends_with(&wanted) || fields[2].ends_with(&wanted))
+                {
+                    inodes.insert(format!("socket:[{}]", fields[9]));
+                }
+            }
+        }
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter(|fd| {
+                std::fs::read_link(fd.path())
+                    .is_ok_and(|target| inodes.contains(target.to_string_lossy().as_ref()))
+            })
+            .count()
     }
 
     #[test]
@@ -884,8 +925,6 @@ mod tests {
         raise_fd_limit();
         let server = echo_server();
         let (reactor, _relay_wake) = start_reactor();
-        #[cfg(target_os = "linux")]
-        let fds_before = open_fds();
         let count = 2000;
         let flows: Vec<TestFlow> = (1..=count)
             .map(|id| open_flow(&reactor, id, RelayTarget::Connect(server), server))
@@ -908,11 +947,13 @@ mod tests {
         // Each flow holds its relay socket and the server's accepted end, and
         // nothing more: no per-flow poller, wake pipe or thread.
         #[cfg(target_os = "linux")]
-        assert!(
-            open_fds() <= fds_before + 2 * count as usize + 16,
-            "{} descriptors for {count} flows (from {fds_before})",
-            open_fds()
-        );
+        {
+            let sockets = sockets_on_port(server.port());
+            assert!(
+                sockets <= 2 * count as usize + 1,
+                "{sockets} sockets on the server's port for {count} flows"
+            );
+        }
         for flow in &flows {
             assert_eq!(flow.exit_state.load(), RelayExitMode::Running);
         }
@@ -1053,6 +1094,55 @@ mod tests {
         let (announced, first_bytes) = interceptor.join().unwrap();
         assert_eq!(announced, destination);
         assert_eq!(first_bytes, b"\x16\x03\x01hello");
+    }
+
+    #[test]
+    fn a_host_that_answers_and_closes_at_once_never_resets_the_guest() {
+        // Like an HTTP server answering `Connection: close`: it reads the
+        // request, writes the whole response and closes, so its FIN arrives
+        // on the same readable event as (or right after) the last bytes.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let server = listener.local_addr().unwrap();
+        let response = vec![b'r'; 3000];
+        let served = response.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let served = served.clone();
+                thread::spawn(move || {
+                    let mut request = [0u8; 64];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(&served);
+                });
+            }
+        });
+        let (reactor, _relay_wake) = start_reactor();
+        for id in 1..=300u64 {
+            let flow = open_flow(&reactor, id, RelayTarget::Connect(server), server);
+            send(&flow, b"GET / HTTP/1.1\r\n\r\n");
+            let mut received = Vec::new();
+            while received.len() < response.len() {
+                match flow.from_proxy.recv_timeout(Duration::from_secs(5)) {
+                    Ok(payload) => received.extend(payload),
+                    Err(_) => panic!(
+                        "flow {id} got {} of {} bytes, then {:?}",
+                        received.len(),
+                        response.len(),
+                        flow.exit_state.load()
+                    ),
+                }
+                flow.drained();
+            }
+            assert_eq!(received, response, "flow {id}");
+            // The host's FIN reaches the guest as a half-close, not a reset.
+            wait_for(&flow, RelayExitMode::HalfClosed);
+            thread::sleep(Duration::from_millis(1));
+            assert_eq!(
+                flow.exit_state.load(),
+                RelayExitMode::HalfClosed,
+                "flow {id}"
+            );
+        }
     }
 
     #[test]
