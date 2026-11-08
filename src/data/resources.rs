@@ -2,10 +2,80 @@
 /// vCPU threads sleep in the hypervisor when idle, so over-provisioning
 /// is low-cost — the host OS time-slices them like any other threads.
 pub const DEFAULT_MICROVM_CPU_COUNT: u8 = 4;
-/// Default agent VM memory in MiB.
+/// Largest default agent VM memory in MiB; see [`default_microvm_memory_mib`]
+/// for the default a new machine gets on this host.
 /// Virtio balloon with free page reporting means this is a ceiling, not a
 /// reservation — the host only consumes what the guest actually uses.
 pub const DEFAULT_MICROVM_MEMORY_MIB: u32 = 8192;
+
+/// Smallest default agent VM memory in MiB, for hosts with very little RAM.
+const MIN_DEFAULT_MICROVM_MEMORY_MIB: u32 = 1024;
+
+/// Memory in MiB a new machine gets when none is asked for: half the host's
+/// RAM, at most [`DEFAULT_MICROVM_MEMORY_MIB`].
+///
+/// The cap is a ceiling, but a busy guest fills it with page cache, so a cap
+/// equal to the host's RAM lets one machine push the rest of the host into
+/// swap. Only new machines take this default: a machine's memory is recorded
+/// when it is created.
+pub fn default_microvm_memory_mib() -> u32 {
+    default_memory_for_host(host_physical_memory_mib())
+}
+
+fn default_memory_for_host(host_mib: Option<u64>) -> u32 {
+    match host_mib {
+        Some(mib) => (mib / 2).clamp(
+            u64::from(MIN_DEFAULT_MICROVM_MEMORY_MIB),
+            u64::from(DEFAULT_MICROVM_MEMORY_MIB),
+        ) as u32,
+        None => DEFAULT_MICROVM_MEMORY_MIB,
+    }
+}
+
+/// The host's physical RAM in MiB, or `None` if it cannot be read.
+fn host_physical_memory_mib() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut bytes = 0u64;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: hw.memsize is a u64 and `len` holds its size.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&mut bytes as *mut u64).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && len == std::mem::size_of::<u64>() && bytes > 0).then_some(bytes >> 20)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // SAFETY: sysconf has no preconditions.
+        let (pages, page_size) = unsafe {
+            (
+                libc::sysconf(libc::_SC_PHYS_PAGES),
+                libc::sysconf(libc::_SC_PAGESIZE),
+            )
+        };
+        (pages > 0 && page_size > 0).then(|| (pages as u64).saturating_mul(page_size as u64) >> 20)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: a zeroed MEMORYSTATUSEX with its length set is the documented input.
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: `status` is a valid, correctly sized out-struct.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+        (ok && status.ullTotalPhys > 0).then_some(status.ullTotalPhys >> 20)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
 
 /// Default VRAM (host shared memory region) exposed to the guest
 /// virtio-gpu device, in MiB.
@@ -239,7 +309,7 @@ impl Default for VmResources {
     fn default() -> Self {
         Self {
             cpus: DEFAULT_MICROVM_CPU_COUNT,
-            memory_mib: DEFAULT_MICROVM_MEMORY_MIB,
+            memory_mib: default_microvm_memory_mib(),
             network: false,
             network_backend: None,
             gpu: false,
@@ -349,5 +419,24 @@ mod tests {
     #[test]
     fn validate_gpu_vram_mib_accepts_none() {
         assert_eq!(validate_gpu_vram_mib(None).unwrap(), None);
+    }
+
+    #[test]
+    fn the_default_memory_is_half_the_host_up_to_eight_gib() {
+        let gib = |n: u64| n * 1024;
+        // The 8 GB Mac that held 8.5 GB after a heavy job now caps at 4 GiB.
+        assert_eq!(default_memory_for_host(Some(gib(8))), 4096);
+        assert_eq!(default_memory_for_host(Some(gib(16))), 8192);
+        assert_eq!(default_memory_for_host(Some(gib(64))), 8192);
+        assert_eq!(default_memory_for_host(Some(gib(12))), 6144);
+        assert_eq!(default_memory_for_host(Some(1536)), 1024);
+        assert_eq!(default_memory_for_host(None), DEFAULT_MICROVM_MEMORY_MIB);
+    }
+
+    #[test]
+    fn this_host_gets_a_default_in_range() {
+        let mib = default_microvm_memory_mib();
+        assert!((MIN_DEFAULT_MICROVM_MEMORY_MIB..=DEFAULT_MICROVM_MEMORY_MIB).contains(&mib));
+        assert_eq!(VmResources::default().memory_mib, mib);
     }
 }

@@ -8,7 +8,7 @@ use crate::cli::format_pid_suffix;
 use smolvm::agent::{vm_data_dir, AgentManager};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::data::network::PortMapping;
-use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::data::resources::{default_microvm_memory_mib, DEFAULT_MICROVM_CPU_COUNT};
 use smolvm::data::storage::HostMount;
 use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
@@ -2151,7 +2151,7 @@ pub fn persist_named_running(
         let record = VmRecord::new(
             name.to_string(),
             DEFAULT_MICROVM_CPU_COUNT,
-            DEFAULT_MICROVM_MEMORY_MIB,
+            default_microvm_memory_mib(),
             vec![],
             vec![],
             false,

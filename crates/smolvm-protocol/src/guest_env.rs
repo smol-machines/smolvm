@@ -82,6 +82,12 @@ pub const MACHINE_NAME: &str = "SMOLVM_MACHINE_NAME";
 /// interval. Read by the guest agent; forwarded from the host env verbatim.
 pub const DISK_TRIM: &str = "SMOLVM_DISK_TRIM";
 
+/// Tunes the in-guest reclaim of idle page cache, which lets the host take
+/// back memory a finished job left cached: `off`/`0` disables it, `<seconds>`
+/// sets how long the machine must be quiet first. Read by the guest agent;
+/// forwarded from the host env verbatim.
+pub const MEMORY_TRIM: &str = "SMOLVM_MEMORY_TRIM";
+
 /// Selects whether the guest should configure a real virtio NIC.
 pub const BACKEND: &str = "SMOLVM_NETWORK_BACKEND";
 /// Canonical backend value meaning "configure guest virtio-net".

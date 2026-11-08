@@ -779,8 +779,9 @@ pub struct RunCmd {
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
 
-    /// Maximum memory in MiB the machine may use [default: 8192]. Memory is
-    /// elastic: the host commits only what the guest touches, up to this cap.
+    /// Maximum memory in MiB the machine may use [default: half the host's
+    /// RAM, at most 8192]. Memory is elastic: the host commits only what the
+    /// guest touches, up to this cap.
     #[arg(long, value_name = "MiB", help_heading = "Resources")]
     pub mem: Option<u32>,
 
@@ -4509,8 +4510,9 @@ pub struct CreateCmd {
     #[arg(long, value_name = "N")]
     pub cpus: Option<u8>,
 
-    /// Maximum memory in MiB the machine may use [default: 8192, or the
-    /// Smolfile/pack value]. Elastic: only touched memory is committed.
+    /// Maximum memory in MiB the machine may use [default: half the host's
+    /// RAM, at most 8192, or the Smolfile/pack value]. Elastic: only touched
+    /// memory is committed.
     #[arg(long, value_name = "MiB")]
     pub mem: Option<u32>,
 

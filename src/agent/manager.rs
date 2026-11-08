@@ -3219,12 +3219,14 @@ impl AgentManager {
             if let Some(ref ctl) = features.control_socket {
                 v.push(("SMOLVM_CONTROL_SOCKET", ctl.to_string_lossy().into_owned()));
             }
-            // Idle reclaim is on by default (SMOLVM_IDLE_RECLAIM=0/off
-            // disables); a pulse without host-side release is pure waste, so
-            // the libkrun reclaim gate follows the same switch. libkrun
-            // additionally hard-disables reclaim for forkable (CoW-shared)
-            // guest RAM regardless of this env.
-            if crate::agent::launcher::idle_reclaim_minutes().is_some() {
+            // Hand the pages the guest frees back to the host. On macOS a
+            // free page report or balloon page is only released with this
+            // gate on (Linux and Windows always release), and without it the
+            // guest's idle page-cache reclaim and the idle balloon pulse free
+            // memory the host never gets back. An explicit setting in the
+            // host env wins. libkrun only punches RAM files it owns, so
+            // forkable (CoW-shared) guest RAM stays intact either way.
+            if std::env::var_os("SMOLVM_BALLOON_RECLAIM").is_none() {
                 v.push(("SMOLVM_BALLOON_RECLAIM", "1".to_string()));
             }
             if let Some(ref snap) = features.snapshot_dir {

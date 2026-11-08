@@ -133,7 +133,7 @@ How It Works
 
 Each workload runs in a hardware-virtualized VM with its own guest kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) is the VMM and [libkrunfw](https://github.com/smol-machines/libkrunfw) supplies the guest kernel. Images use the [OCI](https://opencontainers.org/) format, so anything on Docker Hub, ghcr.io or another registry boots as a microVM, with no Docker daemon.
 
-Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon and idle vCPUs sleep in the hypervisor, so over-provisioning costs almost nothing. Override with `--cpus` and `--mem`.
+Defaults: 4 vCPUs, and half the host's RAM up to 8 GiB. Memory is elastic via virtio balloon and idle vCPUs sleep in the hypervisor, so over-provisioning costs almost nothing. Override with `--cpus` and `--mem`.
 
 Comparison
 ----------
