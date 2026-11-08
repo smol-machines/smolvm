@@ -82,6 +82,7 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 | Inject API keys / tokens without putting them on the command line | `--secret-env`/`--secret-file` flags or Smolfile `[secrets]` |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Change mounts/ports/resources on existing VM | `machine update --name NAME -v ./src:/app -p 8080:8080` |
+| `docker` and `docker compose` on this host | `smolvm docker`, then plain `docker` ([details](docs/docker-in-machine/README.md#one-command-smolvm-docker)) |
 | Mount a host dir into a running VM, no restart | `machine mount add --name NAME -v ./src:/app` (until it stops) |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
 | Move a running machine from an arm64 Mac to arm64 Linux | `machine checkpoint --name NAME -o FILE.checkpoint` on the Mac, then `machine create --name NAME --from FILE.checkpoint` + `machine start` on Linux ([details](docs/mac-to-linux.md)) |
@@ -133,6 +134,8 @@ smolvm pack list [--json]                         # pulled artifacts and their p
 
 smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
 smolvm config registries edit                     # registry auth
+smolvm docker                                     # Docker engine in a managed machine; selects the `smol` docker context
+smolvm docker stop|status|logs|reset|delete       # reset keeps images and volumes unless --volumes
 smolvm completion bash|zsh|fish|powershell|elvish # print a shell completion script
 smolvm <any command> --error-format json        # failures as {"error":{"code":"NOT_FOUND","message":…}}
 ```
