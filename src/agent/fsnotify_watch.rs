@@ -36,6 +36,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 
+/// Whether host directories are watched at all. Setting SMOL_NO_HOT_RELOAD
+/// disables it (e.g. very large trees, or privacy preference); the launcher
+/// asks too, since a share may only keep negative entries while it is watched.
+pub fn watching_enabled() -> bool {
+    std::env::var_os("SMOL_NO_HOT_RELOAD").is_none()
+}
+
 /// Guest mountpoint root for virtiofs devices. MUST match the agent's
 /// `paths::VIRTIOFS_MOUNT_ROOT` — the agent stages each `-v` device at
 /// `<root>/smolvm{index}` and binds it into the container, so events fired on
@@ -116,9 +123,7 @@ impl FsNotifyWatcher {
         mounts: impl IntoIterator<Item = (PathBuf, String)>,
         poll: bool,
     ) -> Option<Self> {
-        // Opt-out escape hatch: setting SMOL_NO_HOT_RELOAD disables host FS
-        // watching entirely (e.g. very large trees, or privacy preference).
-        if std::env::var_os("SMOL_NO_HOT_RELOAD").is_some() {
+        if !watching_enabled() {
             return None;
         }
 

@@ -15,6 +15,12 @@ pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
 /// to it and detached from it at runtime through the control socket (see
 /// libkrun's `KRUN_VIRTIOFS_FLAG_LIVE`).
 pub const KRUN_VIRTIOFS_FLAG_LIVE: u32 = 1 << 1;
+/// `krun_add_virtiofs4` flag letting the guest keep a missing name for a
+/// second instead of asking the host at every stat of it. Only for shares
+/// whose host directory the watcher follows, since the watcher is what drops
+/// the guest's entry when the host creates the name (see libkrun's
+/// `KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES`).
+pub const KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES: u32 = 1 << 2;
 
 /// Whether the libkrun this binary would load can serve host-extracted image
 /// layers with their recorded ownership: on macOS and Windows the server

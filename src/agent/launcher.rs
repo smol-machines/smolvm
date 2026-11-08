@@ -2157,7 +2157,45 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // guest-side remount, but it cannot make the host server accept
             // writes. Fail closed if the symbol is missing rather than
             // silently attaching the mount writable.
-            if mount.read_only || dax_window > 0 {
+            // A watched share lets the guest keep a missing name for a second
+            // (the watcher drops the entry when the host creates it), which
+            // spares a round trip for every repeated stat of a path that does
+            // not exist. Needs krun_add_virtiofs4; older libkrun takes the
+            // paths below.
+            let mut attached = false;
+            let negative_entries = !mount.staged && super::fsnotify_watch::watching_enabled();
+            if let (true, Some(add_virtiofs4)) = (negative_entries, krun.add_virtiofs4) {
+                let ret = add_virtiofs4(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                    super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
+                );
+                if ret >= 0 {
+                    attached = true;
+                    if dax_window > 0 {
+                        tracing::info!(
+                            tag = %mount_tag,
+                            dax_window_mib = dax_window >> 20,
+                            "virtiofs DAX enabled"
+                        );
+                    }
+                } else if ret != -libc::EINVAL {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        format!(
+                            "krun_add_virtiofs4 failed for '{}' - requested mount cannot be attached",
+                            mount.source.display()
+                        ),
+                    ));
+                }
+                // EINVAL: a libkrun that does not know the flag; attach as before.
+            }
+            if attached {
+            } else if mount.read_only || dax_window > 0 {
                 let Some(add_virtiofs3) = krun_add_virtiofs3 else {
                     if mount.read_only {
                         krun_free_ctx(ctx);
