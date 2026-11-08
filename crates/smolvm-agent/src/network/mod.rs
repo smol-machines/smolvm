@@ -156,6 +156,47 @@ pub fn set_extra_addresses(addresses: &[String]) -> Result<(), String> {
     linux::set_extra_addresses("eth0", &parsed)
 }
 
+/// The resolver (and its options) [`set_primary_address`] moved the guest
+/// to. New container overlays get it instead of the one the guest booted
+/// with, which its environment still names.
+static RESOLVER: std::sync::Mutex<Option<(String, Vec<String>)>> = std::sync::Mutex::new(None);
+
+/// The resolver the guest moved to after boot, if it moved.
+pub fn moved_resolver() -> Option<(String, Vec<String>)> {
+    RESOLVER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Replace the interface's primary IPv4 address (the one it booted with),
+/// its default route and the resolver: `address` is `a.b.c.d/len`.
+pub fn set_primary_address(
+    address: &str,
+    gateway: &str,
+    dns: &str,
+    dns_options: &[String],
+) -> Result<(), String> {
+    let (ip, len) = address
+        .split_once('/')
+        .ok_or_else(|| format!("address '{address}' must be a.b.c.d/len"))?;
+    let ip: Ipv4Addr = ip
+        .parse()
+        .map_err(|_| format!("address '{address}' is not IPv4"))?;
+    let len: u8 = len
+        .parse()
+        .ok()
+        .filter(|len| *len <= 32)
+        .ok_or_else(|| format!("address '{address}' has an invalid prefix length"))?;
+    let gateway: Ipv4Addr = gateway
+        .parse()
+        .map_err(|_| format!("gateway '{gateway}' is not IPv4"))?;
+    let dns: Ipv4Addr = dns
+        .parse()
+        .map_err(|_| format!("resolver '{dns}' is not IPv4"))?;
+    linux::set_primary_address("eth0", ip, len, gateway, dns, dns_options)?;
+    *RESOLVER.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((dns.to_string(), dns_options.to_vec()));
+    Ok(())
+}
+
 /// Parse the optional IPv6 trio. All three vars must be present together; a
 /// partial set is a malformed contract and fails the boot rather than leaving a
 /// half-configured stack.
@@ -271,6 +312,17 @@ mod linux {
     }
 
     pub fn set_extra_addresses(_ifname: &str, _addresses: &[(Ipv4Addr, u8)]) -> Result<(), String> {
+        Err("guest virtio networking is only supported on Linux".to_string())
+    }
+
+    pub fn set_primary_address(
+        _ifname: &str,
+        _address: Ipv4Addr,
+        _prefix_len: u8,
+        _gateway: Ipv4Addr,
+        _dns: Ipv4Addr,
+        _dns_options: &[String],
+    ) -> Result<(), String> {
         Err("guest virtio networking is only supported on Linux".to_string())
     }
 }

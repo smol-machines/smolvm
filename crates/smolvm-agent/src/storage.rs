@@ -4735,6 +4735,10 @@ fn open_overlay_etc_file(
 }
 
 fn overlay_resolv_conf_contents() -> String {
+    // A machine branched from a base moved to its own network's resolver.
+    if let Some((dns_server, options)) = crate::network::moved_resolver() {
+        return smolvm_protocol::resolv::render(&[dns_server], &options);
+    }
     // Resolver options (`--dns-option`) ride on every file.
     let options = crate::resolv_options();
 

@@ -530,6 +530,31 @@ pub(crate) async fn after_boot(socket: &Path, record: &ContainerRecord) -> ApiRe
     set_addresses(socket, extra).await
 }
 
+/// After a machine branched from a warm base boots: move its address, which
+/// is still the base's, to its primary network, then add the others.
+pub(crate) async fn after_branch(socket: &Path, record: &ContainerRecord) -> ApiResult<()> {
+    if let Some((_, primary)) = ordered(record)
+        .into_iter()
+        .find(|(_, ep)| !ep.ip.is_empty())
+    {
+        let reply = super::runtime::request(
+            socket,
+            &smolvm_protocol::AgentRequest::SetPrimaryAddress {
+                address: format!("{}/{}", primary.ip, primary.prefix_len),
+                gateway: primary.gateway.clone(),
+                dns: primary.gateway.clone(),
+                dns_options: record.host_config.dns_options.clone(),
+            },
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("address the container: {e}")))?;
+        if let Some(e) = super::runtime::error_text(&reply) {
+            return Err(ApiError::internal(format!("address the container: {e}")));
+        }
+    }
+    after_boot(socket, record).await
+}
+
 fn extra_addresses(record: &ContainerRecord) -> Vec<String> {
     ordered(record)
         .into_iter()

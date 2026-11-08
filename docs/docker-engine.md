@@ -105,6 +105,25 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli docker p
 No environment variable is needed. This works whether or not `/var/run/docker.sock` exists on
 the host.
 
+## Warm bases
+
+When three or more containers of one image (at the same size) run at once, the engine boots one
+more machine from the image with nothing running in it, the image's base, and later containers of
+the image branch from it instead of booting. A branched container starts from the base's memory
+and disks and shares them until it writes: on a Mac, an `alpine` container that sleeps costs
+about 55 MB of its own memory branched and about 230 MB booted, while the base costs about as much
+as one booted container. A branch starts no faster than a boot, so an image run one container at
+a time never gets a base. A base unused for two minutes is retired; it is stopped once no
+container branched from it runs, and deleted with the last one.
+
+Branching is on for macOS. On Linux, a branch's disks are copy-on-write overlay images that take
+writes several times slower than a booted machine's disks, which a database in a container
+notices, so containers boot there. `SMOLVM_ENGINE_BRANCH=1` in the engine's environment turns
+branching on, and `SMOLVM_ENGINE_BRANCH=0` turns it off.
+
+A container branches only on its first start, and only when it mounts no host directory or
+socket: mounts are devices a machine boots with.
+
 ## Building images
 
 The engine does not build images. `POST /build` (`DOCKER_BUILDKIT=0 docker build`, `docker

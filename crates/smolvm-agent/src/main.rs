@@ -3122,6 +3122,13 @@ fn handle_request(
         AgentRequest::SetInterfaceAddresses { addresses } => {
             container::handle_set_interface_addresses(&addresses)
         }
+
+        AgentRequest::SetPrimaryAddress {
+            address,
+            gateway,
+            dns,
+            dns_options,
+        } => container::handle_set_primary_address(&address, &gateway, &dns, &dns_options),
     }
 }
 

@@ -420,8 +420,16 @@ pub(crate) async fn create(
         )?;
         // Start the machine's storage from the image's seed now, so the first
         // start finds the image in place. Best effort: without it, the first
-        // start pulls in the guest.
-        if let Ok(exe) = crate::image_seed::builder_exe() {
+        // start pulls in the guest. A machine that will branch from a warm
+        // base takes the base's storage instead.
+        let branches = e
+            .db
+            .get_vm(&machine_for_task)
+            .ok()
+            .flatten()
+            .is_some_and(|vm| e.bases.ready_for(&vm));
+        let builder = if branches { None } else { crate::image_seed::builder_exe().ok() };
+        if let Some(exe) = builder {
             if let Err(error) = crate::image_seed::seed_storage(
                 &exe,
                 &machine_for_task,
@@ -1024,19 +1032,30 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
     let e = engine.clone();
     let machine = record.machine.clone();
     let pull_ref = record.pull_ref.clone();
+    let first_start = record.state.started_at == super::util::ZERO_TIME;
     let booted = tokio::task::spawn_blocking(
-        move || -> crate::Result<crate::embedded::handle::VmHandle> {
-            let handle = crate::embedded::control::start_vm(&e.db, &machine)?.handle;
+        move || -> crate::Result<(crate::embedded::handle::VmHandle, bool)> {
+            // A first start branches from the image's warm base when it can.
+            let branched = if first_start {
+                super::warm::branch(&e, &machine)
+            } else {
+                None
+            };
+            let is_branch = branched.is_some();
+            let handle = match branched {
+                Some(handle) => handle,
+                None => crate::embedded::control::start_vm(&e.db, &machine)?.handle,
+            };
             let mut client = crate::agent::AgentClient::connect_with_retry(handle.agent_socket())?;
             if client.query(&pull_ref)?.is_none() {
                 client.pull_with_registry_config(&pull_ref)?;
             }
-            Ok(handle)
+            Ok((handle, is_branch))
         },
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
-    let handle = match booted {
+    let (handle, branched) = match booted {
         Ok(h) => h,
         Err(err) => {
             let msg = format!("failed to start container {}: {err}", record.short_id());
@@ -1050,7 +1069,12 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
 
     // The container's other networks go on its interface before anything
     // in it runs.
-    if let Err(e) = super::network::after_boot(&socket, &record).await {
+    let addressed = if branched {
+        super::network::after_branch(&socket, &record).await
+    } else {
+        super::network::after_boot(&socket, &record).await
+    };
+    if let Err(e) = addressed {
         let mut handle = handle;
         let _ = tokio::task::spawn_blocking(move || handle.stop()).await;
         stop_machine(engine, &record.machine, None).await;
@@ -1553,9 +1577,13 @@ pub(crate) async fn remove(
     let e = engine.clone();
     let machine = record.machine.clone();
     tokio::task::spawn_blocking(move || {
-        if e.db.get_vm(&machine).ok().flatten().is_some() {
+        if let Some(vm) = e.db.get_vm(&machine).ok().flatten() {
             if let Err(error) = crate::embedded::control::delete_vm(&e.db, &machine) {
                 tracing::warn!(%machine, %error, "could not delete the container's machine");
+            }
+            // The last container branched from a retired base takes it along.
+            if vm.golden.is_some() {
+                super::warm::collect(&e);
             }
         }
     })

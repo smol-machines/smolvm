@@ -80,6 +80,9 @@ pub fn configure_interface(
     set_mac_address(ifname, &mac)?;
     set_mtu(ifname, mtu)?;
     add_address_v4(ifindex, address, prefix_len)?;
+    *PRIMARY_ADDRESS
+        .lock()
+        .map_err(|_| "address table lock poisoned".to_string())? = Some((address, prefix_len));
     bring_interface_up(ifname)?;
     if let Some(gateway_mac) = gateway_mac {
         add_neigh_static_v4(gateway, gateway_mac, ifindex)?;
@@ -90,7 +93,7 @@ pub fn configure_interface(
         add_address_v6(ifindex, address6, prefix_len6)?;
         add_default_route_v6(gateway6, ifindex)?;
     }
-    write_resolv_conf(dns_server)?;
+    write_resolv_conf(dns_server, &crate::resolv_options())?;
     Ok(())
 }
 
@@ -312,6 +315,67 @@ pub fn set_extra_addresses(ifname: &str, wanted: &[(Ipv4Addr, u8)]) -> Result<()
     Ok(())
 }
 
+/// The primary IPv4 address the interface carries: the one it booted with,
+/// until [`set_primary_address`] moves it.
+static PRIMARY_ADDRESS: std::sync::Mutex<Option<(Ipv4Addr, u8)>> = std::sync::Mutex::new(None);
+
+/// Move `ifname`'s primary IPv4 address to `address/prefix_len`, its default
+/// route to `gateway` and the resolver to `dns`. The new address goes on
+/// first and the old one comes off last, so the interface is never without
+/// an address and a route.
+pub fn set_primary_address(
+    ifname: &str,
+    address: Ipv4Addr,
+    prefix_len: u8,
+    gateway: Ipv4Addr,
+    dns: Ipv4Addr,
+    dns_options: &[String],
+) -> Result<(), String> {
+    let ifindex = get_ifindex(ifname)?;
+    let mut primary = PRIMARY_ADDRESS
+        .lock()
+        .map_err(|_| "address table lock poisoned".to_string())?;
+    let new = (address, prefix_len);
+    if *primary != Some(new) {
+        match netlink_newaddr(
+            ifindex,
+            libc::AF_INET as u8,
+            0,
+            prefix_len,
+            &address.octets(),
+        ) {
+            Ok(()) => {}
+            Err(err) if err.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(err) => return Err(format!("add {address}/{prefix_len}: {err}")),
+        }
+    }
+    netlink_route(
+        libc::AF_INET as u8,
+        &gateway.octets(),
+        ifindex,
+        (libc::NLM_F_CREATE | libc::NLM_F_REPLACE) as u16,
+    )
+    .map_err(|err| format!("replace default route via {gateway}: {err}"))?;
+    if let Some((old, old_len)) = primary.filter(|old| *old != new) {
+        match netlink_addr(
+            libc::RTM_DELADDR,
+            0,
+            ifindex,
+            libc::AF_INET as u8,
+            0,
+            old_len,
+            &old.octets(),
+        ) {
+            Ok(()) => {}
+            Err(err) if err.raw_os_error() == Some(libc::EADDRNOTAVAIL) => {}
+            Err(err) => return Err(format!("remove {old}/{old_len}: {err}")),
+        }
+    }
+    *primary = Some(new);
+    drop(primary);
+    write_resolv_conf(dns, dns_options)
+}
+
 /// Add the guest IPv6 address through rtnetlink (`ip -6 addr add ...`), with
 /// DAD skipped (see [`IFA_F_NODAD`]).
 fn add_address_v6(ifindex: u32, address: Ipv6Addr, prefix_len: u8) -> Result<(), String> {
@@ -398,11 +462,10 @@ fn add_default_route_v6(gateway: Ipv6Addr, ifindex: u32) -> Result<(), String> {
 /// This step is intentionally plain file I/O rather than a C networking API.
 /// DNS configuration in a minimal Linux guest is usually conveyed through
 /// `/etc/resolv.conf`, and that is enough for the MVP.
-fn write_resolv_conf(dns_server: Ipv4Addr) -> Result<(), String> {
+fn write_resolv_conf(dns_server: Ipv4Addr, options: &[String]) -> Result<(), String> {
     // `--dns-option` resolver options ride on this file too (one renderer for
     // every writer, see `smolvm_protocol::resolv`).
-    let options = crate::resolv_options();
-    let contents = smolvm_protocol::resolv::render(&[dns_server.to_string()], &options);
+    let contents = smolvm_protocol::resolv::render(&[dns_server.to_string()], options);
     let direct_err = match std::fs::write("/etc/resolv.conf", &contents) {
         Ok(()) => return Ok(()),
         Err(err) => err,
@@ -667,6 +730,17 @@ fn netlink_addr(
 /// `family` selects IPv4 (`AF_INET`, 4-byte gateway) or IPv6 (`AF_INET6`,
 /// 16-byte gateway).
 fn netlink_newroute(family: u8, gateway: &[u8], ifindex: u32) -> std::io::Result<()> {
+    netlink_route(
+        family,
+        gateway,
+        ifindex,
+        (libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16,
+    )
+}
+
+/// [`netlink_newroute`] with the caller's create flags (`NLM_F_REPLACE` to
+/// move an existing default route).
+fn netlink_route(family: u8, gateway: &[u8], ifindex: u32, flags: u16) -> std::io::Result<()> {
     let rta_len = rta_space(gateway.len());
     let oif = ifindex.to_ne_bytes();
     let oif_len = rta_space(oif.len());
@@ -678,8 +752,7 @@ fn netlink_newroute(family: u8, gateway: &[u8], ifindex: u32) -> std::io::Result
     unsafe {
         (*nlh).nlmsg_len = msg_len as u32;
         (*nlh).nlmsg_type = libc::RTM_NEWROUTE;
-        (*nlh).nlmsg_flags =
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16;
+        (*nlh).nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16 | flags;
         (*nlh).nlmsg_seq = 2;
     }
 

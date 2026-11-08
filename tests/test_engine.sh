@@ -373,6 +373,32 @@ EOF
     (cd "$WORK/stack" && docker compose down -v) >/dev/null 2>&1
 }
 
+# --- warm bases ------------------------------------------------------------------------
+
+# Once a few containers of one image run, later ones branch from a warm
+# base where the host supports it. Each must still get its own address and
+# resolver on its own network, and reach the others by name.
+test_repeated_starts_keep_their_own_addresses() {
+    local net="$PREFIX-warm" i ip inside
+    docker network create --label "$PREFIX" "$net" >/dev/null || return 1
+    for i in 1 2 3; do
+        run -d --name "$PREFIX-w$i" --network "$net" alpine sleep 300 >/dev/null || return 1
+    done
+    # The third start has the engine boot the base; give it time to be ready.
+    sleep 5
+    for i in 4 5 6; do
+        run -d --name "$PREFIX-w$i" --network "$net" alpine sleep 300 >/dev/null || return 1
+    done
+    for i in 1 2 3 4 5 6; do
+        ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$net\").IPAddress}}" "$PREFIX-w$i")
+        inside=$(docker exec "$PREFIX-w$i" sh -c "ip -4 -o addr show eth0" | awk '{print $4}' | cut -d/ -f1)
+        [[ -n "$ip" && "$ip" == "$inside" ]] || return 1
+        docker exec "$PREFIX-w$i" grep -q "nameserver ${ip%.*}.1" /etc/resolv.conf || return 1
+    done
+    docker exec "$PREFIX-w6" ping -c1 -W2 "$PREFIX-w1" >/dev/null || return 1
+    docker exec "$PREFIX-w1" ping -c1 -W2 "$PREFIX-w6" >/dev/null
+}
+
 # --- the Docker socket inside a container --------------------------------------------
 
 test_socket_inside_container() {
@@ -417,6 +443,7 @@ run_test "network connect and disconnect while running" test_network_connect_and
 run_test "default bridge: by address, no names" test_default_bridge_by_address_without_names || true
 run_test "host.docker.internal reaches the host" test_host_docker_internal || true
 run_test "compose: health-check dependency, two networks" test_compose_healthcheck_dependency_two_networks || true
+run_test "repeated starts keep their own addresses" test_repeated_starts_keep_their_own_addresses || true
 run_test "docker socket inside a container" test_socket_inside_container || true
 run_test "container starts a sibling through the socket" test_container_starts_a_sibling_through_the_socket || true
 

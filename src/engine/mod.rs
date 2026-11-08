@@ -42,6 +42,7 @@ mod store;
 mod stream;
 mod util;
 mod volumes;
+mod warm;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -88,6 +89,7 @@ pub(crate) struct Engine {
     pub(crate) networks: network::Networks,
     pub(crate) execs: parking_lot::Mutex<HashMap<String, Arc<exec::Exec>>>,
     pub(crate) events: events::Events,
+    pub(crate) bases: warm::Bases,
 }
 
 impl Engine {
@@ -107,6 +109,7 @@ impl Engine {
             networks,
             execs: parking_lot::Mutex::new(HashMap::new()),
             events: events::Events::new(),
+            bases: warm::Bases::default(),
         });
         for record in engine.store.load_containers()? {
             let container = containers::Container::from_record(record);
@@ -144,6 +147,9 @@ pub async fn serve(config: EngineConfig) -> crate::Result<()> {
         .await
         .map_err(|e| crate::Error::config("engine", e.to_string()))??;
     containers::recover(&engine).await;
+    // Bases left by an earlier run are retired: none is ready any more.
+    warm::shutdown(&engine).await;
+    warm::spawn_reaper(&engine);
 
     let listener = bind_socket(&engine.config.socket)?;
     tracing::info!(socket = %engine.config.socket.display(), "engine listening");
@@ -175,6 +181,7 @@ pub async fn serve(config: EngineConfig) -> crate::Result<()> {
     };
     drop(stop_rx);
     containers::shutdown_all(&engine).await;
+    warm::shutdown(&engine).await;
     let _ = std::fs::remove_file(&engine.config.socket);
     served.map_err(crate::Error::Io)
 }

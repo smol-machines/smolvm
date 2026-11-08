@@ -700,6 +700,19 @@ pub fn handle_set_interface_addresses(addresses: &[String]) -> AgentResponse {
     }
 }
 
+/// Move the guest's primary address to another network.
+pub fn handle_set_primary_address(
+    address: &str,
+    gateway: &str,
+    dns: &str,
+    dns_options: &[String],
+) -> AgentResponse {
+    match crate::network::set_primary_address(address, gateway, dns, dns_options) {
+        Ok(()) => AgentResponse::Ok { data: None },
+        Err(e) => AgentResponse::error(e, error_codes::INTERNAL_ERROR),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -581,6 +581,38 @@ pub(crate) fn fork_vm_with_options(
     )
 }
 
+/// Branch the frozen `golden` into a new machine `clone` and boot it, after
+/// `adjust` has changed the clone's record (its ports, network attachment,
+/// labels). The golden stays paused as a base for further branches.
+#[cfg(unix)]
+pub(crate) fn fork_vm_adjusted(
+    db: &SmolvmDb,
+    golden: &str,
+    clone: &str,
+    adjust: impl FnOnce(&mut VmRecord),
+) -> Result<VmHandle> {
+    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
+    let mut prep = crate::agent::fork::prepare_fork(
+        db,
+        golden,
+        clone,
+        &[],
+        false,
+        &[],
+        &std::collections::BTreeMap::new(),
+        &[],
+        crate::agent::fork::ForkSourcePolicy::Freeze,
+    )?;
+    adjust(&mut prep.clone_record);
+    let record = prep.clone_record.clone();
+    if let Err(error) = db.update_vm(clone, |r| *r = record) {
+        let _ = db.remove_vm(clone);
+        let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
+        return Err(error);
+    }
+    boot_prepared_fork(db, clone, prep, false, None, None, false)
+}
+
 fn boot_prepared_fork(
     db: &SmolvmDb,
     clone: &str,

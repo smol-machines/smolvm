@@ -1223,6 +1223,21 @@ pub enum AgentRequest {
         /// `a.b.c.d/len` entries.
         addresses: Vec<String>,
     },
+
+    /// Move the guest's primary IPv4 address, default route and resolver to
+    /// another network. A machine branched from a base that booted on one
+    /// network takes its own address this way before anything in it runs.
+    SetPrimaryAddress {
+        /// The new primary address, `a.b.c.d/len`.
+        address: String,
+        /// The default gateway on that network.
+        gateway: String,
+        /// The resolver the guest uses.
+        dns: String,
+        /// Resolver options (`ndots:2`, ...).
+        #[serde(default)]
+        dns_options: Vec<String>,
+    },
 }
 
 /// What [`AgentRequest::ContainerStart`] runs, and how.
@@ -1423,6 +1438,9 @@ impl AgentRequest {
             AgentRequest::SetInterfaceAddresses { addresses } => {
                 format!("SetInterfaceAddresses {{ addresses: {addresses:?} }}")
             }
+            AgentRequest::SetPrimaryAddress {
+                address, gateway, ..
+            } => format!("SetPrimaryAddress {{ address: {address}, gateway: {gateway} }}"),
         }
     }
 }
