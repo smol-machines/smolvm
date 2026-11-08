@@ -134,7 +134,8 @@ pub fn plan_launch_network_with(
         || resources.block_private.is_some();
     let has_dns_filter = dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
-    let has_fabric = resources.network_name.is_some();
+    // A container switch is fabric-like routing in the host-side stack too.
+    let has_fabric = resources.network_name.is_some() || resources.switch.is_some();
     // A custom guest subnet shapes the virtio-net link, so like a named
     // network it implies networking and picks virtio-net.
     let has_guest_subnet = resources.guest_subnet.is_some();

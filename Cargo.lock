@@ -3327,6 +3327,8 @@ dependencies = [
  "hex",
  "http-body",
  "humantime",
+ "hyper",
+ "hyper-util",
  "imago",
  "ipnet",
  "landlock",

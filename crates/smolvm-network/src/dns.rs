@@ -46,6 +46,22 @@ const DNS_MAX_LABEL_LEN: usize = 63;
 /// Mirrors Docker's `host.docker.internal`.
 pub const GATEWAY_HOSTNAME: &str = "host.smolvm.internal";
 
+/// Every name the gateway answers with its own address: its own name, and
+/// the names containers conventionally use for the host
+/// (`host.docker.internal`) and its gateway (`gateway.docker.internal`), so
+/// software that expects them reaches the host unchanged.
+pub const GATEWAY_HOSTNAMES: [&str; 3] = [
+    GATEWAY_HOSTNAME,
+    "host.docker.internal",
+    "gateway.docker.internal",
+];
+
+/// Whether `name` (already normalized: lowercase, no trailing dot) is one of
+/// [`GATEWAY_HOSTNAMES`].
+pub fn is_gateway_hostname(name: &str) -> bool {
+    GATEWAY_HOSTNAMES.contains(&name)
+}
+
 /// TTL for the gateway's self-answer. Short so a stack restart with a
 /// different gateway address is picked up quickly.
 const GATEWAY_TTL_SECS: u32 = 60;
@@ -159,6 +175,30 @@ pub fn gateway_response(query: &[u8], gateway: Ipv4Addr) -> Vec<u8> {
     response.extend_from_slice(&GATEWAY_TTL_SECS.to_be_bytes());
     response.extend_from_slice(&(DNS_A_RDATA_LEN as u16).to_be_bytes());
     response.extend_from_slice(&gateway.octets());
+    response
+}
+
+/// A NOERROR answer with `ips` for an A query, and an empty one for any
+/// other type (AAAA: resolvers then use the A records).
+pub fn addresses_response(query: &[u8], ips: &[Ipv4Addr], ttl: u32) -> Vec<u8> {
+    let mut response = error_response(query, 0);
+    let Some(end) = question_section_end(query) else {
+        return response;
+    };
+    if read_u16(query, end - DNS_QUESTION_FIXED_LEN) != Some(DNS_TYPE_A) {
+        return response;
+    }
+    let count = ips.len().min(32) as u16;
+    response[DNS_ANCOUNT_OFFSET..DNS_ANCOUNT_OFFSET + DNS_U16_LEN]
+        .copy_from_slice(&count.to_be_bytes());
+    for ip in ips.iter().take(count as usize) {
+        response.extend_from_slice(&[DNS_POINTER_TAG, DNS_HEADER_LEN as u8]);
+        response.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&(DNS_A_RDATA_LEN as u16).to_be_bytes());
+        response.extend_from_slice(&ip.octets());
+    }
     response
 }
 

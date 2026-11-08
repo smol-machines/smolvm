@@ -444,6 +444,7 @@ pub fn build_create_spec(
             dns_options: Vec::new(),
             network_name: cli_network_name,
             guest_subnet: None,
+            switch: None,
             ports,
             allowed_cidrs,
             allowed_hosts: (!sf_allow_hosts.is_empty()).then_some(sf_allow_hosts),
@@ -569,6 +570,8 @@ pub fn build_create_params(
         dns_options,
         network_name,
         guest_subnet,
+        // Only an engine puts machines on a container switch.
+        switch: _,
         ports,
         allowed_cidrs,
         allowed_hosts,

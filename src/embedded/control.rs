@@ -120,6 +120,7 @@ impl MachineSpec {
             shm_size,
             network_name,
             guest_subnet,
+            switch,
         } = resources;
         crate::machine_spec::CreateSpec {
             cmd: (!command.is_empty()).then_some(command),
@@ -141,6 +142,7 @@ impl MachineSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
             allowed_cidrs,
             allowed_hosts: (!allowed_hosts.is_empty()).then_some(allowed_hosts),

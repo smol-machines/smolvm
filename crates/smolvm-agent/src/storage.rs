@@ -382,6 +382,21 @@ pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, boo
     }
 }
 
+/// Mount the boot virtiofs share `tag` at its staging path (once) and return
+/// that path, for callers that bind a file or subdirectory of it themselves.
+#[cfg(target_os = "linux")]
+pub fn mount_share(tag: &str) -> Result<PathBuf> {
+    validate_storage_id(tag, "mount tag")?;
+    let mount_point = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+    std::fs::create_dir_all(&mount_point)?;
+    if !is_mountpoint(&mount_point) {
+        mount_virtiofs(tag, &mount_point).map_err(|e| {
+            StorageError::new(format!("failed to mount virtiofs share '{tag}': {e}"))
+        })?;
+    }
+    Ok(mount_point)
+}
+
 /// Mount a virtiofs device with one policy for every host-backed filesystem:
 /// request DAX first, then fall back to the normal buffered data path when the
 /// host did not give this device a DAX window. Explicit fsync still provides

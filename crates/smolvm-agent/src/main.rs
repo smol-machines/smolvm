@@ -87,6 +87,7 @@ fn boot_log(level: &str, msg: &str) {
 }
 mod attach;
 mod branchpoint;
+mod container;
 mod credentials;
 mod cuda;
 mod dirwatch;
@@ -2179,7 +2180,12 @@ static WORK_SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
 /// Whether a request waits for a work slot. Liveness pings and shutdown never
 /// queue behind real work.
 fn needs_work_slot(request: &AgentRequest) -> bool {
-    !matches!(request, AgentRequest::Ping | AgentRequest::Shutdown { .. })
+    // A container's init holds its connection for the container's whole life,
+    // like a daemon, not like a unit of work.
+    !matches!(
+        request,
+        AgentRequest::Ping | AgentRequest::Shutdown { .. } | AgentRequest::ContainerStart(_)
+    )
 }
 
 /// A counting semaphore for bounding concurrent connection handlers.
@@ -2517,6 +2523,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         {
             // Handle interactive VM exec session
             handle_interactive_vm_exec(stream, request)?;
+            continue;
+        }
+
+        // ContainerStart runs a container's command as its init and streams
+        // its I/O on this connection until it exits.
+        if let AgentRequest::ContainerStart(spec) = request {
+            container::handle_container_start(stream, *spec)?;
             continue;
         }
 
@@ -3085,6 +3098,26 @@ fn handle_request(
         AgentRequest::PodStats { id } => pod::handle_pod_stats(&id),
 
         AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
+
+        AgentRequest::ContainerStart(_) => AgentResponse::error(
+            "ContainerStart is a streaming request",
+            error_codes::INVALID_REQUEST,
+        ),
+
+        AgentRequest::ContainerSignal {
+            overlay_id,
+            signal,
+            all,
+        } => container::handle_container_signal(&overlay_id, &signal, all),
+
+        AgentRequest::ContainerTop { overlay_id } => container::handle_container_top(&overlay_id),
+
+        AgentRequest::ContainerArchive {
+            image,
+            overlay_id,
+            archive,
+            destination,
+        } => container::handle_container_archive(&image, &overlay_id, &archive, &destination),
     }
 }
 
@@ -4272,6 +4305,33 @@ fn handle_interactive_run(
             }
         };
 
+    // A command that is not there fails the request, with the text a
+    // container engine reports, rather than starting and exiting at once.
+    if let Some(program) = launch.command.first() {
+        let path = launch
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
+            });
+        #[cfg(target_os = "linux")]
+        if let Err(e) = container::check_executable(
+            std::path::Path::new(&prepared.rootfs_path),
+            program,
+            launch.workdir.as_deref(),
+            &path,
+        ) {
+            maybe_cleanup(&prepared.workload_id);
+            send_response(stream, &AgentResponse::error(e, error_codes::SPAWN_FAILED))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (program, path);
+    }
+
     // Spawn the command with crun
     let (mut child, pty_master) = match spawn_interactive_command(
         &prepared.rootfs_path,
@@ -4441,6 +4501,30 @@ fn write_oci_bundle(
     unprivileged: bool,
     container_init: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let spec = build_oci_spec(
+        rootfs_path,
+        launch,
+        mounts,
+        tty,
+        unprivileged,
+        container_init,
+    )?;
+    spec.write_to(bundle_path)
+        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
+
+    Ok(oci::generate_container_id())
+}
+
+/// The OCI spec [`write_oci_bundle`] writes, for callers that add to it first.
+#[cfg(target_os = "linux")]
+fn build_oci_spec(
+    rootfs_path: &std::path::Path,
+    launch: &ResolvedLaunch,
+    mounts: &[(String, String, bool)],
+    tty: bool,
+    unprivileged: bool,
+    container_init: bool,
+) -> Result<oci::OciSpec, Box<dyn std::error::Error>> {
     let workdir_str = launch.workdir.as_deref().unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
     let mut spec = oci::OciSpec::new(
@@ -4486,10 +4570,7 @@ fn write_oci_bundle(
     cuda::inject_into_container(&mut spec, rootfs_path);
     vulkan::inject_into_container(&mut spec, rootfs_path);
     credentials::inject_into_container(&mut spec, rootfs_path, mounts);
-    spec.write_to(bundle_path)
-        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
-
-    Ok(oci::generate_container_id())
+    Ok(spec)
 }
 
 /// Handle a detached run request: start a container in the background and

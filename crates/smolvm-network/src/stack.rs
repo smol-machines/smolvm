@@ -129,6 +129,8 @@ pub struct VirtioPollConfig {
     pub gateway_ipv4: Ipv4Addr,
     /// Guest IPv4 address.
     pub guest_ipv4: Ipv4Addr,
+    /// IPv4 prefix length of the link the gateway and guest share.
+    pub prefix_len4: u8,
     /// Gateway IPv6 (ULA) address.
     pub gateway_ipv6: Ipv6Addr,
     /// Guest IPv6 (ULA) address.
@@ -224,6 +226,7 @@ pub fn start_network_stack(
     udp_publish: Option<crate::udp_publish::UdpPublishChannels>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
+    #[cfg(unix)] switch: Option<crate::switch::SwitchHandle>,
 ) -> std::io::Result<JoinHandle<()>> {
     // A restored guest retains TCP state, but this host-side stack is new.
     // Replaying both the port and ISN sequence collides with saved connections
@@ -250,6 +253,8 @@ pub fn start_network_stack(
                 udp_publish,
                 egress,
                 fabric,
+                #[cfg(unix)]
+                switch,
                 sequence_seed,
                 port_seed,
             )
@@ -264,6 +269,7 @@ fn run_network_stack(
     udp_publish: Option<crate::udp_publish::UdpPublishChannels>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
+    #[cfg(unix)] switch: Option<crate::switch::SwitchHandle>,
     sequence_seed: u64,
     port_seed: u16,
 ) {
@@ -292,6 +298,8 @@ fn run_network_stack(
     let dns_routing = DnsRouting {
         upstream: config.upstream_dns,
         gateway: config.gateway_ipv4,
+        #[cfg(unix)]
+        switch: switch.clone(),
     };
     let dns_socket_handle = add_dns_socket(&mut sockets);
     let dns_tcp_handles = add_dns_tcp_sockets(&mut sockets);
@@ -393,6 +401,26 @@ fn run_network_stack(
         let now = smoltcp_now(clock);
 
         while let Some(frame) = device.stage_next_frame() {
+            // The container switch takes packets for other machines on this
+            // machine's networks, and answers the guest's ARP for them.
+            #[cfg(unix)]
+            if let Some(handle) = switch.as_ref() {
+                match switch_action(frame, handle, config.gateway_mac) {
+                    Some(SwitchAction::Forward { src, dst, packet }) => {
+                        handle.forward(src, dst, packet);
+                        device.drop_staged_frame();
+                        continue;
+                    }
+                    Some(SwitchAction::Reply(reply)) => {
+                        if queues.host_to_guest.push(reply).is_ok() {
+                            queues.host_wake.wake();
+                        }
+                        device.drop_staged_frame();
+                        continue;
+                    }
+                    None => {}
+                }
+            }
             // We inspect the frame before giving it to smoltcp because certain
             // flows need side effects first:
             // - TCP SYN: pre-create a matching smoltcp socket + relay entry
@@ -549,7 +577,7 @@ fn run_network_stack(
             dns_socket_handle,
             &mut sockets,
             &egress,
-            dns_routing,
+            &dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -558,7 +586,7 @@ fn run_network_stack(
             &mut dns_tcp_conns,
             &mut sockets,
             &egress,
-            dns_routing,
+            &dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -700,7 +728,7 @@ fn create_interface(
     //
     // Equivalent conceptual state:
     //   MAC: config.gateway_mac
-    //   IP : config.gateway_ipv4/30
+    //   IP : config.gateway_ipv4/prefix_len4 (a /30 unless the link is wider)
     //        config.gateway_ipv6/64 (ULA) + fe80 link-local
     //
     // The guest IP exists as a peer on the same virtual link; it is not an
@@ -712,7 +740,10 @@ fn create_interface(
     let mut interface = Interface::new(interface_config, device, Instant::ZERO);
     interface.update_ip_addrs(|addresses| {
         addresses
-            .push(IpCidr::new(IpAddress::Ipv4(config.gateway_ipv4), 30))
+            .push(IpCidr::new(
+                IpAddress::Ipv4(config.gateway_ipv4),
+                config.prefix_len4.clamp(1, 30),
+            ))
             .expect("failed to add gateway IPv4 address");
         addresses
             .push(IpCidr::new(
@@ -1041,10 +1072,13 @@ impl DnsGateway {
 
 /// Where guest DNS answers come from: the upstream resolver queries are
 /// forwarded to, and the gateway address answered for the gateway's own name.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DnsRouting {
     upstream: Ipv4Addr,
     gateway: Ipv4Addr,
+    /// The container switch, whose networks' names this machine resolves.
+    #[cfg(unix)]
+    switch: Option<crate::switch::SwitchHandle>,
 }
 
 /// The decision for a single guest DNS query, made on the poll thread using the
@@ -1066,7 +1100,8 @@ enum DnsDecision {
 /// The gateway's own name is answered before the filter runs: it names
 /// gateway-internal plumbing, not egress, so it must resolve even under a
 /// strict allow-host policy.
-fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Addr) -> DnsDecision {
+fn classify_dns_query(query: &[u8], egress: &EgressPolicy, routing: &DnsRouting) -> DnsDecision {
+    let gateway_ipv4 = routing.gateway;
     // A watchlist match is recorded; a `block` entry also answers the name as
     // nonexistent, so the guest sees an ordinary failed lookup. Otherwise the
     // policy below decides exactly as it would without a watchlist.
@@ -1077,17 +1112,32 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Add
             }
         }
     }
-    if dns::question_name(query)
+    if let Some(name) = dns::question_name(query)
         .and_then(|n| dns::normalize_hostname(&n))
-        .is_some_and(|n| n == dns::GATEWAY_HOSTNAME)
+        .filter(|n| dns::is_gateway_hostname(n))
     {
         if egress
-            .record_decision("dns", "allow", &dns::GATEWAY_HOSTNAME, "internal_gateway")
+            .record_decision("dns", "allow", &name, "internal_gateway")
             .is_err()
         {
             return DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL));
         }
         return DnsDecision::Immediate(dns::gateway_response(query, gateway_ipv4));
+    }
+    // Names of the machines on this machine's networks are the switch's to
+    // answer, before any upstream resolver: they exist only here.
+    #[cfg(unix)]
+    if let Some(switch) = routing.switch.as_ref() {
+        if let Some(ips) = dns::question_name(query)
+            .and_then(|n| dns::normalize_hostname(&n))
+            .and_then(|n| switch.lookup(&n))
+        {
+            return DnsDecision::Immediate(dns::addresses_response(
+                query,
+                &ips,
+                crate::switch::NAME_TTL_SECS,
+            ));
+        }
     }
     if !egress.dns_filter_active() {
         let name = dns::question_name(query).unwrap_or_default();
@@ -1122,7 +1172,7 @@ fn dispatch_dns_udp(
     dns_socket_handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
-    routing: DnsRouting,
+    routing: &DnsRouting,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -1135,7 +1185,7 @@ fn dispatch_dns_udp(
             Ok((q, m)) => (q.to_vec(), m.endpoint, m.local_address),
             Err(_) => break,
         };
-        match classify_dns_query(&query, egress, routing.gateway) {
+        match classify_dns_query(&query, egress, routing) {
             DnsDecision::Immediate(response) => {
                 let response_meta = UdpMetadata {
                     endpoint,
@@ -1298,7 +1348,7 @@ fn process_dns_tcp(
     conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
-    routing: DnsRouting,
+    routing: &DnsRouting,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -1363,7 +1413,7 @@ fn process_dns_tcp(
                     query.len(),
                     routing.upstream
                 );
-                match classify_dns_query(&query, egress, routing.gateway) {
+                match classify_dns_query(&query, egress, routing) {
                     DnsDecision::Immediate(response) => {
                         frame_dns_tcp_response(conn, &response);
                         conn.done = true;
@@ -1441,6 +1491,48 @@ fn wake_guest_if_needed(queues: &NetworkFrameQueues, device: &VirtioNetworkDevic
 fn smoltcp_now(clock: StdInstant) -> Instant {
     let elapsed = clock.elapsed();
     Instant::from_millis(elapsed.as_millis() as i64)
+}
+
+/// What the container switch does with one guest frame.
+#[cfg(unix)]
+enum SwitchAction {
+    /// An IPv4 packet for another machine on one of this machine's networks.
+    Forward {
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        packet: Vec<u8>,
+    },
+    /// A frame to hand straight back to the guest (an ARP reply).
+    Reply(Vec<u8>),
+}
+
+#[cfg(unix)]
+fn switch_action(
+    frame: &[u8],
+    switch: &crate::switch::SwitchHandle,
+    gateway_mac: [u8; 6],
+) -> Option<SwitchAction> {
+    if frame.len() < 14 {
+        return None;
+    }
+    match [frame[12], frame[13]] {
+        [0x08, 0x00] => {
+            let packet = &frame[14..];
+            let (src, dst) = crate::switch::ipv4_endpoints(packet)?;
+            (switch.route(dst) == crate::switch::Route::Peer).then(|| SwitchAction::Forward {
+                src,
+                dst,
+                packet: packet.to_vec(),
+            })
+        }
+        [0x08, 0x06] => {
+            let (target, reply) = crate::switch::arp_reply(frame, gateway_mac)?;
+            switch
+                .answers_arp_for(target)
+                .then_some(SwitchAction::Reply(reply))
+        }
+        _ => None,
+    }
 }
 
 fn classify_guest_frame(
@@ -1575,6 +1667,7 @@ mod tests {
             guest_mac: [2, 0, 0, 0, 0, 2],
             gateway_ipv4: Ipv4Addr::new(100, 96, 0, 1),
             guest_ipv4: Ipv4Addr::new(100, 96, 0, 2),
+            prefix_len4: 30,
             gateway_ipv6: "fd00::1".parse().unwrap(),
             guest_ipv6: "fd00::2".parse().unwrap(),
             prefix_len6: 64,

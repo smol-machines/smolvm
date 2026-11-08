@@ -810,6 +810,7 @@ impl CreateVmParams {
             dns_options,
             network_name,
             guest_subnet,
+            switch: None,
             ports: port,
             allowed_cidrs,
             allowed_hosts: dns_filter_hosts,

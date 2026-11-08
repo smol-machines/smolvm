@@ -851,6 +851,7 @@ impl PackCreateCmd {
                 shm_size: None,
                 network_name: None,
                 guest_subnet: None,
+                switch: None,
                 gpu: false,
                 nested_virt: false,
                 cuda: false,

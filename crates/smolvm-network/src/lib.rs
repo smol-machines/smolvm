@@ -77,6 +77,8 @@ pub mod publish_bind;
 pub mod netns_tap;
 pub mod queues;
 pub mod stack;
+#[cfg(unix)]
+pub mod switch;
 pub mod tcp_listeners;
 pub mod tcp_reactor;
 pub mod tcp_relay;
@@ -619,9 +621,31 @@ impl PublishedPorts {
 pub fn start_virtio_network(
     host_stream: Socket,
     guest_network: GuestNetworkConfig,
+    published_ports: BoundPublishedPorts,
+    egress: EgressPolicy,
+    fabric_lease: Option<fabric::FabricLease>,
+) -> io::Result<VirtioNetworkRuntime> {
+    start_virtio_network_on(
+        host_stream,
+        guest_network,
+        published_ports,
+        egress,
+        fabric_lease,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+/// [`start_virtio_network`] for a machine on the container switch
+/// ([`switch`]): its packets for other machines on its networks go through
+/// the switch, and their names resolve.
+pub fn start_virtio_network_on(
+    host_stream: Socket,
+    guest_network: GuestNetworkConfig,
     mut published_ports: BoundPublishedPorts,
     egress: EgressPolicy,
     fabric_lease: Option<fabric::FabricLease>,
+    #[cfg(unix)] switch_endpoint: Option<switch::SwitchEndpoint>,
 ) -> io::Result<VirtioNetworkRuntime> {
     if guest_network.intercept.is_some_and(|mode| mode.all_tcp()) && fabric_lease.is_some() {
         return Err(io::Error::new(
@@ -639,6 +663,16 @@ pub fn start_virtio_network(
     let fabric = match fabric_lease {
         Some(lease) => Some(fabric::start_fabric(
             lease,
+            queues.clone(),
+            guest_network.gateway_mac,
+            guest_network.guest_mac,
+        )?),
+        None => None,
+    };
+    #[cfg(unix)]
+    let switch = match switch_endpoint {
+        Some(endpoint) => Some(switch::start_switch(
+            endpoint,
             queues.clone(),
             guest_network.gateway_mac,
             guest_network.guest_mac,
@@ -671,6 +705,7 @@ pub fn start_virtio_network(
             guest_mac: guest_network.guest_mac,
             gateway_ipv4: guest_network.gateway_ip,
             guest_ipv4: guest_network.guest_ip,
+            prefix_len4: guest_network.prefix_len,
             gateway_ipv6: guest_network.gateway_ip6,
             guest_ipv6: guest_network.guest_ip6,
             prefix_len6: guest_network.prefix_len6,
@@ -684,6 +719,8 @@ pub fn start_virtio_network(
         udp_publish,
         egress,
         fabric,
+        #[cfg(unix)]
+        switch,
     )?;
 
     Ok(VirtioNetworkRuntime {

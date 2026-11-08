@@ -132,6 +132,7 @@ smolvm pack pull REF [-o PATH]                    # pull .smolmachine into the c
 smolvm pack list [--json]                         # pulled artifacts and their paths
 
 smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
+smolvm engine start|stop|status                   # Docker Engine API: docker, compose, Testcontainers (docs/docker-engine.md)
 smolvm config registries edit                     # registry auth
 smolvm completion bash|zsh|fish|powershell|elvish # print a shell completion script
 smolvm <any command> --error-format json        # failures as {"error":{"code":"NOT_FOUND","message":…}}

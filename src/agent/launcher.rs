@@ -16,9 +16,7 @@ use crate::util::{libkrun_filename, libkrunfw_filename};
 
 use crate::agent::vsock_service;
 use smolvm_network::PortMapping as VirtioPortMapping;
-use smolvm_network::{
-    start_virtio_network, BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime,
-};
+use smolvm_network::{BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime};
 use smolvm_protocol::{guest_env, ports};
 use socket2::Socket;
 #[cfg(windows)]
@@ -815,6 +813,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         target: std::path::PathBuf::from("/opt/smolvm-ring"),
                         read_only: false,
                         staged: false,
+                        recorded_ownership: false,
                     });
                 }
             }
@@ -1368,6 +1367,31 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     guest_network.dns_server = lease.gateway_ip;
                     fabric_lease = Some(lease);
                 }
+                // A machine on a container switch boots with its primary
+                // network's address; the engine adds the others once it runs.
+                #[cfg(unix)]
+                let switch_endpoint = resources.switch.as_ref().map(|attachment| {
+                    smolvm_network::switch::SwitchEndpoint {
+                        dir: attachment.dir.clone(),
+                        id: attachment.endpoint.clone(),
+                    }
+                });
+                #[cfg(unix)]
+                if let Some(primary) = switch_endpoint
+                    .as_ref()
+                    .and_then(|endpoint| endpoint.read_members().into_iter().next())
+                {
+                    let mask = if primary.prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - u32::from(primary.prefix.min(32)))
+                    };
+                    let gateway = std::net::Ipv4Addr::from((u32::from(primary.ip) & mask) + 1);
+                    guest_network.guest_ip = primary.ip;
+                    guest_network.gateway_ip = gateway;
+                    guest_network.prefix_len = primary.prefix;
+                    guest_network.dns_server = gateway;
+                }
                 let mut guest_mac = guest_network.guest_mac;
 
                 // Kubernetes pod networking: adopt the CNI interface's IP/prefix/
@@ -1515,12 +1539,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             let host_stream = Socket::from_raw_fd(host_fd);
                             let runtime = match BoundPublishedPorts::bind(&virtio_port_mappings)
                                 .and_then(|ports| {
-                                    start_virtio_network(
+                                    smolvm_network::start_virtio_network_on(
                                         host_stream,
                                         guest_network,
                                         ports,
                                         egress,
                                         fabric_lease,
+                                        #[cfg(unix)]
+                                        switch_endpoint,
                                     )
                                 }) {
                                 Ok(runtime) => runtime,
@@ -1625,7 +1651,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     let spawn = std::thread::Builder::new()
                         .name("smolvm-net-accept".into())
                         .spawn(move || match listener.accept() {
-                            Ok((sock, _)) => match start_virtio_network(
+                            Ok((sock, _)) => match smolvm_network::start_virtio_network(
                                 sock,
                                 guest_network,
                                 published_ports,
@@ -2151,6 +2177,36 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // the COW wall entirely. The shared policy keeps this launcher,
             // packed VMs, and the direct backend on the same window size.
             let dax_window = super::virtiofs::user_mount_dax_window(&mount.target);
+            // A share whose ownership is recorded in an xattr asks the Linux
+            // server for it explicitly (the macOS server always does this).
+            if cfg!(target_os = "linux") && mount.recorded_ownership {
+                let Some(add_virtiofs4) = krun.add_virtiofs4 else {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        "recorded ownership requires libkrun with krun_add_virtiofs4",
+                    ));
+                };
+                if add_virtiofs4(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                    super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
+                ) < 0
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        format!(
+                            "krun_add_virtiofs4 failed for '{}' - requested mount cannot be attached",
+                            mount.source.display()
+                        ),
+                    ));
+                }
+                continue;
+            }
             // Read-only mounts must be enforced host-side by the virtiofs
             // device (krun_add_virtiofs3's read_only flag), not only by the
             // guest's bind-remount: a root process in the guest can undo a

@@ -1051,6 +1051,18 @@ impl EgressPolicy {
     }
 }
 
+/// A machine's place on a container switch (see `smolvm_network::switch`):
+/// the switch directory and the machine's endpoint in it. The engine that
+/// owns the switch decides the machine's networks and addresses; the machine
+/// reads them from its endpoint file at every start.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SwitchAttachment {
+    /// The switch directory.
+    pub dir: std::path::PathBuf,
+    /// The machine's endpoint name.
+    pub endpoint: String,
+}
+
 #[cfg(test)]
 mod forwarder_upstream_tests {
     use super::*;

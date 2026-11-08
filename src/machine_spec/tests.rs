@@ -634,6 +634,7 @@ fn cases() -> Vec<Case> {
         dns_options,
         network_name,
         guest_subnet,
+        switch,
         ports,
         allowed_cidrs,
         allowed_hosts,
@@ -841,6 +842,7 @@ fn cases() -> Vec<Case> {
                     target: "/data".into(),
                     read_only: true,
                     staged: false,
+                    recorded_ownership: false,
                 }]
             },
             |r| r.mounts.len() == 1
@@ -853,6 +855,7 @@ fn cases() -> Vec<Case> {
                 target: "/data".into(),
                 read_only: true,
                 staged: false,
+                recorded_ownership: false,
             }]
         })
         .checkpoint(Refused("volume mounts")),
@@ -1078,6 +1081,22 @@ fn cases() -> Vec<Case> {
             .embedded(|e, _| e.spec.detached = true),
         case!(runtime_managed, |s, _| s.runtime_managed = true, |r| r.runtime_managed)
             .embedded(|e, _| e.spec.runtime_managed = true),
+        case!(
+            switch,
+            |s, _| {
+                s.switch = Some(crate::data::network::SwitchAttachment {
+                    dir: "/sw".into(),
+                    endpoint: "e1".into(),
+                })
+            },
+            |r| r.switch.as_ref().is_some_and(|s| s.endpoint == "e1") && r.network
+        )
+        .embedded(|e, _| {
+            e.spec.resources.switch = Some(crate::data::network::SwitchAttachment {
+                dir: "/sw".into(),
+                endpoint: "e1".into(),
+            })
+        }),
         case!(
             labels,
             |s, _| {

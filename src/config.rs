@@ -504,6 +504,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub staged_mounts: Vec<(usize, String, String)>,
 
+    /// The live mounts keep the guest's file ownership in an xattr (see
+    /// [`crate::data::storage::HostMount::recorded_ownership`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded_ownership: bool,
+
     /// The fork source whose host directories this branch's staged working
     /// copies were seeded from. A branch keeps the copies (they live on its own
     /// cloned storage disk and survive restarts, since the mounts stay
@@ -630,6 +635,10 @@ pub struct VmRecord {
     /// IPv4 subnet for the guest link (virtio-net only). None = `100.96.0.0/30`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_subnet: Option<String>,
+
+    /// Container switch this machine joins on start (virtio-net only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch: Option<crate::data::network::SwitchAttachment>,
 
     /// OCI image for auto-container creation on start.
     #[serde(default)]
@@ -977,6 +986,7 @@ impl VmRecord {
             block_private: None,
             mounts,
             staged_mounts: Vec::new(),
+            recorded_ownership: false,
             staged_mounts_detached_from: None,
             ports,
             udp_ports: Vec::new(),
@@ -1005,6 +1015,7 @@ impl VmRecord {
             shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -1081,6 +1092,7 @@ impl VmRecord {
             block_private: None,
             mounts,
             staged_mounts: Vec::new(),
+            recorded_ownership: false,
             staged_mounts_detached_from: None,
             ports,
             udp_ports: Vec::new(),
@@ -1109,6 +1121,7 @@ impl VmRecord {
             shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -1191,6 +1204,7 @@ impl VmRecord {
                 target: std::path::PathBuf::from(guest),
                 read_only: *ro,
                 staged: false,
+                recorded_ownership: self.recorded_ownership,
             })
             .collect::<std::collections::VecDeque<_>>();
         let staged = self
@@ -1701,6 +1715,7 @@ impl VmRecord {
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
+            switch: self.switch.clone(),
         }
     }
 }

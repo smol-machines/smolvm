@@ -1169,6 +1169,126 @@ pub enum AgentRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_id: Option<String>,
     },
+
+    /// Start a container the way a Docker engine does: the command runs as the
+    /// container's own init (PID 1) on the image overlay `overlay_id`, and its
+    /// I/O streams on THIS connection: `Started`, then `Stdout`/`Stderr`, then
+    /// `Exited` with the command's exit status. Stdin (when `open_stdin`) and
+    /// PTY resizes arrive as `Stdin`/`Resize` requests. Commands run with
+    /// `Run` on the same overlay join this container while it runs. The host
+    /// closing the connection kills the container.
+    ContainerStart(Box<ContainerStartSpec>),
+
+    /// Send a signal to the init process of the container `ContainerStart`
+    /// started on `overlay_id`.
+    ContainerSignal {
+        /// Overlay the container runs on.
+        overlay_id: String,
+        /// Signal name (`SIGTERM`, `HUP`) or number.
+        signal: String,
+        /// Signal every process of the container, not only its init (how
+        /// `SIGSTOP`/`SIGCONT` pause and resume it).
+        #[serde(default)]
+        all: bool,
+    },
+
+    /// Unpack the tar archive at guest path `archive` into `destination` of
+    /// the container root filesystem on overlay `overlay_id` (built from
+    /// `image`), then remove the archive. Works whether or not the container
+    /// runs.
+    ContainerArchive {
+        /// Image the overlay is built from.
+        image: String,
+        /// Overlay the container's root filesystem lives on.
+        overlay_id: String,
+        /// Guest path of the archive.
+        archive: String,
+        /// Directory in the container to unpack into.
+        destination: String,
+    },
+
+    /// List the processes of the container `ContainerStart` started on
+    /// `overlay_id`. Replies `Ok` with `{"titles": [...], "processes": [[...]]}`.
+    ContainerTop {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+}
+
+/// What [`AgentRequest::ContainerStart`] runs, and how.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContainerStartSpec {
+    /// Caller's container id, used for logs and guest paths.
+    pub id: String,
+    /// Image reference (must be pulled first).
+    pub image: String,
+    /// Persistent overlay the container's root filesystem lives on.
+    pub overlay_id: String,
+    /// The command, resolved by the caller (entrypoint + cmd).
+    pub command: Vec<String>,
+    /// The complete environment, resolved by the caller.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Working directory; the image's when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// `user[:group]`, by name or number; the image's when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Allocate a PTY for the command.
+    #[serde(default)]
+    pub tty: bool,
+    /// Keep the command's stdin open for `Stdin` requests. Without it the
+    /// command reads end of file at once.
+    #[serde(default)]
+    pub open_stdin: bool,
+    /// Container hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Extra `/etc/hosts` lines as `(address, names)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<(String, String)>,
+    /// Mounts, in the order given (parents before children is the caller's job).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<ContainerMount>,
+    /// Mount the root filesystem read-only.
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    /// Size of `/dev/shm` in bytes; the runtime default when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<u64>,
+}
+
+/// One mount of a [`ContainerStartSpec`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerMount {
+    /// The host directory shared at boot under virtiofs `tag`, or one file or
+    /// directory below it (`subpath`), bound at `target`.
+    Share {
+        /// Virtiofs tag of the shared directory.
+        tag: String,
+        /// Path below the shared directory to bind instead of all of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+        /// Container path.
+        target: String,
+        /// Bind read-only.
+        #[serde(default)]
+        read_only: bool,
+        /// When the shared directory is empty, first fill it with what the
+        /// image has at `target`, as a container engine does for a new volume.
+        #[serde(default)]
+        copy_up: bool,
+    },
+    /// A memory-backed filesystem at `target`.
+    Tmpfs {
+        /// Container path.
+        target: String,
+        /// Mount options (`size=64m`, `mode=1777`, `noexec`, ...).
+        #[serde(default)]
+        options: Vec<String>,
+    },
 }
 
 impl AgentRequest {
@@ -1266,6 +1386,30 @@ impl AgentRequest {
                 Some(e) => format!("PodDelete {{ id: {id}, exec: {e} }}"),
                 None => format!("PodDelete {{ id: {id} }}"),
             },
+            AgentRequest::ContainerStart(spec) => format!(
+                "ContainerStart {{ id: {}, image: {}, tty: {}, mounts: {} }}",
+                spec.id,
+                spec.image,
+                spec.tty,
+                spec.mounts.len()
+            ),
+            AgentRequest::ContainerSignal {
+                overlay_id,
+                signal,
+                all,
+            } => {
+                format!("ContainerSignal {{ overlay: {overlay_id}, signal: {signal}, all: {all} }}")
+            }
+            AgentRequest::ContainerArchive {
+                overlay_id,
+                destination,
+                ..
+            } => {
+                format!("ContainerArchive {{ overlay: {overlay_id}, destination: {destination} }}")
+            }
+            AgentRequest::ContainerTop { overlay_id } => {
+                format!("ContainerTop {{ overlay: {overlay_id} }}")
+            }
         }
     }
 }

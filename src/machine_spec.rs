@@ -140,6 +140,8 @@ pub struct CreateSpec {
     pub network_name: Option<String>,
     /// Canonical guest link subnet.
     pub guest_subnet: Option<String>,
+    /// Container switch to join (virtio-net only).
+    pub switch: Option<crate::data::network::SwitchAttachment>,
     /// Published ports (TCP and UDP).
     pub ports: Vec<PortMapping>,
     /// Egress CIDR allow-list (`Some([])` denies everything).
@@ -266,6 +268,7 @@ impl CreateSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
             allowed_cidrs,
             allowed_hosts,
@@ -332,6 +335,7 @@ impl CreateSpec {
             dns_options: replace(self.dns_options, dns_options),
             network_name: network_name.or(self.network_name),
             guest_subnet: guest_subnet.or(self.guest_subnet),
+            switch: switch.or(self.switch),
             ports: list(self.ports, ports),
             allowed_cidrs: opt_list(self.allowed_cidrs, allowed_cidrs),
             allowed_hosts: opt_list(self.allowed_hosts, allowed_hosts),
@@ -511,6 +515,8 @@ pub struct ResolvedSpec {
     pub network_name: Option<String>,
     /// Guest subnet.
     pub guest_subnet: Option<String>,
+    /// Container switch.
+    pub switch: Option<crate::data::network::SwitchAttachment>,
     /// Published ports.
     pub ports: Vec<PortMapping>,
     /// CIDR allow-list.
@@ -731,6 +737,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         dns_options,
         network_name,
         guest_subnet,
+        switch,
         ports,
         allowed_cidrs,
         allowed_hosts,
@@ -863,6 +870,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         || dns.is_some()
         || network_name.is_some()
         || guest_subnet.is_some()
+        || switch.is_some()
         || !egress_rules.is_empty()
         || allowed_cidrs
             .as_ref()
@@ -931,6 +939,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
                 allowed_cidrs,
                 allowed_hosts,
@@ -1011,6 +1020,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
                 allowed_cidrs,
                 allowed_hosts,
@@ -1222,6 +1232,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                     target: target.into(),
                     read_only,
                     staged: false,
+                    recorded_ownership: false,
                 })
                 .collect();
 
@@ -1291,6 +1302,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
                 allowed_cidrs,
                 allowed_hosts,
@@ -1398,6 +1410,7 @@ impl ResolvedSpec {
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
+            switch: self.switch.clone(),
         }
     }
 
@@ -1420,6 +1433,7 @@ impl ResolvedSpec {
         record.dns_filter_hosts = self.allowed_hosts.clone();
         record.network_name = self.network_name.clone();
         record.guest_subnet = self.guest_subnet.clone();
+        record.switch = self.switch.clone();
         record.network_backend = self.network_backend;
         record.set_port_mappings(&self.ports);
         record.credential_policy = self.credentials.clone();
@@ -1481,6 +1495,7 @@ impl ResolvedSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
             allowed_cidrs,
             allowed_hosts,
@@ -1509,6 +1524,7 @@ impl ResolvedSpec {
         } = self.clone();
         let restored = restored.unwrap_or_default();
         let is_restore = self.restored.is_some();
+        let recorded_ownership_mounts = mounts.iter().any(|m| m.recorded_ownership);
         let (mounts, staged_mounts) = HostMount::split_storage_tuples(&mounts);
         let (ports, udp_ports) = PortMapping::split_tuples(&ports);
         let credential_placeholders = match credentials.as_ref() {
@@ -1539,6 +1555,7 @@ impl ResolvedSpec {
             block_private,
             mounts,
             staged_mounts,
+            recorded_ownership: recorded_ownership_mounts,
             staged_mounts_detached_from: None,
             ports,
             udp_ports,
@@ -1568,6 +1585,7 @@ impl ResolvedSpec {
             shm_size,
             network_name,
             guest_subnet,
+            switch,
             image,
             entrypoint,
             cmd,

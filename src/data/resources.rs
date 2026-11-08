@@ -33,7 +33,7 @@ fn default_memory_for_host(host_mib: Option<u64>) -> u32 {
 }
 
 /// The host's physical RAM in MiB, or `None` if it cannot be read.
-fn host_physical_memory_mib() -> Option<u64> {
+pub(crate) fn host_physical_memory_mib() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         let mut bytes = 0u64;
@@ -244,6 +244,9 @@ pub struct VmResources {
     /// with Tailscale or carrier NAT running inside the guest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_subnet: Option<String>,
+    /// Container switch the machine joins (virtio-net only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch: Option<crate::data::network::SwitchAttachment>,
 }
 
 /// Minimum memory required for the VM to boot (kernel + agent).
@@ -332,6 +335,7 @@ impl Default for VmResources {
             shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
         }
     }
 }

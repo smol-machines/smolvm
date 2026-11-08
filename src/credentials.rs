@@ -217,6 +217,7 @@ impl CredentialLaunch {
             target: PathBuf::from(GUEST_CA_DIR),
             read_only: true,
             staged: false,
+            recorded_ownership: false,
         }
     }
 
