@@ -125,17 +125,19 @@ machine cannot take them now (below).
 
 On a running machine the change applies from its next request, with no restart:
 
-- A binding unchanged in every respect (hosts, variable, header, body flag,
-  methods, and where its value comes from) keeps its placeholder and value, so
-  processes already holding it keep working.
-- Any other binding, a changed one under the same name included, is new: it
-  gets a new placeholder and no value, so a key bound to one service never
-  reaches another through an old name. Commands started from then on (`exec`,
-  `shell`, the API's exec) see the new placeholder; processes already running
-  keep the environment they started with, and their old placeholder is no
-  longer substituted. Its value comes from `credential-values` (API and
-  embedded machines) or, for a CLI machine, from the binding's secret reference
-  or variable as `machine update` reads it.
+- A binding keeps its placeholder for as long as its name stays, so processes
+  already holding it keep working, whatever else about it changed.
+- New hosts, a header, the body flag or methods keep the binding's value too:
+  the same secret is re-scoped on purpose. A new environment variable, or a
+  value that stops coming from this host, drops the value and where it came
+  from; the binding answers `502 credential unavailable` until a new value is
+  supplied, and the old secret never reaches the new definition.
+- A new name gets a new placeholder that commands started from then on (`exec`,
+  `shell`, the API's exec) see; processes already running keep the environment
+  they started with. Its value comes from `credential-values` (API and
+  embedded machines) or, for a CLI machine, from the binding's secret
+  reference or variable as `machine update` reads it. A name removed and added
+  again later gets a new placeholder.
 - A request already being handled when the bindings change, which would
   resolve a value after the change, is answered `503 smolvm credentials:
   credential bindings changed during the request; retry` instead of being sent
@@ -176,8 +178,8 @@ later apply live.
 Bindings replaced over the API or by an embedder take their values only from
 what is supplied, as at create; so do the bindings a machine already had from
 such a caller, even when the CLI edits them later. When an API caller or
-embedder replaces bindings of a machine whose values came from this host, every
-binding becomes new: none keeps a host variable, file or value.
+embedder replaces bindings of a machine whose values came from this host, no
+binding keeps a host variable, file or value; their placeholders stay.
 
 The machine's boot process, running as the machine's own user, creates and
 widens the CA itself; the server or CLI never writes into the machine's
