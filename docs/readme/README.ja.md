@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <sub><a href="../../README.md">English</a> · <a href="README.zh-CN.md">中文</a> · <b>日本語</b> · <a href="README.ko.md">한국어</a></sub>
+  <sub><a href="../../README.md">English</a> · <a href="README.zh-CN.md">中文</a> · <b>日本語</b> · <a href="README.ko.md">한국어</a> · <a href="README.ru.md">Русский</a> · <a href="README.es.md">Español</a> · <a href="README.de.md">Deutsch</a></sub>
 </p>
 
 smolvm
@@ -31,7 +31,7 @@ curl -sSL https://smolmachines.com/install.sh | bash   # macOS + Linux
 
 Windows：`windows-x86_64` の[リリース](https://github.com/smol-machines/smolvm/releases)を展開し、`smolvm.exe` を実行します（[Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) が必要です）。コーディングエージェント向け：インストール後に `smolvm --help` を実行すると、すべてのコマンドを確認できます。
 
-人とエージェントのためのドキュメントは [`docs/`](../README.md) にあり、タスクごとに 1 フォルダです。事実をまとめた `README.md` と、エージェントがそのまま実行できる `SKILL.md`（スクリプト付き）が、各機能のリファレンスページと並んでいます。
+人とエージェントのためのドキュメントは [`docs/`](../README.md) にあり、タスクごとに 1 フォルダです。事実をまとめた `README.md` と、エージェントが従える手順をまとめた `SKILL.md`（スクリプト付き）が、各機能のリファレンスページと並んでいます。
 
 クイックスタート
 ----------------
@@ -52,6 +52,8 @@ smolvm machine exec --name dev -- apk add git
 docker save myapp | smolvm machine run --image - -- ./app    # local image, no registry
 ```
 
+`-v s3://bucket/prefix:/data` で S3、R2 または MinIO のバケットをマウントできます。[ボリューム](../volumes.md)を参照してください。
+
 マシンは [Smolfile](../smolfile.md) で宣言できます。イメージ、リソース、ポート、マウント、ネットワークポリシーを、リポジトリに置く 1 つのファイルにまとめられます。
 
 組み込み
@@ -63,6 +65,7 @@ docker save myapp | smolvm machine run --image - -- ./app    # local image, no r
 npm install smolmachines     # Node / TypeScript
 pip install smolmachines     # Python
 cargo add smolmachines       # Rust
+go get github.com/smol-machines/smol/sdk/go   # Go
 ```
 
 ```ts
@@ -135,11 +138,11 @@ NOTION_API_KEY=secret_… smolvm machine run --net --image alpine \
 |                     | smolvm | コンテナ | Colima | QEMU | Firecracker | Kata |
 |---------------------|--------|----------|--------|------|-------------|------|
 | ワークロードの境界  | VM + ゲストカーネル | 名前空間 + 共有カーネル | 共有 VM 内の名前空間 | VM + ゲストカーネル | VM + ゲストカーネル | コンテナごとに VM |
-| 起動時間            | エージェント準備完了まで 200ms 未満 | ~100ms | 数秒 | ~15-30s | <125ms | ~500ms |
+| 起動時間            | ゲストエージェント準備完了まで 200ms 未満 | ~100ms | 数秒 | ~15-30s | <125ms | ~500ms |
 | アーキテクチャ      | ライブラリ（libkrun） | デーモン | デーモン（VM 内） | プロセス | プロセス | ランタイムスタック |
 | ワークロードごとの VM | あり | なし | なし（共有） | あり | あり | あり |
 | macOS ネイティブ    | はい | Docker VM 経由 | はい（krunkit） | はい | いいえ | いいえ |
-| 組み込み SDK        | あり | なし | なし | なし | なし | なし |
+| 組み込み可能な SDK  | あり | なし | なし | なし | なし | なし |
 | ポータブルな成果物  | `.smolmachine` | イメージ（デーモンが必要） | なし | なし | なし | なし |
 
 対応プラットフォーム
@@ -160,6 +163,9 @@ Windows はポータブルなチェックポイント、一時停止と再開、
 
 * [Kubernetes](../kubernetes.md)：`RuntimeClass` を通して Pod をマイクロ VM として動かします。
 * [GPU と CUDA](../gpu.md)：virtio-gpu / Venus による Vulkan と、CUDA API リモーティング。
+* [名前付きネットワーク](../named-networks.md)：IP アドレスで互いに通信できるマシン。
+* [ネストされた仮想化](../nested-virtualization.md)：マシン内で KVM、smolvm または QEMU を動かします。
+* [ブラウザー表示](../browser-display.md)：マシンのデスクトップをブラウザーで表示し、キーボードとマウスで操作できます。
 * [サンプル](../../examples/)：python、node、docker-in-vm、local-llm、headless-browser、doom。
 * [開発](../DEVELOPMENT.md) · ユーザー向けドキュメントは [smolmachines.com/docs](https://smolmachines.com/docs/) にあり、[smol-machines/docs](https://github.com/smol-machines/docs) で書かれています（修正はそちらへ。ランタイムのバグはこのリポジトリへ）。
 
