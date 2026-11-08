@@ -1213,6 +1213,11 @@ fn process_runs_another_boot_binary(_pid: i32) -> bool {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FORK_DISK_CHAIN_DEPTH: usize = 32;
 
+/// The depth at which a live branch is refused: reached only when flattening
+/// a chain past `MAX_FORK_DISK_CHAIN_DEPTH` has failed branch after branch.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HARD_FORK_DISK_CHAIN_DEPTH: usize = 2 * MAX_FORK_DISK_CHAIN_DEPTH;
+
 /// Every block disk a branch carries, as `(block id, role filename)`: the id
 /// libkrun pivots the running device by, and the `.raw` name its image is
 /// resolved from. A disk the machine does not have is skipped by whoever
@@ -1387,7 +1392,7 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
     })?;
     let mut relocated = relocated_top.to_path_buf();
     let mut seen = HashSet::new();
-    for _ in 0..MAX_FORK_DISK_CHAIN_DEPTH {
+    for _ in 0..4 * MAX_FORK_DISK_CHAIN_DEPTH {
         if !seen.insert(source.clone()) {
             return Err(Error::agent(
                 "stage fork disk backing",
@@ -1470,12 +1475,19 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
     Err(Error::agent(
         "stage fork disk backing",
         format!(
-            "{} exceeds the safe backing depth of {MAX_FORK_DISK_CHAIN_DEPTH}",
+            "{} exceeds the backing depth a chain can be inspected to",
             source_top.display()
         ),
     ))
 }
 
+/// Refuse a live branch only when compaction has kept failing. A chain past
+/// `MAX_FORK_DISK_CHAIN_DEPTH` that nothing beneath the active disk could fold
+/// (a machine branched from frozen sources before they were kept short) still
+/// branches: the branch turns the active disk into a generation this machine
+/// owns, and that generation is flattened as soon as the branch commits. Only
+/// a chain twice as deep, which takes that flatten failing many times over,
+/// is refused.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
     for (_, raw) in FORK_DISK_ROLES {
@@ -1484,17 +1496,20 @@ fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
             continue;
         }
         let depth = qcow2_backing_depth(&disk)?;
-        if depth >= MAX_FORK_DISK_CHAIN_DEPTH {
+        if depth >= HARD_FORK_DISK_CHAIN_DEPTH {
             // A limit the caller clears by packing the machine, not a fault.
             return Err(Error::agent_conflict(
                 "fork-continue",
                 format!(
-                    "{} already has {depth} qcow2 backing layers; the safe limit is \
-                     {MAX_FORK_DISK_CHAIN_DEPTH}. Stop and pack this machine into a new root \
-                     before creating another live fork",
+                    "{} already has {depth} qcow2 backing layers and flattening could not \
+                     shorten it; the limit is {HARD_FORK_DISK_CHAIN_DEPTH}. Stop and pack this \
+                     machine into a new root before creating another live fork",
                     disk.display()
                 ),
             ));
+        }
+        if depth >= MAX_FORK_DISK_CHAIN_DEPTH {
+            tracing::warn!(disk = %disk.display(), depth, "branching a deep disk chain; its new generation is flattened once the branch commits");
         }
     }
     Ok(())
@@ -2918,6 +2933,18 @@ pub(crate) fn prepare_forks_reusing(
             response = %reply,
             "fork: golden RAM checkpoint written"
         );
+        // The generation this branch made is immutable now that the source
+        // runs on its new overlay. A chain still past the limit (nothing below
+        // the old active disk could be folded) is flattened through it before
+        // any clone opens it. A failure leaves a deep but valid chain.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if fork_continue_snapshot(&snapshot_dir) {
+            if let Err(error) =
+                compact::compact_if_deeper_than(&gdir, vm_ids, MAX_FORK_DISK_CHAIN_DEPTH)
+            {
+                tracing::warn!(%golden, %error, "could not flatten a deep disk chain after branching");
+            }
+        }
         // Clones restore the golden's guest, so they need the packed-layer DAX
         // window it booted with. Without a record they use the legacy window.
         if let Some(window) =
@@ -3343,7 +3370,28 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
             .collect()
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let disks = read_generation_fork_disks(snapshot_dir)?.unwrap_or_else(fallback_disks);
+    let (disks, _gc_guards) = match read_generation_fork_disks(snapshot_dir)? {
+        Some(disks) => (disks, Vec::new()),
+        // A frozen source's active disks are the clone's base. Nothing may
+        // replace them while branches read them, so a base whose chain has
+        // grown deep is swapped for a short one before the clone stacks on it.
+        None => {
+            let mut guards = Vec::new();
+            let mut disks = fallback_disks();
+            for (raw, src, format) in &mut disks {
+                if *format != crate::data::disk::DiskFormat::Qcow2 {
+                    continue;
+                }
+                let Some((id, _)) = FORK_DISK_ROLES.iter().find(|(_, role)| role == raw) else {
+                    continue;
+                };
+                let (base, guard) = compact::shallow_clone_base(gdir, id, src)?;
+                *src = base;
+                guards.extend(guard);
+            }
+            (disks, guards)
+        }
+    };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let disks = fallback_disks();
 
@@ -4903,21 +4951,29 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn live_fork_refuses_an_unbounded_disk_chain() {
-        let temp = tempfile::tempdir().unwrap();
-        let raw = temp.path().join("base.raw");
-        std::fs::write(&raw, vec![0_u8; 20]).unwrap();
-        let mut backing = "base.raw".to_string();
-        for index in 0..MAX_FORK_DISK_CHAIN_DEPTH {
-            let name = if index + 1 == MAX_FORK_DISK_CHAIN_DEPTH {
-                crate::data::storage::STORAGE_DISK_FILENAME.replace(".raw", ".qcow2")
-            } else {
-                format!("layer-{index}.qcow2")
-            };
-            write_test_qcow2(&temp.path().join(&name), Some(&backing));
-            backing = name;
-        }
-        let error = ensure_fork_disk_chain_is_bounded(temp.path()).unwrap_err();
-        assert!(error.to_string().contains("safe limit is 32"));
+        let chain_of = |depth: usize| {
+            let temp = tempfile::tempdir().unwrap();
+            let raw = temp.path().join("base.raw");
+            std::fs::write(&raw, vec![0_u8; 20]).unwrap();
+            let mut backing = "base.raw".to_string();
+            for index in 0..depth {
+                let name = if index + 1 == depth {
+                    crate::data::storage::STORAGE_DISK_FILENAME.replace(".raw", ".qcow2")
+                } else {
+                    format!("layer-{index}.qcow2")
+                };
+                write_test_qcow2(&temp.path().join(&name), Some(&backing));
+                backing = name;
+            }
+            temp
+        };
+        // Past the depth compaction keeps chains under, a branch still goes
+        // ahead: the generation it makes is flattened once it commits.
+        let deep = chain_of(MAX_FORK_DISK_CHAIN_DEPTH);
+        ensure_fork_disk_chain_is_bounded(deep.path()).unwrap();
+        let runaway = chain_of(HARD_FORK_DISK_CHAIN_DEPTH);
+        let error = ensure_fork_disk_chain_is_bounded(runaway.path()).unwrap_err();
+        assert!(error.to_string().contains("the limit is 64"), "{error}");
         assert!(matches!(
             error,
             Error::Agent {
