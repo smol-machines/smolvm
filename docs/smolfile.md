@@ -26,7 +26,7 @@ smolvm machine create --name myvm -s Smolfile   # or --smolfile <PATH>
 smolvm machine start --name myvm
 ```
 
-Port mappings accept a single port (`"8080"`), an explicit mapping (`"8080:80"`), or equal-length one-to-one ranges (`"5173-5180:5173-5180"`). A machine can publish at most 64 concrete mappings.
+Port mappings accept a single port (`"8080"`), an explicit mapping (`"8080:80"`), or equal-length one-to-one ranges (`"5173-5180:5173-5180"`). A machine can publish at most 4096 concrete mappings.
 
 Unknown keys are rejected rather than ignored, so a typo fails at create time
 instead of silently doing nothing.
