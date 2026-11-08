@@ -203,6 +203,34 @@ pub(crate) fn guest_workload_env(shm_size: Option<&str>) -> Vec<std::ffi::CStrin
         .collect()
 }
 
+/// Idle-poll ceiling handed to the agent at boot, shared by both launchers.
+///
+/// On a macOS host a vCPU parked in WFI takes most of a virtio-fs round trip
+/// to wake (45 us for a statvfs on a bind mount, 36 of them between the host's
+/// reply and the guest's next request). Letting the guest kernel poll briefly
+/// before parking halves the trip: 45 -> 24 us per synchronous request, and an
+/// npm ci into a bind mount 27.6 -> 26.6 s, for 0.1 to 0.4 points of a core
+/// while the machine idles. Linux and Windows hosts wake a vCPU far faster and
+/// keep the kernel's default of no polling.
+pub(crate) fn guest_idle_poll_env() -> Vec<std::ffi::CString> {
+    idle_poll_env(cfg!(target_os = "macos"))
+}
+
+/// Measured ceiling for macOS hosts: a longer poll gained nothing more on the
+/// round trip and only cost idle CPU.
+const MACOS_IDLE_POLL_US: u32 = 50;
+
+fn idle_poll_env(host_is_macos: bool) -> Vec<std::ffi::CString> {
+    if !host_is_macos {
+        return Vec::new();
+    }
+    vec![std::ffi::CString::new(format!(
+        "{}={MACOS_IDLE_POLL_US}",
+        smolvm_protocol::guest_env::IDLE_POLL_US
+    ))
+    .expect("constant has no NUL")]
+}
+
 /// Build the guest-network environment variables handed to the agent at boot.
 ///
 /// Shared by both the static (`launcher.rs`) and dynamic (`launcher_dynamic.rs`)
@@ -275,6 +303,19 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+#[cfg(test)]
+mod idle_poll_env_tests {
+    use super::idle_poll_env;
+
+    #[test]
+    fn only_a_macos_host_asks_the_guest_to_poll_before_parking() {
+        assert!(idle_poll_env(false).is_empty());
+        let env = idle_poll_env(true);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].to_str().unwrap(), "SMOLVM_IDLE_POLL_US=50");
+    }
 }
 
 #[cfg(test)]

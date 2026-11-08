@@ -180,6 +180,39 @@ fn raise_kernel_limits() {
     }
 }
 
+/// Apply the host's idle-poll ceiling (`SMOLVM_IDLE_POLL_US`) to the kernel's
+/// `/proc/smolvm-idle-poll-us`, so a vCPU polls briefly for a virtio-fs reply
+/// before parking in WFI. Absent means the kernel's default. A kernel without
+/// the knob or a value it refuses leaves the machine as it was.
+#[cfg(target_os = "linux")]
+fn apply_idle_poll() {
+    if let Some(value) = std::env::var_os(guest_env::IDLE_POLL_US) {
+        let value = value.to_string_lossy();
+        if let Err(error) = write_idle_poll(std::path::Path::new(IDLE_POLL_KNOB), &value) {
+            boot_log("WARN", &format!("set idle poll to {value} us: {error}"));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const IDLE_POLL_KNOB: &str = "/proc/smolvm-idle-poll-us";
+
+/// Write a microsecond ceiling to the idle-poll knob; the kernel accepts a
+/// decimal count up to 10 ms, so anything else is refused here first.
+fn write_idle_poll(knob: &std::path::Path, value: &str) -> std::io::Result<()> {
+    let micros: u32 = value
+        .trim()
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a number"))?;
+    if micros > 10_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "over the kernel's 10 ms ceiling",
+        ));
+    }
+    std::fs::write(knob, micros.to_string())
+}
+
 fn raise_nofile_limit() {
     let desired = libc::rlimit {
         rlim_cur: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
@@ -381,6 +414,8 @@ fn main() {
     delegate_root_cgroup_controllers();
     #[cfg(target_os = "linux")]
     raise_kernel_limits();
+    #[cfg(target_os = "linux")]
+    apply_idle_poll();
 
     // Create /dev/dri device nodes only when GPU is enabled. The setup
     // function polls up to 500ms for the virtio-gpu driver to finish probing —
@@ -8838,6 +8873,27 @@ impl<T: Read + Write + AsRawFd> ReadWrite for T {}
 /// Linux-only because `waitpid` behavior + the agent crate as a whole
 /// is Linux-specific. `cargo test -p smolvm-agent --target
 /// aarch64-unknown-linux-musl` on a Linux runner.
+#[cfg(test)]
+mod idle_poll_tests {
+    use super::write_idle_poll;
+
+    #[test]
+    fn the_idle_poll_ceiling_is_written_as_a_bounded_decimal() {
+        let dir = std::env::temp_dir().join(format!("smolvm-idle-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let knob = dir.join("knob");
+        write_idle_poll(&knob, " 50\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&knob).unwrap(), "50");
+        write_idle_poll(&knob, "0").unwrap();
+        assert_eq!(std::fs::read_to_string(&knob).unwrap(), "0");
+        assert!(write_idle_poll(&knob, "10001").is_err());
+        assert!(write_idle_poll(&knob, "fifty").is_err());
+        assert!(write_idle_poll(&knob, "-1").is_err());
+        assert_eq!(std::fs::read_to_string(&knob).unwrap(), "0");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod work_slot_tests {
