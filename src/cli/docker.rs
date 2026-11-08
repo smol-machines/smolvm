@@ -17,8 +17,10 @@
 //! - the stable socket path resolves to the daemon too, so a container that
 //!   mounts `$DOCKER_HOST`'s path (Testcontainers' Ryuk) reaches it, as does one
 //!   that mounts `/var/run/docker.sock`;
-//! - the machine uses the virtio-net backend, so Docker's bridge networking
-//!   runs over a real interface, as on any Linux host.
+//! - the machine uses the virtio-net backend, whose gateway answers
+//!   `host.docker.internal` for every container and relays it to the host's
+//!   loopback, and dockerd's `host-gateway` (compose `extra_hosts`) points at
+//!   that gateway.
 //!
 //! Docker's data lives on two disk volumes (`/var/lib/docker`,
 //! `/var/lib/containerd`) on the machine's storage disk. `reset` recreates the
@@ -76,7 +78,10 @@ const ENV_MIRRORS: &str = "SMOLVM_DOCKER_REGISTRY_MIRRORS";
 ///    small tmpfs over it keeps the host's link out of reach, and a link in it
 ///    points at `/var/run/docker.sock`. dockerd resolves bind-mount sources
 ///    in this namespace, so `-v $SOCK:/var/run/docker.sock` mounts the daemon.
-/// 2. dockerd listens only on the Unix socket: the image's default adds a TCP
+/// 2. `host-gateway` (compose `extra_hosts`, `--add-host x:host-gateway`) maps
+///    to the machine's default gateway, which the virtio-net backend relays to
+///    the host's loopback.
+/// 3. dockerd listens only on the Unix socket: the image's default adds a TCP
 ///    listener with generated certificates that nothing here uses.
 const BOOT_SCRIPT: &str = r#"set -eu
 sock="${SMOLVM_DOCKER_HOST_SOCKET:-}"
@@ -87,6 +92,10 @@ if [ -n "$sock" ]; then
   ln -sfn /var/run/docker.sock "$sock"
 fi
 set -- dockerd --host=unix:///var/run/docker.sock
+gateway="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+if [ -n "$gateway" ]; then
+  set -- "$@" --host-gateway-ip="$gateway"
+fi
 for mirror in ${SMOLVM_DOCKER_REGISTRY_MIRRORS:-}; do
   set -- "$@" --registry-mirror="$mirror"
 done
@@ -361,7 +370,9 @@ impl MachineSettings {
             "--storage".into(),
             self.disk_gib.to_string(),
             "--net".into(),
-            // Docker's bridge NAT runs over a real interface.
+            // The virtio-net gateway answers host.docker.internal and relays
+            // the gateway address to the host's loopback; Docker's bridge NAT
+            // runs over a real interface.
             "--net-backend".into(),
             "virtio-net".into(),
             "--docker-socket".into(),
@@ -1268,6 +1279,7 @@ mod tests {
     #[test]
     fn boot_script_is_valid_sh_and_execs_the_image_entrypoint() {
         assert!(BOOT_SCRIPT.contains("exec dockerd-entrypoint.sh \"$@\""));
+        assert!(BOOT_SCRIPT.contains("--host-gateway-ip="));
         assert!(BOOT_SCRIPT.contains(ENV_HOST_SOCKET));
         assert!(BOOT_SCRIPT.contains(ENV_MIRRORS));
         if let Ok(status) = std::process::Command::new("sh")

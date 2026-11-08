@@ -240,6 +240,9 @@ metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
 registry. Metadata stays blocked either way. Both imply `--net` and use the
 virtio-net backend; the Smolfile form is `[network] block_private = true` and
 `allow_private = ["10.20.0.0/16"]`.
+On the virtio-net backend the gateway answers `host.smolvm.internal`,
+`host.docker.internal` and `gateway.docker.internal` with its own address, and a
+connection to that address reaches the host's loopback.
 `--deny-cidr CIDR` refuses a range even where an allow would admit it,
 including the host's loopback reached through the gateway. It implies `--net`;
 the Smolfile form is `[network] deny_cidrs`.

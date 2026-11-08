@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test of `smolvm docker`: one command gives a Docker engine that
 # `docker` reaches with no DOCKER_HOST, shares the home directory at the same
-# path, exposes its socket to containers, and keeps Docker data across stop,
-# start and reset.
+# path, resolves host.docker.internal to the host, exposes its socket to
+# containers, and keeps Docker data across stop, start and reset.
 #
 # usage: tests/test_smolvm_docker.sh
 #
@@ -33,8 +33,10 @@ if [[ -e "$props" ]]; then
     props_backup="$work/testcontainers.properties"
     cp -p "$props" "$props_backup"
 fi
+server_pid=""
 
 cleanup() {
+    [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null || true
     "$SMOLVM_BIN" docker delete --force >/dev/null 2>&1 || true
     if [[ -n "$props_backup" ]]; then
         cp -p "$props_backup" "$props"
@@ -76,7 +78,28 @@ for source in /var/run/docker.sock "$socket"; do
 done
 pass "containers that mount /var/run/docker.sock or $socket reach the engine"
 
-# 4. Stop and start keep Docker data.
+# 4. host.docker.internal reaches a server bound to the host's loopback.
+echo host-reached > "$work/index.html"
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+python3 -m http.server "$port" --bind 127.0.0.1 --directory "$work" >/dev/null 2>&1 &
+server_pid=$!
+for _ in $(seq 1 50); do
+    python3 -c "import socket; socket.create_connection(('127.0.0.1', $port), 1)" 2>/dev/null && break
+    sleep 0.1
+done
+for name in host.docker.internal gateway.docker.internal; do
+    out=$(docker run --rm alpine wget -qO- -T 5 "http://$name:$port/")
+    [[ "$out" == host-reached ]] || fail "$name:$port gave '$out'"
+done
+out=$(docker run --rm --add-host hostgw:host-gateway alpine wget -qO- -T 5 "http://hostgw:$port/")
+[[ "$out" == host-reached ]] || fail "host-gateway:$port gave '$out'"
+docker network create smolvm-e2e >/dev/null
+out=$(docker run --rm --network smolvm-e2e alpine wget -qO- -T 5 "http://host.docker.internal:$port/")
+docker network rm smolvm-e2e >/dev/null
+[[ "$out" == host-reached ]] || fail "host.docker.internal on a user network gave '$out'"
+pass "host.docker.internal, gateway.docker.internal and host-gateway reach the host"
+
+# 5. Stop and start keep Docker data.
 docker volume create smolvm-e2e-data >/dev/null
 docker run --rm -v smolvm-e2e-data:/d alpine sh -c 'echo kept > /d/f'
 "$SMOLVM_BIN" docker stop
@@ -85,7 +108,7 @@ docker run --rm -v smolvm-e2e-data:/d alpine sh -c 'echo kept > /d/f'
 [[ "$(docker run --rm -v smolvm-e2e-data:/d alpine cat /d/f)" == kept ]] || fail "volume lost across stop/start"
 pass "stop and start keep volumes"
 
-# 5. Reset applies new settings and keeps volumes; --volumes starts empty.
+# 6. Reset applies new settings and keeps volumes; --volumes starts empty.
 "$SMOLVM_BIN" docker reset --mem 2048
 "$SMOLVM_BIN" docker status --json | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s["mem_mib"]==2048 and s["engine_version"] else 1)' \
     || fail "reset did not apply --mem 2048"
@@ -94,7 +117,7 @@ pass "stop and start keep volumes"
 [[ -z "$(docker volume ls -q)" ]] || fail "reset --volumes kept volumes"
 pass "reset keeps volumes; reset --volumes removes them"
 
-# 6. Delete removes the machine and the host wiring.
+# 7. Delete removes the machine and the host wiring.
 "$SMOLVM_BIN" docker delete --force
 [[ ! -e "$socket" && ! -L "$socket" ]] || fail "socket link left behind"
 [[ "$(docker context show)" == default ]] || fail "the smol context is still selected"
