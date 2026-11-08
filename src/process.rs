@@ -379,6 +379,7 @@ pub fn raise_nofile_limit() -> Option<libc::rlim_t> {
     }
 }
 
+/// No per-process open-file limit to raise on this platform.
 #[cfg(not(unix))]
 pub fn raise_nofile_limit() -> Option<u64> {
     None
