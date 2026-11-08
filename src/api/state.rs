@@ -4,7 +4,7 @@ use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::types::{MachineInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec};
 use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
-use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use crate::data::resources::{default_microvm_memory_mib, DEFAULT_MICROVM_CPU_COUNT};
 use crate::db::SmolvmDb;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1885,7 +1885,7 @@ start `smolvm serve` with --allow-nested-virt to enable it";
 pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmResources {
     VmResources {
         cpus: spec.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
-        memory_mib: spec.memory_mb.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
+        memory_mib: spec.memory_mb.unwrap_or_else(default_microvm_memory_mib),
         network,
         network_backend: spec.network_backend,
         gpu: spec.gpu.unwrap_or(false),
@@ -2239,7 +2239,7 @@ mod tests {
         };
         let res = resource_spec_to_vm_resources(&spec, false);
         assert_eq!(res.cpus, DEFAULT_MICROVM_CPU_COUNT);
-        assert_eq!(res.memory_mib, DEFAULT_MICROVM_MEMORY_MIB);
+        assert_eq!(res.memory_mib, default_microvm_memory_mib());
         assert!(!res.network);
 
         // Test with network enabled

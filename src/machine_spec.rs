@@ -43,7 +43,7 @@ use crate::credentials::CredentialPolicy;
 use crate::data::disk::{AttachedDisk, CacheDisk};
 use crate::data::network::PortMapping;
 use crate::data::resources::{
-    BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB,
+    default_microvm_memory_mib, BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT,
 };
 use crate::data::storage::HostMount;
 use crate::network::NetworkBackend;
@@ -915,7 +915,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 stop_timeout_secs,
                 shm_size,
                 cpus: cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
-                mem: mem.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
+                mem: mem.unwrap_or_else(default_microvm_memory_mib),
                 storage_gb,
                 overlay_gb,
                 block_io: block_io.unwrap_or_default(),

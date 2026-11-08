@@ -94,6 +94,8 @@ mod disk_trim;
 mod docker_bridge;
 mod forkpoint;
 mod io_target;
+#[cfg(target_os = "linux")]
+mod memory_trim;
 mod network;
 mod nsfile;
 mod oci;
@@ -646,6 +648,10 @@ fn main() {
     // With the disks mounted, start reclaiming freed blocks back to the host
     // sparse files so disk footprint tracks live data (see disk_trim).
     disk_trim::spawn();
+    // Likewise give idle page cache back so host memory follows what the
+    // guest uses (see memory_trim).
+    #[cfg(target_os = "linux")]
+    memory_trim::spawn();
 
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {

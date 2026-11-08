@@ -1172,7 +1172,7 @@ fn front_spec(
                         persistent: true,
                         resources: crate::data::resources::VmResources {
                             cpus: crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
-                            memory_mib: crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
+                            memory_mib: crate::data::resources::default_microvm_memory_mib(),
                             ..Default::default()
                         },
                         ..Default::default()

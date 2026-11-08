@@ -8,7 +8,7 @@
 //! and provides the same API as the old confy-based implementation.
 
 use crate::data::network;
-use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use crate::data::resources::{default_microvm_memory_mib, DEFAULT_MICROVM_CPU_COUNT};
 use crate::db::SmolvmDb;
 use crate::error::Result;
 use crate::network::NetworkBackend;
@@ -223,7 +223,7 @@ impl SmolvmConfig {
             db: SmolvmDb::open()?,
             version: 1,
             default_cpus: DEFAULT_MICROVM_CPU_COUNT,
-            default_mem: DEFAULT_MICROVM_MEMORY_MIB,
+            default_mem: default_microvm_memory_mib(),
             default_dns: network::default_dns(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
@@ -254,7 +254,7 @@ impl SmolvmConfig {
         let default_mem = config_map
             .get("default_mem")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB);
+            .unwrap_or_else(default_microvm_memory_mib);
         let default_dns = config_map
             .get("default_dns")
             .cloned()

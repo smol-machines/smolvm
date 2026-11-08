@@ -8,7 +8,7 @@ use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
 use smolvm::data::network::PortMappingSpec;
 use smolvm::data::resources::{
-    BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB,
+    default_microvm_memory_mib, BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT,
 };
 use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
@@ -606,7 +606,7 @@ pub fn build_create_params(
         entrypoint: entrypoint.unwrap_or_default(),
         cmd: cmd.unwrap_or_default(),
         cpus: cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
-        mem: mem.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
+        mem: mem.unwrap_or_else(default_microvm_memory_mib),
         volume: volumes,
         allow_system_mounts: false,
         port: ports,
@@ -1396,7 +1396,9 @@ init = ["echo init"]
 #[cfg(test)]
 mod resource_cap_precedence_tests {
     use super::*;
-    use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+    use smolvm::data::resources::{
+        default_microvm_memory_mib, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB,
+    };
 
     fn smolfile(contents: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1485,7 +1487,7 @@ mod resource_cap_precedence_tests {
         for p in [with_smolfile, without] {
             assert_eq!(
                 (p.cpus, p.mem),
-                (DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB)
+                (DEFAULT_MICROVM_CPU_COUNT, default_microvm_memory_mib())
             );
         }
     }

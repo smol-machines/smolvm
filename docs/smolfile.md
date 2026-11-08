@@ -47,7 +47,7 @@ stop_timeout = 30                     # seconds it gets to exit before it is kil
 
 # Resources
 cpus = 2                              # vCPUs (default: 4)
-memory = 1024                         # MiB (default: 8192, elastic via balloon)
+memory = 1024                         # MiB (default: half the host's RAM, at most 8192; elastic via balloon)
 net = true                            # outbound networking (default: false)
 gpu = true                            # GPU acceleration, Vulkan via virtio-gpu (default: false)
 gpu_vram = 4096                       # GPU shared-memory region in MiB (default: 4096, ignored unless gpu = true)
@@ -145,7 +145,7 @@ volumes:    [dev].volumes, else top-level volumes, then + CLI -v
 ports:      [dev].ports, else top-level ports, then + CLI -p
 init:       [dev].init, else top-level init, then + CLI --init
 workdir:    CLI -w > [dev].workdir > top-level workdir
-cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
+cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, half the host's RAM up to 8192 MiB)
 ```
 
 For `pack create`:

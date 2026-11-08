@@ -2372,6 +2372,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if let Ok(trim) = std::env::var(guest_env::DISK_TRIM) {
             env_strings.push(cstr(&format!("{}={}", guest_env::DISK_TRIM, trim)));
         }
+        // Same for the idle page-cache reclaim (see the agent's memory_trim).
+        if let Ok(trim) = std::env::var(guest_env::MEMORY_TRIM) {
+            env_strings.push(cstr(&format!("{}={}", guest_env::MEMORY_TRIM, trim)));
+        }
 
         // The machine's name rides along so the guest can hostname the
         // container after it — distinct k8s node names, distinguishable
@@ -2845,9 +2849,12 @@ fn raise_fd_limits() {
 /// inflate to ~80% of guest RAM so the guest evicts page cache, then deflate
 /// so the freed pages return to the host via free-page reporting. Re-arms
 /// only after a subsequent burst of activity, so a machine that stays idle is
-/// pulsed once, not continuously. Host-side release additionally needs
-/// SMOLVM_BALLOON_RECLAIM=1 (macOS stage-2 unmap reclaim).
-pub(crate) const IDLE_RECLAIM_DEFAULT_MINUTES: u64 = 10;
+/// pulsed once, not continuously. The guest agent's own page-cache reclaim
+/// (memory_trim) usually gets there first; the pulse is the backstop for what
+/// that leaves and for agents without it. Host-side release on macOS needs
+/// SMOLVM_BALLOON_RECLAIM=1, which the manager sets unless the host env says
+/// otherwise.
+pub(crate) const IDLE_RECLAIM_DEFAULT_MINUTES: u64 = 2;
 const IDLE_RECLAIM_RSS_REARM_GROWTH: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
