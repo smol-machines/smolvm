@@ -6860,15 +6860,19 @@ impl UpdateCmd {
             .flat_map(|p| p.credentials.iter().map(|b| b.name.as_str()))
             .collect();
         let after = saved.credential_policy.clone().unwrap_or_default();
-        // The running boot process resolves a new or changed binding from its
-        // own environment, which `machine start` fixed and which has nothing
-        // for it: hand it the value this command reads, from the binding's
-        // secret reference or variable.
+        // The running boot process resolves a new binding, or one bound to
+        // another variable, from its own environment, which `machine start`
+        // fixed and which has nothing for it: hand it the value this command
+        // reads, from the binding's secret reference or variable.
         if running && !saved.credentials_supplied_by_api {
             let mut values = std::collections::BTreeMap::new();
+            let previous = record.credential_policy.clone().unwrap_or_default();
             for binding in &after.credentials {
-                if record.credential_placeholders.get(&binding.name)
-                    == saved.credential_placeholders.get(&binding.name)
+                // Only new hosts or a header: the boot process keeps the
+                // secret it has.
+                if previous
+                    .binding(&binding.name)
+                    .is_some_and(|old| old.environment_variable == binding.environment_variable)
                 {
                     continue;
                 }

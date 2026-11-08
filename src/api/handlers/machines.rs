@@ -6209,10 +6209,10 @@ pub async fn put_credential_values(
 /// `allowedHosts`, if it has them), on a machine that already has network
 /// egress: bindings never turn networking on. They are stored, so every later
 /// start, resume, restore and branch uses them. A running machine enforces
-/// them from its next request: a binding unchanged in every respect keeps its
-/// placeholder and value; any other (a changed one under the same name
-/// included) gets a new placeholder its new commands see and no value until
-/// `PUT …/credential-values` supplies one; a removed one stops being
+/// them from its next request: a binding keeps its placeholder while its name
+/// stays, and its value unless its variable changed (new hosts or a header
+/// keep it); a new name gets a placeholder its new commands see and no value
+/// until `PUT …/credential-values` supplies one; a removed one stops being
 /// substituted at once and loses its value.
 #[utoipa::path(
     put,

@@ -832,9 +832,10 @@ pub struct BindingsReply {
 ///   not a current binding refuses the whole message.
 /// - `{"bindings":{"policy":{…},"placeholders":{…},"supplied_only":bool}}`
 ///   replaces the bindings. The boot process creates or widens the CA itself
-///   and answers `ok` plus `{"ca_pem":"…"}`. A binding unchanged in every
-///   respect (the binding, its placeholder, and whether values are supplied)
-///   keeps its source and value; any other binding starts with none: it
+///   and answers `ok` plus `{"ca_pem":"…"}`. A binding with the same name,
+///   placeholder and variable, whose values still come from the same kind of
+///   place, keeps its source and value even if its hosts, header, body flag
+///   or methods changed; any other binding starts with none: it
 ///   resolves from the boot process's own variable of its name on a machine
 ///   whose values come from this host, and on a supplied machine only from a
 ///   value sent for it. Policy, placeholders and resolver state change in one
@@ -953,8 +954,17 @@ impl LiveCredentials {
             ca_pem: ca.certificate_pem().to_string(),
         };
         let supplied_only = state.supplied_only || message.supplied_only;
+        // A binding keeps its secret (source and value) when it is the same
+        // binding by name and placeholder, its variable is the same, and its
+        // value still comes from the same kind of place. New hosts or a new
+        // header keep it: the caller re-scoped the same secret. A new
+        // variable, or values that stop coming from this host, drop it, so
+        // the old secret is never sent anywhere under the new definition.
         let unchanged = |binding: &CredentialBinding| {
-            state.policy.binding(&binding.name) == Some(binding)
+            state
+                .policy
+                .binding(&binding.name)
+                .is_some_and(|current| current.environment_variable == binding.environment_variable)
                 && state.placeholders.get(&binding.name) == message.placeholders.get(&binding.name)
                 && state.supplied_only == supplied_only
         };
@@ -1467,35 +1477,50 @@ mod tests {
         }
     }
 
-    /// A binding whose hosts change, even under the same name and
-    /// placeholder, is a new binding: it keeps neither the value nor the
-    /// source it had, so a key bound to one service never reaches another.
+    /// Re-scoping a binding to other hosts or a header keeps its secret: the
+    /// caller moved the same secret on purpose. Giving it another variable
+    /// drops the secret it had (source and value), so the old one is never
+    /// sent under the new definition; it resolves to nothing until a value
+    /// is supplied. The placeholder stays either way.
     #[test]
-    fn a_rebound_name_keeps_neither_value_nor_source() {
+    fn a_new_variable_drops_the_secret_and_new_hosts_keep_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("openai");
         std::fs::write(&path, "sk-openai").unwrap();
         let launch = launch_in(dir.path(), &["key=OPENAI_KEY@api.openai.com"], false);
         launch.ensure_ca().unwrap();
+        let file = crate::secrets::file_ref(path);
         let (_interceptor, live) = launch
-            .spawn_interceptor([("key".into(), crate::secrets::file_ref(path))].into())
+            .spawn_interceptor([("key".into(), file.clone())].into())
             .unwrap();
         live.clone().serve(dir.path());
         assert_eq!(send(dir.path(), r#"{"values":{"key":"sk-live"}}"#), "ok");
 
-        let mut moved = launch_in(dir.path(), &["key=OPENAI_KEY@api.anthropic.com"], false);
-        moved.placeholders = launch.placeholders.clone();
-        assert!(send(dir.path(), &bindings_message(&moved)).starts_with("ok"));
+        let mut rescoped = launch_in(
+            dir.path(),
+            &["key=OPENAI_KEY@api.openai.com,eu.openai.com:set-header=authorization"],
+            false,
+        );
+        rescoped.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&rescoped)).starts_with("ok"));
+        let state = resolver_of(&live).lock().clone();
+        assert_eq!(state.live.get("key").map(|v| v.as_str()), Some("sk-live"));
+        assert_eq!(state.sources["key"], file, "the same secret, re-scoped");
+
+        let mut renamed = launch_in(dir.path(), &["key=ANTHROPIC_KEY@api.anthropic.com"], false);
+        renamed.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&renamed)).starts_with("ok"));
         let state = resolver_of(&live).lock().clone();
         assert!(
             state.live.is_empty(),
-            "the value sent for the old binding is gone"
+            "the value sent for the old variable is gone"
         );
         assert_eq!(
             state.sources["key"].from_env.as_deref(),
-            Some("OPENAI_KEY"),
+            Some("ANTHROPIC_KEY"),
             "the old file source is gone too"
         );
+        assert_eq!(live.state.lock().unwrap().placeholders, launch.placeholders);
     }
 
     /// An API caller or embedder replacing an operator's binding, even with

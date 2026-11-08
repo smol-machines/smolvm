@@ -1693,10 +1693,12 @@ impl VmRecord {
     /// host's environment. The machine must already have egress: bindings
     /// never turn networking on.
     ///
-    /// A binding unchanged in every respect (hosts, variable, header, body
-    /// flag, methods, and whether its value is supplied) keeps its
-    /// placeholder, so processes already holding it keep working; any other
-    /// binding gets a fresh placeholder; a removed one loses its. Removing every binding keeps an empty policy on a
+    /// A binding keeps its placeholder for as long as its name stays, even
+    /// when its hosts, header or variable change, so processes already holding
+    /// it keep working; a new name gets a fresh placeholder; a removed one
+    /// loses its (re-adding it later mints another).
+    ///
+    /// Removing every binding keeps an empty policy on a
     /// machine that had one, so its CA device, network backend and
     /// interceptor stay what they were, a saved checkpoint of it still
     /// restores, and bindings added later reach it live.
@@ -1746,22 +1748,19 @@ impl VmRecord {
             if !next.credentials_supplied_by_api {
                 crate::credentials::require_host_sources(&policy)?;
             }
-            // A binding keeps its placeholder only when nothing about it
-            // changed, where its value comes from included. Anything else is a
-            // new binding: a process holding the old placeholder must not have
-            // it substituted under different hosts, headers or values.
-            let same_source = next.credentials_supplied_by_api == self.credentials_supplied_by_api;
-            let old_policy = self.credential_policy.clone().unwrap_or_default();
+            // A binding keeps its placeholder for as long as its name stays,
+            // whatever else changed, so processes already holding it keep
+            // working. What a changed definition may take away is the secret
+            // behind it, which the boot process decides (see
+            // `crate::credentials::LiveCredentials`).
             let fresh = smolvm_credentials::generate_placeholders(&policy);
             next.credential_placeholders = policy
                 .credentials
                 .iter()
                 .map(|binding| {
-                    let unchanged =
-                        same_source && old_policy.binding(&binding.name) == Some(binding);
-                    let placeholder = unchanged
-                        .then(|| self.credential_placeholders.get(&binding.name))
-                        .flatten()
+                    let placeholder = self
+                        .credential_placeholders
+                        .get(&binding.name)
                         .or_else(|| fresh.get(&binding.name))
                         .cloned()
                         .unwrap_or_default();
@@ -3199,8 +3198,8 @@ mod tests {
         );
         assert!(both.credential_placeholders["b"].starts_with("SMOL_PLACEHOLDER_B_"));
 
-        // The same name with other hosts, another variable, a header or the
-        // body flag is a new binding with a new placeholder.
+        // The same name keeps its placeholder whatever else changed: a
+        // running process holding it must keep working.
         for changed in [
             "a=A_KEY@api.a.com,v2.a.com",
             "a=OTHER_KEY@api.a.com",
@@ -3210,23 +3209,25 @@ mod tests {
             let next = both
                 .with_credential_bindings(bindings(&[changed, "b=B_KEY@api.b.com"]), Caller::Api)
                 .unwrap();
-            assert_ne!(next.credential_placeholders["a"], a, "{changed}");
+            assert_eq!(next.credential_placeholders["a"], a, "{changed}");
             assert_eq!(
                 next.credential_placeholders["b"],
                 both.credential_placeholders["b"]
             );
         }
-        // So is a binding whose value stops coming from this host.
+        // Even when its value stops coming from this host (the boot process
+        // drops the host source; the placeholder stays).
         let operator = record
             .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Cli)
             .unwrap();
         let taken_over = operator
-            .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Api)
+            .with_credential_bindings(bindings(&["a=A_KEY@api.b.com"]), Caller::Api)
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             taken_over.credential_placeholders["a"],
             operator.credential_placeholders["a"]
         );
+        assert!(taken_over.credentials_supplied_by_api);
 
         let only_b = both
             .with_credential_bindings(bindings(&["b=B_KEY@api.b.com"]), Caller::Api)

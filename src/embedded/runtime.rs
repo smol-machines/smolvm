@@ -1473,10 +1473,10 @@ impl EmbeddedRuntime {
     /// so every later start, resume, restore and branch uses them. An empty
     /// policy removes every binding.
     ///
-    /// A running machine enforces them from its next request: a binding
-    /// unchanged in every respect keeps its placeholder and value, so
-    /// processes already holding it keep working; any other (a changed one
-    /// under the same name included) gets a placeholder that new commands
+    /// A running machine enforces them from its next request: a binding keeps
+    /// its placeholder while its name stays, so processes already holding it
+    /// keep working, and its value unless its variable changed (new hosts or
+    /// a header keep it); a new name gets a placeholder that new commands
     /// see, and is substituted on its hosts once a value is supplied with
     /// [`Self::supply_credential_values`]; a removed one stops being
     /// substituted at once, and the value held for it is dropped. The machine
