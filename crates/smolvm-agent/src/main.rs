@@ -5586,13 +5586,13 @@ fn container_workdir_path(
 ///
 /// Returning `None` means this is a fresh container and should use the normal
 /// OCI runtime path. Unprivileged workloads deliberately never call this path.
-#[cfg(target_os = "linux")]
 /// The environment a command run in a restored clone's container gets: the
 /// container init's own (`raw`, as `/proc/<pid>/environ` holds it) with
 /// `launch` layered over it. A credential placeholder the init inherited is
 /// left out unless `launch` hands it again: the host sends every binding the
 /// machine has now, so one it no longer sends was removed after the snapshot,
 /// and its variable must not reappear in new commands.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn restored_exec_environment(raw: &[u8], launch: &[(String, String)]) -> Vec<(String, String)> {
     let mut environment = raw
         .split(|byte| *byte == 0)
@@ -5608,6 +5608,7 @@ fn restored_exec_environment(raw: &[u8], launch: &[(String, String)]) -> Vec<(St
     environment
 }
 
+#[cfg(target_os = "linux")]
 fn restored_container_exec_command(
     container_id: &str,
     launch: &ResolvedLaunch,
