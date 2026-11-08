@@ -104,4 +104,5 @@ The repository's `scripts/install.sh --help` lists `--uninstall`.
 # drops cached images, except for a machine created from an image
 smolvm machine prune --name <NAME>
 smolvm pack prune                    # cached pack extractions
+smolvm pack prune --artifact <SHA8|FILE>   # Linux: only that pack's shared extraction, unless a machine references it
 ```
