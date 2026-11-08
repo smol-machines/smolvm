@@ -1,8 +1,8 @@
 # The Docker Engine API from smolvm
 
-`smolvm engine` answers the Docker Engine API on a Unix socket. The docker CLI talks to it as it
-talks to a Docker daemon, and nothing runs Docker: every container is a smol machine booted from
-its image.
+`smolvm engine` answers the Docker Engine API on a Unix socket. The docker CLI and Docker Compose
+talk to it as they talk to a Docker daemon, and nothing runs Docker: every container is a smol
+machine booted from its image.
 
 ## Start it
 
@@ -45,9 +45,9 @@ volume and network, and each container's log in Docker's `json-file` format.
 with the CPUs and memory the container asks for (`--cpus`, `--memory`). `docker start` boots it and
 runs the container's command in it as its main process; when the command exits, the machine stops
 and the container is `exited` with the command's exit code. `docker exec` runs in the same
-container. Restart policies, health checks, `docker pause`, `docker top`, `docker stats`,
-`docker cp`, `docker logs --follow --timestamps --tail`, `docker attach`, `docker wait` and
-`docker rename` work as they do with Docker.
+container. Restart policies, health checks (and so Compose's `depends_on: service_healthy`),
+`docker pause`, `docker top`, `docker stats`, `docker cp`, `docker logs --follow --timestamps
+--tail`, `docker attach`, `docker wait` and `docker rename` work as they do with Docker.
 
 Images are pulled from the image's registry with the credentials in `~/.docker/config.json`,
 including credential helpers, or the ones a client sends (`X-Registry-Auth`). A
@@ -73,17 +73,22 @@ environment makes them listen on every interface.
 ## Networks
 
 Every machine's network traffic goes through its own user-space network stack on the host. The
-engine connects those stacks with a switch, and every container is on the default network,
-`bridge` (172.17.0.0/16), as with Docker's default bridge:
+engine connects those stacks with a switch:
 
-- A container gets an address, reaches the other containers by address, and has a way out.
-- Names do not resolve on it, as on Docker's default bridge; `--link` adds the linked names to
-  `/etc/hosts`.
+- The default network, `bridge` (172.17.0.0/16), gives every container an address and a way out,
+  and no names, as Docker's default bridge does. `--link` adds the linked names to `/etc/hosts`.
+- A user-defined network (`docker network create`, every Compose project) gets its own subnet
+  from Docker's pools (172.18-31.0.0/16, then 192.168.N.0/20). Containers on it reach each other by
+  address, container name, service name and alias; a name resolves only on the networks the asking
+  container shares with it.
+- Containers on different networks cannot reach each other at all, by name or address.
+- `docker network connect` and `disconnect` work on running containers.
+- `--internal` networks have no way out.
 - `host.docker.internal` and `gateway.docker.internal` reach the host from every container.
 
-`docker network ls` and `inspect` show `bridge`, `host` and `none`. `--network host` is accepted
-with a warning and gives the container the default network: a container is a machine and cannot
-share the host's network. `--network container:<name>` is refused for the same reason.
+`--network host` is accepted with a warning and gives the container the default network: a
+container is a machine and cannot share the host's network. `--network container:<name>` is
+refused for the same reason.
 
 ## Building images
 
@@ -108,10 +113,9 @@ What the clients send, for whoever adds builds:
 
 ## Not yet
 
-- User-defined networks (`docker network create`, `connect` and `disconnect`), and so Docker
-  Compose, which creates one for every project.
 - IPv6 networks, other network drivers than `bridge`, and `--network container:<name>`.
 - Binding a Unix socket into a container, the Docker socket included.
 - `docker save`, `docker load`, `docker push` and `docker commit`.
 - A listening address per published port (`-p 0.0.0.0:8080:80`).
 - A volume for each `VOLUME` an image declares: that path stays in the container's own filesystem.
+- Changing an internal network's egress after a container on it was created.

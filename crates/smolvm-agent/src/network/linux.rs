@@ -264,6 +264,54 @@ fn add_address_v4(ifindex: u32, address: Ipv4Addr, prefix_len: u8) -> Result<(),
     })
 }
 
+/// Extra addresses [`set_extra_addresses`] added, so a later call can remove
+/// the ones it no longer lists without touching the boot address.
+static EXTRA_ADDRESSES: std::sync::Mutex<Vec<(Ipv4Addr, u8)>> = std::sync::Mutex::new(Vec::new());
+
+/// Make `ifname`'s extra IPv4 addresses exactly `wanted`.
+pub fn set_extra_addresses(ifname: &str, wanted: &[(Ipv4Addr, u8)]) -> Result<(), String> {
+    let ifindex = get_ifindex(ifname)?;
+    let mut current = EXTRA_ADDRESSES
+        .lock()
+        .map_err(|_| "address table lock poisoned".to_string())?;
+    for (address, prefix_len) in current.clone() {
+        if !wanted.contains(&(address, prefix_len)) {
+            match netlink_addr(
+                libc::RTM_DELADDR,
+                0,
+                ifindex,
+                libc::AF_INET as u8,
+                0,
+                prefix_len,
+                &address.octets(),
+            ) {
+                Ok(()) => {}
+                Err(err) if err.raw_os_error() == Some(libc::EADDRNOTAVAIL) => {}
+                Err(err) => return Err(format!("remove {address}/{prefix_len}: {err}")),
+            }
+            current.retain(|entry| *entry != (address, prefix_len));
+        }
+    }
+    for &(address, prefix_len) in wanted {
+        if current.contains(&(address, prefix_len)) {
+            continue;
+        }
+        match netlink_newaddr(
+            ifindex,
+            libc::AF_INET as u8,
+            0,
+            prefix_len,
+            &address.octets(),
+        ) {
+            Ok(()) => {}
+            Err(err) if err.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(err) => return Err(format!("add {address}/{prefix_len}: {err}")),
+        }
+        current.push((address, prefix_len));
+    }
+    Ok(())
+}
+
 /// Add the guest IPv6 address through rtnetlink (`ip -6 addr add ...`), with
 /// DAD skipped (see [`IFA_F_NODAD`]).
 fn add_address_v6(ifindex: u32, address: Ipv6Addr, prefix_len: u8) -> Result<(), String> {
@@ -535,6 +583,28 @@ fn netlink_newaddr(
     prefix_len: u8,
     address: &[u8],
 ) -> std::io::Result<()> {
+    netlink_addr(
+        libc::RTM_NEWADDR,
+        (libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16,
+        ifindex,
+        family,
+        flags,
+        prefix_len,
+        address,
+    )
+}
+
+/// `RTM_NEWADDR` or `RTM_DELADDR` for one address; `extra_flags` joins
+/// `NLM_F_REQUEST | NLM_F_ACK`.
+fn netlink_addr(
+    msg_type: u16,
+    extra_flags: u16,
+    ifindex: u32,
+    family: u8,
+    flags: u8,
+    prefix_len: u8,
+    address: &[u8],
+) -> std::io::Result<()> {
     let rta_len = rta_space(address.len());
     let msg_len = NLMSG_HDRLEN + IFADDRMSG_LEN + (rta_len * 2);
     let mut buf = vec![0u8; nlmsg_align(msg_len)];
@@ -543,9 +613,8 @@ fn netlink_newaddr(
     // SAFETY: `buf` is large enough for `nlmsghdr`.
     unsafe {
         (*nlh).nlmsg_len = msg_len as u32;
-        (*nlh).nlmsg_type = libc::RTM_NEWADDR;
-        (*nlh).nlmsg_flags =
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16;
+        (*nlh).nlmsg_type = msg_type;
+        (*nlh).nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16 | extra_flags;
         (*nlh).nlmsg_seq = 1;
     }
 

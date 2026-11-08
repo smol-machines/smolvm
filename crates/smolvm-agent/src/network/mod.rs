@@ -135,6 +135,27 @@ pub fn configure_from_env() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Make the interface's extra IPv4 addresses (beyond the one it booted with)
+/// exactly `addresses` (`a.b.c.d/len` each), adding and removing as needed.
+pub fn set_extra_addresses(addresses: &[String]) -> Result<(), String> {
+    let mut parsed = Vec::with_capacity(addresses.len());
+    for entry in addresses {
+        let (ip, len) = entry
+            .split_once('/')
+            .ok_or_else(|| format!("address '{entry}' must be a.b.c.d/len"))?;
+        let ip: Ipv4Addr = ip
+            .parse()
+            .map_err(|_| format!("address '{entry}' is not IPv4"))?;
+        let len: u8 = len
+            .parse()
+            .ok()
+            .filter(|len| *len <= 32)
+            .ok_or_else(|| format!("address '{entry}' has an invalid prefix length"))?;
+        parsed.push((ip, len));
+    }
+    linux::set_extra_addresses("eth0", &parsed)
+}
+
 /// Parse the optional IPv6 trio. All three vars must be present together; a
 /// partial set is a malformed contract and fails the boot rather than leaving a
 /// half-configured stack.
@@ -246,6 +267,10 @@ mod linux {
         _ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
         _dns_server: Ipv4Addr,
     ) -> Result<(), String> {
+        Err("guest virtio networking is only supported on Linux".to_string())
+    }
+
+    pub fn set_extra_addresses(_ifname: &str, _addresses: &[(Ipv4Addr, u8)]) -> Result<(), String> {
         Err("guest virtio networking is only supported on Linux".to_string())
     }
 }

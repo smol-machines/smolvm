@@ -9,8 +9,9 @@
 //! container, so `Run` requests on the same overlay (`docker exec`) join it.
 //!
 //! The other requests here act on that container: `ContainerSignal`
-//! (`docker kill`), `ContainerTop` (`docker top`) and `ContainerArchive`
-//! (`docker cp`).
+//! (`docker kill`), `ContainerTop` (`docker top`), and
+//! `SetInterfaceAddresses`, which lets a running machine join and leave
+//! networks.
 
 use smolvm_protocol::{error_codes, AgentResponse, ContainerStartSpec};
 
@@ -688,6 +689,14 @@ fn clock_ticks() -> u64 {
         ticks as u64
     } else {
         100
+    }
+}
+
+/// Make the interface's extra addresses exactly `addresses`.
+pub fn handle_set_interface_addresses(addresses: &[String]) -> AgentResponse {
+    match crate::network::set_extra_addresses(addresses) {
+        Ok(()) => AgentResponse::Ok { data: None },
+        Err(e) => AgentResponse::error(e, error_codes::INTERNAL_ERROR),
     }
 }
 

@@ -3118,6 +3118,10 @@ fn handle_request(
             archive,
             destination,
         } => container::handle_container_archive(&image, &overlay_id, &archive, &destination),
+
+        AgentRequest::SetInterfaceAddresses { addresses } => {
+            container::handle_set_interface_addresses(&addresses)
+        }
     }
 }
 

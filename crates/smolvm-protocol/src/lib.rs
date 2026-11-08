@@ -1213,6 +1213,16 @@ pub enum AgentRequest {
         /// Overlay the container runs on.
         overlay_id: String,
     },
+
+    /// Replace the extra IPv4 addresses on the guest's network interface:
+    /// every listed `address/prefix` is present afterwards, and any address
+    /// added by an earlier call and not listed is removed. The primary address
+    /// the guest booted with is never touched. Lets a running machine join and
+    /// leave networks.
+    SetInterfaceAddresses {
+        /// `a.b.c.d/len` entries.
+        addresses: Vec<String>,
+    },
 }
 
 /// What [`AgentRequest::ContainerStart`] runs, and how.
@@ -1409,6 +1419,9 @@ impl AgentRequest {
             }
             AgentRequest::ContainerTop { overlay_id } => {
                 format!("ContainerTop {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::SetInterfaceAddresses { addresses } => {
+                format!("SetInterfaceAddresses {{ addresses: {addresses:?} }}")
             }
         }
     }

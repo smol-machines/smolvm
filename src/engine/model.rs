@@ -242,6 +242,60 @@ pub(crate) struct ExecStartRequest {
     pub console_size: Option<Vec<u16>>,
 }
 
+/// The body of `POST /networks/create`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub(crate) struct NetworkCreateRequest {
+    pub name: String,
+    pub driver: String,
+    pub internal: bool,
+    pub attachable: bool,
+    #[serde(rename = "EnableIPv6")]
+    pub enable_ipv6: Option<bool>,
+    #[serde(rename = "IPAM")]
+    pub ipam: Option<Ipam>,
+    #[serde(deserialize_with = "null_as_default")]
+    pub options: BTreeMap<String, String>,
+    #[serde(deserialize_with = "null_as_default")]
+    pub labels: BTreeMap<String, String>,
+    pub check_duplicate: Option<bool>,
+}
+
+/// `IPAM` of a network create request.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub(crate) struct Ipam {
+    pub driver: String,
+    #[serde(deserialize_with = "null_as_default")]
+    pub config: Vec<IpamConfig>,
+}
+
+/// One address pool of a network.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub(crate) struct IpamConfig {
+    pub subnet: String,
+    #[serde(rename = "IPRange")]
+    pub ip_range: String,
+    pub gateway: String,
+}
+
+/// The body of `POST /networks/{id}/connect`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub(crate) struct NetworkConnectRequest {
+    pub container: String,
+    pub endpoint_config: Option<EndpointSettings>,
+}
+
+/// The body of `POST /networks/{id}/disconnect`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub(crate) struct NetworkDisconnectRequest {
+    pub container: String,
+    pub force: bool,
+}
+
 /// The body of `POST /volumes/create`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]

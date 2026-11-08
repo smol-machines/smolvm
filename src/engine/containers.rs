@@ -376,6 +376,7 @@ pub(crate) async fn create(
         dns: host_config.dns.iter().find_map(|d| d.parse().ok()),
         dns_options: host_config.dns_options.clone(),
         // On an internal network only, a container has no way out.
+        allowed_cidrs: super::network::internal_only(engine, &networks).then(Vec::new),
         switch: (!networks.is_empty()).then(|| super::network::attachment(engine, &id)),
         labels,
         ..Default::default()
@@ -1009,6 +1010,16 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
         }
     };
     let socket = handle.agent_socket();
+
+    // The container's other networks go on its interface before anything
+    // in it runs.
+    if let Err(e) = super::network::after_boot(&socket, &record).await {
+        let mut handle = handle;
+        let _ = tokio::task::spawn_blocking(move || handle.stop()).await;
+        stop_machine(engine, &record.machine, None).await;
+        remove_after_failed_start(engine, c);
+        return Err(e);
+    }
 
     // Files uploaded before the first start go in now, before the command.
     for (file, destination) in &record.pending_archives {
@@ -1925,7 +1936,7 @@ pub(crate) fn inspect(engine: &Engine, c: &Container, size: bool) -> serde_json:
         "GraphDriver": {"Name": "smolvm", "Data": {"Machine": r.machine}},
         "Mounts": mounts_view(engine, &r),
         "Config": config,
-        "NetworkSettings": super::network::settings_view(&r, running),
+        "NetworkSettings": super::network::settings_view(engine, &r, running),
     });
     if let Some(h) = health {
         out["State"]["Health"] = h;
@@ -2017,7 +2028,7 @@ pub(crate) fn summary(engine: &Engine, c: &Container) -> serde_json::Value {
         "State": r.state.status,
         "Status": status_text(&r, running),
         "HostConfig": {"NetworkMode": network_mode(&r)},
-        "NetworkSettings": {"Networks": super::network::settings_view(&r, running)["Networks"]},
+        "NetworkSettings": {"Networks": super::network::settings_view(engine, &r, running)["Networks"]},
         "Mounts": mounts_view(engine, &r),
     })
 }

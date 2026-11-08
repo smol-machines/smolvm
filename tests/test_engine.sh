@@ -2,9 +2,10 @@
 #
 # The Docker Engine API that `smolvm engine` serves, driven by the docker CLI
 # and Docker Compose exactly as users run them: containers, images, ports,
-# volumes, exec, logs, and the default network.
+# volumes, exec, logs, networks between containers, and Compose with
+# health-check dependencies.
 #
-# Needs the docker CLI. With DOCKER_HOST set, the
+# Needs the docker CLI with the compose plugin. With DOCKER_HOST set, the
 # suite uses that engine; otherwise it starts `smolvm engine serve` on a
 # socket of its own and stops it at the end.
 #
@@ -275,6 +276,33 @@ test_tmpfs() {
 
 # --- networks --------------------------------------------------------------------
 
+test_networks_names_aliases_isolation() {
+    local n1="$PREFIX-n1" n2="$PREFIX-n2"
+    docker network create --label "$PREFIX" "$n1" >/dev/null || return 1
+    docker network create --label "$PREFIX" "$n2" >/dev/null || return 1
+    run -d --name "$PREFIX-a" --network "$n1" --network-alias alpha alpine sleep 300 >/dev/null || return 1
+    run -d --name "$PREFIX-b" --network "$n2" alpine sleep 300 >/dev/null || return 1
+    run --rm --network "$n1" alpine sh -c "ping -c1 -W2 $PREFIX-a && ping -c1 -W2 alpha" >/dev/null || return 1
+    # Not on n2: neither its names nor its addresses are reachable.
+    run --rm --network "$n1" alpine getent hosts "$PREFIX-b" >/dev/null 2>&1 && return 1
+    local b_ip
+    b_ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$n2\").IPAddress}}" "$PREFIX-b")
+    [[ -n "$b_ip" ]] || return 1
+    run --rm --network "$n1" alpine ping -c1 -W2 "$b_ip" >/dev/null 2>&1 && return 1
+    return 0
+}
+
+test_network_connect_and_disconnect_live() {
+    local n1="$PREFIX-n1" n2="$PREFIX-n2"
+    run -d --name "$PREFIX-both" --network "$n1" alpine sleep 300 >/dev/null || return 1
+    docker network connect --alias bee "$n2" "$PREFIX-both" || return 1
+    docker exec "$PREFIX-both" ping -c1 -W2 "$PREFIX-b" >/dev/null || return 1
+    run --rm --network "$n2" alpine ping -c1 -W2 bee >/dev/null || return 1
+    docker network disconnect "$n2" "$PREFIX-both" || return 1
+    docker exec "$PREFIX-both" ping -c1 -W2 "$PREFIX-b" >/dev/null 2>&1 && return 1
+    return 0
+}
+
 test_default_bridge_by_address_without_names() {
     run -d --name "$PREFIX-ba" alpine sleep 300 >/dev/null || return 1
     local a_ip
@@ -294,6 +322,55 @@ test_host_docker_internal() {
     run --rm alpine wget -q -O /dev/null -T 3 http://host.docker.internal:18766/ || rc=$?
     kill $srv 2>/dev/null || true
     [[ $rc -eq 0 ]]
+}
+
+# --- compose -----------------------------------------------------------------------
+
+test_compose_healthcheck_dependency_two_networks() {
+    mkdir -p "$WORK/stack"
+    cat >"$WORK/stack/compose.yaml" <<EOF
+name: ${PREFIX}-stack
+services:
+  db:
+    image: alpine
+    command: ["sh", "-c", "sleep 2; touch /tmp/ready; nc -lk -p 5000 -e echo db-ok"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      retries: 30
+    networks: [backend]
+    labels: ["$PREFIX"]
+  api:
+    image: alpine
+    command: ["sh", "-c", "nc -lk -p 8000 -e sh -c 'nc db 5000'"]
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      backend: {}
+      frontend:
+        aliases: [api-alias]
+    labels: ["$PREFIX"]
+  web:
+    image: alpine
+    command: ["sleep", "300"]
+    depends_on: [api]
+    networks: [frontend]
+    labels: ["$PREFIX"]
+networks:
+  backend:
+    labels: ["$PREFIX"]
+  frontend:
+    labels: ["$PREFIX"]
+EOF
+    (cd "$WORK/stack" && docker compose up -d --wait) >/dev/null 2>&1 || return 1
+    local out
+    out=$(cd "$WORK/stack" && docker compose exec -T web sh -c 'nc api-alias 8000 </dev/null') || true
+    [[ "$out" == db-ok ]] || { (cd "$WORK/stack" && docker compose ps); return 1; }
+    (cd "$WORK/stack" && docker compose exec -T web sh -c 'nc -z -w 2 db 5000') 2>/dev/null && return 1
+    (cd "$WORK/stack" && docker compose ps --format '{{.Service}} {{.Health}}') | has 'db healthy' || return 1
+    (cd "$WORK/stack" && docker compose logs db) >/dev/null || return 1
+    (cd "$WORK/stack" && docker compose down -v) >/dev/null 2>&1
 }
 
 run_test "ping, version, info" test_ping_version_info || true
@@ -318,7 +395,10 @@ run_test "named volume persists" test_named_volume_persists || true
 run_test "new volume takes the image content" test_new_volume_takes_the_image_content || true
 run_test "bind mounts: dir, file, read-only" test_bind_mounts_dir_file_readonly || true
 run_test "tmpfs" test_tmpfs || true
+run_test "networks: names, aliases, isolation" test_networks_names_aliases_isolation || true
+run_test "network connect and disconnect while running" test_network_connect_and_disconnect_live || true
 run_test "default bridge: by address, no names" test_default_bridge_by_address_without_names || true
 run_test "host.docker.internal reaches the host" test_host_docker_internal || true
+run_test "compose: health-check dependency, two networks" test_compose_healthcheck_dependency_two_networks || true
 
 print_summary "engine"
