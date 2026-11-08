@@ -2113,6 +2113,9 @@ mod tests {
     /// reaches it; everything something can still read stays.
     #[test]
     fn only_layers_nothing_reads_are_collected() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
         let branch = tmp.path().join("branch");
@@ -2184,6 +2187,9 @@ mod tests {
     /// branch's cache chain reads them, never mistaken for orphans.
     #[test]
     fn a_cache_generation_a_branch_reads_is_kept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
         let branch = tmp.path().join("branch");
@@ -2307,6 +2313,9 @@ mod tests {
 
     #[test]
     fn a_killed_process_releases_gc_and_disk_locks_and_stale_markers() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (source, live, _) = branched_machine(dir.path(), 30);
         let before = read_all(&live);
@@ -2391,6 +2400,9 @@ mod tests {
 
     #[test]
     fn crashing_on_either_side_of_publication_keeps_data_and_retry_safe() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         use std::os::unix::fs::MetadataExt;
         for phase in ["before-rename", "after-rename"] {
             let dir = tempfile::tempdir().unwrap();
