@@ -11,54 +11,6 @@ longer commented version, with the kernel requirements, a TCP
 endpoint recipe, a K3d cluster and the managed-cloud variant where each exec has its own mount
 namespace.
 
-## One command: `smolvm docker`
-
-To use `docker` and `docker compose` on your own computer:
-
-```bash
-smolvm docker
-docker run --rm alpine echo ok
-```
-
-`smolvm docker` creates a machine named `docker` from `docker:29-dind` on first use, starts it and
-waits until the engine answers (about 1.3 s on a restart). Then:
-
-- **Socket.** The engine's socket is linked at `~/.smolvm/run/docker.sock`, a path that does not
-  change.
-- **Docker context.** A context named `smol` is created and selected, so `docker` and
-  `docker compose` work with no `DOCKER_HOST`. A `DOCKER_HOST` set in the shell still wins.
-- **Testcontainers.** `docker.host` in `~/.testcontainers.properties` names the socket, unless
-  that file already names another engine.
-- **Containers that mount the socket.** Inside the machine, `/var/run/docker.sock` and the
-  stable path both reach the daemon. So does a container that mounts the socket's host path, like
-  Testcontainers' Ryuk.
-- **Home directory.** It is shared at the same path, so `docker run -v "$PWD:$PWD"`, Compose
-  relative binds and Dev Containers work unchanged. `--no-home` turns this off.
-- **The host from a container.** `host.docker.internal` (and `gateway.docker.internal`) resolve
-  in every container, on every network. They reach services on the host, including ones bound
-  only to `127.0.0.1`. `host-gateway` in `--add-host` or Compose `extra_hosts` maps there too.
-  The machine uses the virtio-net backend, whose gateway answers these names.
-- **Resources.** The machine gets every host CPU and half the host's memory, at most 8 GiB
-  (`--cpus`, `--mem`). Its disk for images, containers and volumes is 64 GiB, sparse (`--disk`).
-  `--registry-mirror URL` gives dockerd a mirror, and `--image` another engine image.
-
-| Command | What it does |
-|---|---|
-| `smolvm docker` / `smolvm docker start` | create if needed, start, select the context |
-| `smolvm docker stop` | stop; images, containers and volumes are kept |
-| `smolvm docker status [--json]` | machine state, engine version, socket, context |
-| `smolvm docker logs [-f] [--tail N]` | dockerd's output |
-| `smolvm docker reset [--volumes]` | recreate the machine with fresh settings around the same disk; `--volumes` also deletes Docker's data |
-| `smolvm docker delete [--force]` | delete the machine and its data, the context and the socket link |
-| `smolvm docker link-socket [--print]` | `sudo ln -sfn ~/.smolvm/run/docker.sock /var/run/docker.sock`, for tools that only look there; it asks for your password, and macOS clears `/var/run` at boot |
-
-Ports published inside the engine (`-p`, Compose `ports:`) are not forwarded to the host
-automatically yet. Publish one on the machine with
-`smolvm machine update --name docker -p 8080:80`; it takes effect without a restart.
-`tests/test_smolvm_docker.sh` is the end-to-end check.
-
-The rest of this packet is for a Docker daemon in a machine you define yourself.
-
 ## The short version: two disk volumes
 
 From v1.28.1, give Docker its data directories as disk volumes, a guest path with no host side:
