@@ -877,6 +877,7 @@ pub fn launch_agent_vm_dynamic(
         &config.resources.dns_options,
         None,
     ));
+    env_strings.extend(crate::agent::guest_idle_poll_env());
     env_strings.extend(crate::agent::guest_workload_env(
         config.resources.shm_size.as_deref(),
     ));

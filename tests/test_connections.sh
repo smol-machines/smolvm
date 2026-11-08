@@ -44,11 +44,13 @@ if [[ "$os" == Darwin ]]; then
     # Closed connections keep their local port in TIME-WAIT for 30 s out of
     # 16384 ephemeral ports, so a sustained churn tops out near 540 a second.
     rate=450
+    # An idle machine process holds about 180 descriptors of its own, so on a
+    # Mac with the usual 10,240-file cap the full 10,000 fit.
     per_process=$(sysctl -n kern.maxfilesperproc)
-    if (( COUNT > per_process - 700 )); then
+    if (( COUNT > per_process - 200 )); then
         echo "NOTE: macOS allows one process $per_process open files (kern.maxfilesperproc);"
-        echo "      holding $((per_process - 700)) connections instead of $COUNT"
-        COUNT=$((per_process - 700))
+        echo "      holding $((per_process - 200)) connections instead of $COUNT"
+        COUNT=$((per_process - 200))
     fi
 fi
 
