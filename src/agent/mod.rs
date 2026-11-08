@@ -104,8 +104,9 @@ pub use launcher::{
 };
 pub(crate) use manager::cleanup_dead_vm_runtime_in_db;
 pub use manager::{
-    apply_live_credential_values, apply_live_egress_policy, apply_live_published_ports,
-    cleanup_dead_vm_runtime, lock_live_egress,
+    apply_live_credential_policy, apply_live_credential_values, apply_live_egress_policy,
+    apply_live_published_ports, cleanup_dead_vm_runtime, install_live_credential_trust,
+    lock_live_egress, supports_live_credential_trust,
 };
 pub use manager::{
     bind_ready_listener, branchable_now, disk_used_mb, docker_config_dir, docker_config_mount,

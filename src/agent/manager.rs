@@ -687,6 +687,57 @@ pub fn apply_live_credential_values(
     })
 }
 
+/// Replace running machine `name`'s credential bindings with `launch`'s,
+/// through its credentials socket: the interceptor swaps policy and
+/// placeholders at once, starting if the machine booted without bindings.
+/// The CA must already cover every host (see
+/// [`crate::credentials::CredentialLaunch::ensure_ca`]).
+pub fn apply_live_credential_policy(
+    name: &str,
+    launch: &crate::credentials::CredentialLaunch,
+) -> Result<()> {
+    let request = serde_json::json!({ "launch": launch }).to_string();
+    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
+        // A boot process from before binding changes knows only values.
+        let reason = if reason == "malformed request" {
+            "this machine was started before live binding changes were supported and needs a \
+             restart"
+                .to_string()
+        } else {
+            reason
+        };
+        Error::config(
+            "credentials",
+            format!(
+                "could not change machine '{name}''s credential bindings while it runs: {reason}"
+            ),
+        )
+    })
+}
+
+/// Have running machine `name`'s guest trust `pem` as its credential CA,
+/// in the machine root and every workload container.
+pub fn install_live_credential_trust(name: &str, pem: &str) -> Result<()> {
+    let mut client = AgentManager::for_vm(name)?.connect()?;
+    if !client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)? {
+        return Err(Error::config(
+            "credentials",
+            format!(
+                "machine '{name}' runs a guest agent that cannot take a credential CA while it \
+                 runs; restart it to apply bindings for new hosts"
+            ),
+        ));
+    }
+    client.install_credential_trust(pem)
+}
+
+/// Whether running machine `name`'s guest can take a credential CA live.
+pub fn supports_live_credential_trust(name: &str) -> Result<bool> {
+    AgentManager::for_vm(name)?
+        .connect()?
+        .supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)
+}
+
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
     use std::io::{Read, Write};
     let path = vm_data_dir(name).join(socket);
@@ -3074,6 +3125,17 @@ impl AgentManager {
                         r.agent_rootfs_path = Some(rootfs_path.clone());
                     })?;
                 }
+                // A fresh boot mounts the credential CA as a device; a restore
+                // must rebuild the device set its saved memory was taken with,
+                // which has the CA only if that boot mounted it.
+                let restoring = features.snapshot_dir.is_some();
+                if let Some(launch) = features.credentials.as_mut() {
+                    launch.ca_boot_mount = !restoring || record.credential_ca_boot_device();
+                }
+                let ca_device = features.credentials.is_some();
+                if !restoring && record.credential_ca_device != Some(ca_device) {
+                    db.update_vm(name, |r| r.credential_ca_device = Some(ca_device))?;
+                }
                 if record.mediated_egress_required {
                     // A persisted mediated boundary cannot be downgraded by
                     // a restart path that only supplies the broker binding.
@@ -3453,6 +3515,20 @@ impl AgentManager {
             None
         };
 
+        // The guest trusts the CA it was last given; a restored one may have
+        // been saved before the CA was widened, or before the machine had
+        // bindings at all. Settled once the guest answers.
+        let launched_credentials = features
+            .credentials
+            .clone()
+            .map(|launch| (launch, features.snapshot_dir.is_some()));
+        let trusted_ca = match (self.name(), &launched_credentials) {
+            (Some(name), Some(_)) => crate::db::SmolvmDb::open()?
+                .get_vm(name)?
+                .and_then(|record| record.credential_ca_trusted),
+            _ => None,
+        };
+
         // Supplied credential values ride in the boot process's own
         // environment, never in the boot config written below.
         let credential_env = features
@@ -3787,7 +3863,63 @@ impl AgentManager {
         if let (Err(_), Some(name)) = (&launched, adopted_scope) {
             release_failed_launch_scope(name, child_pid);
         }
+        if let (Ok(()), Some((launch, restored))) = (&launched, launched_credentials) {
+            self.settle_credential_trust(&launch, restored, trusted_ca.as_deref());
+        }
         launched
+    }
+
+    /// Make sure the guest that just answered trusts `launch`'s current CA,
+    /// and record which certificate that is. A fresh boot read it from its CA
+    /// mount; a restore is handed it unless the guest was saved already
+    /// trusting this very certificate.
+    fn settle_credential_trust(
+        &self,
+        launch: &crate::credentials::CredentialLaunch,
+        restored: bool,
+        trusted: Option<&str>,
+    ) {
+        let Some(name) = self.name() else {
+            return;
+        };
+        let pem = match launch.ca_certificate_pem() {
+            Ok(pem) => pem,
+            Err(error) => {
+                tracing::warn!(%error, "credential CA unreadable after boot");
+                return;
+            }
+        };
+        let current = crate::credentials::CredentialLaunch::ca_fingerprint(&pem);
+        if trusted == Some(current.as_str()) {
+            return;
+        }
+        if restored {
+            if let Err(error) = self.install_credential_trust(&pem) {
+                if launch.ca_boot_mount {
+                    tracing::warn!(%error, "restored guest keeps the credential CA it was saved with");
+                } else {
+                    tracing::error!(%error, "restored guest does not trust the credential CA; requests to bound hosts will fail TLS until it restarts");
+                }
+                return;
+            }
+        }
+        let recorded = crate::db::SmolvmDb::open()
+            .and_then(|db| db.update_vm(name, |r| r.credential_ca_trusted = Some(current)));
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "could not record the credential CA the guest trusts");
+        }
+    }
+
+    /// Hand the running guest `pem` as its credential CA.
+    fn install_credential_trust(&self, pem: &str) -> Result<()> {
+        let mut client = self.connect()?;
+        if !client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)? {
+            return Err(Error::agent(
+                "install credential trust",
+                "the guest agent predates live credential trust",
+            ));
+        }
+        client.install_credential_trust(pem)
     }
 
     /// Like `ensure_running_with_full_config` but uses subprocess launch.

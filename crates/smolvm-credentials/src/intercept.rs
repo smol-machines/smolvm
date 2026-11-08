@@ -34,7 +34,7 @@ use smolvm_protocol::intercept::{
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -67,16 +67,41 @@ pub struct InterceptorConfig {
 /// A running interceptor. Dropping it stops the listener and every session.
 pub struct Interceptor {
     endpoint: InterceptEndpoint,
+    state: Arc<State>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-struct State {
-    machine: String,
+/// Changes a running interceptor's bindings and CA. Cloneable; outlives
+/// nothing: once the [`Interceptor`] is dropped, changes have no effect.
+#[derive(Clone)]
+pub struct InterceptorControl(Arc<State>);
+
+/// The bindings an interceptor enforces, swapped as one value so a request
+/// never sees one binding's policy beside another's placeholders.
+struct Bindings {
     policy: CredentialPolicy,
     /// placeholder → binding name
-    bindings_by_placeholder: HashMap<String, String>,
-    ca: MachineCa,
+    by_placeholder: HashMap<String, String>,
+}
+
+impl Bindings {
+    fn new(policy: CredentialPolicy, placeholders: &BTreeMap<String, String>) -> Self {
+        Self {
+            by_placeholder: placeholders
+                .iter()
+                .filter(|(binding, _)| policy.binding(binding).is_some())
+                .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
+                .collect(),
+            policy,
+        }
+    }
+}
+
+struct State {
+    machine: String,
+    bindings: RwLock<Arc<Bindings>>,
+    ca: RwLock<Arc<MachineCa>>,
     resolver: Arc<dyn CredentialResolver>,
     endpoint: InterceptEndpoint,
     leaves: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
@@ -103,13 +128,8 @@ impl Interceptor {
             .collect::<Result<Vec<_>>>()?;
         let state = Arc::new(State {
             machine: config.machine,
-            bindings_by_placeholder: config
-                .placeholders
-                .iter()
-                .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
-                .collect(),
-            policy: config.policy,
-            ca: config.ca,
+            bindings: RwLock::new(Arc::new(Bindings::new(config.policy, &config.placeholders))),
+            ca: RwLock::new(Arc::new(config.ca)),
             resolver,
             endpoint,
             leaves: Mutex::new(HashMap::new()),
@@ -118,6 +138,7 @@ impl Interceptor {
             sessions: Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS)),
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = state.clone();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("smolvm-credentials")
@@ -136,7 +157,7 @@ impl Interceptor {
                         }
                     };
                     tokio::select! {
-                        _ = accept_loop(state, listener) => {}
+                        _ = accept_loop(served, listener) => {}
                         _ = shutdown_rx => {}
                     }
                 });
@@ -145,6 +166,7 @@ impl Interceptor {
             .context("interceptor thread")?;
         Ok(Self {
             endpoint,
+            state,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -153,6 +175,33 @@ impl Interceptor {
     /// Where the network backend should redirect flows, and with which token.
     pub fn endpoint(&self) -> InterceptEndpoint {
         self.endpoint
+    }
+
+    /// A handle that changes this interceptor's bindings and CA while it runs.
+    pub fn control(&self) -> InterceptorControl {
+        InterceptorControl(self.state.clone())
+    }
+}
+
+impl InterceptorControl {
+    /// Enforce `policy` with `placeholders` from the next request on. A
+    /// request already being forwarded finishes under the bindings it began
+    /// with; every later one, on a new connection or an open one, uses these.
+    /// A host no binding allows any more is spliced through untouched on its
+    /// next connection, and a placeholder whose binding is gone is refused.
+    pub fn replace_bindings(
+        &self,
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+    ) {
+        let next = Arc::new(Bindings::new(policy, placeholders));
+        *self.0.bindings.write().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+
+    /// Sign leaves with `ca` from the next handshake on.
+    pub fn replace_ca(&self, ca: MachineCa) {
+        *self.0.ca.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(ca);
+        self.0.leaves.lock().expect("leaf cache").clear();
     }
 }
 
@@ -226,8 +275,16 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
     .await
     .context("client hello timeout")??;
 
+    let intercepted = |host: &str| {
+        state
+            .bindings()
+            .policy
+            .bindings_for_host(host)
+            .next()
+            .is_some()
+    };
     match peek {
-        Peek::ServerName(host) if state.policy.bindings_for_host(&host).next().is_some() => {
+        Peek::ServerName(host) if intercepted(&host) => {
             // The upstream client opens its own verified connection.
             drop(upstream);
             terminate(state, stream, buffered, host, destination).await
@@ -300,6 +357,17 @@ async fn terminate(
 }
 
 impl State {
+    fn bindings(&self) -> Arc<Bindings> {
+        self.bindings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn ca(&self) -> Arc<MachineCa> {
+        self.ca.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Ask the resolver for `binding`'s value for this request. The inner
     /// `Err` is the reply to send the guest when it has none.
     async fn resolve(
@@ -335,7 +403,7 @@ impl State {
         if let Some(config) = self.leaves.lock().expect("leaf cache").get(host) {
             return Ok(config.clone());
         }
-        let (chain, key) = self.ca.issue_leaf(host)?;
+        let (chain, key) = self.ca().issue_leaf(host)?;
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -434,6 +502,9 @@ impl State {
             return Ok(reply);
         }
 
+        // One view of the bindings for the whole request, so a replacement
+        // landing mid-request never pairs one policy with other placeholders.
+        let bindings = self.bindings();
         let (parts, body) = request.into_parts();
         let target = parts
             .uri
@@ -482,13 +553,13 @@ impl State {
             .map(|(_, placeholder)| placeholder)
             .or(body_placeholder.as_ref())
         {
-            let Some(binding_name) = self.bindings_by_placeholder.get(placeholder) else {
+            let Some(binding_name) = bindings.by_placeholder.get(placeholder) else {
                 return Ok(text(
                     StatusCode::FORBIDDEN,
                     "smolvm credentials: unknown placeholder",
                 ));
             };
-            let binding = self
+            let binding = bindings
                 .policy
                 .binding(binding_name)
                 .context("binding vanished from policy")?;
@@ -576,7 +647,7 @@ impl State {
 
         // Header-setting bindings: the host supplies the whole value and it
         // replaces whatever the guest sent, placeholder or not.
-        for binding in self.policy.header_bindings(host, parts.method.as_str()) {
+        for binding in bindings.policy.header_bindings(host, parts.method.as_str()) {
             let header_name = binding
                 .set_header
                 .as_deref()
@@ -1149,6 +1220,102 @@ mod tests {
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(seen[0].0, format!("Bearer {}", f.placeholder));
         assert_eq!(seen[0].1, "/raw");
+    }
+
+    /// Bindings and the CA change under a running interceptor: a kept
+    /// binding keeps substituting with its placeholder, a new one substitutes
+    /// on its own host under the new CA, and a removed one's host is spliced
+    /// through untouched from its next connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaced_bindings_take_effect_on_the_next_request() {
+        let binding = |name: &str, host: &str| CredentialBinding {
+            name: name.into(),
+            environment_variable: format!("{}_TOKEN", name.to_uppercase()),
+            allowed_hosts: vec![host.into()],
+            injection_location: InjectionLocation::default(),
+            methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+            set_header: None,
+        };
+        let f = fixture_with_policy(
+            CredentialPolicy {
+                credentials: vec![binding("svc", CRED_HOST)],
+            },
+            CRED_HOST,
+            StaticResolver::new()
+                .with("svc", "svc-secret")
+                .with("other", "other-secret"),
+        )
+        .await;
+        let request = |host: &str, placeholder: &str| {
+            format!(
+                "GET /p HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let control = f.interceptor.control();
+        let other_placeholder = crate::policy::generate_placeholder("other");
+        let wider = MachineCa::generate(
+            "test-machine",
+            &[CRED_HOST.to_string(), OTHER_HOST.to_string()],
+        )
+        .unwrap();
+        let wider_pem = wider.certificate_pem().to_string();
+        control.replace_ca(wider);
+        control.replace_bindings(
+            CredentialPolicy {
+                credentials: vec![binding("svc", CRED_HOST), binding("other", OTHER_HOST)],
+            },
+            &[
+                ("svc".to_string(), f.placeholder.clone()),
+                ("other".to_string(), other_placeholder.clone()),
+            ]
+            .into(),
+        );
+        let kept = guest_request(
+            &f,
+            wider_pem.as_bytes(),
+            CRED_HOST,
+            &request(CRED_HOST, &f.placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(kept.starts_with("HTTP/1.1 200"), "{kept}");
+        let added = guest_request(
+            &f,
+            wider_pem.as_bytes(),
+            OTHER_HOST,
+            &request(OTHER_HOST, &other_placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+
+        control.replace_bindings(
+            CredentialPolicy {
+                credentials: vec![binding("other", OTHER_HOST)],
+            },
+            &[("other".to_string(), other_placeholder.clone())].into(),
+        );
+        // Trusting only the upstream's certificate proves the flow was spliced.
+        let removed = guest_request(
+            &f,
+            &f.upstream.cert_pem,
+            CRED_HOST,
+            &request(CRED_HOST, &f.placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(removed.starts_with("HTTP/1.1 200"), "{removed}");
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter()
+                .map(|(auth, _)| auth.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Bearer svc-secret".to_string(),
+                "Bearer other-secret".to_string(),
+                format!("Bearer {}", f.placeholder),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

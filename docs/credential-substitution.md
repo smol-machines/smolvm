@@ -79,7 +79,7 @@ API (`POST /api/v1/machines`): the same object under `credentials`, with
 `injection_location: { "header": true, "body": true }` for form-body
 substitution (omit `body` to keep the default).
 
-Rules checked at create:
+Rules checked at create, and whenever bindings are replaced:
 
 - `allowed_hosts` are lowercase DNS names, or a whole-label wildcard
   `*.example.com` that matches every subdomain of `example.com` but not
@@ -90,6 +90,82 @@ Rules checked at create:
   under it. Widening the machine's network never widens a credential, and a
   credential never grants reachability the network does not.
 - Binding names and environment variables are unique within a machine.
+
+## Changing bindings after create
+
+A machine's bindings can be replaced in any state: created, stopped, paused or
+running. The new set is exactly what you send, validated as create validates
+it, and stored on the machine, so every later start, resume, restore and branch
+uses it.
+
+```sh
+# HTTP API: the complete set, each binding as in the create body
+curl -X PUT http://127.0.0.1:8080/api/v1/machines/notes/credentials \
+  -H 'Content-Type: application/json' --data-binary @- <<'JSON'
+{"credentials":[
+  {"name":"notion","environment_variable":"NOTION_API_KEY","allowed_hosts":["api.notion.com"]},
+  {"name":"github","environment_variable":"GITHUB_TOKEN","allowed_hosts":["api.github.com"]}
+]}
+JSON
+# then the values, for a machine whose values are supplied:
+curl -X PUT http://127.0.0.1:8080/api/v1/machines/notes/credential-values \
+  -H 'Content-Type: application/json' -d '{"values":{"notion":"…","github":"…"}}'
+
+# CLI: add or replace a binding by name, or remove one
+smolvm machine update --name notes --credential github=GITHUB_TOKEN@api.github.com
+smolvm machine update --name notes --remove-credential notion
+```
+
+The embedded runtime has `set_credential_bindings(name, policy)`. An empty list
+leaves the machine with no binding. The route answers with the machine's info,
+`400` for bindings create would refuse, and `409`, with nothing changed, when the
+machine cannot take them now (below).
+
+On a running machine the change applies from its next request, with no restart:
+
+- A binding kept by name keeps its placeholder, so processes already holding it
+  keep working, even if its hosts or methods changed.
+- A new binding gets a new placeholder. Commands started from then on (`exec`,
+  `shell`, the API's exec) see it in their environment; processes already
+  running keep the environment they started with. Its value comes from
+  `credential-values` (API and embedded machines) or, for a CLI machine, from
+  the variable it names in the environment of `machine update`.
+- A removed binding stops being substituted at once. A new connection to its
+  host is relayed untouched, so its placeholder goes out as a plain string; a
+  request on a connection the interceptor already terminated is refused as an
+  unknown placeholder. The value held for it is dropped.
+- A host outside the machine's CA widens the CA: it is re-certified with the
+  same key, so processes that loaded the earlier certificate keep trusting the
+  hosts it covered, and the guest agent installs the wider one in the machine
+  root and every workload container for commands started from then on. The CA
+  never narrows.
+
+A machine that booted without bindings gains them live when it runs on
+virtio-net with outbound access (every networked machine under `serve`, and
+any networked machine with an allow list or published ports): the first
+bindings start the interceptor in its host process, and the guest agent
+installs the CA. A running machine is refused, with nothing changed, when:
+
+- it has no network device: libkrun fixes a VM's devices when it starts;
+- it runs on TSI: libkrun redirects connections to an interceptor only through
+  a hook it takes before the VM starts;
+- it has inbound-only networking (published ports, no egress): its network
+  runtime started deny-all and cannot open egress while it runs;
+- its guest agent predates live trust and the change needs the CA installed
+  (first bindings, or a host outside the CA).
+
+Stop it, set the bindings, and start it again. A paused or restored machine
+resumes the devices its memory was saved with, so a first binding that needs
+another network backend (from none or TSI to virtio-net) is refused; one on
+virtio-net takes it, and its guest gets the CA through its agent on resume.
+
+Removing every binding keeps the machine's CA, interceptor and network backend,
+so a checkpoint taken while it had bindings still restores, and bindings added
+later apply live.
+
+Bindings replaced over the API or by an embedder take their values only from
+what is supplied, as at create; so do the bindings a machine already had from
+such a caller, even when the CLI edits them later.
 
 ## Setting a header
 
@@ -172,11 +248,12 @@ path, and expects the raw value back. See `crates/smolvm-credentials`.
 ## What the guest sees
 
 - `ENV_VAR=SMOL_PLACEHOLDER_<NAME>_<random>` in the workload environment,
-  for `start`, `exec`, `run` and `shell`. Placeholders are minted once at
-  create and stay stable for the machine's lifetime.
-- `/run/smol/credentials/ca.pem`: the machine's public CA, mounted read-only.
-  It is name-constrained to the policy's `allowed_hosts`, so clients reject
-  any certificate it signs for another domain.
+  for `start`, `exec`, `run` and `shell`. A binding's placeholder is minted when
+  the binding is added and stays the same while the machine has it.
+- `/run/smol/credentials/ca.pem`: the machine's public CA, mounted read-only,
+  or written by the guest agent when the machine gained its bindings after
+  boot. It is name-constrained to the hosts its bindings have named, so
+  clients reject any certificate it signs for another domain.
   Nothing else in that directory.
 - `/run/smolvm/ca-bundle.pem`: the image's own trust roots followed by the
   machine CA, assembled by the guest agent at boot so clients keep trusting
@@ -225,8 +302,11 @@ A request to an allowed host that carries no placeholder is forwarded as is.
 
 ## Branching and checkpoints
 
-`machine branch` children inherit the golden's placeholders and trust the same
-CA, so processes restored from the snapshot keep working without restarting.
+`machine branch` children inherit the golden's bindings and placeholders and
+trust the same CA, so processes restored from the snapshot keep working without
+restarting. A child's bindings can then be replaced like any machine's; a new
+host widens the lineage's shared CA, which never narrows, so its siblings keep
+trusting theirs.
 Each child resolves under its own machine name: a resolver can hand different
 values to different branches, or refuse one branch, without touching the rest.
 Values supplied for the golden (over the API or the embedded runtime) are used
@@ -234,7 +314,9 @@ by its branches too, until values are supplied for a branch itself.
 
 Placeholders, the policy and the CA travel with portable checkpoints, so
 processes captured in a checkpoint keep trusting the interceptor after a
-restore. Values never travel: supply them again for the restored machine.
+restore. Values never travel: supply them again for the restored machine. A
+restored machine starts with the bindings it was captured with; replace them
+after the restore, before or after its first start.
 
 ## Backends and limits
 

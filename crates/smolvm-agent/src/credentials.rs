@@ -8,13 +8,35 @@
 //! `requests`, Git), so the agent assembles one bundle — the image's own roots
 //! followed by the machine CA — and bind-mounts it where the host-provided
 //! environment already points.
+//!
+//! A machine that booted with credential bindings gets the CA as a read-only
+//! mount. One that gains its first binding while it runs, or whose CA is
+//! widened to cover a new host, gets the certificate from the host instead
+//! ([`install_live`]): the agent writes it, rebuilds every bundle, and gives
+//! containers created later the same files.
 
 use crate::oci::OciSpec;
 use smolvm_protocol::credentials::{GUEST_CA_BUNDLE, GUEST_CA_DIR, GUEST_CA_FILE};
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Agent-side location of the assembled bundle (tmpfs; rebuilt every boot).
 const AGENT_BUNDLE: &str = "/run/smolvm-credentials/ca-bundle.pem";
+/// Agent-side copy of a CA the host sent while the machine runs, bound into
+/// containers that have no CA mount of their own.
+const AGENT_CA: &str = "/run/smolvm-credentials/ca.pem";
+
+/// The CA the host sent while the machine runs, newest first in force. Lives
+/// in guest memory, so a checkpoint, a branch and a resume keep it.
+static LIVE_CA: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+fn live_ca() -> Option<Vec<u8>> {
+    LIVE_CA.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn guest_ca_path() -> String {
+    format!("{GUEST_CA_DIR}/{GUEST_CA_FILE}")
+}
 
 /// Trust-root files commonly shipped by images, checked in order.
 const SYSTEM_BUNDLES: &[&str] = &[
@@ -28,16 +50,22 @@ const SYSTEM_BUNDLES: &[&str] = &[
 /// If the machine's credential CA is among `mounts`, assemble the trust bundle
 /// and bind it into the container at [`GUEST_CA_BUNDLE`].
 pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(String, String, bool)]) {
-    let Some((tag, _, _)) = mounts.iter().find(|(_, path, _)| path == GUEST_CA_DIR) else {
-        return;
-    };
-    let ca_path = crate::storage::volume_bind_source(tag).join(GUEST_CA_FILE);
-    let ca = match std::fs::read(&ca_path) {
-        Ok(ca) => ca,
-        Err(e) => {
-            tracing::warn!(path = %ca_path.display(), error = %e, "credential CA not readable; workload will not trust the interceptor");
-            return;
+    let ca_mount = mounts.iter().find(|(_, path, _)| path == GUEST_CA_DIR);
+    // A CA the host sent while the machine runs is the newest certificate,
+    // even beside a CA mount: it may have been widened since boot.
+    let ca = match (live_ca(), ca_mount) {
+        (Some(ca), _) => ca,
+        (None, Some((tag, _, _))) => {
+            let ca_path = crate::storage::volume_bind_source(tag).join(GUEST_CA_FILE);
+            match std::fs::read(&ca_path) {
+                Ok(ca) => ca,
+                Err(e) => {
+                    tracing::warn!(path = %ca_path.display(), error = %e, "credential CA not readable; workload will not trust the interceptor");
+                    return;
+                }
+            }
         }
+        (None, None) => return,
     };
     let bundle = assemble_bundle(rootfs, Path::new("/"), &ca);
     if let Err(e) = write_bundle(&bundle) {
@@ -49,6 +77,98 @@ pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(Strin
         return;
     }
     spec.add_bind_mount(AGENT_BUNDLE, GUEST_CA_BUNDLE, true);
+    // Without a CA mount, the CA file itself comes from the agent's copy.
+    if ca_mount.is_none() {
+        let target = guest_ca_path();
+        if let Err(e) = crate::storage::ensure_file_mount_target_under_root(rootfs, &target) {
+            tracing::warn!(error = %e, "could not prepare credential CA mountpoint");
+            return;
+        }
+        spec.add_bind_mount(AGENT_CA, &target, true);
+    }
+}
+
+/// Trust `ca_pem` from now on, in the machine root and every running
+/// workload container, and remember it for containers created later.
+///
+/// Where the CA is the machine's own read-only mount (it booted with
+/// bindings), the host has already replaced the file under it; only the
+/// bundles, which hold a copy, are rebuilt. Everywhere else the agent writes
+/// the CA file too.
+pub fn install_live(ca_pem: &str) -> Result<(), String> {
+    if !ca_pem.contains("-----BEGIN CERTIFICATE-----") {
+        return Err("credential CA is not a PEM certificate".to_string());
+    }
+    let mut ca = ca_pem.as_bytes().to_vec();
+    if !ca.ends_with(b"\n") {
+        ca.push(b'\n');
+    }
+    write_file(Path::new(AGENT_CA), &ca).map_err(|e| format!("write {AGENT_CA}: {e}"))?;
+    *LIVE_CA.lock().unwrap_or_else(|e| e.into_inner()) = Some(ca.clone());
+
+    // The machine root, where a machine without an image runs its commands.
+    write_unless_read_only(Path::new(&guest_ca_path()), &ca)?;
+    let root_bundle = assemble_bundle(Path::new("/"), Path::new("/"), &ca);
+    write_file(Path::new(GUEST_CA_BUNDLE), &root_bundle)
+        .map_err(|e| format!("write {GUEST_CA_BUNDLE}: {e}"))?;
+    // Containers created at boot bind this one file; rewriting it in place
+    // updates every one of them.
+    if Path::new(AGENT_BUNDLE).exists() {
+        write_file(Path::new(AGENT_BUNDLE), &root_bundle)
+            .map_err(|e| format!("write {AGENT_BUNDLE}: {e}"))?;
+    }
+
+    let mut failures = Vec::new();
+    for pid in crate::nsfile::container_namespace_pids() {
+        if let Err(e) = install_in_container(pid, &ca) {
+            failures.push(format!("container {pid}: {e}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Write the CA and a bundle of the container's own roots into container
+/// `pid`. A bundle that is the boot-time bind of [`AGENT_BUNDLE`] is
+/// read-only there, and gets this container's bundle through that file.
+fn install_in_container(pid: u32, ca: &[u8]) -> Result<(), String> {
+    use crate::nsfile::{write_in_container, ContainerWriteError};
+    let rootfs = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+    let bundle = assemble_bundle(&rootfs, Path::new("/"), ca);
+    match write_in_container(pid, GUEST_CA_BUNDLE, &bundle) {
+        Ok(()) => {}
+        Err(ContainerWriteError::ReadOnly) => {
+            write_file(Path::new(AGENT_BUNDLE), &bundle)
+                .map_err(|e| format!("write {AGENT_BUNDLE}: {e}"))?;
+        }
+        Err(ContainerWriteError::Failed(e)) => return Err(format!("{GUEST_CA_BUNDLE}: {e}")),
+    }
+    match write_in_container(pid, &guest_ca_path(), ca) {
+        // The CA's own mount, already replaced by the host.
+        Ok(()) | Err(ContainerWriteError::ReadOnly) => Ok(()),
+        Err(ContainerWriteError::Failed(e)) => Err(format!("{}: {e}", guest_ca_path())),
+    }
+}
+
+/// Overwrite `path` in place, creating it and its directory when missing.
+fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, bytes)
+}
+
+/// [`write_file`], leaving a file on a read-only mount alone.
+fn write_unless_read_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    match write_file(path, bytes) {
+        Ok(()) => Ok(()),
+        #[cfg(target_os = "linux")]
+        Err(e) if e.raw_os_error() == Some(libc::EROFS) => Ok(()),
+        Err(e) => Err(format!("write {}: {e}", path.display())),
+    }
 }
 
 /// For a machine without a container image, whose commands run in the agent's
@@ -111,11 +231,7 @@ fn assemble_bundle(rootfs: &Path, agent_rootfs: &Path, ca: &[u8]) -> Vec<u8> {
 }
 
 fn write_bundle(bundle: &[u8]) -> std::io::Result<()> {
-    let path = Path::new(AGENT_BUNDLE);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, bundle)
+    write_file(Path::new(AGENT_BUNDLE), bundle)
 }
 
 #[cfg(test)]

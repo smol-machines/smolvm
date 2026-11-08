@@ -821,9 +821,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         }
     }
     // Only the public CA is exposed; the signing key stays in the parent dir.
+    // A boot restoring saved memory taken without the CA device leaves it out
+    // (the device set must match); the host hands the guest the CA instead.
     if let Some(credentials) = credentials {
         credentials.ensure_ca()?;
-        mounts_vec.push(credentials.guest_ca_mount());
+        if credentials.ca_boot_mount {
+            mounts_vec.push(credentials.guest_ca_mount());
+        }
     }
     let mounts: &[crate::data::storage::HostMount] = &mounts_vec;
 
@@ -1298,6 +1302,18 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         interceptor.endpoint(),
                     ));
                     _credential_interceptor = Some(interceptor);
+                } else if external_interceptor.is_none()
+                    && network_plan.outbound
+                    && pod_net.is_none()
+                {
+                    // No bindings yet: serve the credentials socket anyway, so
+                    // the machine's first bindings start an interceptor while
+                    // it runs and the relay sends HTTPS through it from then on.
+                    if let Some(dir) = vsock_socket.parent() {
+                        let slot = smolvm_network::LateHttpsIntercept::new();
+                        guest_network.late_https_intercept = Some(slot);
+                        crate::credentials::serve_without_bindings(dir, slot);
+                    }
                 }
                 if let Some(endpoint) = external_interceptor {
                     guest_network.intercept = Some(if *mediated_egress {
