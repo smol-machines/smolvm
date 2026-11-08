@@ -4966,7 +4966,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
-        let fixture = Fixture(
+        let mut fixture = Fixture(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -4999,8 +4999,10 @@ mod tests {
             "stop must wait for workers, not just the leader"
         );
         assert!(try_wait(pid).is_none());
-        drop(fixture);
-        assert!(std::net::TcpListener::bind(address).is_ok());
+        // Closing stdin lets the worker exit. Rebinding the freed port here
+        // would race other tests that bind ephemeral ports in parallel.
+        drop(fixture.0.stdin.take());
+        assert!(fixture.0.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]
