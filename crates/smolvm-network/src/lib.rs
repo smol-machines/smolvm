@@ -146,6 +146,29 @@ impl PortMapping {
     }
 }
 
+/// Upstream resolvers a DNS forwarder takes, at most: glibc's own limit
+/// (`MAXNS`).
+pub const MAX_UPSTREAM_RESOLVERS: usize = 3;
+
+/// The upstream resolvers as socket addresses, in order: `resolvers` when any
+/// is set, otherwise `primary` alone.
+pub fn upstream_list(
+    primary: Ipv4Addr,
+    resolvers: &[Option<IpAddr>; MAX_UPSTREAM_RESOLVERS],
+) -> Vec<std::net::SocketAddr> {
+    let mut list: Vec<std::net::SocketAddr> = Vec::new();
+    for addr in resolvers.iter().flatten() {
+        let addr = std::net::SocketAddr::new(*addr, 53);
+        if !list.contains(&addr) {
+            list.push(addr);
+        }
+    }
+    if list.is_empty() {
+        list.push(std::net::SocketAddr::new(IpAddr::V4(primary), 53));
+    }
+    list
+}
+
 /// Static guest network configuration for the virtio-net MVP.
 ///
 /// This struct describes the two endpoints of the single virtual Ethernet link:
@@ -184,6 +207,10 @@ pub struct GuestNetworkConfig {
     /// caller passes `--dns <ip>` so a VM on a network that blocks the default
     /// resolver can still resolve names.
     pub upstream_dns: Ipv4Addr,
+    /// Every upstream resolver the gateway's DNS forwarder may use, in the
+    /// order to try them, failing over when one is silent (as glibc does across
+    /// `resolv.conf`). All `None` means [`Self::upstream_dns`] alone.
+    pub upstream_resolvers: [Option<IpAddr>; MAX_UPSTREAM_RESOLVERS],
     /// Optional dedicated host service reachable only through the gateway IP.
     pub host_service: Option<GatewayHostService>,
     /// Host interceptor and the outbound streams routed through it. Each stream
@@ -217,6 +244,7 @@ impl GuestNetworkConfig {
                 IpAddr::V4(ip) => ip,
                 IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
             },
+            upstream_resolvers: [None; MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
         }
@@ -646,6 +674,7 @@ pub fn start_virtio_network(
             guest_ipv6: guest_network.guest_ip6,
             prefix_len6: guest_network.prefix_len6,
             upstream_dns: guest_network.upstream_dns,
+            upstream_resolvers: guest_network.upstream_resolvers,
             host_service: guest_network.host_service,
             intercept: guest_network.intercept,
             mtu: 1500,

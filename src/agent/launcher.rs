@@ -1348,6 +1348,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 )
                 .addr
                 .unwrap_or(guest_network.upstream_dns);
+                guest_network.upstream_resolvers =
+                    crate::data::network::dns_forwarder_upstreams(resources.dns);
                 // A named network (--network) leases this VM a distinct /30 so
                 // members can address each other; the lease is handed to the
                 // virtio runtime below, which starts the fabric threads.
@@ -2860,9 +2862,13 @@ pub(crate) fn start_tsi_dns_forwarder(
         tracing::debug!("libkrun has no krun_set_dns_forwarder; TSI guest DNS goes direct");
         return;
     };
-    let upstream = tsi_dns_upstream(dns_override);
+    let upstreams = crate::data::network::dns_forwarder_upstreams(dns_override)
+        .into_iter()
+        .flatten()
+        .map(|addr| std::net::SocketAddr::new(addr, 53))
+        .collect::<Vec<_>>();
     let addr = match smolvm_network::dns_forward::serve_loopback(
-        std::net::SocketAddr::new(upstream.into(), 53),
+        upstreams.clone(),
         std::sync::Arc::new(|| false),
     ) {
         Ok(addr) => addr,
@@ -2883,21 +2889,8 @@ pub(crate) fn start_tsi_dns_forwarder(
             "krun_set_dns_forwarder failed; TSI guest DNS goes direct"
         );
     } else {
-        tracing::info!(%addr, %upstream, "TSI guest DNS answered by the host forwarder");
+        tracing::info!(%addr, ?upstreams, "TSI guest DNS answered by the host forwarder");
     }
-}
-
-/// The resolver a TSI guest would query itself: `--dns`, else the host's own
-/// resolver when the guest may reach it, else the first public default (the
-/// guest's resolv.conf names the same one).
-fn tsi_dns_upstream(dns_override: Option<std::net::Ipv4Addr>) -> std::net::Ipv4Addr {
-    crate::data::network::effective_dns(dns_override, EffectiveNetworkBackend::Tsi)
-        .addr
-        .unwrap_or_else(|| {
-            smolvm_protocol::resolv::DEFAULT_NAMESERVERS[0]
-                .parse()
-                .expect("default nameserver is an IPv4 address")
-        })
 }
 
 /// Idle-reclaim policy: once the whole VM process (vCPUs + I/O threads) has

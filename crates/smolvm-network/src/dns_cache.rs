@@ -15,13 +15,13 @@
 //! Only plain recursive queries are cached: one question, opcode QUERY, no
 //! answer/authority records, at most one EDNS OPT record. The key is the
 //! lowercased question plus the bits that change an answer (RD, CD, EDNS, DO),
-//! and the upstream it came from. Positive answers live for the smallest TTL of
+//! and the upstreams that answer it. Positive answers live for the smallest TTL of
 //! their records, NXDOMAIN and NODATA answers for their SOA's negative TTL, and
 //! nothing else (SERVFAIL, REFUSED, truncated) is kept. A served answer carries
 //! the asking query's id and question bytes, and TTLs reduced by its age.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 const HEADER_LEN: usize = 12;
@@ -51,7 +51,8 @@ const MAX_ANSWER_LEN: usize = 4096;
 /// What identifies a cacheable query.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
-    upstream: IpAddr,
+    /// The upstreams that answer it, in order.
+    upstreams: Vec<SocketAddr>,
     /// Lowercased question name in wire form, then QTYPE and QCLASS.
     question: Vec<u8>,
     /// RD, CD, EDNS present, DO.
@@ -68,9 +69,9 @@ pub struct Query {
 }
 
 impl Query {
-    /// Parse a guest query bound for `upstream`. `None` when it is not a plain
+    /// Parse a guest query for `upstreams`. `None` when it is not a plain
     /// cacheable query; such queries are forwarded as they are.
-    pub fn parse(packet: &[u8], upstream: IpAddr) -> Option<Self> {
+    pub fn parse(packet: &[u8], upstreams: &[SocketAddr]) -> Option<Self> {
         if packet.len() < HEADER_LEN {
             return None;
         }
@@ -111,7 +112,7 @@ impl Query {
         }
         Some(Self {
             key: CacheKey {
-                upstream,
+                upstreams: upstreams.to_vec(),
                 question,
                 flags: key_flags,
             },
@@ -365,9 +366,9 @@ fn parse_rr(packet: &[u8], offset: usize) -> Option<(u16, u32, usize)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
-    const UP: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+    const UP: &[SocketAddr] = &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)];
 
     fn name(n: &str) -> Vec<u8> {
         let mut out = Vec::new();
@@ -524,11 +525,8 @@ pub(crate) mod tests {
         cache.insert(&p, &answer(&q, &[(60, [1, 1, 1, 1])]), t0);
         let aaaa = Query::parse(&query(2, "a.example", 28, false), UP).unwrap();
         let edns = Query::parse(&query(3, "a.example", 1, true), UP).unwrap();
-        let other = Query::parse(
-            &query(4, "a.example", 1, false),
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-        )
-        .unwrap();
+        let eight = [SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)];
+        let other = Query::parse(&query(4, "a.example", 1, false), &eight).unwrap();
         for miss in [aaaa, edns, other] {
             assert!(cache.get(&miss, t0).is_none());
         }

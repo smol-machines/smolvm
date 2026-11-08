@@ -107,9 +107,13 @@ pub struct DnsRelayChannels {
 /// whenever an answer is queued so the loop wakes to deliver it. The thread
 /// exits when `shutdown` reports true (checked at least once per
 /// [`RELAY_POLL_MAX_MS`]).
+///
+/// `upstreams` are the resolvers UDP queries go to, in order, failing over
+/// between them; empty means each query's own [`DnsQuery::upstream`].
 pub fn start_dns_relay(
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
+    upstreams: Vec<SocketAddr>,
 ) -> DnsRelayChannels {
     let (to_relay_tx, to_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let (from_relay_tx, from_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -125,6 +129,7 @@ pub fn start_dns_relay(
                 thread_wake,
                 reply_wake,
                 shutdown,
+                upstreams,
             );
         });
 
@@ -157,6 +162,7 @@ fn run_dns_relay(
     wake: WakePipe,
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
+    upstreams: Vec<SocketAddr>,
 ) {
     // Cache, coalescing and resends for every UDP query (see `dns_forward`).
     let mut forwarder: Forwarder<u64> = Forwarder::new();
@@ -174,9 +180,14 @@ fn run_dns_relay(
             match outbound.try_recv() {
                 Ok(query) => match query.transport {
                     DnsTransport::Udp => {
-                        let upstream = SocketAddr::new(IpAddr::V4(query.upstream), DNS_PORT);
+                        let own = [SocketAddr::new(IpAddr::V4(query.upstream), DNS_PORT)];
+                        let targets = if upstreams.is_empty() {
+                            &own[..]
+                        } else {
+                            &upstreams[..]
+                        };
                         if let Some((id, answer)) =
-                            forwarder.submit(query.id, query.query, upstream, Instant::now())
+                            forwarder.submit(query.id, query.query, targets, Instant::now())
                         {
                             woke_reply |= deliver_answer(&inbound, id, answer);
                         }
@@ -359,6 +370,7 @@ mod tests {
         let channels = start_dns_relay(
             reply_wake.clone(),
             Arc::new(move || stop_flag.load(Ordering::Relaxed)),
+            Vec::new(),
         );
 
         // 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed unroutable, so the

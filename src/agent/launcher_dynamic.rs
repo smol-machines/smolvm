@@ -456,6 +456,8 @@ pub fn launch_agent_vm_dynamic(
             )
             .addr
             .unwrap_or(guest_network.upstream_dns);
+            guest_network.upstream_resolvers =
+                crate::data::network::dns_forwarder_upstreams(config.resources.dns);
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings

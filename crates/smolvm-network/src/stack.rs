@@ -137,6 +137,9 @@ pub struct VirtioPollConfig {
     pub prefix_len6: u8,
     /// Upstream resolver the gateway forwards guest DNS queries to.
     pub upstream_dns: Ipv4Addr,
+    /// Every upstream resolver, in the order to try them (see
+    /// [`crate::GuestNetworkConfig::upstream_resolvers`]).
+    pub upstream_resolvers: [Option<IpAddr>; crate::MAX_UPSTREAM_RESOLVERS],
     /// Dedicated loopback service reachable only at the guest-visible gateway.
     pub host_service: Option<crate::GatewayHostService>,
     /// Host interceptor and the outbound streams routed through it.
@@ -338,6 +341,7 @@ fn run_network_stack(
         dns_relay::start_dns_relay(
             relay_wake.clone(),
             Arc::new(move || shutdown_queues.is_shutting_down()),
+            crate::upstream_list(config.upstream_dns, &config.upstream_resolvers),
         )
     };
     let mut dns_gateway = DnsGateway::new();
@@ -1506,6 +1510,7 @@ mod tests {
             guest_ipv6: "fd00::2".parse().unwrap(),
             prefix_len6: 64,
             upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
+            upstream_resolvers: [None; crate::MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
             mtu: 1500,

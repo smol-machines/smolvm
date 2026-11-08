@@ -196,6 +196,53 @@ fn select_dns(
     }
 }
 
+/// The resolvers a machine's DNS forwarder queries, in order: `--dns` alone
+/// when given, otherwise every resolver the host's resolver config names (as
+/// glibc tries `resolv.conf`), then systemd-resolved's uplinks when the config
+/// names none, then the public defaults. At most
+/// [`smolvm_network::MAX_UPSTREAM_RESOLVERS`].
+///
+/// The forwarder runs on the host for either backend, so a host loopback stub
+/// is as usable as any other entry, and IPv6 resolvers count too.
+pub fn dns_forwarder_upstreams(
+    dns_override: Option<Ipv4Addr>,
+) -> [Option<IpAddr>; smolvm_network::MAX_UPSTREAM_RESOLVERS] {
+    let uplink = resolv_conf_nameservers(
+        &std::fs::read_to_string(SYSTEMD_RESOLVED_UPLINK).unwrap_or_default(),
+    );
+    select_forwarder_upstreams(dns_override, &host_nameservers(), &uplink)
+}
+
+/// The pure half of [`dns_forwarder_upstreams`].
+fn select_forwarder_upstreams(
+    dns_override: Option<Ipv4Addr>,
+    host: &[IpAddr],
+    systemd_uplink: &[IpAddr],
+) -> [Option<IpAddr>; smolvm_network::MAX_UPSTREAM_RESOLVERS] {
+    let defaults: Vec<IpAddr> = smolvm_protocol::resolv::DEFAULT_NAMESERVERS
+        .iter()
+        .filter_map(|addr| addr.parse().ok())
+        .collect();
+    let list: &[IpAddr] = match dns_override {
+        Some(addr) => &[IpAddr::V4(addr)],
+        None if !host.is_empty() => host,
+        None if !systemd_uplink.is_empty() => systemd_uplink,
+        None => &defaults,
+    };
+    let mut out = [None; smolvm_network::MAX_UPSTREAM_RESOLVERS];
+    let mut n = 0;
+    for addr in list {
+        if n == out.len() {
+            break;
+        }
+        if !out[..n].contains(&Some(*addr)) {
+            out[n] = Some(*addr);
+            n += 1;
+        }
+    }
+    out
+}
+
 /// Every nameserver in a resolv.conf, in file order.
 fn resolv_conf_nameservers(contents: &str) -> Vec<IpAddr> {
     contents
@@ -1001,5 +1048,66 @@ impl EgressPolicy {
             cidrs: Vec::new(),
             hosts: hosts.into_iter().map(Into::into).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod forwarder_upstream_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn every_host_resolver_is_used_in_order_up_to_three() {
+        let host = [
+            ip("10.0.0.2"),
+            ip("fd00::53"),
+            ip("10.0.0.3"),
+            ip("10.0.0.4"),
+        ];
+        assert_eq!(
+            select_forwarder_upstreams(None, &host, &[]),
+            [
+                Some(ip("10.0.0.2")),
+                Some(ip("fd00::53")),
+                Some(ip("10.0.0.3"))
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_override_stands_alone() {
+        let host = [ip("10.0.0.2"), ip("10.0.0.3")];
+        assert_eq!(
+            select_forwarder_upstreams(Some("192.0.2.53".parse().unwrap()), &host, &[]),
+            [Some(ip("192.0.2.53")), None, None]
+        );
+    }
+
+    #[test]
+    fn a_host_stub_is_kept_and_an_empty_config_falls_back() {
+        assert_eq!(
+            select_forwarder_upstreams(None, &[ip("127.0.0.53")], &[ip("10.1.1.1")]),
+            [Some(ip("127.0.0.53")), None, None]
+        );
+        assert_eq!(
+            select_forwarder_upstreams(None, &[], &[ip("10.1.1.1"), ip("10.1.1.2")]),
+            [Some(ip("10.1.1.1")), Some(ip("10.1.1.2")), None]
+        );
+        assert_eq!(
+            select_forwarder_upstreams(None, &[], &[]),
+            [Some(ip("1.1.1.1")), Some(ip("8.8.8.8")), None]
+        );
+    }
+
+    #[test]
+    fn repeated_entries_count_once() {
+        let host = [ip("10.0.0.2"), ip("10.0.0.2"), ip("10.0.0.3")];
+        assert_eq!(
+            select_forwarder_upstreams(None, &host, &[]),
+            [Some(ip("10.0.0.2")), Some(ip("10.0.0.3")), None]
+        );
     }
 }
