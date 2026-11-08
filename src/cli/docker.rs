@@ -12,6 +12,8 @@
 //!
 //! Inside the machine:
 //!
+//! - the home directory is shared at the same path, so bind mounts of absolute
+//!   host paths and Dev Containers work unchanged;
 //! - the stable socket path resolves to the daemon too, so a container that
 //!   mounts `$DOCKER_HOST`'s path (Testcontainers' Ryuk) reaches it, as does one
 //!   that mounts `/var/run/docker.sock`;
@@ -69,10 +71,11 @@ const ENV_MIRRORS: &str = "SMOLVM_DOCKER_REGISTRY_MIRRORS";
 /// The machine's workload. It runs before dockerd, as root, in the machine's
 /// container:
 ///
-/// 1. The host's stable socket path resolves to the daemon here too: a link
-///    at that path, on a small tmpfs, points at `/var/run/docker.sock`. dockerd
-///    resolves bind-mount sources in this namespace, so
-///    `-v $SOCK:/var/run/docker.sock` mounts the daemon.
+/// 1. The host's stable socket path resolves to the daemon here too. The home
+///    directory is shared, so `~/.smolvm/run` is the host's own directory; a
+///    small tmpfs over it keeps the host's link out of reach, and a link in it
+///    points at `/var/run/docker.sock`. dockerd resolves bind-mount sources
+///    in this namespace, so `-v $SOCK:/var/run/docker.sock` mounts the daemon.
 /// 2. dockerd listens only on the Unix socket: the image's default adds a TCP
 ///    listener with generated certificates that nothing here uses.
 const BOOT_SCRIPT: &str = r#"set -eu
@@ -172,6 +175,9 @@ pub struct StartArgs {
     /// Registry mirror for the engine, e.g. https://mirror.gcr.io (repeatable)
     #[arg(long = "registry-mirror", value_name = "URL")]
     registry_mirrors: Vec<String>,
+    /// Do not share the home directory with containers
+    #[arg(long)]
+    no_home: bool,
 }
 
 /// Arguments of `smolvm docker reset`.
@@ -224,6 +230,7 @@ fn refuse_unsupported_host() -> smolvm::Result<()> {
 
 /// The host paths `smolvm docker` touches, resolved once.
 struct HostEnv {
+    home: PathBuf,
     /// `~/.smolvm/run/docker.sock`, what clients use.
     socket: PathBuf,
     /// The docker CLI's configuration directory.
@@ -242,6 +249,7 @@ impl HostEnv {
             socket: stable_socket_path(&home),
             testcontainers: home.join(".testcontainers.properties"),
             docker_config,
+            home,
         })
     }
 
@@ -281,6 +289,7 @@ struct MachineSettings {
     image: String,
     image_pinned: bool,
     registry_mirrors: Vec<String>,
+    share_home: bool,
 }
 
 impl MachineSettings {
@@ -296,13 +305,15 @@ impl MachineSettings {
                 .unwrap_or_else(|| DEFAULT_IMAGE.to_string()),
             image_pinned: args.image.is_some(),
             registry_mirrors: args.registry_mirrors.clone(),
+            share_home: !args.no_home,
         }
     }
 
     /// The settings an existing machine was created with, so `reset` keeps
     /// them; explicit arguments win.
-    fn from_record(record: &VmRecord, args: &StartArgs) -> Self {
+    fn from_record(record: &VmRecord, home: &Path, args: &StartArgs) -> Self {
         let image_pinned = record.labels.contains_key(PINNED_IMAGE_LABEL);
+        let home_target = home.display().to_string();
         let mirrors = record
             .env
             .iter()
@@ -326,11 +337,16 @@ impl MachineSettings {
             } else {
                 args.registry_mirrors.clone()
             },
+            share_home: !args.no_home
+                && record
+                    .mounts
+                    .iter()
+                    .any(|(_, target, _)| *target == home_target),
         }
     }
 
     /// `machine create` arguments for this machine, after the subcommand.
-    fn create_args(&self, socket: &Path) -> Vec<String> {
+    fn create_args(&self, home: &Path, socket: &Path) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "--name".into(),
             MACHINE_NAME.into(),
@@ -356,6 +372,10 @@ impl MachineSettings {
         ];
         if self.image_pinned {
             args.extend(["--label".into(), format!("{PINNED_IMAGE_LABEL}=pinned")]);
+        }
+        if self.share_home {
+            let home = home.display().to_string();
+            args.extend(["-v".into(), format!("{home}:{home}")]);
         }
         args.extend([
             "-e".into(),
@@ -484,14 +504,15 @@ fn create_machine(settings: &MachineSettings, env: &HostEnv) -> smolvm::Result<V
         #[command(flatten)]
         create: super::machine::CreateCmd,
     }
-    let argv = settings.create_args(&env.socket);
+    let argv = settings.create_args(&env.home, &env.socket);
     let parsed = CreateArgv::try_parse_from(&argv)
         .map_err(|e| Error::config("create the Docker machine", e.to_string()))?;
     parsed.create.create()
 }
 
 fn start_machine(env: &HostEnv) -> smolvm::Result<()> {
-    // The socket link the next steps make lives here.
+    // The boot script mounts over the socket's directory inside the machine;
+    // with the home directory shared, that is this directory.
     if let Some(dir) = env.socket.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::config("create the socket directory", e.to_string()))?;
@@ -557,6 +578,7 @@ fn args_given(args: &StartArgs) -> bool {
         || args.disk.is_some()
         || args.image.is_some()
         || !args.registry_mirrors.is_empty()
+        || args.no_home
 }
 
 /// Link the stable socket, select the context, name the socket for
@@ -802,7 +824,7 @@ fn reset(env: &HostEnv, args: &ResetArgs) -> smolvm::Result<()> {
         return start(env, &args.settings);
     };
     drop(db);
-    let mut settings = MachineSettings::from_record(&record, &args.settings);
+    let mut settings = MachineSettings::from_record(&record, &env.home, &args.settings);
     let existing_disk = record.storage_gb.unwrap_or(DEFAULT_DISK_GIB);
     if !args.volumes && settings.disk_gib < existing_disk {
         return Err(Error::config(
@@ -1023,7 +1045,7 @@ mod tests {
         let settings = MachineSettings::new(&StartArgs::default(), &host(8, 8));
         let home = Path::new("/Users/me");
         let socket = stable_socket_path(home);
-        let args = settings.create_args(&socket);
+        let args = settings.create_args(home, &socket);
         let dash = args.iter().position(|a| a == "--").unwrap();
         let joined = args[..dash].join(" ");
         for expected in [
@@ -1036,6 +1058,7 @@ mod tests {
             "--net --net-backend virtio-net",
             "--docker-socket",
             "-v /var/lib/docker -v /var/lib/containerd",
+            "-v /Users/me:/Users/me",
             "-e SMOLVM_DOCKER_HOST_SOCKET=/Users/me/.smolvm/run/docker.sock",
         ] {
             assert!(
@@ -1058,9 +1081,10 @@ mod tests {
             disk: Some(100),
             image: Some("docker:28-dind".into()),
             registry_mirrors: vec!["https://mirror.gcr.io".into(), "https://m2".into()],
+            no_home: true,
         };
         let settings = MachineSettings::new(&args, &host(8, 8));
-        let args = settings.create_args(Path::new("/s"));
+        let args = settings.create_args(Path::new("/home/me"), Path::new("/s"));
         let dash = args.iter().position(|a| a == "--").unwrap();
         let joined = args[..dash].join(" ");
         assert!(joined.contains("--cpus 2 --mem 3000 --storage 100"));
@@ -1069,7 +1093,11 @@ mod tests {
         assert!(
             joined.contains("-e SMOLVM_DOCKER_REGISTRY_MIRRORS=https://mirror.gcr.io https://m2")
         );
-        assert!(joined.contains("-e SMOLVM_DOCKER_HOST_SOCKET=/s"));
+        assert!(!joined.contains("/home/me:/home/me"));
+        assert!(
+            joined.contains("-e SMOLVM_DOCKER_HOST_SOCKET=/s"),
+            "the socket path resolves in the machine even without the home share"
+        );
     }
 
     #[test]
@@ -1089,7 +1117,8 @@ mod tests {
         );
         let home = Path::new("/Users/me");
         let parsed =
-            CreateArgv::try_parse_from(settings.create_args(&stable_socket_path(home))).unwrap();
+            CreateArgv::try_parse_from(settings.create_args(home, &stable_socket_path(home)))
+                .unwrap();
         let create = parsed.create;
         assert_eq!(create.name.as_deref(), Some("docker"));
         assert_eq!(create.cpus, Some(4));
@@ -1099,12 +1128,19 @@ mod tests {
             create.net_backend,
             Some(smolvm::network::NetworkBackend::VirtioNet)
         );
-        assert_eq!(create.volume, ["/var/lib/docker", "/var/lib/containerd"]);
+        assert_eq!(
+            create.volume,
+            [
+                "/var/lib/docker",
+                "/var/lib/containerd",
+                "/Users/me:/Users/me"
+            ]
+        );
         assert_eq!(create.command, ["/bin/sh", "-c", BOOT_SCRIPT]);
     }
 
-    fn record_from(settings: &MachineSettings) -> VmRecord {
-        let args = settings.create_args(Path::new("/Users/me/.smolvm/run/docker.sock"));
+    fn record_from(settings: &MachineSettings, home: &Path) -> VmRecord {
+        let args = settings.create_args(home, &stable_socket_path(home));
         let mut record = VmRecord::new(
             MACHINE_NAME.into(),
             settings.cpus,
@@ -1126,6 +1162,11 @@ mod tests {
                     let (k, v) = iter.next().unwrap().split_once('=').unwrap();
                     record.env.push((k.into(), v.into()));
                 }
+                "-v" => {
+                    if let Some((h, g)) = iter.next().unwrap().split_once(':') {
+                        record.mounts.push((h.into(), g.into(), false));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1134,6 +1175,7 @@ mod tests {
 
     #[test]
     fn reset_keeps_the_machines_settings_unless_overridden() {
+        let home = Path::new("/Users/me");
         let original = MachineSettings::new(
             &StartArgs {
                 cpus: Some(3),
@@ -1144,26 +1186,33 @@ mod tests {
             },
             &host(8, 8),
         );
-        let record = record_from(&original);
-        let kept = MachineSettings::from_record(&record, &StartArgs::default());
+        let record = record_from(&original, home);
+        let kept = MachineSettings::from_record(&record, home, &StartArgs::default());
         assert_eq!(kept, original);
 
         let changed = MachineSettings::from_record(
             &record,
+            home,
             &StartArgs {
                 mem: Some(2048),
+                no_home: true,
                 ..StartArgs::default()
             },
         );
         assert_eq!(changed.mem, 2048);
+        assert!(!changed.share_home);
         assert_eq!(changed.cpus, 3);
     }
 
     #[test]
     fn reset_moves_an_unpinned_image_to_the_default_and_keeps_a_pinned_one() {
-        let mut record = record_from(&MachineSettings::new(&StartArgs::default(), &host(4, 8)));
+        let home = Path::new("/Users/me");
+        let mut record = record_from(
+            &MachineSettings::new(&StartArgs::default(), &host(4, 8)),
+            home,
+        );
         record.image = Some("docker:28-dind".into());
-        let settings = MachineSettings::from_record(&record, &StartArgs::default());
+        let settings = MachineSettings::from_record(&record, home, &StartArgs::default());
         assert_eq!(settings.image, DEFAULT_IMAGE);
         assert!(!settings.image_pinned);
 
@@ -1174,8 +1223,8 @@ mod tests {
             },
             &host(4, 8),
         );
-        let record = record_from(&pinned);
-        let settings = MachineSettings::from_record(&record, &StartArgs::default());
+        let record = record_from(&pinned, home);
+        let settings = MachineSettings::from_record(&record, home, &StartArgs::default());
         assert_eq!(settings.image, "registry.example/docker:dind");
         assert!(settings.image_pinned);
     }
