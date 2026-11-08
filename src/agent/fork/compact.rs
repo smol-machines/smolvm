@@ -1811,6 +1811,9 @@ mod tests {
     /// their inodes.
     #[test]
     fn a_clone_of_a_deep_frozen_lineage_gets_a_short_shared_base() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let machines = frozen_lineage(dir.path(), 20);
@@ -1849,6 +1852,9 @@ mod tests {
     /// read what they wrote.
     #[test]
     fn a_hundred_frozen_golden_cycles_stay_shallow() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut golden = restored_machine(dir.path(), 38);
         let mut deepest = 0;
@@ -1966,6 +1972,9 @@ mod tests {
     /// reads the same as before, plus every write made meanwhile.
     #[test]
     fn writes_to_the_live_layer_during_a_flatten_are_never_lost() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (gdir, live, gens) = branched_machine(dir.path(), 20);
         let before = read_all(&live);
@@ -2019,6 +2028,9 @@ mod tests {
     /// reads the same bytes it always did.
     #[test]
     fn an_open_reader_keeps_the_file_it_opened() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (gdir, live, _) = branched_machine(dir.path(), 20);
         let (target, root) = flatten_target(&gdir, "storage", &live, COMPACT_AT_DEPTH)
@@ -2343,6 +2355,9 @@ mod tests {
 
     #[test]
     fn separate_processes_compact_one_shared_ancestor_without_changing_children() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (source, _, generations) = branched_machine(dir.path(), 30);
         let mut workers = Vec::new();
@@ -2377,6 +2392,9 @@ mod tests {
 
     #[test]
     fn disk_lock_cleanup_keeps_live_and_inflight_owners() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let owner = dir.path().join("machine");
         std::fs::create_dir(&owner).unwrap();
@@ -2459,6 +2477,9 @@ mod tests {
 
     #[test]
     fn shallow_sources_do_not_wait_for_other_machines_disk_gc() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (source, _, _) = branched_machine(dir.path(), 0);
         let gc_guard = lock_disk_gc(&source, libc::LOCK_EX).unwrap();

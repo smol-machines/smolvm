@@ -4,8 +4,10 @@
 /// `true` in that copy (run the test body) and `false` in the original, which
 /// has already checked that the copy passed and must return at once.
 ///
-/// For a test that takes a non-blocking file lock and needs it free right
-/// after an earlier holder let go. Every test shares one process, and when
+/// For a test that takes a non-blocking file lock (`flock` with `LOCK_NB`,
+/// `File::try_lock`), directly or through the code under test, and needs it
+/// free right after an earlier holder let go. Every such test in this crate
+/// uses it; a new one must too. Every test shares one process, and when
 /// another test spawns a child, the child holds a copy of every open
 /// descriptor until it execs, so a lock released here can still be held by
 /// that copy for a moment and the non-blocking attempt fails.

@@ -4601,6 +4601,9 @@ mod tests {
     /// swept; one beside a machine that still exists is left to its export.
     #[test]
     fn a_left_export_directory_is_swept_once_its_machine_is_gone() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let vms = tempfile::tempdir().unwrap();
         std::fs::create_dir(vms.path().join("live")).unwrap();
         let live = vms.path().join(".live.export-abc123");
@@ -5089,6 +5092,9 @@ mod tests {
     /// machine never takes it.
     #[test]
     fn an_orphaned_lock_is_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".gone.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();
@@ -5106,6 +5112,9 @@ mod tests {
     /// name rather than look for a directory called after it.
     #[test]
     fn a_live_machines_lock_survives_the_sweep() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".alive.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();
@@ -5149,6 +5158,9 @@ mod tests {
     /// runs in the VM cache root, which holds every machine's data directory.
     #[test]
     fn the_sweep_touches_nothing_but_lock_files() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let bystanders = [".hidden", "machine-dir-ish", "name.lock", "_shared"];
         for f in bystanders {
@@ -5164,6 +5176,9 @@ mod tests {
 
     #[test]
     fn a_paused_disks_record_is_swept_with_its_machine() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("0123abcd");
         std::fs::create_dir(&live).unwrap();
