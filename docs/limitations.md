@@ -13,12 +13,19 @@ such as Vite, nodemon, and file-watch test runners reload without polling. Set
 `SMOL_NO_HOT_RELOAD=1` in the host process to disable recursive watching for a
 machine with an unusually large directory tree.
 
-For sequential or mmap-heavy reads, `SMOLVM_MOUNT_DAX=1` enables a 2 GiB
-virtiofs DAX window for each user mount when the machine starts. This is a host
-process setting (set it on `smolvm serve` for served machines), and an existing
-machine needs a stop/start to apply it. DAX does not materially accelerate
-metadata-heavy traversal. Confirm it in the guest with
+On x86_64 hosts, `SMOLVM_MOUNT_DAX=1` enables a 2 GiB virtiofs DAX window for
+each user mount when the machine starts, which helps sequential or mmap-heavy
+reads. This is a host process setting (set it on `smolvm serve` for served
+machines), and an existing machine needs a stop/start to apply it. DAX does not
+materially accelerate metadata-heavy traversal. Confirm it in the guest with
 `grep virtiofs /proc/mounts`; an active mount includes `dax=always`.
+
+On arm64 hosts, including every Apple silicon Mac, virtiofs DAX is off and
+`SMOLVM_MOUNT_DAX` has no effect: Linux's filesystem DAX is not correct on
+architectures with virtually indexed caches, so the bundled arm64 guest kernel is
+built without FUSE DAX, and the engine reserves no DAX window there
+(`src/agent/virtiofs.rs`). Host mounts on these hosts always go through the
+buffered virtiofs path.
 
 * Virtio-net accepts up to 512 simultaneous TCP relay connections per machine by
   default. For higher-concurrency workloads, set `SMOLVM_TCP_RELAY_CAPACITY` on
