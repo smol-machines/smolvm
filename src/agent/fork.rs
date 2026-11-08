@@ -276,8 +276,10 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
             }
             continue;
         }
-        // So are the layers its pause pinned.
-        if let Some(dir) = crate::portable_checkpoint::paused_layers_owner(&path) {
+        // So are the layers its pause pinned, and the resume inputs it kept.
+        if let Some(dir) = crate::portable_checkpoint::paused_layers_owner(&path)
+            .or_else(|| crate::portable_checkpoint::paused_resume_owner(&path))
+        {
             if !vms_dir.join(dir).is_dir() {
                 let _ = std::fs::remove_dir_all(&path);
             }

@@ -5910,6 +5910,9 @@ fn remove_machine_data_and_record(
             if let Err(error) = crate::portable_checkpoint::remove_paused_layers(data_dir) {
                 tracing::warn!(machine = name, %error, "could not remove pinned layers");
             }
+            if let Err(error) = crate::portable_checkpoint::remove_paused_resume(data_dir) {
+                tracing::warn!(machine = name, %error, "could not remove kept resume inputs");
+            }
         }
         // Storage may already be gone after an interrupted delete or DB failure.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
