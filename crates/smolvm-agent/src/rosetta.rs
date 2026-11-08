@@ -12,6 +12,19 @@
 //! execution. The `F` (fix-binary) flag pins the wrapper fd at registration
 //! time so it keeps working inside crun containers whose mount namespaces don't
 //! include the agent rootfs.
+//!
+//! The wrapper execs the translator by path, `/mnt/rosetta/rosetta`, which
+//! smolvm bind-mounts into its own containers but which a container started by
+//! a runtime *inside* the machine (Docker, containerd, Podman) cannot see. So
+//! the registered interpreter is a copy of the wrapper with the translator
+//! appended ([`write_embedded_interpreter`]): pinned by `F`, it travels into
+//! every mount namespace, and the wrapper execs the appended copy from a memfd
+//! wherever the path is missing. `docker run --platform linux/amd64` therefore
+//! works with no hook, mount or daemon configuration in the nested runtime.
+//!
+//! The validation ioctl is answered by one tracer helper for the whole
+//! machine ([`crate::rosetta_tracer`]), so the translated program keeps the
+//! PID it was started with and no extra process lives in its container.
 
 use smolvm_protocol::guest_env;
 
@@ -20,18 +33,63 @@ use smolvm_protocol::guest_env;
 #[cfg(target_os = "linux")]
 const WRAPPER_PATH: &str = "/usr/bin/rosetta-wrapper";
 
+/// Where the interpreter (wrapper plus appended translator) is written before
+/// registration. A tmpfs in the agent's own root; the file is unlinked once
+/// binfmt_misc has pinned it, so nothing is left behind.
+#[cfg(target_os = "linux")]
+const EMBEDDED_INTERPRETER: &str = "/tmp/smolvm-rosetta-interpreter";
+
+/// Trailer magic after the appended translator. Keep in sync with
+/// `EMBED_MAGIC` in `scripts/rosetta/rosetta-wrapper.c`.
+#[cfg(any(target_os = "linux", test))]
+const EMBED_MAGIC: &[u8; 16] = b"SMOLVM-ROSETTA\0\x01";
+
 /// binfmt_misc control directory and its registration file.
 #[cfg(target_os = "linux")]
 const BINFMT_MISC_DIR: &str = "/proc/sys/fs/binfmt_misc";
 #[cfg(target_os = "linux")]
 const BINFMT_REGISTER_FILE: &str = "/proc/sys/fs/binfmt_misc/register";
 
-/// binfmt_misc registration line: match x86_64 ELF — both `ET_EXEC` and `ET_DYN`
-/// (PIE), via the `\xfe` byte in the e_type mask — and route to the wrapper. The
-/// magic/mask are literal `\xNN` escapes; the kernel's binfmt parser unescapes
-/// them. Same magic/mask qemu-user uses for `qemu-x86_64`.
+/// binfmt_misc registration line minus its interpreter: match x86_64 ELF —
+/// both `ET_EXEC` and `ET_DYN` (PIE), via the `\xfe` byte in the e_type mask.
+/// The magic/mask are literal `\xNN` escapes; the kernel's binfmt parser
+/// unescapes them. Same magic/mask qemu-user uses for `qemu-x86_64`.
 #[cfg(target_os = "linux")]
-const BINFMT_REGISTER: &str = ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/usr/bin/rosetta-wrapper:F";
+const BINFMT_MATCH: &str = ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:";
+
+/// The registration line routing x86_64 ELF to `interpreter`, pinned (`F`).
+#[cfg(target_os = "linux")]
+fn binfmt_register_line(interpreter: &str) -> String {
+    format!("{BINFMT_MATCH}{interpreter}:F")
+}
+
+/// Trailer flag: the tracer helper runs and will seize every wrapper. Keep in
+/// sync with `EMBED_FLAG_TRACER` in `rosetta-wrapper.c`.
+#[cfg(any(target_os = "linux", test))]
+const EMBED_FLAG_TRACER: u64 = 1;
+
+/// Size of the trailer: offset, size, flags (u64 each) and the magic.
+#[cfg(any(target_os = "linux", test))]
+const TRAILER_LEN: usize = 40;
+
+/// Write `wrapper` followed by `translator` and a trailer naming where the
+/// translator starts, how long it is and `flags`, the layout
+/// `rosetta-wrapper.c` reads back from its own executable. The wrapper is an
+/// ELF executable, so the bytes after it are never loaded; the translator
+/// starts 8-byte aligned.
+#[cfg(any(target_os = "linux", test))]
+fn embedded_interpreter_bytes(wrapper: &[u8], translator: &[u8], flags: u64) -> Vec<u8> {
+    let offset = wrapper.len().next_multiple_of(8);
+    let mut out = Vec::with_capacity(offset + translator.len() + TRAILER_LEN);
+    out.extend_from_slice(wrapper);
+    out.resize(offset, 0);
+    out.extend_from_slice(translator);
+    out.extend_from_slice(&(offset as u64).to_le_bytes());
+    out.extend_from_slice(&(translator.len() as u64).to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(EMBED_MAGIC);
+    out
+}
 
 /// Whether the host requested Rosetta translation for this VM.
 pub fn is_enabled() -> bool {
@@ -173,7 +231,92 @@ fn register_binfmt() -> std::io::Result<()> {
         return Ok(());
     }
 
-    std::fs::write(BINFMT_REGISTER_FILE, BINFMT_REGISTER)
+    // Prefer the self-contained interpreter so nested containers translate
+    // too; fall back to the bare wrapper (smolvm's own containers only).
+    match write_embedded_interpreter(EMBED_FLAG_TRACER) {
+        Ok(identity) => {
+            if let Err(e) = start_tracer(identity) {
+                tracing::warn!(error = %e, "rosetta: tracer helper unavailable; translated programs get a new PID");
+                if let Err(e) = write_embedded_interpreter(0) {
+                    tracing::warn!(error = %e, "rosetta: could not rewrite the embedded interpreter");
+                }
+            }
+            let registered = std::fs::write(
+                BINFMT_REGISTER_FILE,
+                binfmt_register_line(EMBEDDED_INTERPRETER),
+            );
+            // `F` keeps the kernel's own reference: the file is not needed now.
+            let _ = std::fs::remove_file(EMBEDDED_INTERPRETER);
+            match registered {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "rosetta: registering the embedded interpreter failed; nested containers will not translate")
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "rosetta: could not build the embedded interpreter; nested containers will not translate")
+        }
+    }
+    std::fs::write(BINFMT_REGISTER_FILE, binfmt_register_line(WRAPPER_PATH))
+}
+
+/// Write the wrapper with the translator appended to [`EMBEDDED_INTERPRETER`];
+/// returns the file's (device, inode), which identify it as a running
+/// process's `/proc/<pid>/exe`.
+#[cfg(target_os = "linux")]
+fn write_embedded_interpreter(flags: u64) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let wrapper = std::fs::read(WRAPPER_PATH)?;
+    let translator =
+        std::fs::read(std::path::Path::new(smolvm_protocol::ROSETTA_GUEST_PATH).join("rosetta"))?;
+    let bytes = embedded_interpreter_bytes(&wrapper, &translator, flags);
+    let _ = std::fs::remove_file(EMBEDDED_INTERPRETER);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(EMBEDDED_INTERPRETER)?;
+    std::io::Write::write_all(&mut file, &bytes)?;
+    file.sync_all()?;
+    let meta = file.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// Start the machine's tracer helper for the interpreter `(dev, ino)` and wait
+/// until it listens for execs.
+#[cfg(target_os = "linux")]
+fn start_tracer((dev, ino): (u64, u64)) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("/proc/self/exe")
+        .arg(crate::rosetta_tracer::TRACER_ARG)
+        .arg(dev.to_string())
+        .arg(ino.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    // Bounded: a helper that never answers must not hold up the boot.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut ready = [0u8; 1];
+            let _ = tx.send(matches!(out.read(&mut ready), Ok(1) if ready[0] == b'R'));
+        });
+    }
+    let listening = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap_or(false);
+    if !listening {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("the tracer helper did not start"));
+    }
+    // It runs for the life of the machine; keep the handle so it is not
+    // mistaken for a finished child.
+    static TRACER: std::sync::OnceLock<std::sync::Mutex<std::process::Child>> =
+        std::sync::OnceLock::new();
+    let _ = TRACER.set(std::sync::Mutex::new(child));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -229,6 +372,49 @@ mod tests {
         let mounts_before = spec.mounts.len();
         inject_into_container_if(&mut spec, true);
         assert_eq!(spec.mounts.len(), mounts_before);
+    }
+
+    #[test]
+    fn embedded_interpreter_trailer_locates_the_translator() {
+        let wrapper = b"\x7fELF-wrapper-13";
+        let translator = b"rosetta-bytes";
+        let bytes = embedded_interpreter_bytes(wrapper, translator, EMBED_FLAG_TRACER);
+        assert!(
+            bytes.starts_with(wrapper),
+            "the wrapper stays an executable"
+        );
+        let trailer = &bytes[bytes.len() - TRAILER_LEN..];
+        let offset = u64::from_le_bytes(trailer[..8].try_into().unwrap()) as usize;
+        let size = u64::from_le_bytes(trailer[8..16].try_into().unwrap()) as usize;
+        let flags = u64::from_le_bytes(trailer[16..24].try_into().unwrap());
+        assert_eq!(&trailer[24..], EMBED_MAGIC);
+        assert_eq!(flags, EMBED_FLAG_TRACER);
+        assert_eq!(offset % 8, 0);
+        assert!(offset >= wrapper.len());
+        assert_eq!(&bytes[offset..offset + size], translator);
+        assert_eq!(offset + size + TRAILER_LEN, bytes.len());
+    }
+
+    #[test]
+    fn the_c_wrapper_reads_the_same_magic() {
+        let source = include_str!("../../../scripts/rosetta/rosetta-wrapper.c");
+        assert!(
+            source.contains(r#""SMOLVM-ROSETTA\0\1";"#),
+            "rosetta-wrapper.c and rosetta.rs must agree on the trailer magic"
+        );
+        assert!(source.contains("#define EMBED_FLAG_TRACER 1"));
+        assert!(
+            source.contains("uint64_t flags;\n    char magic[16];"),
+            "the C trailer is offset, size, flags, magic"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_registration_pins_the_interpreter() {
+        let line = binfmt_register_line("/tmp/x");
+        assert!(line.starts_with(":rosetta:M::\\x7fELF"));
+        assert!(line.ends_with(":/tmp/x:F"));
     }
 
     #[test]

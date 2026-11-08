@@ -107,6 +107,7 @@ mod publish_socket;
 mod relay;
 mod retry;
 mod rosetta;
+mod rosetta_tracer;
 mod s3mount;
 mod ssh_agent;
 mod storage;
@@ -303,6 +304,9 @@ fn main() {
     }
     if process::container_init_requested() {
         std::process::exit(process::run_container_init());
+    }
+    if rosetta_tracer::requested() {
+        std::process::exit(rosetta_tracer::run());
     }
     if forkpoint::worker_ready_helper_requested() {
         std::process::exit(forkpoint::run_worker_ready_helper());
