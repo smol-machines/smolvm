@@ -230,7 +230,11 @@ combined and repeated, and imply `--net`, as do `--outbound-localhost-only`
 and `--guest-subnet`. `-p HOST:GUEST` publishes a TCP port and
 `-p HOST:GUEST/udp` a UDP one (each client gets its own session, answered from
 the same host port; datagrams up to 1472 bytes); the server inside must listen
-on `0.0.0.0`, and a published port alone gives no outbound access.
+on `0.0.0.0`, and a published port alone gives no outbound access. Published
+ports listen on `127.0.0.1` and `[::1]`; a port below 1024, which macOS lets a
+normal user bind only on the wildcard address, listens there and drops every
+connection that is not from this host. A machine can publish up to 4096
+mappings.
 `--block-private` keeps the public internet open but blocks the LAN, cloud
 metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
 `--allow-private CIDR` re-opens one private range, such as an internal

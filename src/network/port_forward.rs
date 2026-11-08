@@ -5,141 +5,70 @@
 //! port is a host TCP listener here: every connection it accepts dials the
 //! machine's port-forward socket (libkrun bridges it to the guest's
 //! [`smolvm_protocol::ports::PORT_FORWARD`] vsock port), names the guest port on
-//! one line, and relays both ways.
+//! one line, and relays both ways. Every listener is accepted on one shared
+//! thread ([`TcpAcceptorSet`]), so the number of ports costs sockets, not threads.
+//!
+//! TCP only. A UDP server inside a TSI machine cannot answer a client that is
+//! also inside it: TSI routes a datagram reply to the host unless the guest
+//! has a socket bound to the destination in the sender's own network
+//! namespace, which a container's reply to a forwarder never has. UDP ports are
+//! published on virtio-net machines, whose host stack carries them.
 
-use std::collections::HashMap;
+use smolvm_network::acceptor::{AcceptedConnection, BoundTcpPorts, TcpAcceptorSet};
+use smolvm_network::{PortMapping, PortProtocol};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::net::{Shutdown, TcpStream};
+use std::path::Path;
+use std::sync::Arc;
 
 /// Host file name of the socket libkrun bridges to the guest forwarder.
 pub const PORT_FORWARD_SOCKET: &str = "port-forward.sock";
 
-/// How often an idle listener checks whether it was removed.
-const ACCEPT_POLL: Duration = Duration::from_millis(200);
-
-struct Forward {
-    /// Guest port each new connection is relayed to; changes in place.
-    guest: Arc<AtomicU16>,
-    stop: Arc<AtomicBool>,
-    /// Owns the listener; joined so a removed port is closed once `replace`
-    /// returns, not up to an accept poll later.
-    accepting: std::thread::JoinHandle<()>,
-}
-
 /// The live-published ports of one running machine.
 #[derive(Clone)]
 pub struct PortForwarder {
-    socket: PathBuf,
-    forwards: Arc<Mutex<HashMap<u16, Forward>>>,
+    tcp: Arc<TcpAcceptorSet>,
 }
 
 impl PortForwarder {
     /// A forwarder that relays through `socket`, publishing nothing yet.
-    pub fn new(socket: &Path) -> Self {
-        Self {
-            socket: socket.to_path_buf(),
-            forwards: Arc::default(),
-        }
-    }
-
-    /// Publish exactly `ports` (`(host, guest)` pairs): new host ports start
-    /// accepting, a kept host port moved to another guest port relays new
-    /// connections there, and removed ones are closed by the time this returns
-    /// (connections already accepted carry on). Every new port is bound before
-    /// anything changes, so a taken port fails the call with the set as it was.
-    pub fn replace(&self, ports: &[(u16, u16)]) -> Result<(), String> {
-        let mut forwards = self.forwards.lock().unwrap_or_else(|p| p.into_inner());
-        let mut bound = Vec::new();
-        for &(host, guest) in ports {
-            if forwards.contains_key(&host) {
-                continue;
-            }
-            let listener = TcpListener::bind((publish_addr(), host))
-                .map_err(|error| format!("host port {host}: {error}"))?;
-            listener
-                .set_nonblocking(true)
-                .map_err(|error| format!("host port {host}: {error}"))?;
-            bound.push((host, guest, listener));
-        }
-        let wanted: HashMap<u16, u16> = ports.iter().copied().collect();
-        let removed: Vec<u16> = forwards
-            .keys()
-            .filter(|host| !wanted.contains_key(host))
-            .copied()
-            .collect();
-        for host in removed {
-            if let Some(forward) = forwards.remove(&host) {
-                forward.stop.store(true, Ordering::Relaxed);
-                let _ = forward.accepting.join();
-            }
-        }
-        for (host, forward) in forwards.iter() {
-            if let Some(&guest) = wanted.get(host) {
-                forward.guest.store(guest, Ordering::Relaxed);
-            }
-        }
-        for (host, guest, listener) in bound {
-            let guest = Arc::new(AtomicU16::new(guest));
-            let stop = Arc::new(AtomicBool::new(false));
-            let socket = self.socket.clone();
-            let (thread_guest, thread_stop) = (guest.clone(), stop.clone());
-            let accepting = std::thread::Builder::new()
-                .name(format!("port-forward-{host}"))
-                .spawn(move || accept_loop(listener, thread_guest, socket, thread_stop))
-                .map_err(|error| format!("host port {host}: {error}"))?;
-            forwards.insert(
-                host,
-                Forward {
-                    guest,
-                    stop,
-                    accepting,
-                },
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Published ports bind loopback unless the node widened it, as
-/// virtio-net's listeners do (`SMOLVM_PUBLISH_ADDR`).
-fn publish_addr() -> Ipv4Addr {
-    std::env::var("SMOLVM_PUBLISH_ADDR")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(Ipv4Addr::LOCALHOST)
-}
-
-fn accept_loop(
-    listener: TcpListener,
-    guest: Arc<AtomicU16>,
-    socket: PathBuf,
-    stop: Arc<AtomicBool>,
-) {
-    while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((client, _)) => {
-                let guest = guest.load(Ordering::Relaxed);
+    pub fn new(socket: &Path) -> std::io::Result<Self> {
+        let socket = socket.to_path_buf();
+        let tcp = TcpAcceptorSet::start(
+            BoundTcpPorts::bind(&[])?,
+            Box::new(move |connection: AcceptedConnection| {
                 let socket = socket.clone();
+                let guest = connection.guest_port;
                 let _ = std::thread::Builder::new()
                     .name("port-forward-conn".into())
                     .spawn(move || {
-                        if let Err(error) = relay(client, &socket, guest) {
+                        if let Err(error) = relay(connection.stream, &socket, guest) {
                             tracing::debug!(guest, %error, "port forward ended");
                         }
                     });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL);
-            }
-            Err(error) => {
-                tracing::debug!(guest = guest.load(Ordering::Relaxed), %error, "port forward accept failed");
-                std::thread::sleep(ACCEPT_POLL);
-            }
+            }),
+        )?;
+        Ok(Self { tcp: Arc::new(tcp) })
+    }
+
+    /// Publish exactly `ports` (TCP): new host ports start accepting, a kept
+    /// host port moved to another guest port relays new connections there, and
+    /// removed ones are closed by the time this returns (connections already
+    /// accepted carry on). Every new port is bound before anything changes, so
+    /// a taken port fails the call with the set as it was.
+    pub fn replace(&self, ports: &[PortMapping]) -> Result<(), String> {
+        if let Some(udp) = ports.iter().find(|m| m.protocol == PortProtocol::Udp) {
+            return Err(format!(
+                "{}:{}/udp: UDP ports are published only on the virtio-net backend",
+                udp.host, udp.guest
+            ));
         }
+        self.tcp.replace(ports).map_err(|error| error.to_string())
+    }
+
+    /// The forwarded mappings.
+    pub fn mappings(&self) -> Vec<PortMapping> {
+        self.tcp.mappings()
     }
 }
 
@@ -169,7 +98,7 @@ fn relay(client: TcpStream, socket: &Path, guest: u16) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Serve the ports control socket in `vm_dir` with `forwarder`, the way the
+/// Serve the ports control socket in `vm_dir` with `ports`, the way the
 /// virtio-net runtime serves it: each request is the full set of mappings.
 pub fn serve_forwarded_ports_control(forwarder: PortForwarder, vm_dir: &Path) {
     super::launch::serve_ports_requests(vm_dir, move |next| {
@@ -179,14 +108,15 @@ pub fn serve_forwarded_ports_control(forwarder: PortForwarder, vm_dir: &Path) {
         {
             return Err("UDP ports can only change while the machine is stopped".to_string());
         }
-        let pairs: Vec<(u16, u16)> = next.iter().map(|m| (m.host, m.guest)).collect();
-        forwarder.replace(&pairs)
+        forwarder.replace(next)
     });
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::time::Duration;
 
     /// A stand-in for libkrun's bridge: accepts on the forward socket, reads
     /// the port line, and echoes the rest back prefixed with that port.
@@ -201,9 +131,10 @@ mod tests {
                     while stream.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
                         header.push(byte[0]);
                     }
+                    let header = String::from_utf8_lossy(&header).to_string();
                     let mut body = String::new();
                     let _ = stream.read_to_string(&mut body);
-                    let reply = format!("{}:{body}", String::from_utf8_lossy(&header));
+                    let reply = format!("{header}:{body}");
                     let _ = stream.write_all(reply.as_bytes());
                 });
             }
@@ -232,20 +163,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join(PORT_FORWARD_SOCKET);
         fake_guest(&socket);
-        let forwarder = PortForwarder::new(&socket);
+        let forwarder = PortForwarder::new(&socket).unwrap();
         let (a, b) = (free_port(), free_port());
 
-        forwarder.replace(&[(a, 8080)]).unwrap();
+        forwarder.replace(&[PortMapping::new(a, 8080)]).unwrap();
         assert_eq!(
             ask(a, "hello"),
             "8080:hello",
             "half-close lets the reply finish"
         );
 
-        forwarder.replace(&[(a, 8080), (b, 9090)]).unwrap();
+        forwarder
+            .replace(&[PortMapping::new(a, 8080), PortMapping::new(b, 9090)])
+            .unwrap();
         assert_eq!(ask(b, "x"), "9090:x");
 
-        forwarder.replace(&[(b, 9090)]).unwrap();
+        forwarder.replace(&[PortMapping::new(b, 9090)]).unwrap();
         // Closed by the time the change returns, not an accept poll later. The
         // freed port may already belong to another test's listener, so what is
         // checked is that nothing on it reaches this machine any more.
@@ -273,12 +206,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join(PORT_FORWARD_SOCKET);
         fake_guest(&socket);
-        let forwarder = PortForwarder::new(&socket);
+        let forwarder = PortForwarder::new(&socket).unwrap();
         let a = free_port();
-        forwarder.replace(&[(a, 8080)]).unwrap();
+        forwarder.replace(&[PortMapping::new(a, 8080)]).unwrap();
         assert_eq!(ask(a, "one"), "8080:one");
-        forwarder.replace(&[(a, 9090)]).unwrap();
+        forwarder.replace(&[PortMapping::new(a, 9090)]).unwrap();
         assert_eq!(ask(a, "two"), "9090:two");
+    }
+
+    #[test]
+    fn udp_is_refused_with_the_backend_that_carries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(PORT_FORWARD_SOCKET);
+        fake_guest(&socket);
+        let forwarder = PortForwarder::new(&socket).unwrap();
+        let a = free_port();
+        forwarder.replace(&[PortMapping::new(a, 80)]).unwrap();
+        let err = forwarder
+            .replace(&[PortMapping::with_protocol(a, 53, PortProtocol::Udp)])
+            .unwrap_err();
+        assert!(err.contains("virtio-net"), "{err}");
+        assert_eq!(forwarder.mappings(), vec![PortMapping::new(a, 80)]);
     }
 
     #[test]
@@ -286,14 +234,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join(PORT_FORWARD_SOCKET);
         fake_guest(&socket);
-        let forwarder = PortForwarder::new(&socket);
+        let forwarder = PortForwarder::new(&socket).unwrap();
         let (a, held) = (
             free_port(),
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
         );
         let taken = held.local_addr().unwrap().port();
-        forwarder.replace(&[(a, 80)]).unwrap();
-        assert!(forwarder.replace(&[(taken, 81)]).is_err());
+        forwarder.replace(&[PortMapping::new(a, 80)]).unwrap();
+        assert!(forwarder.replace(&[PortMapping::new(taken, 81)]).is_err());
         assert_eq!(ask(a, "z"), "80:z");
     }
 }

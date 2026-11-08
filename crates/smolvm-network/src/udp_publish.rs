@@ -24,9 +24,11 @@
 //! pressure (full channels or tables) is acceptable UDP behaviour: logged, never
 //! blocking.
 
+use crate::publish_bind::{self, BoundSockets};
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use crate::BoundPublishedPorts;
+use crate::PortMapping;
 use polling::{Event, Events};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
@@ -114,6 +116,24 @@ struct PublishedSocket {
     socket: HostUdpSocket,
     host_port: u16,
     guest_port: u16,
+    /// Bound on the wildcard address only because loopback was refused:
+    /// datagrams from other hosts are dropped (see [`publish_bind`]).
+    loopback_only: bool,
+}
+
+/// Bind the host sockets of one published UDP mapping.
+pub fn bind_udp_port(mapping: &PortMapping) -> std::io::Result<BoundSockets<HostUdpSocket>> {
+    publish_bind::bind_udp(mapping.host).map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "cannot publish host UDP {}:{} to guest UDP {}: {err}",
+                publish_bind::publish_addr(),
+                mapping.host,
+                mapping.guest,
+            ),
+        )
+    })
 }
 
 /// Start the publisher thread over the UDP sockets `ports` bound. Returns
@@ -129,13 +149,15 @@ pub fn start_udp_publisher(
         return Ok(None);
     }
     let mut published = Vec::new();
-    for (mapping, socket, socket_v6) in ports.udp.drain(..) {
-        for socket in std::iter::once(socket).chain(socket_v6) {
+    for (mapping, sockets) in ports.udp.drain(..) {
+        let loopback_only = sockets.loopback_only;
+        for socket in sockets.into_sockets() {
             socket.set_nonblocking(true)?;
             published.push(PublishedSocket {
                 socket,
                 host_port: mapping.host,
                 guest_port: mapping.guest,
+                loopback_only,
             });
         }
     }
@@ -227,6 +249,9 @@ fn run_publisher(
             loop {
                 match entry.socket.recv_from(&mut recv_buf) {
                     Ok((len, client)) => {
+                        if !publish_bind::peer_allowed(entry.loopback_only, &client) {
+                            continue;
+                        }
                         let datagram = InboundUdpDatagram {
                             host_port: entry.host_port,
                             guest_port: entry.guest_port,

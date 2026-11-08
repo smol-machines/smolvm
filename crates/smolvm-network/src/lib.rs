@@ -25,7 +25,7 @@
 //! │  ├─ reader thread
 //! │  └─ writer thread
 //! ├─ TcpPortListeners
-//! │  └─ one non-blocking accept loop per `-p HOST:GUEST`
+//! │  └─ one accept thread for every `-p HOST:GUEST`
 //! ├─ Arc<NetworkFrameQueues>
 //! │  ├─ guest_to_host
 //! │  ├─ host_to_guest
@@ -57,6 +57,7 @@
 //! - accepting published host TCP ports and forwarding them into guest TCP
 //!   connections
 
+pub mod acceptor;
 pub mod device;
 pub mod dns;
 pub mod dns_relay;
@@ -67,6 +68,7 @@ pub mod fabric;
 pub mod frame_stream;
 pub mod icmp_relay;
 pub mod opening;
+pub mod publish_bind;
 // CNI netns ↔ virtio-net L2 bridge for the Kubernetes runtime (Linux only:
 // needs /dev/net/tun + setns).
 #[cfg(target_os = "linux")]
@@ -620,7 +622,7 @@ pub fn start_virtio_network(
     let udp_mappings: Vec<PortMapping> = published_ports
         .udp
         .iter()
-        .map(|(mapping, _, _)| *mapping)
+        .map(|(mapping, _)| *mapping)
         .collect();
     let (udp_publisher, udp_publish) =
         match udp_publish::start_udp_publisher(&mut published_ports, queues.relay_wake.clone())? {
