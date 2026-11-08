@@ -3547,6 +3547,23 @@ fn optional_json_body<T: serde::de::DeserializeOwned + Default>(
         .map_err(|error| ApiError::BadRequest(format!("invalid JSON request body: {error}")))
 }
 
+/// A machine with redirect egress rules sends those flows to a mediated
+/// interceptor, so every start must bind one. Checked again where the machine
+/// launches; rejected here so the caller learns its request was incomplete
+/// rather than seeing the start fail.
+fn require_mediated_interceptor(record: &VmRecord, mediated_egress: bool) -> Result<(), ApiError> {
+    let redirects = record
+        .egress_rules
+        .iter()
+        .any(|rule| rule.action == smolvm_protocol::RuleAction::Redirect);
+    if redirects && !mediated_egress {
+        return Err(ApiError::BadRequest(
+            "this machine has redirect egress rules, so every start needs egressInterceptor with mediated: true".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Start a machine.
 #[utoipa::path(
     post,
@@ -3702,6 +3719,7 @@ pub async fn start_machine(
             "this machine requires egressInterceptor.address and egressInterceptor.token on every start".into(),
         ));
     }
+    require_mediated_interceptor(&record, mediated_egress)?;
 
     let mut recovered_unreachable = false;
     if resolved == RecordState::Unreachable {
@@ -8649,5 +8667,23 @@ mod tests {
         record.overlay_gb = overlay_gb;
         db.insert_vm(name, &record)
             .expect("failed to insert test vm");
+    }
+
+    #[test]
+    fn a_start_without_the_mediated_interceptor_its_redirect_rules_need_is_a_bad_request() {
+        let mut record = VmRecord::new("redirecting".to_string(), 1, 512, vec![], vec![], false);
+        assert!(require_mediated_interceptor(&record, false).is_ok());
+        record.egress_rules = vec![serde_json::from_value(serde_json::json!({
+            "transport": "tcp",
+            "cidr": "1.1.1.1/32",
+            "ports": {"start": 443, "end": 443},
+            "action": "redirect"
+        }))
+        .unwrap()];
+        assert!(matches!(
+            require_mediated_interceptor(&record, false),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(require_mediated_interceptor(&record, true).is_ok());
     }
 }
