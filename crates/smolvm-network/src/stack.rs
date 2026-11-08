@@ -73,7 +73,7 @@ use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
     IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
@@ -83,8 +83,16 @@ use std::time::{Duration, Instant as StdInstant};
 
 const DNS_SOCKET_PORT: u16 = 53;
 const TCP_RELAY_STATS_INTERVAL: Duration = Duration::from_secs(5);
-const DNS_PACKET_SLOTS: usize = 8;
-const DNS_BUFFER_BYTES: usize = 2048;
+// Room for a burst: 128 concurrent lookups are 256 queries (A and AAAA). The
+// queue held 8 queries and 2 KiB of answers, so a burst lost the rest silently
+// and each loser waited out the guest resolver's 5 s retry.
+const DNS_PACKET_SLOTS: usize = 512;
+const DNS_RX_BYTES: usize = 64 * 1024;
+const DNS_TX_BYTES: usize = 256 * 1024;
+/// Answers held back while the guest-facing DNS socket is full, at most.
+const DNS_BACKLOG_MAX: usize = 1024;
+/// Poll again this soon while answers are held back.
+const DNS_BACKLOG_RETRY: Duration = Duration::from_millis(2);
 // DNS-over-TCP to the gateway. Real resolvers (and resolv.conf clients) fall
 // back to TCP for truncated answers and EDNS, so the gateway filter must serve
 // TCP/53 in addition to UDP/53. A small pool of listening sockets handles
@@ -129,6 +137,9 @@ pub struct VirtioPollConfig {
     pub prefix_len6: u8,
     /// Upstream resolver the gateway forwards guest DNS queries to.
     pub upstream_dns: Ipv4Addr,
+    /// Every upstream resolver, in the order to try them (see
+    /// [`crate::GuestNetworkConfig::upstream_resolvers`]).
+    pub upstream_resolvers: [Option<IpAddr>; crate::MAX_UPSTREAM_RESOLVERS],
     /// Dedicated loopback service reachable only at the guest-visible gateway.
     pub host_service: Option<crate::GatewayHostService>,
     /// Host interceptor and the outbound streams routed through it.
@@ -330,6 +341,7 @@ fn run_network_stack(
         dns_relay::start_dns_relay(
             relay_wake.clone(),
             Arc::new(move || shutdown_queues.is_shutting_down()),
+            crate::upstream_list(config.upstream_dns, &config.upstream_resolvers),
         )
     };
     let mut dns_gateway = DnsGateway::new();
@@ -605,6 +617,12 @@ fn run_network_stack(
             Some(timeout) => Some(timeout),
             None => Some(Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64)),
         };
+        // Held-back DNS answers go out as soon as the socket drains.
+        let timeout = if dns_gateway.backlog.is_empty() {
+            timeout
+        } else {
+            timeout.map(|t| t.min(DNS_BACKLOG_RETRY))
+        };
 
         // Block until either wake notifies the shared poller or the timeout
         // elapses. The wakes are notify-only, so no events are reported; the
@@ -696,8 +714,8 @@ fn link_local_from_mac(mac: [u8; 6]) -> Ipv6Addr {
 fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
     let rx_meta = vec![PacketMetadata::EMPTY; DNS_PACKET_SLOTS];
     let tx_meta = vec![PacketMetadata::EMPTY; DNS_PACKET_SLOTS];
-    let rx_buffer = PacketBuffer::new(rx_meta, vec![0u8; DNS_BUFFER_BYTES]);
-    let tx_buffer = PacketBuffer::new(tx_meta, vec![0u8; DNS_BUFFER_BYTES]);
+    let rx_buffer = PacketBuffer::new(rx_meta, vec![0u8; DNS_RX_BYTES]);
+    let tx_buffer = PacketBuffer::new(tx_meta, vec![0u8; DNS_TX_BYTES]);
     let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
     socket
         .bind(smoltcp::wire::IpListenEndpoint {
@@ -911,6 +929,9 @@ const MAX_PENDING_DNS: usize = 512;
 struct DnsGateway {
     next_id: u64,
     pending_udp: HashMap<u64, PendingDnsUdp>,
+    /// UDP answers the guest-facing socket had no room for yet, oldest first.
+    /// Dropping one would cost the guest a full resolver timeout.
+    backlog: VecDeque<(Vec<u8>, UdpMetadata)>,
 }
 
 /// The guest-reply context we must remember while a UDP query is off-thread.
@@ -926,6 +947,31 @@ impl DnsGateway {
         Self {
             next_id: 0,
             pending_udp: HashMap::new(),
+            backlog: VecDeque::new(),
+        }
+    }
+
+    /// Queue `answer` for the guest: straight into the socket when nothing is
+    /// held back and it fits, otherwise behind the held-back answers.
+    fn send_udp(&mut self, socket: &mut UdpSocket<'_>, answer: Vec<u8>, meta: UdpMetadata) {
+        self.flush_backlog(socket);
+        if self.backlog.is_empty() && socket.send_slice(&answer, meta).is_ok() {
+            return;
+        }
+        if self.backlog.len() >= DNS_BACKLOG_MAX {
+            virtio_net_log!("virtio-net: dropping DNS answer (guest socket backlog full)");
+            return;
+        }
+        self.backlog.push_back((answer, meta));
+    }
+
+    /// Move held-back answers into the socket while it has room.
+    fn flush_backlog(&mut self, socket: &mut UdpSocket<'_>) {
+        while let Some((answer, meta)) = self.backlog.front() {
+            if socket.send_slice(answer, *meta).is_err() {
+                return;
+            }
+            self.backlog.pop_front();
         }
     }
 
@@ -1039,7 +1085,7 @@ fn dispatch_dns_udp(
                     local_address,
                     meta: Default::default(),
                 };
-                let _ = socket.send_slice(&response, response_meta);
+                gateway.send_udp(socket, response, response_meta);
             }
             DnsDecision::Forward { learn } => {
                 if gateway.pending_udp.len() >= MAX_PENDING_DNS {
@@ -1091,6 +1137,7 @@ fn deliver_dns_responses(
     gateway: &mut DnsGateway,
     from_relay: &Receiver<DnsResponse>,
 ) {
+    gateway.flush_backlog(sockets.get_mut::<UdpSocket>(dns_socket_handle));
     while let Ok(response) = from_relay.try_recv() {
         if let Some(pending) = gateway.pending_udp.remove(&response.id) {
             if let Some(answer) = response.answer {
@@ -1103,7 +1150,7 @@ fn deliver_dns_responses(
                     local_address: pending.local_address,
                     meta: Default::default(),
                 };
-                let _ = socket.send_slice(&answer, response_meta);
+                gateway.send_udp(socket, answer, response_meta);
             }
             continue;
         }
@@ -1463,6 +1510,7 @@ mod tests {
             guest_ipv6: "fd00::2".parse().unwrap(),
             prefix_len6: 64,
             upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
+            upstream_resolvers: [None; crate::MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
             mtu: 1500,

@@ -287,7 +287,7 @@ env = [
 ]
 ```
 
-Proxy vars are NOT forwarded automatically: each VM gets exactly the env you specify, unless you ask for the host's (below). The guest uses the host's own resolver: the first `/etc/resolv.conf` nameserver, systemd-resolved's uplink when that file names only the local stub, or the Windows system resolver list; `--dns` sets a custom DNS resolver for the guest instead.
+Proxy vars are NOT forwarded automatically: each VM gets exactly the env you specify, unless you ask for the host's (below). The guest uses the host's own resolver: the first `/etc/resolv.conf` nameserver, systemd-resolved's uplink when that file names only the local stub, or the Windows system resolver list; `--dns` sets a custom DNS resolver for the guest instead. Guest lookups are answered by the engine on the host, after the allow list and egress watchlist have passed them: it caches answers for their TTL (at most 5 minutes, 1 minute for a name that does not exist), sends one upstream query for a burst of the same name, and resends a lost query after 250 ms instead of leaving the guest to its 5 s retry. Without `--dns` it uses every resolver the host's config names, up to three in order, and moves past one that is silent or answers SERVFAIL, so one dead resolver does not take a machine's DNS down. Each machine's process holds its own cache, so a restored checkpoint, branch or fork starts empty. On TSI this needs a libkrun with `krun_set_dns_forwarder`; with an older one the guest queries its resolver directly.
 
 ### Behind a corporate firewall
 

@@ -542,3 +542,38 @@ assert_volume_targets_resolve() {
     fi
     return 0
 }
+
+# 128 concurrent glibc lookups of one name, three bursts, inside a machine
+# started with the given extra flags. No lookup may take a second: a lost DNS
+# datagram used to cost the guest resolver's whole 5 s retry timer, which is
+# how a burst of gRPC dials stalled (the gateway's DNS queue held 8 queries).
+dns_burst_in_machine() {
+    local output
+    output=$($SMOLVM machine run --net "$@" --image python:3.12-slim -- python3 -c '
+import socket, threading, time
+worst = 0.0
+for burst in range(3):
+    times = [0.0] * 128
+    start = threading.Event()
+    def lookup(i):
+        start.wait()
+        t = time.monotonic()
+        try:
+            socket.getaddrinfo("one.one.one.one", 443, proto=socket.IPPROTO_TCP)
+        except OSError:
+            times[i] = 99.0
+            return
+        times[i] = time.monotonic() - t
+    threads = [threading.Thread(target=lookup, args=(i,)) for i in range(128)]
+    for t in threads:
+        t.start()
+    start.set()
+    for t in threads:
+        t.join()
+    worst = max(worst, max(times))
+    print("DNS_BURST burst=%d max_ms=%d over_1s=%d" % (burst, max(times) * 1000, sum(t > 1 for t in times)))
+print("DNS_BURST_RESULT %s" % ("PASS" if worst < 1 else "FAIL"))
+' 2>&1)
+    echo "$output" | grep DNS_BURST
+    [[ "$output" == *"DNS_BURST_RESULT PASS"* ]]
+}

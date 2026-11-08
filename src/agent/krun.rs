@@ -154,6 +154,9 @@ pub struct KrunFunctions {
     pub get_guest_ram: Option<unsafe extern "C" fn(u32, *mut u64, u32, *mut u64) -> i32>,
     /// Register a Unix control socket for the VM (pause/resume/checkpoint/restore).
     pub set_control_socket: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
+    /// Route every TSI guest DNS query to a host forwarder on loopback.
+    /// `None` on libkrun builds that predate it.
+    pub set_dns_forwarder: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
     /// Boot the VM as a fork clone from a snapshot directory (CoW-map a golden
     /// VM's RAM + restore state instead of cold-booting).
     pub set_snapshot: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
@@ -257,6 +260,7 @@ impl KrunFunctions {
         let add_input_device = load_optional_sym!("krun_add_input_device");
         let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
+        let set_dns_forwarder = load_optional_sym!("krun_set_dns_forwarder");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
         let set_snapshot_memory_fd = load_optional_sym!("krun_set_snapshot_memory_fd");
         let set_snapshot_memory_fd2 = load_optional_sym!("krun_set_snapshot_memory_fd2");
@@ -297,6 +301,7 @@ impl KrunFunctions {
             add_input_device,
             get_guest_ram,
             set_control_socket,
+            set_dns_forwarder,
             set_snapshot,
             set_snapshot_memory_fd,
             set_snapshot_memory_fd2,

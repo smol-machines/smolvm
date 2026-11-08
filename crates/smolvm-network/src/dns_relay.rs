@@ -28,7 +28,8 @@
 //!   -> poll loop: classify (allow-host) -> allowed?
 //!        no  -> answer NXDOMAIN/SERVFAIL immediately (no relay)
 //!        yes -> assign id, remember reply context, channel (id, query) to relay
-//!   -> relay thread: UDP -> non-blocking connected host socket + poller
+//!   -> relay thread: UDP -> `dns_forward::Forwarder` (cache, one upstream
+//!                           query per burst of a name, resends)
 //!                    TCP -> bounded detached worker (rare path)
 //!   -> answer bytes -> channel back -> reply_wake
 //!   -> poll loop: learn A/AAAA records, write answer into the guest socket
@@ -37,11 +38,14 @@
 //! DNS is low-volume and its answers are quick, so the tables here are small and
 //! loss under saturation just makes a guest see a normal DNS timeout.
 
+#[cfg(test)]
+use crate::dns_forward::start_udp_query;
+use crate::dns_forward::{Forwarder, DNS_MAX_MSG};
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use polling::{Event, Events};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket as HostUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -50,14 +54,10 @@ use std::time::{Duration, Instant};
 
 /// DNS service port.
 const DNS_PORT: u16 = 53;
-/// Upstream exchange timeout, matching the previous inline behaviour.
+/// DNS-over-TCP exchange timeout.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
-/// Largest DNS message we accept back (EDNS0 / DNS-over-TCP bound).
-const DNS_MAX_MSG: usize = 4096;
 /// Max in-flight queries buffered in each channel direction.
 const CHANNEL_CAPACITY: usize = 256;
-/// Max concurrent in-flight UDP queries with a live host socket.
-const MAX_INFLIGHT_UDP: usize = 256;
 /// Max concurrent in-flight DNS-over-TCP worker threads.
 const MAX_INFLIGHT_TCP: usize = 64;
 /// Relay thread poll ceiling so shutdown and deadlines are noticed promptly.
@@ -107,9 +107,13 @@ pub struct DnsRelayChannels {
 /// whenever an answer is queued so the loop wakes to deliver it. The thread
 /// exits when `shutdown` reports true (checked at least once per
 /// [`RELAY_POLL_MAX_MS`]).
+///
+/// `upstreams` are the resolvers UDP queries go to, in order, failing over
+/// between them; empty means each query's own [`DnsQuery::upstream`].
 pub fn start_dns_relay(
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
+    upstreams: Vec<SocketAddr>,
 ) -> DnsRelayChannels {
     let (to_relay_tx, to_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let (from_relay_tx, from_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -125,6 +129,7 @@ pub fn start_dns_relay(
                 thread_wake,
                 reply_wake,
                 shutdown,
+                upstreams,
             );
         });
 
@@ -133,13 +138,6 @@ pub fn start_dns_relay(
         from_relay: from_relay_rx,
         relay_thread_wake,
     }
-}
-
-/// One in-flight UDP query: a non-blocking connected host socket awaiting its
-/// single response, and the deadline after which we give up.
-struct InflightUdp {
-    socket: HostUdpSocket,
-    deadline: Instant,
 }
 
 /// Send one answer back to the poll loop. Returns `true` if the caller should
@@ -164,10 +162,10 @@ fn run_dns_relay(
     wake: WakePipe,
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
+    upstreams: Vec<SocketAddr>,
 ) {
-    let mut inflight: std::collections::HashMap<u64, InflightUdp> =
-        std::collections::HashMap::new();
-    let mut recv_buf = vec![0u8; DNS_MAX_MSG];
+    // Cache, coalescing and resends for every UDP query (see `dns_forward`).
+    let mut forwarder: Forwarder<u64> = Forwarder::new();
     let tcp_inflight = Arc::new(AtomicUsize::new(0));
 
     loop {
@@ -182,33 +180,16 @@ fn run_dns_relay(
             match outbound.try_recv() {
                 Ok(query) => match query.transport {
                     DnsTransport::Udp => {
-                        if inflight.len() >= MAX_INFLIGHT_UDP {
-                            virtio_net_log!(
-                                "virtio-net: dropping DNS query id={} (in-flight UDP table full)",
-                                query.id
-                            );
-                            woke_reply |= deliver_answer(&inbound, query.id, None);
-                            continue;
-                        }
-                        let upstream = SocketAddr::new(IpAddr::V4(query.upstream), DNS_PORT);
-                        match start_udp_query(upstream, &query.query) {
-                            Ok(socket) => {
-                                inflight.insert(
-                                    query.id,
-                                    InflightUdp {
-                                        socket,
-                                        deadline: Instant::now() + UPSTREAM_TIMEOUT,
-                                    },
-                                );
-                            }
-                            Err(err) => {
-                                virtio_net_log!(
-                                    "virtio-net: DNS/UDP upstream send failed id={} error={}",
-                                    query.id,
-                                    err
-                                );
-                                woke_reply |= deliver_answer(&inbound, query.id, None);
-                            }
+                        let own = [SocketAddr::new(IpAddr::V4(query.upstream), DNS_PORT)];
+                        let targets = if upstreams.is_empty() {
+                            &own[..]
+                        } else {
+                            &upstreams[..]
+                        };
+                        if let Some((id, answer)) =
+                            forwarder.submit(query.id, query.query, targets, Instant::now())
+                        {
+                            woke_reply |= deliver_answer(&inbound, id, answer);
                         }
                     }
                     DnsTransport::Tcp => {
@@ -220,89 +201,44 @@ fn run_dns_relay(
             }
         }
 
-        // Inbound: block on "wake OR any in-flight UDP socket readable", exactly
-        // like the UDP relay. Each socket is registered at key `slot + 1`.
+        // Inbound: block on "wake OR any upstream socket readable", exactly
+        // like the UDP relay. Each socket is registered at key `index + 1`.
         let poller = wake.poller();
-        let ids: Vec<u64> = inflight.keys().copied().collect();
-        for (slot, id) in ids.iter().enumerate() {
-            // SAFETY: the socket is owned by `inflight` and is deleted from the
-            // poller below before it can be dropped.
-            let _ = unsafe { poller.add(&inflight[id].socket, Event::readable(slot + 1)) };
+        let slots: Vec<u64> = forwarder.sockets().map(|(slot, _)| slot).collect();
+        for (index, (_, socket)) in forwarder.sockets().enumerate() {
+            // SAFETY: the socket is owned by the forwarder and is deleted from
+            // the poller below before the forwarder can drop it.
+            let _ = unsafe { poller.add(socket, Event::readable(index + 1)) };
         }
 
-        // Wake no later than the nearest deadline so timeouts fire on time.
-        let now = Instant::now();
-        let mut wait = Duration::from_millis(RELAY_POLL_MAX_MS);
-        for f in inflight.values() {
-            let remaining = f.deadline.saturating_duration_since(now);
-            if remaining < wait {
-                wait = remaining;
-            }
-        }
+        // Wake no later than the nearest resend or deadline.
+        let wait = forwarder
+            .next_due()
+            .map(|due| due.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(RELAY_POLL_MAX_MS))
+            .min(Duration::from_millis(RELAY_POLL_MAX_MS));
 
         let mut events = Events::new();
         let _ = poller.wait(&mut events, Some(wait));
+        let ready: Vec<u64> = events
+            .iter()
+            .filter(|e| e.key >= 1)
+            .filter_map(|e| slots.get(e.key - 1).copied())
+            .collect();
 
-        let mut ready: Vec<bool> = vec![false; ids.len()];
-        for event in events.iter() {
-            if event.key >= 1 && event.key - 1 < ready.len() {
-                ready[event.key - 1] = true;
-            }
+        // Deregister every socket before the forwarder may drop any.
+        for (_, socket) in forwarder.sockets() {
+            let _ = poller.delete(socket);
         }
 
-        // Deregister every socket before mutating `inflight`.
-        for id in &ids {
-            let _ = poller.delete(&inflight[id].socket);
-        }
-
-        // Deliver ready answers; expire the rest past their deadline.
-        let now = Instant::now();
-        for (slot, id) in ids.iter().enumerate() {
-            if ready[slot] {
-                let answer = inflight
-                    .get(id)
-                    .and_then(|f| match f.socket.recv(&mut recv_buf) {
-                        Ok(len) => Some(recv_buf[..len].to_vec()),
-                        Err(_) => None,
-                    });
-                match answer {
-                    Some(bytes) => {
-                        inflight.remove(id);
-                        woke_reply |= deliver_answer(&inbound, *id, Some(bytes));
-                    }
-                    // Spurious readiness with nothing to read: leave it in flight
-                    // to be retried or expired.
-                    None if inflight.get(id).is_some_and(|f| f.deadline <= now) => {
-                        inflight.remove(id);
-                        woke_reply |= deliver_answer(&inbound, *id, None);
-                    }
-                    None => {}
-                }
-            } else if inflight.get(id).is_some_and(|f| f.deadline <= now) {
-                inflight.remove(id);
-                woke_reply |= deliver_answer(&inbound, *id, None);
-            }
+        for (id, answer) in forwarder.service(&ready, Instant::now()) {
+            woke_reply |= deliver_answer(&inbound, id, answer);
         }
 
         if woke_reply {
             reply_wake.wake();
         }
     }
-}
-
-/// Open a non-blocking host UDP socket connected to the upstream resolver and
-/// send the query. The single response is collected later by the poll section.
-fn start_udp_query(upstream: SocketAddr, query: &[u8]) -> std::io::Result<HostUdpSocket> {
-    let bind: SocketAddr = if upstream.is_ipv4() {
-        (Ipv4Addr::UNSPECIFIED, 0).into()
-    } else {
-        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-    };
-    let socket = HostUdpSocket::bind(bind)?;
-    socket.connect(upstream)?;
-    socket.set_nonblocking(true)?;
-    socket.send(query)?;
-    Ok(socket)
 }
 
 /// Resolve a DNS-over-TCP query on a bounded, detached worker thread.
@@ -384,6 +320,7 @@ fn forward_dns_query_tcp(upstream: SocketAddr, query: &[u8]) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::UdpSocket as HostUdpSocket;
     use std::sync::atomic::AtomicBool;
 
     /// `start_udp_query` sends off a non-blocking connected socket; its single
@@ -433,6 +370,7 @@ mod tests {
         let channels = start_dns_relay(
             reply_wake.clone(),
             Arc::new(move || stop_flag.load(Ordering::Relaxed)),
+            Vec::new(),
         );
 
         // 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed unroutable, so the
@@ -453,10 +391,10 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(50));
 
         // The answer (a timeout -> None) arrives via the channel, driven by the
-        // relay thread, within a bit over the 2s upstream timeout.
+        // relay thread, within a bit over the upstream timeout.
         let resp = channels
             .from_relay
-            .recv_timeout(Duration::from_secs(4))
+            .recv_timeout(Duration::from_secs(6))
             .expect("relay must always answer, even on timeout");
         assert_eq!(resp.id, 7);
         assert!(resp.answer.is_none());

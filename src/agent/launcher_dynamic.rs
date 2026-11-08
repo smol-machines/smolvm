@@ -416,6 +416,12 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_set_port_map failed");
             }
 
+            crate::agent::launcher::start_tsi_dns_forwarder(
+                ctx,
+                krun.set_dns_forwarder,
+                config.resources.dns,
+            );
+
             tracing::info!("network backend: tsi");
             None
         }
@@ -450,6 +456,8 @@ pub fn launch_agent_vm_dynamic(
             )
             .addr
             .unwrap_or(guest_network.upstream_dns);
+            guest_network.upstream_resolvers =
+                crate::data::network::dns_forwarder_upstreams(config.resources.dns);
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings
