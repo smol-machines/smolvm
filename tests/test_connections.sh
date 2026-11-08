@@ -10,7 +10,12 @@
 #     the guest's handshake), and
 #   - opens and closes CHURN connections, each echoing a byte, and checks the
 #     machine's host process holds no more file descriptors afterwards and
-#     that the sink sees every connection closed.
+#     that the sink sees every connection closed, and
+#   - makes short HTTP requests to a real server on the internet (REMOTE),
+#     one after another and many at once, half of them closed by the server
+#     first and half half-closed by the guest first, every one read to the
+#     end. A local sink only ever closes after the guest does, which is how a
+#     reset on a server's early close once went unnoticed.
 #
 #   SMOLVM_BIN=./target/release/smolvm tests/test_connections.sh
 #
@@ -24,6 +29,9 @@
 #   HOST_ADDR       host address the guest dials (default: the host's
 #                   address on its default route)
 #   TEST_IMAGE      guest image with python3 (default python:3.12-alpine)
+#   REMOTE          real HTTP server host:port (default deb.debian.org:80,
+#                   which answers a half-closed request; example.com does
+#                   not, even from the host); REMOTE=skip leaves it out
 set -euo pipefail
 
 SMOLVM_BIN="${SMOLVM_BIN:-${SMOLVM:-smolvm}}"
@@ -31,6 +39,7 @@ BACKENDS="${BACKENDS:-tsi virtio-net}"
 COUNT="${COUNT:-10000}"
 CHURN="${CHURN:-100000}"
 TEST_IMAGE="${TEST_IMAGE:-python:3.12-alpine}"
+REMOTE="${REMOTE:-deb.debian.org:80}"
 fixtures="$(cd "$(dirname "$0")" && pwd)/fixtures/connections"
 command -v "$SMOLVM_BIN" >/dev/null || { echo "Missing tool: $SMOLVM_BIN" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "Missing tool: python3" >&2; exit 1; }
@@ -156,6 +165,25 @@ for backend in $BACKENDS; do
     [[ "$open" == 0 ]] || fail "$backend hold: the host still has $open connections open after the guest closed them"
     settle_ports
 
+    if [[ "$REMOTE" != skip ]]; then
+        for shape in "40 1" "120 20"; do
+            read -r total concurrency <<<"$shape"
+            echo "== $backend: $total HTTP requests to $REMOTE, $concurrency at a time"
+            line=$("$SMOLVM_BIN" machine run --net --net-backend "$backend" --image "$TEST_IMAGE" \
+                -v "$fixtures:/probe" -- \
+                python3 /probe/client.py http "${REMOTE%:*}" "${REMOTE##*:}" "$total" "$concurrency" 2>&1 |
+                grep '^{' | tail -1) || true
+            echo "   $line"
+            if [[ -z "$line" ]]; then
+                fail "$backend http: no result"
+                continue
+            fi
+            ok=$(( $(json_field "$line" ok_server_closed) + $(json_field "$line" ok_half_closed) ))
+            [[ "$ok" == "$total" ]] ||
+                fail "$backend http: $ok of $total requests to $REMOTE completed"
+        done
+    fi
+
     echo "== $backend: open and close $CHURN connections"
     name="conn-churn-$backend-$$"
     machines+=("$name")
@@ -195,7 +223,7 @@ for backend in $BACKENDS; do
 done
 
 if [[ "$failed" == 0 ]]; then
-    echo "PASS: $COUNT concurrent and $CHURN churned connections on: $BACKENDS"
+    echo "PASS: $COUNT concurrent and $CHURN churned connections, and real-server HTTP, on: $BACKENDS"
 else
     echo "FAIL: guest connection scale"
     exit 1
