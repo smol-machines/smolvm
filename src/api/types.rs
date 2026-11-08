@@ -389,6 +389,193 @@ pub struct ExecResponse {
     pub stderr_b64: Vec<u8>,
 }
 
+/// Start a command the node owns: it outlives the request that started it,
+/// keeps its output for readers to fetch by offset, and keeps its exit code
+/// until read. See `api::exec_sessions`.
+///
+/// Same command fields as [`ExecRequest`], plus the session's id and shape.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateExecSessionRequest {
+    /// The session's id, 8 to 64 of `[A-Za-z0-9_-]`. A client chooses it so a
+    /// retried start finds the session the first one made instead of running
+    /// the command twice. Generated when absent.
+    #[serde(default)]
+    pub exec_id: Option<String>,
+    /// Command and arguments.
+    #[schema(example = json!(["echo", "hello"]))]
+    pub command: Vec<String>,
+    /// Environment variables.
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs; rejected unless empty (see [`ExecRequest`]).
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
+    /// Working directory.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Run as this user (image machines).
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Kill the command after this many seconds (exit code 124).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Data written to the command's stdin when it starts. Unless
+    /// `interactive`, stdin is closed after it.
+    #[serde(default)]
+    pub stdin: Option<String>,
+    /// Stdin stays open for sequenced frames (`POST .../stdin` or the attach
+    /// WebSocket). An interactive session left without a reader for the
+    /// detach grace is killed.
+    #[serde(default)]
+    pub interactive: bool,
+    /// Run the command on a PTY (implies `interactive`); stderr joins stdout.
+    #[serde(default)]
+    pub tty: bool,
+    /// Initial terminal width (`tty` only).
+    #[serde(default)]
+    pub cols: Option<u16>,
+    /// Initial terminal height (`tty` only).
+    #[serde(default)]
+    pub rows: Option<u16>,
+    /// Boot a stopped machine to run the command (the default).
+    #[serde(default = "auto_start_default")]
+    #[schema(default = true)]
+    pub auto_start: bool,
+    /// Wait up to this many seconds (at most 60) for output or the exit before
+    /// answering, and answer with the output from offset 0; a short command
+    /// then needs this one request.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
+    /// Most output bytes in the answer.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+/// Query for reading an exec session's output.
+#[derive(Debug, Default, Deserialize, ToSchema, utoipa::IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecSessionReadQuery {
+    /// Return output from this offset. It also acknowledges every byte before
+    /// it, which the node then drops. Default 0.
+    #[serde(default)]
+    pub after: u64,
+    /// Wait up to this many seconds (at most 60) for output past `after` or
+    /// the exit. Default 0.
+    #[serde(default)]
+    pub wait: Option<u64>,
+    /// Most output bytes in the answer.
+    #[serde(default)]
+    pub max: Option<usize>,
+}
+
+/// One piece of an exec session's output.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecOutputChunk {
+    /// `stdout` or `stderr`.
+    pub stream: String,
+    /// Offset of the first byte. Stdout and stderr share one offset space.
+    pub offset: u64,
+    /// The bytes, base64-encoded.
+    #[serde(with = "smolvm_protocol::base64_bytes")]
+    #[schema(value_type = String)]
+    pub data: Vec<u8>,
+}
+
+/// Offsets a reader asked for that the node no longer holds: it fell more
+/// than the output window behind after being away longer than the detach
+/// grace.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExecOutputGap {
+    /// First offset no longer held.
+    pub from: u64,
+    /// The oldest offset still held.
+    pub to: u64,
+}
+
+/// An exec session's state and the output a read returned.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecSessionResponse {
+    /// The exec id.
+    pub exec_id: String,
+    /// `starting`, `running` or `exited`.
+    pub state: String,
+    /// The command ended and `output` reaches the end of its output: nothing
+    /// more will come. Stop reading here.
+    pub done: bool,
+    /// The command's exit code, once it exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Why the session ended without an exit code (killed, the machine
+    /// stopped, it never started), or what went wrong around it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Output after the offset asked for, in offset order.
+    pub output: Vec<ExecOutputChunk>,
+    /// Pass as `after` on the next read.
+    pub next: u64,
+    /// The oldest offset the node still holds.
+    pub start: u64,
+    /// One past the newest byte produced.
+    pub end: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Offsets asked for that are no longer held.
+    pub lost: Option<ExecOutputGap>,
+    /// The last stdin frame applied (0 = none).
+    pub stdin_applied: u64,
+    /// It runs on a PTY.
+    pub tty: bool,
+    /// Its stdin takes sequenced frames.
+    pub interactive: bool,
+    /// Unix milliseconds.
+    pub created_at: u64,
+}
+
+/// One stdin frame for an interactive exec session.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecStdinRequest {
+    /// The frame's sequence number; the first is 1. A frame applies only after
+    /// the one before it; a frame already applied is acknowledged and ignored.
+    pub seq: u64,
+    /// The bytes, base64-encoded, at most 64 KiB.
+    #[serde(default, with = "smolvm_protocol::base64_bytes")]
+    #[schema(value_type = String)]
+    pub data: Vec<u8>,
+    /// Close stdin after this frame.
+    #[serde(default)]
+    pub eof: bool,
+}
+
+/// The last stdin frame applied.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecStdinResponse {
+    /// The last frame applied (0 = none).
+    pub stdin_applied: u64,
+}
+
+/// Resize an exec session's terminal.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExecResizeRequest {
+    /// Width in columns.
+    pub cols: u16,
+    /// Height in rows.
+    pub rows: u16,
+}
+
+/// The exec sessions on a machine.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListExecSessionsResponse {
+    /// The sessions, oldest first.
+    pub execs: Vec<crate::api::exec_sessions::SessionSummary>,
+}
+
 /// Request to export a stopped machine to a `.smolmachine` and push it to a
 /// registry. The control plane mints a pre-scoped OCI bearer (`push_token`)
 /// that authorizes the write against `reference_host`.
@@ -588,6 +775,15 @@ pub struct LogsQuery {
     /// kept across restarts and readable while the machine is stopped.
     #[serde(default)]
     pub source: Option<String>,
+    /// Resume from this file offset: the `id` of the last event received.
+    /// The SSE `Last-Event-ID` header does the same. Every event of a resumed
+    /// read carries the offset just past its line as its `id`.
+    #[serde(default)]
+    pub after: Option<u64>,
+    /// Give every event the offset just past its line as its `id`, so the
+    /// read can be resumed with `after`.
+    #[serde(default)]
+    pub ids: bool,
 }
 
 // ============================================================================

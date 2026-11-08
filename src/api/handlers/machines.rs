@@ -5827,7 +5827,14 @@ pub(crate) async fn delete_one(
     // A cleanup request may outlive its caller's deadline while waiting for a
     // branch. Keep it queued, and hold its locks through the blocking teardown.
     with_owned_operation(move |reply| async move {
+        let sessions = state.exec_sessions().clone();
+        let machine = name.clone();
         let result = delete_one_transaction(state, name).await;
+        if result.is_ok() {
+            // Its commands died with it; their ids must not be read on a
+            // machine that reuses the name.
+            sessions.forget_machine(&machine).await;
+        }
         let _ = reply.send(result);
     })
     .await
