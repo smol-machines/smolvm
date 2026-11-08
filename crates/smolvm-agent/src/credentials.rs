@@ -20,8 +20,10 @@ use smolvm_protocol::credentials::{GUEST_CA_BUNDLE, GUEST_CA_DIR, GUEST_CA_FILE}
 use std::path::Path;
 use std::sync::Mutex;
 
-/// Agent-side location of the assembled bundle (tmpfs; rebuilt every boot).
-const AGENT_BUNDLE: &str = "/run/smolvm-credentials/ca-bundle.pem";
+/// Agent-side directory of the assembled bundles, one per container (tmpfs;
+/// rebuilt every boot). Each container trusts its own image's roots, so no
+/// container's bundle is another's.
+const AGENT_BUNDLES: &str = "/run/smolvm-credentials/bundles";
 /// Agent-side copy of a CA the host sent while the machine runs, bound into
 /// containers that have no CA mount of their own.
 const AGENT_CA: &str = "/run/smolvm-credentials/ca.pem";
@@ -29,6 +31,18 @@ const AGENT_CA: &str = "/run/smolvm-credentials/ca.pem";
 /// The CA the host sent while the machine runs, newest first in force. Lives
 /// in guest memory, so a checkpoint, a branch and a resume keep it.
 static LIVE_CA: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Containers given a bundle at creation: the agent-side bundle each one
+/// binds, and the container's root filesystem it was assembled from.
+static BUNDLES: Mutex<Vec<(std::path::PathBuf, std::path::PathBuf)>> = Mutex::new(Vec::new());
+
+/// The agent-side bundle for the container whose root filesystem is `rootfs`.
+fn bundle_path_for(rootfs: &Path) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rootfs.hash(&mut hasher);
+    Path::new(AGENT_BUNDLES).join(format!("{:016x}.pem", hasher.finish()))
+}
 
 fn live_ca() -> Option<Vec<u8>> {
     LIVE_CA.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -68,7 +82,8 @@ pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(Strin
         (None, None) => return,
     };
     let bundle = assemble_bundle(rootfs, Path::new("/"), &ca);
-    if let Err(e) = write_bundle(&bundle) {
+    let bundle_path = bundle_path_for(rootfs);
+    if let Err(e) = write_file(&bundle_path, &bundle) {
         tracing::warn!(error = %e, "could not write credential trust bundle");
         return;
     }
@@ -76,7 +91,11 @@ pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(Strin
         tracing::warn!(error = %e, "could not prepare credential trust bundle mountpoint");
         return;
     }
-    spec.add_bind_mount(AGENT_BUNDLE, GUEST_CA_BUNDLE, true);
+    spec.add_bind_mount(&bundle_path.to_string_lossy(), GUEST_CA_BUNDLE, true);
+    let mut bound = BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
+    bound.retain(|(path, _)| *path != bundle_path);
+    bound.push((bundle_path, rootfs.to_path_buf()));
+    drop(bound);
     // Without a CA mount, the CA file itself comes from the agent's copy.
     if ca_mount.is_none() {
         let target = guest_ca_path();
@@ -111,11 +130,14 @@ pub fn install_live(ca_pem: &str) -> Result<(), String> {
     let root_bundle = assemble_bundle(Path::new("/"), Path::new("/"), &ca);
     write_file(Path::new(GUEST_CA_BUNDLE), &root_bundle)
         .map_err(|e| format!("write {GUEST_CA_BUNDLE}: {e}"))?;
-    // Containers created at boot bind this one file; rewriting it in place
-    // updates every one of them.
-    if Path::new(AGENT_BUNDLE).exists() {
-        write_file(Path::new(AGENT_BUNDLE), &root_bundle)
-            .map_err(|e| format!("write {AGENT_BUNDLE}: {e}"))?;
+    // Containers given a bundle when they were created bind their own file;
+    // rewriting it in place updates that container, from its own roots.
+    let bound = BUNDLES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for (bundle_path, rootfs) in bound {
+        if rootfs.is_dir() {
+            write_file(&bundle_path, &assemble_bundle(&rootfs, Path::new("/"), &ca))
+                .map_err(|e| format!("write {}: {e}", bundle_path.display()))?;
+        }
     }
 
     let mut failures = Vec::new();
@@ -132,18 +154,16 @@ pub fn install_live(ca_pem: &str) -> Result<(), String> {
 }
 
 /// Write the CA and a bundle of the container's own roots into container
-/// `pid`. A bundle that is the boot-time bind of [`AGENT_BUNDLE`] is
-/// read-only there, and gets this container's bundle through that file.
+/// `pid`. A bundle that is the container's bind of its agent-side file is
+/// read-only there, and was rewritten through that file already.
 fn install_in_container(pid: u32, ca: &[u8]) -> Result<(), String> {
     use crate::nsfile::{write_in_container, ContainerWriteError};
+    // The container's root as the agent sees it; paths below it are resolved
+    // as the container would resolve them (see `read_in_root`).
     let rootfs = std::path::PathBuf::from(format!("/proc/{pid}/root"));
     let bundle = assemble_bundle(&rootfs, Path::new("/"), ca);
     match write_in_container(pid, GUEST_CA_BUNDLE, &bundle) {
-        Ok(()) => {}
-        Err(ContainerWriteError::ReadOnly) => {
-            write_file(Path::new(AGENT_BUNDLE), &bundle)
-                .map_err(|e| format!("write {AGENT_BUNDLE}: {e}"))?;
-        }
+        Ok(()) | Err(ContainerWriteError::ReadOnly) => {}
         Err(ContainerWriteError::Failed(e)) => return Err(format!("{GUEST_CA_BUNDLE}: {e}")),
     }
     match write_in_container(pid, &guest_ca_path(), ca) {
@@ -211,7 +231,7 @@ fn install_bundle_at(mounts: &[(String, String, bool)], root: &Path, bundle_path
 fn assemble_bundle(rootfs: &Path, agent_rootfs: &Path, ca: &[u8]) -> Vec<u8> {
     let read_roots = |root: &Path| {
         SYSTEM_BUNDLES.iter().find_map(|candidate| {
-            std::fs::read(root.join(candidate)).ok().filter(|pem| {
+            read_in_root(root, candidate).filter(|pem| {
                 pem.windows(b"-----BEGIN CERTIFICATE-----".len())
                     .any(|window| window == b"-----BEGIN CERTIFICATE-----")
             })
@@ -230,13 +250,118 @@ fn assemble_bundle(rootfs: &Path, agent_rootfs: &Path, ca: &[u8]) -> Vec<u8> {
     bundle
 }
 
-fn write_bundle(bundle: &[u8]) -> std::io::Result<()> {
-    write_file(Path::new(AGENT_BUNDLE), bundle)
+/// Read `path` as a process whose root directory is `root` would: a link,
+/// absolute or relative, is followed inside `root`, and `..` never climbs
+/// above it. A container image's roots are commonly links (`/etc/ssl/cert.pem
+/// -> /etc/pki/...`), which read from outside would resolve against the
+/// machine's own root instead of the container's.
+fn read_in_root(root: &Path, path: &str) -> Option<Vec<u8>> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+    fn parts(path: &Path) -> VecDeque<OsString> {
+        path.components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                _ => None,
+            })
+            .collect()
+    }
+    let mut pending = parts(Path::new(path));
+    let mut resolved: Vec<OsString> = Vec::new();
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            resolved.pop();
+            continue;
+        }
+        let mut candidate = root.to_path_buf();
+        candidate.extend(&resolved);
+        candidate.push(&part);
+        let meta = std::fs::symlink_metadata(&candidate).ok()?;
+        if meta.file_type().is_symlink() {
+            links += 1;
+            if links > 40 {
+                return None;
+            }
+            let target = std::fs::read_link(&candidate).ok()?;
+            if target.is_absolute() {
+                resolved.clear();
+            }
+            let mut next = parts(&target);
+            next.extend(pending);
+            pending = next;
+        } else {
+            resolved.push(part);
+        }
+    }
+    let mut file = root.to_path_buf();
+    file.extend(&resolved);
+    std::fs::read(file).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An image's roots reached through links resolve inside its own root:
+    /// an absolute link restarts at the container root, not the machine's,
+    /// and `..` cannot climb out of it.
+    #[cfg(unix)]
+    #[test]
+    fn roots_behind_links_are_read_inside_the_containers_root() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("etc/pki/tls/certs")).unwrap();
+        std::fs::create_dir_all(r.join("etc/ssl/certs")).unwrap();
+        std::fs::write(
+            r.join("etc/pki/tls/certs/ca-bundle.crt"),
+            b"-----BEGIN CERTIFICATE-----\ncontainer\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            r.join("etc/ssl/certs/ca-certificates.crt"),
+        )
+        .unwrap();
+        let read = read_in_root(r, "etc/ssl/certs/ca-certificates.crt").unwrap();
+        assert!(String::from_utf8(read).unwrap().contains("container"));
+
+        // A relative link climbing above the root stays inside it.
+        std::os::unix::fs::symlink(
+            "../../../../../../etc/pki/tls/certs/ca-bundle.crt",
+            r.join("etc/ssl/cert.pem"),
+        )
+        .unwrap();
+        assert!(read_in_root(r, "etc/ssl/cert.pem").is_some());
+        // A loop ends instead of spinning.
+        std::os::unix::fs::symlink("loop-b", r.join("etc/loop-a")).unwrap();
+        std::os::unix::fs::symlink("loop-a", r.join("etc/loop-b")).unwrap();
+        assert!(read_in_root(r, "etc/loop-a").is_none());
+        // The whole bundle comes from the container's roots.
+        let bundle = assemble_bundle(
+            r,
+            Path::new("/nonexistent"),
+            b"-----BEGIN CERTIFICATE-----\nmachine\n-----END CERTIFICATE-----\n",
+        );
+        let text = String::from_utf8(bundle).unwrap();
+        assert!(
+            text.starts_with("-----BEGIN CERTIFICATE-----\ncontainer"),
+            "{text}"
+        );
+    }
+
+    /// Each container's bundle has a file of its own, so one container's
+    /// roots never end up in another's trust.
+    #[test]
+    fn every_container_gets_its_own_bundle_file() {
+        let a = bundle_path_for(Path::new("/storage/overlays/a/merged"));
+        let b = bundle_path_for(Path::new("/storage/overlays/b/merged"));
+        assert_ne!(a, b);
+        assert_eq!(a, bundle_path_for(Path::new("/storage/overlays/a/merged")));
+        assert!(a.starts_with(AGENT_BUNDLES));
+    }
 
     #[test]
     fn a_machine_without_an_image_gets_the_bundle_its_environment_names() {

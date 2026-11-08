@@ -321,7 +321,11 @@ pub(crate) fn serve_control_socket(
     });
 }
 
-fn serve_control_socket_with_reply(
+/// [`serve_control_socket`] for requests that answer with data: `apply`
+/// returns the whole reply line(s). The socket is made private to this
+/// process's user: only the host, never another machine's process, may
+/// change a machine.
+pub(crate) fn serve_control_socket_with_reply(
     path: std::path::PathBuf,
     thread_name: &str,
     max_request_bytes: u64,
@@ -335,6 +339,14 @@ fn serve_control_socket_with_reply(
             return;
         }
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!(path = %path.display(), %error, "control socket left with default mode");
+        }
+    }
     let spawned = std::thread::Builder::new()
         .name(thread_name.into())
         .spawn(move || {

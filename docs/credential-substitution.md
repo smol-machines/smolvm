@@ -96,7 +96,9 @@ Rules checked at create, and whenever bindings are replaced:
 A machine's bindings can be replaced in any state: created, stopped, paused or
 running. The new set is exactly what you send, validated as create validates
 it, and stored on the machine, so every later start, resume, restore and branch
-uses it.
+uses it. The machine must already have network egress (`--net`, or an allow
+list covering the hosts): unlike `--credential` at create, replacing bindings
+never turns networking on.
 
 ```sh
 # HTTP API: the complete set, each binding as in the create body
@@ -123,13 +125,21 @@ machine cannot take them now (below).
 
 On a running machine the change applies from its next request, with no restart:
 
-- A binding kept by name keeps its placeholder, so processes already holding it
-  keep working, even if its hosts or methods changed.
-- A new binding gets a new placeholder. Commands started from then on (`exec`,
-  `shell`, the API's exec) see it in their environment; processes already
-  running keep the environment they started with. Its value comes from
-  `credential-values` (API and embedded machines) or, for a CLI machine, from
-  the variable it names in the environment of `machine update`.
+- A binding unchanged in every respect (hosts, variable, header, body flag,
+  methods, and where its value comes from) keeps its placeholder and value, so
+  processes already holding it keep working.
+- Any other binding, a changed one under the same name included, is new: it
+  gets a new placeholder and no value, so a key bound to one service never
+  reaches another through an old name. Commands started from then on (`exec`,
+  `shell`, the API's exec) see the new placeholder; processes already running
+  keep the environment they started with, and their old placeholder is no
+  longer substituted. Its value comes from `credential-values` (API and
+  embedded machines) or, for a CLI machine, from the binding's secret reference
+  or variable as `machine update` reads it.
+- A request already being handled when the bindings change, which would
+  resolve a value after the change, is answered `503 smolvm credentials:
+  credential bindings changed during the request; retry` instead of being sent
+  with a value it was not checked against.
 - A removed binding stops being substituted at once. A new connection to its
   host is relayed untouched, so its placeholder goes out as a plain string; a
   request on a connection the interceptor already terminated is refused as an
@@ -165,7 +175,19 @@ later apply live.
 
 Bindings replaced over the API or by an embedder take their values only from
 what is supplied, as at create; so do the bindings a machine already had from
-such a caller, even when the CLI edits them later.
+such a caller, even when the CLI edits them later. When an API caller or
+embedder replaces bindings of a machine whose values came from this host, every
+binding becomes new: none keeps a host variable, file or value.
+
+The machine's boot process, running as the machine's own user, creates and
+widens the CA itself; the server or CLI never writes into the machine's
+directory, and reads the certificate there without following links. It talks
+to the boot process over `credentials.sock` in the machine's data directory
+(mode `0600`), sending only the bindings, their placeholders and whether values
+are supplied; where values come from, the machine's identity and the CA's
+location are the boot process's own. A change that fails part-way (the guest
+cannot take the new CA, or the record cannot be saved) is rolled back to
+exactly the previous bindings, sources and values.
 
 ## Setting a header
 
