@@ -18,12 +18,14 @@
 # matching agent. Needs internet access (Alpine packages, Tailscale's public
 # DERP relays, the echo host).
 #   SMOLVM_E2E_BIN   smolvm binary (default target/debug/smolvm)
+#   E2E_REGISTRY     prefix for the Docker Hub images, e.g. mirror.gcr.io/library/
 #   E2E_HEADSCALE    headscale binary (default: download v0.29.5)
 #   E2E_ECHO_HOST    HTTPS host that echoes request headers at /headers
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 binary=${SMOLVM_E2E_BIN:-"$repo/target/debug/smolvm"}
+registry=${E2E_REGISTRY:-}
 echo_host=${E2E_ECHO_HOST:-httpbin.org}
 [[ -x $binary ]] || { echo "Missing smolvm binary: $binary" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo 'This test requires Linux KVM' >&2; exit 1; }
@@ -125,7 +127,7 @@ exit_forwarded() {
 
 # --- the exit node ------------------------------------------------------------------
 # Off the 100.64.0.0/10 range Tailscale uses, so the guest keeps its gateway.
-"$binary" machine create --name "$exit_vm" --image alpine:3.23 --guest-subnet 10.231.0.0/24 -- sleep infinity >/dev/null
+"$binary" machine create --name "$exit_vm" --image "${registry}alpine:3.23" --guest-subnet 10.231.0.0/24 -- sleep infinity >/dev/null
 "$binary" machine start --name "$exit_vm" >/dev/null
 start_tailscaled "$exit_vm"
 in_vm "$exit_vm" "sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 &&
@@ -141,7 +143,7 @@ in_vm "$exit_vm" "(socat TCP4-LISTEN:443,bind=$exit_v4,fork,reuseaddr TCP4:$echo
 
 # --- kernel mode (tailscale0) ------------------------------------------------------
 current=kernel
-"$binary" machine create --name "$kernel_vm" --image alpine:3.23 --guest-subnet 10.232.0.0/24 \
+"$binary" machine create --name "$kernel_vm" --image "${registry}alpine:3.23" --guest-subnet 10.232.0.0/24 \
   "${credential[@]}" -- sleep infinity >/dev/null
 "$binary" machine start --name "$kernel_vm" >/dev/null
 start_tailscaled "$kernel_vm"
@@ -168,7 +170,7 @@ pass "every host through an exit node: the credential host got the value, throug
 # redirected connection's replies arrive on loopback, so the agent exempts
 # them in whichever iptables the workload uses.
 current=kernel_legacy
-"$binary" machine create --name "$legacy_vm" --image alpine:3.23 --guest-subnet 10.234.0.0/24 \
+"$binary" machine create --name "$legacy_vm" --image "${registry}alpine:3.23" --guest-subnet 10.234.0.0/24 \
   "${credential[@]}" -- sleep infinity >/dev/null
 "$binary" machine start --name "$legacy_vm" >/dev/null
 in_vm "$legacy_vm" "apk add -q iptables ip6tables iptables-legacy >/dev/null && mkdir -p /usr/local/sbin &&
@@ -184,7 +186,7 @@ pass "with tailscaled's rules in legacy iptables, tailnet hosts over IPv4 and IP
 
 # --- userspace mode (SOCKS5 and HTTP proxies) ------------------------------------------
 current=userspace
-"$binary" machine create --name "$user_vm" --image alpine:3.23 --guest-subnet 10.233.0.0/24 \
+"$binary" machine create --name "$user_vm" --image "${registry}alpine:3.23" --guest-subnet 10.233.0.0/24 \
   "${credential[@]}" -- sleep infinity >/dev/null
 "$binary" machine start --name "$user_vm" >/dev/null
 start_tailscaled "$user_vm" "--tun=userspace-networking --socks5-server=localhost:1055 --outbound-http-proxy-listen=localhost:1056"

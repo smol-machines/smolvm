@@ -15,12 +15,14 @@
 # Run after building smolvm on Linux KVM with an agent rootfs carrying the
 # matching agent. Needs internet access (Alpine packages, the echo host).
 #   SMOLVM_E2E_BIN   smolvm binary (default target/debug/smolvm)
+#   E2E_REGISTRY     prefix for the Docker Hub images, e.g. mirror.gcr.io/library/
 #   E2E_ECHO_HOST    HTTPS host that echoes request headers at /headers
 #   E2E_CASES        space-separated subset of the cases below
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 binary=${SMOLVM_E2E_BIN:-"$repo/target/debug/smolvm"}
+registry=${E2E_REGISTRY:-}
 echo_host=${E2E_ECHO_HOST:-httpbin.org}
 all_cases="ipv4 ipv6 flush netns_forward netns_tunnel back_out_nic ssh_socks docker tsi"
 cases=${E2E_CASES:-$all_cases}
@@ -104,7 +106,7 @@ credential=(--credential "t=TOKEN@$echo_host" --secret-file "TOKEN=$tmp/token")
 vpn_flags='--proto udp --secret /vpn.key --cipher AES-256-CBC --daemon $(openvpn --version 2>/dev/null | head -1 | grep -qE "OpenVPN 2\.[0-6]\." || echo --allow-deprecated-insecure-static-crypto)'
 
 # --- the exit machine -------------------------------------------------------
-"$binary" machine create --name "$exit_vm" --image alpine:3.20 --net \
+"$binary" machine create --name "$exit_vm" --image "${registry}alpine:3.20" --net \
   -p "$vpn_a:1194/udp" -p "$vpn_c:1196/udp" -p "$vpn_t:1197/udp" -p "$ssh_port:22" -- sleep infinity >/dev/null
 "$binary" machine start --name "$exit_vm" >/dev/null
 in_vm "$exit_vm" "apk add -q openvpn iptables ip6tables socat >/dev/null && openvpn --genkey secret /vpn.key 2>/dev/null"
@@ -165,7 +167,7 @@ pass() { echo "PASS [$current]: $*"; passed+=("$current"); }
 needs_client=0
 for c in ipv4 ipv6 flush netns_forward netns_tunnel back_out_nic ssh_socks; do want "$c" && needs_client=1; done
 if (( needs_client )); then
-  start_client "$client_vm" --image alpine:3.20
+  start_client "$client_vm" --image "${registry}alpine:3.20"
   in_vm "$client_vm" "apk add -q openvpn curl openssl iproute2 iptables nftables >/dev/null"
   vpn_up "$client_vm" tun0 "$vpn_a" 10.67.0.1 10.67.0.2 "--ifconfig-ipv6 fd67::1/64 fd67::2"
 fi
@@ -289,7 +291,7 @@ fi
 if want docker; then
   current=docker
   # dockerd is the image's own workload.
-  start_client "$docker_vm" --image-workload --image docker:29-dind --cpus 2 --mem 2048 \
+  start_client "$docker_vm" --image-workload --image "${registry}docker:29-dind" --cpus 2 --mem 2048 \
     --storage 20 -v /var/lib/docker
   in_vm "$docker_vm" "apk add -q openvpn curl iproute2 >/dev/null"
   for _ in $(seq 1 60); do in_vm "$docker_vm" "docker info >/dev/null 2>&1" && break; sleep 1; done
@@ -313,7 +315,7 @@ fi
 # --- the TSI backend ---------------------------------------------------------------
 if want tsi; then
   current=tsi
-  start_client "$tsi_vm" --image alpine:3.20 --net-backend tsi
+  start_client "$tsi_vm" --image "${registry}alpine:3.20" --net-backend tsi
   in_vm "$tsi_vm" "apk add -q openvpn curl iproute2 >/dev/null"
   vpn_up "$tsi_vm" tun0 "$vpn_t" 10.70.0.1 10.70.0.2
   route_via "$tsi_vm" tun0
