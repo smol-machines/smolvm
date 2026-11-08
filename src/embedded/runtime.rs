@@ -1473,12 +1473,14 @@ impl EmbeddedRuntime {
     /// so every later start, resume, restore and branch uses them. An empty
     /// policy removes every binding.
     ///
-    /// A running machine enforces them from its next request: a binding kept
-    /// by name keeps its placeholder, so processes already holding it keep
-    /// working; a new one gets a placeholder that new commands see, and is
-    /// substituted on its hosts once a value is supplied with
+    /// A running machine enforces them from its next request: a binding
+    /// unchanged in every respect keeps its placeholder and value, so
+    /// processes already holding it keep working; any other (a changed one
+    /// under the same name included) gets a placeholder that new commands
+    /// see, and is substituted on its hosts once a value is supplied with
     /// [`Self::supply_credential_values`]; a removed one stops being
-    /// substituted at once, and the value held for it is dropped. A machine
+    /// substituted at once, and the value held for it is dropped. The machine
+    /// must already have network egress. A machine
     /// that booted without bindings gains them live when it runs on
     /// virtio-net with outbound access; otherwise the call fails, changes
     /// nothing, and names the reason. Values always come from what is
@@ -2148,6 +2150,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(refused.contains("no credential binding 'a'"), "{refused}");
+        // Replacing bindings never makes this process create or widen a CA:
+        // that is the boot process's job, as the machine's own user.
+        assert!(!crate::credentials::ca_dir("rebound").exists());
         crate::credentials::forget_values("rebound");
     }
 

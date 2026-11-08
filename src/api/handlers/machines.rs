@@ -6206,12 +6206,14 @@ pub async fn put_credential_values(
 ///
 /// The bindings in the body become exactly the machine's bindings, validated
 /// as create validates them (a credential host must fall under the machine's
-/// `allowedHosts`, if it has them). They are stored, so every later start,
-/// resume, restore and branch uses them. A running machine enforces them from
-/// its next request: a binding kept by name keeps its placeholder, a new one
-/// gets a placeholder its new commands see and is substituted on its hosts,
-/// and a removed one stops being substituted at once and loses its supplied
-/// value. Values for new bindings come from `PUT …/credential-values`.
+/// `allowedHosts`, if it has them), on a machine that already has network
+/// egress: bindings never turn networking on. They are stored, so every later
+/// start, resume, restore and branch uses them. A running machine enforces
+/// them from its next request: a binding unchanged in every respect keeps its
+/// placeholder and value; any other (a changed one under the same name
+/// included) gets a new placeholder its new commands see and no value until
+/// `PUT …/credential-values` supplies one; a removed one stops being
+/// substituted at once and loses its value.
 #[utoipa::path(
     put,
     path = "/api/v1/machines/{name}/credentials",
@@ -6222,7 +6224,7 @@ pub async fn put_credential_values(
     request_body = SetCredentialsRequest,
     responses(
         (status = 200, description = "Bindings replaced; a running machine already enforces them", body = MachineInfo),
-        (status = 400, description = "Invalid bindings, as create would refuse them", body = ApiErrorResponse),
+        (status = 400, description = "Invalid bindings, as create would refuse them, or a machine without network egress", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
         (status = 409, description = "The machine is mid-transition, or runs in a way that cannot take its first binding live (no network device, TSI, inbound-only, or a guest agent too old for new hosts); nothing changed", body = ApiErrorResponse)
     )
@@ -8655,6 +8657,19 @@ mod tests {
     async fn put_credentials_replaces_the_bindings_of_a_stopped_machine() {
         let (_dir, state) = setup_test_state();
         create_test_vm(state.db(), "cred-vm", Some(20), Some(5));
+        // A binding grants no reachability: refused until the machine has it.
+        let refused = put_credentials(
+            &state,
+            "cred-vm",
+            vec![serde_json::json!({"name": "a", "environment_variable": "A_KEY", "allowed_hosts": ["api.a.com"]})],
+        )
+        .await;
+        assert!(matches!(refused.unwrap_err(), ApiError::BadRequest(_)));
+        assert!(!state.db().get_vm("cred-vm").unwrap().unwrap().network);
+        state
+            .db()
+            .update_vm("cred-vm", |r| r.network = true)
+            .unwrap();
         let request = |body: serde_json::Value| -> SetCredentialsRequest {
             serde_json::from_value(body).unwrap()
         };
@@ -8666,7 +8681,6 @@ mod tests {
         let first = state.db().get_vm("cred-vm").unwrap().unwrap();
         let a = first.credential_placeholders["a"].clone();
         assert!(first.credentials_supplied_by_api);
-        assert!(first.network, "bindings imply networking, as at create");
 
         put_credentials(
             &state,

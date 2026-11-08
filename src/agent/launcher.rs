@@ -656,6 +656,9 @@ pub struct LaunchConfig<'a> {
     /// the machine CA read-only at the guest credentials directory and, on
     /// virtio-net, starts the interceptor that HTTPS flows are redirected to.
     pub credentials: Option<&'a crate::credentials::CredentialLaunch>,
+    /// Who the machine is, so bindings it gains while it runs resolve for it
+    /// and widen its lineage's CA. `None` outside a named machine.
+    pub credential_identity: Option<&'a crate::credentials::CredentialIdentity>,
     /// Launch-scoped host service for all outbound TCP streams.
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     /// Use the versioned mediated-egress protocol for the external binding.
@@ -710,6 +713,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_telemetry,
         pod_net,
         credentials,
+        credential_identity,
         external_interceptor,
         mediated_egress,
         mediated_parent_id,
@@ -1309,10 +1313,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     // No bindings yet: serve the credentials socket anyway, so
                     // the machine's first bindings start an interceptor while
                     // it runs and the relay sends HTTPS through it from then on.
-                    if let Some(dir) = vsock_socket.parent() {
+                    if let (Some(dir), Some(identity)) =
+                        (vsock_socket.parent(), credential_identity)
+                    {
                         let slot = smolvm_network::LateHttpsIntercept::new();
                         guest_network.late_https_intercept = Some(slot);
-                        crate::credentials::serve_without_bindings(dir, slot);
+                        crate::credentials::serve_without_bindings(dir, (*identity).clone(), slot);
                     }
                 }
                 if let Some(endpoint) = external_interceptor {

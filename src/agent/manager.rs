@@ -687,30 +687,52 @@ pub fn apply_live_credential_values(
     })
 }
 
-/// Replace running machine `name`'s credential bindings with `launch`'s,
-/// through its credentials socket: the interceptor swaps policy and
-/// placeholders at once, starting if the machine booted without bindings.
-/// The CA must already cover every host (see
-/// [`crate::credentials::CredentialLaunch::ensure_ca`]).
+/// Replace running machine `name`'s credential bindings through its
+/// credentials socket: the boot process widens the CA as needed and swaps
+/// policy, placeholders and resolver state at once, starting an interceptor
+/// if the machine booted without bindings. Answers with the CA certificate.
 pub fn apply_live_credential_policy(
     name: &str,
-    launch: &crate::credentials::CredentialLaunch,
-) -> Result<()> {
-    let request = serde_json::json!({ "launch": launch }).to_string();
-    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
-        // A boot process from before binding changes knows only values.
-        let reason = if reason == "malformed request" {
-            "this machine was started before live binding changes were supported and needs a \
-             restart"
-                .to_string()
-        } else {
-            reason
-        };
+    message: &crate::credentials::BindingsMessage,
+) -> Result<crate::credentials::BindingsReply> {
+    let request = serde_json::json!({ "bindings": message }).to_string();
+    let fail = |reason: String| {
         Error::config(
             "credentials",
             format!(
                 "could not change machine '{name}''s credential bindings while it runs: {reason}"
             ),
+        )
+    };
+    let reply = send_live_request(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(
+        |reason| {
+            // A boot process from before binding changes knows only values.
+            if reason == "malformed request" {
+                fail(
+                    "this machine was started before live binding changes were supported and \
+                     needs a restart"
+                        .to_string(),
+                )
+            } else {
+                fail(reason)
+            }
+        },
+    )?;
+    serde_json::from_str(&reply).map_err(|e| fail(format!("unreadable answer: {e}")))
+}
+
+/// Return running machine `name`'s boot process to exactly the bindings it
+/// had before the last ones it was sent.
+pub fn roll_back_live_credential_policy(name: &str) -> Result<()> {
+    send_live_change(
+        name,
+        crate::credentials::CREDENTIALS_SOCKET,
+        r#"{"rollback":true}"#,
+    )
+    .map_err(|reason| {
+        Error::config(
+            "credentials",
+            format!("could not restore machine '{name}''s credential bindings: {reason}"),
         )
     })
 }
@@ -739,6 +761,16 @@ pub fn supports_live_credential_trust(name: &str) -> Result<bool> {
 }
 
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    send_live_request(name, socket, rendered).map(|_| ())
+}
+
+/// Send `rendered` to one of running machine `name`'s control sockets and
+/// return what followed its `ok`.
+fn send_live_request(
+    name: &str,
+    socket: &str,
+    rendered: &str,
+) -> std::result::Result<String, String> {
     use std::io::{Read, Write};
     let path = vm_data_dir(name).join(socket);
     let mut stream =
@@ -748,7 +780,7 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
             },
         )?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .and_then(|()| stream.write_all(rendered.as_bytes()))
         .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
         .map_err(|e| e.to_string())?;
@@ -756,9 +788,11 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
     stream
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
-    match reply.trim() {
-        "ok" => Ok(()),
-        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+    let reply = reply.trim();
+    match reply.split_once('\n') {
+        Some(("ok", data)) => Ok(data.trim().to_string()),
+        None if reply == "ok" => Ok(String::new()),
+        _ => Err(reply.strip_prefix("error: ").unwrap_or(reply).to_string()),
     }
 }
 
@@ -3073,6 +3107,7 @@ impl AgentManager {
                 features.pod_netns.is_some(),
             )?;
         }
+        let mut credential_identity = None;
         if let Some(name) = self.name() {
             let db = crate::db::SmolvmDb::open()?;
             if let Some(record) = db.get_vm(name)? {
@@ -3132,6 +3167,10 @@ impl AgentManager {
                 if let Some(launch) = features.credentials.as_mut() {
                     launch.ca_boot_mount = !restoring || record.credential_ca_boot_device();
                 }
+                credential_identity = Some(crate::credentials::CredentialIdentity::of(
+                    name,
+                    record.golden.as_deref(),
+                ));
                 let ca_device = features.credentials.is_some();
                 if !restoring && record.credential_ca_device != Some(ca_device) {
                     db.update_vm(name, |r| r.credential_ca_device = Some(ca_device))?;
@@ -3565,6 +3604,7 @@ impl AgentManager {
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
+            credential_identity,
             external_interceptor: features.external_interceptor,
             mediated_egress: features.mediated_egress,
             mediated_parent_id: features.mediated_parent_id,

@@ -6860,25 +6860,40 @@ impl UpdateCmd {
             .flat_map(|p| p.credentials.iter().map(|b| b.name.as_str()))
             .collect();
         let after = saved.credential_policy.clone().unwrap_or_default();
-        // The running boot process reads a binding's variable from the
-        // environment it started with, which has no variable for a binding
-        // added now: hand it the value this command can read.
+        // The running boot process resolves a new or changed binding from its
+        // own environment, which `machine start` fixed and which has nothing
+        // for it: hand it the value this command reads, from the binding's
+        // secret reference or variable.
         if running && !saved.credentials_supplied_by_api {
-            let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> = after
-                .credentials
-                .iter()
-                .filter(|binding| !before.contains(&binding.name.as_str()))
-                .filter(|binding| {
-                    !saved
-                        .secret_refs
-                        .contains_key(&binding.environment_variable)
-                })
-                .filter_map(|binding| {
-                    std::env::var(&binding.environment_variable)
-                        .ok()
-                        .map(|value| (binding.name.clone(), zeroize::Zeroizing::new(value)))
-                })
-                .collect();
+            let mut values = std::collections::BTreeMap::new();
+            for binding in &after.credentials {
+                if record.credential_placeholders.get(&binding.name)
+                    == saved.credential_placeholders.get(&binding.name)
+                {
+                    continue;
+                }
+                let source = saved
+                    .secret_refs
+                    .get(&binding.environment_variable)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        smolvm::secrets::env_ref(binding.environment_variable.clone())
+                    });
+                match smolvm::secrets::resolve_secret_ref_classified(
+                    &binding.name,
+                    &source,
+                    smolvm::secrets::ResolutionScope::TrustedLocal,
+                ) {
+                    Ok(value) => {
+                        values.insert(binding.name.clone(), value);
+                    }
+                    Err(failure) => eprintln!(
+                        "warning: credential '{}' has no value yet ({}); requests to its hosts fail until one is supplied",
+                        binding.name,
+                        failure.as_str()
+                    ),
+                }
+            }
             if !values.is_empty() {
                 smolvm::agent::apply_live_credential_values(&self.name, &values)?;
             }

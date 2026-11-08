@@ -37,10 +37,6 @@ const NO_CREDENTIAL_HOST: &str = "credentials.invalid";
 /// most a few KiB.
 const MAX_CREDENTIALS_REQUEST_BYTES: u64 = 1024 * 1024;
 
-/// Values handed to a running boot process through [`CREDENTIALS_SOCKET`], by
-/// binding name. A binding with one resolves to it instead of its reference.
-type LiveValues = Arc<Mutex<BTreeMap<String, zeroize::Zeroizing<String>>>>;
-
 /// Name of the directory inside a machine's data dir that holds its
 /// credential CA.
 pub const CA_DIR_NAME: &str = "credentials";
@@ -227,82 +223,26 @@ impl CredentialLaunch {
         }
     }
 
-    /// The DNS subtrees the policy's hosts live in: a wildcard's parent is
-    /// the subtree the CA may sign in, and the name constraint on it already
-    /// covers every subdomain.
-    fn host_subtrees(&self) -> Vec<String> {
-        self.policy
-            .credentials
-            .iter()
-            .flat_map(|binding| binding.allowed_hosts.iter())
-            .map(|host| smolvm_protocol::credentials::host_subtree(host).to_string())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect()
+    /// Who this launch resolves for, and where its lineage's CA lives.
+    pub fn identity(&self) -> CredentialIdentity {
+        CredentialIdentity {
+            machine: self.machine.clone(),
+            ca_owner: self.ca_owner.clone(),
+            ca_dir: self.ca_dir.clone(),
+        }
     }
 
     /// Create the lineage's CA on first use, or widen it to every host the
-    /// policy names. Returns whether the certificate changed, in which case a
-    /// running guest must be handed the new one. Called by the launcher before
-    /// the guest CA directory is mounted, and before bindings are replaced on
-    /// a running machine.
+    /// policy names. Returns whether the certificate changed. Called only in
+    /// the boot process, which runs as the machine's own user and owns the
+    /// directory: by the launcher before the CA is mounted, and when a
+    /// running machine is handed new bindings.
     ///
     /// Widening keeps the key, so leaves stay valid for processes that loaded
     /// the earlier certificate, and never narrows: branches share the CA, and
     /// a host a sibling still uses must stay permitted.
     pub fn ensure_ca(&self) -> Result<bool> {
-        fn fail(e: impl std::fmt::Display) -> Error {
-            Error::config("credentials", format!("machine CA: {e:#}"))
-        }
-        // The common case reads only: a boot whose CA already covers its
-        // hosts writes nothing (a confined boot process may only read it).
-        if self.ca_covers_policy()? {
-            return Ok(false);
-        }
-        std::fs::create_dir_all(&self.ca_dir)
-            .map_err(|e| Error::config("credentials", format!("machine CA: {e}")))?;
-        // Branches of one lineage may widen the shared CA at once.
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(self.ca_dir.join("ca.lock"))
-            .map_err(|e| Error::config("credentials", format!("machine CA lock: {e}")))?;
-        crate::agent::fork::lock_file_exclusive(&lock)
-            .map_err(|e| Error::config("credentials", format!("machine CA lock: {e}")))?;
-        let hosts = self.host_subtrees();
-        if !MachineCa::exists(&self.ca_dir) {
-            let hosts = if hosts.is_empty() {
-                vec![NO_CREDENTIAL_HOST.to_string()]
-            } else {
-                hosts
-            };
-            MachineCa::generate(&self.ca_owner, &hosts)
-                .and_then(|ca| ca.save(&self.ca_dir))
-                .map_err(fail)?;
-            return Ok(true);
-        }
-        let ca = MachineCa::load(&self.ca_dir, &self.ca_owner).map_err(fail)?;
-        match ca.widened(&hosts).map_err(fail)? {
-            Some(wider) => {
-                wider.save(&self.ca_dir).map_err(fail)?;
-                tracing::info!(machine = %self.machine, ca_owner = %self.ca_owner, "credential CA widened to new hosts");
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    /// Whether the lineage's CA exists and already permits every host the
-    /// policy names, so the guest's trust needs no change.
-    pub fn ca_covers_policy(&self) -> Result<bool> {
-        if !MachineCa::exists(&self.ca_dir) {
-            return Ok(false);
-        }
-        MachineCa::load(&self.ca_dir, &self.ca_owner)
-            .and_then(|ca| ca.widened(&self.host_subtrees()))
-            .map(|wider| wider.is_none())
-            .map_err(|e| Error::config("credentials", format!("machine CA: {e:#}")))
+        ensure_lineage_ca(&self.identity(), &self.policy).map(|(_, changed)| changed)
     }
 
     /// SHA-256 (hex) of a CA certificate PEM, as
@@ -312,11 +252,10 @@ impl CredentialLaunch {
         hex::encode(sha2::Sha256::digest(pem.as_bytes()))
     }
 
-    /// The CA certificate the guest trusts, PEM.
+    /// The CA certificate the guest trusts, read by the host without
+    /// following links (see [`read_ca_certificate`]).
     pub fn ca_certificate_pem(&self) -> Result<String> {
-        MachineCa::load(&self.ca_dir, &self.ca_owner)
-            .map(|ca| ca.certificate_pem().to_string())
-            .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))
+        read_ca_certificate(&self.ca_dir)
     }
 
     /// Read-only mount exposing only the public CA to the guest.
@@ -348,10 +287,7 @@ impl CredentialLaunch {
     ) -> Result<(Interceptor, Arc<LiveCredentials>)> {
         let ca = MachineCa::load(&self.ca_dir, &self.ca_owner)
             .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?;
-        let resolver = Arc::new(SecretRefResolver {
-            sources: Arc::new(Mutex::new(sources)),
-            live: LiveValues::default(),
-        });
+        let resolver = Arc::new(SecretRefResolver::new(sources));
         let interceptor = Interceptor::spawn(
             InterceptorConfig {
                 machine: self.machine.clone(),
@@ -364,32 +300,221 @@ impl CredentialLaunch {
         )
         .map_err(|e| Error::config("credentials", format!("start interceptor: {e:#}")))?;
         let live = Arc::new(LiveCredentials {
+            identity: self.identity(),
+            late: None,
             state: Mutex::new(LiveState {
+                policy: self.policy.clone(),
+                placeholders: self.placeholders.clone(),
+                supplied_only: self.supplied_only,
                 running: Some(Running {
                     control: interceptor.control(),
                     resolver,
-                    ca_dir: self.ca_dir.clone(),
-                    supplied_only: self.supplied_only,
                     _owned: None,
                 }),
-                policy: self.policy.clone(),
+                previous: None,
             }),
-            late: None,
         });
         Ok((interceptor, live))
     }
 }
 
+/// Who a running boot process enforces bindings for and where the CA of its
+/// lineage lives. Fixed when it boots, from the machine's record; never taken
+/// from a message on its socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialIdentity {
+    /// Machine name, the identity the resolver is asked for.
+    pub machine: String,
+    /// Machine whose CA the lineage shares (the golden for a branch).
+    pub ca_owner: String,
+    /// The CA's host directory.
+    pub ca_dir: PathBuf,
+}
+
+impl CredentialIdentity {
+    /// The identity of machine `name`, branched from `golden` if it was.
+    pub fn of(name: &str, golden: Option<&str>) -> Self {
+        let ca_owner = golden.unwrap_or(name);
+        Self {
+            machine: name.to_string(),
+            ca_owner: ca_owner.to_string(),
+            ca_dir: ca_dir(ca_owner),
+        }
+    }
+}
+
+/// Create the CA of `identity`'s lineage on first use, or widen it to every
+/// host `policy` names; returns it and whether it changed. Writes only when
+/// it must, so a confined boot whose CA already covers its hosts only reads.
+fn ensure_lineage_ca(
+    identity: &CredentialIdentity,
+    policy: &CredentialPolicy,
+) -> Result<(MachineCa, bool)> {
+    fn fail(e: impl std::fmt::Display) -> Error {
+        Error::config("credentials", format!("machine CA: {e:#}"))
+    }
+    let dir = &identity.ca_dir;
+    let hosts: Vec<String> = policy
+        .credentials
+        .iter()
+        .flat_map(|binding| binding.allowed_hosts.iter())
+        .map(|host| smolvm_protocol::credentials::host_subtree(host).to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let covering = |ca: MachineCa| -> Result<Option<MachineCa>> {
+        Ok(match ca.widened(&hosts).map_err(fail)? {
+            None => Some(ca),
+            Some(_) => None,
+        })
+    };
+    if MachineCa::exists(dir) {
+        if let Some(ca) = covering(MachineCa::load(dir, &identity.ca_owner).map_err(fail)?)? {
+            return Ok((ca, false));
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(fail)?;
+    // Branches of one lineage may widen the shared CA at once.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("ca.lock"))
+        .map_err(fail)?;
+    crate::agent::fork::lock_file_exclusive(&lock).map_err(fail)?;
+    if !MachineCa::exists(dir) {
+        let permitted = if hosts.is_empty() {
+            vec![NO_CREDENTIAL_HOST.to_string()]
+        } else {
+            hosts.clone()
+        };
+        let ca = MachineCa::generate(&identity.ca_owner, &permitted).map_err(fail)?;
+        ca.save(dir).map_err(fail)?;
+        return Ok((ca, true));
+    }
+    let ca = MachineCa::load(dir, &identity.ca_owner).map_err(fail)?;
+    match ca.widened(&hosts).map_err(fail)? {
+        Some(wider) => {
+            wider.save(dir).map_err(fail)?;
+            tracing::info!(machine = %identity.machine, ca_owner = %identity.ca_owner, "credential CA widened to new hosts");
+            Ok((wider, true))
+        }
+        None => Ok((ca, false)),
+    }
+}
+
+/// Read the public CA certificate of a lineage from the host, for a process
+/// that may run as another user than the directory's owner (root `serve`
+/// beside a machine running under its own uid).
+///
+/// Each component below the machine's data directory is opened without
+/// following links and must be a directory or a regular file, so a machine
+/// that swapped one for a link cannot make the reader open something else;
+/// and only the first certificate in the file is returned, re-encoded, so
+/// nothing but a certificate ever reaches the guest it is handed to.
+pub fn read_ca_certificate(ca_dir: &Path) -> Result<String> {
+    let fail = |reason: String| Error::config("credentials", format!("read machine CA: {reason}"));
+    let bytes = read_without_links(ca_dir, &[smolvm_credentials::ca::GUEST_SUBDIR, "ca.pem"])
+        .map_err(|e| fail(e.to_string()))?;
+    let der = rustls_pemfile::certs(&mut bytes.as_slice())
+        .next()
+        .ok_or_else(|| fail("no certificate".into()))?
+        .map_err(|e| fail(e.to_string()))?;
+    Ok(pem_certificate(&der))
+}
+
+/// PEM text for one DER certificate.
+fn pem_certificate(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for line in body.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem
+}
+
+/// Read `base/<components…>`: `base` itself and every component below it
+/// opened without following a link, each directory with `O_DIRECTORY` and the
+/// file required to be regular.
+#[cfg(unix)]
+fn read_without_links(base: &Path, components: &[&str]) -> std::io::Result<Vec<u8>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let open_at = |dir: Option<&OwnedFd>, name: &std::ffi::OsStr, flags: i32| {
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let at = dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
+        // SAFETY: a NUL-terminated path and a live directory descriptor.
+        let fd = unsafe {
+            libc::openat(
+                at,
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a descriptor this function now owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let mut dir = open_at(None, base.as_os_str(), libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let (file, dirs) = components
+        .split_last()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    for name in dirs {
+        dir = open_at(
+            Some(&dir),
+            std::ffi::OsStr::new(name),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?;
+    }
+    let file = std::fs::File::from(open_at(
+        Some(&dir),
+        std::ffi::OsStr::new(file),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+    )?);
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(&file, 64 * 1024), &mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_without_links(base: &Path, components: &[&str]) -> std::io::Result<Vec<u8>> {
+    let mut path = base.to_path_buf();
+    for name in components {
+        path.push(name);
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(std::io::Error::other("is a link"));
+        }
+    }
+    std::fs::read(path)
+}
+
 /// Serve [`CREDENTIALS_SOCKET`] in `vm_dir` for a machine that booted without
 /// bindings on a network whose HTTPS flows can be redirected after boot: the
 /// first bindings sent start the interceptor and publish it in `slot`.
-pub fn serve_without_bindings(vm_dir: &Path, slot: smolvm_network::LateHttpsIntercept) {
+pub fn serve_without_bindings(
+    vm_dir: &Path,
+    identity: CredentialIdentity,
+    slot: smolvm_network::LateHttpsIntercept,
+) {
     Arc::new(LiveCredentials {
-        state: Mutex::new(LiveState {
-            running: None,
-            policy: CredentialPolicy::default(),
-        }),
+        identity,
         late: Some(slot),
+        state: Mutex::new(LiveState {
+            policy: CredentialPolicy::default(),
+            placeholders: BTreeMap::new(),
+            supplied_only: false,
+            running: None,
+            previous: None,
+        }),
     })
     .serve(vm_dir);
 }
@@ -476,10 +601,7 @@ pub fn set_bindings(
             next.credential_ca_trusted = Some(trusted);
         }
     }
-    let saved = db.update_vm(name, |r| {
-        r.take_credential_bindings(&next);
-        r.network = next.network;
-    });
+    let saved = db.update_vm(name, |r| r.take_credential_bindings(&next));
     match saved {
         Ok(Some(saved)) => {
             retain_values(
@@ -494,7 +616,7 @@ pub fn set_bindings(
         failed => {
             // The record keeps the old bindings, so the running machine must too.
             if running {
-                revert_live_bindings(name, &record, &next);
+                roll_back_live_bindings(name);
             }
             Err(BindingsError::Failed(match failed {
                 Err(e) => e,
@@ -521,16 +643,16 @@ fn lock_bindings(name: &str) -> Result<std::fs::File> {
 }
 
 /// Apply `next`'s bindings to running machine `name`, whose record is
-/// `before`.
+/// `before`, and return the fingerprint of the CA its guest trusts afterwards.
 ///
-/// The CA is created or widened first, so it covers every new host. The
-/// boot process then swaps policy and placeholders in its interceptor in one
+/// The boot process, which owns the CA directory, creates or widens the CA
+/// to cover every host, swaps policy, placeholders and resolver state in one
 /// step (starting the interceptor when the machine booted without bindings),
-/// and, when the CA is new to the guest or now covers more, the guest agent
-/// installs it in the machine root and every workload container. A guest
-/// that cannot take the CA is refused before anything changes.
-///
-/// Returns the fingerprint of the CA the guest was handed, when it was.
+/// and answers with the CA certificate. When the guest was last given another
+/// certificate (by the record, not by what is on disk: a sibling branch may
+/// have widened the shared CA, or an earlier attempt failed), the guest agent
+/// installs it. A guest that cannot take it, or an install that fails, rolls
+/// the boot process back to exactly what it had.
 pub fn apply_live_bindings(
     name: &str,
     before: &VmRecord,
@@ -539,56 +661,67 @@ pub fn apply_live_bindings(
     before
         .check_live_credentials(next)
         .map_err(BindingsError::Conflict)?;
-    let Some(launch) = CredentialLaunch::for_record(name, next) else {
+    let Some(policy) = next.credential_policy.clone() else {
         return Ok(None);
     };
-    let trust_needed = before.credential_policy.is_none()
-        || !launch.ca_covers_policy().map_err(BindingsError::Failed)?;
-    if trust_needed
-        && !crate::agent::supports_live_credential_trust(name).map_err(BindingsError::Conflict)?
-    {
-        return Err(BindingsError::Conflict(Error::config(
+    let capable =
+        crate::agent::supports_live_credential_trust(name).map_err(BindingsError::Conflict)?;
+    let message = BindingsMessage {
+        policy,
+        placeholders: next.credential_placeholders.clone(),
+        supplied_only: next.credentials_supplied_by_api,
+    };
+    let reply = crate::agent::apply_live_credential_policy(name, &message)
+        .map_err(BindingsError::Conflict)?;
+    let pem = rustls_pemfile::certs(&mut reply.ca_pem.as_bytes())
+        .next()
+        .and_then(|der| der.ok())
+        .map(|der| pem_certificate(&der));
+    let Some(pem) = pem else {
+        roll_back_live_bindings(name);
+        return Err(BindingsError::Failed(Error::config(
+            "credentials",
+            "the boot process answered without a CA certificate",
+        )));
+    };
+    let fingerprint = CredentialLaunch::ca_fingerprint(&pem);
+    if !guest_needs_ca(before, &pem) {
+        return Ok(Some(fingerprint));
+    }
+    let installed = if capable {
+        crate::agent::install_live_credential_trust(name, &pem)
+    } else {
+        Err(Error::config(
             "credentials",
             format!(
                 "machine '{name}' runs a guest agent that cannot take a credential CA while it \
-                 runs, which bindings for new hosts need; restart it to apply them"
+                 runs, which these bindings need; restart it to apply them"
             ),
-        )));
-    }
-    launch.ensure_ca().map_err(BindingsError::Failed)?;
-    crate::agent::apply_live_credential_policy(name, &launch).map_err(BindingsError::Conflict)?;
-    if !trust_needed {
-        return Ok(None);
-    }
-    let installed = launch.ca_certificate_pem().and_then(|pem| {
-        crate::agent::install_live_credential_trust(name, &pem)
-            .map(|()| CredentialLaunch::ca_fingerprint(&pem))
-    });
+        ))
+    };
     match installed {
-        Ok(fingerprint) => Ok(Some(fingerprint)),
+        Ok(()) => Ok(Some(fingerprint)),
         Err(error) => {
-            revert_live_bindings(name, before, next);
+            roll_back_live_bindings(name);
             Err(BindingsError::Conflict(error))
         }
     }
 }
 
-/// Put `before`'s bindings back on running machine `name` after applying
-/// `next`'s failed further on. Best effort: the error that caused it is what
-/// the caller reports.
-fn revert_live_bindings(name: &str, before: &VmRecord, next: &VmRecord) {
-    let previous = CredentialLaunch::for_record(name, before).or_else(|| {
-        // It booted without bindings: an interceptor with none splices
-        // everything through.
-        let mut empty = CredentialLaunch::for_record(name, next)?;
-        empty.policy = CredentialPolicy::default();
-        empty.placeholders.clear();
-        Some(empty)
-    });
-    if let Some(previous) = previous {
-        if let Err(error) = crate::agent::apply_live_credential_policy(name, &previous) {
-            tracing::warn!(machine = name, %error, "could not restore the previous credential bindings");
-        }
+/// Whether a running machine's guest must be handed CA certificate `pem`:
+/// judged by the certificate its record says the guest was last given, never
+/// by what is on disk, which a sibling branch may have widened or an earlier,
+/// rolled-back attempt may have changed without the guest ever seeing it.
+fn guest_needs_ca(before: &VmRecord, pem: &str) -> bool {
+    before.credential_ca_trusted.as_deref() != Some(CredentialLaunch::ca_fingerprint(pem).as_str())
+}
+
+/// Return running machine `name`'s boot process to the bindings, sources and
+/// values it had before the last bindings it was sent. Best effort: the error
+/// that caused it is what the caller reports.
+fn roll_back_live_bindings(name: &str) {
+    if let Err(error) = crate::agent::roll_back_live_credential_policy(name) {
+        tracing::warn!(machine = name, %error, "could not restore the previous credential bindings");
     }
 }
 
@@ -664,41 +797,80 @@ impl CredentialLaunch {
     }
 }
 
+/// The bindings a host hands a running boot process: everything else (who
+/// it resolves for, where the CA lives, where values come from) the boot
+/// process knows itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingsMessage {
+    /// The bindings, exactly.
+    pub policy: CredentialPolicy,
+    /// Binding name → placeholder, as the record holds them.
+    pub placeholders: BTreeMap<String, String>,
+    /// Values come only from what is sent. Once set for a running machine it
+    /// stays set until a rollback undoes the message that set it.
+    #[serde(default)]
+    pub supplied_only: bool,
+}
+
+/// What the boot process answers to a [`BindingsMessage`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingsReply {
+    /// The lineage's CA certificate, now covering every bound host.
+    pub ca_pem: String,
+}
+
 /// The credentials a running boot process enforces, as its
 /// [`CREDENTIALS_SOCKET`] changes them.
 ///
-/// Each connection to the socket sends one JSON object and reads back `ok` or
-/// `error: <reason>`:
+/// The socket is private to the machine's user (mode `0600`). Each
+/// connection sends one JSON object and reads back `ok` (followed, for
+/// `bindings`, by one line of JSON) or `error: <reason>`:
 ///
 /// - `{"values":{"<binding>":"<value>",…}}` replaces the values the machine
 ///   resolves for the bindings named, from its next request on. A name that is
 ///   not a current binding refuses the whole message.
-/// - `{"launch":<CredentialLaunch>}` replaces the bindings: the policy and
-///   placeholders are swapped in the interceptor as one value, a binding no
-///   longer present stops being substituted and loses any value sent for it,
-///   and the CA is reloaded from disk (the host widens it before sending). A
-///   binding kept by name keeps resolving where it did; a new one resolves
-///   from the launch's source, or, for a machine whose values are supplied
-///   (`supplied_only`), only from values sent afterwards. On a machine that
-///   booted without bindings, the first launch starts the interceptor.
+/// - `{"bindings":{"policy":{…},"placeholders":{…},"supplied_only":bool}}`
+///   replaces the bindings. The boot process creates or widens the CA itself
+///   and answers `ok` plus `{"ca_pem":"…"}`. A binding unchanged in every
+///   respect (the binding, its placeholder, and whether values are supplied)
+///   keeps its source and value; any other binding starts with none: it
+///   resolves from the boot process's own variable of its name on a machine
+///   whose values come from this host, and on a supplied machine only from a
+///   value sent for it. Policy, placeholders and resolver state change in one
+///   step. On a machine that booted without bindings, the first ones start
+///   the interceptor.
+/// - `{"rollback":true}` restores exactly what the last `bindings` replaced:
+///   policy, placeholders, sources, values, whether values are supplied, and
+///   whether an interceptor ran at all.
 pub struct LiveCredentials {
-    state: Mutex<LiveState>,
+    identity: CredentialIdentity,
     /// Where an interceptor started after boot is published.
     late: Option<smolvm_network::LateHttpsIntercept>,
+    state: Mutex<LiveState>,
 }
 
 struct LiveState {
-    /// The bindings in force.
     policy: CredentialPolicy,
+    placeholders: BTreeMap<String, String>,
+    supplied_only: bool,
     /// The interceptor, once there is one.
     running: Option<Running>,
+    /// What the last `bindings` message replaced.
+    previous: Option<Previous>,
+}
+
+struct Previous {
+    policy: CredentialPolicy,
+    placeholders: BTreeMap<String, String>,
+    supplied_only: bool,
+    /// The resolver's state, or `None` when no interceptor ran before.
+    resolver: Option<ResolverState>,
 }
 
 struct Running {
     control: InterceptorControl,
     resolver: Arc<SecretRefResolver>,
-    ca_dir: PathBuf,
-    supplied_only: bool,
     /// An interceptor started after boot, kept alive here.
     _owned: Option<Interceptor>,
 }
@@ -709,14 +881,16 @@ struct LiveRequest {
     #[serde(default)]
     values: Option<BTreeMap<String, String>>,
     #[serde(default)]
-    launch: Option<CredentialLaunch>,
+    bindings: Option<BindingsMessage>,
+    #[serde(default)]
+    rollback: Option<bool>,
 }
 
 impl LiveCredentials {
     fn serve(self: Arc<Self>, vm_dir: &Path) {
         let path = vm_dir.join(CREDENTIALS_SOCKET);
         let _ = std::fs::remove_file(&path);
-        crate::network::launch::serve_control_socket(
+        crate::network::launch::serve_control_socket_with_reply(
             path,
             "credentials-control",
             MAX_CREDENTIALS_REQUEST_BYTES,
@@ -724,13 +898,16 @@ impl LiveCredentials {
         );
     }
 
-    fn handle(&self, request: &str) -> std::result::Result<(), String> {
+    fn handle(&self, request: &str) -> std::result::Result<String, String> {
         let request: LiveRequest =
             serde_json::from_str(request).map_err(|_| "malformed request".to_string())?;
-        match (request.values, request.launch) {
-            (Some(values), None) => self.replace_values(values),
-            (None, Some(launch)) => self.replace_bindings(launch),
-            _ => Err("send exactly one of `values` and `launch`".to_string()),
+        match (request.values, request.bindings, request.rollback) {
+            (Some(values), None, None) => self.replace_values(values).map(|()| String::new()),
+            (None, Some(bindings), None) => self
+                .replace_bindings(bindings)
+                .and_then(|reply| serde_json::to_string(&reply).map_err(|e| e.to_string())),
+            (None, None, Some(true)) => self.roll_back().map(|()| String::new()),
+            _ => Err("send exactly one of `values`, `bindings` and `rollback`".to_string()),
         }
     }
 
@@ -744,58 +921,86 @@ impl LiveCredentials {
             return Ok(());
         };
         let names: Vec<String> = values.keys().cloned().collect();
-        running
-            .resolver
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .extend(
-                values
-                    .into_iter()
-                    .map(|(name, value)| (name, zeroize::Zeroizing::new(value))),
-            );
+        running.resolver.lock().live.extend(
+            values
+                .into_iter()
+                .map(|(name, value)| (name, zeroize::Zeroizing::new(value))),
+        );
         tracing::info!(bindings = ?names, "credential values replaced");
         Ok(())
     }
 
-    fn replace_bindings(&self, launch: CredentialLaunch) -> std::result::Result<(), String> {
-        launch.policy.validate(None).map_err(|e| e.to_string())?;
+    fn replace_bindings(
+        &self,
+        message: BindingsMessage,
+    ) -> std::result::Result<BindingsReply, String> {
+        message.policy.validate(None).map_err(|e| e.to_string())?;
+        if let Some(missing) = message
+            .policy
+            .credentials
+            .iter()
+            .find(|b| !message.placeholders.contains_key(&b.name))
+        {
+            return Err(format!(
+                "credential binding '{}' has no placeholder",
+                missing.name
+            ));
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let ca = MachineCa::load(&launch.ca_dir, &launch.ca_owner)
-            .map_err(|e| format!("load machine CA: {e:#}"))?;
-        match &mut state.running {
+        let (ca, _) =
+            ensure_lineage_ca(&self.identity, &message.policy).map_err(|e| e.to_string())?;
+        let reply = BindingsReply {
+            ca_pem: ca.certificate_pem().to_string(),
+        };
+        let supplied_only = state.supplied_only || message.supplied_only;
+        let unchanged = |binding: &CredentialBinding| {
+            state.policy.binding(&binding.name) == Some(binding)
+                && state.placeholders.get(&binding.name) == message.placeholders.get(&binding.name)
+                && state.supplied_only == supplied_only
+        };
+        let kept: Vec<&str> = message
+            .policy
+            .credentials
+            .iter()
+            .filter(|b| unchanged(b))
+            .map(|b| b.name.as_str())
+            .collect();
+        let fresh_source = |binding: &CredentialBinding| {
+            (!supplied_only && !binding.environment_variable.is_empty())
+                .then(|| crate::secrets::env_ref(binding.environment_variable.clone()))
+        };
+        match &state.running {
             Some(running) => {
-                if running.ca_dir != launch.ca_dir {
-                    return Err(format!(
-                        "the machine's credential CA lives in {}, not {}",
-                        running.ca_dir.display(),
-                        launch.ca_dir.display()
-                    ));
+                let mut resolver = running.resolver.lock();
+                let previous_resolver = resolver.clone();
+                let mut next = ResolverState::default();
+                for binding in &message.policy.credentials {
+                    let name = &binding.name;
+                    if kept.contains(&name.as_str()) {
+                        if let Some(source) = resolver.sources.get(name) {
+                            next.sources.insert(name.clone(), source.clone());
+                        }
+                        if let Some(value) = resolver.live.get(name) {
+                            next.live.insert(name.clone(), value.clone());
+                        }
+                    } else if let Some(source) = fresh_source(binding) {
+                        next.sources.insert(name.clone(), source);
+                    }
                 }
-                let mut sources = running
-                    .resolver
-                    .sources
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let next = next_sources(
-                    &launch,
-                    &sources,
-                    running.supplied_only || launch.supplied_only,
-                );
-                *sources = next;
-                drop(sources);
-                running
-                    .resolver
-                    .live
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .retain(|name, _| launch.policy.binding(name).is_some());
-                running.supplied_only |= launch.supplied_only;
-                // The CA first: a new binding's host may need the wider one.
+                // Under the resolver's lock: no value is resolved between the
+                // new bindings and their sources and values.
                 running.control.replace_ca(ca);
                 running
                     .control
-                    .replace_bindings(launch.policy.clone(), &launch.placeholders);
+                    .replace_bindings(message.policy.clone(), &message.placeholders);
+                *resolver = next;
+                drop(resolver);
+                state.previous = Some(Previous {
+                    policy: state.policy.clone(),
+                    placeholders: state.placeholders.clone(),
+                    supplied_only: state.supplied_only,
+                    resolver: Some(previous_resolver),
+                });
             }
             None => {
                 let Some(slot) = self.late else {
@@ -803,16 +1008,18 @@ impl LiveCredentials {
                                 interceptor started after boot; restart it"
                         .to_string());
                 };
-                let sources = next_sources(&launch, &BTreeMap::new(), launch.supplied_only);
-                let resolver = Arc::new(SecretRefResolver {
-                    sources: Arc::new(Mutex::new(sources)),
-                    live: LiveValues::default(),
-                });
+                let sources = message
+                    .policy
+                    .credentials
+                    .iter()
+                    .filter_map(|b| fresh_source(b).map(|source| (b.name.clone(), source)))
+                    .collect();
+                let resolver = Arc::new(SecretRefResolver::new(sources));
                 let interceptor = Interceptor::spawn(
                     InterceptorConfig {
-                        machine: launch.machine.clone(),
-                        policy: launch.policy.clone(),
-                        placeholders: launch.placeholders.clone(),
+                        machine: self.identity.machine.clone(),
+                        policy: message.policy.clone(),
+                        placeholders: message.placeholders.clone(),
                         ca,
                         upstream_roots_pem: Vec::new(),
                     },
@@ -823,48 +1030,67 @@ impl LiveCredentials {
                 state.running = Some(Running {
                     control: interceptor.control(),
                     resolver,
-                    ca_dir: launch.ca_dir.clone(),
-                    supplied_only: launch.supplied_only,
                     _owned: Some(interceptor),
+                });
+                state.previous = Some(Previous {
+                    policy: state.policy.clone(),
+                    placeholders: state.placeholders.clone(),
+                    supplied_only: state.supplied_only,
+                    resolver: None,
                 });
                 tracing::info!("credential interceptor started on a running machine");
             }
         }
-        let names: Vec<&str> = launch
+        let names: Vec<&str> = message
             .policy
             .credentials
             .iter()
             .map(|b| b.name.as_str())
             .collect();
-        tracing::info!(bindings = ?names, "credential bindings replaced");
-        state.policy = launch.policy;
+        tracing::info!(bindings = ?names, kept = ?kept, "credential bindings replaced");
+        state.policy = message.policy;
+        state.placeholders = message.placeholders;
+        state.supplied_only = supplied_only;
+        Ok(reply)
+    }
+
+    fn roll_back(&self) -> std::result::Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(previous) = state.previous.take() else {
+            return Err("there are no replaced bindings to restore".to_string());
+        };
+        match previous.resolver {
+            Some(resolver_state) => {
+                if let Some(running) = &state.running {
+                    let mut resolver = running.resolver.lock();
+                    running
+                        .control
+                        .replace_bindings(previous.policy.clone(), &previous.placeholders);
+                    *resolver = resolver_state;
+                }
+            }
+            None => {
+                // No interceptor ran before: stop the one started since.
+                if let Some(slot) = self.late {
+                    slot.clear();
+                }
+                state.running = None;
+            }
+        }
+        state.policy = previous.policy;
+        state.placeholders = previous.placeholders;
+        state.supplied_only = previous.supplied_only;
+        tracing::info!("credential bindings restored");
         Ok(())
     }
 }
 
-/// Where each binding of `launch` resolves from once it is in force: a
-/// binding the machine already has keeps its source (which may be a value its
-/// boot was handed); a new one takes the launch's source, except on a machine
-/// whose values are supplied, where it has none until a value is sent: such a
-/// machine must never resolve from this host's environment.
-fn next_sources(
-    launch: &CredentialLaunch,
-    current: &BTreeMap<String, SecretRef>,
-    supplied_only: bool,
-) -> BTreeMap<String, SecretRef> {
-    launch
-        .policy
-        .credentials
-        .iter()
-        .filter_map(|binding| {
-            let source = match current.get(&binding.name) {
-                Some(kept) => Some(kept.clone()),
-                None if supplied_only => None,
-                None => launch.sources.get(&binding.name).cloned(),
-            };
-            source.map(|source| (binding.name.clone(), source))
-        })
-        .collect()
+/// Where a running machine resolves each binding from: its source, and a
+/// value handed to it through [`CREDENTIALS_SOCKET`], which wins.
+#[derive(Clone, Default)]
+struct ResolverState {
+    sources: BTreeMap<String, SecretRef>,
+    live: BTreeMap<String, zeroize::Zeroizing<String>>,
 }
 
 /// Resolves each binding from its secret reference on every request, through
@@ -872,8 +1098,22 @@ fn next_sources(
 /// rotated file or variable takes effect on the next request. A value handed
 /// to the running machine through [`CREDENTIALS_SOCKET`] takes precedence.
 struct SecretRefResolver {
-    sources: Arc<Mutex<BTreeMap<String, SecretRef>>>,
-    live: LiveValues,
+    state: Mutex<ResolverState>,
+}
+
+impl SecretRefResolver {
+    fn new(sources: BTreeMap<String, SecretRef>) -> Self {
+        Self {
+            state: Mutex::new(ResolverState {
+                sources,
+                live: BTreeMap::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ResolverState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl CredentialResolver for SecretRefResolver {
@@ -881,24 +1121,19 @@ impl CredentialResolver for SecretRefResolver {
         &self,
         request: &CredentialRequest,
     ) -> std::result::Result<zeroize::Zeroizing<String>, ResolveError> {
-        if let Some(value) = self
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&request.binding)
-        {
+        // Held while reading the source too, so a binding swap (made under
+        // this lock) is never seen half-done.
+        let state = self.lock();
+        if let Some(value) = state.live.get(&request.binding) {
             return Ok(value.clone());
         }
-        let source = self
+        let source = state
             .sources
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .get(&request.binding)
-            .cloned()
             .ok_or(ResolveError::Unknown)?;
         crate::secrets::resolve_secret_ref_classified(
             &request.binding,
-            &source,
+            source,
             crate::secrets::ResolutionScope::RecordReplay,
         )
         .map_err(|failure| ResolveError::Unavailable(failure.as_str().to_string()))
@@ -1095,6 +1330,17 @@ mod tests {
             .clone()
     }
 
+    fn bindings_message(launch: &CredentialLaunch) -> String {
+        serde_json::json!({
+            "bindings": BindingsMessage {
+                policy: launch.policy.clone(),
+                placeholders: launch.placeholders.clone(),
+                supplied_only: launch.supplied_only,
+            }
+        })
+        .to_string()
+    }
+
     /// A running machine takes a rotated value through its credentials socket
     /// and resolves it from the next request, over the value it booted with.
     #[test]
@@ -1122,12 +1368,28 @@ mod tests {
         );
         assert_eq!(resolver.resolve(&github).unwrap().as_str(), "rotated");
         assert!(send(dir.path(), "{}").starts_with("error:"));
+        // Sources, the CA and the machine are the boot process's own; a
+        // message cannot name them.
+        let smuggled = send(
+            dir.path(),
+            r#"{"bindings":{"policy":{"credentials":[]},"placeholders":{},"sources":{}}}"#,
+        );
+        assert!(smuggled.starts_with("error:"), "{smuggled}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(CREDENTIALS_SOCKET))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "only the machine's user reaches it");
+        }
     }
 
-    /// New bindings reach a running machine whole: a kept binding keeps its
-    /// source and value, a removed one loses both, and a new one resolves from
-    /// its own source — or, on a machine whose values are supplied, only from
-    /// a value sent for it.
+    /// New bindings reach a running machine whole: a binding unchanged in
+    /// every respect keeps its source and value, a removed one loses both,
+    /// and a new one resolves from its own variable, or, on a machine whose
+    /// values are supplied, only from a value sent for it.
     #[test]
     fn bindings_sent_to_a_running_machine_replace_the_ones_it_booted_with() {
         for supplied_only in [false, true] {
@@ -1160,34 +1422,37 @@ mod tests {
             );
             next.placeholders
                 .insert("a".into(), launch.placeholders["a"].clone());
-            let message = serde_json::json!({ "launch": next }).to_string();
-            assert_eq!(send(dir.path(), &message), "ok");
+            let reply = send(dir.path(), &bindings_message(&next));
+            let (ok, data) = reply.split_once('\n').expect("ok and the CA");
+            assert_eq!(ok, "ok");
+            let reply: BindingsReply = serde_json::from_str(data).unwrap();
+            assert!(reply.ca_pem.contains("BEGIN CERTIFICATE"));
 
             let resolver = resolver_of(&live);
-            let sources = resolver.sources.lock().unwrap().clone();
+            let state = resolver.lock().clone();
             assert_eq!(
-                sources["a"].from_env.as_deref(),
+                state.sources["a"].from_env.as_deref(),
                 Some("SMOLVM_CREDENTIAL_0"),
-                "a kept binding resolves where it did"
+                "an unchanged binding resolves where it did"
             );
             assert!(
-                !sources.contains_key("b"),
+                !state.sources.contains_key("b"),
                 "a removed binding has no source"
             );
             assert_eq!(
-                sources.get("c").and_then(|s| s.from_env.as_deref()),
+                state.sources.get("c").and_then(|s| s.from_env.as_deref()),
                 (!supplied_only).then_some("C_KEY"),
                 "a new binding of a supplied machine never reads this host's environment"
             );
-            let held = resolver.live.lock().unwrap();
-            assert_eq!(held.get("a").map(|v| v.as_str()), Some("va"));
-            assert!(!held.contains_key("b"), "a removed binding drops its value");
-            drop(held);
+            assert_eq!(state.live.get("a").map(|v| v.as_str()), Some("va"));
+            assert!(
+                !state.live.contains_key("b"),
+                "a removed binding drops its value"
+            );
             assert!(matches!(
                 resolver.resolve(&request("b", "api.b.com")),
                 Err(ResolveError::Unknown)
             ));
-            // Values now name the new bindings, not the removed one.
             assert!(
                 send(dir.path(), r#"{"values":{"b":"x"}}"#).contains("no credential binding 'b'")
             );
@@ -1202,26 +1467,227 @@ mod tests {
         }
     }
 
-    /// A machine that booted without bindings serves the socket too, and its
-    /// first bindings start the interceptor and publish it to the network.
+    /// A binding whose hosts change, even under the same name and
+    /// placeholder, is a new binding: it keeps neither the value nor the
+    /// source it had, so a key bound to one service never reaches another.
+    #[test]
+    fn a_rebound_name_keeps_neither_value_nor_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openai");
+        std::fs::write(&path, "sk-openai").unwrap();
+        let launch = launch_in(dir.path(), &["key=OPENAI_KEY@api.openai.com"], false);
+        launch.ensure_ca().unwrap();
+        let (_interceptor, live) = launch
+            .spawn_interceptor([("key".into(), crate::secrets::file_ref(path))].into())
+            .unwrap();
+        live.clone().serve(dir.path());
+        assert_eq!(send(dir.path(), r#"{"values":{"key":"sk-live"}}"#), "ok");
+
+        let mut moved = launch_in(dir.path(), &["key=OPENAI_KEY@api.anthropic.com"], false);
+        moved.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&moved)).starts_with("ok"));
+        let state = resolver_of(&live).lock().clone();
+        assert!(
+            state.live.is_empty(),
+            "the value sent for the old binding is gone"
+        );
+        assert_eq!(
+            state.sources["key"].from_env.as_deref(),
+            Some("OPENAI_KEY"),
+            "the old file source is gone too"
+        );
+    }
+
+    /// An API caller or embedder replacing an operator's binding, even with
+    /// the very same binding, must never resolve it from this host: the
+    /// machine becomes supplied, so every host source and every value goes.
+    #[test]
+    fn a_supplied_replacement_drops_every_host_source_and_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gh");
+        std::fs::write(&path, "ghp_operator").unwrap();
+        let launch = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
+        launch.ensure_ca().unwrap();
+        let (_interceptor, live) = launch
+            .spawn_interceptor([("gh".into(), crate::secrets::file_ref(path))].into())
+            .unwrap();
+        live.clone().serve(dir.path());
+        assert_eq!(send(dir.path(), r#"{"values":{"gh":"ghp_cli"}}"#), "ok");
+
+        let mut hijack = launch_in(dir.path(), &["gh=GH_TOKEN@attacker.example"], true);
+        hijack.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&hijack)).starts_with("ok"));
+        let resolver = resolver_of(&live);
+        let state = resolver.lock().clone();
+        assert!(state.sources.is_empty(), "{:?}", state.sources.keys());
+        assert!(state.live.is_empty());
+        assert!(matches!(
+            resolver.resolve(&request("gh", "attacker.example")),
+            Err(ResolveError::Unknown)
+        ));
+        // The same binding, unchanged but now supplied, is no different.
+        let mut same = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], true);
+        same.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&same)).starts_with("ok"));
+        assert!(resolver.lock().sources.is_empty());
+        // Once supplied, a message cannot make it read this host again.
+        let mut back = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
+        back.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&back)).starts_with("ok"));
+        assert!(resolver.lock().sources.is_empty());
+    }
+
+    /// A rollback restores exactly what the last bindings replaced: policy,
+    /// placeholders, sources, values and whether values are supplied.
+    #[test]
+    fn a_rollback_restores_the_exact_previous_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = launch_in(
+            dir.path(),
+            &["a=A_KEY@api.a.com", "b=B_KEY@api.b.com"],
+            false,
+        );
+        launch.ensure_ca().unwrap();
+        let boot: BTreeMap<String, SecretRef> = [
+            ("a".to_string(), crate::secrets::env_ref("A_KEY")),
+            ("b".to_string(), crate::secrets::env_ref("B_KEY")),
+        ]
+        .into();
+        let (_interceptor, live) = launch.spawn_interceptor(boot.clone()).unwrap();
+        live.clone().serve(dir.path());
+        assert_eq!(send(dir.path(), r#"{"values":{"a":"va","b":"vb"}}"#), "ok");
+        let before = resolver_of(&live).lock().clone();
+
+        let next = launch_in(dir.path(), &["c=C_KEY@api.c.com"], true);
+        assert!(send(dir.path(), &bindings_message(&next)).starts_with("ok"));
+        assert!(live.state.lock().unwrap().supplied_only);
+        assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
+
+        let state = live.state.lock().unwrap();
+        assert!(!state.supplied_only);
+        assert_eq!(state.policy, launch.policy);
+        assert_eq!(state.placeholders, launch.placeholders);
+        drop(state);
+        let after = resolver_of(&live).lock().clone();
+        assert_eq!(after.sources, before.sources);
+        assert_eq!(
+            after
+                .live
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect::<Vec<_>>(),
+            before
+                .live
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert!(send(dir.path(), r#"{"rollback":true}"#).contains("no replaced bindings"));
+    }
+
+    /// A machine that booted without bindings serves the socket too. Its
+    /// first bindings make the boot process (the machine's own user) create
+    /// the CA in the machine's own directory and start the interceptor; a
+    /// rollback stops it again.
     #[test]
     fn the_first_bindings_start_an_interceptor_on_a_running_machine() {
         let dir = tempfile::tempdir().unwrap();
         let slot = smolvm_network::LateHttpsIntercept::new();
-        serve_without_bindings(dir.path(), slot);
+        let identity = CredentialIdentity {
+            machine: "live-test".into(),
+            ca_owner: "live-test".into(),
+            ca_dir: dir.path().join("ca"),
+        };
+        serve_without_bindings(dir.path(), identity.clone(), slot);
         assert!(send(dir.path(), r#"{"values":{"a":"x"}}"#).contains("no credential binding 'a'"));
         assert_eq!(send(dir.path(), r#"{"values":{}}"#), "ok");
         assert!(slot.get().is_none());
+        assert!(!identity.ca_dir.exists(), "no CA before the first binding");
 
         let launch = launch_in(dir.path(), &["a=A_KEY@api.a.com"], true);
-        launch.ensure_ca().unwrap();
-        let message = serde_json::json!({ "launch": launch }).to_string();
-        assert_eq!(send(dir.path(), &message), "ok");
+        let reply = send(dir.path(), &bindings_message(&launch));
+        assert!(reply.starts_with("ok\n"), "{reply}");
+        assert!(
+            MachineCa::exists(&identity.ca_dir),
+            "the boot process made the CA"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let key = std::fs::metadata(identity.ca_dir.join("ca.key")).unwrap();
+            // SAFETY: getuid has no preconditions.
+            assert_eq!(
+                key.uid(),
+                unsafe { libc::getuid() },
+                "owned by the boot process's user"
+            );
+            assert_eq!(key.mode() & 0o777, 0o600);
+        }
         assert!(
             slot.get().is_some(),
             "HTTPS now goes through the interceptor"
         );
         assert_eq!(send(dir.path(), r#"{"values":{"a":"x"}}"#), "ok");
+
+        assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
+        assert!(slot.get().is_none(), "back to relaying directly");
+        assert!(send(dir.path(), r#"{"values":{"a":"x"}}"#).contains("no credential binding 'a'"));
+    }
+
+    /// The guest is handed the CA unless its record says it already holds
+    /// that very certificate: a CA widened on disk by a sibling branch, or by
+    /// an attempt that was rolled back, still reaches it.
+    #[test]
+    fn the_guest_gets_the_ca_unless_it_holds_that_certificate() {
+        let mut record = VmRecord::new("trust".into(), 1, 512, vec![], vec![], true);
+        let first = MachineCa::generate("trust", &["api.a.com".to_string()]).unwrap();
+        let pem = first.certificate_pem().to_string();
+        assert!(guest_needs_ca(&record, &pem), "never given one");
+        record.credential_ca_trusted = Some(CredentialLaunch::ca_fingerprint(&pem));
+        assert!(!guest_needs_ca(&record, &pem));
+        let widened = first.widened(&["api.b.com".to_string()]).unwrap().unwrap();
+        assert!(
+            guest_needs_ca(&record, widened.certificate_pem()),
+            "a certificate widened elsewhere is new to this guest"
+        );
+    }
+
+    /// The host reads the CA without following links: a machine that swapped
+    /// any component for a link cannot make it read another file, and only a
+    /// certificate ever comes back.
+    #[cfg(unix)]
+    #[test]
+    fn the_host_reads_the_ca_without_following_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("credentials");
+        let ca = MachineCa::generate("m", &["api.a.com".to_string()]).unwrap();
+        ca.save(&ca_dir).unwrap();
+        let pem = read_ca_certificate(&ca_dir).unwrap();
+        assert_eq!(pem, ca.certificate_pem().replace("\r\n", "\n"));
+
+        // Trailing data after the certificate never comes back.
+        let guest = MachineCa::guest_dir(&ca_dir);
+        let mut padded = ca.certificate_pem().as_bytes().to_vec();
+        padded.extend_from_slice(b"SECRET-NOT-A-CERT\n");
+        std::fs::write(guest.join("ca.pem"), &padded).unwrap();
+        assert!(!read_ca_certificate(&ca_dir).unwrap().contains("SECRET"));
+
+        let elsewhere = dir.path().join("elsewhere");
+        ca.save(&elsewhere).unwrap();
+        // The file, the guest directory, and the CA directory itself.
+        std::fs::remove_file(guest.join("ca.pem")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("guest/ca.pem"), guest.join("ca.pem")).unwrap();
+        assert!(read_ca_certificate(&ca_dir).is_err());
+        std::fs::remove_dir_all(&guest).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("guest"), &guest).unwrap();
+        assert!(read_ca_certificate(&ca_dir).is_err());
+        std::fs::remove_dir_all(&ca_dir).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &ca_dir).unwrap();
+        assert!(read_ca_certificate(&ca_dir).is_err());
+        // Not a regular file.
+        std::fs::remove_file(&ca_dir).unwrap();
+        std::fs::create_dir_all(MachineCa::guest_dir(&ca_dir).join("ca.pem")).unwrap();
+        assert!(read_ca_certificate(&ca_dir).is_err());
     }
 
     /// The CA is created on first use and only widened afterwards, keeping
@@ -1266,10 +1732,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("refresh-token");
         let source = crate::secrets::file_ref(path.clone());
-        let resolver = SecretRefResolver {
-            sources: Arc::new(Mutex::new([("refresh".into(), source)].into())),
-            live: LiveValues::default(),
-        };
+        let resolver = SecretRefResolver::new([("refresh".into(), source)].into());
         let request = CredentialRequest {
             machine: "oauth-test".into(),
             binding: "refresh".into(),

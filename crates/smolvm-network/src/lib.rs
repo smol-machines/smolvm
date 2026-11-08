@@ -242,6 +242,11 @@ impl LateHttpsIntercept {
         *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some(endpoint);
     }
 
+    /// Relay HTTPS flows opened from now on directly again.
+    pub fn clear(&self) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// The interceptor HTTPS flows go to, once one was published.
     pub fn get(&self) -> Option<InterceptEndpoint> {
         *self.0.read().unwrap_or_else(|e| e.into_inner())

@@ -295,6 +295,21 @@ pub(crate) fn serve_control_socket(
     max_request_bytes: u64,
     apply: impl Fn(&str) -> Result<(), String> + Send + 'static,
 ) {
+    serve_control_socket_with_reply(path, thread_name, max_request_bytes, move |request| {
+        apply(request).map(|()| String::new())
+    });
+}
+
+/// [`serve_control_socket`] for requests that answer with data: a non-empty
+/// `Ok` follows the `ok` line. The socket is made private to this process's
+/// user: only the host, never another machine's process, may change a
+/// machine.
+pub(crate) fn serve_control_socket_with_reply(
+    path: std::path::PathBuf,
+    thread_name: &str,
+    max_request_bytes: u64,
+    apply: impl Fn(&str) -> Result<String, String> + Send + 'static,
+) {
     use std::io::{Read, Write};
     let listener = match crate::platform::uds::UdsListener::bind(&path) {
         Ok(listener) => listener,
@@ -303,6 +318,14 @@ pub(crate) fn serve_control_socket(
             return;
         }
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!(path = %path.display(), %error, "control socket left with default mode");
+        }
+    }
     let spawned = std::thread::Builder::new()
         .name(thread_name.into())
         .spawn(move || {
@@ -317,7 +340,8 @@ pub(crate) fn serve_control_socket(
                     .read_to_string(&mut request)
                 {
                     Ok(_) => match apply(&request) {
-                        Ok(()) => "ok\n".to_string(),
+                        Ok(data) if data.is_empty() => "ok\n".to_string(),
+                        Ok(data) => format!("ok\n{data}\n"),
                         Err(reason) => format!("error: {reason}\n"),
                     },
                     Err(error) => format!("error: {error}\n"),

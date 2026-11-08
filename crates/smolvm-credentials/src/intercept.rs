@@ -46,6 +46,10 @@ const REQUEST_LIMIT: usize = 8 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SESSIONS: usize = 256;
+/// Longest a guest may take to send a request body to a credential host. The
+/// bindings a request is checked against are fixed when it arrives, so a body
+/// that trickles in must not hold them open indefinitely.
+const BODY_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CACHED_CLIENTS: usize = 64;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -185,8 +189,11 @@ impl Interceptor {
 
 impl InterceptorControl {
     /// Enforce `policy` with `placeholders` from the next request on. A
-    /// request already being forwarded finishes under the bindings it began
-    /// with; every later one, on a new connection or an open one, uses these.
+    /// request that resolves a value after this is refused with a `503`
+    /// rather than sent with a value it was not checked against; every later
+    /// one, on a new connection or an open one, uses these. A caller that
+    /// also changes the resolver's values must do both under the lock its
+    /// resolver takes to resolve, so no resolution sees one without the other.
     /// A host no binding allows any more is spliced through untouched on its
     /// next connection, and a placeholder whose binding is gone is refused.
     pub fn replace_bindings(
@@ -364,6 +371,15 @@ impl State {
             .clone()
     }
 
+    /// Whether `seen` is still the bindings in force. A value is resolved by
+    /// binding name; checked after resolving, this proves the value belongs
+    /// to the binding the request was checked against, not to a binding of
+    /// the same name that replaced it meanwhile (the controller swaps
+    /// bindings and the resolver's values as one step).
+    fn bindings_unchanged(&self, seen: &Arc<Bindings>) -> bool {
+        Arc::ptr_eq(seen, &self.bindings())
+    }
+
     fn ca(&self) -> Arc<MachineCa> {
         self.ca.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -522,15 +538,24 @@ impl State {
             Ok(found) => found,
             Err(reason) => return Ok(text(StatusCode::FORBIDDEN, reason)),
         };
-        let body = match Limited::new(body, REQUEST_LIMIT).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => {
-                return Ok(text(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "smolvm credentials: request body exceeds 8 MiB",
-                ))
-            }
-        };
+        let body =
+            match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, REQUEST_LIMIT).collect())
+                .await
+            {
+                Ok(Ok(collected)) => collected.to_bytes(),
+                Ok(Err(_)) => {
+                    return Ok(text(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "smolvm credentials: request body exceeds 8 MiB",
+                    ))
+                }
+                Err(_) => {
+                    return Ok(text(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "smolvm credentials: request body took too long",
+                    ))
+                }
+            };
         let body_placeholder = match find_body_placeholder(&body) {
             Ok(found) => found,
             Err(reason) => return Ok(text(StatusCode::FORBIDDEN, reason)),
@@ -615,6 +640,9 @@ impl State {
                 Ok(secret) => secret,
                 Err(reply) => return Ok(reply),
             };
+            if !self.bindings_unchanged(&bindings) {
+                return Ok(bindings_changed());
+            }
             if let Some((header_name, _)) = &substitution {
                 let current = headers
                     .get(header_name)
@@ -665,6 +693,9 @@ impl State {
                 Ok(secret) => secret,
                 Err(reply) => return Ok(reply),
             };
+            if !self.bindings_unchanged(&bindings) {
+                return Ok(bindings_changed());
+            }
             let (Ok(name), Ok(mut value)) = (
                 header::HeaderName::from_bytes(header_name.as_bytes()),
                 header::HeaderValue::from_bytes(secret.as_bytes()),
@@ -834,6 +865,15 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
     }
     headers.remove("keep-alive");
     headers.remove("proxy-connection");
+}
+
+/// The reply to a request whose bindings were replaced while it was being
+/// handled: nothing was sent upstream, and a retry runs under the new ones.
+fn bindings_changed() -> Reply {
+    text(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "smolvm credentials: credential bindings changed during the request; retry",
+    )
 }
 
 fn text(status: StatusCode, message: &'static str) -> Reply {
@@ -1315,6 +1355,94 @@ mod tests {
                 "Bearer other-secret".to_string(),
                 format!("Bearer {}", f.placeholder),
             ]
+        );
+    }
+
+    /// A resolver that holds every resolution until released, so a test can
+    /// replace the bindings while a request is between check and send.
+    struct GatedResolver {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl CredentialResolver for GatedResolver {
+        fn resolve(
+            &self,
+            _request: &CredentialRequest,
+        ) -> std::result::Result<zeroize::Zeroizing<String>, crate::resolver::ResolveError>
+        {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(zeroize::Zeroizing::new("value-of-the-old-binding".into()))
+        }
+    }
+
+    /// Bindings replaced while a request resolves its value refuse the
+    /// request: the value was resolved by name and may belong to the binding
+    /// that replaced the one the request was checked against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_whose_bindings_change_while_it_resolves_is_refused() {
+        let upstream = start_upstream().await;
+        let policy = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "svc".into(),
+                environment_variable: "SVC_TOKEN".into(),
+                allowed_hosts: vec![CRED_HOST.into()],
+                injection_location: InjectionLocation::default(),
+                methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+                set_header: None,
+            }],
+        };
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let placeholder = placeholders["svc"].clone();
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let ca_pem = ca.certificate_pem().to_string();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: policy.clone(),
+                placeholders: placeholders.clone(),
+                ca,
+                upstream_roots_pem: vec![upstream.cert_pem.clone()],
+            },
+            Arc::new(GatedResolver {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+        )
+        .unwrap();
+        let f = Fixture {
+            upstream,
+            interceptor,
+            placeholder: placeholder.clone(),
+            ca_pem,
+        };
+        let control = f.interceptor.control();
+        let swapper = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            // The same name, now bound elsewhere.
+            let mut moved = policy.clone();
+            moved.credentials[0].allowed_hosts = vec![OTHER_HOST.into()];
+            control.replace_bindings(moved, &placeholders);
+            release_tx.send(()).unwrap();
+        });
+        let request = format!(
+            "GET /p HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        swapper.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("changed during the request"),
+            "{response}"
+        );
+        assert!(
+            f.upstream.seen.lock().unwrap().is_empty(),
+            "nothing went upstream"
         );
     }
 
