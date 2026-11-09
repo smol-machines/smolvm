@@ -29,9 +29,12 @@ at_least() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
 # IRQ_MAX 15): four -v mounts boot and five fail with "no more IRQs are
 # available". Any -p, --allow-host or --allow-cidr adds one virtio-net device,
 # however many ports. Measured on Windows Hypervisor Platform. v1.23.0 ships
-# libkrun with IRQ_MAX 23 (#1521) and its ceiling was not measured, so the check
-# applies to x86_64 through v1.22.2 only. arm64 guests have 128 IRQs.
-DEVICE_BUDGET=4
+# libkrun with IRQ_MAX 23 (#1521): on v1.34.0 on Linux KVM nine mounts boot and
+# ten fail with the same error, and the network device still counts as one.
+# v1.23.0 to v1.33.x were not measured and take the newer budget. arm64 guests
+# have 128 IRQs.
+DEVICE_BUDGET_TO_1_22=4
+DEVICE_BUDGET=9
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 note() { printf 'note=%s\n' "$1"; }
@@ -144,14 +147,16 @@ net_devices=0
 emit planned_mounts "$mounts"
 emit planned_ports "$ports"
 emit devices_requested "$((mounts + net_devices))"
-if [ "$arch" = "x86_64" ] && [ -n "${version:-}" ] && [ "$version" != "unknown" ] && ! at_least "$version" "1.22.3"; then
-    emit device_budget "$DEVICE_BUDGET"
-    if [ "$((mounts + net_devices))" -le "$DEVICE_BUDGET" ]; then
+if [ "$arch" = "x86_64" ] && [ -n "${version:-}" ] && [ "$version" != "unknown" ]; then
+    budget="$DEVICE_BUDGET"
+    at_least "$version" "1.22.3" || budget="$DEVICE_BUDGET_TO_1_22"
+    emit device_budget "$budget"
+    if [ "$((mounts + net_devices))" -le "$budget" ]; then
         emit device_budget_ok yes
     else
         emit device_budget_ok no
         blocked=1
-        note "on x86_64 through v1.22.2 more than four devices beyond the base set fail with 'no more IRQs are available'; a published port or an --allow-host grant is one. Combine directories under one mount."
+        note "on x86_64 more than $budget devices beyond the base set fail with 'no more IRQs are available' (four through v1.22.2, nine from v1.23.0); a published port or an --allow-host grant is one. Combine directories under one mount."
     fi
 else
     emit device_budget_ok not_limiting
