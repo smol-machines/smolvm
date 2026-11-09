@@ -64,6 +64,12 @@ including credential helpers, or the ones a client sends (`X-Registry-Auth`). A
   mounted over a path the image has files at starts with those files, as with Docker. On Linux,
   the owner a container sets on a volume's files (a database's `chown`) is kept as an extended
   attribute, so it holds without root on the host.
+- **Anonymous volumes**: every `VOLUME` an image declares, and every `-v /path` without a
+  source, gets a new volume named by a random id, as with Docker, unless something else is
+  mounted there. It starts with the image's files at that path, stays with the container across
+  restarts (and across a Compose recreate), and goes with `docker rm -v` or `docker volume prune`.
+- **`--volumes-from`** mounts another container's volumes and binds at the same paths (`:ro`
+  makes them read-only).
 - **tmpfs** (`--tmpfs`, `--mount type=tmpfs`) is a tmpfs in the machine.
 
 ## Ports
@@ -149,5 +155,4 @@ What the clients send, for whoever adds builds:
 
 - IPv6 networks, other network drivers than `bridge`, and `--network container:<name>`.
 - `docker save`, `docker load`, `docker push` and `docker commit`.
-- A volume for each `VOLUME` an image declares: that path stays in the container's own filesystem.
 - Changing an internal network's egress after a container on it was created.

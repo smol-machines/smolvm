@@ -773,9 +773,50 @@ fn resolve_mounts(
             ..default_mount()
         })?;
     }
-    // Anonymous volumes the client asked for (`docker run -v /data`).
-    for dest in req.config.volumes.keys() {
-        if mounts.iter().any(|m| &m.destination == dest) {
+    // `--volumes-from`: another container's volumes and binds, at the same
+    // paths, read-only with `:ro`.
+    for from in &req.host_config.volumes_from {
+        let (name, mode) = from.split_once(':').unwrap_or((from.as_str(), ""));
+        let other = engine
+            .find_container(name)
+            .ok_or_else(|| ApiError::no_such_container(name))?;
+        for m in other.record().mounts {
+            if m.kind == "tmpfs" || mounts.iter().any(|o| o.destination == m.destination) {
+                continue;
+            }
+            let read_only = match mode {
+                "ro" => true,
+                "rw" => false,
+                _ => m.read_only,
+            };
+            mounts.push(MountRecord {
+                read_only,
+                copy_up: false,
+                share: None,
+                ..m
+            });
+        }
+    }
+    // Anonymous volumes the client asked for (`docker run -v /data`) and
+    // the ones the image declares (`VOLUME` in its Dockerfile), for every
+    // path nothing else is mounted on, as Docker creates them. Each starts
+    // with the image's content at its path.
+    let image_volumes: Vec<String> = image.container_config()["Volumes"]
+        .as_object()
+        .map(|v| v.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut wanted: Vec<String> = req.config.volumes.keys().cloned().collect();
+    for dest in image_volumes {
+        if !wanted.contains(&dest) {
+            wanted.push(dest);
+        }
+    }
+    for dest in &wanted {
+        let dest = normalize_destination(dest);
+        if mounts
+            .iter()
+            .any(|m| normalize_destination(&m.destination) == dest)
+        {
             continue;
         }
         let (vol, _) =
@@ -785,12 +826,12 @@ fn resolve_mounts(
         mounts.push(MountRecord {
             kind: "volume".into(),
             source: vol.name,
-            destination: dest.clone(),
+            destination: dest,
             copy_up: true,
             ..default_mount()
         });
     }
-    let _ = (image, id);
+    let _ = id;
 
     // Turn binds and volumes into machine shares. A bind of a host socket
     // becomes a socket bridge (the Docker socket included); a bind of one
@@ -857,6 +898,17 @@ fn resolve_mounts(
         m.subpath = subpath;
     }
     Ok((mounts, shares, sockets))
+}
+
+/// A mount destination without a trailing slash, so `/data/` and `/data`
+/// are the same path.
+fn normalize_destination(dest: &str) -> String {
+    let trimmed = dest.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".into()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn default_mount() -> MountRecord {

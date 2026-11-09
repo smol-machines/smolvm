@@ -285,6 +285,42 @@ test_new_volume_takes_the_image_content() {
     run --rm -v "$vol:/etc/apk" alpine ls /etc/apk | has repositories
 }
 
+# `VOLUME /data` in redis's image: an anonymous volume, as with Docker, that
+# starts with the image's directory (owner included), outlives a restart and
+# goes with `rm -v`; `--volumes-from` mounts it in another container; and
+# Compose keeps it across a recreate.
+test_image_volumes_are_anonymous_volumes() {
+    local name="$PREFIX-imgvol" vol
+    run -d --name "$name" redis:7-alpine >/dev/null || return 1
+    vol=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$name")
+    [[ ${#vol} -eq 64 ]] || return 1
+    docker volume inspect -f '{{json .Labels}}' "$vol" | has com.docker.volume.anonymous || return 1
+    [[ "$(docker exec "$name" stat -c %U /data)" == redis ]] || return 1
+    docker exec "$name" sh -c 'echo kept > /data/marker' || return 1
+    docker restart -t 1 "$name" >/dev/null || return 1
+    [[ "$(docker exec "$name" cat /data/marker)" == kept ]] || return 1
+    [[ "$(run --rm --volumes-from "$name:ro" alpine cat /data/marker)" == kept ]] || return 1
+    run --rm --volumes-from "$name:ro" alpine sh -c 'echo x > /data/other' 2>/dev/null && return 1
+    docker rm -f -v "$name" >/dev/null || return 1
+    docker volume inspect "$vol" >/dev/null 2>&1 && return 1
+
+    mkdir -p "$WORK/imgvol"
+    cat >"$WORK/imgvol/compose.yaml" <<EOF
+name: ${PREFIX}-imgvol
+services:
+  cache:
+    image: redis:7-alpine
+    labels: ["$PREFIX"]
+EOF
+    (cd "$WORK/imgvol" && docker compose up -d) >/dev/null 2>&1 || return 1
+    (cd "$WORK/imgvol" && docker compose exec -T cache sh -c 'echo kept > /data/marker') || return 1
+    (cd "$WORK/imgvol" && docker compose up -d --force-recreate) >/dev/null 2>&1 || return 1
+    local out
+    out=$(cd "$WORK/imgvol" && docker compose exec -T cache cat /data/marker) || return 1
+    (cd "$WORK/imgvol" && docker compose down -v) >/dev/null 2>&1
+    [[ "$out" == kept ]]
+}
+
 test_bind_mounts_dir_file_readonly() {
     mkdir -p "$WORK/dir" && echo from-host >"$WORK/dir/f"
     echo single >"$WORK/single.conf"
@@ -463,6 +499,7 @@ run_test "images list, inspect, tag, remove" test_image_list_inspect_tag_remove 
 run_test "build is refused clearly" test_build_is_refused_clearly || true
 run_test "named volume persists" test_named_volume_persists || true
 run_test "new volume takes the image content" test_new_volume_takes_the_image_content || true
+run_test "image volumes are anonymous volumes" test_image_volumes_are_anonymous_volumes || true
 run_test "bind mounts: dir, file, read-only" test_bind_mounts_dir_file_readonly || true
 run_test "tmpfs" test_tmpfs || true
 run_test "networks: names, aliases, isolation" test_networks_names_aliases_isolation || true

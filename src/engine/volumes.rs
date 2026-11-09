@@ -25,6 +25,9 @@ pub(crate) struct VolumeRecord {
     pub anonymous: bool,
 }
 
+/// The label Docker puts on the volumes it names itself.
+const ANONYMOUS_LABEL: &str = "com.docker.volume.anonymous";
+
 /// The engine's volumes.
 pub(crate) struct Volumes {
     records: parking_lot::RwLock<HashMap<String, VolumeRecord>>,
@@ -81,6 +84,11 @@ impl Volumes {
         if let Some(existing) = self.get(&name) {
             return Ok((existing, false));
         }
+        // Docker marks the volumes it names itself.
+        let mut labels = labels;
+        if anonymous {
+            labels.insert(ANONYMOUS_LABEL.to_string(), String::new());
+        }
         std::fs::create_dir_all(self.mountpoint(&name))
             .map_err(|e| ApiError::internal(format!("create volume directory for {name}: {e}")))?;
         let record = VolumeRecord {
@@ -103,7 +111,7 @@ impl Volumes {
             return Err(ApiError::not_found(format!("get {name}: no such volume")));
         }
         store.remove_object("volumes", name);
-        let _ = std::fs::remove_dir_all(self.root.join(name));
+        remove_tree(&self.root.join(name));
         Ok(())
     }
 
@@ -138,9 +146,55 @@ pub(crate) fn matches(volume: &VolumeRecord, filters: &Filters, in_use: bool) ->
         && filters.labels_match("label", &volume.labels)
 }
 
+/// Remove a volume's directory even where a container left directories its
+/// owner may not enter (an overlayfs work directory is mode 0): those get
+/// their owner's access back first.
+fn remove_tree(path: &std::path::Path) {
+    if std::fs::remove_dir_all(path).is_ok() || !path.exists() {
+        return;
+    }
+    fn open_up(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
+        if !meta.is_dir() {
+            return;
+        }
+        let mode = meta.permissions().mode() | 0o700;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode));
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                open_up(&entry.path());
+            }
+        }
+    }
+    open_up(path);
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        tracing::warn!(path = %path.display(), error = %e, "could not remove a volume's directory");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volume_with_closed_directories_is_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let vol = dir.path().join("v");
+        std::fs::create_dir_all(vol.join("work/work")).unwrap();
+        std::fs::write(vol.join("work/work/f"), b"x").unwrap();
+        std::fs::set_permissions(
+            vol.join("work/work"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::set_permissions(vol.join("work"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        remove_tree(&vol);
+        assert!(!vol.exists());
+    }
 
     #[test]
     fn create_is_idempotent_and_remove_deletes_data() {
