@@ -22,8 +22,8 @@ on Linux aarch64 on v1.22.2 on 2026-10-03.
 - **A branch's captured state stays on this host and cannot be exported.** So a branch point is
   paired with a checkpoint taken at the same moment, which is the copy you keep.
 - **`--branchable` at `start` decides what a machine can do later.** A branch source needs it on
-  every host, and on macOS so does a stored capture, which is what the scripts here take; Linux
-  checkpoints and pauses without it. `README.md` has the errors when it is missing. The scripts
+  every host, and on macOS before v1.24.0 so does a stored capture, which is what the scripts here
+  take; Linux checkpoints and pauses without it. `README.md` has the errors when it is missing. The scripts
   always start with it.
 
 ## Procedure
@@ -62,10 +62,11 @@ The workload writes a counter into `/dev/shm` every second, which is tmpfs and s
 the disk. `--branch-ready` makes the workload park in `smolvm-branch-ready` after its setup, which a
 batch branch waits for.
 
-**Or the user's own machine.** Name it with `--name` in the steps below. On macOS, if it was
-started without `--branchable`, the first capture fails with `deferred durable save requires
-file-backed guest RAM` on v1.22.2 or `guest RAM has no file-backed regions` before v1.20.0, and the
-only fix is a restart with the flag:
+**Or the user's own machine.** Name it with `--name` in the steps below. On macOS before v1.24.0,
+if it was started without `--branchable`, the first capture fails with `deferred durable save
+requires file-backed guest RAM` (v1.20.0 to v1.23.7) or `guest RAM has no file-backed regions`
+(before v1.20.0); from v1.24.0 the capture falls back to a synchronous save (#1584) and works. On
+the older releases, and for a branch on any release, the only fix is a restart with the flag:
 
 ```bash
 smolvm machine stop  --name worker
