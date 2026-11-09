@@ -283,6 +283,11 @@ impl ServeStartCmd {
             tracing::info!("verbose logging enabled");
         }
 
+        // A node admitting branches for a control plane: on a large host, keep
+        // the host reserve and charge each child for its growth (local CLI use
+        // and small hosts keep the old, looser defaults).
+        smolvm::agent::fork::enable_serve_branch_admission();
+
         // Per-VM resource isolation + lossless-restart placement. Two paths:
         //
         // - systemd host: adopt each VM into its OWN `smolvm-vm-<id>.scope` after

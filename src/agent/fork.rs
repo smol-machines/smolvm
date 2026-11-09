@@ -672,13 +672,53 @@ pub struct BranchAdmissionParams {
 /// over minutes; on 2026-11-09 thousands of 16-32 GiB children admitted at
 /// 64 MiB each grew three 755-1511 GiB workers into a global OOM. A quarter of
 /// the guest is what a busy child plausibly makes private while keeping
-/// copy-on-write density at 4x the guest-RAM sum.
+/// copy-on-write density at 4x the guest-RAM sum. Only a default on large
+/// serve hosts (see [`branch_admission_defaults`]).
 const DEFAULT_BRANCH_CHILD_GROWTH_FRACTION: f64 = 0.25;
 
-/// `SMOLVM_BRANCH_CHILD_GROWTH_FRACTION`, clamped to `0..=1`.
-fn branch_child_growth_fraction(configured: Option<&str>) -> Result<f64> {
+/// Hosts at least this large (MiB) get the host-derived branch reserve and the
+/// per-child growth charge by default when they run `smolvm serve`. Laptops,
+/// dev boxes and CI runners keep the old 5%/4 GiB reserve and 64 MiB per child:
+/// they branch a handful of children and a 2 GiB-per-child charge would refuse
+/// fan-outs that fit there fine.
+const LARGE_SERVE_HOST_MIN_MIB: u64 = 128 * 1024;
+
+/// Set once by `smolvm serve` at startup: this process is a node that admits
+/// branches for a control plane, not a local CLI invocation.
+static SERVE_BRANCH_ADMISSION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as `smolvm serve`, so a large host uses the stricter
+/// branch admission defaults.
+pub fn enable_serve_branch_admission() {
+    SERVE_BRANCH_ADMISSION.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The default `(reserve_mib, child_growth_fraction)` for a host with
+/// `total_mib` of memory that keeps `host_reserved_mib` out of reach of VMs.
+/// Only `smolvm serve` on a host of at least [`LARGE_SERVE_HOST_MIN_MIB`]
+/// raises the reserve to the host reserve and charges child growth; everywhere
+/// else the old defaults hold. Explicit env vars override both either way.
+fn branch_admission_defaults(
+    total_mib: u64,
+    under_serve: bool,
+    host_reserved_mib: u64,
+) -> (u64, f64) {
+    if under_serve && total_mib >= LARGE_SERVE_HOST_MIN_MIB {
+        (
+            default_branch_reserve_mib(total_mib, host_reserved_mib),
+            DEFAULT_BRANCH_CHILD_GROWTH_FRACTION,
+        )
+    } else {
+        (default_branch_reserve_mib(total_mib, 0), 0.0)
+    }
+}
+
+/// `SMOLVM_BRANCH_CHILD_GROWTH_FRACTION`, clamped to `0..=1`, or `default`
+/// when unset.
+fn branch_child_growth_fraction(configured: Option<&str>, default: f64) -> Result<f64> {
     let Some(value) = configured else {
-        return Ok(DEFAULT_BRANCH_CHILD_GROWTH_FRACTION);
+        return Ok(default);
     };
     match value.trim().parse::<f64>() {
         Ok(fraction) if !fraction.is_nan() => Ok(fraction.clamp(0.0, 1.0)),
@@ -703,13 +743,13 @@ pub fn branch_admission_params(total_mib: u64) -> Result<Option<BranchAdmissionP
     if std::env::var("SMOLVM_BRANCH_MEMORY_ADMISSION").as_deref() == Ok("0") {
         return Ok(None);
     }
-    let reserve_mib = branch_admission_value(
-        "SMOLVM_HOST_MEMORY_RESERVE_MIB",
-        default_branch_reserve_mib(
-            total_mib,
-            crate::systemd_scope::configured_host_reserved_memory_mib(total_mib),
-        ),
-    )?;
+    let (default_reserve_mib, default_growth_fraction) = branch_admission_defaults(
+        total_mib,
+        SERVE_BRANCH_ADMISSION.load(std::sync::atomic::Ordering::Relaxed),
+        crate::systemd_scope::configured_host_reserved_memory_mib(total_mib),
+    );
+    let reserve_mib =
+        branch_admission_value("SMOLVM_HOST_MEMORY_RESERVE_MIB", default_reserve_mib)?;
     // H100 and ordinary Linux QA put a booted, idle VMM at roughly 39–42 MiB.
     // Reserve 64 MiB to include thread stacks and transient launch state.
     let child_overhead_mib = branch_admission_value("SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD", 64)?;
@@ -717,6 +757,7 @@ pub fn branch_admission_params(total_mib: u64) -> Result<Option<BranchAdmissionP
         std::env::var("SMOLVM_BRANCH_CHILD_GROWTH_FRACTION")
             .ok()
             .as_deref(),
+        default_growth_fraction,
     )?;
     Ok(Some(BranchAdmissionParams {
         reserve_mib,
@@ -4864,13 +4905,52 @@ mod tests {
 
     #[test]
     fn child_growth_fraction_defaults_clamps_and_rejects_junk() {
-        assert_eq!(branch_child_growth_fraction(None).unwrap(), 0.25);
-        assert_eq!(branch_child_growth_fraction(Some("0.5")).unwrap(), 0.5);
-        assert_eq!(branch_child_growth_fraction(Some(" 0 ")).unwrap(), 0.0);
-        assert_eq!(branch_child_growth_fraction(Some("3")).unwrap(), 1.0);
-        assert_eq!(branch_child_growth_fraction(Some("-1")).unwrap(), 0.0);
-        assert!(branch_child_growth_fraction(Some("NaN")).is_err());
-        assert!(branch_child_growth_fraction(Some("lots")).is_err());
+        assert_eq!(branch_child_growth_fraction(None, 0.25).unwrap(), 0.25);
+        assert_eq!(branch_child_growth_fraction(None, 0.0).unwrap(), 0.0);
+        // An explicit value wins over either default.
+        assert_eq!(branch_child_growth_fraction(Some("0.5"), 0.0).unwrap(), 0.5);
+        assert_eq!(
+            branch_child_growth_fraction(Some(" 0 "), 0.25).unwrap(),
+            0.0
+        );
+        assert_eq!(branch_child_growth_fraction(Some("3"), 0.25).unwrap(), 1.0);
+        assert_eq!(branch_child_growth_fraction(Some("-1"), 0.25).unwrap(), 0.0);
+        assert!(branch_child_growth_fraction(Some("NaN"), 0.25).is_err());
+        assert!(branch_child_growth_fraction(Some("lots"), 0.25).is_err());
+    }
+
+    #[test]
+    fn only_serve_on_a_large_host_gets_the_stricter_branch_defaults() {
+        let host_reserved = |total| crate::systemd_scope::host_reserved_memory_mib(total, None);
+        // 755 GiB worker under serve: host reserve + quarter-guest growth.
+        let worker = 755 * 1024;
+        assert_eq!(
+            branch_admission_defaults(worker, true, host_reserved(worker)),
+            (46387, 0.25)
+        );
+        // The same host from the CLI keeps the old defaults.
+        assert_eq!(
+            branch_admission_defaults(worker, false, host_reserved(worker)),
+            (4096, 0.0)
+        );
+        // A 64 GiB dev box keeps them even under serve.
+        let dev = 64 * 1024;
+        assert_eq!(
+            branch_admission_defaults(dev, true, host_reserved(dev)),
+            (3276, 0.0)
+        );
+        // 128 GiB is the threshold.
+        let edge = 128 * 1024;
+        assert_eq!(
+            branch_admission_defaults(edge, true, host_reserved(edge)),
+            (8192, 0.25)
+        );
+        assert_eq!(
+            branch_admission_defaults(edge - 1, true, host_reserved(edge - 1)),
+            (4096, 0.0)
+        );
+        // SMOLVM_HOST_RESERVED_MEMORY_MB=0 leaves the old reserve on a worker.
+        assert_eq!(branch_admission_defaults(worker, true, 0), (4096, 0.25));
     }
 
     #[test]
