@@ -23,9 +23,9 @@ use crate::secrets::ResolutionError;
 /// attempts that flood `secrets: {...}` with thousands of entries.
 pub(crate) const MAX_REQ_SECRETS_PER_REQUEST: usize = 64;
 
-/// Resolve a [`MachineEntry`]'s persisted `secret_refs` under
-/// `RecordReplay` scope and add its credential placeholders. In-memory
-/// access — no DB hit per request.
+/// Resolve a machine's persisted `secret_refs` under `RecordReplay` scope and
+/// add its credential placeholders, read from its record (the entry only
+/// when there is none).
 ///
 /// Returns the plaintext `(key, value)` tuples ready to extend into an
 /// env vector. A variable bound to a credential yields its placeholder, never
@@ -34,17 +34,28 @@ pub(crate) const MAX_REQ_SECRETS_PER_REQUEST: usize = 64;
 /// across exec/run handlers.
 pub(crate) fn record_secret_refs_env(
     entry: &std::sync::Arc<parking_lot::Mutex<MachineEntry>>,
+    record: Option<&crate::config::VmRecord>,
 ) -> Result<Vec<(String, String)>, ApiError> {
-    let (refs, credential_env) = {
-        let guard = entry.lock();
-        let credentials = guard.credentials.as_ref();
-        crate::credentials::workload_env(
-            credentials.map(|c| &c.policy),
-            credentials
-                .map(|c| &c.placeholders)
-                .unwrap_or(&Default::default()),
-            &guard.secret_refs,
-        )
+    // The record is the truth: the CLI or an embedder may have changed the
+    // bindings (and which references they withhold) since this server loaded
+    // its entry. The entry serves only when there is no record to read.
+    let (refs, credential_env) = match record {
+        Some(record) => crate::credentials::workload_env(
+            record.credential_policy.as_ref(),
+            &record.credential_placeholders,
+            &record.secret_refs,
+        ),
+        None => {
+            let guard = entry.lock();
+            let credentials = guard.credentials.as_ref();
+            crate::credentials::workload_env(
+                credentials.map(|c| &c.policy),
+                credentials
+                    .map(|c| &c.placeholders)
+                    .unwrap_or(&Default::default()),
+                &guard.secret_refs,
+            )
+        }
     };
     let mut env = if refs.is_empty() {
         Vec::new()
@@ -134,7 +145,7 @@ pub(crate) fn machine_command_context(
     let mut env = record.map(|record| record.env.clone()).unwrap_or_default();
     use crate::util::layer_env;
     layer_env(&mut env, crate::api::types::EnvVar::to_tuples(request_env));
-    layer_env(&mut env, record_secret_refs_env(entry)?);
+    layer_env(&mut env, record_secret_refs_env(entry, record)?);
     layer_env(
         &mut env,
         crate::secrets::expose_into_env(resolve_request_secrets(request_secrets)?),

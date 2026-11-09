@@ -434,6 +434,8 @@ pub struct RestoredState {
     pub credentials_from_artifact: bool,
     /// The captured boot mounted the credential CA as a boot device.
     pub credential_ca_device: Option<bool>,
+    /// The captured guest agent can be handed a credential CA live.
+    pub guest_credential_trust: Option<bool>,
 }
 
 /// A [`CreateSpec`] with every rule applied: the machine's settings, ready to
@@ -1332,6 +1334,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                         .as_ref()
                         .is_some_and(|policy| !policy.is_empty()),
                     credential_ca_device: captured_net.credential_ca_device,
+                    guest_credential_trust: captured_net.guest_credential_trust,
                 }),
             }
         }
@@ -1602,6 +1605,7 @@ impl ResolvedSpec {
             credential_ca_device: restored.credential_ca_device,
             // Unknown for a restore: its guest is handed the CA once it runs.
             credential_ca_trusted: None,
+            guest_credential_trust: restored.guest_credential_trust,
             ephemeral,
             source_smolmachine: None,
             packed_image_on_storage: false,

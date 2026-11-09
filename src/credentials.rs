@@ -134,6 +134,11 @@ pub struct CredentialLaunch {
     /// environment (bindings that arrived over the HTTP API).
     #[serde(default)]
     pub supplied_only: bool,
+    /// The machine's secret references by variable, so a binding the host
+    /// operator adds while the machine runs resolves from the same place it
+    /// would at boot (a file read per request, say). References only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub host_sources: BTreeMap<String, SecretRef>,
     /// The launcher mounts the CA read-only at [`GUEST_CA_DIR`] as a boot
     /// device. False when the boot restores saved memory whose device set had
     /// no such mount (the machine gained its bindings after that boot): the
@@ -220,6 +225,7 @@ impl CredentialLaunch {
             sources,
             supplied_only: false,
             ca_boot_mount: true,
+            host_sources: secret_refs.clone(),
         }
     }
 
@@ -229,6 +235,7 @@ impl CredentialLaunch {
             machine: self.machine.clone(),
             ca_owner: self.ca_owner.clone(),
             ca_dir: self.ca_dir.clone(),
+            host_sources: self.host_sources.clone(),
         }
     }
 
@@ -329,16 +336,40 @@ pub struct CredentialIdentity {
     pub ca_owner: String,
     /// The CA's host directory.
     pub ca_dir: PathBuf,
+    /// The machine's secret references by variable (references only), where
+    /// a binding the host operator adds while it runs resolves from. Never
+    /// used for a machine whose values are supplied.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub host_sources: BTreeMap<String, SecretRef>,
 }
 
 impl CredentialIdentity {
-    /// The identity of machine `name`, branched from `golden` if it was.
-    pub fn of(name: &str, golden: Option<&str>) -> Self {
-        let ca_owner = golden.unwrap_or(name);
+    /// The identity of machine `name` with `record`'s secret references.
+    pub fn of(name: &str, record: &VmRecord) -> Self {
+        let ca_owner = record.golden.as_deref().unwrap_or(name);
         Self {
             machine: name.to_string(),
             ca_owner: ca_owner.to_string(),
             ca_dir: ca_dir(ca_owner),
+            host_sources: record.secret_refs.clone(),
+        }
+    }
+}
+
+impl CredentialLaunch {
+    /// A launch with no binding, for a boot that must still recreate the CA
+    /// device a saved guest was saved with.
+    pub fn without_bindings(identity: &CredentialIdentity, supplied_only: bool) -> Self {
+        Self {
+            machine: identity.machine.clone(),
+            policy: CredentialPolicy::default(),
+            placeholders: BTreeMap::new(),
+            ca_owner: identity.ca_owner.clone(),
+            ca_dir: identity.ca_dir.clone(),
+            sources: BTreeMap::new(),
+            supplied_only,
+            ca_boot_mount: true,
+            host_sources: identity.host_sources.clone(),
         }
     }
 }
@@ -564,22 +595,30 @@ pub fn set_bindings(
     policy: CredentialPolicy,
     caller: crate::machine_spec::Caller,
 ) -> std::result::Result<VmRecord, BindingsError> {
+    set_bindings_then(db, name, policy, caller, |_, _, _| Ok(()))
+}
+
+/// [`set_bindings`], then `then(before, saved, running)` while the change is
+/// still exclusive: no other binding change, and no start, can land between
+/// the two (the CLI hands a running machine values for the bindings it just
+/// set this way, so none can reach a binding someone else set meanwhile).
+pub fn set_bindings_then(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    policy: CredentialPolicy,
+    caller: crate::machine_spec::Caller,
+    then: impl FnOnce(&VmRecord, &VmRecord, bool) -> Result<()>,
+) -> std::result::Result<VmRecord, BindingsError> {
     use crate::config::RecordState;
-    let read = || {
-        db.get_vm(name)
-            .map_err(BindingsError::Failed)?
-            .ok_or_else(|| BindingsError::Failed(Error::vm_not_found(name)))
-    };
-    let mut record = read()?;
-    // Changes to a running machine are serialized across processes, so the
-    // boot process and the record never see two of them interleaved.
-    let _lock = if record.actual_state() == RecordState::Running {
-        let lock = lock_bindings(name).map_err(BindingsError::Failed)?;
-        record = read()?;
-        Some(lock)
-    } else {
-        None
-    };
+    // Every change to one machine's bindings, and every start of it, is
+    // serialized across processes: a start never boots bindings a change is
+    // replacing, and the boot process and the record never see two changes
+    // interleaved.
+    let _lock = lock_bindings(name).map_err(BindingsError::Failed)?;
+    let record = db
+        .get_vm(name)
+        .map_err(BindingsError::Failed)?
+        .ok_or_else(|| BindingsError::Failed(Error::vm_not_found(name)))?;
     let running = match record.actual_state() {
         RecordState::Running => true,
         RecordState::Created | RecordState::Stopped | RecordState::Failed | RecordState::Paused => {
@@ -592,10 +631,13 @@ pub fn set_bindings(
             }))
         }
     };
-    let next = record
-        .with_credential_bindings(policy, caller)
-        .map_err(BindingsError::Invalid)?;
-    let mut next = next;
+    let mut next =
+        record
+            .with_credential_bindings(policy, caller)
+            .map_err(|error| match error {
+                Error::Agent { .. } => BindingsError::Conflict(error),
+                other => BindingsError::Invalid(other),
+            })?;
     if running {
         if let Some(trusted) = apply_live_bindings(name, &record, &next)? {
             next.credential_ca_trusted = Some(trusted);
@@ -610,7 +652,9 @@ pub fn set_bindings(
                     .credential_policy
                     .as_ref()
                     .unwrap_or(&CredentialPolicy::default()),
+                &saved.credential_placeholders,
             );
+            then(&record, &saved, running).map_err(BindingsError::Conflict)?;
             Ok(saved)
         }
         failed => {
@@ -626,8 +670,9 @@ pub fn set_bindings(
     }
 }
 
-/// Serialize binding changes to one machine across processes.
-fn lock_bindings(name: &str) -> Result<std::fs::File> {
+/// Serialize binding changes to one machine, and its starts, across
+/// processes.
+pub(crate) fn lock_bindings(name: &str) -> Result<std::fs::File> {
     let dir = crate::agent::vm_data_dir(name);
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::agent("credentials update lock", e.to_string()))?;
@@ -661,9 +706,11 @@ pub fn apply_live_bindings(
     before
         .check_live_credentials(next)
         .map_err(BindingsError::Conflict)?;
-    let Some(policy) = next.credential_policy.clone() else {
+    // Removing every binding still reaches the boot process, as an empty set.
+    if before.credential_policy.is_none() && next.credential_policy.is_none() {
         return Ok(None);
-    };
+    }
+    let policy = next.credential_policy.clone().unwrap_or_default();
     let capable =
         crate::agent::supports_live_credential_trust(name).map_err(BindingsError::Conflict)?;
     let message = BindingsMessage {
@@ -671,8 +718,16 @@ pub fn apply_live_bindings(
         placeholders: next.credential_placeholders.clone(),
         supplied_only: next.credentials_supplied_by_api,
     };
-    let reply = crate::agent::apply_live_credential_policy(name, &message)
-        .map_err(BindingsError::Conflict)?;
+    let reply = match crate::agent::apply_live_credential_policy(name, &message) {
+        Ok(reply) => reply,
+        Err(error) => {
+            // The boot process may have applied it and only the answer was
+            // lost (a timeout): put back what it had. One that refused it
+            // kept nothing to roll back to, and says so.
+            roll_back_live_bindings(name);
+            return Err(BindingsError::Conflict(error));
+        }
+    };
     let pem = rustls_pemfile::certs(&mut reply.ca_pem.as_bytes())
         .next()
         .and_then(|der| der.ok())
@@ -725,40 +780,86 @@ fn roll_back_live_bindings(name: &str) {
     }
 }
 
+/// A value handed to this process for one binding, with the binding it was
+/// handed for: its variable and placeholder. It serves only that binding; a
+/// binding of the same name bound to another variable, or removed and added
+/// again (a new placeholder), never receives it.
+#[derive(Clone)]
+struct HeldValue {
+    value: zeroize::Zeroizing<String>,
+    environment_variable: String,
+    placeholder: String,
+}
+
 /// Values handed to this process for its machines' bindings, by machine name
 /// then binding name. Held in memory only: never written to a record, a boot
 /// config or a checkpoint, and gone when the process exits, so whoever supplied
 /// them supplies them again before the next boot.
-type SuppliedValues = BTreeMap<String, zeroize::Zeroizing<String>>;
+type SuppliedValues = BTreeMap<String, HeldValue>;
 
 static SUPPLIED: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, SuppliedValues>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Hold `values` (binding name → value) for `machine`'s next boots, replacing
-/// any held before.
-pub fn supply_values(machine: &str, values: SuppliedValues) {
+/// any held before, each for the binding `policy` and `placeholders` (the
+/// machine's record) say it has now. A name with no binding is ignored.
+pub fn supply_values(
+    machine: &str,
+    values: BTreeMap<String, zeroize::Zeroizing<String>>,
+    policy: &CredentialPolicy,
+    placeholders: &BTreeMap<String, String>,
+) {
+    let entries: SuppliedValues = values
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let binding = policy.binding(&name)?;
+            Some((
+                name.clone(),
+                HeldValue {
+                    value,
+                    environment_variable: binding.environment_variable.clone(),
+                    placeholder: placeholders.get(&name).cloned().unwrap_or_default(),
+                },
+            ))
+        })
+        .collect();
     let mut held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
-    if values.is_empty() {
+    if entries.is_empty() {
         held.remove(machine);
     } else {
-        held.insert(machine.to_string(), values);
+        held.insert(machine.to_string(), entries);
     }
 }
 
 /// Drop whatever was supplied for `machine`.
 pub fn forget_values(machine: &str) {
-    supply_values(machine, BTreeMap::new());
+    SUPPLIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(machine);
 }
 
-/// Drop the values supplied for `machine`'s bindings other than `bindings`,
-/// once those are all it has.
-pub fn retain_values(machine: &str, bindings: &CredentialPolicy) {
+/// Drop the values supplied for `machine` that no binding of `policy` (with
+/// `placeholders`) still takes: removed, re-added, or bound to another
+/// variable. New hosts or a header keep theirs.
+pub fn retain_values(
+    machine: &str,
+    policy: &CredentialPolicy,
+    placeholders: &BTreeMap<String, String>,
+) {
     let mut held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(values) = held.get_mut(machine) {
-        values.retain(|name, _| bindings.binding(name).is_some());
+        values.retain(|name, held| held.serves(policy.binding(name), placeholders.get(name)));
         if values.is_empty() {
             held.remove(machine);
         }
+    }
+}
+
+impl HeldValue {
+    fn serves(&self, binding: Option<&CredentialBinding>, placeholder: Option<&String>) -> bool {
+        binding.is_some_and(|b| b.environment_variable == self.environment_variable)
+            && placeholder == Some(&self.placeholder)
     }
 }
 
@@ -778,13 +879,25 @@ impl CredentialLaunch {
         let held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
         // A branch uses its golden's values unless some were supplied for the
         // branch itself: it restores guest state that already relies on them,
-        // and its own name is new to whoever supplied the golden's.
-        let supplied = held.get(&self.machine).or_else(|| held.get(&self.ca_owner));
+        // and its own name is new to whoever supplied the golden's. Either way
+        // a value serves only the binding it was supplied for.
+        let own = held.get(&self.machine);
+        let golden = (self.ca_owner != self.machine)
+            .then(|| held.get(&self.ca_owner))
+            .flatten();
         let mut env = Vec::new();
         for (index, binding) in self.policy.credentials.iter().enumerate() {
-            let value = supplied
-                .and_then(|values| values.get(&binding.name))
-                .cloned();
+            let placeholder = self.placeholders.get(&binding.name);
+            let take = |values: Option<&SuppliedValues>| {
+                values
+                    .and_then(|values| values.get(&binding.name))
+                    .filter(|held| held.serves(Some(binding), placeholder))
+                    .map(|held| held.value.clone())
+            };
+            let value = match own {
+                Some(_) => take(own),
+                None => take(golden),
+            };
             if value.is_none() && !self.supplied_only {
                 continue;
             }
@@ -807,8 +920,8 @@ pub struct BindingsMessage {
     pub policy: CredentialPolicy,
     /// Binding name → placeholder, as the record holds them.
     pub placeholders: BTreeMap<String, String>,
-    /// Values come only from what is sent. Once set for a running machine it
-    /// stays set until a rollback undoes the message that set it.
+    /// Values come only from what is sent, never from this host. A change of
+    /// it from the bindings in force drops every binding's secret.
     #[serde(default)]
     pub supplied_only: bool,
 }
@@ -867,6 +980,10 @@ struct Previous {
     supplied_only: bool,
     /// The resolver's state, or `None` when no interceptor ran before.
     resolver: Option<ResolverState>,
+    /// Bindings the replacement kept with their secret.
+    kept: Vec<String>,
+    /// Values sent after the replacement, with the binding each was sent for.
+    values_since: BTreeMap<String, (Option<CredentialBinding>, zeroize::Zeroizing<String>)>,
 }
 
 struct Running {
@@ -881,6 +998,11 @@ struct Running {
 struct LiveRequest {
     #[serde(default)]
     values: Option<BTreeMap<String, String>>,
+    /// With `values`: the binding each value is meant for. A value whose
+    /// binding is no longer exactly this one is refused, so a value read for
+    /// one binding never reaches one that replaced it meanwhile.
+    #[serde(default)]
+    expect: Option<BTreeMap<String, CredentialBinding>>,
     #[serde(default)]
     bindings: Option<BindingsMessage>,
     #[serde(default)]
@@ -902,8 +1024,13 @@ impl LiveCredentials {
     fn handle(&self, request: &str) -> std::result::Result<String, String> {
         let request: LiveRequest =
             serde_json::from_str(request).map_err(|_| "malformed request".to_string())?;
+        if request.expect.is_some() && request.values.is_none() {
+            return Err("`expect` goes with `values`".to_string());
+        }
         match (request.values, request.bindings, request.rollback) {
-            (Some(values), None, None) => self.replace_values(values).map(|()| String::new()),
+            (Some(values), None, None) => self
+                .replace_values(values, request.expect.as_ref())
+                .map(|()| String::new()),
             (None, Some(bindings), None) => self
                 .replace_bindings(bindings)
                 .and_then(|reply| serde_json::to_string(&reply).map_err(|e| e.to_string())),
@@ -912,10 +1039,38 @@ impl LiveCredentials {
         }
     }
 
-    fn replace_values(&self, values: BTreeMap<String, String>) -> std::result::Result<(), String> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    fn replace_values(
+        &self,
+        values: BTreeMap<String, String>,
+        expect: Option<&BTreeMap<String, CredentialBinding>>,
+    ) -> std::result::Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(unknown) = values.keys().find(|k| state.policy.binding(k).is_none()) {
             return Err(format!("no credential binding '{unknown}'"));
+        }
+        if let Some(expect) = expect {
+            if let Some(name) = values
+                .keys()
+                .find(|name| state.policy.binding(name) != expect.get(*name))
+            {
+                return Err(format!(
+                    "credential binding '{name}' changed since this value was read for it"
+                ));
+            }
+        }
+        // A rollback of the bindings these values were sent for keeps them,
+        // for the bindings it restores that take them.
+        let bound: Vec<Option<CredentialBinding>> = values
+            .keys()
+            .map(|name| state.policy.binding(name).cloned())
+            .collect();
+        if let Some(previous) = state.previous.as_mut() {
+            for ((name, value), binding) in values.iter().zip(bound) {
+                previous.values_since.insert(
+                    name.clone(),
+                    (binding, zeroize::Zeroizing::new(value.clone())),
+                );
+            }
         }
         let Some(running) = &state.running else {
             // No binding at all, so `values` is empty.
@@ -935,6 +1090,10 @@ impl LiveCredentials {
         &self,
         message: BindingsMessage,
     ) -> std::result::Result<BindingsReply, String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Only a replacement that succeeds may be rolled back to what it
+        // replaced; one refused for any reason leaves nothing to restore.
+        state.previous = None;
         message.policy.validate(None).map_err(|e| e.to_string())?;
         if let Some(missing) = message
             .policy
@@ -947,13 +1106,15 @@ impl LiveCredentials {
                 missing.name
             ));
         }
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (ca, _) =
             ensure_lineage_ca(&self.identity, &message.policy).map_err(|e| e.to_string())?;
         let reply = BindingsReply {
             ca_pem: ca.certificate_pem().to_string(),
         };
-        let supplied_only = state.supplied_only || message.supplied_only;
+        // The record decides where values come from (it stays supplied while a
+        // supplied binding remains); a change of it, either way, is a change
+        // of every binding's secret.
+        let supplied_only = message.supplied_only;
         // A binding keeps its secret (source and value) when it is the same
         // binding by name and placeholder, its variable is the same, and its
         // value still comes from the same kind of place. New hosts or a new
@@ -968,16 +1129,26 @@ impl LiveCredentials {
                 && state.placeholders.get(&binding.name) == message.placeholders.get(&binding.name)
                 && state.supplied_only == supplied_only
         };
-        let kept: Vec<&str> = message
+        let kept: Vec<String> = message
             .policy
             .credentials
             .iter()
             .filter(|b| unchanged(b))
-            .map(|b| b.name.as_str())
+            .map(|b| b.name.clone())
             .collect();
+        // Where a binding without a kept secret resolves from: nowhere on a
+        // supplied machine; otherwise as at boot, from the machine's own
+        // reference for its variable, or the boot process's variable of it.
         let fresh_source = |binding: &CredentialBinding| {
-            (!supplied_only && !binding.environment_variable.is_empty())
-                .then(|| crate::secrets::env_ref(binding.environment_variable.clone()))
+            (!supplied_only && !binding.environment_variable.is_empty()).then(|| {
+                self.identity
+                    .host_sources
+                    .get(&binding.environment_variable)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        crate::secrets::env_ref(binding.environment_variable.clone())
+                    })
+            })
         };
         match &state.running {
             Some(running) => {
@@ -986,7 +1157,7 @@ impl LiveCredentials {
                 let mut next = ResolverState::default();
                 for binding in &message.policy.credentials {
                     let name = &binding.name;
-                    if kept.contains(&name.as_str()) {
+                    if kept.contains(name) {
                         if let Some(source) = resolver.sources.get(name) {
                             next.sources.insert(name.clone(), source.clone());
                         }
@@ -1000,9 +1171,11 @@ impl LiveCredentials {
                 // Under the resolver's lock: no value is resolved between the
                 // new bindings and their sources and values.
                 running.control.replace_ca(ca);
-                running
-                    .control
-                    .replace_bindings(message.policy.clone(), &message.placeholders);
+                running.control.replace_bindings_keeping(
+                    message.policy.clone(),
+                    &message.placeholders,
+                    &kept,
+                );
                 *resolver = next;
                 drop(resolver);
                 state.previous = Some(Previous {
@@ -1010,6 +1183,8 @@ impl LiveCredentials {
                     placeholders: state.placeholders.clone(),
                     supplied_only: state.supplied_only,
                     resolver: Some(previous_resolver),
+                    kept: kept.clone(),
+                    values_since: BTreeMap::new(),
                 });
             }
             None => {
@@ -1047,6 +1222,8 @@ impl LiveCredentials {
                     placeholders: state.placeholders.clone(),
                     supplied_only: state.supplied_only,
                     resolver: None,
+                    kept: Vec::new(),
+                    values_since: BTreeMap::new(),
                 });
                 tracing::info!("credential interceptor started on a running machine");
             }
@@ -1070,12 +1247,21 @@ impl LiveCredentials {
             return Err("there are no replaced bindings to restore".to_string());
         };
         match previous.resolver {
-            Some(resolver_state) => {
+            Some(mut resolver_state) => {
+                // Values sent since serve the restored bindings that are the
+                // very ones they were sent for.
+                for (name, (binding, value)) in previous.values_since {
+                    if binding.is_some() && previous.policy.binding(&name) == binding.as_ref() {
+                        resolver_state.live.insert(name, value);
+                    }
+                }
                 if let Some(running) = &state.running {
                     let mut resolver = running.resolver.lock();
-                    running
-                        .control
-                        .replace_bindings(previous.policy.clone(), &previous.placeholders);
+                    running.control.replace_bindings_keeping(
+                        previous.policy.clone(),
+                        &previous.placeholders,
+                        &previous.kept,
+                    );
                     *resolver = resolver_state;
                 }
             }
@@ -1131,19 +1317,25 @@ impl CredentialResolver for SecretRefResolver {
         &self,
         request: &CredentialRequest,
     ) -> std::result::Result<zeroize::Zeroizing<String>, ResolveError> {
-        // Held while reading the source too, so a binding swap (made under
-        // this lock) is never seen half-done.
-        let state = self.lock();
-        if let Some(value) = state.live.get(&request.binding) {
-            return Ok(value.clone());
-        }
-        let source = state
-            .sources
-            .get(&request.binding)
-            .ok_or(ResolveError::Unknown)?;
+        // The lock covers only the lookup, never reading the source (which may
+        // run a helper or wait on a file): a swap made under it is seen whole,
+        // and the interceptor checks after resolving that the binding it
+        // resolved for is still the same one, so a value read from a source
+        // the swap replaced is never sent.
+        let source = {
+            let state = self.lock();
+            if let Some(value) = state.live.get(&request.binding) {
+                return Ok(value.clone());
+            }
+            state
+                .sources
+                .get(&request.binding)
+                .cloned()
+                .ok_or(ResolveError::Unknown)?
+        };
         crate::secrets::resolve_secret_ref_classified(
             &request.binding,
-            source,
+            &source,
             crate::secrets::ResolutionScope::RecordReplay,
         )
         .map_err(|failure| ResolveError::Unavailable(failure.as_str().to_string()))
@@ -1555,11 +1747,27 @@ mod tests {
         same.placeholders = launch.placeholders.clone();
         assert!(send(dir.path(), &bindings_message(&same)).starts_with("ok"));
         assert!(resolver.lock().sources.is_empty());
-        // Once supplied, a message cannot make it read this host again.
+        assert_eq!(send(dir.path(), r#"{"values":{"gh":"api-value"}}"#), "ok");
+        // Back to the operator (the record cleared its supplied bindings and
+        // the CLI added this one): the API caller's value is dropped too, and
+        // the binding reads its own source again.
         let mut back = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
         back.placeholders = launch.placeholders.clone();
         assert!(send(dir.path(), &bindings_message(&back)).starts_with("ok"));
-        assert!(resolver.lock().sources.is_empty());
+        let state = resolver.lock().clone();
+        assert!(
+            state.live.is_empty(),
+            "a value supplied by the API caller never serves the operator"
+        );
+        assert_eq!(state.sources["gh"].from_env.as_deref(), Some("GH_TOKEN"));
+        // And a later API takeover of the operator's binding drops that again.
+        assert_eq!(
+            send(dir.path(), r#"{"values":{"gh":"operator-pushed"}}"#),
+            "ok"
+        );
+        assert!(send(dir.path(), &bindings_message(&hijack)).starts_with("ok"));
+        let state = resolver.lock().clone();
+        assert!(state.live.is_empty() && state.sources.is_empty());
     }
 
     /// A rollback restores exactly what the last bindings replaced: policy,
@@ -1622,6 +1830,7 @@ mod tests {
             machine: "live-test".into(),
             ca_owner: "live-test".into(),
             ca_dir: dir.path().join("ca"),
+            host_sources: BTreeMap::new(),
         };
         serve_without_bindings(dir.path(), identity.clone(), slot);
         assert!(send(dir.path(), r#"{"values":{"a":"x"}}"#).contains("no credential binding 'a'"));
@@ -1657,6 +1866,153 @@ mod tests {
         assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
         assert!(slot.get().is_none(), "back to relaying directly");
         assert!(send(dir.path(), r#"{"values":{"a":"x"}}"#).contains("no credential binding 'a'"));
+    }
+
+    /// A value is sent tagged with the binding it was read for, and refused
+    /// when the boot process has another binding of that name by then.
+    #[test]
+    fn a_value_for_a_binding_replaced_meanwhile_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
+        launch.ensure_ca().unwrap();
+        let (_interceptor, live) = launch.spawn_interceptor(BTreeMap::new()).unwrap();
+        live.clone().serve(dir.path());
+        let expect_for = |spec: &str| {
+            serde_json::json!({
+                "values": {"gh": "operator-value"},
+                "expect": {"gh": parse_credential_flag(spec).unwrap()},
+            })
+            .to_string()
+        };
+        assert_eq!(
+            send(dir.path(), &expect_for("gh=GH_TOKEN@github.com")),
+            "ok"
+        );
+        // An API caller rebinds gh before the operator's value arrives.
+        let mut rebound = launch_in(dir.path(), &["gh=GH_TOKEN@attacker.example"], true);
+        rebound.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&rebound)).starts_with("ok"));
+        let refused = send(dir.path(), &expect_for("gh=GH_TOKEN@github.com"));
+        assert!(
+            refused.contains("changed since this value was read"),
+            "{refused}"
+        );
+        assert!(resolver_of(&live).lock().live.is_empty());
+    }
+
+    /// The resolver never holds its lock while reading a source: a slow
+    /// source (a FIFO here, a keychain helper in life) does not stall a
+    /// binding change or any other request.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_source_does_not_hold_the_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("slow");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let resolver = Arc::new(SecretRefResolver::new(
+            [("slow".to_string(), crate::secrets::file_ref(fifo.clone()))].into(),
+        ));
+        let reading = {
+            let resolver = resolver.clone();
+            std::thread::spawn(move || resolver.resolve(&request("slow", "api.slow.com")))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let free = resolver.state.try_lock().is_ok();
+        // Unblock the reader whatever happened.
+        std::fs::write(&fifo, "late-value").unwrap();
+        let _ = reading.join();
+        assert!(free, "the lock was free while the source was being read");
+    }
+
+    /// A replacement that fails leaves nothing to roll back to, so a host
+    /// that rolls back after an error never restores an older state; and a
+    /// rollback keeps values sent after the replacement for the bindings it
+    /// restores that they were sent for.
+    #[test]
+    fn rollback_after_a_failed_replacement_restores_nothing_and_keeps_new_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = launch_in(dir.path(), &["a=A_KEY@api.a.com"], true);
+        launch.ensure_ca().unwrap();
+        let (_interceptor, live) = launch.spawn_interceptor(BTreeMap::new()).unwrap();
+        live.clone().serve(dir.path());
+
+        let mut more = launch_in(
+            dir.path(),
+            &["a=A_KEY@api.a.com", "b=B_KEY@api.b.com"],
+            true,
+        );
+        more.placeholders
+            .insert("a".into(), launch.placeholders["a"].clone());
+        assert!(send(dir.path(), &bindings_message(&more)).starts_with("ok"));
+        assert_eq!(
+            send(dir.path(), r#"{"values":{"a":"sent-after","b":"vb"}}"#),
+            "ok"
+        );
+        assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
+        let state = resolver_of(&live).lock().clone();
+        assert_eq!(
+            state.live.get("a").map(|v| v.as_str()),
+            Some("sent-after"),
+            "a value sent for a binding the rollback restores is kept"
+        );
+        assert!(!state.live.contains_key("b"));
+
+        // A refused replacement (no placeholder) clears what an earlier one
+        // could be rolled back to.
+        assert!(send(dir.path(), &bindings_message(&more)).starts_with("ok"));
+        let mut broken = more.clone();
+        broken.placeholders.remove("b");
+        assert!(send(dir.path(), &bindings_message(&broken)).starts_with("error:"));
+        assert!(send(dir.path(), r#"{"rollback":true}"#).contains("no replaced bindings"));
+        assert_eq!(live.state.lock().unwrap().policy, more.policy);
+    }
+
+    /// A binding the host operator adds while the machine runs resolves from
+    /// the machine's own reference for its variable, as at boot, so rotating
+    /// that file keeps working; it never does on a supplied machine.
+    #[test]
+    fn an_operator_binding_added_live_resolves_from_its_reference() {
+        for supplied_only in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let token = dir.path().join("token");
+            std::fs::write(&token, "first").unwrap();
+            let slot = smolvm_network::LateHttpsIntercept::new();
+            let identity = CredentialIdentity {
+                machine: "live-test".into(),
+                ca_owner: "live-test".into(),
+                ca_dir: dir.path().join("ca"),
+                host_sources: [(
+                    "GH_TOKEN".to_string(),
+                    crate::secrets::file_ref(token.clone()),
+                )]
+                .into(),
+            };
+            let live = Arc::new(LiveCredentials {
+                identity: identity.clone(),
+                late: Some(slot),
+                state: Mutex::new(LiveState {
+                    policy: CredentialPolicy::default(),
+                    placeholders: BTreeMap::new(),
+                    supplied_only: false,
+                    running: None,
+                    previous: None,
+                }),
+            });
+            live.clone().serve(dir.path());
+            let launch = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], supplied_only);
+            assert!(send(dir.path(), &bindings_message(&launch)).starts_with("ok"));
+            let resolver = resolver_of(&live);
+            let gh = request("gh", "github.com");
+            if supplied_only {
+                assert!(matches!(resolver.resolve(&gh), Err(ResolveError::Unknown)));
+                continue;
+            }
+            assert_eq!(resolver.resolve(&gh).unwrap().as_str(), "first");
+            std::fs::write(&token, "rotated").unwrap();
+            assert_eq!(resolver.resolve(&gh).unwrap().as_str(), "rotated");
+        }
     }
 
     /// The guest is handed the CA unless its record says it already holds
@@ -1772,6 +2128,19 @@ mod tests {
         assert_eq!(resolver.resolve(&request).unwrap().as_str(), "second");
     }
 
+    /// Fixed placeholders, so values held for a binding can be told apart.
+    fn fixed_placeholders(names: &[&str]) -> BTreeMap<String, String> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    format!("SMOL_PLACEHOLDER_{}_1", n.to_uppercase()),
+                )
+            })
+            .collect()
+    }
+
     fn launch(machine: &str, supplied_only: bool) -> CredentialLaunch {
         let policy = CredentialPolicy {
             credentials: vec![
@@ -1782,7 +2151,7 @@ mod tests {
         let mut launch = CredentialLaunch::from_parts(
             machine,
             &policy,
-            &BTreeMap::new(),
+            &fixed_placeholders(&["a", "b"]),
             &BTreeMap::new(),
             None,
         )
@@ -1791,17 +2160,23 @@ mod tests {
         launch
     }
 
+    fn supply(machine: &str, launch: &CredentialLaunch, values: &[(&str, &str)]) {
+        supply_values(
+            machine,
+            values
+                .iter()
+                .map(|(k, v)| (k.to_string(), zeroize::Zeroizing::new(v.to_string())))
+                .collect(),
+            &launch.policy,
+            &launch.placeholders,
+        );
+    }
+
     #[test]
     fn supplied_values_reach_only_the_boot_process() {
         let machine = "cred-test-supplied";
-        supply_values(
-            machine,
-            [(
-                "a".to_string(),
-                zeroize::Zeroizing::new("value-a".to_string()),
-            )]
-            .into(),
-        );
+        let template = launch(machine, false);
+        supply(machine, &template, &[("a", "value-a")]);
         let mut l = launch(machine, false);
         let env = l.child_env();
         // The supplied binding moves to a private variable carrying its value.
@@ -1823,50 +2198,98 @@ mod tests {
     #[test]
     fn values_of_removed_bindings_are_dropped() {
         let machine = "cred-test-retain";
-        supply_values(
-            machine,
-            [
-                ("a".to_string(), zeroize::Zeroizing::new("va".to_string())),
-                ("b".to_string(), zeroize::Zeroizing::new("vb".to_string())),
-            ]
-            .into(),
-        );
+        let template = launch(machine, true);
+        supply(machine, &template, &[("a", "va"), ("b", "vb")]);
         retain_values(
             machine,
             &CredentialPolicy {
                 credentials: vec![parse_credential_flag("b=B_KEY@api.b.com").unwrap()],
             },
+            &fixed_placeholders(&["b"]),
         );
         let mut l = launch(machine, true);
         let env = l.child_env();
         assert_eq!(env[0].1, None, "a's value is gone");
         assert_eq!(env[1].1.as_deref().map(String::as_str), Some("vb"));
-        retain_values(machine, &CredentialPolicy::default());
+        retain_values(machine, &CredentialPolicy::default(), &BTreeMap::new());
         assert!(launch(machine, true)
             .child_env()
             .iter()
             .all(|(_, v)| v.is_none()));
     }
 
+    /// A held value serves only the binding it was supplied for: after a
+    /// stop and start, a name bound to another variable, or removed and
+    /// added again (a new placeholder), gets nothing; new hosts keep it.
+    #[test]
+    fn a_held_value_serves_only_the_binding_it_was_supplied_for() {
+        let machine = "cred-test-held";
+        let template = launch(machine, true);
+        supply(machine, &template, &[("a", "va")]);
+        let boot = |spec: &str, placeholder: &str| {
+            let policy = CredentialPolicy {
+                credentials: vec![parse_credential_flag(spec).unwrap()],
+            };
+            let placeholders: BTreeMap<String, String> =
+                [("a".to_string(), placeholder.to_string())].into();
+            let mut l = CredentialLaunch::from_parts(
+                machine,
+                &policy,
+                &placeholders,
+                &BTreeMap::new(),
+                None,
+            )
+            .unwrap();
+            l.supplied_only = true;
+            l.child_env().remove(0).1.map(|v| v.to_string())
+        };
+        assert_eq!(
+            boot("a=A_KEY@api.a.com", "SMOL_PLACEHOLDER_A_1").as_deref(),
+            Some("va")
+        );
+        assert_eq!(
+            boot("a=A_KEY@other.a.com", "SMOL_PLACEHOLDER_A_1").as_deref(),
+            Some("va"),
+            "re-scoped to other hosts: the same secret"
+        );
+        assert_eq!(
+            boot("a=OTHER_KEY@api.a.com", "SMOL_PLACEHOLDER_A_1"),
+            None,
+            "another variable"
+        );
+        assert_eq!(
+            boot("a=A_KEY@api.a.com", "SMOL_PLACEHOLDER_A_2"),
+            None,
+            "removed and re-added"
+        );
+        // Pruned once the record says so.
+        retain_values(
+            machine,
+            &CredentialPolicy {
+                credentials: vec![parse_credential_flag("a=OTHER_KEY@api.a.com").unwrap()],
+            },
+            &fixed_placeholders(&["a"]),
+        );
+        assert!(SUPPLIED.lock().unwrap().get(machine).is_none());
+        forget_values(machine);
+    }
+
     #[test]
     fn a_branch_uses_its_goldens_values_until_given_its_own() {
         let golden = "cred-test-golden";
         let clone = "cred-test-golden-branch";
-        supply_values(
-            golden,
-            [(
-                "a".to_string(),
-                zeroize::Zeroizing::new("golden-a".to_string()),
-            )]
-            .into(),
-        );
         let policy = CredentialPolicy {
             credentials: vec![parse_credential_flag("a=A_KEY@api.a.com").unwrap()],
         };
+        let placeholders = fixed_placeholders(&["a"]);
+        let held = |value: &str| -> BTreeMap<String, zeroize::Zeroizing<String>> {
+            [("a".to_string(), zeroize::Zeroizing::new(value.to_string()))].into()
+        };
+        supply_values(golden, held("golden-a"), &policy, &placeholders);
         let mut l = CredentialLaunch::from_parts(
             clone,
             &policy,
-            &BTreeMap::new(),
+            &placeholders,
             &BTreeMap::new(),
             Some(golden),
         )
@@ -1874,14 +2297,33 @@ mod tests {
         l.supplied_only = true;
         let env = l.child_env();
         assert_eq!(env[0].1.as_deref().map(String::as_str), Some("golden-a"));
-        supply_values(
+        // A branch whose binding was re-added (a new placeholder) or bound to
+        // another variable never falls back to the golden's value.
+        let mut readded = CredentialLaunch::from_parts(
             clone,
-            [(
-                "a".to_string(),
-                zeroize::Zeroizing::new("branch-a".to_string()),
-            )]
-            .into(),
-        );
+            &policy,
+            &[("a".to_string(), "SMOL_PLACEHOLDER_A_9".to_string())].into(),
+            &BTreeMap::new(),
+            Some(golden),
+        )
+        .unwrap();
+        readded.supplied_only = true;
+        assert_eq!(readded.child_env()[0].1, None);
+        let rebound = CredentialPolicy {
+            credentials: vec![parse_credential_flag("a=OTHER@api.a.com").unwrap()],
+        };
+        let mut rebound = CredentialLaunch::from_parts(
+            clone,
+            &rebound,
+            &placeholders,
+            &BTreeMap::new(),
+            Some(golden),
+        )
+        .unwrap();
+        rebound.supplied_only = true;
+        assert_eq!(rebound.child_env()[0].1, None);
+
+        supply_values(clone, held("branch-a"), &policy, &placeholders);
         let env = l.child_env();
         assert_eq!(env[0].1.as_deref().map(String::as_str), Some("branch-a"));
         forget_values(golden);

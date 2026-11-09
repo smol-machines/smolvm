@@ -1754,7 +1754,7 @@ async fn relaunch_image_workload(
     command.extend(record.cmd.clone());
     let mut env = record.env.clone();
     env.extend(
-        crate::api::handlers::record_secret_refs_env(entry)
+        crate::api::handlers::record_secret_refs_env(entry, Some(&record))
             .map_err(|e| crate::Error::agent("resolve workload secrets", format!("{e:?}")))?,
     );
     // Remote volumes mount inside the workload container; build the mount script

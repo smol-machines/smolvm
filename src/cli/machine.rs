@@ -6697,6 +6697,47 @@ pub struct UpdateCmd {
     pub clear_dns_options: bool,
 }
 
+/// Values a running machine's boot process cannot find itself for bindings
+/// the operator just added, or bound to another variable: those read from a
+/// host variable, which the boot process sees only as `machine start` left
+/// its environment. A binding with a secret reference (a file, the keychain)
+/// gets no value: the boot process resolves the reference itself on every
+/// request, so rotating it keeps working. New hosts or a header need nothing:
+/// the boot process keeps the secret it has.
+fn host_values_for_new_bindings(
+    before: &smolvm::config::VmRecord,
+    saved: &smolvm::config::VmRecord,
+) -> std::collections::BTreeMap<String, zeroize::Zeroizing<String>> {
+    let previous = before.credential_policy.clone().unwrap_or_default();
+    let mut values = std::collections::BTreeMap::new();
+    for binding in saved
+        .credential_policy
+        .iter()
+        .flat_map(|p| p.credentials.iter())
+    {
+        let unchanged = previous
+            .binding(&binding.name)
+            .is_some_and(|old| old.environment_variable == binding.environment_variable);
+        if unchanged
+            || saved
+                .secret_refs
+                .contains_key(&binding.environment_variable)
+        {
+            continue;
+        }
+        match std::env::var(&binding.environment_variable) {
+            Ok(value) => {
+                values.insert(binding.name.clone(), zeroize::Zeroizing::new(value));
+            }
+            Err(_) => eprintln!(
+                "warning: credential '{}' has no value yet (${} is not set here); requests to its hosts fail until one is supplied",
+                binding.name, binding.environment_variable
+            ),
+        }
+    }
+    values
+}
+
 impl UpdateCmd {
     /// The record's egress after this update's allow-list flags, or `None`
     /// when none were given. The merge and its guards live on the record
@@ -6846,13 +6887,35 @@ impl UpdateCmd {
         db: &smolvm::db::SmolvmDb,
         record: &smolvm::config::VmRecord,
     ) -> smolvm::Result<()> {
-        let running = record.actual_state() == smolvm::config::RecordState::Running;
         let policy = self.next_credentials(record)?;
-        let saved = smolvm::credentials::set_bindings(
+        let mut running = false;
+        // The values go to the boot process before the change's lock is
+        // released, tagged with the bindings they were read for: no other
+        // change can land between, and the boot process refuses them if one
+        // somehow did.
+        let saved = smolvm::credentials::set_bindings_then(
             db,
             &self.name,
             policy,
             smolvm::machine_spec::Caller::Cli,
+            |before, saved, is_running| {
+                running = is_running;
+                if !is_running || saved.credentials_supplied_by_api {
+                    return Ok(());
+                }
+                let values = host_values_for_new_bindings(before, saved);
+                if values.is_empty() {
+                    return Ok(());
+                }
+                smolvm::agent::apply_live_credential_values(
+                    &self.name,
+                    &values,
+                    saved
+                        .credential_policy
+                        .as_ref()
+                        .unwrap_or(&Default::default()),
+                )
+            },
         )?;
         let before: Vec<&str> = record
             .credential_policy
@@ -6860,48 +6923,6 @@ impl UpdateCmd {
             .flat_map(|p| p.credentials.iter().map(|b| b.name.as_str()))
             .collect();
         let after = saved.credential_policy.clone().unwrap_or_default();
-        // The running boot process resolves a new binding, or one bound to
-        // another variable, from its own environment, which `machine start`
-        // fixed and which has nothing for it: hand it the value this command
-        // reads, from the binding's secret reference or variable.
-        if running && !saved.credentials_supplied_by_api {
-            let mut values = std::collections::BTreeMap::new();
-            let previous = record.credential_policy.clone().unwrap_or_default();
-            for binding in &after.credentials {
-                // Only new hosts or a header: the boot process keeps the
-                // secret it has.
-                if previous
-                    .binding(&binding.name)
-                    .is_some_and(|old| old.environment_variable == binding.environment_variable)
-                {
-                    continue;
-                }
-                let source = saved
-                    .secret_refs
-                    .get(&binding.environment_variable)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        smolvm::secrets::env_ref(binding.environment_variable.clone())
-                    });
-                match smolvm::secrets::resolve_secret_ref_classified(
-                    &binding.name,
-                    &source,
-                    smolvm::secrets::ResolutionScope::TrustedLocal,
-                ) {
-                    Ok(value) => {
-                        values.insert(binding.name.clone(), value);
-                    }
-                    Err(failure) => eprintln!(
-                        "warning: credential '{}' has no value yet ({}); requests to its hosts fail until one is supplied",
-                        binding.name,
-                        failure.as_str()
-                    ),
-                }
-            }
-            if !values.is_empty() {
-                smolvm::agent::apply_live_credential_values(&self.name, &values)?;
-            }
-        }
         println!(
             "Updated machine '{}'{}:",
             self.name,

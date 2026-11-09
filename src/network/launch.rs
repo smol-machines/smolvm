@@ -117,9 +117,11 @@ pub fn plan_launch_network(
 
 /// [`plan_launch_network`] for a machine that may also carry a credential
 /// policy. Credential substitution is enforced by the host-side virtio-net
-/// stack, so a policy implies networking and steers the default backend to
+/// stack, so a policy steers the default backend of a networked machine to
 /// virtio-net exactly as an egress allow-list does; an explicit backend choice
-/// is still honored (TSI then needs the libkrun interception hook).
+/// is still honored (TSI then needs the libkrun interception hook). A policy
+/// never turns networking or egress on: a credential only travels over the
+/// network the machine already has.
 pub fn plan_launch_network_with(
     resources: &VmResources,
     dns_filter_hosts: Option<&[String]>,
@@ -143,8 +145,7 @@ pub fn plan_launch_network_with(
         || has_cidr_policy
         || has_dns_filter
         || has_fabric
-        || has_guest_subnet
-        || has_credentials;
+        || has_guest_subnet;
 
     if !wants_network {
         return LaunchNetworkPlan {
@@ -154,12 +155,8 @@ pub fn plan_launch_network_with(
     }
     // Ports and the host service are inbound paths; everything else here is a
     // request for egress, possibly narrowed by its own allow-list.
-    let outbound = resources.network
-        || has_cidr_policy
-        || has_dns_filter
-        || has_fabric
-        || has_guest_subnet
-        || has_credentials;
+    let outbound =
+        resources.network || has_cidr_policy || has_dns_filter || has_fabric || has_guest_subnet;
 
     // Published ports need the inbound path, which only virtio-net provides.
     // When the caller didn't pick a backend explicitly, default to virtio-net
@@ -480,7 +477,12 @@ mod tests {
         assert!(plan_launch_network(&allow_listed, None, 1).outbound);
         let hosts = ["api.example.com".to_string()];
         assert!(plan_launch_network(&resources(), Some(&hosts), 1).outbound);
-        assert!(plan_launch_network_with(&resources(), None, 1, true).outbound);
+        // Credential bindings never open egress a machine does not have.
+        assert!(!plan_launch_network_with(&resources(), None, 1, true).outbound);
+        assert_eq!(
+            plan_launch_network_with(&resources(), None, 0, true).backend,
+            EffectiveNetworkBackend::None
+        );
     }
 
     #[test]

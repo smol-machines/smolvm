@@ -785,6 +785,12 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ca_trusted: Option<String>,
 
+    /// Whether the guest agent of the machine's current or saved boot can be
+    /// handed a credential CA while it runs, as it reported when it booted.
+    /// `None` before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_credential_trust: Option<bool>,
+
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
     pub ephemeral: bool,
@@ -1047,6 +1053,7 @@ impl VmRecord {
             credentials_supplied_by_api: false,
             credential_ca_device: None,
             credential_ca_trusted: None,
+            guest_credential_trust: None,
             ephemeral: false,
             source_smolmachine: None,
             packed_image_on_storage: false,
@@ -1153,6 +1160,7 @@ impl VmRecord {
             credentials_supplied_by_api: false,
             credential_ca_device: None,
             credential_ca_trusted: None,
+            guest_credential_trust: None,
             ephemeral: false,
             source_smolmachine: None,
             packed_image_on_storage: false,
@@ -1691,25 +1699,30 @@ impl VmRecord {
     /// host allow list, and bindings whose values come from this host need a
     /// variable to read each one from. Only the CLI (`caller`) may bind this
     /// host's environment. The machine must already have egress: bindings
-    /// never turn networking on.
+    /// never turn networking on, and removing them never leaves it on.
     ///
     /// A binding keeps its placeholder for as long as its name stays, even
     /// when its hosts, header or variable change, so processes already holding
     /// it keep working; a new name gets a fresh placeholder; a removed one
     /// loses its (re-adding it later mints another).
     ///
-    /// Removing every binding keeps an empty policy on a
-    /// machine that had one, so its CA device, network backend and
-    /// interceptor stay what they were, a saved checkpoint of it still
-    /// restores, and bindings added later reach it live.
+    /// A secret reference a removed or re-pointed binding fed (`--secret-file
+    /// GH_TOKEN=… --credential gh=GH_TOKEN@…`) goes with it: it was never meant
+    /// for the guest's environment, and a reference no binding withholds would
+    /// be injected there as plaintext.
+    ///
+    /// Removing every binding leaves no policy. A machine whose network
+    /// backend came only from its bindings is pinned to virtio-net, so a
+    /// running or saved guest keeps the device it has.
     ///
     /// Bindings that came from someone other than the host operator, now or
     /// before, keep taking their values only from what is supplied, so a
     /// later edit can never route a host variable an earlier caller named.
     ///
     /// A machine resuming saved memory keeps the network device it was saved
-    /// with, so a first binding that would need a different backend (from no
-    /// network or TSI to virtio-net) is refused.
+    /// with, so a first binding that would need a different backend is
+    /// refused, as is one its saved guest agent could not trust (a conflict:
+    /// the machine's state, not the bindings, is the obstacle).
     pub fn with_credential_bindings(
         &self,
         policy: smolvm_protocol::CredentialPolicy,
@@ -1722,12 +1735,11 @@ impl VmRecord {
         // Pin what the current boot (and memory saved from it) has, before the
         // policy it would otherwise be read from changes.
         next.credential_ca_device = Some(self.credential_ca_boot_device());
+        let old_policy = self.credential_policy.clone().unwrap_or_default();
         if policy.is_empty() {
-            next.credential_policy = self
-                .credential_policy
-                .as_ref()
-                .map(|_| smolvm_protocol::CredentialPolicy::default());
+            next.credential_policy = None;
             next.credential_placeholders.clear();
+            next.credentials_supplied_by_api = false;
         } else {
             policy
                 .validate(self.dns_filter_hosts.as_deref())
@@ -1739,12 +1751,17 @@ impl VmRecord {
                     self.name
                 )));
             }
-            let had_bindings = self
-                .credential_policy
-                .as_ref()
-                .is_some_and(|p| !p.is_empty());
+            // A credential only ever travels over the network the machine has;
+            // it grants none.
+            if !self.has_own_egress() {
+                return Err(fail(format!(
+                    "machine '{}' has no network egress, and a credential binding grants none; \
+                     give it network access (or allow its hosts) first",
+                    self.name
+                )));
+            }
             next.credentials_supplied_by_api =
-                (had_bindings && self.credentials_supplied_by_api) || !from_host_operator;
+                (!old_policy.is_empty() && self.credentials_supplied_by_api) || !from_host_operator;
             if !next.credentials_supplied_by_api {
                 crate::credentials::require_host_sources(&policy)?;
             }
@@ -1767,36 +1784,86 @@ impl VmRecord {
                     (binding.name.clone(), placeholder)
                 })
                 .collect();
-            next.credential_policy = Some(policy);
-            // A credential only ever travels over the network the machine has;
-            // it grants none. Bindings never turn networking on.
-            let has_egress = self.network
-                || self
-                    .dns_filter_hosts
-                    .as_ref()
-                    .is_some_and(|h| !h.is_empty())
-                || self.allowed_cidrs.as_ref().is_some_and(|c| !c.is_empty());
-            if !has_egress {
-                return Err(fail(format!(
-                    "machine '{}' has no network egress, and a credential binding grants none; \
-                     give it network access (or allow its hosts) first",
-                    self.name
-                )));
+            next.credential_policy = Some(policy.clone());
+        }
+        // A reference that fed a binding which no longer reads that variable
+        // goes with it, never into the guest's environment.
+        for binding in &old_policy.credentials {
+            let still_bound = policy
+                .credentials
+                .iter()
+                .any(|b| b.environment_variable == binding.environment_variable);
+            if !still_bound {
+                next.secret_refs.remove(&binding.environment_variable);
             }
         }
-        let resumes_saved_memory =
-            self.paused_checkpoint.is_some() || self.checkpoint_head.is_some();
         let before = self.launch_network_plan().backend;
         let after = next.launch_network_plan().backend;
-        if resumes_saved_memory && before != after {
-            return Err(fail(format!(
-                "machine '{}' resumes saved memory taken with {before:?} networking, and \
-                 credential bindings need {after:?}; a restored guest keeps the devices it was \
-                 saved with, so recreate the machine, or start it fresh, to add its first binding",
-                self.name
-            )));
+        // The device a running or saved guest has stays; bindings only ever
+        // steered the default, and losing them must not move it.
+        if before == crate::network::launch::EffectiveNetworkBackend::VirtioNet
+            && after != before
+            && next.network_backend.is_none()
+        {
+            next.network_backend = Some(crate::network::NetworkBackend::VirtioNet);
+        }
+        let after = next.launch_network_plan().backend;
+        if self.resumes_saved_memory() {
+            if before != after {
+                return Err(crate::Error::agent_conflict(
+                    "credentials",
+                    format!(
+                        "machine '{}' resumes saved memory taken with {before:?} networking, and \
+                         credential bindings need {after:?}; a restored guest keeps the devices \
+                         it was saved with, so start it fresh to add its first binding",
+                        self.name
+                    ),
+                ));
+            }
+            let old_hosts: std::collections::BTreeSet<&String> = old_policy
+                .credentials
+                .iter()
+                .flat_map(|b| b.allowed_hosts.iter())
+                .collect();
+            let needs_trust = next.credential_policy.as_ref().is_some_and(|p| {
+                !self.credential_ca_boot_device()
+                    || p.credentials
+                        .iter()
+                        .flat_map(|b| b.allowed_hosts.iter())
+                        .any(|h| !old_hosts.contains(h))
+            });
+            if needs_trust && self.guest_credential_trust != Some(true) {
+                return Err(crate::Error::agent_conflict(
+                    "credentials",
+                    format!(
+                        "machine '{}' resumes saved memory whose guest agent cannot be handed a \
+                         credential CA, which these bindings need; start it fresh to add them",
+                        self.name
+                    ),
+                ));
+            }
         }
         Ok(next)
+    }
+
+    /// Whether the machine's own settings give it outbound access: its
+    /// network flag or an allow list, never its credential bindings.
+    pub fn has_own_egress(&self) -> bool {
+        self.network
+            || self
+                .dns_filter_hosts
+                .as_ref()
+                .is_some_and(|h| !h.is_empty())
+            || self.allowed_cidrs.as_ref().is_some_and(|c| !c.is_empty())
+    }
+
+    /// Whether the next start restores saved memory: a pause, or a restored
+    /// checkpoint not yet booted. Capturing a checkpoint does not make a
+    /// machine one that restores.
+    pub fn resumes_saved_memory(&self) -> bool {
+        self.paused_checkpoint.is_some()
+            || crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(&self.name))
+                .is_some()
     }
 
     /// Refuse a credential change a running machine cannot take: `next` is
@@ -1847,6 +1914,8 @@ impl VmRecord {
         self.credentials_supplied_by_api = next.credentials_supplied_by_api;
         self.credential_ca_device = next.credential_ca_device;
         self.credential_ca_trusted = next.credential_ca_trusted.clone();
+        self.secret_refs = next.secret_refs.clone();
+        self.network_backend = next.network_backend;
     }
 
     /// The network this machine launches with. A credential policy steers the
@@ -3238,17 +3307,19 @@ mod tests {
             both.credential_placeholders["b"]
         );
 
-        // Removing everything keeps an empty policy: the CA device and the
-        // interceptor stay, and so does the network backend.
+        // Removing everything leaves no policy, and pins the backend.
         let none = only_b
             .with_credential_bindings(smolvm_protocol::CredentialPolicy::default(), Caller::Api)
             .unwrap();
-        assert_eq!(none.credential_policy, Some(Default::default()));
+        assert_eq!(none.credential_policy, None, "no binding leaves no policy");
         assert!(none.credential_placeholders.is_empty());
+        assert!(!none.credentials_supplied_by_api);
+        // A machine whose virtio-net came from its bindings keeps it.
         assert_eq!(
             none.launch_network_plan().backend,
             only_b.launch_network_plan().backend
         );
+        assert_eq!(none.network_backend, Some(NetworkBackend::VirtioNet));
         // A machine that never had bindings stays without a policy.
         let untouched = record
             .with_credential_bindings(smolvm_protocol::CredentialPolicy::default(), Caller::Api)
@@ -3359,10 +3430,41 @@ mod tests {
             .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Api)
             .unwrap_err();
         assert!(err.to_string().contains("resumes saved memory"), "{err}");
+        assert!(
+            matches!(
+                err,
+                crate::Error::Agent {
+                    kind: crate::error::AgentErrorKind::Conflict,
+                    ..
+                }
+            ),
+            "the machine's state, not the bindings, is the obstacle: {err:?}"
+        );
         let mut paused_virtio = networked("paused-virtio");
         paused_virtio.network_backend = Some(NetworkBackend::VirtioNet);
         paused_virtio.paused_checkpoint = Some("saved".into());
+        // A saved guest whose agent cannot take the CA is refused up front,
+        // rather than failing TLS after it resumes.
+        for unknown_or_old in [None, Some(false)] {
+            paused_virtio.guest_credential_trust = unknown_or_old;
+            let err = paused_virtio
+                .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Api)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("cannot be handed a credential CA"),
+                "{err}"
+            );
+        }
+        paused_virtio.guest_credential_trust = Some(true);
         let next = paused_virtio
+            .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Api)
+            .unwrap();
+        // Having captured a checkpoint does not make a machine one that
+        // restores: a running TSI machine with a checkpoint head takes them.
+        let mut captured = networked("captured");
+        captured.checkpoint_head = Some("gen-1".into());
+        assert!(!captured.resumes_saved_memory());
+        captured
             .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Api)
             .unwrap();
         // Its saved device set had no CA mount; the guest gets it from the host.
@@ -3406,6 +3508,126 @@ mod tests {
             &next
                 .with_credential_bindings(Default::default(), Caller::Api)
                 .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A secret reference a binding withheld from the guest goes with the
+    /// binding: removing or re-pointing it never injects the operator's
+    /// secret into the guest's environment as plaintext.
+    #[test]
+    fn a_removed_binding_takes_its_secret_reference_with_it() {
+        use crate::machine_spec::Caller;
+        let mut record = networked("withheld");
+        record
+            .secret_refs
+            .insert("GH_TOKEN".into(), crate::secrets::file_ref("/home/op/gh"));
+        record
+            .secret_refs
+            .insert("OTHER".into(), crate::secrets::env_ref("OTHER"));
+        let bound = record
+            .with_credential_bindings(bindings(&["gh=GH_TOKEN@api.github.com"]), Caller::Cli)
+            .unwrap();
+        assert!(
+            bound.secret_refs.contains_key("GH_TOKEN"),
+            "still feeding the binding"
+        );
+        let (refs, _) = crate::credentials::workload_env(
+            bound.credential_policy.as_ref(),
+            &bound.credential_placeholders,
+            &bound.secret_refs,
+        );
+        assert!(!refs.contains_key("GH_TOKEN"), "withheld while bound");
+
+        for next in [
+            bound
+                .with_credential_bindings(Default::default(), Caller::Api)
+                .unwrap(),
+            bound
+                .with_credential_bindings(bindings(&["gh=OTHER_GH@api.github.com"]), Caller::Api)
+                .unwrap(),
+            bound
+                .with_credential_bindings(
+                    bindings(&["renamed=OTHER_GH@api.github.com"]),
+                    Caller::Cli,
+                )
+                .unwrap_or_else(|_| {
+                    // The CLI needs a variable to read; a header-less rename is fine.
+                    bound.clone()
+                }),
+        ] {
+            if next.credential_policy == bound.credential_policy {
+                continue;
+            }
+            assert!(
+                !next.secret_refs.contains_key("GH_TOKEN"),
+                "{:?}",
+                next.secret_refs.keys()
+            );
+            assert!(
+                next.secret_refs.contains_key("OTHER"),
+                "unrelated references stay"
+            );
+            let (refs, _) = crate::credentials::workload_env(
+                next.credential_policy.as_ref(),
+                &next.credential_placeholders,
+                &next.secret_refs,
+            );
+            assert!(!refs.contains_key("GH_TOKEN"), "never exposed as plaintext");
+        }
+        // A binding still reading the variable keeps it.
+        let rescoped = bound
+            .with_credential_bindings(bindings(&["gh=GH_TOKEN@github.com"]), Caller::Cli)
+            .unwrap();
+        assert!(rescoped.secret_refs.contains_key("GH_TOKEN"));
+    }
+
+    /// Bindings never give a machine network or egress: removing them all
+    /// leaves no policy, `--no-net` then leaves no network at all, and an
+    /// external interceptor may be bound again.
+    #[test]
+    fn bindings_never_widen_the_network() {
+        use crate::machine_spec::Caller;
+        let record = networked("widen");
+        let bound = record
+            .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Api)
+            .unwrap();
+        assert_eq!(bound.network, record.network, "nothing turned on");
+        let cleared = bound
+            .with_credential_bindings(Default::default(), Caller::Api)
+            .unwrap();
+        assert_eq!(cleared.credential_policy, None);
+
+        let mut offline = cleared.clone();
+        offline
+            .apply_egress_policy(&network::EgressPolicy::default())
+            .unwrap();
+        assert!(!offline.network);
+        assert_eq!(
+            offline.launch_network_plan().backend,
+            crate::network::launch::EffectiveNetworkBackend::None,
+            "no binding keeps a network the machine turned off"
+        );
+        // Even with bindings, a machine whose network is turned off has none.
+        let mut bound_offline = bound.clone();
+        bound_offline.network = false;
+        let plan = bound_offline.launch_network_plan();
+        assert_eq!(
+            plan.backend,
+            crate::network::launch::EffectiveNetworkBackend::None
+        );
+        assert!(!plan.outbound);
+
+        // No policy left, so an external interceptor is not blocked by one.
+        let endpoint = smolvm_protocol::InterceptEndpoint {
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            token: [1; 32],
+        };
+        crate::agent::validate_external_interceptor(
+            &endpoint,
+            &cleared.vm_resources(),
+            cleared.credential_policy.is_some(),
+            false,
         )
         .unwrap();
     }

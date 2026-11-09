@@ -535,6 +535,10 @@ pub struct CheckpointNetwork {
     /// it was recorded, where the device follows `credential_policy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ca_device: Option<bool>,
+    /// Whether the captured guest agent can be handed a credential CA while
+    /// it runs. Absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_credential_trust: Option<bool>,
 }
 
 /// Versioned host CPU compatibility contract for a live checkpoint.

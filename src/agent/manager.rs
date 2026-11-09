@@ -667,16 +667,26 @@ pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()
 }
 
 /// Hand running machine `name` new values for its credential bindings, by
-/// binding name: its next request to a bound host uses them.
+/// binding name: its next request to a bound host uses them. `expect` is the
+/// bindings the values were read for (the record's, under the caller's lock):
+/// a value whose binding has changed in the boot process since is refused,
+/// so it never reaches a binding that replaced the one it was meant for.
 pub fn apply_live_credential_values(
     name: &str,
     values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+    expect: &crate::credentials::CredentialPolicy,
 ) -> Result<()> {
     let values: std::collections::BTreeMap<&str, &str> = values
         .iter()
         .map(|(binding, value)| (binding.as_str(), value.as_str()))
         .collect();
-    let request = zeroize::Zeroizing::new(serde_json::json!({ "values": values }).to_string());
+    let expect: std::collections::BTreeMap<&str, &crate::credentials::CredentialBinding> = values
+        .keys()
+        .filter_map(|binding| expect.binding(binding).map(|b| (*binding, b)))
+        .collect();
+    let request = zeroize::Zeroizing::new(
+        serde_json::json!({ "values": values, "expect": expect }).to_string(),
+    );
     send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
         Error::config(
             "credentials",
@@ -3108,6 +3118,13 @@ impl AgentManager {
             )?;
         }
         let mut credential_identity = None;
+        // Held until this boot is up: a change to the machine's bindings
+        // waits for it, and this boot never reads bindings a change is
+        // replacing.
+        let _bindings_lock = match self.name() {
+            Some(name) => Some(crate::credentials::lock_bindings(name)?),
+            None => None,
+        };
         if let Some(name) = self.name() {
             let db = crate::db::SmolvmDb::open()?;
             if let Some(record) = db.get_vm(name)? {
@@ -3164,13 +3181,31 @@ impl AgentManager {
                 // must rebuild the device set its saved memory was taken with,
                 // which has the CA only if that boot mounted it.
                 let restoring = features.snapshot_dir.is_some();
+                let identity = crate::credentials::CredentialIdentity::of(name, &record);
+                // The record, read under the lock, decides the bindings this
+                // boot enforces, whatever the caller loaded earlier (an API
+                // entry, a supervisor restart): a change made by another
+                // process since must not be booted over.
+                if record.credential_policy.is_some() {
+                    features.credentials =
+                        crate::credentials::CredentialLaunch::for_record(name, &record);
+                } else if restoring && record.credential_ca_boot_device() {
+                    // No binding any more, but the saved guest has the CA
+                    // device: recreate it, with an interceptor that has none.
+                    features.credentials =
+                        Some(crate::credentials::CredentialLaunch::without_bindings(
+                            &identity,
+                            record.credentials_supplied_by_api,
+                        ));
+                } else {
+                    // A record without bindings boots none, whatever a caller
+                    // loaded before they were removed.
+                    features.credentials = None;
+                }
                 if let Some(launch) = features.credentials.as_mut() {
                     launch.ca_boot_mount = !restoring || record.credential_ca_boot_device();
                 }
-                credential_identity = Some(crate::credentials::CredentialIdentity::of(
-                    name,
-                    record.golden.as_deref(),
-                ));
+                credential_identity = Some(identity);
                 let ca_device = features.credentials.is_some();
                 if !restoring && record.credential_ca_device != Some(ca_device) {
                     db.update_vm(name, |r| r.credential_ca_device = Some(ca_device))?;
@@ -3906,6 +3941,9 @@ impl AgentManager {
         if let (Ok(()), Some((launch, restored))) = (&launched, launched_credentials) {
             self.settle_credential_trust(&launch, restored, trusted_ca.as_deref());
         }
+        if launched.is_ok() {
+            self.record_guest_credential_trust();
+        }
         launched
     }
 
@@ -3947,6 +3985,34 @@ impl AgentManager {
             .and_then(|db| db.update_vm(name, |r| r.credential_ca_trusted = Some(current)));
         if let Err(error) = recorded {
             tracing::warn!(%error, "could not record the credential CA the guest trusts");
+        }
+    }
+
+    /// Record whether the guest that just answered can be handed a credential
+    /// CA while it runs, so a change to the bindings of a machine resuming
+    /// memory saved from this boot knows whether its guest can take them.
+    fn record_guest_credential_trust(&self) {
+        let Some(name) = self.name() else {
+            return;
+        };
+        let capable = match self.connect().and_then(|mut client| {
+            client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)
+        }) {
+            Ok(capable) => capable,
+            Err(error) => {
+                tracing::debug!(%error, "could not ask the guest agent what it supports");
+                return;
+            }
+        };
+        let recorded = crate::db::SmolvmDb::open().and_then(|db| {
+            db.update_vm(name, |r| {
+                if r.guest_credential_trust != Some(capable) {
+                    r.guest_credential_trust = Some(capable);
+                }
+            })
+        });
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "could not record the guest agent's credential support");
         }
     }
 

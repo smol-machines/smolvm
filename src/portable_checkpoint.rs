@@ -3942,6 +3942,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         credential_policy: vm.credential_policy.clone(),
         credential_placeholders: vm.credential_placeholders.clone(),
         credential_ca_device: Some(vm.credential_ca_boot_device()),
+        guest_credential_trust: vm.guest_credential_trust,
     }
 }
 

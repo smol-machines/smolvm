@@ -3307,8 +3307,18 @@ mod tests {
         };
         let resources = VmResources::default();
         assert!(validate_external_interceptor(&endpoint, &resources, false, false).is_ok());
+        // Bindings never turn networking on; on a networked machine they
+        // steer the default backend to virtio-net.
         assert_eq!(
             select_network_plan(&resources, false, 0, true).backend,
+            crate::network::EffectiveNetworkBackend::None
+        );
+        let networked = VmResources {
+            network: true,
+            ..VmResources::default()
+        };
+        assert_eq!(
+            select_network_plan(&networked, false, 0, true).backend,
             crate::network::EffectiveNetworkBackend::VirtioNet
         );
         for addr in ["0.0.0.0:1234", "192.0.2.1:1234", "127.0.0.1:0"] {

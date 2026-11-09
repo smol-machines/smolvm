@@ -1459,9 +1459,15 @@ impl EmbeddedRuntime {
             let running =
                 crate::agent::state_probe::resolve_state(name, &record) == RecordState::Running;
             let live = running.then(|| values.clone());
-            crate::credentials::supply_values(name, values);
+            let policy = record.credential_policy.clone().unwrap_or_default();
+            crate::credentials::supply_values(
+                name,
+                values,
+                &policy,
+                &record.credential_placeholders,
+            );
             match live {
-                Some(values) => crate::agent::apply_live_credential_values(name, &values),
+                Some(values) => crate::agent::apply_live_credential_values(name, &values, &policy),
                 None => Ok(()),
             }
         })
