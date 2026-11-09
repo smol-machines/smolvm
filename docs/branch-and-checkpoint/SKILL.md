@@ -5,11 +5,11 @@ description: Saves a running smolvm machine as checkpoints on a schedule, keeps 
 
 # Checkpoints, restores, pauses and branches
 
-Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a restore
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a restore
 brings back both the disk and the memory you left, the schedule keeps exactly the checkpoints you
 asked for and no fewer, and every child of a branch starts from a state you still hold as a
 checkpoint after the children are gone.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 `README.md` says what each of these operations is. This file is how to run them, and the traps.
@@ -229,7 +229,7 @@ Full detail in `references/traps.md`. The ones that cost the most:
 and **Linux aarch64** on v1.18.2 and once on v1.22.2, with the one difference that Linux needs no
 `--branchable`. On v1.16.1 Linux aarch64 refused `--store` and froze a branch source; from v1.18.2
 it does neither. **Linux x86_64**
-was not re-run. **Windows** on v1.34.0 checkpoints to a file, pauses and resumes, and restores a
+ran every script on v1.34.0, twice, with the same results. **Windows** on v1.34.0 checkpoints to a file, pauses and resumes, and restores a
 machine started with `--branchable`; without the flag a checkpoint or a pause fails with `os error
 1784` from v1.28.1, where v1.22.2 to v1.28.0 took them. Every branch needs `--freeze-source` and
 `--store` is refused, so `checkpoint.sh` cannot run there.
@@ -280,6 +280,11 @@ Captures now take under a second, so `checkpoint.sh` run right after another hit
 collision 4 times in 6 (`result=FAILED ... already exists`); it now waits for the next second. On
 macOS a machine started without `--branchable` took a `--store` capture and restored with its RAM
 token on v1.24.0 and v1.34.0, where v1.23.7 refused it.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step: `result=schedule_ok` with 4 of 4 captures,
+three generations listed, restores of `~2` and the newest holding the source's RAM token, a pause
+and resume with the counter at 31 then 32, and both children of a batch branch holding one token.
 
 ## Re-verified on v1.29.0
 
@@ -335,7 +340,7 @@ children holding the same token.
 
 ## What was not run
 
-- **Linux x86_64**, and the scripts on Windows, which are bash.
+- **The scripts on Windows**, which are bash.
 - **A schedule over hours.** Four captures ten seconds apart on each host, and single captures
   within each run; the growth of a store under `--history 32` over a day was not measured.
 - **Restores on another host, beyond Mac to Linux.** Through v1.22.2 a checkpoint restores only on

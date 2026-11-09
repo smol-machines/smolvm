@@ -5,8 +5,8 @@ description: Runs a coding agent (Claude Code, OpenCode, Codex or any other) ins
 
 # A coding agent in a machine
 
-Verified on **smolvm v1.27.4** on Linux x86_64, 2026-10-14, and on **v1.34.0** on macOS arm64,
-2026-11-09. Done means the agent runs inside the
+Verified on **smolvm v1.34.0** on macOS arm64 and on Linux x86_64, 2026-11-09, and on **v1.27.4**
+on Linux x86_64, 2026-10-14. Done means the agent runs inside the
 machine from the project directory, its edits appear on the host, and git works on the mounted
 repo.
 
@@ -63,3 +63,8 @@ on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). On macOS every step, twice: 
 36 s, restart 0 s, Claude Code 2.1.321, OpenCode 1.19.5, `git status` clean of `dubious ownership`,
 an edit in the guest on the host, the throwaway SSH key listed. On Linux the 4096 MiB machine did
 not boot inside 30 s on this 11 GiB host.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step: first start 30 s, restart 1 s, Claude Code
+2.1.321, OpenCode 1.19.5, `git status` clean of `dubious ownership`, an edit in the guest on the
+host, the throwaway SSH key listed.

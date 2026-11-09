@@ -5,10 +5,10 @@ description: Installs smolvm from a published release and proves the host can ac
 
 # Installing smolvm and proving it works
 
-Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means `smolvm --version` prints the release version **and** a throwaway VM has run
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means `smolvm --version` prints the release version **and** a throwaway VM has run
 one command and exited. A version number alone proves nothing: on every
 platform here there is at least one way for the install to succeed and every VM start to fail.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 `scripts/preflight.sh` reports the host as `key=value` lines and ends with `result=ready`,
@@ -134,7 +134,7 @@ included, so read the plain report first.
 - **macOS arm64**: verified on v1.34.0. The path-length rule in `references/traps.md` applies to
   every install.
 - **Linux aarch64**: verified on v1.18.2, and run once on v1.22.2 and on v1.34.0. **Linux x86_64**: verified on
-  v1.14.2, and installed on v1.14.6 for the gpu-cuda run. The `kvm` group check applies to every
+  v1.34.0, twice, on an NVIDIA A10 cloud host. The `kvm` group check applies to every
   fresh host.
 - **Intel Mac**: the installer accepts macOS 11 or later on Intel and then stops at the download,
   because no `darwin-x86_64` archive is published for v1.34.0; `preflight.sh` says so.
@@ -177,6 +177,11 @@ printed `Installing version: 1.34.0` and `Checksum verified`, then `result=ready
 preflight gave `socket_path_bytes=106` and `result=blocked`, and the boot's error now ends by
 telling you to run with a shorter `HOME`. On Linux the same install, `KVM access verified`, and
 `result=boot_ok` after the seed helper's 8192 MiB timed out and the guest pulled the image itself.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`: `result=not_installed`, `KVM access verified`,
+`Installing version: 1.34.0`, `Checksum verified`, then `result=ready`, `guest_kernel=Linux
+6.18.60`, `is_a_vm=yes` and `result=boot_ok` on the first boot, and a clean cleanup.
 
 ## Re-verified on v1.29.0
 
@@ -238,8 +243,6 @@ verified on v1.18.2.
   Windows run whose account already held the privilege. The failure it guards against has been
   reported from outside and reproduced by forcing the state, but the unprivileged install itself
   has not been run.
-- **The scripts on Linux x86_64**; that arm was last verified on v1.14.2 (install and boot) and
-  installed on v1.14.6 for the gpu-cuda run.
 
 ## Related packets
 

@@ -5,12 +5,12 @@ description: "Stops every smolvm machine a session started, removes smolvm's sta
 
 # Leaving nothing running and nothing behind
 
-Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64,
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64,
 2026-09-24. This packet exists on its own because **the obvious cleanup steps fail here**: the
 obvious assertion gives a false failure, the obvious reaper matches the wrong process or nothing
 at all, and killing a wrapper around a run does not stop its machine. Anything that starts machines
 needs this more than it needs any single feature.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 The cleanup scripts of credentials, dev-env, docker-in-machine, gpu-cuda and install are this
@@ -182,8 +182,7 @@ session's; delete it by name with `--force`.
 
 - **macOS arm64**: the scripts were run here on v1.34.0. **Linux aarch64**: on v1.18.2, and once
   on v1.22.2.
-- **Linux x86_64**: the procedure was verified on v1.14.2 on an NVIDIA A10 cloud host. The
-  scripts themselves were not re-run there.
+- **Linux x86_64**: the scripts ran on v1.34.0, twice, on an NVIDIA A10 cloud host.
 - **Windows x86_64**: `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on
   Windows 11 Home build 10.0.26200 UBR 9711 as the cleanup after runs that had created
   machines, packs and bakes, after which the profile matched its listing from before them. The
@@ -228,6 +227,12 @@ real installation's three directories. After `--uninstall`, `find` listed
 Linux: the orphaned VM was found and killed by `--reap`, `verify-clean.sh` then said `vm_dirs=FAIL`
 until `smolvm serve start` ran once, and then `result=clean`; `--protected` gave `ok` for the box's
 real data and cache directories, and `--uninstall` left the same two paths.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, as on Linux aarch64: `--reap` killed the orphaned VM,
+`verify-clean.sh` said `machines=FAIL` and `vm_dirs=FAIL` until `smolvm serve start` ran once and
+then `result=clean`, and `--uninstall` left the same two paths. `--protected` was not run there:
+that host had no other installation.
 
 ## Re-verified on v1.29.0
 
@@ -288,7 +293,6 @@ helpers left listed by interrupted and failed first boots. Linux was last verifi
 - **Kubernetes.** `references/kubernetes.md` records a sweep verified on an Ubuntu 22.04 x86_64 k3s
   node on v1.14.2, not re-run since. Its lines for the `RuntimeClass`, the node label and the
   drop-in are read from the repository's k3s scripts at v1.22.2 and were not run.
-- **Linux x86_64.**
 - **The macOS `hdiutil` mount-point case.** `references/traps.md` records that `rm -rf` on the
   pack cache can fail with `Resource busy` and what the uninstaller does about it. No pack was
   created in the runs recorded here, so that path was not exercised.

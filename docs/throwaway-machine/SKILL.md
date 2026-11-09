@@ -6,10 +6,10 @@ description: Runs untrusted code in a throwaway smolvm microVM against a repo it
 # Running untrusted work in a throwaway machine
 
 Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, by the offline route, the network-on route
-and the cancel; on Linux aarch64 by the offline route and the cancel on v1.20.2, 2026-09-29, and the
+and the cancel, and on Linux x86_64 by all three, 2026-11-09; on Linux aarch64 by the offline route and the cancel on v1.20.2, 2026-09-29, and the
 network-on route on v1.18.2, 2026-09-24. Done means the command's output landed in your writable directory,
 the repo is unchanged, the workload could not reach the network, and nothing is left running.
-The Linux runs used the scripts of their date; this version's preflight, run and cleanup scripts
+The Linux aarch64 runs used the scripts of their date; this version's preflight, run and cleanup scripts
 ran on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 **On macOS from v1.24.0 to v1.29.0 the offline route does not run**
@@ -218,8 +218,8 @@ Read these when the situation calls for them; they are not needed for a normal r
 
 - **Linux aarch64**: **the offline route and the cancel path on both routes were run here on
   v1.20.2**, 2026-09-29; the network-on route end to end on v1.18.2, and once on v1.22.2.
-- **Linux x86_64**: the offline route was verified on v1.14.2 on an NVIDIA A10 cloud host, not
-  re-run since.
+- **Linux x86_64**: **every step, twice, on v1.34.0**, 2026-11-09, on an NVIDIA A10 cloud host,
+  the 8192 MiB bake helper included. The mount ceiling in step 1 was measured there.
 - **macOS arm64**: **the offline route, the network-on route and the cancel path on both were run
   here on v1.23.0**, 2026-10-04, and on v1.34.0, 2026-11-09; on v1.24.0 to v1.29.0 everything but
   the offline route (#1819). Before v1.20.2 the offline shape is unavailable (#1192, reproduced
@@ -290,6 +290,13 @@ with `inside_network=ok (REACHED)`; `--allow-host example.com` reached it and no
 cancel `result=clean`; the shell by hand and the persistent machine with no network as above. On
 Linux the bake's 8192 MiB helper did not boot inside 30 s, and `bake.sh` said so with
 `control_boot_2048=ok`; the network-on route, the grant and the cancel held.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step at the packet's sizes:
+`offline_shape=available`, `baked in 8s`, `used_host_cache=yes`, `result=isolation_held` on both
+routes, `--allow-host example.com` reached it and not `example.org`, the cancel `result=clean`, and
+the shell by hand and the persistent machine at the default size printed `print(6*7)`, `Read-only
+file system`, `bad address 'example.com'` and `42`.
 
 ## Re-verified on v1.23.0
 
