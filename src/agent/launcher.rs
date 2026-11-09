@@ -1377,17 +1377,22 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     }
                 });
                 #[cfg(unix)]
-                if let Some(primary) = switch_endpoint
-                    .as_ref()
-                    .and_then(|endpoint| endpoint.read_members().into_iter().next())
-                {
+                if let Some((primary, ip)) = switch_endpoint.as_ref().and_then(|endpoint| {
+                    endpoint
+                        .read_members()
+                        .into_iter()
+                        .find_map(|m| match m.ip {
+                            std::net::IpAddr::V4(ip) => Some((m, ip)),
+                            std::net::IpAddr::V6(_) => None,
+                        })
+                }) {
                     let mask = if primary.prefix == 0 {
                         0
                     } else {
                         u32::MAX << (32 - u32::from(primary.prefix.min(32)))
                     };
-                    let gateway = std::net::Ipv4Addr::from((u32::from(primary.ip) & mask) + 1);
-                    guest_network.guest_ip = primary.ip;
+                    let gateway = std::net::Ipv4Addr::from((u32::from(ip) & mask) + 1);
+                    guest_network.guest_ip = ip;
                     guest_network.gateway_ip = gateway;
                     guest_network.prefix_len = primary.prefix;
                     guest_network.dns_server = gateway;

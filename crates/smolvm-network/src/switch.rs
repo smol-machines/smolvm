@@ -1,4 +1,4 @@
-//! The container switch: routed IPv4 between machines on shared networks.
+//! The container switch: routed IP between machines on shared networks.
 //!
 //! A container engine runs every container as its own machine, each with
 //! this crate's network stack in its VMM. Containers on the same network
@@ -12,6 +12,7 @@
 //! <dir>/ep/<endpoint>.sock      one per running machine, bound by its stack
 //! <dir>/ep/<endpoint>.json      the machine's addresses, written by the engine:
 //!                               {"members":[{"network":"n1","ip":"172.18.0.2","prefix":16}]}
+//!                               (a network with IPv6 adds a member with its IPv6 address)
 //! <dir>/n/<network>/<ip>        symlink to the member's endpoint socket
 //! <dir>/n/<network>/names       "name ip" lines: the names that resolve on the network
 //! ```
@@ -20,7 +21,9 @@
 //! leaves the guest through its own stack, which writes the raw IP packet to
 //! `<dir>/n/<network>/<dst>`, a connect that the symlink takes to the
 //! destination's endpoint socket. The destination stack wraps it in an
-//! Ethernet frame for its guest. Framing between stacks is
+//! Ethernet frame for its guest. A guest reaches its peers' link addresses
+//! through its own stack, which answers ARP and IPv6 neighbor solicitation
+//! for them with its own MAC. Framing between stacks is
 //! `[4-byte big-endian length][raw IP packet]`, as for [`crate::fabric`].
 //!
 //! Isolation is checked on both ends. A stack forwards a packet only when
@@ -38,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, RwLock};
@@ -91,7 +94,7 @@ pub struct Member {
     /// The network's directory name under `n/`.
     pub network: NetworkName,
     /// The machine's address on it.
-    pub ip: Ipv4Addr,
+    pub ip: IpAddr,
     /// The network's prefix length.
     pub prefix: u8,
 }
@@ -106,12 +109,14 @@ pub fn parse_endpoint_file(bytes: &[u8]) -> Vec<Member> {
         .map(|list| {
             list.iter()
                 .filter_map(|m| {
+                    let ip: IpAddr = m["ip"].as_str()?.parse().ok()?;
+                    let max = if ip.is_ipv4() { 32 } else { 128 };
                     Some(Member {
                         network: NetworkName::new(m["network"].as_str()?)?,
-                        ip: m["ip"].as_str()?.parse().ok()?,
+                        ip,
                         prefix: u8::try_from(m["prefix"].as_u64()?)
                             .ok()
-                            .filter(|p| *p <= 32)?,
+                            .filter(|p| *p <= max)?,
                     })
                 })
                 .collect()
@@ -167,25 +172,51 @@ impl NetworkName {
     }
 }
 
+/// An address as a 128-bit number with its width, so one subnet rule
+/// covers IPv4 and IPv6.
+fn bits(ip: IpAddr) -> (u128, u32) {
+    match ip {
+        IpAddr::V4(v4) => (u128::from(u32::from(v4)), 32),
+        IpAddr::V6(v6) => (u128::from(v6), 128),
+    }
+}
+
 impl Member {
-    fn mask(&self) -> u32 {
-        if self.prefix == 0 {
+    fn mask(&self) -> u128 {
+        let (_, width) = bits(self.ip);
+        let prefix = u32::from(self.prefix).min(width);
+        let all = if width == 32 {
+            u128::from(u32::MAX)
+        } else {
+            u128::MAX
+        };
+        if prefix == 0 {
             0
         } else {
-            u32::MAX << (32 - self.prefix.min(32) as u32)
+            all & (all << (width - prefix))
         }
     }
 
     /// Whether `ip` is inside this member's network.
-    pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        u32::from(ip) & self.mask() == u32::from(self.ip) & self.mask()
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        if ip.is_ipv4() != self.ip.is_ipv4() {
+            return false;
+        }
+        bits(ip).0 & self.mask() == bits(self.ip).0 & self.mask()
     }
 
-    /// The network's own address and its broadcast, which no member owns.
-    fn reserved(&self, ip: Ipv4Addr) -> bool {
-        let net = u32::from(self.ip) & self.mask();
-        let ip = u32::from(ip);
-        ip == net || ip == net | !self.mask()
+    /// The network's own address, and an IPv4 network's broadcast, which no
+    /// member owns.
+    fn reserved(&self, ip: IpAddr) -> bool {
+        let (net, width) = bits(self.ip);
+        let net = net & self.mask();
+        let ip = bits(ip).0;
+        let all = if width == 32 {
+            u128::from(u32::MAX)
+        } else {
+            u128::MAX
+        };
+        ip == net || (width == 32 && ip == net | (all & !self.mask()))
     }
 }
 
@@ -203,7 +234,7 @@ pub enum Route {
 pub struct SwitchHandle {
     endpoint: SwitchEndpoint,
     members: Arc<RwLock<Vec<Member>>>,
-    sender: SyncSender<(Ipv4Addr, Vec<u8>)>,
+    sender: SyncSender<(IpAddr, Vec<u8>)>,
     names: Arc<RwLock<HashMap<NetworkName, NamesFile>>>,
     /// When the endpoint file was last read.
     seen: Arc<std::sync::Mutex<Option<SystemTime>>>,
@@ -213,12 +244,12 @@ pub struct SwitchHandle {
 #[derive(Default)]
 struct NamesFile {
     modified: Option<SystemTime>,
-    entries: HashMap<String, Vec<Ipv4Addr>>,
+    entries: HashMap<String, Vec<IpAddr>>,
 }
 
 impl SwitchHandle {
     /// Where `dst` goes.
-    pub fn route(&self, dst: Ipv4Addr) -> Route {
+    pub fn route(&self, dst: IpAddr) -> Route {
         let members = self.members.read().unwrap_or_else(|e| e.into_inner());
         if members.iter().any(|m| m.ip == dst) {
             return Route::Elsewhere;
@@ -237,6 +268,16 @@ impl SwitchHandle {
     /// own MAC: any address on the machine's networks but its own, so the
     /// guest sends traffic for its peers (and their gateways) to the stack.
     pub fn answers_arp_for(&self, target: Ipv4Addr) -> bool {
+        self.answers_for(IpAddr::V4(target))
+    }
+
+    /// [`answers_arp_for`](Self::answers_arp_for) for IPv6 neighbor
+    /// solicitation.
+    pub fn answers_ndp_for(&self, target: Ipv6Addr) -> bool {
+        self.answers_for(IpAddr::V6(target))
+    }
+
+    fn answers_for(&self, target: IpAddr) -> bool {
         let members = self.members.read().unwrap_or_else(|e| e.into_inner());
         !members.iter().any(|m| m.ip == target)
             && members
@@ -245,7 +286,7 @@ impl SwitchHandle {
     }
 
     /// Whether `ip` is the gateway address of one of the machine's networks.
-    pub fn is_gateway(&self, ip: Ipv4Addr) -> bool {
+    pub fn is_gateway(&self, ip: IpAddr) -> bool {
         let members = self.members.read().unwrap_or_else(|e| e.into_inner());
         members.iter().any(|m| is_gateway(m, ip))
     }
@@ -253,7 +294,7 @@ impl SwitchHandle {
     /// Queue one guest IP packet for its peer. Dropped (as IP may drop)
     /// when the queue is full or the source is not the machine's own address
     /// on the destination's network.
-    pub fn forward(&self, src: Ipv4Addr, dst: Ipv4Addr, packet: Vec<u8>) {
+    pub fn forward(&self, src: IpAddr, dst: IpAddr, packet: Vec<u8>) {
         let allowed = {
             let members = self.members.read().unwrap_or_else(|e| e.into_inner());
             members.iter().any(|m| m.contains(dst) && m.ip == src)
@@ -267,7 +308,7 @@ impl SwitchHandle {
     }
 
     /// The addresses `name` has on the machine's networks, if it has any.
-    pub fn lookup(&self, name: &str) -> Option<Vec<Ipv4Addr>> {
+    pub fn lookup(&self, name: &str) -> Option<Vec<IpAddr>> {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
         // A name lookup right after a network change must see the new
         // networks, not wait for the next poll.
@@ -326,14 +367,13 @@ impl SwitchHandle {
     }
 }
 
-fn is_gateway(m: &Member, ip: Ipv4Addr) -> bool {
-    let net = u32::from(m.ip) & m.mask();
-    u32::from(ip) == net + 1
+fn is_gateway(m: &Member, ip: IpAddr) -> bool {
+    ip.is_ipv4() == m.ip.is_ipv4() && bits(ip).0 == (bits(m.ip).0 & m.mask()) + 1
 }
 
 /// Parse a names file: `name ip` per line; a name may repeat.
-pub fn parse_names(text: &str) -> HashMap<String, Vec<Ipv4Addr>> {
-    let mut out: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
+pub fn parse_names(text: &str) -> HashMap<String, Vec<IpAddr>> {
+    let mut out: HashMap<String, Vec<IpAddr>> = HashMap::new();
     for line in text.lines() {
         let mut parts = line.split_whitespace();
         let (Some(name), Some(ip)) = (parts.next(), parts.next()) else {
@@ -369,7 +409,7 @@ pub fn start_switch(
             .ok(),
     ));
     let members = Arc::new(RwLock::new(endpoint.read_members()));
-    let (sender, receiver) = sync_channel::<(Ipv4Addr, Vec<u8>)>(SENDER_QUEUE_DEPTH);
+    let (sender, receiver) = sync_channel::<(IpAddr, Vec<u8>)>(SENDER_QUEUE_DEPTH);
     let handle = SwitchHandle {
         endpoint: endpoint.clone(),
         members: members.clone(),
@@ -458,7 +498,7 @@ fn wait_readable(listener: &std::os::unix::net::UnixListener) {
 /// Whether a packet from a peer may reach this guest: for one of its
 /// addresses, from inside that address's network.
 fn accepts(members: &[Member], packet: &[u8]) -> bool {
-    let Some((src, dst)) = ipv4_endpoints(packet) else {
+    let Some((src, dst)) = ip_endpoints(packet) else {
         return false;
     };
     members
@@ -474,6 +514,25 @@ pub fn ipv4_endpoints(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
     let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
     let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
     Some((src, dst))
+}
+
+/// Source and destination of an IPv6 packet.
+pub fn ipv6_endpoints(packet: &[u8]) -> Option<(Ipv6Addr, Ipv6Addr)> {
+    if packet.len() < 40 || packet[0] >> 4 != 6 {
+        return None;
+    }
+    let src: [u8; 16] = packet[8..24].try_into().ok()?;
+    let dst: [u8; 16] = packet[24..40].try_into().ok()?;
+    Some((Ipv6Addr::from(src), Ipv6Addr::from(dst)))
+}
+
+/// Source and destination of an IPv4 or IPv6 packet.
+pub fn ip_endpoints(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    match packet.first()? >> 4 {
+        4 => ipv4_endpoints(packet).map(|(s, d)| (IpAddr::V4(s), IpAddr::V4(d))),
+        6 => ipv6_endpoints(packet).map(|(s, d)| (IpAddr::V6(s), IpAddr::V6(d))),
+        _ => None,
+    }
 }
 
 fn peer_reader(
@@ -501,7 +560,16 @@ fn peer_reader(
         if !ok {
             continue;
         }
-        let frame = crate::fabric::ethernet_frame_for_guest(gateway_mac, guest_mac, &packet);
+        let frame = if packet[0] >> 4 == 6 {
+            let mut frame = Vec::with_capacity(14 + packet.len());
+            frame.extend_from_slice(&guest_mac);
+            frame.extend_from_slice(&gateway_mac);
+            frame.extend_from_slice(&[0x86, 0xdd]);
+            frame.extend_from_slice(&packet);
+            frame
+        } else {
+            crate::fabric::ethernet_frame_for_guest(gateway_mac, guest_mac, &packet)
+        };
         if queues.host_to_guest.push(frame).is_ok() {
             queues.host_wake.wake();
         }
@@ -534,11 +602,11 @@ fn read_full(
 
 fn send_loop(
     dir: PathBuf,
-    receiver: Receiver<(Ipv4Addr, Vec<u8>)>,
+    receiver: Receiver<(IpAddr, Vec<u8>)>,
     members: Arc<RwLock<Vec<Member>>>,
     queues: Arc<NetworkFrameQueues>,
 ) {
-    let mut connections: HashMap<Ipv4Addr, std::os::unix::net::UnixStream> = HashMap::new();
+    let mut connections: HashMap<IpAddr, std::os::unix::net::UnixStream> = HashMap::new();
     let mut generation: Vec<Member> = Vec::new();
     for (dst, packet) in receiver.iter() {
         if queues.is_shutting_down() {
@@ -566,8 +634,8 @@ fn send_loop(
 fn send(
     dir: &Path,
     network: NetworkName,
-    connections: &mut HashMap<Ipv4Addr, std::os::unix::net::UnixStream>,
-    dst: Ipv4Addr,
+    connections: &mut HashMap<IpAddr, std::os::unix::net::UnixStream>,
+    dst: IpAddr,
     packet: &[u8],
 ) -> io::Result<()> {
     use std::collections::hash_map::Entry;
@@ -613,6 +681,77 @@ pub fn arp_reply(request: &[u8], mac: [u8; 6]) -> Option<(Ipv4Addr, Vec<u8>)> {
     reply.extend_from_slice(sender_mac);
     reply.extend_from_slice(sender_ip);
     Some((target_ip, reply))
+}
+
+/// A neighbor advertisement telling the soliciting guest that the target of
+/// its neighbor solicitation `request` (an Ethernet frame) is at `mac`.
+/// `None` when `request` is not an IPv6 neighbor solicitation.
+pub fn ndp_reply(request: &[u8], mac: [u8; 6]) -> Option<(Ipv6Addr, Vec<u8>)> {
+    // Ethernet (14) + IPv6 (40) + ICMPv6 NS (24 at least).
+    if request.len() < 14 + 40 + 24 || request[12..14] != [0x86, 0xdd] {
+        return None;
+    }
+    let ip = &request[14..];
+    if ip[0] >> 4 != 6 || ip[6] != 58 {
+        return None;
+    }
+    let icmp = &ip[40..];
+    if icmp[0] != 135 || icmp[1] != 0 {
+        return None;
+    }
+    let target = Ipv6Addr::from(<[u8; 16]>::try_from(&icmp[8..24]).ok()?);
+    let source = Ipv6Addr::from(<[u8; 16]>::try_from(&ip[8..24]).ok()?);
+    // An unspecified source (duplicate address detection) gets its answer on
+    // all-nodes.
+    let dst = if source.is_unspecified() {
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)
+    } else {
+        source
+    };
+    let mut body = Vec::with_capacity(32);
+    body.extend_from_slice(&[136, 0, 0, 0]);
+    let flags: u8 = if source.is_unspecified() { 0x20 } else { 0x60 };
+    body.extend_from_slice(&[flags, 0, 0, 0]);
+    body.extend_from_slice(&target.octets());
+    body.extend_from_slice(&[2, 1]);
+    body.extend_from_slice(&mac);
+    let checksum = icmpv6_checksum(target, dst, &body);
+    body[2..4].copy_from_slice(&checksum.to_be_bytes());
+    let mut frame = Vec::with_capacity(14 + 40 + body.len());
+    frame.extend_from_slice(&request[6..12]);
+    frame.extend_from_slice(&mac);
+    frame.extend_from_slice(&[0x86, 0xdd]);
+    frame.extend_from_slice(&[0x60, 0, 0, 0]);
+    frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&[58, 255]);
+    frame.extend_from_slice(&target.octets());
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&body);
+    Some((target, frame))
+}
+
+/// The ICMPv6 checksum of `body` from `src` to `dst` (with the pseudo-header).
+fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, body: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut add = |bytes: &[u8]| {
+        for chunk in bytes.chunks(2) {
+            let word = if chunk.len() == 2 {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], 0])
+            };
+            sum += u32::from(word);
+        }
+    };
+    add(&src.octets());
+    add(&dst.octets());
+    add(&(body.len() as u32).to_be_bytes());
+    add(&[0, 0, 0, 58]);
+    add(body);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 #[cfg(test)]
@@ -668,10 +807,7 @@ mod tests {
     fn names_parse_and_repeat() {
         let names = parse_names("db 172.18.0.2\nDB 172.18.0.3\nweb 172.18.0.4\nbad\n");
         assert_eq!(names["db"].len(), 2);
-        assert_eq!(
-            names["web"],
-            vec!["172.18.0.4".parse::<Ipv4Addr>().unwrap()]
-        );
+        assert_eq!(names["web"], vec!["172.18.0.4".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]
@@ -682,6 +818,34 @@ mod tests {
         assert!(m.reserved("172.18.0.0".parse().unwrap()));
         assert!(m.reserved("172.18.255.255".parse().unwrap()));
         assert!(is_gateway(&m, "172.18.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_members_route_and_answer_neighbor_solicitation() {
+        let m = member("a", "fd00:1::2", 64);
+        assert!(m.contains("fd00:1::9".parse().unwrap()));
+        assert!(!m.contains("fd00:2::9".parse().unwrap()));
+        assert!(!m.contains("172.18.0.2".parse().unwrap()));
+        assert!(m.reserved("fd00:1::".parse().unwrap()));
+        assert!(is_gateway(&m, "fd00:1::1".parse().unwrap()));
+        // A neighbor solicitation from fd00:1::2 for fd00:1::5.
+        let mut frame = vec![0x33, 0x33, 0xff, 0, 0, 5];
+        frame.extend_from_slice(&[2, 0x53, 0x4d, 0, 0, 2, 0x86, 0xdd]);
+        let target: Ipv6Addr = "fd00:1::5".parse().unwrap();
+        let src: Ipv6Addr = "fd00:1::2".parse().unwrap();
+        frame.extend_from_slice(&[0x60, 0, 0, 0, 0, 24, 58, 255]);
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&"ff02::1:ff00:5".parse::<Ipv6Addr>().unwrap().octets());
+        frame.extend_from_slice(&[135, 0, 0, 0, 0, 0, 0, 0]);
+        frame.extend_from_slice(&target.octets());
+        let (got, reply) = ndp_reply(&frame, [2, 0x53, 0x4d, 0, 0, 1]).unwrap();
+        assert_eq!(got, target);
+        assert_eq!(&reply[0..6], &[2, 0x53, 0x4d, 0, 0, 2]);
+        assert_eq!(reply[14 + 40], 136);
+        assert_eq!(&reply[14 + 24..14 + 40], &src.octets());
+        // The checksum verifies: summing again over the filled field gives 0.
+        let body = &reply[14 + 40..];
+        assert_eq!(icmpv6_checksum(target, src, body), 0);
     }
 
     #[test]

@@ -135,21 +135,23 @@ pub fn configure_from_env() -> Result<bool, String> {
     Ok(true)
 }
 
-/// Make the interface's extra IPv4 addresses (beyond the one it booted with)
-/// exactly `addresses` (`a.b.c.d/len` each), adding and removing as needed.
+/// Make the interface's extra addresses (beyond the one it booted with)
+/// exactly `addresses` (`a.b.c.d/len` or `ipv6/len` each), adding and
+/// removing as needed.
 pub fn set_extra_addresses(addresses: &[String]) -> Result<(), String> {
     let mut parsed = Vec::with_capacity(addresses.len());
     for entry in addresses {
         let (ip, len) = entry
             .split_once('/')
-            .ok_or_else(|| format!("address '{entry}' must be a.b.c.d/len"))?;
-        let ip: Ipv4Addr = ip
+            .ok_or_else(|| format!("address '{entry}' must be address/len"))?;
+        let ip: std::net::IpAddr = ip
             .parse()
-            .map_err(|_| format!("address '{entry}' is not IPv4"))?;
+            .map_err(|_| format!("address '{entry}' is not an IP address"))?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
         let len: u8 = len
             .parse()
             .ok()
-            .filter(|len| *len <= 32)
+            .filter(|len| *len <= max)
             .ok_or_else(|| format!("address '{entry}' has an invalid prefix length"))?;
         parsed.push((ip, len));
     }
@@ -311,7 +313,10 @@ mod linux {
         Err("guest virtio networking is only supported on Linux".to_string())
     }
 
-    pub fn set_extra_addresses(_ifname: &str, _addresses: &[(Ipv4Addr, u8)]) -> Result<(), String> {
+    pub fn set_extra_addresses(
+        _ifname: &str,
+        _addresses: &[(std::net::IpAddr, u8)],
+    ) -> Result<(), String> {
         Err("guest virtio networking is only supported on Linux".to_string())
     }
 

@@ -269,24 +269,35 @@ fn add_address_v4(ifindex: u32, address: Ipv4Addr, prefix_len: u8) -> Result<(),
 
 /// Extra addresses [`set_extra_addresses`] added, so a later call can remove
 /// the ones it no longer lists without touching the boot address.
-static EXTRA_ADDRESSES: std::sync::Mutex<Vec<(Ipv4Addr, u8)>> = std::sync::Mutex::new(Vec::new());
+static EXTRA_ADDRESSES: std::sync::Mutex<Vec<(std::net::IpAddr, u8)>> =
+    std::sync::Mutex::new(Vec::new());
 
-/// Make `ifname`'s extra IPv4 addresses exactly `wanted`.
-pub fn set_extra_addresses(ifname: &str, wanted: &[(Ipv4Addr, u8)]) -> Result<(), String> {
+/// The rtnetlink family and bytes of `ip`.
+fn family_and_octets(ip: std::net::IpAddr) -> (u8, Vec<u8>) {
+    match ip {
+        std::net::IpAddr::V4(v4) => (libc::AF_INET as u8, v4.octets().to_vec()),
+        std::net::IpAddr::V6(v6) => (libc::AF_INET6 as u8, v6.octets().to_vec()),
+    }
+}
+
+/// Make `ifname`'s extra addresses exactly `wanted`. IPv6 addresses skip
+/// duplicate address detection, as the boot address does.
+pub fn set_extra_addresses(ifname: &str, wanted: &[(std::net::IpAddr, u8)]) -> Result<(), String> {
     let ifindex = get_ifindex(ifname)?;
     let mut current = EXTRA_ADDRESSES
         .lock()
         .map_err(|_| "address table lock poisoned".to_string())?;
     for (address, prefix_len) in current.clone() {
         if !wanted.contains(&(address, prefix_len)) {
+            let (family, octets) = family_and_octets(address);
             match netlink_addr(
                 libc::RTM_DELADDR,
                 0,
                 ifindex,
-                libc::AF_INET as u8,
+                family,
                 0,
                 prefix_len,
-                &address.octets(),
+                &octets,
             ) {
                 Ok(()) => {}
                 Err(err) if err.raw_os_error() == Some(libc::EADDRNOTAVAIL) => {}
@@ -299,13 +310,9 @@ pub fn set_extra_addresses(ifname: &str, wanted: &[(Ipv4Addr, u8)]) -> Result<()
         if current.contains(&(address, prefix_len)) {
             continue;
         }
-        match netlink_newaddr(
-            ifindex,
-            libc::AF_INET as u8,
-            0,
-            prefix_len,
-            &address.octets(),
-        ) {
+        let (family, octets) = family_and_octets(address);
+        let flags = if address.is_ipv6() { IFA_F_NODAD } else { 0 };
+        match netlink_newaddr(ifindex, family, flags, prefix_len, &octets) {
             Ok(()) => {}
             Err(err) if err.raw_os_error() == Some(libc::EEXIST) => {}
             Err(err) => return Err(format!("add {address}/{prefix_len}: {err}")),

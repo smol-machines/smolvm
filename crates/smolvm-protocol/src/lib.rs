@@ -1228,13 +1228,13 @@ pub enum AgentRequest {
         overlay_id: String,
     },
 
-    /// Replace the extra IPv4 addresses on the guest's network interface:
-    /// every listed `address/prefix` is present afterwards, and any address
+    /// Replace the extra addresses on the guest's network interface (IPv4
+    /// and IPv6): every listed `address/prefix` is present afterwards, and any address
     /// added by an earlier call and not listed is removed. The primary address
     /// the guest booted with is never touched. Lets a running machine join and
     /// leave networks.
     SetInterfaceAddresses {
-        /// `a.b.c.d/len` entries.
+        /// `a.b.c.d/len` or `ipv6/len` entries.
         addresses: Vec<String>,
     },
 

@@ -180,24 +180,36 @@ pub fn gateway_response(query: &[u8], gateway: Ipv4Addr) -> Vec<u8> {
 
 /// A NOERROR answer with `ips` for an A query, and an empty one for any
 /// other type (AAAA: resolvers then use the A records).
-pub fn addresses_response(query: &[u8], ips: &[Ipv4Addr], ttl: u32) -> Vec<u8> {
+pub fn addresses_response(query: &[u8], ips: &[std::net::IpAddr], ttl: u32) -> Vec<u8> {
     let mut response = error_response(query, 0);
     let Some(end) = question_section_end(query) else {
         return response;
     };
-    if read_u16(query, end - DNS_QUESTION_FIXED_LEN) != Some(DNS_TYPE_A) {
+    // An A question gets the IPv4 addresses, an AAAA question the IPv6 ones;
+    // anything else, or a name without that family, an empty answer.
+    let qtype = read_u16(query, end - DNS_QUESTION_FIXED_LEN);
+    let rdata: Vec<Vec<u8>> = ips
+        .iter()
+        .filter_map(|ip| match (qtype, ip) {
+            (Some(DNS_TYPE_A), std::net::IpAddr::V4(v4)) => Some(v4.octets().to_vec()),
+            (Some(DNS_TYPE_AAAA), std::net::IpAddr::V6(v6)) => Some(v6.octets().to_vec()),
+            _ => None,
+        })
+        .take(32)
+        .collect();
+    let Some(qtype) = qtype else {
         return response;
-    }
-    let count = ips.len().min(32) as u16;
+    };
+    let count = rdata.len() as u16;
     response[DNS_ANCOUNT_OFFSET..DNS_ANCOUNT_OFFSET + DNS_U16_LEN]
         .copy_from_slice(&count.to_be_bytes());
-    for ip in ips.iter().take(count as usize) {
+    for data in rdata {
         response.extend_from_slice(&[DNS_POINTER_TAG, DNS_HEADER_LEN as u8]);
-        response.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        response.extend_from_slice(&qtype.to_be_bytes());
         response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
         response.extend_from_slice(&ttl.to_be_bytes());
-        response.extend_from_slice(&(DNS_A_RDATA_LEN as u16).to_be_bytes());
-        response.extend_from_slice(&ip.octets());
+        response.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        response.extend_from_slice(&data);
     }
     response
 }

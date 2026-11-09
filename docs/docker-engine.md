@@ -111,6 +111,9 @@ engine connects those stacks with a switch:
 - Containers on different networks cannot reach each other at all, by name or address.
 - `docker network connect` and `disconnect` work on running containers.
 - `--internal` networks have no way out.
+- `--ipv6` (Compose's `enable_ipv6: true`) gives a network an IPv6 subnet as well, the one the
+  client names or a unique-local /64: each container gets an IPv6 address on it, reachable by the
+  others on the network (and only them), and its names answer AAAA queries too.
 - `host.docker.internal` and `gateway.docker.internal` reach the host from every container.
 
 `--network container:<name>` (Compose's `network_mode: service:<name>`) runs the container in the
@@ -178,5 +181,5 @@ What the clients send, for whoever adds builds:
 
 ## Not yet
 
-- IPv6 networks, and other network drivers than `bridge`.
+- Network drivers other than `bridge`, and IPv6 on the default `bridge` network.
 - Changing an internal network's egress after a container on it was created.

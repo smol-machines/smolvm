@@ -139,6 +139,16 @@ pub(crate) struct EndpointRecord {
     pub mac: String,
     #[serde(default)]
     pub links: Vec<String>,
+    /// The address asked for on an IPv6 network.
+    #[serde(default)]
+    pub requested_ip6: String,
+    /// The container's IPv6 address, on a network with IPv6.
+    #[serde(default)]
+    pub ip6: String,
+    #[serde(default)]
+    pub prefix_len6: u8,
+    #[serde(default)]
+    pub gateway6: String,
 }
 
 /// Everything persisted about one container.

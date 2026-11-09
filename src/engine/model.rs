@@ -203,6 +203,8 @@ pub(crate) struct EndpointSettings {
 pub(crate) struct EndpointIpam {
     #[serde(rename = "IPv4Address")]
     pub ipv4_address: String,
+    #[serde(rename = "IPv6Address")]
+    pub ipv6_address: String,
 }
 
 /// The body of `POST /containers/create`.

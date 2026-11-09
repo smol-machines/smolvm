@@ -484,6 +484,28 @@ EOF
     [[ $ok -eq 0 ]]
 }
 
+# IPv6 networks: `--ipv6` with a unique-local subnet or the client's own,
+# addresses reachable from the other containers on the network, and names
+# answering AAAA.
+test_ipv6_networks() {
+    local net="$PREFIX-v6" net2="$PREFIX-v6b" a6
+    docker network create --ipv6 --label "$PREFIX" "$net" >/dev/null || return 1
+    run -d --name "$PREFIX-v6a" --network "$net" nginx:alpine >/dev/null || return 1
+    a6=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$net\").GlobalIPv6Address}}" "$PREFIX-v6a")
+    [[ "$a6" == fd* ]] || return 1
+    docker network inspect -f '{{.EnableIPv6}}' "$net" | has true || return 1
+    run --rm --network "$net" alpine sh -c "
+        ip -6 addr show eth0 | grep -q '${a6%::*}' &&
+        ping -6 -c1 -W2 $a6 >/dev/null &&
+        nslookup -type=AAAA $PREFIX-v6a 2>/dev/null | grep -q '$a6' &&
+        for i in 1 2 3 4 5 6 7 8 9 10; do wget -qO- http://[$a6]/ 2>/dev/null | grep -q nginx && exit 0; sleep 0.3; done; exit 1" || return 1
+    docker network create --ipv6 --subnet fd00:dead::/64 --label "$PREFIX" "$net2" >/dev/null || return 1
+    run --rm --network "$net2" alpine ip -6 addr show eth0 | has 'fd00:dead::' || return 1
+    # Not on the network: its IPv6 address is out of reach too.
+    run --rm --network "$net2" alpine ping -6 -c1 -W2 "$a6" >/dev/null 2>&1 && return 1
+    return 0
+}
+
 test_host_docker_internal() {
     python3 -m http.server 18766 --bind 127.0.0.1 --directory "$WORK" >/dev/null 2>&1 &
     local srv=$!
@@ -616,6 +638,7 @@ run_test "networks: names, aliases, isolation" test_networks_names_aliases_isola
 run_test "network connect and disconnect while running" test_network_connect_and_disconnect_live || true
 run_test "default bridge: by address, no names" test_default_bridge_by_address_without_names || true
 run_test "--network container: shares a network" test_network_container_mode || true
+run_test "IPv6 networks" test_ipv6_networks || true
 run_test "host.docker.internal reaches the host" test_host_docker_internal || true
 run_test "compose: health-check dependency, two networks" test_compose_healthcheck_dependency_two_networks || true
 run_test "repeated starts keep their own addresses" test_repeated_starts_keep_their_own_addresses || true

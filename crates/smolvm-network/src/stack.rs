@@ -1496,13 +1496,14 @@ fn smoltcp_now(clock: StdInstant) -> Instant {
 /// What the container switch does with one guest frame.
 #[cfg(unix)]
 enum SwitchAction {
-    /// An IPv4 packet for another machine on one of this machine's networks.
+    /// An IP packet for another machine on one of this machine's networks.
     Forward {
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
+        src: std::net::IpAddr,
+        dst: std::net::IpAddr,
         packet: Vec<u8>,
     },
-    /// A frame to hand straight back to the guest (an ARP reply).
+    /// A frame to hand straight back to the guest (an ARP reply or an IPv6
+    /// neighbor advertisement).
     Reply(Vec<u8>),
 }
 
@@ -1519,6 +1520,22 @@ fn switch_action(
         [0x08, 0x00] => {
             let packet = &frame[14..];
             let (src, dst) = crate::switch::ipv4_endpoints(packet)?;
+            let (src, dst) = (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst));
+            (switch.route(dst) == crate::switch::Route::Peer).then(|| SwitchAction::Forward {
+                src,
+                dst,
+                packet: packet.to_vec(),
+            })
+        }
+        [0x86, 0xdd] => {
+            if let Some((target, reply)) = crate::switch::ndp_reply(frame, gateway_mac) {
+                return switch
+                    .answers_ndp_for(target)
+                    .then_some(SwitchAction::Reply(reply));
+            }
+            let packet = &frame[14..];
+            let (src, dst) = crate::switch::ipv6_endpoints(packet)?;
+            let (src, dst) = (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst));
             (switch.route(dst) == crate::switch::Route::Peer).then(|| SwitchAction::Forward {
                 src,
                 dst,

@@ -22,7 +22,7 @@
 //! its stack answers for the host.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -60,6 +60,11 @@ pub(crate) struct NetworkRecord {
     pub attachable: bool,
     #[serde(default)]
     pub builtin: bool,
+    /// `addr/len` of the network's IPv6 subnet; empty without IPv6.
+    #[serde(default)]
+    pub subnet6: String,
+    #[serde(default)]
+    pub gateway6: String,
 }
 
 impl NetworkRecord {
@@ -78,6 +83,27 @@ impl NetworkRecord {
     fn routable(&self) -> bool {
         self.net().is_some()
     }
+
+    /// The IPv6 subnet, on a network with IPv6.
+    fn net6(&self) -> Option<(Ipv6Addr, u8)> {
+        let (ip, len) = self.subnet6.split_once('/')?;
+        let ip: Ipv6Addr = ip.parse().ok()?;
+        let len: u8 = len.parse().ok().filter(|l| *l <= 124)?;
+        Some((Ipv6Addr::from(u128::from(ip) & mask6(len)), len))
+    }
+}
+
+fn mask6(len: u8) -> u128 {
+    if len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(len))
+    }
+}
+
+fn overlaps6(a: (Ipv6Addr, u8), b: (Ipv6Addr, u8)) -> bool {
+    let len = a.1.min(b.1);
+    u128::from(a.0) & mask6(len) == u128::from(b.0) & mask6(len)
 }
 
 fn mask(len: u8) -> u32 {
@@ -132,6 +158,8 @@ impl Networks {
                     internal: false,
                     attachable: false,
                     builtin: true,
+                    subnet6: String::new(),
+                    gateway6: String::new(),
                 };
                 store.save_object("networks", &record.id, &record)?;
                 records.insert(record.id.clone(), record);
@@ -214,11 +242,11 @@ impl Networks {
                 "network driver \"{driver}\" is not supported: every container is its own machine, and networks between them are bridge networks"
             )));
         }
-        if req.enable_ipv6 == Some(true) {
-            return Err(ApiError::bad_request(
-                "IPv6 networks between containers are not supported yet",
-            ));
-        }
+        let subnet6 = if req.enable_ipv6 == Some(true) {
+            Some(self.ipv6_subnet(&req)?)
+        } else {
+            None
+        };
         let config = req
             .ipam
             .as_ref()
@@ -285,6 +313,12 @@ impl Networks {
             internal: req.internal,
             attachable: req.attachable,
             builtin: false,
+            subnet6: subnet6
+                .map(|(net, len)| format!("{net}/{len}"))
+                .unwrap_or_default(),
+            gateway6: subnet6
+                .map(|(net, _)| Ipv6Addr::from(u128::from(net) + 1).to_string())
+                .unwrap_or_default(),
         };
         store.save_object("networks", &record.id, &record)?;
         self.records
@@ -292,6 +326,65 @@ impl Networks {
             .insert(record.id.clone(), record.clone());
         let _ = std::fs::create_dir_all(self.dir.join("n").join(record.short()));
         Ok(record)
+    }
+
+    /// The IPv6 subnet of a new network: the one its IPAM config names, or a
+    /// unique-local /64 no other network uses.
+    fn ipv6_subnet(&self, req: &NetworkCreateRequest) -> ApiResult<(Ipv6Addr, u8)> {
+        let used: Vec<(Ipv6Addr, u8)> = self
+            .records
+            .read()
+            .values()
+            .filter_map(NetworkRecord::net6)
+            .collect();
+        let asked = req
+            .ipam
+            .as_ref()
+            .and_then(|i| i.config.iter().find(|c| c.subnet.contains(':')).cloned());
+        if let Some(c) = asked {
+            let bad = || ApiError::bad_request(format!("invalid subnet {}", c.subnet));
+            let (ip, len) = c.subnet.split_once('/').ok_or_else(bad)?;
+            let ip: Ipv6Addr = ip.parse().map_err(|_| bad())?;
+            let len: u8 = len
+                .parse()
+                .ok()
+                .filter(|l| (48..=120).contains(l))
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "invalid subnet {}: the prefix must be between /48 and /120",
+                        c.subnet
+                    ))
+                })?;
+            let net = Ipv6Addr::from(u128::from(ip) & mask6(len));
+            if used.iter().any(|u| overlaps6(*u, (net, len))) {
+                return Err(ApiError::bad_request(format!(
+                    "invalid pool request: Pool overlaps with other one on this address space: {}",
+                    c.subnet
+                )));
+            }
+            let first = Ipv6Addr::from(u128::from(net) + 1);
+            if !c.gateway.is_empty() && c.gateway.contains(':') && c.gateway != first.to_string() {
+                return Err(ApiError::bad_request(format!(
+                    "gateway {} is not supported: a network's gateway is the first address of its subnet ({first})",
+                    c.gateway
+                )));
+            }
+            return Ok((net, len));
+        }
+        // fdXX:XXXX:XXXX::/64 from the name, then the next free one.
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(req.name.as_bytes());
+        for attempt in 0u8..=255 {
+            let mut octets = [0u8; 16];
+            octets[0] = 0xfd;
+            octets[1..6].copy_from_slice(&digest[..5]);
+            octets[7] = attempt;
+            let net = Ipv6Addr::from(octets);
+            if !used.iter().any(|u| overlaps6(*u, (net, 64))) {
+                return Ok((net, 64));
+            }
+        }
+        Err(ApiError::internal("no free IPv6 subnet for a new network"))
     }
 
     fn remove(&self, store: &Store, id: &str) {
@@ -378,6 +471,14 @@ fn endpoint_for(
             .as_ref()
             .map(|c| c.ipv4_address.clone())
             .unwrap_or_default(),
+        requested_ip6: settings
+            .ipam_config
+            .as_ref()
+            .map(|c| c.ipv6_address.clone())
+            .unwrap_or_default(),
+        ip6: String::new(),
+        prefix_len6: 0,
+        gateway6: String::new(),
         ip: String::new(),
         prefix_len: 0,
         gateway: String::new(),
@@ -483,6 +584,57 @@ fn allocate(
         .ok_or_else(|| ApiError::internal(format!("no free address on network {}", network.name)))
 }
 
+/// Pick an IPv6 address on `network` for container `id`.
+fn allocate6(
+    engine: &Engine,
+    network: &NetworkRecord,
+    requested: &str,
+    id: &str,
+) -> ApiResult<Option<Ipv6Addr>> {
+    let Some((net, len)) = network.net6() else {
+        return Ok(None);
+    };
+    let used: Vec<Ipv6Addr> = engine
+        .containers
+        .read()
+        .values()
+        .filter(|c| c.id() != id)
+        .filter_map(|c| {
+            c.record()
+                .networks
+                .get(&network.name)
+                .and_then(|ep| ep.ip6.parse().ok())
+        })
+        .collect();
+    let gateway = u128::from(net) + 1;
+    if !requested.is_empty() {
+        let ip: Ipv6Addr = requested
+            .parse()
+            .map_err(|_| ApiError::bad_request(format!("invalid address {requested}")))?;
+        let n = u128::from(ip);
+        if n & mask6(len) != u128::from(net) || n == gateway || n == u128::from(net) {
+            return Err(ApiError::bad_request(format!(
+                "address {ip} is not usable on network {}",
+                network.name
+            )));
+        }
+        if used.contains(&ip) {
+            return Err(ApiError::conflict(format!(
+                "Address already in use: {ip} on network {}",
+                network.name
+            )));
+        }
+        return Ok(Some(ip));
+    }
+    (gateway + 1..gateway + 65536)
+        .map(Ipv6Addr::from)
+        .find(|ip| !used.contains(ip))
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::internal(format!("no free IPv6 address on network {}", network.name))
+        })
+}
+
 /// Give a container its addresses before its machine boots, and put it on
 /// the switch.
 pub(crate) async fn before_start(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<()> {
@@ -503,6 +655,7 @@ pub(crate) async fn before_start(engine: &Arc<Engine>, c: &Arc<Container>) -> Ap
         ep.mac = mac_for(ip);
         ep.endpoint_id = super::util::new_id();
         ep.network_id = network.id.clone();
+        set_ip6(engine, &network, &mut ep, &record.id)?;
         assigned.push((name, ep));
     }
     c.update(engine, |r| {
@@ -555,13 +708,42 @@ pub(crate) async fn after_branch(socket: &Path, record: &ContainerRecord) -> Api
     after_boot(socket, record).await
 }
 
+/// The container's IPv6 address on `network`, when it has IPv6.
+fn set_ip6(
+    engine: &Engine,
+    network: &NetworkRecord,
+    ep: &mut EndpointRecord,
+    id: &str,
+) -> ApiResult<()> {
+    match allocate6(engine, network, &ep.requested_ip6, id)? {
+        Some(ip6) => {
+            ep.ip6 = ip6.to_string();
+            ep.prefix_len6 = network.net6().map(|(_, l)| l).unwrap_or(64);
+            ep.gateway6 = network.gateway6.clone();
+        }
+        None => {
+            ep.ip6.clear();
+            ep.prefix_len6 = 0;
+            ep.gateway6.clear();
+        }
+    }
+    Ok(())
+}
+
+/// The addresses the guest adds to its interface beyond the one it boots
+/// with: the other networks' IPv4 addresses, and every IPv6 one.
 fn extra_addresses(record: &ContainerRecord) -> Vec<String> {
-    ordered(record)
-        .into_iter()
+    let all = ordered(record);
+    let v4 = all
+        .iter()
         .skip(1)
         .filter(|(_, ep)| !ep.ip.is_empty())
-        .map(|(_, ep)| format!("{}/{}", ep.ip, ep.prefix_len))
-        .collect()
+        .map(|(_, ep)| format!("{}/{}", ep.ip, ep.prefix_len));
+    let v6 = all
+        .iter()
+        .filter(|(_, ep)| !ep.ip6.is_empty())
+        .map(|(_, ep)| format!("{}/{}", ep.ip6, ep.prefix_len6));
+    v4.chain(v6).collect()
 }
 
 async fn set_addresses(socket: &Path, addresses: Vec<String>) -> ApiResult<()> {
@@ -591,6 +773,9 @@ pub(crate) async fn after_stop(engine: &Arc<Engine>, c: &Arc<Container>) {
             ep.prefix_len = 0;
             ep.gateway.clear();
             ep.endpoint_id.clear();
+            ep.ip6.clear();
+            ep.prefix_len6 = 0;
+            ep.gateway6.clear();
         }
     });
     let _ = std::fs::remove_file(
@@ -622,16 +807,24 @@ fn endpoint_socket(engine: &Engine, record: &ContainerRecord) -> PathBuf {
 }
 
 fn write_endpoint(engine: &Engine, record: &ContainerRecord) -> ApiResult<()> {
-    let members: Vec<smolvm_network::switch::Member> = ordered(record)
-        .into_iter()
-        .filter_map(|(name, ep)| {
-            let network = engine.networks.find(&name)?;
-            Some(smolvm_network::switch::Member {
-                network: smolvm_network::switch::NetworkName::new(network.short())?,
-                ip: ep.ip.parse().ok()?,
-                prefix: ep.prefix_len,
-            })
+    // IPv4 first, primary first: the machine boots with the first address.
+    let all = ordered(record);
+    let member = |name: &str, ip: &str, prefix: u8| {
+        let network = engine.networks.find(name)?;
+        Some(smolvm_network::switch::Member {
+            network: smolvm_network::switch::NetworkName::new(network.short())?,
+            ip: ip.parse().ok()?,
+            prefix,
         })
+    };
+    let members: Vec<smolvm_network::switch::Member> = all
+        .iter()
+        .filter_map(|(name, ep)| member(name, &ep.ip, ep.prefix_len))
+        .chain(
+            all.iter()
+                .filter(|(_, ep)| !ep.ip6.is_empty())
+                .filter_map(|(name, ep)| member(name, &ep.ip6, ep.prefix_len6)),
+        )
         .collect();
     let path = engine
         .networks
@@ -653,9 +846,11 @@ fn link_all(engine: &Engine, record: &ContainerRecord) {
         if let Some(network) = engine.networks.find(name) {
             let dir = engine.networks.switch_dir().join("n").join(network.short());
             let _ = std::fs::create_dir_all(&dir);
-            let link = dir.join(&ep.ip);
-            let _ = std::fs::remove_file(&link);
-            let _ = std::os::unix::fs::symlink(&socket, &link);
+            for ip in [&ep.ip, &ep.ip6].into_iter().filter(|ip| !ip.is_empty()) {
+                let link = dir.join(ip);
+                let _ = std::fs::remove_file(&link);
+                let _ = std::os::unix::fs::symlink(&socket, &link);
+            }
         }
     }
 }
@@ -667,15 +862,13 @@ fn unlink_all(engine: &Engine, record: &ContainerRecord) {
             continue;
         }
         if let Some(network) = engine.networks.find(name) {
-            let link = engine
-                .networks
-                .switch_dir()
-                .join("n")
-                .join(network.short())
-                .join(&ep.ip);
-            // Only our own link: the address may be someone else's by now.
-            if std::fs::read_link(&link).is_ok_and(|t| t == socket) {
-                let _ = std::fs::remove_file(&link);
+            let dir = engine.networks.switch_dir().join("n").join(network.short());
+            for ip in [&ep.ip, &ep.ip6].into_iter().filter(|ip| !ip.is_empty()) {
+                let link = dir.join(ip);
+                // Only our own link: the address may be someone else's by now.
+                if std::fs::read_link(&link).is_ok_and(|t| t == socket) {
+                    let _ = std::fs::remove_file(&link);
+                }
             }
         }
     }
@@ -705,6 +898,9 @@ fn refresh_names(engine: &Engine, networks: &[String]) {
                 }
                 for n in dns_names(c, ep) {
                     text.push_str(&format!("{n} {}\n", ep.ip));
+                    if !ep.ip6.is_empty() {
+                        text.push_str(&format!("{n} {}\n", ep.ip6));
+                    }
                 }
             }
         }
@@ -837,9 +1033,9 @@ pub(crate) fn settings_view(
                     "Gateway": live(&ep.gateway),
                     "IPAddress": live(&ep.ip),
                     "IPPrefixLen": if running { ep.prefix_len } else { 0 },
-                    "IPv6Gateway": "",
-                    "GlobalIPv6Address": "",
-                    "GlobalIPv6PrefixLen": 0,
+                    "IPv6Gateway": live(&ep.gateway6),
+                    "GlobalIPv6Address": live(&ep.ip6),
+                    "GlobalIPv6PrefixLen": if running { ep.prefix_len6 } else { 0 },
                     "DNSNames": dns,
                 }),
             )
@@ -860,11 +1056,11 @@ pub(crate) fn settings_view(
         "SecondaryIPv6Addresses": null,
         "EndpointID": p(|e| &e.endpoint_id),
         "Gateway": p(|e| &e.gateway),
-        "GlobalIPv6Address": "",
-        "GlobalIPv6PrefixLen": 0,
+        "GlobalIPv6Address": p(|e| &e.ip6),
+        "GlobalIPv6PrefixLen": if running { primary.as_ref().map(|e| e.prefix_len6).unwrap_or(0) } else { 0 },
         "IPAddress": p(|e| &e.ip),
         "IPPrefixLen": if running { primary.as_ref().map(|e| e.prefix_len).unwrap_or(0) } else { 0 },
-        "IPv6Gateway": "",
+        "IPv6Gateway": p(|e| &e.gateway6),
         "MacAddress": p(|e| &e.mac),
         "Networks": networks,
     })
@@ -906,13 +1102,13 @@ fn view(engine: &Engine, n: &NetworkRecord, with_containers: bool) -> serde_json
                         "EndpointID": ep.endpoint_id,
                         "MacAddress": ep.mac,
                         "IPv4Address": format!("{}/{}", ep.ip, ep.prefix_len),
-                        "IPv6Address": "",
+                        "IPv6Address": if ep.ip6.is_empty() { String::new() } else { format!("{}/{}", ep.ip6, ep.prefix_len6) },
                     }),
                 );
             }
         }
     }
-    let config: Vec<serde_json::Value> = if n.subnet.is_empty() {
+    let mut config: Vec<serde_json::Value> = if n.subnet.is_empty() {
         Vec::new()
     } else {
         let mut c = serde_json::json!({"Subnet": n.subnet, "Gateway": n.gateway});
@@ -921,6 +1117,9 @@ fn view(engine: &Engine, n: &NetworkRecord, with_containers: bool) -> serde_json
         }
         vec![c]
     };
+    if !n.subnet6.is_empty() {
+        config.push(serde_json::json!({"Subnet": n.subnet6, "Gateway": n.gateway6}));
+    }
     serde_json::json!({
         "Name": n.name,
         "Id": n.id,
@@ -928,7 +1127,7 @@ fn view(engine: &Engine, n: &NetworkRecord, with_containers: bool) -> serde_json
         "Scope": "local",
         "Driver": n.driver,
         "EnableIPv4": true,
-        "EnableIPv6": false,
+        "EnableIPv6": !n.subnet6.is_empty(),
         "IPAM": {"Driver": "default", "Options": {}, "Config": config},
         "Internal": n.internal,
         "Attachable": n.attachable,
@@ -1114,6 +1313,7 @@ async fn connect(
             ep.gateway = n.gateway.clone();
             ep.mac = mac_for(ip);
             ep.endpoint_id = super::util::new_id();
+            set_ip6(&engine, &n, &mut ep, &record.id)?;
             c.update(&engine, |r| {
                 r.networks.insert(n.name.clone(), ep.clone());
             });
@@ -1189,6 +1389,47 @@ mod tests {
         let a = (Ipv4Addr::new(172, 18, 0, 0), 16);
         assert!(overlaps(a, (Ipv4Addr::new(172, 18, 5, 0), 24)));
         assert!(!overlaps(a, (Ipv4Addr::new(172, 19, 0, 0), 16)));
+    }
+
+    #[test]
+    fn ipv6_networks_get_a_unique_local_or_their_own_subnet() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let nets = Networks::load(&store, &dir.path().join("run/docker.sock")).unwrap();
+        let auto = nets
+            .create(
+                &store,
+                NetworkCreateRequest {
+                    name: "v6".into(),
+                    enable_ipv6: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(auto.subnet6.starts_with("fd"), "{}", auto.subnet6);
+        assert!(auto.subnet6.ends_with("/64"));
+        let (net, _) = auto.net6().unwrap();
+        assert_eq!(
+            auto.gateway6,
+            Ipv6Addr::from(u128::from(net) + 1).to_string()
+        );
+        let own = |name: &str, subnet: &str| NetworkCreateRequest {
+            name: name.into(),
+            enable_ipv6: Some(true),
+            ipam: Some(super::super::model::Ipam {
+                driver: String::new(),
+                config: vec![super::super::model::IpamConfig {
+                    subnet: subnet.into(),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let custom = nets.create(&store, own("v6b", "fd00:1::/64")).unwrap();
+        assert_eq!(custom.subnet6, "fd00:1::/64");
+        assert_eq!(custom.gateway6, "fd00:1::1");
+        assert!(nets.create(&store, own("v6c", "fd00:1::/80")).is_err());
+        assert!(nets.find("v6b").unwrap().subnet.contains('.'));
     }
 
     #[test]
