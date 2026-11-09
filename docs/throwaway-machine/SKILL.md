@@ -51,10 +51,13 @@ scripts/preflight.sh --mounts 2 --ports 0
 
 `device_budget_ok=no` means the boot will fail with `no more IRQs are available`. On x86_64
 through v1.22.2 the guest has eleven IRQs: **four `-v` mounts boot and five do not, and publishing
-any port, or granting egress, adds one device**. arm64 guests have 128, and the preflight prints
-`device_budget_ok=not_limiting` there. v1.23.0 ships a libkrun whose x86_64 guests have IRQs 5 to 23
-(#1521); its ceiling was not measured, and the preflight applies the budget through v1.22.2 only.
-Combine directories under one mount rather than discovering this at boot.
+any port, or granting egress, adds one device**. v1.23.0 ships a libkrun whose x86_64 guests have
+IRQs 5 to 23 (#1521): on v1.34.0 on Linux x86_64 **nine mounts boot and ten do not**, and eight
+mounts with any number of `-p`, or with `--allow-host`, is the most that boots; `--net` alone adds
+nothing. The error leads with `krun_start_enter returned: -22 (EINVAL` and a guess about disks;
+`no more IRQs are available` is at its end. arm64 guests have 128, and the preflight prints
+`device_budget_ok=not_limiting` there. Combine directories under one mount rather than discovering
+this at boot.
 
 `offline_shape=unavailable` means this host cannot run the shape below: macOS before v1.20.2
 (#1192), or Windows. The preflight cannot see whether the 8192 MiB bake helper fits; `bake.sh`
