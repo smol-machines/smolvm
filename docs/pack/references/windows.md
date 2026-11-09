@@ -2,7 +2,8 @@
 
 ## Contents
 
-- On v1.22.2 an artifact cannot be run here
+- On v1.34.0 artifacts run again
+- From v1.18.2 to v1.22.2 an artifact could not be run here
 - What was verified
 - `--from-vm` works here, and the marker proves it
 - The stub is written without `.exe`
@@ -11,14 +12,38 @@
 - The trap that makes `pack run` look broken
 - What was never run here
 
-**Re-run on 2026-10-03 against smolvm v1.22.2**, where an artifact could not be run (the next
-section). "What was verified" is from the earlier v1.14.2 run on the same host, and its image path
-and sizes were not measured again. The three sections after it are the **2026-09-11 run against
-v1.14.6** on Windows 11 Home build 10.0.26200.0 UBR 9445 x86_64 (Intel Core Ultra 9 185H,
-31.6 GB), in an elevated session. `scripts/*.sh` are bash and do not run there, so every
-command below was issued by hand from PowerShell.
+**Re-run on 2026-11-09 against smolvm v1.34.0** on Windows 11 Home build 10.0.26200 UBR 9711
+x86_64 (Intel Core Ultra 9 185H, 31.6 GB), in an elevated session; the next section has that run.
+"What was verified" is from the earlier v1.14.2 run on the same host, and its image path and sizes
+were not measured again. The sections after it are the **2026-09-11 run against v1.14.6** on
+Windows 11 Home build 10.0.26200.0 UBR 9445. `scripts/*.sh` are bash and do not run there, so
+every command below was issued by hand from PowerShell.
 
-## On v1.22.2 an artifact cannot be run here
+## On v1.34.0 artifacts run again
+
+Both paths pack and every way of running the result works, through `pack run --sidecar`, through
+the stub and through `machine create --from`:
+
+```
+pack create --image alpine --output wpack      20.3 s, wpack 44382172 bytes, wpack.smolmachine 20203310
+pack run --sidecar wpack.smolmachine -- sh -c "echo PACK_RUN_OK"      PACK_RUN_OK, 3.6 s
+p.exe run -- sh -c "echo STUB_RUN_OK; uname -sr"                      STUB_RUN_OK, Linux 6.18.60
+machine create --from wpack.smolmachine, start, exec                  FROM_PACK_OK, x86_64
+pack create --from-vm (stopped source), then pvm.exe run -- cat /root/marker.txt   FROMVM_MARKER_1109
+pack create --single-file --output single.exe, then single.exe run    SINGLE_OK, 64479058 bytes, no sidecar
+```
+
+- **Name the output `<name>.exe`.** `--output named.exe` writes `named.exe` and
+  `named.exe.smolmachine`, which run as they are. `--output wpack` still writes a stub with no
+  extension, which `cmd` refuses as `not recognized as an internal or external command`.
+- **A command goes after `run --`.** `p.exe -- sh -c ...` is refused with `unexpected argument
+  'sh' found`, and `p.exe sh -c ...` is read as the `sh` alias of `shell`.
+- `pack create --from-vm` of a running machine is refused with the remedy, `Stop it first with:
+  smolvm machine stop --name <vm>`.
+- A stub run created `%LOCALAPPDATA%\smolvm-libs`, and the pack cache in
+  `%LOCALAPPDATA%\smolvm-pack` held 1218 MB after these runs. The `teardown` packet removes both.
+
+## From v1.18.2 to v1.22.2 an artifact could not be run here
 
 Run on 2026-10-03 on Windows 11 Home build 10.0.26200 UBR 9457. `pack create` still works on both paths: `--from-vm` of a machine
 holding a marker wrote `pk` (45.6 MB) and `pk.smolmachine` (17.7 MB) in 6.8 s, and an image pack
@@ -40,8 +65,8 @@ with the pack cache emptied before each release:
 | v1.18.2, v1.19.3, v1.20.2, v1.21.1, v1.22.2 | `os error 123` |
 
 `alpine:3.19`, `alpine:3.20` and `busybox` fail the same way on v1.22.2, so it is not one image.
-Until a release changes this, an artifact meant for a Windows host cannot be checked there; the
-sections below record what worked on v1.14.6.
+v1.25.2 fixed it (#1617, the owner record for a directory entry), and v1.28.1 fixed the `os error
+5` on read-only entries that followed (#1784). The sections below record what worked on v1.14.6.
 
 ## What was verified
 
@@ -106,7 +131,7 @@ PACK_IMG_OK
 ```
 
 The sidecar has to be renamed with it: the stub looks for `<stub name>.smolmachine`. Still present
-on v1.14.6.
+on v1.34.0, where naming the output `<name>.exe` avoids it.
 
 ## An artifact built for another architecture is refused by Windows, not by smolvm
 
