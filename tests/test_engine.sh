@@ -262,6 +262,67 @@ test_image_list_inspect_tag_remove() {
     docker image inspect alpine >/dev/null
 }
 
+# commit (with a change and a deleted file), save and load back, export and
+# import, push to a registry running in a container, and pull it back: the
+# image moves the ways Docker moves it, and runs the same each time.
+test_image_commit_save_load_export_import_push() {
+    local img="$PREFIX-img:1" imported="$PREFIX-imported:1" out
+    local reg="localhost:15000/$PREFIX/img:1"
+    run --name "$PREFIX-src" alpine sh -c 'echo committed > /hello; rm /etc/motd' || return 1
+    docker commit -c 'CMD ["cat", "/hello"]' "$PREFIX-src" "$img" >/dev/null || return 1
+    [[ "$(run --rm "$img")" == committed ]] || return 1
+    run --rm "$img" test ! -e /etc/motd || return 1
+
+    docker save "$img" -o "$WORK/img.tar" || return 1
+    docker rmi "$img" >/dev/null || return 1
+    docker load -i "$WORK/img.tar" | has "Loaded image: $img" || return 1
+    [[ "$(run --rm "$img")" == committed ]] || return 1
+    docker save alpine | docker load | has 'Loaded image: alpine:latest' || return 1
+
+    docker export "$PREFIX-src" -o "$WORK/fs.tar" || return 1
+    docker import -c 'CMD ["cat", "/hello"]' "$WORK/fs.tar" "$imported" >/dev/null || return 1
+    [[ "$(run --rm "$imported")" == committed ]] || return 1
+
+    # The registry's data needs no volume for this.
+    run -d --name "$PREFIX-registry" --tmpfs /var/lib/registry -p 127.0.0.1:15000:5000 registry:2 >/dev/null || return 1
+    local ok=1
+    for _ in $(seq 1 50); do
+        curl -sf -m 2 http://127.0.0.1:15000/v2/ >/dev/null && { ok=0; break; }
+        sleep 0.2
+    done
+    [[ $ok -eq 0 ]] || return 1
+    docker tag "$img" "$reg" || return 1
+    docker push "$reg" | has 'digest: sha256:' || return 1
+    docker rmi "$reg" >/dev/null || return 1
+    docker pull "$reg" >/dev/null || return 1
+    out=$(run --rm "$reg") || return 1
+    docker rmi -f "$img" "$imported" "$reg" >/dev/null 2>&1
+    [[ "$out" == committed ]]
+}
+
+# The engine builds nothing itself, but buildx's own builder (a BuildKit
+# container it starts through the engine and talks to over `docker exec`)
+# builds, and `--load` hands the image back through `docker load`.
+test_buildx_container_builder_builds_and_loads() {
+    docker buildx version >/dev/null 2>&1 || return 0
+    local builder="$PREFIX-bx" img="$PREFIX-built:1" out
+    mkdir -p "$WORK/bx"
+    echo built-by-buildkit > "$WORK/bx/hello.txt"
+    printf 'FROM scratch\nCOPY hello.txt /hello.txt\n' > "$WORK/bx/Dockerfile"
+    docker buildx create --name "$builder" --driver docker-container >/dev/null || return 1
+    docker buildx build --builder "$builder" --load -t "$img" "$WORK/bx" >/dev/null 2>&1 || {
+        docker buildx rm "$builder" >/dev/null 2>&1
+        return 1
+    }
+    local id
+    id=$(docker create "$img" /none) || return 1
+    out=$(docker cp "$id:/hello.txt" - | tar -xO) || return 1
+    docker rm "$id" >/dev/null
+    docker buildx rm "$builder" >/dev/null 2>&1
+    docker rmi "$img" >/dev/null 2>&1
+    [[ "$out" == built-by-buildkit ]]
+}
+
 test_build_is_refused_clearly() {
     printf 'FROM alpine\n' >"$WORK/Dockerfile"
     local out
@@ -496,6 +557,8 @@ run_test "copy before the first start" test_copy_before_start || true
 run_test "events stream the lifecycle" test_events_stream_lifecycle || true
 run_test "filters and labels" test_filters_and_labels || true
 run_test "images list, inspect, tag, remove" test_image_list_inspect_tag_remove || true
+run_test "commit, save, load, export, import, push" test_image_commit_save_load_export_import_push || true
+run_test "buildx container builder builds and loads" test_buildx_container_builder_builds_and_loads || true
 run_test "build is refused clearly" test_build_is_refused_clearly || true
 run_test "named volume persists" test_named_volume_persists || true
 run_test "new volume takes the image content" test_new_volume_takes_the_image_content || true

@@ -56,6 +56,24 @@ Images are pulled from the image's registry with the credentials in `~/.docker/c
 including credential helpers, or the ones a client sends (`X-Registry-Auth`). A
 `[images.registries."docker.io"] mirror` in the smolvm configuration applies to the engine too.
 
+## Moving images
+
+- `docker save` and `docker load` write and read `docker save` archives (and `docker load` reads
+  OCI image layouts too). Saving an image pulled from a registry fetches its layers on the host,
+  with the same credentials a pull uses.
+- `docker commit` makes an image of a container's changes (files written and deleted) on top of
+  its image, with its config and any `--change` instructions; `docker export` writes a container's
+  whole filesystem as a tar, and `docker import` makes a one-layer image of one (from a file,
+  stdin or a URL).
+- `docker push` uploads an image to its registry with the credentials in `~/.docker/config.json`
+  or the ones the client sends, never through a pull mirror.
+- `docker tag` and `docker rmi` work as with Docker.
+
+A pulled image boots from its registry: each container's guest pulls it. Every other image (a
+loaded archive, an import, a commit, or a pull from a registry on this host, such as
+`localhost:5000`, which a guest cannot reach) is an archive in smolvm's local image cache, booted
+as `smolvm machine run --image ./image.tar` boots one.
+
 ## Storage
 
 - **Bind mounts** (`-v /host/path:/path`, `--mount type=bind`) share the host directory into the
@@ -133,8 +151,8 @@ socket: mounts are devices a machine boots with.
 ## Building images
 
 The engine does not build images. `POST /build` (`DOCKER_BUILDKIT=0 docker build`, `docker
-compose build` with `DOCKER_BUILDKIT=0`), `/session`, `/grpc` and `POST /images/load` answer with
-an error that says so. Build the image elsewhere, push it to a registry the engine can pull from,
+compose build` with `DOCKER_BUILDKIT=0`), `/session` and `/grpc` answer with an error that says
+so. Build the image elsewhere, push it to a registry the engine can pull from,
 and refer to it by name.
 
 What the clients send, for whoever adds builds:
@@ -143,7 +161,11 @@ What the clients send, for whoever adds builds:
   connection upgraded from HTTP/1.1, to reach the BuildKit embedded in a Docker daemon. When that
   fails, buildx creates a builder of its own: it pulls `moby/buildkit:buildx-stable-1`, creates and
   starts a container from it, and talks BuildKit's gRPC to it through `docker exec`. Against this
-  engine that container is an ordinary container, so this path needs no build endpoint at all.
+  engine that container is an ordinary container, so this path needs no build endpoint at all:
+  `docker buildx create --driver docker-container` then `docker buildx build --load` builds, and
+  the image comes back through `docker load`. A `RUN` step does not work there yet: BuildKit keeps
+  its snapshots in a volume, and the snapshot mounts it makes in a host-directory volume are
+  refused.
 - `DOCKER_BUILDKIT=0 docker build` uses the classic `POST /build?t=<tag>&dockerfile=<path>` with
   the build context as a tar body, and reads a JSON progress stream back.
 - `docker compose build` hands the build to buildx (`bake`), with the same two paths;
@@ -154,5 +176,4 @@ What the clients send, for whoever adds builds:
 ## Not yet
 
 - IPv6 networks, other network drivers than `bridge`, and `--network container:<name>`.
-- `docker save`, `docker load`, `docker push` and `docker commit`.
 - Changing an internal network's egress after a container on it was created.

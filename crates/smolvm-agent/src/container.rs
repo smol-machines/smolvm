@@ -9,7 +9,8 @@
 //! container, so `Run` requests on the same overlay (`docker exec`) join it.
 //!
 //! The other requests here act on that container: `ContainerSignal`
-//! (`docker kill`), `ContainerTop` (`docker top`), and
+//! (`docker kill`), `ContainerTop` (`docker top`), `ContainerDiff`
+//! (`docker commit`), and
 //! `SetInterfaceAddresses`, which lets a running machine join and leave
 //! networks.
 
@@ -698,6 +699,143 @@ pub fn handle_set_interface_addresses(addresses: &[String]) -> AgentResponse {
         Ok(()) => AgentResponse::Ok { data: None },
         Err(e) => AgentResponse::error(e, error_codes::INTERNAL_ERROR),
     }
+}
+
+/// Files the engine generates for every container: a commit leaves them out,
+/// as Docker's does (they are bind mounts there).
+const DIFF_SKIPPED: [&str; 3] = ["etc/hosts", "etc/hostname", "etc/resolv.conf"];
+
+/// The first line of the `gai.conf` the agent writes into an image without
+/// one; a commit leaves that file out too.
+const MANAGED_GAI_HEADER: &str = "# Managed by smolvm";
+
+/// Build the layer of what the container on `overlay_id` changed (see
+/// `AgentRequest::ContainerDiff`) in a file on the storage disk, and return
+/// its path.
+pub(crate) fn build_container_diff(overlay_id: &str) -> Result<std::path::PathBuf, String> {
+    if overlay_id.is_empty() || overlay_id.contains('/') || overlay_id.contains("..") {
+        return Err(format!("invalid overlay id {overlay_id:?}"));
+    }
+    let upper = std::path::Path::new("/storage/overlays")
+        .join(format!("persistent-{overlay_id}"))
+        .join("upper");
+    if !upper.is_dir() {
+        return Err(format!(
+            "no changes recorded for {overlay_id}: the container never ran"
+        ));
+    }
+    let dir = std::path::Path::new("/storage/engine-diffs");
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{overlay_id}-{}.tar", std::process::id()));
+    let file =
+        std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let written = write_overlay_diff(&upper, std::io::BufWriter::new(file));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("build the container's changes: {e}"));
+    }
+    Ok(path)
+}
+
+/// Write `upper` (an overlayfs upper directory) to `out` as an OCI layer:
+/// a whiteout (a 0:0 character device) becomes `.wh.<name>`, an opaque
+/// directory gets `.wh..wh..opq`, and the engine's generated files are left
+/// out.
+pub(crate) fn write_overlay_diff(
+    upper: &std::path::Path,
+    out: impl std::io::Write,
+) -> std::io::Result<()> {
+    let mut tar = tar::Builder::new(out);
+    tar.follow_symlinks(false);
+    tar.mode(tar::HeaderMode::Complete);
+    diff_dir(&mut tar, upper, std::path::Path::new(""))?;
+    tar.into_inner()?.flush()
+}
+
+fn diff_dir<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    upper: &std::path::Path,
+    rel: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(upper.join(rel))?
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+    names.sort();
+    for name in names {
+        let rel_path = rel.join(&name);
+        let path = upper.join(&rel_path);
+        let shown = rel_path.to_string_lossy();
+        if DIFF_SKIPPED.contains(&shown.as_ref()) {
+            continue;
+        }
+        if shown == "etc/gai.conf"
+            && std::fs::read_to_string(&path).is_ok_and(|s| s.starts_with(MANAGED_GAI_HEADER))
+        {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&path)?;
+        let kind = meta.file_type();
+        if kind.is_char_device() && meta.rdev() == 0 {
+            let marker = rel.join(format!(".wh.{}", name.to_string_lossy()));
+            append_empty(tar, &marker, meta.mtime())?;
+        } else if kind.is_dir() {
+            tar.append_dir(&rel_path, &path)?;
+            // The agent marks /tmp opaque at every boot so it starts empty;
+            // that is not a change the container made.
+            if shown != "tmp" && is_opaque(&path) {
+                append_empty(tar, &rel_path.join(".wh..wh..opq"), meta.mtime())?;
+            }
+            diff_dir(tar, upper, &rel_path)?;
+        } else if kind.is_file() || kind.is_symlink() {
+            tar.append_path_with_name(&path, &rel_path)?;
+        } else {
+            // Device nodes and FIFOs: the header carries all there is.
+            let mut header = tar::Header::new_gnu();
+            header.set_metadata_in_mode(&meta, tar::HeaderMode::Complete);
+            header.set_size(0);
+            tar.append_data(&mut header, &rel_path, std::io::empty())?;
+        }
+    }
+    Ok(())
+}
+
+fn append_empty<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    path: &std::path::Path,
+    mtime: i64,
+) -> std::io::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_mtime(mtime.max(0) as u64);
+    tar.append_data(&mut header, path, std::io::empty())
+}
+
+/// Whether overlayfs marked `dir` opaque: it hides the same directory in
+/// the image.
+fn is_opaque(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut value = [0u8; 4];
+    for name in [c"trusted.overlay.opaque", c"user.overlay.opaque"] {
+        // SAFETY: both strings are NUL-terminated and `value` is writable for its length.
+        let n = unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if n > 0 && value[0] == b'y' {
+            return true;
+        }
+    }
+    false
 }
 
 /// Move the guest's primary address to another network.

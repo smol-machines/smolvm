@@ -145,27 +145,49 @@ pub(crate) async fn pump(
     input: &InputQueue,
     mut on_output: impl FnMut(u8, Vec<u8>),
 ) -> Exit {
-    let mut input_open = true;
-    loop {
-        tokio::select! {
-            frame = reader.recv() => match frame {
+    // Input and output run at once: a process that echoes its input (a
+    // tunnel such as `buildctl dial-stdio`) blocks writing output while its
+    // input waits, so output read only between input writes deadlocks both.
+    let forward = async {
+        loop {
+            let next = input.next().await;
+            if writer.send(&next.into_request()).await.is_err() {
+                // The process is gone; its exit arrives on the reader.
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    let receive = async {
+        loop {
+            match reader.recv().await {
                 Ok(AgentResponse::Stdout { data }) => on_output(1, data),
                 Ok(AgentResponse::Stderr { data }) => on_output(2, data),
                 Ok(AgentResponse::Exited { exit_code, oom }) => {
-                    return Exit { code: exit_code as i64, oom };
+                    return Exit {
+                        code: exit_code as i64,
+                        oom,
+                    };
                 }
                 Ok(AgentResponse::Error { message, .. }) => {
                     on_output(2, format!("{message}\n").into_bytes());
-                    return Exit { code: 126, oom: false };
+                    return Exit {
+                        code: 126,
+                        oom: false,
+                    };
                 }
                 Ok(_) => {}
-                Err(_) => return Exit { code: 137, oom: false },
-            },
-            next = input.next(), if input_open => {
-                if writer.send(&next.into_request()).await.is_err() {
-                    input_open = false;
+                Err(_) => {
+                    return Exit {
+                        code: 137,
+                        oom: false,
+                    }
                 }
             }
         }
+    };
+    tokio::pin!(forward);
+    tokio::select! {
+        exit = receive => exit,
+        _ = &mut forward => unreachable!("input forwarding never ends on its own"),
     }
 }

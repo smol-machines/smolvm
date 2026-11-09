@@ -53,14 +53,17 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
                 .head(super::archive::head_archive)
                 .put(super::archive::put_archive),
         )
+        .route("/containers/{id}/export", get(super::archive::export))
         .route("/containers/{id}", axum::routing::delete(container_remove))
+        .route("/commit", post(container_commit))
         .route("/exec/{id}/start", post(exec_start))
         .route("/exec/{id}/resize", post(exec_resize))
         .route("/exec/{id}/json", get(exec_inspect))
         .route("/images/create", post(image_pull))
         .route("/images/json", get(image_list))
         .route("/images/prune", post(image_prune))
-        .route("/images/load", post(super::build::image_load))
+        .route("/images/load", post(image_load))
+        .route("/images/get", get(images_get))
         .route("/images/{*rest}", any(image_dispatch))
         .route("/build", post(super::build::build))
         .route("/build/prune", post(super::build::build_prune))
@@ -115,8 +118,16 @@ async fn record_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let json = content_type.contains("json")
-        || (content_type.is_empty() && !parts.uri.path().ends_with("/archive"));
+    // Only a body small enough to hold, and declared so: buffering an upload
+    // (an image tar the CLI sends untyped) would cut it off at the limit.
+    let small = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
+        .is_some_and(|n| n <= 4 << 20);
+    let json = small
+        && (content_type.contains("json")
+            || (content_type.is_empty() && !parts.uri.path().ends_with("/archive")));
     let (body, recorded) = if json && parts.method != Method::GET {
         match axum::body::to_bytes(body, 4 << 20).await {
             Ok(bytes) => {
@@ -1176,15 +1187,58 @@ async fn exec_inspect(
 // Images
 // ============================================================================
 
-async fn image_pull(State(engine): S, Query(q): Q, headers: HeaderMap) -> ApiResult<Response> {
+/// A JSON-lines response, as the image endpoints stream their progress.
+fn json_stream(body: axum::body::Body) -> Response {
+    let mut r = Response::new(body);
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    r
+}
+
+/// Every value a query parameter has (`changes` and `names` repeat).
+fn q_all(pairs: &[(String, String)], key: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
+async fn image_pull(
+    State(engine): S,
+    Query(pairs): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<Response> {
+    let q: HashMap<String, String> = pairs.iter().cloned().collect();
+    if let Some(src) = q.get("fromSrc").filter(|s| !s.is_empty()) {
+        let (tx, out) = super::stream::json_lines();
+        let src = src.clone();
+        let changes = q_all(&pairs, "changes");
+        tokio::spawn(async move {
+            super::image_ops::import(
+                &engine,
+                &src,
+                q.get("repo").map(String::as_str).unwrap_or(""),
+                q.get("tag").map(String::as_str).unwrap_or(""),
+                q.get("message").map(String::as_str).unwrap_or(""),
+                &changes,
+                q.get("platform")
+                    .map(String::as_str)
+                    .filter(|p| !p.is_empty()),
+                body,
+                tx,
+            )
+            .await;
+        });
+        return Ok(json_stream(out));
+    }
     let from = q
         .get("fromImage")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            ApiError::bad_request(
-                "importing images (fromSrc) is not supported; pull with fromImage",
-            )
-        })?;
+        .ok_or_else(|| ApiError::bad_request("fromImage or fromSrc is required"))?;
     let tag = q.get("tag").cloned().unwrap_or_default();
     let name = if tag.is_empty() {
         from.clone()
@@ -1209,6 +1263,53 @@ async fn image_pull(State(engine): S, Query(q): Q, headers: HeaderMap) -> ApiRes
         HeaderValue::from_static("application/json"),
     );
     Ok(r)
+}
+
+/// `GET /images/get?names=`: one archive of every named image.
+async fn images_get(
+    State(engine): S,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> ApiResult<Response> {
+    super::image_ops::save(&engine, &q_all(&pairs, "names")).await
+}
+
+/// `POST /images/load`: the images of a `docker save` or OCI archive.
+async fn image_load(State(engine): S, body: Body) -> ApiResult<Response> {
+    let (tx, out) = super::stream::json_lines();
+    tokio::spawn(async move { super::image_ops::load(&engine, body, tx).await });
+    Ok(json_stream(out))
+}
+
+/// `POST /commit`: a new image from a container's changes.
+async fn container_commit(
+    State(engine): S,
+    Query(pairs): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let q: HashMap<String, String> = pairs.iter().cloned().collect();
+    let container = q
+        .get("container")
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::bad_request("container is required"))?;
+    let config = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?
+    };
+    let req = super::image_ops::CommitRequest {
+        repo: q.get("repo").cloned().unwrap_or_default(),
+        tag: q.get("tag").cloned().unwrap_or_default(),
+        comment: q.get("comment").cloned().unwrap_or_default(),
+        author: q.get("author").cloned().unwrap_or_default(),
+        changes: q_all(&pairs, "changes"),
+        config,
+    };
+    let image = super::image_ops::commit(&engine, container, req).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "Id": image.id })),
+    )
+        .into_response())
 }
 
 async fn image_list(State(engine): S, Query(q): Q) -> ApiResult<Json<Vec<serde_json::Value>>> {
@@ -1239,6 +1340,7 @@ async fn image_dispatch(
     Path(rest): Path<String>,
     method: Method,
     Query(q): Q,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     if method == Method::GET {
         if let Some(name) = rest.strip_suffix("/json") {
@@ -1255,10 +1357,8 @@ async fn image_dispatch(
                 .ok_or_else(|| ApiError::not_found(format!("No such image: {name}")))?;
             return Ok(Json(img.history()).into_response());
         }
-        if rest.ends_with("/get") {
-            return Err(ApiError::not_implemented(
-                "saving images is not supported by the smolvm engine",
-            ));
+        if let Some(name) = rest.strip_suffix("/get") {
+            return super::image_ops::save(&engine, &[name.to_string()]).await;
         }
     }
     if method == Method::POST {
@@ -1287,10 +1387,16 @@ async fn image_dispatch(
             );
             return Ok(StatusCode::CREATED.into_response());
         }
-        if rest.ends_with("/push") {
-            return Err(ApiError::not_implemented(
-                "pushing images is not supported by the smolvm engine",
-            ));
+        if let Some(name) = rest.strip_suffix("/push") {
+            let auth = super::images::pull_auth(
+                headers.get("X-Registry-Auth").and_then(|h| h.to_str().ok()),
+            );
+            let (tx, out) = super::stream::json_lines();
+            let (name, tag) = (name.to_string(), q.get("tag").cloned().unwrap_or_default());
+            tokio::spawn(async move {
+                super::image_ops::push(&engine, &name, &tag, auth, tx).await;
+            });
+            return Ok(json_stream(out));
         }
     }
     if method == Method::DELETE {

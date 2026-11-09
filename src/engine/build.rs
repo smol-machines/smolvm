@@ -1,4 +1,4 @@
-//! Image builds and loads, which the engine does not do yet.
+//! Image builds, which the engine does not do yet.
 //!
 //! The engine runs images; it does not build them. Both build protocols a
 //! client may use are answered with a clear error: the classic
@@ -35,11 +35,4 @@ pub(crate) async fn build_prune() -> axum::Json<serde_json::Value> {
 /// `POST /session` and `POST /grpc`, BuildKit's entry points.
 pub(crate) async fn session() -> ApiResult<Response> {
     Err(ApiError::not_implemented(BUILD_UNSUPPORTED))
-}
-
-/// `POST /images/load`.
-pub(crate) async fn image_load() -> ApiResult<Response> {
-    Err(ApiError::not_implemented(
-        "the smolvm engine does not load image archives yet: push the image to a registry and pull it",
-    ))
 }

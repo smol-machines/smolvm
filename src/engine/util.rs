@@ -385,6 +385,15 @@ pub(crate) fn signal_number(signal: &str) -> Option<i32> {
     })
 }
 
+/// This host's architecture as images name it (`arm64`, `amd64`).
+pub(crate) fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

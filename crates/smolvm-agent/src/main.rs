@@ -2593,6 +2593,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if let AgentRequest::ContainerDiff { ref overlay_id } = request {
+            handle_streaming_container_diff(stream, overlay_id)?;
+            continue;
+        }
+
         if let AgentRequest::FlattenLayers {
             ref lowerdirs,
             output: None,
@@ -3058,12 +3063,12 @@ fn handle_request(
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
-        AgentRequest::FileRead { .. } | AgentRequest::ArchiveDirectory { .. } => {
-            AgentResponse::error(
-                "streaming read must be handled at connection level",
-                error_codes::INTERNAL_ERROR,
-            )
-        }
+        AgentRequest::FileRead { .. }
+        | AgentRequest::ArchiveDirectory { .. }
+        | AgentRequest::ContainerDiff { .. } => AgentResponse::error(
+            "streaming read must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // Pod-container lifecycle (containerd shim v2 datapath, see pod.rs).
         AgentRequest::PodCreate {
@@ -4195,6 +4200,55 @@ fn handle_streaming_archive_directory(
             ),
         ),
     }
+}
+
+/// Stream a container's changes as one image layer (`ContainerDiff`): the
+/// layer is written to a file on the storage disk first, since building it
+/// walks the whole upper directory, then sent in chunks.
+fn handle_streaming_container_diff(
+    stream: &mut impl ReadWrite,
+    overlay_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let built = container::build_container_diff(overlay_id);
+    let path = match built {
+        Ok(path) => path,
+        Err(message) => {
+            send_response(
+                stream,
+                &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+    let file = std::fs::File::open(&path);
+    let _ = std::fs::remove_file(&path);
+    let mut file = match file {
+        Ok(file) => file,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("open container diff: {error}"),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    send_data_chunks_body(
+        stream,
+        &mut file,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read container diff",
+        error_codes::FILE_IO_FAILED,
+    )?;
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: Vec::new(),
+            done: true,
+        },
+    )
 }
 
 /// Handle an interactive run session with streaming I/O.

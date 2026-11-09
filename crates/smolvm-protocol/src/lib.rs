@@ -1214,6 +1214,16 @@ pub enum AgentRequest {
         overlay_id: String,
     },
 
+    /// Stream what the container on `overlay_id` changed against its image,
+    /// as one image layer: a tar of the overlay's upper directory with
+    /// overlayfs whiteouts turned into OCI `.wh.` markers, and the files the
+    /// engine generates for every container left out (`docker commit`).
+    /// Replies with `DataChunk`s, the last one `done`.
+    ContainerDiff {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+
     /// Replace the extra IPv4 addresses on the guest's network interface:
     /// every listed `address/prefix` is present afterwards, and any address
     /// added by an earlier call and not listed is removed. The primary address
@@ -1434,6 +1444,9 @@ impl AgentRequest {
             }
             AgentRequest::ContainerTop { overlay_id } => {
                 format!("ContainerTop {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::ContainerDiff { overlay_id } => {
+                format!("ContainerDiff {{ overlay: {overlay_id} }}")
             }
             AgentRequest::SetInterfaceAddresses { addresses } => {
                 format!("SetInterfaceAddresses {{ addresses: {addresses:?} }}")

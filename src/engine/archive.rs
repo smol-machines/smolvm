@@ -40,15 +40,23 @@ fn path_param(q: &std::collections::HashMap<String, String>) -> ApiResult<String
 /// waits for the copy instead of racing the stop.
 struct FilesMachine {
     socket: std::path::PathBuf,
-    temporary: Option<(Arc<Engine>, String, tokio::sync::OwnedMutexGuard<()>)>,
+    temporary: Option<Temporary>,
+}
+
+/// A machine booted only to reach the container's files, with the locks
+/// that keep its container from starting meanwhile.
+struct Temporary {
+    engine: Arc<Engine>,
+    machine: String,
+    _vm: tokio::sync::OwnedMutexGuard<()>,
+    _op: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl FilesMachine {
     async fn finish(mut self) {
-        if let Some((engine, machine, guard)) = self.temporary.take() {
-            super::containers::stop_machine(&engine, &machine, Some(std::time::Duration::ZERO))
+        if let Some(t) = self.temporary.take() {
+            super::containers::stop_machine(&t.engine, &t.machine, Some(std::time::Duration::ZERO))
                 .await;
-            drop(guard);
         }
     }
 }
@@ -56,11 +64,14 @@ impl FilesMachine {
 impl Drop for FilesMachine {
     fn drop(&mut self) {
         // An error path that never reached `finish` still stops the machine.
-        if let Some((engine, machine, guard)) = self.temporary.take() {
+        if let Some(t) = self.temporary.take() {
             tokio::spawn(async move {
-                super::containers::stop_machine(&engine, &machine, Some(std::time::Duration::ZERO))
-                    .await;
-                drop(guard);
+                super::containers::stop_machine(
+                    &t.engine,
+                    &t.machine,
+                    Some(std::time::Duration::ZERO),
+                )
+                .await;
             });
         }
     }
@@ -80,6 +91,9 @@ async fn files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<Fi
             temporary: None,
         });
     }
+    // A machine still shutting down after its command exited must be down
+    // before it boots again.
+    let vm = c.vm.clone().lock_owned().await;
     let record = c.record();
     let e = engine.clone();
     let machine = record.machine.clone();
@@ -100,7 +114,12 @@ async fn files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<Fi
     .map_err(|e| ApiError::internal(format!("boot the container's machine: {e}")))?;
     Ok(FilesMachine {
         socket,
-        temporary: Some((engine.clone(), record.machine, guard)),
+        temporary: Some(Temporary {
+            engine: engine.clone(),
+            machine: record.machine,
+            _vm: vm,
+            _op: guard,
+        }),
     })
 }
 
@@ -435,6 +454,110 @@ async fn upload(socket: &std::path::Path, path: &str, data: &[u8]) -> ApiResult<
         expect_ok(reply)?;
     }
     Ok(())
+}
+
+/// Write what the container changed against its image to `out`, as one
+/// image layer (`docker commit`).
+pub(crate) async fn container_diff(
+    engine: &Arc<Engine>,
+    c: &Arc<Container>,
+    out: &std::path::Path,
+) -> ApiResult<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let machine = files_machine(engine, c).await?;
+    let overlay_id = super::containers::overlay_id(&c.record());
+    let (mut reader, mut writer) = super::runtime::connect(&machine.socket)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    writer
+        .send(&AgentRequest::ContainerDiff { overlay_id })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut file = tokio::fs::File::create(out)
+        .await
+        .map_err(|e| ApiError::internal(format!("write the layer: {e}")))?;
+    loop {
+        match reader
+            .recv()
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+        {
+            AgentResponse::DataChunk { data, done } => {
+                file.write_all(&data)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("write the layer: {e}")))?;
+                if done {
+                    break;
+                }
+            }
+            AgentResponse::Error { message, .. } => {
+                return Err(ApiError::internal(format!(
+                    "read the container's changes: {message}"
+                )))
+            }
+            _ => {}
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|e| ApiError::internal(format!("write the layer: {e}")))?;
+    machine.finish().await;
+    Ok(())
+}
+
+/// `GET /containers/{id}/export`: the container's whole filesystem as a tar,
+/// streamed as the guest produces it.
+pub(crate) async fn export(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let c = engine
+        .find_container(&id)
+        .ok_or_else(|| ApiError::no_such_container(&id))?;
+    let machine = files_machine(&engine, &c).await?;
+    let (mut reader, mut writer) = super::runtime::connect(&machine.socket)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    writer
+        .send(&AgentRequest::ArchiveDirectory {
+            path: "/".into(),
+            target: Some(target(&c)),
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(8);
+    tokio::spawn(async move {
+        loop {
+            match reader.recv().await {
+                Ok(AgentResponse::DataChunk { data, done }) => {
+                    if !data.is_empty() && tx.send(Ok(data.into())).await.is_err() {
+                        break;
+                    }
+                    if done {
+                        break;
+                    }
+                }
+                Ok(AgentResponse::Error { message, .. }) => {
+                    let _ = tx.send(Err(std::io::Error::other(message))).await;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    break;
+                }
+            }
+        }
+        machine.finish().await;
+    });
+    let mut r = Response::new(Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    ));
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-tar"),
+    );
+    Ok(r)
 }
 
 #[cfg(test)]

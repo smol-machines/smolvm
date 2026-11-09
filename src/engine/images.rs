@@ -660,13 +660,23 @@ pub(crate) async fn finish_pull(
                 .await;
         }
     }
-    let seed_ref = pull_ref.clone();
-    let seed_auth = auth.clone();
-    let built = tokio::task::spawn_blocking(move || build_seed(&seed_ref, &seed_auth)).await;
-    let err = match built {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(e.to_string()),
-        Err(e) => Some(e.to_string()),
+    // A registry on this host's loopback is out of a guest's reach: the host
+    // fetches the image, and containers boot from the fetched archive.
+    let (pull_ref, err) = if super::image_ops::host_fetched(&reference) {
+        match super::image_ops::fetch_on_host(&pull_ref, &auth).await {
+            Ok(local) => (local, None),
+            Err(e) => (pull_ref, Some(e.message)),
+        }
+    } else {
+        let seed_ref = pull_ref.clone();
+        let seed_auth = auth.clone();
+        let built = tokio::task::spawn_blocking(move || build_seed(&seed_ref, &seed_auth)).await;
+        let err = match built {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        (pull_ref, err)
     };
     if let Some(message) = err {
         let _ = tx
