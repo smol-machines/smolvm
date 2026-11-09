@@ -178,8 +178,9 @@ Full detail in `references/traps.md`.
 ## Platform arms
 
 `references/platforms.md`. macOS arm64 ran every script on v1.29.0 and v1.22.2, and both hosts gave the same
-results on v1.18.2, on the default virtio-net backend and on `--net-backend tsi`. Linux x86_64 and
-Windows were not run.
+results on v1.18.2, on the default virtio-net backend and on `--net-backend tsi`. Windows ran by
+hand on v1.34.0 with the same answers, except that its guest search needs another route, because
+`machine exec -i` passes no piped input there. Linux x86_64 was not run.
 
 ## Eval prompts, and what they produced
 
@@ -278,7 +279,7 @@ record search, `verify-containment.sh` and the rest of the procedure took 25 s.
   nothing here changed a value under a running machine except by the variable.
 - **Credentials over the HTTP API**, branches and checkpoints carrying bindings, and portable
   restores on another host.
-- **Linux x86_64 and Windows.**
+- **Linux x86_64**, and these scripts on Windows, which are bash.
 
 ## Related packets
 
