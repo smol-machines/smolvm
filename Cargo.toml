@@ -57,7 +57,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 libc = "0.2"
 # Cross-platform dynamic library loading for libkrun (dlopen on Unix,
 # LoadLibraryW on Windows). Replaces the previous direct libc::dlopen path.
