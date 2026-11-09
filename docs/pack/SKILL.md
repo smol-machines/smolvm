@@ -254,13 +254,12 @@ Full detail with the evidence in `references/traps.md`. The ones that cost the m
   memory was not what failed, so read the memory lines as hints about the helper VMs only.
 - **Linux x86_64**: verified in the material behind this packet on v1.14.6, including the branched
   and restored cases. Not re-run here.
-- **Windows x86_64**: `references/windows.md`. **On v1.22.2 an artifact is created and cannot
-  be run there**, re-run on 2026-10-03 on Windows 11 Home build 10.0.26200 UBR 9457: both paths pack, and running any artifact,
-  through its stub, `pack run --sidecar` or `machine create --from`, fails extracting its first
-  layer with `os error 123`. v1.16.1 and v1.14.6 run the same pack on the same host; v1.18.2 and
-  every later release tried fail. On v1.14.6 both paths worked end to end, with the marker read
-  back out of the artifact. The stub is written without `.exe` and will not run until it and its
-  sidecar are renamed.
+- **Windows x86_64**: `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on
+  Windows 11 Home build 10.0.26200 UBR 9711: both paths pack and run again, through the stub's
+  `run --`, `pack run --sidecar` and `machine create --from`, with the marker read back out of a
+  `--from-vm` artifact, and `--single-file` too. From v1.18.2 to v1.22.2 every artifact failed
+  extracting its first layer with `os error 123`. The stub is still written without `.exe` unless
+  the output is named `<name>.exe`.
 
 **Both hosts run here produce `linux/arm64` artifacts**, so two hosts is two hosts and not two
 artifact architectures. The `linux/amd64` side rests on the x86_64 run above.
