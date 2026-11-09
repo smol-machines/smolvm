@@ -437,6 +437,53 @@ test_default_bridge_by_address_without_names() {
     run --rm --link "$PREFIX-ba:peer" alpine ping -c1 -W2 peer >/dev/null
 }
 
+# `--network container:<id>` (and Compose's `network_mode: service:x`): the
+# sidecar shares the other container's network, loopback included, and its
+# name, keeps its own filesystem and mounts, and stops on its own.
+test_network_container_mode() {
+    local host="$PREFIX-nethost" side="$PREFIX-side"
+    mkdir -p "$WORK/side"
+    echo from-host-dir > "$WORK/side/f"
+    run -d --name "$host" nginx:alpine >/dev/null || return 1
+    run -d --name "$side" --network "container:$host" -v "$WORK/side:/data" alpine sleep 300 >/dev/null || return 1
+    local ok=1
+    for _ in $(seq 1 50); do
+        docker exec "$side" wget -qO- http://127.0.0.1/ 2>/dev/null | has nginx && { ok=0; break; }
+        sleep 0.2
+    done
+    [[ $ok -eq 0 ]] || return 1
+    [[ "$(docker exec "$side" hostname)" == "$(docker exec "$host" hostname)" ]] || return 1
+    [[ "$(docker exec "$side" cat /data/f)" == from-host-dir ]] || return 1
+    docker exec "$side" test ! -e /usr/sbin/nginx || return 1
+    run --rm --network "container:$host" -p 18093:80 alpine true >/dev/null 2>&1 && return 1
+    docker stop -t 1 "$side" >/dev/null || return 1
+    docker exec "$host" true || return 1
+    docker start "$side" >/dev/null || return 1
+    docker exec "$side" wget -qO- http://127.0.0.1/ | has nginx || return 1
+
+    mkdir -p "$WORK/sidecar"
+    cat >"$WORK/sidecar/compose.yaml" <<EOF
+name: ${PREFIX}-sidecar
+services:
+  web:
+    image: nginx:alpine
+    labels: ["$PREFIX"]
+  probe:
+    image: alpine
+    labels: ["$PREFIX"]
+    network_mode: "service:web"
+    command: ["sleep", "300"]
+EOF
+    (cd "$WORK/sidecar" && docker compose up -d) >/dev/null 2>&1 || return 1
+    ok=1
+    for _ in $(seq 1 50); do
+        (cd "$WORK/sidecar" && docker compose exec -T probe wget -qO- http://127.0.0.1/ 2>/dev/null) | has nginx && { ok=0; break; }
+        sleep 0.2
+    done
+    (cd "$WORK/sidecar" && docker compose down -t 1) >/dev/null 2>&1
+    [[ $ok -eq 0 ]]
+}
+
 test_host_docker_internal() {
     python3 -m http.server 18766 --bind 127.0.0.1 --directory "$WORK" >/dev/null 2>&1 &
     local srv=$!
@@ -568,6 +615,7 @@ run_test "tmpfs" test_tmpfs || true
 run_test "networks: names, aliases, isolation" test_networks_names_aliases_isolation || true
 run_test "network connect and disconnect while running" test_network_connect_and_disconnect_live || true
 run_test "default bridge: by address, no names" test_default_bridge_by_address_without_names || true
+run_test "--network container: shares a network" test_network_container_mode || true
 run_test "host.docker.internal reaches the host" test_host_docker_internal || true
 run_test "compose: health-check dependency, two networks" test_compose_healthcheck_dependency_two_networks || true
 run_test "repeated starts keep their own addresses" test_repeated_starts_keep_their_own_addresses || true

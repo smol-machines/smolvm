@@ -91,6 +91,24 @@ async fn files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<Fi
             temporary: None,
         });
     }
+    // A container that shares another's network has its files in that
+    // container's machine, which only that container boots.
+    if let Some(host) = c.record().network_host().map(str::to_string) {
+        let socket = engine
+            .find_container(&host)
+            .and_then(|h| h.socket())
+            .ok_or_else(|| {
+                ApiError::conflict(format!(
+                    "the files of {} are in the machine of container {host}, which is not running",
+                    c.name()
+                ))
+            })?;
+        drop(guard);
+        return Ok(FilesMachine {
+            socket,
+            temporary: None,
+        });
+    }
     // A machine still shutting down after its command exited must be down
     // before it boots again.
     let vm = c.vm.clone().lock_owned().await;
@@ -399,6 +417,7 @@ pub(crate) async fn unpack(
             overlay_id: super::containers::overlay_id(record),
             archive: guest,
             destination: destination.to_string(),
+            image_source: record.image_source(),
         },
     )
     .await

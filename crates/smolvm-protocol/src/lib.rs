@@ -1205,6 +1205,10 @@ pub enum AgentRequest {
         archive: String,
         /// Directory in the container to unpack into.
         destination: String,
+        /// Where the image's layers come from, when not the machine's own
+        /// image (see [`ContainerImageSource`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_source: Option<ContainerImageSource>,
     },
 
     /// List the processes of the container `ContainerStart` started on
@@ -1292,6 +1296,25 @@ pub struct ContainerStartSpec {
     /// Size of `/dev/shm` in bytes; the runtime default when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shm_size: Option<u64>,
+    /// Where the image's layers come from, when not the machine's own image:
+    /// a container started in a machine booted for another container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<ContainerImageSource>,
+}
+
+/// Where a container's image layers come from when the machine it runs in
+/// was booted for another image.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerImageSource {
+    /// The machine's image store, by the image reference (pulled there).
+    Store,
+    /// A local image archive's directory (the one holding `archive.tar`),
+    /// added to the machine's read-only live device as `share`.
+    Attached {
+        /// Share name on the read-only live device.
+        share: String,
+    },
 }
 
 /// One mount of a [`ContainerStartSpec`].
@@ -1313,6 +1336,26 @@ pub enum ContainerMount {
         read_only: bool,
         /// When the shared directory is empty, first fill it with what the
         /// image has at `target`, as a container engine does for a new volume.
+        #[serde(default)]
+        copy_up: bool,
+    },
+    /// A directory the host added to the machine's live virtio-fs device
+    /// (`share`, on the read-only device when `read_only`) while it runs, or
+    /// one file or directory below it (`subpath`), bound at `target`. For a
+    /// container started in a machine booted for another one.
+    Attached {
+        /// Share name on the live device.
+        share: String,
+        /// Path below the share to bind instead of all of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+        /// Container path.
+        target: String,
+        /// Bind read-only (from the read-only device).
+        #[serde(default)]
+        read_only: bool,
+        /// When the share is empty, first fill it with what the image has at
+        /// `target`.
         #[serde(default)]
         copy_up: bool,
     },
@@ -1734,7 +1777,7 @@ impl AgentResponse {
 }
 
 /// Image information returned by Query/ListImages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageInfo {
     /// Image reference.
     pub reference: String,

@@ -97,8 +97,14 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
         return Err(format!("invalid container id '{}'", spec.id).into());
     }
     crate::ensure_storage_mounted();
-    let prepared = crate::storage::prepare_for_run_persistent(&spec.image, &spec.overlay_id)
-        .map_err(|e| format!("prepare the container filesystem: {e}"))?;
+    let source = layer_source(spec.image_source.as_ref())?;
+    let prepared = crate::storage::prepare_for_run_persistent_from(
+        &spec.image,
+        &spec.overlay_id,
+        source.as_layer_source(),
+        |_, _| {},
+    )
+    .map_err(|e| format!("prepare the container filesystem: {e}"))?;
     let rootfs = Path::new(&prepared.rootfs_path);
     let workload_id = format!("persistent-{}", spec.overlay_id);
 
@@ -141,6 +147,31 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
                         ));
                     }
                 }
+            }
+            ContainerMount::Attached {
+                share,
+                subpath,
+                target,
+                read_only,
+                copy_up,
+            } => {
+                let base = crate::attach::share_path(*read_only, share)
+                    .ok_or_else(|| format!("share {share} is not attached to this machine"))?;
+                if *copy_up {
+                    copy_up_into(rootfs, target, &base);
+                }
+                let source = match subpath.as_deref().filter(|s| !s.is_empty()) {
+                    None => base,
+                    Some(sub) => safe_join(&base, sub)?,
+                };
+                if source.is_file() {
+                    crate::storage::ensure_file_mount_target_under_root(rootfs, target)?;
+                }
+                extra_binds.push((
+                    source.to_string_lossy().into_owned(),
+                    target.clone(),
+                    *read_only,
+                ));
             }
             ContainerMount::Tmpfs { target, options } => {
                 tmpfs.push((target.clone(), options.clone()));
@@ -355,6 +386,7 @@ fn resolve_in_root(rootfs: &std::path::Path, path: &str) -> Option<std::path::Pa
 fn mount_target(mount: &smolvm_protocol::ContainerMount) -> &str {
     match mount {
         smolvm_protocol::ContainerMount::Share { target, .. }
+        | smolvm_protocol::ContainerMount::Attached { target, .. }
         | smolvm_protocol::ContainerMount::Tmpfs { target, .. } => target,
     }
 }
@@ -476,18 +508,61 @@ fn unpack_archive(
     Ok(())
 }
 
+/// Where a container's layers come from, resolved to a guest path.
+#[cfg(target_os = "linux")]
+enum ResolvedSource {
+    Machine,
+    Store,
+    Packed(std::path::PathBuf),
+}
+
+#[cfg(target_os = "linux")]
+impl ResolvedSource {
+    fn as_layer_source(&self) -> crate::storage::LayerSource<'_> {
+        match self {
+            Self::Machine => crate::storage::LayerSource::Machine,
+            Self::Store => crate::storage::LayerSource::Store,
+            Self::Packed(dir) => crate::storage::LayerSource::Packed(dir),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn layer_source(
+    source: Option<&smolvm_protocol::ContainerImageSource>,
+) -> Result<ResolvedSource, String> {
+    use smolvm_protocol::ContainerImageSource;
+    Ok(match source {
+        None => ResolvedSource::Machine,
+        Some(ContainerImageSource::Store) => ResolvedSource::Store,
+        Some(ContainerImageSource::Attached { share }) => ResolvedSource::Packed(
+            crate::attach::share_path(true, share)
+                .ok_or_else(|| format!("image share {share} is not attached to this machine"))?,
+        ),
+    })
+}
+
 /// Unpack an uploaded archive into a container's root filesystem.
 pub fn handle_container_archive(
     image: &str,
     overlay_id: &str,
     archive: &str,
     destination: &str,
+    image_source: Option<&smolvm_protocol::ContainerImageSource>,
 ) -> AgentResponse {
     #[cfg(target_os = "linux")]
     {
         crate::ensure_storage_mounted();
-        let result = crate::storage::prepare_for_run_persistent(image, overlay_id)
-            .map_err(|e| e.to_string())
+        let result = layer_source(image_source)
+            .and_then(|source| {
+                crate::storage::prepare_for_run_persistent_from(
+                    image,
+                    overlay_id,
+                    source.as_layer_source(),
+                    |_, _| {},
+                )
+                .map_err(|e| e.to_string())
+            })
             .and_then(|prepared| {
                 unpack_archive(
                     std::path::Path::new(&prepared.rootfs_path),
@@ -506,7 +581,7 @@ pub fn handle_container_archive(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (image, overlay_id, archive, destination);
+        let _ = (image, overlay_id, archive, destination, image_source);
         AgentResponse::error(
             "not supported on this platform",
             error_codes::INTERNAL_ERROR,

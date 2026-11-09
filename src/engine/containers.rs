@@ -176,9 +176,56 @@ pub(crate) struct ContainerRecord {
     /// destination)`, unpacked into the container at start.
     #[serde(default)]
     pub pending_archives: Vec<(String, String)>,
+    /// For a container that shares another's network
+    /// (`--network container:<id>`) and so runs in its machine: the host
+    /// directories its mounts come from, added to that machine while it runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guest_shares: Vec<GuestShare>,
+}
+
+/// A host directory a container that runs in another container's machine
+/// mounts (see [`ContainerRecord::guest_shares`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct GuestShare {
+    pub source: PathBuf,
+    pub read_only: bool,
 }
 
 impl ContainerRecord {
+    /// The container whose network (and machine) this one shares, for
+    /// `--network container:<id>`.
+    pub(crate) fn network_host(&self) -> Option<&str> {
+        self.host_config
+            .network_mode
+            .strip_prefix("container:")
+            .filter(|h| !h.is_empty())
+    }
+
+    /// The name of guest share `index` on the host container's machine.
+    fn guest_share_name(&self, index: usize) -> String {
+        format!("g{}s{index}", &self.id[..12])
+    }
+
+    /// The share a local image archive is added to the host container's
+    /// machine under, for a container that runs there.
+    fn guest_image_share(&self) -> String {
+        format!("g{}img", &self.id[..12])
+    }
+
+    /// Where the image's layers come from in the machine the container runs
+    /// in: its own machine's image, or, in another container's machine, the
+    /// image store or the shared local archive.
+    pub(crate) fn image_source(&self) -> Option<smolvm_protocol::ContainerImageSource> {
+        self.network_host()?;
+        Some(if crate::data::image_source::is_local_ref(&self.pull_ref) {
+            smolvm_protocol::ContainerImageSource::Attached {
+                share: self.guest_image_share(),
+            }
+        } else {
+            smolvm_protocol::ContainerImageSource::Store
+        })
+    }
+
     pub(crate) fn short_id(&self) -> &str {
         &self.id[..12]
     }
@@ -353,10 +400,30 @@ pub(crate) async fn create(
     let (path, args) = command_of(&req.config, &image)
         .ok_or_else(|| ApiError::bad_request("no command specified"))?;
     let host_config = req.host_config.clone();
-    if host_config.network_mode.starts_with("container:") {
-        return Err(ApiError::bad_request(
-            "network mode container:<name> is not supported: every container has its own machine and network stack",
-        ));
+    // `--network container:<id>`: the container runs in that container's
+    // machine, so it shares its network, as with Docker.
+    let mut host_config = host_config;
+    if let Some(target) = host_config.network_mode.strip_prefix("container:") {
+        let target = engine
+            .find_container(target)
+            .ok_or_else(|| ApiError::no_such_container(target))?;
+        if target.record().network_host().is_some() {
+            return Err(ApiError::bad_request(format!(
+                "cannot join the network of {}: it shares another container's network itself",
+                target.name()
+            )));
+        }
+        if !host_config.port_bindings.is_empty() || host_config.publish_all_ports {
+            return Err(ApiError::bad_request(
+                "conflicting options: port publishing and the container type network mode",
+            ));
+        }
+        if !req.config.hostname.is_empty() {
+            return Err(ApiError::bad_request(
+                "conflicting options: hostname and the network mode",
+            ));
+        }
+        host_config.network_mode = format!("container:{}", target.id());
     }
     if host_config.network_mode == "host" {
         warnings.push(
@@ -365,10 +432,36 @@ pub(crate) async fn create(
     }
 
     let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
+    let guest = host_config.network_mode.starts_with("container:");
+    if guest && !sockets.is_empty() {
+        return Err(ApiError::bad_request(
+            "a container that shares another container's network cannot mount a Unix socket",
+        ));
+    }
     let ports = resolve_ports(engine, &mut config, &host_config)?;
-    let networks = super::network::attach_at_create(engine, &id, &name, &req)?;
+    let networks = if guest {
+        BTreeMap::new()
+    } else {
+        super::network::attach_at_create(engine, &id, &name, &req)?
+    };
 
-    let machine = format!("docker-{}", &id[..12]);
+    // A container that shares another's network has no machine of its own.
+    let machine = if guest {
+        String::new()
+    } else {
+        format!("docker-{}", &id[..12])
+    };
+    let guest_shares: Vec<GuestShare> = if guest {
+        shares
+            .iter()
+            .map(|s| GuestShare {
+                source: s.source.clone(),
+                read_only: s.read_only,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut labels = BTreeMap::new();
     labels.insert(MACHINE_LABEL.to_string(), id.clone());
     let spec = crate::machine_spec::CreateSpec {
@@ -424,12 +517,16 @@ pub(crate) async fn create(
         user_stopped: false,
         running_at_shutdown: false,
         pending_archives: Vec::new(),
+        guest_shares,
     };
 
     let e = engine.clone();
     let pull_ref = image.pull_ref.clone();
     let machine_for_task = machine.clone();
     tokio::task::spawn_blocking(move || -> crate::Result<()> {
+        if machine_for_task.is_empty() {
+            return Ok(());
+        }
         crate::embedded::control::create_vm_from_spec(
             &e.db,
             &machine_for_task,
@@ -1118,6 +1215,19 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
     super::network::before_start(engine, c).await?;
     let record = c.record();
 
+    // A container that shares another's network runs in its machine.
+    if let Some(host) = record.network_host().map(str::to_string) {
+        let socket = match guest_machine(engine, &record, &host).await {
+            Ok(socket) => socket,
+            Err(e) => {
+                c.update(engine, |r| r.state.error = e.message.clone());
+                remove_after_failed_start(engine, c);
+                return Err(e);
+            }
+        };
+        return run_container(engine, c, &record, None, socket).await;
+    }
+
     // Boot the machine and make sure the image is in its storage.
     let e = engine.clone();
     let machine = record.machine.clone();
@@ -1171,7 +1281,20 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
         remove_after_failed_start(engine, c);
         return Err(e);
     }
+    run_container(engine, c, &record, Some(handle), socket).await
+}
 
+/// Run the container's command in the booted machine behind `socket`
+/// (`handle` is the machine's own, `None` for a container that runs in
+/// another container's machine) and carry its I/O until it exits.
+async fn run_container(
+    engine: &Arc<Engine>,
+    c: &Arc<Container>,
+    record: &ContainerRecord,
+    handle: Option<crate::embedded::handle::VmHandle>,
+    socket: PathBuf,
+) -> ApiResult<bool> {
+    let record = record.clone();
     // Files uploaded before the first start go in now, before the command.
     for (file, destination) in &record.pending_archives {
         let unpacked = match tokio::fs::read(file).await {
@@ -1219,20 +1342,30 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
                 r.state.error = msg.clone();
                 r.state.exit_code = code;
             });
-            let mut handle = handle;
-            let _ = tokio::task::spawn_blocking(move || handle.stop()).await;
-            let e = engine.clone();
-            let machine = record.machine.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::embedded::control::mark_stopped(&e.db, &machine)
-            })
-            .await;
+            if let Some(mut handle) = handle {
+                let _ = tokio::task::spawn_blocking(move || handle.stop()).await;
+                let e = engine.clone();
+                let machine = record.machine.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::embedded::control::mark_stopped(&e.db, &machine)
+                })
+                .await;
+            } else {
+                release_guest_shares(engine, &record).await;
+            }
             remove_after_failed_start(engine, c);
             return Err(ApiError::bad_request(msg));
         }
     };
 
-    let pid = handle.child_pid().unwrap_or(0) as i64;
+    let pid = match &handle {
+        Some(handle) => handle.child_pid().unwrap_or(0) as i64,
+        None => record
+            .network_host()
+            .and_then(|h| engine.find_container(h))
+            .map(|h| h.record().state.pid)
+            .unwrap_or(0),
+    };
     c.update(engine, |r| {
         r.state.status = "running".into();
         r.state.pid = pid;
@@ -1258,7 +1391,7 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
         .map(|h| tokio::spawn(health_loop(engine.clone(), c.clone(), h)).abort_handle());
     *c.running.lock() = Some(Running {
         socket,
-        vm: Some(handle),
+        vm: handle,
         _health: health,
     });
     c.emit(engine, "start", &[]);
@@ -1312,6 +1445,20 @@ fn start_spec(engine: &Engine, record: &ContainerRecord) -> smolvm_protocol::Con
                 target: m.destination.clone(),
                 options: m.options.clone(),
             },
+            _ if record.network_host().is_some() => {
+                let index = m.share.unwrap_or(0);
+                ContainerMount::Attached {
+                    share: record.guest_share_name(index),
+                    subpath: m.subpath.clone(),
+                    target: m.destination.clone(),
+                    read_only: record
+                        .guest_shares
+                        .get(index)
+                        .map(|s| s.read_only)
+                        .unwrap_or(m.read_only),
+                    copy_up: m.copy_up,
+                }
+            }
             _ => ContainerMount::Share {
                 tag: crate::data::storage::HostMount::mount_tag(m.share.unwrap_or(0)),
                 subpath: m.subpath.clone(),
@@ -1321,6 +1468,13 @@ fn start_spec(engine: &Engine, record: &ContainerRecord) -> smolvm_protocol::Con
             },
         })
         .collect();
+    // A container that shares another's network shares its name and its
+    // hosts file too, as with Docker.
+    let host = record
+        .network_host()
+        .and_then(|h| engine.find_container(h))
+        .map(|h| h.record());
+    let names = host.as_ref().unwrap_or(record);
     let mut argv = vec![record.path.clone()];
     argv.extend(record.args.iter().cloned());
     let env = record
@@ -1332,14 +1486,14 @@ fn start_spec(engine: &Engine, record: &ContainerRecord) -> smolvm_protocol::Con
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         })
         .collect();
-    let mut hosts: Vec<(String, String)> = super::network::hosts_entries(engine, record);
+    let mut hosts: Vec<(String, String)> = super::network::hosts_entries(engine, names);
     for entry in &record.host_config.extra_hosts {
         let (name, ip) = entry
             .split_once(':')
             .or_else(|| entry.split_once('='))
             .unwrap_or((entry.as_str(), ""));
         let ip = if ip == "host-gateway" {
-            super::network::host_gateway(record)
+            super::network::host_gateway(names)
         } else {
             ip.to_string()
         };
@@ -1357,17 +1511,24 @@ fn start_spec(engine: &Engine, record: &ContainerRecord) -> smolvm_protocol::Con
         user: (!record.config.user.is_empty()).then(|| record.config.user.clone()),
         tty: record.config.tty,
         open_stdin: record.config.open_stdin,
-        hostname: Some(record.config.hostname.clone()),
+        hostname: Some(names.config.hostname.clone()),
         hosts,
         mounts,
         read_only_rootfs: record.host_config.readonly_rootfs,
         shm_size: (record.host_config.shm_size > 0).then_some(record.host_config.shm_size as u64),
+        image_source: record.image_source(),
     }
 }
 
 /// The persistent overlay a container's root filesystem lives on.
 pub(crate) fn overlay_id(record: &ContainerRecord) -> String {
-    record.machine.clone()
+    // A container in another container's machine has no machine of its own;
+    // its overlay is named as its machine would be.
+    if record.machine.is_empty() {
+        format!("docker-{}", record.short_id())
+    } else {
+        record.machine.clone()
+    }
 }
 
 /// The container's command ended: record it, stop the machine, and apply the
@@ -1401,7 +1562,11 @@ async fn on_exit(engine: Arc<Engine>, c: Arc<Container>, exit: Exit) {
         let _ = tokio::task::spawn_blocking(move || handle.stop_with_timeout(Some(Duration::ZERO)))
             .await;
     }
-    stop_machine(&engine, &record.machine, Some(Duration::ZERO)).await;
+    if record.network_host().is_some() {
+        release_guest_shares(&engine, &record).await;
+    } else {
+        stop_machine(&engine, &record.machine, Some(Duration::ZERO)).await;
+    }
     super::network::after_stop(&engine, &c).await;
     drop(vm_guard);
 
@@ -1459,6 +1624,91 @@ fn should_restart(record: &ContainerRecord, code: i64) -> bool {
         }
         _ => false,
     }
+}
+
+/// Get a container that shares `host`'s network ready to run in `host`'s
+/// machine: `host` must be running; the container's host directories are
+/// added to the machine, and its image pulled there. Returns the machine's
+/// agent socket.
+async fn guest_machine(
+    engine: &Arc<Engine>,
+    record: &ContainerRecord,
+    host: &str,
+) -> ApiResult<PathBuf> {
+    let host = engine
+        .find_container(host)
+        .ok_or_else(|| ApiError::no_such_container(host))?;
+    let socket = host.socket().ok_or_else(|| {
+        ApiError::conflict(format!(
+            "cannot join network of a non running container: {}",
+            host.id()
+        ))
+    })?;
+    let machine = host.record().machine;
+    let shares: Vec<(String, GuestShare)> = record
+        .guest_shares
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (record.guest_share_name(i), s.clone()))
+        .collect();
+    let pull_ref = record.pull_ref.clone();
+    let image_share = record.guest_image_share();
+    let agent_socket = socket.clone();
+    tokio::task::spawn_blocking(move || -> crate::Result<()> {
+        for (name, share) in &shares {
+            // A share left by an earlier run of this container goes first.
+            let _ = crate::attach::remove_share(&machine, name, share.read_only);
+            crate::attach::add_share(&machine, name, &share.source, share.read_only)?;
+        }
+        if crate::data::image_source::is_local_ref(&pull_ref) {
+            // A local image goes in as its archive, which the guest unpacks.
+            let dir = crate::data::image_source::packed_layers_dir_for_ref(&pull_ref)
+                .ok_or_else(|| crate::Error::config("image", format!("{pull_ref} is gone")))?;
+            let _ = crate::attach::remove_share(&machine, &image_share, true);
+            crate::attach::add_share(&machine, &image_share, &dir, true)?;
+        } else {
+            let mut client = crate::agent::AgentClient::connect_with_retry(&agent_socket)?;
+            if client.query(&pull_ref)?.is_none() {
+                client.pull_with_registry_config(&pull_ref)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(|e| {
+        ApiError::internal(format!(
+            "prepare the container in {}'s machine: {e}",
+            host.name()
+        ))
+    })?;
+    Ok(socket)
+}
+
+/// Take a container's host directories back out of the machine it ran in.
+async fn release_guest_shares(engine: &Arc<Engine>, record: &ContainerRecord) {
+    let Some(host) = record.network_host().and_then(|h| engine.find_container(h)) else {
+        return;
+    };
+    if !host.is_running() {
+        return;
+    }
+    let machine = host.record().machine;
+    let mut shares: Vec<(String, bool)> = record
+        .guest_shares
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (record.guest_share_name(i), s.read_only))
+        .collect();
+    if crate::data::image_source::is_local_ref(&record.pull_ref) {
+        shares.push((record.guest_image_share(), true));
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        for (name, read_only) in shares {
+            let _ = crate::attach::remove_share(&machine, &name, read_only);
+        }
+    })
+    .await;
 }
 
 /// Stop the machine behind a container, whatever state it is in.

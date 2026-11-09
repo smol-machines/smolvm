@@ -113,9 +113,12 @@ engine connects those stacks with a switch:
 - `--internal` networks have no way out.
 - `host.docker.internal` and `gateway.docker.internal` reach the host from every container.
 
+`--network container:<name>` (Compose's `network_mode: service:<name>`) runs the container in the
+other container's machine, so it shares its network (loopback included) and its hostname, as with
+Docker, while keeping its own filesystem and mounts. The other container has to be running, and
+the container stops if it does. Such a container cannot publish ports or mount a Unix socket.
 `--network host` is accepted with a warning and gives the container the default network: a
-container is a machine and cannot share the host's network. `--network container:<name>` is
-refused for the same reason.
+container is a machine and cannot share the host's network.
 
 ## The Docker socket inside a container
 
@@ -175,5 +178,5 @@ What the clients send, for whoever adds builds:
 
 ## Not yet
 
-- IPv6 networks, other network drivers than `bridge`, and `--network container:<name>`.
+- IPv6 networks, and other network drivers than `bridge`.
 - Changing an internal network's egress after a container on it was created.

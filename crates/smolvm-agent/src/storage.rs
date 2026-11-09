@@ -5360,9 +5360,36 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
     prepare_for_run_persistent_with_progress(image, overlay_id, |_, _| {})
 }
 
+/// Where a persistent overlay's image layers come from.
+#[derive(Debug, Clone, Copy)]
+pub enum LayerSource<'a> {
+    /// The machine's own image: its packed layers when it has them,
+    /// otherwise the image store.
+    Machine,
+    /// The image store, by reference, even on a machine with packed layers.
+    Store,
+    /// A packed-layers directory (or staged local archive) other than the
+    /// machine's own.
+    Packed(&'a Path),
+}
+
 pub fn prepare_for_run_persistent_with_progress<F>(
     image: &str,
     overlay_id: &str,
+    progress: F,
+) -> Result<PreparedOverlayRootfs>
+where
+    F: FnMut(&str, u64),
+{
+    prepare_for_run_persistent_from(image, overlay_id, LayerSource::Machine, progress)
+}
+
+/// [`prepare_for_run_persistent_with_progress`] with the image's layers
+/// taken from `source`.
+pub fn prepare_for_run_persistent_from<F>(
+    image: &str,
+    overlay_id: &str,
+    source: LayerSource<'_>,
     mut progress: F,
 ) -> Result<PreparedOverlayRootfs>
 where
@@ -5371,11 +5398,29 @@ where
     validate_storage_id(overlay_id, "persistent overlay id")?;
     let workload_id = format!("persistent-{}", overlay_id);
 
+    // An overlay already mounted and answering this boot is reused as it
+    // stands; its layers were resolved when it was mounted. A container
+    // started in a machine booted for another image (its exec sessions name
+    // an image this machine's store does not hold) depends on that.
+    let setup = OverlaySetup::new(&workload_id)?;
+    if is_mountpoint(&setup.merged_path) && mounted_overlay_is_healthy(&setup.merged_path) {
+        let overlay = setup.execute_or_remount(Vec::new())?;
+        return Ok(PreparedOverlayRootfs {
+            workload_id,
+            rootfs_path: overlay.rootfs_path,
+        });
+    }
+
     // Resolve image layers (same logic as prepare_overlay). A local image
     // archive is flattened into a rootfs first; a packed-layers dir is used
     // as-is. A packed machine has exactly one image, so only an image-store
     // overlay records and checks which image it was built from.
-    let (lowerdirs, image_store) = if let Some(packed_dir) = get_packed_layers_dir() {
+    let packed = match source {
+        LayerSource::Machine => get_packed_layers_dir().map(PathBuf::as_path),
+        LayerSource::Store => None,
+        LayerSource::Packed(dir) => Some(dir),
+    };
+    let (lowerdirs, image_store) = if let Some(packed_dir) = packed {
         let effective = effective_packed_dir_with_progress(packed_dir, &mut progress)?;
         (get_packed_lowerdirs(&effective)?, false)
     } else {

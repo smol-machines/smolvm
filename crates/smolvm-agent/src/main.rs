@@ -3122,7 +3122,14 @@ fn handle_request(
             overlay_id,
             archive,
             destination,
-        } => container::handle_container_archive(&image, &overlay_id, &archive, &destination),
+            image_source,
+        } => container::handle_container_archive(
+            &image,
+            &overlay_id,
+            &archive,
+            &destination,
+            image_source.as_ref(),
+        ),
 
         AgentRequest::SetInterfaceAddresses { addresses } => {
             container::handle_set_interface_addresses(&addresses)
@@ -4489,9 +4496,16 @@ impl ResolvedLaunch {
         user: Option<String>,
         s3_volumes: Vec<smolvm_protocol::S3Volume>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!("image not found: {image}").into()
-        })?;
+        let info = match storage::query_image(image)? {
+            Some(info) => info,
+            // An image this machine's store does not hold, with the command
+            // given: a session joining a container started from an image
+            // shared into the machine (the Docker engine's containers in
+            // another container's machine), whose settings the caller already
+            // merged. Preparing its overlay still fails for anything else.
+            None if !command.is_empty() => smolvm_protocol::ImageInfo::default(),
+            None => return Err(format!("image not found: {image}").into()),
+        };
         let command = if command.is_empty() {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
