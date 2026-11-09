@@ -5,13 +5,13 @@ description: Gives a workload in a smolvm machine an API key or token it can use
 
 # A credential the machine can use and never hold
 
-Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24, for everything that
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24, for everything that
 is decided on the host; on v1.29.0 on macOS arm64 **the substituted value also arrived at a real API**
 that echoes the headers it received, a dummy value. Done means the guest's variable is a placeholder, the value
 is nowhere in the guest, the machine's record or smolvm's database, TLS to the bound host goes
 through the machine's own CA, and a placeholder anywhere but a request header is refused before it
 leaves the host (from v1.27.0 a binding with `:body` also substitutes into a form body).
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 `docs/credential-substitution.md` in the smolvm repository is how the feature works: bindings,
@@ -180,7 +180,7 @@ Full detail in `references/traps.md`.
 `references/platforms.md`. macOS arm64 ran every script on v1.29.0 and v1.22.2, and both hosts gave the same
 results on v1.18.2, on the default virtio-net backend and on `--net-backend tsi`. Windows ran by
 hand on v1.34.0 with the same answers, except that its guest search needs another route, because
-`machine exec -i` passes no piped input there. Linux x86_64 was not run.
+`machine exec -i` passes no piped input there. Linux x86_64 ran every script on v1.34.0 with the same results.
 
 ## Eval prompts, and what they produced
 
@@ -239,6 +239,10 @@ on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts, bo
 with a dummy value: `result=contained`, `query_refused=ok (403)`, and a `GET /headers` from the
 guest came back carrying the dummy value, not the placeholder.
 
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step: `result=contained`, `query_refused=ok (403)`,
+and the guest's `GET /headers` to `httpbin.org` came back carrying the dummy value.
+
 ## Re-verified on v1.29.0
 
 Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
@@ -279,7 +283,7 @@ record search, `verify-containment.sh` and the rest of the procedure took 25 s.
   nothing here changed a value under a running machine except by the variable.
 - **Credentials over the HTTP API**, branches and checkpoints carrying bindings, and portable
   restores on another host.
-- **Linux x86_64**, and these scripts on Windows, which are bash.
+- **These scripts on Windows**, which are bash.
 
 ## Related packets
 

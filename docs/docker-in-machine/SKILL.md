@@ -5,10 +5,10 @@ description: Runs a Docker daemon inside a smolvm machine and shows it working t
 
 # A Docker daemon inside a machine
 
-Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24; the Linux runs used
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24; the aarch64 runs used
 the Smolfile with `memory = 1024`, for a host reason given below. Done means `docker info` succeeds inside the guest, a nested container runs, and
 Docker's data sits on the ext4 storage disk rather than the rootfs overlay.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 **On Windows, up to and including v1.22.2, `dockerd` does not start in a machine.** The Windows
@@ -171,7 +171,8 @@ verified**: neither host used here has a `docker` client.
   host could not boot larger guests inside the fixed 30 s readiness window, and the `install`
   packet's traps have the numbers. On a small or busy host, lower `memory` before suspecting
   Docker; 1024 MiB was enough for `dockerd` and a nested alpine container.
-- **Linux x86_64**: not run anywhere for this use case.
+- **Linux x86_64**: verified on v1.34.0, twice, on an NVIDIA A10 cloud host, with the Smolfile as
+  shipped.
 - **Windows x86_64**: **does not run on v1.22.2**. A v1.14.2 run showed `dockerd` failing; on
   2026-10-03 on v1.22.2 (Windows 11 Home build 10.0.26200 UBR 9457) the direct kernel probe in a
   plain `alpine` guest gave `RTNETLINK answers: Not supported` for a bridge and `No such device` for
@@ -219,6 +220,11 @@ on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts wit
 Docker 29.9.3, `docker_root_device=ok (/dev/vda)`, `nested_container=ok` and `result=docker_ok`,
 again after a stop and start.
 
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step with the disk volumes: Docker 29.9.3,
+`docker_root_device=ok (/dev/vda)`, `nested_container=ok (NESTED_OK)` and `result=docker_ok`, again
+after a stop and start.
+
 ## Re-verified on v1.29.0, with the disk volumes
 
 Run 2026-10-15 PT against v1.29.0 from the published release (the `darwin-arm64` archive, checksum
@@ -264,7 +270,6 @@ Linux aarch64 at `memory = 1024`: the same lines.
 
 - **`dockerd` itself on Windows after v1.14.2.** The v1.22.2 answer is the kernel probe, not a
   daemon run.
-- **Linux x86_64.** Not run for this use case on any host, then or now.
 - **Driving the host-side `docker.sock` from a host `docker` client.** The socket is created and
   asserted; neither host here has a docker client to drive it with.
 - **Compose and Testcontainers themselves.** The packet verifies `docker info`, a nested container

@@ -7,8 +7,8 @@
 
 set -uo pipefail
 
-# The Linux GPU path last ran on 1.14.6; the no-GPU answer on macOS on 1.22.2.
-case "$(uname -s)" in Linux) VERIFIED_VERSION="1.14.6" ;; *) VERIFIED_VERSION="1.22.2" ;; esac
+# The Linux GPU path last ran on 1.34.0; the no-GPU answer on macOS on 1.22.2.
+case "$(uname -s)" in Linux) VERIFIED_VERSION="1.34.0" ;; *) VERIFIED_VERSION="1.22.2" ;; esac
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 note() { printf 'note=%s\n' "$1"; }

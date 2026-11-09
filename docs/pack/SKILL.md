@@ -8,11 +8,11 @@ description: Turns an image, or a machine already provisioned, into a single sel
 For macOS first-import performance, storage seed behavior and a file-heavy
 reproduction, see [macOS storage seeds](references/macos-storage-seeds.md).
 
-Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.14.6** on Linux aarch64,
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.14.6** on Linux aarch64,
 2026-09-11; the Linux host could not run the packing steps on v1.18.2 or v1.22.2, for the reason in
 "Platform arms". Done means the artifact runs a command in a real VM and, for a machine pack, **the state you installed is still
 inside it**.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 **The assertion that matters is a value, not a boot.** A pack that lost its rootfs still boots,
@@ -252,8 +252,8 @@ Full detail with the evidence in `references/traps.md`. The ones that cost the m
   way. That host could not boot guests above 2048 MiB in time, which the `install` packet's traps
   record. The preflight on v1.18.2 said `exporter_memory_ok=yes` there with 10386 MiB free: free
   memory was not what failed, so read the memory lines as hints about the helper VMs only.
-- **Linux x86_64**: verified in the material behind this packet on v1.14.6, including the branched
-  and restored cases. Not re-run here.
+- **Linux x86_64**: the scripts verified on v1.34.0, twice, on an NVIDIA A10 cloud host; the
+  branched and restored cases rest on v1.14.6, in the material behind this packet.
 - **Windows x86_64**: `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on
   Windows 11 Home build 10.0.26200 UBR 9711: both paths pack and run again, through the stub's
   `run --`, `pack run --sidecar` and `machine create --from`, with the marker read back out of a
@@ -329,6 +329,11 @@ of 2 artifacts)`, `machine_pack_carried_rootfs=ok (PACKED_STATE_PRESENT)`, and t
 free, 4096 asked) and the machine pack still succeeded. On Linux nothing packed, for the host reason
 in "Platform arms": `pack create --image`'s agent VM and the default-size source both missed the 30
 s boot.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step: `exporter_memory_ok=yes`,
+`result=artifacts_good (2 of 2 artifacts)`, `machine_pack_carried_rootfs=ok (PACKED_STATE_PRESENT)`,
+and the image artifact's `run --ssh-agent` listed the throwaway key.
 
 ## Re-verified on v1.29.0
 
