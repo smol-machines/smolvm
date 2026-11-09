@@ -179,11 +179,11 @@ messages, and `branch-and-checkpoint` covers pause alongside checkpoints.
   v1.23.0 the current script passed over the Unix socket, run once.
 - **Linux x86_64**: verified on v1.14.2 on an NVIDIA A10 cloud host, over both transports, not
   re-run since.
-- **Windows x86_64**: `references/windows.md`, **re-run on 2026-10-03 against v1.22.2** on
-  Windows 11 Home build 10.0.26200 UBR 9457, where the whole lifecycle passed over loopback TCP. A `unix://` listen is refused there.
-  Error bodies arrive as on Unix, and PowerShell 5.1's `Invoke-WebRequest` drops them, so read
-  them with `curl.exe`. Routes live under `/api/v1/`; a bodiless POST to `start` is accepted from
-  v1.21.0.
+- **Windows x86_64**: `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on
+  Windows 11 Home build 10.0.26200 UBR 9711, where the whole lifecycle passed over loopback TCP. A `unix://` listen is refused there.
+  Error bodies arrive as on Unix; in PowerShell 5.1 read `$_.ErrorDetails.Message`, or use
+  `curl.exe`. Routes live under `/api/v1/`; a bodiless POST to `start` is accepted from v1.21.0.
+  `pause` on a machine started without `branchable` answers 500 there from v1.28.1.
 
 ## Eval prompts, and what they produced
 
