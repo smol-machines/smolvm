@@ -29,6 +29,11 @@ use std::sync::{Arc, Mutex};
 /// [`LiveCredentials`] for the protocol.
 pub const CREDENTIALS_SOCKET: &str = "credentials.sock";
 
+/// Capability a server advertises in `GET /health` (`capabilities`) when it
+/// serves `PUT /api/v1/machines/{name}/credentials`: bindings replaceable in
+/// every state, live on a running machine.
+pub const CREDENTIAL_BINDINGS_CAPABILITY: &str = "credential-bindings-v1";
+
 /// Host the CA of a credential lineage is constrained to while it has no
 /// binding at all: a reserved name (RFC 2606) no real certificate is for.
 const NO_CREDENTIAL_HOST: &str = "credentials.invalid";

@@ -826,6 +826,13 @@ pub struct HealthResponse {
     /// Whether this server runs nested-virtualization machines (started with
     /// `--allow-nested-virt`), so a fleet scheduler can place them here.
     pub nested_virt: bool,
+    /// Features this server supports that a control plane may need to know
+    /// about before using them, so it never has to infer them from `version`.
+    /// `credential-bindings-v1`: `PUT /api/v1/machines/{name}/credentials`
+    /// replaces a machine's credential bindings in any state, live on a
+    /// running one.
+    #[schema(example = json!(["credential-bindings-v1"]))]
+    pub capabilities: Vec<&'static str>,
 }
 
 /// Machine counts for health response.
