@@ -120,6 +120,9 @@ smolvm machine update --name notes --credential github=GITHUB_TOKEN@api.github.c
 smolvm machine update --name notes --remove-credential notion
 ```
 
+A server that supports this lists `credential-bindings-v1` in the
+`capabilities` array of `GET /health`; check for it rather than for a version.
+
 The embedded runtime has `set_credential_bindings(name, policy)`. An empty list
 leaves the machine with no binding. The route answers with the machine's info;
 `400`, with nothing changed, for bindings create would refuse or a machine
