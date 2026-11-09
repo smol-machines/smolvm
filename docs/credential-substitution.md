@@ -97,8 +97,10 @@ A machine's bindings can be replaced in any state: created, stopped, paused or
 running. The new set is exactly what you send, validated as create validates
 it, and stored on the machine, so every later start, resume, restore and branch
 uses it. The machine must already have network egress (`--net`, or an allow
-list covering the hosts): unlike `--credential` at create, replacing bindings
-never turns networking on.
+list covering the hosts): unlike `--credential` at create, which turns `--net`
+on for the new machine, replacing bindings never turns networking on, and a
+binding never keeps networking that the machine turns off (`machine update
+--no-net` leaves it with no network, bindings or not).
 
 ```sh
 # HTTP API: the complete set, each binding as in the create body
@@ -119,9 +121,10 @@ smolvm machine update --name notes --remove-credential notion
 ```
 
 The embedded runtime has `set_credential_bindings(name, policy)`. An empty list
-leaves the machine with no binding. The route answers with the machine's info,
-`400` for bindings create would refuse, and `409`, with nothing changed, when the
-machine cannot take them now (below).
+leaves the machine with no binding. The route answers with the machine's info;
+`400`, with nothing changed, for bindings create would refuse or a machine
+without egress; and `409`, with nothing changed, when the machine's state is
+the obstacle (below).
 
 On a running machine the change applies from its next request, with no restart:
 
@@ -136,16 +139,26 @@ On a running machine the change applies from its next request, with no restart:
   `shell`, the API's exec) see; processes already running keep the environment
   they started with. Its value comes from `credential-values` (API and
   embedded machines) or, for a CLI machine, from the binding's secret
-  reference or variable as `machine update` reads it. A name removed and added
-  again later gets a new placeholder.
-- A request already being handled when the bindings change, which would
-  resolve a value after the change, is answered `503 smolvm credentials:
-  credential bindings changed during the request; retry` instead of being sent
-  with a value it was not checked against.
+  reference or variable: a binding with a secret reference (a file, the
+  keychain) is resolved by the machine on every request, so rotating it keeps
+  working, and one read from a variable takes the value `machine update` reads.
+  A name removed and added again later gets a new placeholder.
+- A value supplied for a binding serves only that binding: after a restart, a
+  name bound to another variable, or removed and added again, gets no value
+  until one is supplied for it, and a branch never inherits its source's value
+  for such a binding.
+- A request already being handled when its own binding changes (a new
+  definition, or its secret dropped), which would resolve a value after the
+  change, is answered `503 smolvm credentials: credential bindings changed
+  during the request; retry` instead of being sent with a value it was not
+  checked against. Changes to other bindings, or an identical re-send, leave it
+  alone. A request body that sends nothing for 60 seconds is answered `408`.
 - A removed binding stops being substituted at once. A new connection to its
   host is relayed untouched, so its placeholder goes out as a plain string; a
   request on a connection the interceptor already terminated is refused as an
-  unknown placeholder. The value held for it is dropped.
+  unknown placeholder. The value held for it is dropped, and a secret reference
+  it read (`--secret-file GH_TOKEN=…` feeding `gh=GH_TOKEN@…`) is removed with
+  it, so the secret never reaches the guest's environment as plaintext.
 - A host outside the machine's CA widens the CA: it is re-certified with the
   same key, so processes that loaded the earlier certificate keep trusting the
   hosts it covered, and the guest agent installs the wider one in the machine
@@ -156,24 +169,29 @@ A machine that booted without bindings gains them live when it runs on
 virtio-net with outbound access (every networked machine under `serve`, and
 any networked machine with an allow list or published ports): the first
 bindings start the interceptor in its host process, and the guest agent
-installs the CA. A running machine is refused, with nothing changed, when:
+installs the CA. A machine without egress (no network device, or published
+ports only) is refused with `400`, as above. A running machine with egress is
+refused with `409`, nothing changed, when:
 
-- it has no network device: libkrun fixes a VM's devices when it starts;
-- it runs on TSI: libkrun redirects connections to an interceptor only through
-  a hook it takes before the VM starts;
-- it has inbound-only networking (published ports, no egress): its network
-  runtime started deny-all and cannot open egress while it runs;
+- it runs on TSI and booted without bindings: libkrun redirects connections to
+  an interceptor only through a hook it takes before the VM starts;
 - its guest agent predates live trust and the change needs the CA installed
   (first bindings, or a host outside the CA).
 
-Stop it, set the bindings, and start it again. A paused or restored machine
-resumes the devices its memory was saved with, so a first binding that needs
-another network backend (from none or TSI to virtio-net) is refused; one on
-virtio-net takes it, and its guest gets the CA through its agent on resume.
+Stop it, set the bindings, and start it again. A paused machine, or one restored
+from a checkpoint and not started yet, resumes the devices its memory was saved
+with, so a first binding that needs another network backend (from TSI to
+virtio-net) is refused with `409`; so is a change whose CA its saved guest agent
+could not take (an agent that predates live trust, or one not known to). On
+virtio-net with a capable agent it takes them, and its guest gets the CA through
+its agent on resume. A machine that merely captured a checkpoint is not one that
+restores.
 
-Removing every binding keeps the machine's CA, interceptor and network backend,
-so a checkpoint taken while it had bindings still restores, and bindings added
-later apply live.
+Removing every binding leaves the machine with no policy. A machine whose
+virtio-net backend came only from its bindings keeps virtio-net, and a saved
+guest that had the CA device gets it again on resume, so a checkpoint taken
+while it had bindings still restores. A running TSI machine whose bindings were
+all removed is treated as having none: adding one again needs a restart.
 
 Bindings replaced over the API or by an embedder take their values only from
 what is supplied, as at create; so do the bindings a machine already had from
@@ -187,9 +205,13 @@ directory, and reads the certificate there without following links. It talks
 to the boot process over `credentials.sock` in the machine's data directory
 (mode `0600`), sending only the bindings, their placeholders and whether values
 are supplied; where values come from, the machine's identity and the CA's
-location are the boot process's own. A change that fails part-way (the guest
-cannot take the new CA, or the record cannot be saved) is rolled back to
-exactly the previous bindings, sources and values.
+location are the boot process's own. Values sent to a running machine carry the
+binding they were read for, and are refused if that binding has changed. A
+change that fails part-way (the guest cannot take the new CA, the answer is
+lost, or the record cannot be saved) is rolled back to exactly the previous
+bindings, sources and values, keeping values sent since for the bindings it
+restores. Changes to one machine's bindings, and its starts, are serialized
+across processes, and every start enforces the bindings its record holds.
 
 ## Setting a header
 

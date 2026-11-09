@@ -296,9 +296,34 @@ fn read_in_root(root: &Path, path: &str) -> Option<Vec<u8>> {
             resolved.push(part);
         }
     }
-    let mut file = root.to_path_buf();
-    file.extend(&resolved);
-    std::fs::read(file).ok()
+    let mut path = root.to_path_buf();
+    path.extend(&resolved);
+    read_regular_file(&path, MAX_ROOTS_BYTES)
+}
+
+/// Largest trust-root file read from an image: real bundles are a few hundred
+/// KiB.
+const MAX_ROOTS_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read `path` if it is a regular file of at most `max` bytes, opening it
+/// without following a link and without blocking (a FIFO a container planted
+/// there is refused, never waited on; a device such as `/dev/zero` is refused,
+/// never read forever).
+fn read_regular_file(path: &Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= max).then_some(bytes)
 }
 
 #[cfg(test)]
@@ -350,6 +375,31 @@ mod tests {
             text.starts_with("-----BEGIN CERTIFICATE-----\ncontainer"),
             "{text}"
         );
+    }
+
+    /// A container cannot make the agent read a device, a FIFO, a link it
+    /// planted at the last step, or a huge file in place of its roots.
+    #[cfg(unix)]
+    #[test]
+    fn roots_are_read_only_from_small_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("etc/ssl/certs")).unwrap();
+        let roots = r.join("etc/ssl/certs/ca-certificates.crt");
+        // A FIFO: refused at once, never waited on.
+        let fifo = std::ffi::CString::new(roots.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        assert!(read_in_root(r, "etc/ssl/certs/ca-certificates.crt").is_none());
+        std::fs::remove_file(&roots).unwrap();
+        // A device reached through an absolute link resolves inside the
+        // container root, where it is missing; and a device itself is refused.
+        assert!(read_regular_file(Path::new("/dev/zero"), MAX_ROOTS_BYTES).is_none());
+        // Too large.
+        std::fs::write(&roots, vec![b'x'; (MAX_ROOTS_BYTES + 1) as usize]).unwrap();
+        assert!(read_in_root(r, "etc/ssl/certs/ca-certificates.crt").is_none());
+        std::fs::write(&roots, b"-----BEGIN CERTIFICATE-----\nok\n").unwrap();
+        assert!(read_in_root(r, "etc/ssl/certs/ca-certificates.crt").is_some());
     }
 
     /// Each container's bundle has a file of its own, so one container's
