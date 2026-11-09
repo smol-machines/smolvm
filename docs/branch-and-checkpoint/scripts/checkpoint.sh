@@ -85,8 +85,15 @@ fi
 printf '%s\n' "$$" > "$LOCK/pid"
 trap 'rm -rf "$LOCK"' EXIT
 
+# The name has one-second resolution and a capture can take less than that, so a
+# capture right after another waits for the next second rather than collide.
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 output="$OUT/$NAME-$LABEL-$stamp.smolcheckpoint"
+if [ -e "$output" ]; then
+    sleep 1
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    output="$OUT/$NAME-$LABEL-$stamp.smolcheckpoint"
+fi
 if [ -e "$output" ]; then
     printf 'result=FAILED %s already exists; smolvm never overwrites an output, and two captures in one second collide on this name\n' "$output"
     exit 1
