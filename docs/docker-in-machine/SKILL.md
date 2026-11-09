@@ -5,7 +5,7 @@ description: Runs a Docker daemon inside a smolvm machine and shows it working t
 
 # A Docker daemon inside a machine
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24; the Linux runs used
+Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24; the Linux runs used
 the Smolfile with `memory = 1024`, for a host reason given below. Done means `docker info` succeeds inside the guest, a nested container runs, and
 Docker's data sits on the ext4 storage disk rather than the rootfs overlay.
 The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
@@ -165,7 +165,7 @@ verified**: neither host used here has a `docker` client.
 
 ## Platform arms
 
-- **macOS arm64**: v1.29.0 with the disk volumes, every check passed before and after a stop and
+- **macOS arm64**: v1.34.0 and v1.29.0 with the disk volumes, every check passed before and after a stop and
   start; the bind-mount file on v1.29.0 too, the restart trap and its recovery included.
 - **Linux aarch64**: v1.18.2 and once on v1.22.2, with the Smolfile's memory at 1024 MiB: the Lima
   host could not boot larger guests inside the fixed 30 s readiness window, and the `install`
@@ -210,6 +210,14 @@ has `CONFIG_BRIDGE` and `CONFIG_POSIX_MQUEUE` both off, so `dockerd` fails on
 daemon comes up healthy while every container fails on `/dev/mqueue`. That result is from an
 earlier run on Windows 11 against v1.14.2, and the kernel probe on `references/windows.md` gave
 the same two answers on v1.22.2.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts with the disk volumes:
+Docker 29.9.3, `docker_root_device=ok (/dev/vda)`, `nested_container=ok` and `result=docker_ok`,
+again after a stop and start.
 
 ## Re-verified on v1.29.0, with the disk volumes
 

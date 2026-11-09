@@ -5,7 +5,7 @@ description: Runs untrusted code in a throwaway smolvm microVM against a repo it
 
 # Running untrusted work in a throwaway machine
 
-Verified on **smolvm v1.23.0** on macOS arm64, 2026-10-04, by the offline route, the network-on route
+Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, by the offline route, the network-on route
 and the cancel; on Linux aarch64 by the offline route and the cancel on v1.20.2, 2026-09-29, and the
 network-on route on v1.18.2, 2026-09-24. Done means the command's output landed in your writable directory,
 the repo is unchanged, the workload could not reach the network, and nothing is left running.
@@ -218,14 +218,14 @@ Read these when the situation calls for them; they are not needed for a normal r
 - **Linux x86_64**: the offline route was verified on v1.14.2 on an NVIDIA A10 cloud host, not
   re-run since.
 - **macOS arm64**: **the offline route, the network-on route and the cancel path on both were run
-  here on v1.23.0**, 2026-10-04; on v1.29.0 everything but the offline route, which fails from
-  v1.24.0. Before v1.20.2 the offline shape is unavailable (#1192, reproduced
+  here on v1.23.0**, 2026-10-04, and on v1.34.0, 2026-11-09; on v1.24.0 to v1.29.0 everything but
+  the offline route (#1819). Before v1.20.2 the offline shape is unavailable (#1192, reproduced
   3 of 3 on v1.18.2), and `references/macos.md` gives the routes run on v1.18.2.
 - **Windows x86_64**: the offline shape is unavailable for a different reason, the bake never
-  completes. `references/windows.md`, **re-run on 2026-10-03 against v1.22.2** on Windows 11 Home
-  build 10.0.26200 UBR 9457: the mount, the artifact directory and the network-off refusal
-  confirmed, the bake still did not complete inside a five minute cap in any of four shapes, and a
-  plain foreground run interrupted by Ctrl-C or a kill left its VM running.
+  completes. `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on Windows 11 Home
+  build 10.0.26200 UBR 9711: the mount, the artifact directory and the network-off refusal
+  confirmed, the bake still did not complete inside a five minute cap with or without a mount, and
+  a plain foreground run whose CLI was killed left its VM running (on v1.22.2, by Ctrl-C too).
 
 ## Eval prompts, and what they produced
 
@@ -275,26 +275,18 @@ v1.20.2 it says `offline_shape=unavailable`, `offline_shape_blocker=smol-machine
 `result=blocked`, and `bake.sh` refuses with `result=unsupported_on_macos` rather than baking
 something unusable.
 
-## Run on v1.29.0, not re-verified
+## Re-verified on v1.34.0
 
-Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
-isolated `HOME` on macOS 27.0.1 arm64, twice, the second time from a fresh `HOME`. Linux was not
-run. The stamp stays on v1.23.0 because the offline route failed.
-
-**The offline route failed.** `bake.sh` printed `baked in 10s` and then `agent did not become ready
-within 30 seconds`, and `run.sh` the same error with `used_host_cache=yes`, so `verify.sh` found
-no artifact. The same `machine run --oci-cache` with `--net` and without it failed 3 of 3 on
-v1.29.0 and passed on v1.23.7, so the cause is in smolvm, not in the scripts.
-
-**Everything else held.** The network-on route gave `inside_workspace=ok (readonly)`,
-`inside_out=ok (writable)`, `inside_network=ok (REACHED)`, `artifact=ok (42)` and
-`result=isolation_held`; once in three it exited 255 with no artifact and the log was overwritten
-before it was read. `--allow-host example.com` reached it. Ctrl-C to the script's process group gave
-`cli_exit=130` and no machine; `SIGKILL` to the script left `running (eph)`, and
-`cleanup.sh --cancel --purge` printed `cancelled=<pid>` and `result=clean`. The interactive shell
-above gave `Read-only file system` and `bad address 'example.com'`. The persistent machine with no
-network in `README.md` started in 7 s with `network` false, the same two refusals, and `42` in the
-output directory.
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). **The offline route runs again on macOS** (#1819
+is fixed from v1.29.1: `machine run --oci-cache` failed on v1.29.0 and printed `HI` on v1.29.1).
+Both passes: `offline_shape=available`, `baked in 35s`, `used_host_cache=yes`, `inside_network=ok
+(blocked)`, `artifact=ok (42)`, `repo_unchanged=ok`, `result=isolation_held`; the network-on route
+with `inside_network=ok (REACHED)`; `--allow-host example.com` reached it and not `example.org`; the
+cancel `result=clean`; the shell by hand and the persistent machine with no network as above. On
+Linux the bake's 8192 MiB helper did not boot inside 30 s, and `bake.sh` said so with
+`control_boot_2048=ok`; the network-on route, the grant and the cancel held.
 
 ## Re-verified on v1.23.0
 

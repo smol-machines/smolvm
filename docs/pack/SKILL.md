@@ -8,7 +8,7 @@ description: Turns an image, or a machine already provisioned, into a single sel
 For macOS first-import performance, storage seed behavior and a file-heavy
 reproduction, see [macOS storage seeds](references/macos-storage-seeds.md).
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.14.6** on Linux aarch64,
+Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.14.6** on Linux aarch64,
 2026-09-11; the Linux host could not run the packing steps on v1.18.2 or v1.22.2, for the reason in
 "Platform arms". Done means the artifact runs a command in a real VM and, for a machine pack, **the state you installed is still
 inside it**.
@@ -243,7 +243,7 @@ Full detail with the evidence in `references/traps.md`. The ones that cost the m
 
 ## Platform arms
 
-- **macOS arm64**: verified on v1.29.0, the SSH agent forwarding included; on v1.22.2 also a branched source, and
+- **macOS arm64**: verified on v1.34.0, the SSH agent forwarding included; on v1.22.2 also a branched source, and
   a pack of a restored machine on v1.18.2. An extra `Signing binary with hypervisor entitlements`
   step runs here that does not on Linux.
 - **Linux aarch64**: verified on v1.14.6. Not run on v1.18.2 or v1.22.2: `pack create --image`
@@ -319,6 +319,17 @@ That is the v1.14.6 output, when the export helper was fixed at 8192 MiB. From v
 failure names the figure it asked for and `SMOLVM_EXPORT_HELPER_MEMORY_MIB`, and
 `exporter_memory_mib` is what the binary will ask for, 4096 or less. The recorded note's last
 sentence was never right: `pack create --image` boots its own 8192 MiB VM on every release here.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). On macOS every step: `result=artifacts_good (2
+of 2 artifacts)`, `machine_pack_carried_rootfs=ok (PACKED_STATE_PRESENT)`, and the image artifact's
+`run --ssh-agent` listed the throwaway key. The preflight said `exporter_memory_ok=no` (3661 MiB
+free, 4096 asked) and the machine pack still succeeded. On Linux nothing packed, for the host reason
+in "Platform arms": `pack create --image`'s agent VM and the default-size source both missed the 30
+s boot.
 
 ## Re-verified on v1.29.0
 

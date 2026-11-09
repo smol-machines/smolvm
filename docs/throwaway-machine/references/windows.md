@@ -3,13 +3,15 @@
 ## Contents
 
 - What was verified
+- On v1.34.0
 - On v1.22.2
 - Why the offline shape is unavailable
 - What a Windows run has to do instead
 - The reaper on Windows
 
-**Re-run on 2026-10-03 against smolvm v1.22.2** on Windows 11 Home build 10.0.26200 UBR 9457
-x86_64, in an elevated session; the section "On v1.22.2" below has that run. The rest of this page
+**Re-run on 2026-11-09 against smolvm v1.34.0** on Windows 11 Home build 10.0.26200 UBR 9711
+x86_64, in an elevated session; the section "On v1.34.0" below has that run, and "On v1.22.2" the
+one before it. The rest of this page
 is the **2026-09-11 run against v1.14.6** on build 10.0.26200.0 UBR 9445, also elevated. The host mount, the artifact-out directory and the network-off
 refusal all behaved as recorded below, and the bake still never completes. The transcripts below
 are from the earlier v1.14.2 run except where a v1.14.6 line is quoted. `scripts/*.sh` are
@@ -49,6 +51,21 @@ Error: fetching manifest docker.io/library/python:3.12-alpine: ... network is un
 Hint: networking is disabled. Add --net to enable image pulls:
   smolvm machine run --net --image python:3.12-alpine ...
 ```
+
+## On v1.34.0
+
+- **The mount, the artifact directory and the network-off refusal held.** The command above
+  printed `ws_blocked` in 5.0 s, the host's `result.txt` read `42`, and there was no `EVIL` in the
+  repo. A run without `--net` stopped at the pull with `network is unreachable` and the same hint.
+- **The bake still never completes.** With no mount, and again with a `:ro` mount, `--oci-cache`
+  stayed on `Caching image 481a6b05b23a80b2 (one-time; reused on later runs)` until the five
+  minute cap, and each left an `init-bake-481a6b05b23a80b2-<pid>` machine `running` at 8192 MiB
+  until deleted.
+- **A plain foreground `machine run` still leaves its VM running when the CLI is killed.** Its
+  `_boot-vm` child was alive 10 s later and the machine was listed as `vm-<id> running (eph)`.
+  `machine stop` and `machine delete --force` on that name both succeeded, and the `_boot-vm`
+  process was still alive when they returned, so it was ended by its process id. Ctrl-C was not
+  delivered this time.
 
 ## On v1.22.2
 

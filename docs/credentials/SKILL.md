@@ -5,7 +5,7 @@ description: Gives a workload in a smolvm machine an API key or token it can use
 
 # A credential the machine can use and never hold
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24, for everything that
+Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24, for everything that
 is decided on the host; on v1.29.0 on macOS arm64 **the substituted value also arrived at a real API**
 that echoes the headers it received, a dummy value. Done means the guest's variable is a placeholder, the value
 is nowhere in the guest, the machine's record or smolvm's database, TLS to the bound host goes
@@ -229,6 +229,14 @@ Create-time rules, both hosts, on v1.22.2: `*.example.com` and an IP address are
 with `is not reachable under the machine's network allow_hosts`. From v1.26.0 `*.example.com` is
 accepted, and an IP address is refused with `must be a lowercase DNS name, optionally` followed by
 the wildcard form.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts, bound to `httpbin.org`
+with a dummy value: `result=contained`, `query_refused=ok (403)`, and a `GET /headers` from the
+guest came back carrying the dummy value, not the placeholder.
 
 ## Re-verified on v1.29.0
 

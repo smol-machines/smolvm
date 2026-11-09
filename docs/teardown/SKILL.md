@@ -5,7 +5,7 @@ description: "Stops every smolvm machine a session started, removes smolvm's sta
 
 # Leaving nothing running and nothing behind
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64,
+Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64,
 2026-09-24. This packet exists on its own because **the obvious cleanup steps fail here**: the
 obvious assertion gives a false failure, the obvious reaper matches the wrong process or nothing
 at all, and killing a wrapper around a run does not stop its machine. Anything that starts machines
@@ -180,7 +180,7 @@ session's; delete it by name with `--force`.
 
 ## Platform arms
 
-- **macOS arm64**: the scripts were run here on v1.29.0. **Linux aarch64**: on v1.18.2, and once
+- **macOS arm64**: the scripts were run here on v1.34.0. **Linux aarch64**: on v1.18.2, and once
   on v1.22.2.
 - **Linux x86_64**: the procedure was verified on v1.14.2 on an NVIDIA A10 cloud host. The
   scripts themselves were not re-run there.
@@ -214,6 +214,20 @@ vm_process=89092 config=/tmp/u23/Library/Caches/smolvm/vms/ea8c396d10b0f0b9/boot
 $HOME/.smolvm` against the real installation beside the isolated one:
 `protected_untouched_since_2026-10-04:<dir>=ok` for each `--protected` directory, and
 `result=clean`.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). On macOS: an orphaned CLI and its VM, left by
+killing a wrapper, were found by `cleanup.sh` and killed by `--reap`; `verify-clean.sh` then
+reported `vm_dirs=FAIL` for `vms/_pack-templates`, a cache from v1.31.2 that `smolvm serve start`
+does not reclaim, and now reports it as `pack_templates=present`. `--protected` gave `ok` for the
+real installation's three directories. After `--uninstall`, `find` listed
+`Library/Caches/smolvm-image-archives` (21 MB) and the packets' own `.local/state/smolvm-skills`. On
+Linux: the orphaned VM was found and killed by `--reap`, `verify-clean.sh` then said `vm_dirs=FAIL`
+until `smolvm serve start` ran once, and then `result=clean`; `--protected` gave `ok` for the box's
+real data and cache directories, and `--uninstall` left the same two paths.
 
 ## Re-verified on v1.29.0
 
