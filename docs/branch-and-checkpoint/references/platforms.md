@@ -5,14 +5,14 @@
 | run here | every step, v1.23.0 | every step, v1.18.2, and once on v1.22.2; a Mac checkpoint restored on v1.23.0 | not run | by hand, v1.22.2 |
 | `checkpoint` file without `--branchable` | works from v1.20.0, refused before | works | worked on v1.14.2 | works |
 | `pause` without `--branchable` | works from v1.20.0, refused before | works | not run | works |
-| `checkpoint --store` | works, and needs `--branchable` | works (refused on v1.16.1) | not run | refused |
+| `checkpoint --store` | works; needs `--branchable` before v1.24.0 | works (refused on v1.16.1) | not run | refused |
 | branching | from a running source | from a running source (`frozen` on v1.16.1) | `running` on v1.14.2 | every branch needs `--freeze-source`; the source stays `frozen` |
 | restored disks | `.raw` files, copy-on-write on APFS; `_restore-checkpoints` from v1.22.0, `_restore-base` before | `qcow2` layers over `.smolcheckpoint-*.raw` | not run | not measured |
 
 ## macOS arm64
 
 macOS 27.0.1, Apple M4, v1.23.0, 2026-10-04. Every script here ran end to end. A checkpoint file
-and a pause do not need `--branchable` from v1.20.0; `--store` and `branch` still do. On v1.18.2
+and a pause do not need `--branchable` from v1.20.0, nor `--store` from v1.24.0; `branch` still does. On v1.18.2
 captures of a 1 GiB alpine machine took 1 to 5 s with a source pause of 0.027 to 0.048 s.
 
 ## Linux aarch64

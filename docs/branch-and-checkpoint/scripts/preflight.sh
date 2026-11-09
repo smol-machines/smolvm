@@ -88,12 +88,16 @@ case "$kernel" in
         else
             emit socket_path_status ok
         fi
-        # v1.20.0 lifted the flag for a checkpoint file and for pause; a stored
-        # capture, which is what these scripts take, still needs it on v1.22.2.
-        emit checkpoint_needs_branchable yes
-        if [ -n "${version:-}" ] && [ "$(printf '%s\n%s\n' "$version" 1.20.0 | sort -V | head -1)" = "1.20.0" ]; then
+        # v1.20.0 lifted the flag for a checkpoint file and for pause, and v1.24.0
+        # for a stored capture, which falls back to a synchronous save (#1584).
+        if [ -n "${version:-}" ] && [ "$(printf '%s\n%s\n' "$version" 1.24.0 | sort -V | head -1)" = "1.24.0" ]; then
+            emit checkpoint_needs_branchable no
+            note "on macOS from v1.24.0 a checkpoint, a stored capture and a pause all work without machine start --branchable; a branch still needs it, and the flag cannot be added to a running machine. The scripts here always start with it."
+        elif [ -n "${version:-}" ] && [ "$(printf '%s\n%s\n' "$version" 1.20.0 | sort -V | head -1)" = "1.20.0" ]; then
+            emit checkpoint_needs_branchable yes
             note "on macOS machine checkpoint --store refuses a machine that was not started with machine start --branchable, with deferred durable save requires file-backed guest RAM, which names neither. A checkpoint file and a pause do not need it from v1.20.0. The flag cannot be added to a running machine; the scripts here always start with it."
         else
+            emit checkpoint_needs_branchable yes
             note "on macOS machine checkpoint and machine pause refuse a machine that was not started with machine start --branchable, and the error, guest RAM has no file-backed regions, names neither. The flag cannot be added to a running machine; the scripts here always start with it."
         fi
         ;;
