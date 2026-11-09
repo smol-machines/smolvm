@@ -1,8 +1,9 @@
 //! Replace a machine's published ports, live when it runs.
 //!
 //! One implementation for every caller that changes ports: the embedded SDK
-//! runtime and the HTTP API. The caller holds its own per-machine lock and
-//! says whether the machine is running.
+//! runtime and the HTTP API. The caller holds its lifecycle lock and the
+//! cross-process published-ports lock from before reading the record until
+//! persistence or rollback finishes. It says whether the machine is running.
 
 use crate::config::VmRecord;
 use crate::data::network::{PortMapping, PortProtocol, MAX_PORT_MAPPINGS};

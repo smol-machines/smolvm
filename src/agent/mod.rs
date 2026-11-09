@@ -102,10 +102,10 @@ pub use launcher::{
     create_disk_overlays, find_lib_dir, launch_agent_vm, validate_external_interceptor,
     DiskOverlaySpec, LaunchConfig, LaunchFeatures, VmDisks,
 };
-pub(crate) use manager::cleanup_dead_vm_runtime_in_db;
+pub(crate) use manager::{allocate_live_port, cleanup_dead_vm_runtime_in_db};
 pub use manager::{
     apply_live_credential_values, apply_live_egress_policy, apply_live_published_ports,
-    cleanup_dead_vm_runtime, lock_live_egress,
+    cleanup_dead_vm_runtime, lock_live_egress, lock_published_ports,
 };
 pub use manager::{
     bind_ready_listener, branchable_now, disk_used_mb, docker_config_dir, docker_config_mount,

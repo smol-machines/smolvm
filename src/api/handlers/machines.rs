@@ -6226,15 +6226,17 @@ pub async fn set_machine_ports(
     // the state and applying the ports.
     let lifecycle = state.lifecycle_lock(&name);
     let guard = lifecycle.lock_owned().await;
-    let record = state
-        .lookup_vm(&name)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
-    let running = record.actual_state() == RecordState::Running;
     let ports: Vec<PortMapping> = req.ports.iter().map(PortMapping::from).collect();
     let db = state.db().clone();
+    let machine = name.clone();
     let saved = tokio::task::spawn_blocking(move || {
         let _guard = guard;
+        let name = machine;
+        let _ports_lock = crate::agent::lock_published_ports(&name)?;
+        let record = db
+            .get_vm(&name)?
+            .ok_or_else(|| crate::Error::vm_not_found(&name))?;
+        let running = record.actual_state() == RecordState::Running;
         crate::agent::live_ports::set_published_ports(&db, &record, running, &ports)
     })
     .await

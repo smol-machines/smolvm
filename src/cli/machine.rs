@@ -6929,6 +6929,11 @@ impl UpdateCmd {
         use smolvm::data::storage::HostMount;
 
         let db = smolvm::db::SmolvmDb::open()?;
+        let _ports_lock = if !self.port.is_empty() || !self.remove_port.is_empty() {
+            Some(smolvm::agent::lock_published_ports(&self.name)?)
+        } else {
+            None
+        };
         let record = db.get_vm(&self.name)?.ok_or_else(|| {
             smolvm::Error::config("update", format!("machine '{}' not found", self.name))
         })?;

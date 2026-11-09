@@ -641,6 +641,25 @@ fn lock_live_egress_at(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+/// Serialize publication, complete-set changes and rollback across SDK, API
+/// and CLI processes. Keep the lock outside the VM directory so deleting that
+/// directory cannot replace a held lock with a different inode.
+pub fn lock_published_ports(name: &str) -> Result<std::fs::File> {
+    let root = vm_cache_root();
+    std::fs::create_dir_all(&root)
+        .map_err(|error| Error::agent("published ports lock", error.to_string()))?;
+    let path = root.join(format!(".{}.ports-update.lock", vm_dir_hash(name)));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| Error::agent("published ports lock", error.to_string()))?;
+    super::fork::lock_file_exclusive(&file)
+        .map_err(|error| Error::agent("published ports lock", error.to_string()))?;
+    Ok(file)
+}
+
 fn live_egress_refusal(reason: String, with_rules: bool) -> String {
     if with_rules && reason.contains("expected `cidr <range>` or `host <name>`") {
         return format!(
@@ -688,6 +707,71 @@ pub fn apply_live_credential_values(
 }
 
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    let reply = send_live_request(name, socket, rendered)?;
+    match reply.trim() {
+        "ok" => Ok(()),
+        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PortAllocationError {
+    pub error: Error,
+    pub may_have_allocated: bool,
+}
+
+pub(crate) fn allocate_live_port(
+    name: &str,
+    guest: u16,
+) -> std::result::Result<u16, PortAllocationError> {
+    let reply = send_live_request(
+        name,
+        smolvm_network::PORTS_SOCKET,
+        &format!("allocate {guest}\n"),
+    )
+    .map_err(|reason| PortAllocationError {
+        error: Error::config("atomic port publication", reason),
+        may_have_allocated: true,
+    })?;
+    parse_port_allocation_reply(guest, &reply)
+}
+
+fn parse_port_allocation_reply(
+    guest: u16,
+    reply: &str,
+) -> std::result::Result<u16, PortAllocationError> {
+    if let Some(reason) = reply.trim().strip_prefix("error: ") {
+        return Err(PortAllocationError {
+            error: Error::config("atomic port publication", reason),
+            may_have_allocated: false,
+        });
+    }
+    reply
+        .trim()
+        .strip_prefix("ok ")
+        .and_then(|ports| ports.split_once(':'))
+        .and_then(|(host, returned_guest)| {
+            Some((
+                host.parse::<u16>().ok()?,
+                returned_guest.parse::<u16>().ok()?,
+            ))
+        })
+        .filter(|(host, returned_guest)| *host != 0 && *returned_guest == guest)
+        .map(|(host, _)| host)
+        .ok_or_else(|| PortAllocationError {
+            error: Error::config(
+                "atomic port publication",
+                "machine returned an invalid atomic port allocation reply; it may need a restart",
+            ),
+            may_have_allocated: true,
+        })
+}
+
+fn send_live_request(
+    name: &str,
+    socket: &str,
+    rendered: &str,
+) -> std::result::Result<String, String> {
     use std::io::{Read, Write};
     let path = vm_data_dir(name).join(socket);
     let mut stream =
@@ -705,10 +789,7 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
     stream
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
-    match reply.trim() {
-        "ok" => Ok(()),
-        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
-    }
+    Ok(reply)
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's
@@ -1294,6 +1375,10 @@ fn read_egress_telemetry_at(path: &Path) -> Option<u64> {
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("SMOLVM_TEST_VM_CACHE_ROOT") {
+        return path.into();
+    }
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))

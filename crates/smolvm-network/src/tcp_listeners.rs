@@ -152,6 +152,10 @@ impl TcpPortListeners {
         self.acceptor.mappings()
     }
 
+    pub fn publish_atomic(&self, guest: u16) -> io::Result<PortMapping> {
+        self.acceptor.publish_atomic(guest)
+    }
+
     pub fn replace(&mut self, next: &[PortMapping]) -> io::Result<()> {
         if self.acceptor.is_closed() {
             return Err(io::Error::other("the network runtime is shutting down"));
