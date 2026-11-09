@@ -5,7 +5,7 @@ description: "Drives smolvm programmatically over its local HTTP API (smolvm ser
 
 # Driving smolvm over HTTP
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a machine went through
+Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a machine went through
 its whole lifecycle over HTTP and `GET /api/v1/machines/<name>` answers `NOT_FOUND` at the end.
 The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
@@ -172,7 +172,7 @@ messages, and `branch-and-checkpoint` covers pause alongside checkpoints.
 
 ## Platform arms
 
-- **macOS arm64**: v1.29.0 over both, v1.27.3 over the Unix socket, and v1.22.2 over both.
+- **macOS arm64**: v1.34.0 and v1.29.0 over both, v1.27.3 over the Unix socket, and v1.22.2 over both.
 - **Linux aarch64**: v1.18.2 over the Unix socket, 2026-09-24, `result=lifecycle_ok` with all
   eleven checks. The single v1.22.2 run failed only at `machines_empty`, the check that then
   required an empty machine list, on `image-seed-*` helpers an interrupted run had left listed. On
@@ -209,10 +209,18 @@ and dropped, which `references/api-fields.md` records:
 ```
 POST /api/v1/machines {"name":"...","image":"alpine","network":true,"memory":1024}
 -> 422 Failed to deserialize the JSON body into the target type: memory: unknown field `memory`,
-   expected one of `name`, `cpus`, `memoryMb`, `mounts`, `ports`, `network`, ... at line 1 column 63
+   expected one of `name`, `cpus`, `memoryMb`, `mounts`, `diskVolumes`, `ports`, `network`, ... at line 1 column 63
 ```
 
 A 404 returns `{"error":"machine 'nope-does-not-exist' not found","code":"NOT_FOUND"}`.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts, over the Unix socket
+and over TCP: `result=lifecycle_ok`; `serve openapi` wrote 45 paths. The 422 for `memory` now lists
+`diskVolumes` among the fields it expected.
 
 ## Re-verified on v1.29.0
 

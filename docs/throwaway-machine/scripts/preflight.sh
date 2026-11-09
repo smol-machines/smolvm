@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERIFIED_VERSION="1.23.0"
+VERIFIED_VERSION="1.34.0"
 
 # v1.20.2 fixed both issues this packet was built around (#1467): a cached run
 # with a mount boots on macOS (#1192), and a cached run's VM ends with its CLI

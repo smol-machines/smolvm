@@ -5,7 +5,7 @@ description: Saves a running smolvm machine as checkpoints on a schedule, keeps 
 
 # Checkpoints, restores, pauses and branches
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a restore
+Verified on **smolvm v1.34.0** on macOS arm64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a restore
 brings back both the disk and the memory you left, the schedule keeps exactly the checkpoints you
 asked for and no fewer, and every child of a branch starts from a state you still hold as a
 checkpoint after the children are gone.
@@ -266,6 +266,18 @@ Linux, across a 10 s pause. Separately, on macOS a restored machine paused while
 full failed its first resume with `extract paused checkpoint: failed to unpack ...`, and the same
 `machine resume` succeeded once space was freed: counter 8 before the pause, 14 after, still
 counting.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts: `result=schedule_ok`,
+three generations listed, restores of `~2` and the newest holding the source's RAM token, a pause
+and resume with the counter at 32 then 33, and both children of a batch branch holding one token.
+Captures now take under a second, so `checkpoint.sh` run right after another hit the one-second name
+collision 4 times in 6 (`result=FAILED ... already exists`); it now waits for the next second. On
+macOS a machine started without `--branchable` took a `--store` capture and restored with its RAM
+token on v1.24.0 and v1.34.0, where v1.23.7 refused it.
 
 ## Re-verified on v1.29.0
 
