@@ -30,7 +30,8 @@ objects without removing the store.
 On macOS the VM cache also holds `_restore-base`, a clone of the last restored checkpoint with its
 memory, which stays until removed by hand or by the uninstaller. From v1.22.0 restores are cached in
 `_restore-checkpoints` instead, the three most recent and up to 16 GiB. Beside `vms/` the cache also
-keeps `agent-rootfs-tars/`; the uninstaller removes all of them with the cache directory.
+keeps `agent-rootfs-tars/`, and from v1.31.2 `_pack-templates`, one unpacked template per pack that
+machines created from it clone; the uninstaller removes all of them with the cache directory.
 
 The ones people miss are `smolvm-libs`, which appears only once a packed `.smolmachine` stub has
 run, and the last two rows, which the uninstaller deliberately leaves.
