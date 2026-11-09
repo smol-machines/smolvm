@@ -1,5 +1,12 @@
 # Teardown on Windows
 
+**Re-run on 2026-11-09 against smolvm v1.34.0** on Windows 11 Home build 10.0.26200 UBR 9711
+x86_64, as the cleanup after runs of every packet's Windows arm, packs and two abandoned bakes
+included. The sequence below left the host as listed before those runs: the same 72 entries in
+`%LOCALAPPDATA%`, 727 firewall rules before and after with no filter naming smolvm, no smolvm
+process, and the same `PATH` hashes. It removed `%LOCALAPPDATA%\smolvm` (81.5 MB),
+`%LOCALAPPDATA%\smolvm-pack` (2460 MB apparent) and `%LOCALAPPDATA%\smolvm-libs` (94.8 MB).
+
 **Run on 2026-10-03 against smolvm v1.22.2** on Windows 11 Home build 10.0.26200 UBR 9457 x86_64,
 as the cleanup after runs that had created machines, packs and four abandoned `--oci-cache` bakes.
 The sequence below removed everything: `%LOCALAPPDATA%\smolvm` held 291 MB at removal, no smolvm
@@ -29,6 +36,13 @@ working directory leaves 30 GB behind with nothing pointing at it.
 `%LOCALAPPDATA%\smolvm-pack` separately reached 92 GB apparent after three `pack run`s of one
 alpine pack.
 
+**A fourth directory, `%LOCALAPPDATA%\smolvm-image-archives`**, holds images fetched on the host
+for a machine with no network, and local `--image` archives, from v1.23.0: it is the cache
+directory's `smolvm-image-archives` that the macOS and Linux rows of `references/locations.md` name,
+and on Windows the cache directory is `%LOCALAPPDATA%` (`src/data/image_source.rs:500-504` at
+v1.34.0). The tested host had one from an earlier session, 29.8 MB; the runs above did not add to
+it.
+
 ## The sequence
 
 On Windows there is one state tree per user and no way to scope by `HOME`, so this sequence
@@ -49,13 +63,14 @@ Get-Process | Where-Object { $_.Path -eq (Resolve-Path $exe).Path } | Stop-Proce
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\smolvm"
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\smolvm-pack"   # exists once packs have run
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\smolvm-libs"   # seen on v1.16.0 once a packed stub had run
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\smolvm-image-archives"   # images fetched on the host, from v1.23.0
 
 # 4. remove your own working directory
 Remove-Item -Recurse -Force <your scratch dir>
 ```
 
-The v1.22.2 run matched step 2 on any path containing `smolvm`; the exact-path form above is
-narrowed from it and has not been run on Windows.
+The v1.22.2 run matched step 2 on any path containing `smolvm`. The exact-path form above ran on
+v1.34.0 with nothing left to stop, so it has not yet been seen to stop a process.
 
 **A killed `--oci-cache` bake leaves a registered machine** named `init-bake-<hash>-<pid>`. It
 appears in `machine list` and has to be deleted like any other machine; the next bake removes the

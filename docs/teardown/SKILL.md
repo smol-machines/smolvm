@@ -151,7 +151,9 @@ memory included, in `vms/_restore-base`, after every machine and checkpoint is g
 `verify-clean.sh` reports it as `restore_base=present` rather than as a leak; remove it with
 `rm -rf` once no restore is running.
 From v1.22.0 it is `vms/_restore-checkpoints`, reported as `restore_cache=present`;
-`references/traps.md` has its size and how to turn it off.
+`references/traps.md` has its size and how to turn it off. From v1.31.2 macOS also keeps
+`vms/_pack-templates`, one unpacked template per pack that machines created from it clone, reported
+as `pack_templates=present`; on v1.34.0 the README's pack steps left 385 MB there.
 
 **A machine named `image-seed-<hash>-<pid>` or `init-bake-<hash>-<pid>` is smolvm's own helper.**
 From v1.22.0 the first run of a registry image builds a shared seed of it in a helper machine, and
@@ -182,8 +184,8 @@ session's; delete it by name with `--force`.
   on v1.22.2.
 - **Linux x86_64**: the procedure was verified on v1.14.2 on an NVIDIA A10 cloud host. The
   scripts themselves were not re-run there.
-- **Windows x86_64**: `references/windows.md`, **run on 2026-10-03 against v1.22.2** on
-  Windows 11 Home build 10.0.26200 UBR 9457 as the cleanup after runs that had created
+- **Windows x86_64**: `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on
+  Windows 11 Home build 10.0.26200 UBR 9711 as the cleanup after runs that had created
   machines, packs and bakes, after which the profile matched its listing from before them. The
   scripts are bash and do not run there. State cannot be relocated there, and one set of runs left
   30 GB in `%LOCALAPPDATA%\smolvm`.

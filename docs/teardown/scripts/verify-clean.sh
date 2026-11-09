@@ -104,12 +104,13 @@ list_vm_processes() {
 
 # _shared is the Linux shared pack store, _restore-base the clone of the last
 # restored checkpoint, _restore-checkpoints the cache of recent restores that
-# replaced it in v1.22.0, and checkpoint-unpack their scratch area, none of them a
+# replaced it in v1.22.0, checkpoint-unpack their scratch area, and _pack-templates
+# the macOS unpack of each pack that new machines clone (v1.31.2), none of them a
 # machine. Excluding them is what makes this a leak check rather than a false
 # alarm; the two restore caches are reported, since they hold guest memory and disks.
 # An empty directory holds no state and is reported apart from the check.
 if [ -d "$cache_dir/vms" ]; then
-    left="$(find "$cache_dir/vms" -mindepth 1 -maxdepth 1 -type d ! -empty ! -name _shared ! -name _restore-base ! -name _restore-checkpoints ! -name checkpoint-unpack 2>/dev/null | wc -l | tr -d ' ')"
+    left="$(find "$cache_dir/vms" -mindepth 1 -maxdepth 1 -type d ! -empty ! -name _shared ! -name _restore-base ! -name _restore-checkpoints ! -name checkpoint-unpack ! -name _pack-templates 2>/dev/null | wc -l | tr -d ' ')"
     empty="$(find "$cache_dir/vms" -mindepth 1 -maxdepth 1 -type d -empty ! -name checkpoint-unpack 2>/dev/null | wc -l | tr -d ' ')"
     [ "$empty" != 0 ] && printf 'empty_vm_dirs=%s (no state in them; not counted)\n' "$empty"
 else
@@ -117,6 +118,9 @@ else
 fi
 if [ -d "$cache_dir/vms/_restore-checkpoints" ]; then
     printf 'restore_cache=present %s (recently restored checkpoints'"'"' memory and disks; machine create --from --restore-cache-entries 0 turns it off)\n' "$(du -sh "$cache_dir/vms/_restore-checkpoints" 2>/dev/null | cut -f1)"
+fi
+if [ -d "$cache_dir/vms/_pack-templates" ]; then
+    printf 'pack_templates=present %s (one unpacked template per pack, cloned for each machine created from it; the uninstaller removes it)\n' "$(du -sh "$cache_dir/vms/_pack-templates" 2>/dev/null | cut -f1)"
 fi
 if [ -d "$cache_dir/vms/_restore-base" ]; then
     printf 'restore_base=present %s (the last restored checkpoint'"'"'s memory and disks; rm -rf it once no restore is running)\n' "$(du -sh "$cache_dir/vms/_restore-base" 2>/dev/null | cut -f1)"
