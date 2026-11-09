@@ -1639,11 +1639,58 @@ impl EmbeddedRuntime {
     /// A host port already taken fails the call and changes nothing.
     pub fn set_ports(&self, name: &str, ports: &[crate::data::network::PortMapping]) -> Result<()> {
         self.with_name_lock(name, || {
+            let _ports_lock = crate::agent::lock_published_ports(name)?;
             let record = control::get_record(&self.db, name)?;
             let running =
                 crate::agent::state_probe::resolve_state(name, &record) == RecordState::Running;
             crate::agent::live_ports::set_published_ports(&self.db, &record, running, ports)
                 .map(|_| ())
+        })
+    }
+
+    /// Publish one TCP guest port on an OS-allocated, continuously owned loopback listener.
+    pub fn publish_atomic(&self, name: &str, guest: u16) -> Result<u16> {
+        if guest == 0 {
+            return Err(Error::config(
+                "atomic port publication",
+                "guest port must be positive",
+            ));
+        }
+        self.with_name_lock(name, || {
+            let _ports_lock = crate::agent::lock_published_ports(name)?;
+            let record = control::get_record(&self.db, name)?;
+            if crate::agent::state_probe::resolve_state(name, &record) != RecordState::Running {
+                return Err(Error::config(
+                    "atomic port publication",
+                    "machine must be running",
+                ));
+            }
+            if record.ports.len() + record.udp_ports.len()
+                >= crate::data::network::MAX_PORT_MAPPINGS
+            {
+                return Err(Error::config(
+                    "atomic port publication",
+                    "too many published ports",
+                ));
+            }
+            let host = match crate::agent::allocate_live_port(name, guest) {
+                Ok(host) => host,
+                Err(failure) => {
+                    if failure.may_have_allocated {
+                        // The engine may have bound before its reply was lost.
+                        let _ = crate::agent::apply_live_published_ports(name, &record.ports);
+                    }
+                    return Err(failure.error);
+                }
+            };
+            match self.db.update_vm(name, |r| r.ports.push((host, guest))) {
+                Ok(Some(_)) => Ok(host),
+                result => {
+                    let _ = crate::agent::apply_live_published_ports(name, &record.ports);
+                    result?;
+                    Err(Error::vm_not_found(name))
+                }
+            }
         })
     }
 
@@ -2396,3 +2443,7 @@ mod tests {
         assert!(db.get_vm("delete-frozen").unwrap().is_none());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "atomic_port_tests.rs"]
+mod atomic_port_tests;
