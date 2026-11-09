@@ -229,8 +229,10 @@ Full detail in `references/traps.md`. The ones that cost the most:
 and **Linux aarch64** on v1.18.2 and once on v1.22.2, with the one difference that Linux needs no
 `--branchable`. On v1.16.1 Linux aarch64 refused `--store` and froze a branch source; from v1.18.2
 it does neither. **Linux x86_64**
-was not re-run. **Windows** on v1.22.2 checkpoints to a file, pauses and branches with
-`--freeze-source` on every branch, and refuses `--store`, so `checkpoint.sh` cannot run there.
+was not re-run. **Windows** on v1.34.0 checkpoints to a file, pauses and resumes, and restores a
+machine started with `--branchable`; without the flag a checkpoint or a pause fails with `os error
+1784` from v1.28.1, where v1.22.2 to v1.28.0 took them. Every branch needs `--freeze-source` and
+`--store` is refused, so `checkpoint.sh` cannot run there.
 From v1.23.0 a checkpoint from an arm64 Mac restores on arm64 Linux, run once from this Mac to Lima.
 
 ## Eval prompts, and what they produced
