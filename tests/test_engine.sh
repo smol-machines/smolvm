@@ -158,6 +158,32 @@ test_ports_published_and_random() {
     docker rm -f "$name" >/dev/null
 }
 
+# The host's own address on its LAN, to tell a loopback-only port from one
+# on every interface.
+host_lan_ip() {
+    python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("192.0.2.1", 9)); print(s.getsockname()[0])'
+}
+
+test_ports_listen_where_asked() {
+    local name="$PREFIX-listen" lan ok=1
+    lan=$(host_lan_ip)
+    run -d --name "$name" -p 127.0.0.1:18090:80 -p 18091:80 nginx:alpine >/dev/null || return 1
+    for _ in $(seq 1 50); do
+        curl -sf -m 2 http://127.0.0.1:18090/ | has nginx && { ok=0; break; }
+        sleep 0.2
+    done
+    [[ $ok -eq 0 ]] || return 1
+    # Asked for loopback: not reachable on the LAN address.
+    curl -sf -m 2 "http://$lan:18090/" >/dev/null 2>&1 && return 1
+    # No address: every interface, IPv4 and IPv6, as with Docker.
+    curl -sf -m 2 "http://$lan:18091/" | has nginx || return 1
+    curl -gsf -m 2 "http://[::1]:18091/" | has nginx || return 1
+    docker port "$name" 80 | has '127.0.0.1:18090' || return 1
+    docker port "$name" 80 | has '0.0.0.0:18091' || return 1
+    docker port "$name" 80 | has '\[::\]:18091' || return 1
+    docker rm -f "$name" >/dev/null
+}
+
 test_env_workdir_user() {
     run --rm -e FOO=bar -w /tmp -u nobody alpine sh -c 'echo "$FOO $(pwd) $(id -u)"' | has -x 'bar /tmp 65534'
 }
@@ -425,6 +451,7 @@ run_test "detached logs, exec, top, stats" test_detached_logs_exec_top_stats || 
 run_test "stop, start, restart, pause, rename, kill" test_lifecycle_stop_start_restart_pause || true
 run_test "wait returns the exit code" test_wait_returns_the_exit_code || true
 run_test "published and random ports" test_ports_published_and_random || true
+run_test "ports listen where asked" test_ports_listen_where_asked || true
 run_test "env, workdir, user" test_env_workdir_user || true
 run_test "restart policy on-failure" test_restart_policy_on_failure || true
 run_test "health check goes healthy" test_healthcheck_goes_healthy || true

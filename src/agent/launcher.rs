@@ -3280,11 +3280,21 @@ pub(crate) fn virtio_port_mapping(mapping: &PortMapping) -> VirtioPortMapping {
         crate::data::network::PortProtocol::Udp => smolvm_network::PortProtocol::Udp,
     };
     VirtioPortMapping::with_protocol(mapping.host, mapping.guest, protocol)
+        .listening_on(mapping.listen)
 }
 
 /// libkrun's TSI port map as `HOST:GUEST` strings. TSI publishes only TCP, so a
 /// UDP mapping refuses the launch instead of being dropped without a word.
 pub(crate) fn tsi_port_map(mappings: &[PortMapping]) -> Result<Vec<CString>> {
+    if let Some(named) = mappings.iter().find(|m| m.listen.is_some()) {
+        return Err(Error::config(
+            "publish port",
+            format!(
+                "port {} names a listen address, which needs the virtio-net network backend",
+                named.label()
+            ),
+        ));
+    }
     if let Some(udp) = mappings
         .iter()
         .find(|m| m.protocol == crate::data::network::PortProtocol::Udp)

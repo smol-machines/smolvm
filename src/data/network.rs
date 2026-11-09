@@ -325,6 +325,23 @@ pub struct PortMapping {
     /// Transport forwarded; omitted for TCP.
     #[serde(default, skip_serializing_if = "PortProtocol::is_tcp")]
     pub protocol: PortProtocol,
+    /// The host address the port listens on; omitted for the default
+    /// publish address (loopback unless `SMOLVM_PUBLISH_ADDR` widens it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<IpAddr>,
+}
+
+/// The host address one published port listens on, as a machine record
+/// keeps it beside its `(host, guest)` port pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ListenAddress {
+    /// The host port.
+    pub host: u16,
+    /// Its transport.
+    #[serde(default, skip_serializing_if = "PortProtocol::is_tcp")]
+    pub protocol: PortProtocol,
+    /// The address it listens on.
+    pub address: IpAddr,
 }
 
 /// Maximum concrete mappings permitted for one machine.
@@ -517,7 +534,28 @@ impl PortMapping {
             host,
             guest,
             protocol,
+            listen: None,
         }
+    }
+
+    /// This mapping, listening on `listen` instead of the default address.
+    pub fn listening_on(mut self, listen: Option<IpAddr>) -> Self {
+        self.listen = listen;
+        self
+    }
+
+    /// The listen addresses of `ports` that name one, for a machine record.
+    pub fn listen_addresses(ports: &[Self]) -> Vec<ListenAddress> {
+        ports
+            .iter()
+            .filter_map(|p| {
+                p.listen.map(|address| ListenAddress {
+                    host: p.host,
+                    protocol: p.protocol,
+                    address,
+                })
+            })
+            .collect()
     }
 
     /// Create a TCP port mapping where host and guest ports are the same.

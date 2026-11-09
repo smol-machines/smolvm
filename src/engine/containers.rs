@@ -75,6 +75,23 @@ pub(crate) struct PublishedPort {
     pub host_port: u16,
 }
 
+impl PublishedPort {
+    /// The addresses the port listens on, as Docker lists them: the IPv4
+    /// wildcard also stands for the IPv6 one.
+    pub(crate) fn listen_ips(&self) -> Vec<&str> {
+        if self.host_ip == "0.0.0.0" {
+            vec!["0.0.0.0", "::"]
+        } else {
+            vec![self.host_ip.as_str()]
+        }
+    }
+
+    /// The address the machine's port listens on.
+    pub(crate) fn listen(&self) -> Option<std::net::IpAddr> {
+        self.host_ip.parse().ok()
+    }
+}
+
 /// A mount, resolved to what the machine shares.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MountRecord {
@@ -372,6 +389,7 @@ pub(crate) async fn create(
                         crate::data::network::PortProtocol::Tcp
                     },
                 )
+                .listening_on(p.listen())
             })
             .collect(),
         cpus: cpus_of(&host_config),
@@ -934,12 +952,27 @@ fn resolve_ports(
             bindings
         };
         for b in bindings {
+            // No address means every interface, as with Docker.
+            let host_ip: std::net::IpAddr = match b
+                .host_ip
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+            {
+                "" => std::net::Ipv4Addr::UNSPECIFIED.into(),
+                ip => ip.parse().map_err(|_| {
+                    ApiError::bad_request(format!(
+                        "invalid host IP address {:?} for port {key}",
+                        b.host_ip
+                    ))
+                })?,
+            };
             let used = |port: u16| {
                 taken.contains(&(port, proto.clone()))
                     || out.iter().any(|p| p.host_port == port && p.proto == proto)
             };
             let host_port = match b.host_port.trim() {
-                "" | "0" => free_port(&proto, &used)?,
+                "" | "0" => free_port(&proto, host_ip, &used)?,
                 range if range.contains('-') => {
                     let (lo, hi) = range.split_once('-').unwrap();
                     let lo: u16 = lo.parse().map_err(|_| {
@@ -949,7 +982,7 @@ fn resolve_ports(
                         ApiError::bad_request(format!("invalid port range {range}"))
                     })?;
                     (lo..=hi)
-                        .find(|p| !used(*p) && port_free(&proto, *p))
+                        .find(|p| !used(*p) && port_free(&proto, host_ip, *p))
                         .ok_or_else(|| {
                             ApiError::internal(format!("no free host port in {range}"))
                         })?
@@ -960,17 +993,14 @@ fn resolve_ports(
             };
             if used(host_port) {
                 return Err(ApiError::internal(format!(
-                    "Bind for 0.0.0.0:{host_port} failed: port is already allocated"
+                    "Bind for {}:{host_port} failed: port is already allocated",
+                    show_ip(host_ip)
                 )));
             }
             out.push(PublishedPort {
                 container_port,
                 proto: proto.clone(),
-                host_ip: if b.host_ip.is_empty() {
-                    "127.0.0.1".into()
-                } else {
-                    b.host_ip.clone()
-                },
+                host_ip: host_ip.to_string(),
                 host_port,
             });
         }
@@ -978,22 +1008,30 @@ fn resolve_ports(
     Ok(out)
 }
 
-fn port_free(proto: &str, port: u16) -> bool {
-    if proto == "udp" {
-        std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
-    } else {
-        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+/// An address as Docker prints it beside a port: IPv6 in brackets.
+fn show_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        v4 => v4.to_string(),
     }
 }
 
-fn free_port(proto: &str, used: &dyn Fn(u16) -> bool) -> ApiResult<u16> {
+fn port_free(proto: &str, ip: std::net::IpAddr, port: u16) -> bool {
+    if proto == "udp" {
+        std::net::UdpSocket::bind((ip, port)).is_ok()
+    } else {
+        std::net::TcpListener::bind((ip, port)).is_ok()
+    }
+}
+
+fn free_port(proto: &str, ip: std::net::IpAddr, used: &dyn Fn(u16) -> bool) -> ApiResult<u16> {
     for _ in 0..64 {
         let port = if proto == "udp" {
-            std::net::UdpSocket::bind(("127.0.0.1", 0))
+            std::net::UdpSocket::bind((ip, 0))
                 .and_then(|s| s.local_addr())
                 .map(|a| a.port())
         } else {
-            std::net::TcpListener::bind(("127.0.0.1", 0))
+            std::net::TcpListener::bind((ip, 0))
                 .and_then(|s| s.local_addr())
                 .map(|a| a.port())
         }
@@ -2063,9 +2101,11 @@ fn ports_list(r: &ContainerRecord, running: bool) -> Vec<serde_json::Value> {
             out.push(serde_json::json!({"PrivatePort": port, "Type": proto}));
         } else {
             for p in published {
-                out.push(serde_json::json!({
-                    "IP": p.host_ip, "PrivatePort": port, "PublicPort": p.host_port, "Type": proto,
-                }));
+                for ip in p.listen_ips() {
+                    out.push(serde_json::json!({
+                        "IP": ip, "PrivatePort": port, "PublicPort": p.host_port, "Type": proto,
+                    }));
+                }
             }
         }
     }

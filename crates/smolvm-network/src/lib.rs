@@ -125,12 +125,15 @@ pub enum PortProtocol {
 /// into the main `smolvm` crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortMapping {
-    /// Port bound on the host loopback interface.
+    /// Port bound on the host.
     pub host: u16,
     /// Port exposed inside the guest.
     pub guest: u16,
     /// Transport forwarded between them.
     pub protocol: PortProtocol,
+    /// The host address the port listens on; `None` is the default publish
+    /// address (see [`publish_bind`]).
+    pub listen: Option<IpAddr>,
 }
 
 impl PortMapping {
@@ -145,7 +148,14 @@ impl PortMapping {
             host,
             guest,
             protocol,
+            listen: None,
         }
+    }
+
+    /// This mapping, listening on `listen` instead of the default address.
+    pub const fn listening_on(mut self, listen: Option<IpAddr>) -> Self {
+        self.listen = listen;
+        self
     }
 }
 

@@ -1194,10 +1194,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 .ports
                 .iter()
                 .map(|port| PortMapping::new(port.host, port.guest))
-                .chain(captured_net.udp_ports.iter().map(|port| PortMapping {
-                    host: port.host,
-                    guest: port.guest,
-                    protocol: crate::data::network::PortProtocol::Udp,
+                .chain(captured_net.udp_ports.iter().map(|port| {
+                    PortMapping::with_protocol(
+                        port.host,
+                        port.guest,
+                        crate::data::network::PortProtocol::Udp,
+                    )
                 }))
                 .collect();
             let ports = if ports.is_empty() {
@@ -1526,6 +1528,7 @@ impl ResolvedSpec {
         let is_restore = self.restored.is_some();
         let recorded_ownership_mounts = mounts.iter().any(|m| m.recorded_ownership);
         let (mounts, staged_mounts) = HostMount::split_storage_tuples(&mounts);
+        let listen_addresses = PortMapping::listen_addresses(&ports);
         let (ports, udp_ports) = PortMapping::split_tuples(&ports);
         let credential_placeholders = match credentials.as_ref() {
             // A restored workload already holds its placeholders.
@@ -1559,6 +1562,7 @@ impl ResolvedSpec {
             staged_mounts_detached_from: None,
             ports,
             udp_ports,
+            listen_addresses,
             published_sockets,
             network: net,
             gpu: gpu.then_some(true),

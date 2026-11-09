@@ -790,8 +790,10 @@ pub(crate) fn settings_view(
                 .ports
                 .iter()
                 .filter(|p| p.container_port.to_string() == port && p.proto == proto)
-                .map(|p| {
-                    serde_json::json!({"HostIp": p.host_ip, "HostPort": p.host_port.to_string()})
+                .flat_map(|p| {
+                    p.listen_ips().into_iter().map(
+                        |ip| serde_json::json!({"HostIp": ip, "HostPort": p.host_port.to_string()}),
+                    )
                 })
                 .collect();
             ports.insert(

@@ -111,6 +111,7 @@ fn key(vm: &VmRecord) -> Option<String> {
 fn adjust(clone: &mut VmRecord, own: &VmRecord) {
     clone.ports = own.ports.clone();
     clone.udp_ports = own.udp_ports.clone();
+    clone.listen_addresses = own.listen_addresses.clone();
     clone.allowed_cidrs = own.allowed_cidrs.clone();
     clone.egress_rules = own.egress_rules.clone();
     clone.dns = own.dns;

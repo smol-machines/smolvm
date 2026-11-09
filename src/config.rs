@@ -528,6 +528,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub udp_ports: Vec<(u16, u16)>,
 
+    /// Host addresses published ports listen on, for the ports that name
+    /// one; the others listen on the default publish address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen_addresses: Vec<crate::data::network::ListenAddress>,
+
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     #[serde(default)]
     pub published_sockets: Vec<PublishedSocketConfig>,
@@ -990,6 +995,7 @@ impl VmRecord {
             staged_mounts_detached_from: None,
             ports,
             udp_ports: Vec::new(),
+            listen_addresses: Vec::new(),
             published_sockets: Vec::new(),
             network,
             gpu: None,
@@ -1096,6 +1102,7 @@ impl VmRecord {
             staged_mounts_detached_from: None,
             ports,
             udp_ports: Vec::new(),
+            listen_addresses: Vec::new(),
             published_sockets: Vec::new(),
             network,
             gpu: None,
@@ -1238,14 +1245,19 @@ impl VmRecord {
     /// Convert stored ports to PortMapping format, TCP then UDP.
     pub fn port_mappings(&self) -> Vec<crate::data::network::PortMapping> {
         use crate::data::network::{PortMapping, PortProtocol};
-        let tcp = self
-            .ports
-            .iter()
-            .map(|(host, guest)| PortMapping::new(*host, *guest));
-        let udp = self
-            .udp_ports
-            .iter()
-            .map(|(host, guest)| PortMapping::with_protocol(*host, *guest, PortProtocol::Udp));
+        let listen = |host: u16, protocol: PortProtocol| {
+            self.listen_addresses
+                .iter()
+                .find(|l| l.host == host && l.protocol == protocol)
+                .map(|l| l.address)
+        };
+        let tcp = self.ports.iter().map(|(host, guest)| {
+            PortMapping::new(*host, *guest).listening_on(listen(*host, PortProtocol::Tcp))
+        });
+        let udp = self.udp_ports.iter().map(|(host, guest)| {
+            PortMapping::with_protocol(*host, *guest, PortProtocol::Udp)
+                .listening_on(listen(*host, PortProtocol::Udp))
+        });
         tcp.chain(udp).collect()
     }
 
@@ -1254,6 +1266,7 @@ impl VmRecord {
         let (tcp, udp) = crate::data::network::PortMapping::split_tuples(mappings);
         self.ports = tcp;
         self.udp_ports = udp;
+        self.listen_addresses = crate::data::network::PortMapping::listen_addresses(mappings);
     }
 
     /// Whether this machine's registry image must be fetched on the HOST before

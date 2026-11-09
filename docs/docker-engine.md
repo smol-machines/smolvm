@@ -68,10 +68,10 @@ including credential helpers, or the ones a client sends (`X-Registry-Auth`). A
 
 ## Ports
 
-`-p HOST:CONTAINER`, `-p CONTAINER` (a random host port), ranges, `/udp` and `-P` work. Published
-ports listen on the host's loopback addresses, `127.0.0.1` and `::1`, whatever address the client
-gives, as every smolvm machine's ports do; `SMOLVM_PUBLISH_ADDR=0.0.0.0` in the engine's
-environment makes them listen on every interface.
+`-p HOST:CONTAINER`, `-p CONTAINER` (a random host port), ranges, `/udp` and `-P` work, and each
+port listens where the client asks, as with Docker: `-p 127.0.0.1:8080:80` on loopback only,
+`-p 192.168.1.5:8080:80` on that address, `-p [::1]:8080:80` on IPv6 loopback, and a port given no
+address on every interface, IPv4 and IPv6. `docker port` lists those addresses.
 
 ## Networks
 
@@ -149,6 +149,5 @@ What the clients send, for whoever adds builds:
 
 - IPv6 networks, other network drivers than `bridge`, and `--network container:<name>`.
 - `docker save`, `docker load`, `docker push` and `docker commit`.
-- A listening address per published port (`-p 0.0.0.0:8080:80`).
 - A volume for each `VOLUME` an image declares: that path stays in the container's own filesystem.
 - Changing an internal network's egress after a container on it was created.
