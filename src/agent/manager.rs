@@ -1670,7 +1670,13 @@ impl AgentManager {
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("smolvm")
         };
-        std::fs::create_dir_all(&smolvm_runtime)?;
+        // A named machine's directory is made by `ensure_vm_dir` when it is
+        // launched. Observing one (status, exec, stop) must create nothing,
+        // or a name that was never created leaves an empty `vms/<hash>/`
+        // behind. Only the shared runtime dir of ephemeral runs is made here.
+        if name.is_none() {
+            std::fs::create_dir_all(&smolvm_runtime)?;
+        }
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
         let pid_file = smolvm_runtime.join("agent.pid");
@@ -5313,6 +5319,40 @@ mod tests {
         ensure_vm_dir_at(&dir, "real").unwrap();
         let err = ensure_vm_dir_at(&dir, "impostor").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    /// `machine status`, `exec` and `stop` open a machine to observe it. On a
+    /// name that was never created that must leave no `vms/<hash>/` behind;
+    /// only a launch makes the machine's directory.
+    #[test]
+    fn observing_a_machine_that_was_never_created_leaves_no_data_dir() {
+        let name = format!(
+            "never-created-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = vm_data_dir(&name);
+        assert!(!dir.exists(), "fresh name already has {}", dir.display());
+        // Whatever a failing run leaves behind is removed, so the host is not
+        // littered by the very bug under test.
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(dir.clone());
+
+        let manager = AgentManager::for_vm(&name).unwrap();
+        assert_eq!(manager.name(), Some(name.as_str()));
+        assert!(
+            !dir.exists(),
+            "observing a machine that was never created made {}",
+            dir.display()
+        );
     }
 
     #[test]
