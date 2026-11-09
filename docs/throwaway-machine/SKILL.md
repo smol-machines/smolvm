@@ -12,13 +12,12 @@ the repo is unchanged, the workload could not reach the network, and nothing is 
 The Linux runs used the scripts of their date; this version's preflight, run and cleanup scripts
 ran on Linux aarch64 on v1.22.2 on 2026-10-03.
 
-**On macOS from v1.24.0 the offline route does not run**
-([#1819](https://github.com/smol-machines/smolvm/issues/1819)). Every `--oci-cache` run, the bake's own
-included, fails with `agent did not become ready within 30 seconds`: measured on v1.24.0, v1.24.1,
-v1.25.0, v1.25.1, v1.27.3, v1.28.1 and v1.29.0, while v1.23.3 and v1.23.7 boot the same command on
-the same host. The preflight says `offline_shape=unavailable` there and `bake.sh` says
-`result=FAILED`. For a run with no network, use the persistent machine with no network in
-`README.md`, which boots the image with no bake; the network-on route works.
+**On macOS from v1.24.0 to v1.29.0 the offline route does not run**
+([#1819](https://github.com/smol-machines/smolvm/issues/1819), fixed in v1.29.1). Every `--oci-cache`
+run, the bake's own included, fails with `agent did not become ready within 30 seconds`: measured on
+v1.24.0, v1.24.1, v1.25.0, v1.25.1, v1.27.3, v1.28.1 and v1.29.0. On those releases the preflight
+says `offline_shape=unavailable` and `bake.sh` says `result=FAILED`; upgrade, or use the persistent
+machine with no network in `README.md`, which boots the image with no bake.
 
 **Ctrl-C on `run.sh` ends the run from v1.20.2**: the script forwards an interrupt or a `SIGTERM`
 to the CLI, which ends its VM. Before v1.20.2 the cancel is `scripts/cleanup.sh --cancel`, as
@@ -270,8 +269,8 @@ on v1.22.2 and v1.23.0 on macOS the same cancel printed `cancelled=<pid> config=
 
 **3. "Can I run untrusted code on this host?"**
 
-On macOS arm64 on v1.23.0 the preflight says `offline_shape=available` and `result=ready`; from
-v1.24.0 it says `offline_shape=unavailable` and `result=blocked`, as above. Before
+On macOS arm64 on v1.23.0 and v1.34.0 the preflight says `offline_shape=available` and
+`result=ready`; from v1.24.0 to v1.29.0 it says `offline_shape=unavailable` and `result=blocked`. Before
 v1.20.2 it says `offline_shape=unavailable`, `offline_shape_blocker=smol-machines/smolvm#1192` and
 `result=blocked`, and `bake.sh` refuses with `result=unsupported_on_macos` rather than baking
 something unusable.

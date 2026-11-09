@@ -18,6 +18,11 @@ VERIFIED_VERSION="1.23.0"
 # with a mount boots on macOS (#1192), and a cached run's VM ends with its CLI
 # (#1193). Older releases still have both.
 FIXED_IN="1.20.2"
+
+# From v1.24.0 to v1.29.0 no --oci-cache run boots on macOS (#1819); v1.29.1
+# boots cached runs in a fresh process (#1821).
+REGRESSED_IN="1.24.0"
+REGRESSION_FIXED_IN="1.29.1"
 at_least() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
 
 # x86_64 guests through v1.22.2 have eleven IRQs (libkrun IRQ_BASE 5 to
@@ -87,12 +92,13 @@ case "$kernel" in
         fi
         # The offline shape is bake with --oci-cache, then run with mounts and
         # no network. Before v1.20.2 that combination never boots on macOS, and
-        # from v1.24.0 no --oci-cache run boots there (measured through v1.29.0).
-        if [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "1.24.0"; then
+        # from v1.24.0 to v1.29.0 no --oci-cache run boots there.
+        if [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "$REGRESSED_IN" \
+            && ! at_least "$version" "$REGRESSION_FIXED_IN"; then
             emit offline_shape unavailable
-            emit offline_shape_blocker "an --oci-cache run does not boot on macOS from v1.24.0"
+            emit offline_shape_blocker "smol-machines/smolvm#1819, fixed in v$REGRESSION_FIXED_IN"
             blocked=1
-            note "from v1.24.0 to at least v1.29.0, on macOS every --oci-cache run, the bake's own included, fails with 'agent did not become ready within 30 seconds', so the offline shape cannot run here. A persistent machine with no network boots the image with no bake (README.md, \"The network is off unless you ask for it\")."
+            note "from v1.24.0 to v1.29.0, on macOS every --oci-cache run, the bake's own included, fails with 'agent did not become ready within 30 seconds', so the offline shape cannot run here. Upgrade to v$REGRESSION_FIXED_IN or later; until then a persistent machine with no network boots the image with no bake (README.md, \"The network is off unless you ask for it\")."
         elif [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "$FIXED_IN"; then
             emit offline_shape available
         else
