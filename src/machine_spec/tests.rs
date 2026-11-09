@@ -143,6 +143,82 @@ fn a_pack_turns_on_the_devices_and_network_it_was_made_with() {
 }
 
 #[test]
+fn a_pack_preserves_its_egress_policy_and_lets_the_caller_override_it() {
+    let mut manifest = pack_manifest();
+    manifest.allowed_cidrs = Some(vec!["198.51.100.1/32".into()]);
+    manifest.dns_filter_hosts = Some(vec!["pypi.org".into(), "*.files.pythonhosted.org".into()]);
+    manifest.egress_rules = vec![smolvm_protocol::EgressRule {
+        transport: None,
+        cidr: Some("10.0.0.0/8".into()),
+        ports: None,
+        action: smolvm_protocol::RuleAction::Deny,
+    }];
+
+    let inherited = resolve(
+        SpecSource::Pack(&manifest),
+        CreateSpec::default(),
+        Caller::Api,
+    )
+    .unwrap()
+    .to_record("m")
+    .unwrap();
+    assert!(inherited.network);
+    assert_eq!(inherited.allowed_cidrs, manifest.allowed_cidrs);
+    assert_eq!(inherited.dns_filter_hosts, manifest.dns_filter_hosts);
+    assert_eq!(inherited.egress_rules, manifest.egress_rules);
+
+    // An explicit host pattern replaces the pack's allow list as a unit so old
+    // baked host IPs do not remain open.
+    let host_only = resolve(
+        SpecSource::Pack(&manifest),
+        CreateSpec {
+            allowed_hosts: Some(vec!["=only.test".into()]),
+            ..Default::default()
+        },
+        Caller::Cli,
+    )
+    .unwrap()
+    .to_record("m")
+    .unwrap();
+    assert!(host_only.network);
+    assert_eq!(host_only.allowed_cidrs, None);
+    assert_eq!(host_only.dns_filter_hosts, Some(vec!["=only.test".into()]));
+    assert_eq!(host_only.egress_rules, manifest.egress_rules);
+
+    // CLI deny rules prepend ahead of the pack's rules and UDP allows append.
+    let cli_layered = resolve(
+        SpecSource::Pack(&manifest),
+        CreateSpec {
+            egress_rules: vec![
+                smolvm_protocol::EgressRule {
+                    transport: None,
+                    cidr: Some("192.168.0.0/16".into()),
+                    ports: None,
+                    action: smolvm_protocol::RuleAction::Deny,
+                },
+                smolvm_protocol::EgressRule {
+                    transport: Some(smolvm_protocol::FlowTransport::Udp),
+                    cidr: Some("1.1.1.1/32".into()),
+                    ports: None,
+                    action: smolvm_protocol::RuleAction::Allow,
+                },
+            ],
+            ..Default::default()
+        },
+        Caller::Cli,
+    )
+    .unwrap()
+    .to_record("m")
+    .unwrap();
+    let rule_cidrs: Vec<_> = cli_layered
+        .egress_rules
+        .iter()
+        .map(|r| r.cidr.as_deref().unwrap())
+        .collect();
+    assert_eq!(rule_cidrs, ["192.168.0.0/16", "10.0.0.0/8", "1.1.1.1/32"]);
+}
+
+#[test]
 fn a_vm_mode_pack_is_not_an_image_machine() {
     let mut manifest = pack_manifest();
     manifest.mode = PackMode::Vm;

@@ -1444,7 +1444,14 @@ impl VmRecord {
         cidrs: Vec<String>,
         hosts: Vec<String>,
     ) -> Result<()> {
-        let rules = self.egress_rules.clone();
+        // Egress rules imply networking at launch (`plan_launch_network_with`),
+        // so turning networking off clears them alongside the allow list rather
+        // than leaving a deny rule to re-enable open egress on start.
+        let rules = if network {
+            self.egress_rules.clone()
+        } else {
+            Vec::new()
+        };
         self.replace_egress_and_rules(network, cidrs, hosts, rules)
     }
 
@@ -2880,6 +2887,33 @@ mod tests {
                 record.dns_filter_hosts.clone()
             ),
             (None, None)
+        );
+
+        // A machine with a deny rule (e.g. created from a pack that carried
+        // `--allow-host pypi.org --deny-cidr 1.1.1.1/32`) that has its egress
+        // replaced with `network: false` must clear `egress_rules` too, so the
+        // remaining deny rule does not re-enable networking at launch with the
+        // allow list gone.
+        record.dns_filter_hosts = Some(vec!["pypi.org".to_string()]);
+        record.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("1.1.1.1/32".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
+        record
+            .apply_egress_policy(&network::EgressPolicy::default())
+            .unwrap();
+        assert!(!record.network);
+        assert_eq!(record.allowed_cidrs, None);
+        assert_eq!(record.dns_filter_hosts, None);
+        assert!(record.egress_rules.is_empty());
+        assert_eq!(
+            record.launch_network_plan(),
+            crate::network::LaunchNetworkPlan {
+                backend: crate::network::EffectiveNetworkBackend::None,
+                outbound: false,
+            }
         );
     }
 
