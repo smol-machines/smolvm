@@ -86,6 +86,7 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod attach;
+mod auto_ports;
 mod branchpoint;
 mod credentials;
 mod cuda;
@@ -637,6 +638,11 @@ fn main() {
     // Forward ports published while the machine runs (no virtio-net).
     if port_forward::is_enabled() {
         port_forward::start();
+    }
+
+    // Report listening TCP ports so the host publishes them (`--auto-ports`).
+    if auto_ports::is_enabled() {
+        auto_ports::start();
     }
 
     // Start any user-published Unix-socket bridges (`--expose-socket` /

@@ -122,6 +122,9 @@ pub const DNS_OPTIONS: &str = "SMOLVM_NETWORK_DNS_OPTIONS";
 pub const SHM_SIZE: &str = "SMOLVM_SHM_SIZE";
 /// Enables the guest-side port forwarder on [`crate::ports::PORT_FORWARD`].
 pub const PORT_FORWARD: &str = "SMOLVM_PORT_FORWARD";
+/// Enables the guest's listening-port watcher, which reports its TCP
+/// listeners on [`crate::ports::AUTO_PORTS`] so the host publishes them.
+pub const AUTO_PORTS: &str = "SMOLVM_AUTO_PORTS";
 
 /// Validate a `--shm-size` value and return it as a tmpfs `size=` value: a
 /// byte count with an optional `k`, `m` or `g` suffix (`512m`, `2g`), or a

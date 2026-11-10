@@ -327,6 +327,33 @@ pub struct PortMapping {
     pub protocol: PortProtocol,
 }
 
+/// Automatic port publishing (`--auto-ports`): while a machine runs, every
+/// TCP port a process in it listens on is published on the host's loopback at
+/// the same port number, and closed again once nothing listens on it. Only
+/// machines the local CLI starts use it; see `crate::network::auto_ports`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoPorts {
+    /// Guest ports never published automatically, ascending.
+    pub exclude: Vec<u16>,
+}
+
+impl AutoPorts {
+    /// Auto ports with `exclude` left out, sorted and without duplicates so
+    /// two settings that mean the same compare equal.
+    pub fn excluding(exclude: impl IntoIterator<Item = u16>) -> Self {
+        let mut exclude: Vec<u16> = exclude.into_iter().collect();
+        exclude.sort_unstable();
+        exclude.dedup();
+        Self { exclude }
+    }
+
+    /// `self` with `other`'s exclusions added.
+    pub fn merged(self, other: AutoPorts) -> Self {
+        Self::excluding(self.exclude.into_iter().chain(other.exclude))
+    }
+}
+
 /// Maximum concrete mappings permitted for one machine.
 ///
 /// Published listeners share one accept thread (`smolvm_network::acceptor`),
