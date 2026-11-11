@@ -366,7 +366,11 @@ pub fn raise_nofile_limit() -> Option<libc::rlim_t> {
         };
         #[cfg(not(target_os = "macos"))]
         let wanted = limit.rlim_max;
-        if wanted > limit.rlim_cur {
+        // A soft limit above `kern.maxfilesperproc` (a shell with `ulimit -n`
+        // past it) is not the one in force: macOS holds the process to the
+        // per-process cap anyway. Set it to the cap so what we report, and
+        // what children inherit, is the limit that applies.
+        if wanted != limit.rlim_cur {
             let raised = libc::rlimit {
                 rlim_cur: wanted,
                 rlim_max: limit.rlim_max,
@@ -6124,8 +6128,13 @@ mod oom_victim_order_tests {
 mod nofile_limit_tests {
     use super::*;
 
+    /// The tests below change this process's open-file limit; one must not
+    /// move it between another's raise and its check.
+    static RLIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn the_open_file_limit_rises_to_the_hard_limit_or_the_macos_cap() {
+        let _guard = RLIMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let raised = raise_nofile_limit().expect("getrlimit works");
         // SAFETY: getrlimit on a local struct.
         let hard = unsafe {
@@ -6145,5 +6154,34 @@ mod nofile_limit_tests {
         #[cfg(not(target_os = "macos"))]
         let wanted = hard;
         assert_eq!(raised, wanted);
+    }
+
+    /// A shell can hand a process a soft limit above `kern.maxfilesperproc`
+    /// (`ulimit -n` past it). macOS holds the process to the cap regardless,
+    /// so the raise must bring the soft limit down to the cap instead of
+    /// reporting a limit that is not in force.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_soft_limit_above_the_macos_cap_comes_down_to_it() {
+        let _guard = RLIMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = macos_max_files_per_process().expect("kern.maxfilesperproc");
+        // SAFETY: getrlimit/setrlimit on local structs.
+        unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            if limit.rlim_max <= cap {
+                // No soft limit above the cap is possible on this host.
+                return;
+            }
+            let above = libc::rlimit {
+                rlim_cur: limit.rlim_max.min(cap * 2),
+                rlim_max: limit.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &above), 0);
+        }
+        assert_eq!(raise_nofile_limit(), Some(cap));
     }
 }
