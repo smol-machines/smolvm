@@ -48,11 +48,12 @@ first: an ephemeral machine's entry retires after its run returns.
 Only machines recorded in the state file are deleted, so a machine you or another session created
 by hand is never deleted. A script records what it creates with
 `scripts/cleanup.sh --record <name>`, and names must carry the `smolskill-` prefix or the delete
-is skipped. `--purge` removes the state file once the list is empty.
+is skipped. `--purge` removes the state file once none of the recorded machines is listed,
+whatever other machines the host has.
 
 **When the user asks you to clean up machines they made themselves**, which is what "clean up
-after me" usually means, nothing is recorded and the script reports them as `machines=remaining`
-and leaves them. That is the guard working, not the end of the job. List them, confirm they are
+after me" usually means, nothing is recorded and the script lists them under
+`other_machines=left as they are` and leaves them. That is the guard working, not the end of the job. List them, confirm they are
 the user's and not another session's, and delete each by name. `smolvm machine list --json` gives
 each machine's `created_at`, in Unix seconds, and its image: one created before the user's session
 began, or under a name they do not recognise, is not theirs to delete without asking.
