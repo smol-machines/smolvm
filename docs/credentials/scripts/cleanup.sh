@@ -9,7 +9,7 @@
 # usage: cleanup.sh [--record <name>] [--reap] [--purge]
 #   --record <name>  add a machine name to the state file and exit
 #   --reap           kill every VM process under this HOME; run without it first
-#   --purge          also remove the state file once the list is empty
+#   --purge          also remove the state file once none of its machines is listed
 
 set -uo pipefail
 
@@ -123,7 +123,7 @@ fi
 # most, until no recorded name is listed. A list that fails counts as remaining.
 printf 'waiting=up to 20s for ephemeral entries to retire before asserting\n'
 ours_listed() {
-    listing="$("$SMOLVM" machine list </dev/null 2>&1)" || { printf '%s\n' "$listing"; return; }
+    listing="$("$SMOLVM" machine list </dev/null 2>&1)" || { printf 'machine list failed: %s\n' "$listing"; return; }
     [ -s "$STATE_FILE" ] || return
     awk 'NR>2{print $1}' <<<"$listing" | grep -xF -f <(grep "^$PREFIX" "$STATE_FILE")
 }
