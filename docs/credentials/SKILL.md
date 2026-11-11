@@ -95,7 +95,8 @@ result=contained
 
 `value_in_guest` hands the value to a `grep` inside the guest on standard input for the length of
 the search, and looks in every process environment and the writable trees inside the guest;
-`value_in_record` searches the machine's directory and smolvm's database on the host;
+`value_in_record` searches the machine's directory without its disk images, smolvm's database and
+its usage journal on the host, and fails if any file there cannot be read;
 `interception` reads the issuer of the bound host's certificate as the guest sees it, which is
 `smolvm <machine> credential CA`, while `--other-host` keeps its real issuer.
 
