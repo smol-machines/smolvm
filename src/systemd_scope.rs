@@ -200,6 +200,192 @@ pub fn configure_vm_slice() -> Result<usize> {
     Ok(reserved)
 }
 
+/// The least memory a host keeps out of reach of VMs by default (MiB): room for
+/// the kernel, `smolvm-node serve`, the node agent, sshd and journald.
+const HOST_RESERVED_MEMORY_FLOOR_MIB: u64 = 8 * 1024;
+
+/// Share of host memory (percent) kept out of reach of VMs by default. A fixed
+/// few GiB is noise on a 755–1511 GiB worker: on 2026-11-09 three of them ran
+/// out of memory globally with branch children, the kernel wedged, and sshd and
+/// the node agent stopped answering until the hosts were reset.
+const HOST_RESERVED_MEMORY_PERCENT: u64 = 6;
+
+/// VMs keep at least this much memory (MiB) whatever reserve is configured.
+const VM_MEMORY_FLOOR_MIB: u64 = 1024;
+
+/// How much host memory (MiB) to keep out of reach of VMs on a host with
+/// `total_mib` of memory. `SMOLVM_HOST_RESERVED_MEMORY_MB` wins when it is a
+/// number (`0` turns the reservation off); otherwise the larger of
+/// [`HOST_RESERVED_MEMORY_FLOOR_MIB`] and [`HOST_RESERVED_MEMORY_PERCENT`] of
+/// the host, but never more than a quarter of it so a small dev host still
+/// runs VMs. Always leaves VMs at least [`VM_MEMORY_FLOOR_MIB`].
+pub fn host_reserved_memory_mib(total_mib: u64, configured: Option<&str>) -> u64 {
+    let wanted = match configured.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(n) => n,
+        None => (total_mib.saturating_mul(HOST_RESERVED_MEMORY_PERCENT) / 100)
+            .max(HOST_RESERVED_MEMORY_FLOOR_MIB)
+            .min(total_mib / 4),
+    };
+    wanted.min(total_mib.saturating_sub(VM_MEMORY_FLOOR_MIB))
+}
+
+/// [`host_reserved_memory_mib`] with the operator's
+/// `SMOLVM_HOST_RESERVED_MEMORY_MB`, if any.
+pub fn configured_host_reserved_memory_mib(total_mib: u64) -> u64 {
+    let configured = std::env::var("SMOLVM_HOST_RESERVED_MEMORY_MB").ok();
+    host_reserved_memory_mib(total_mib, configured.as_deref())
+}
+
+/// systemd's encoding of "no limit" for a memory property.
+const MEMORY_LIMIT_INFINITY: u64 = u64::MAX;
+
+/// The memory limits applied to [`VM_SLICE`], in bytes
+/// ([`MEMORY_LIMIT_INFINITY`] = no limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmSliceMemoryLimits {
+    /// `MemoryHigh`: above it the kernel throttles VM allocations and reclaims
+    /// their page cache, which also shows up as memory pressure the pressure
+    /// guard acts on.
+    pub high_bytes: u64,
+    /// `MemoryMax`: the hard cap. An OOM at it kills a VM inside the slice
+    /// instead of starving the host's own services.
+    pub max_bytes: u64,
+    /// The slice already held more than the cap when it was applied, so the
+    /// limits were raised to what it holds rather than OOM-killing VMs that
+    /// are running now. The next serve start with the slice below the cap
+    /// applies the real one.
+    pub raised_to_current: bool,
+}
+
+/// The [`VM_SLICE`] memory limits for a host with `total_bytes` of memory that
+/// keeps `reserved_bytes` for itself, given what the slice holds now
+/// (`current_bytes`, when known). `MemoryHigh` sits 2% of the cap (at most
+/// 8 GiB) below `MemoryMax` so reclaim and pressure start before the hard cap.
+fn vm_slice_memory_limits(
+    total_bytes: u64,
+    reserved_bytes: u64,
+    current_bytes: Option<u64>,
+) -> VmSliceMemoryLimits {
+    if reserved_bytes == 0 || reserved_bytes >= total_bytes {
+        return VmSliceMemoryLimits {
+            high_bytes: MEMORY_LIMIT_INFINITY,
+            max_bytes: MEMORY_LIMIT_INFINITY,
+            raised_to_current: false,
+        };
+    }
+    let max_bytes = total_bytes - reserved_bytes;
+    let gap = (max_bytes / 50).min(8 * 1024 * 1024 * 1024);
+    let high_bytes = max_bytes - gap;
+    match current_bytes {
+        // Lowering a limit below what the slice holds makes the kernel reclaim
+        // at once, and guest RAM (shared memory, no swap) cannot be reclaimed:
+        // it would throttle or OOM-kill running VMs the moment serve restarts.
+        Some(current) if current >= high_bytes => VmSliceMemoryLimits {
+            high_bytes: current,
+            max_bytes: max_bytes.max(current.saturating_add(gap)),
+            raised_to_current: true,
+        },
+        _ => VmSliceMemoryLimits {
+            high_bytes,
+            max_bytes,
+            raised_to_current: false,
+        },
+    }
+}
+
+fn slice_memory_args(limits: &VmSliceMemoryLimits) -> Vec<String> {
+    // Runtime only, like AllowedCPUs: serve sets it again on every start.
+    [
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "SetUnitProperties",
+        "sba(sv)",
+        VM_SLICE,
+        "true",
+        "2",
+        "MemoryHigh",
+        "t",
+        &limits.high_bytes.to_string(),
+        "MemoryMax",
+        "t",
+        &limits.max_bytes.to_string(),
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// What [`configure_vm_slice_memory`] applied, for the serve log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmSliceMemoryCap {
+    /// Host `MemTotal` (MiB).
+    pub host_total_mib: u64,
+    /// Memory kept out of reach of VMs (MiB); 0 = no cap.
+    pub reserved_mib: u64,
+    /// The limits applied to the slice.
+    pub limits: VmSliceMemoryLimits,
+}
+
+/// Cap [`VM_SLICE`] at host memory minus [`configured_host_reserved_memory_mib`],
+/// so the host's own services always keep memory: guest RAM is shared memory a
+/// per-VM `memory.high` cannot reclaim, and thousands of branch children can
+/// otherwise push the whole host into a global OOM that wedges the kernel.
+/// Called once by `serve` when it runs VMs in scopes; idempotent (a reserve of
+/// 0 clears an earlier cap).
+pub fn configure_vm_slice_memory() -> Result<VmSliceMemoryCap> {
+    const MIB: u64 = 1024 * 1024;
+    let host_total_mib = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| parse_mem_total_bytes(&meminfo))
+        .ok_or_else(|| Error::agent("vm slice", "cannot read MemTotal from /proc/meminfo"))?
+        / MIB;
+    let reserved_mib = configured_host_reserved_memory_mib(host_total_mib);
+    let current_bytes = std::fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(VM_SLICE)
+            .join("memory.current"),
+    )
+    .ok()
+    .and_then(|v| v.trim().parse::<u64>().ok());
+    let limits = vm_slice_memory_limits(
+        host_total_mib.saturating_mul(MIB),
+        reserved_mib.saturating_mul(MIB),
+        current_bytes,
+    );
+    let busctl = busctl_path()
+        .ok_or_else(|| Error::agent("vm slice", "busctl not found; cannot set up the VM slice"))?;
+    let mut cmd = Command::new(&busctl);
+    cmd.args(slice_memory_args(&limits));
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if !out.status.success() {
+        return Err(Error::agent(
+            "vm slice",
+            format!(
+                "SetUnitProperties {VM_SLICE} memory failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    Ok(VmSliceMemoryCap {
+        host_total_mib,
+        reserved_mib,
+        limits,
+    })
+}
+
+fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+    let rest = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+    rest.split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1024)
+}
+
 /// Resource caps applied to the VM's scope (as systemd unit properties).
 ///
 /// Mirrors the per-VM cgroup limits set by [`crate::process::place_in_cgroup`]:
@@ -746,6 +932,91 @@ mod tests {
         // An empty mask clears any earlier restriction.
         let cleared = slice_cpus_args(&[]);
         assert_eq!(&cleared[cleared.len() - 2..], &["ay", "0"]);
+    }
+
+    #[test]
+    fn big_hosts_reserve_six_percent_and_small_ones_eight_gib_at_most_a_quarter() {
+        // 755 GiB worker: 6% = 46387 MiB (~45 GiB).
+        assert_eq!(host_reserved_memory_mib(755 * 1024, None), 46387);
+        // 1511 GiB worker: ~90.7 GiB.
+        assert_eq!(host_reserved_memory_mib(1511 * 1024, None), 92835);
+        // Mid-size hosts get the 8 GiB floor.
+        assert_eq!(host_reserved_memory_mib(64 * 1024, None), 8192);
+        // Small hosts never give up more than a quarter.
+        assert_eq!(host_reserved_memory_mib(16 * 1024, None), 4096);
+        // An explicit size wins, 0 turns it off, junk falls back to the default.
+        assert_eq!(host_reserved_memory_mib(755 * 1024, Some("65536")), 65536);
+        assert_eq!(host_reserved_memory_mib(755 * 1024, Some("0")), 0);
+        assert_eq!(host_reserved_memory_mib(64 * 1024, Some("lots")), 8192);
+        // VMs always keep at least 1 GiB.
+        assert_eq!(host_reserved_memory_mib(4096, Some("9999")), 3072);
+        assert_eq!(host_reserved_memory_mib(512, Some("1")), 0);
+    }
+
+    #[test]
+    fn the_vm_slice_memory_cap_is_host_minus_reserve_with_high_just_below() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let limits = vm_slice_memory_limits(755 * GIB, 45 * GIB, Some(100 * GIB));
+        assert_eq!(limits.max_bytes, 710 * GIB);
+        // 2% of 710 GiB is above 8 GiB, so the gap is 8 GiB.
+        assert_eq!(limits.high_bytes, 702 * GIB);
+        assert!(!limits.raised_to_current);
+        // A small cap keeps high 2% below max.
+        let small = vm_slice_memory_limits(16 * GIB, 4 * GIB, None);
+        assert_eq!(small.max_bytes, 12 * GIB);
+        assert_eq!(small.high_bytes, 12 * GIB - 12 * GIB / 50);
+        // No reserve clears any earlier cap.
+        let off = vm_slice_memory_limits(755 * GIB, 0, None);
+        assert_eq!(
+            (off.high_bytes, off.max_bytes),
+            (MEMORY_LIMIT_INFINITY, MEMORY_LIMIT_INFINITY)
+        );
+    }
+
+    #[test]
+    fn a_slice_already_over_the_cap_is_not_squeezed_on_serve_restart() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let limits = vm_slice_memory_limits(755 * GIB, 45 * GIB, Some(705 * GIB));
+        assert!(limits.raised_to_current);
+        assert_eq!(limits.high_bytes, 705 * GIB);
+        assert_eq!(limits.max_bytes, 713 * GIB);
+        let over = vm_slice_memory_limits(755 * GIB, 45 * GIB, Some(740 * GIB));
+        assert_eq!(over.high_bytes, 740 * GIB);
+        assert_eq!(over.max_bytes, 748 * GIB);
+    }
+
+    #[test]
+    fn slice_memory_args_set_high_and_max_on_the_vm_slice() {
+        let args = slice_memory_args(&VmSliceMemoryLimits {
+            high_bytes: 100,
+            max_bytes: 200,
+            raised_to_current: false,
+        });
+        assert_eq!(
+            &args[4..],
+            &[
+                "SetUnitProperties",
+                "sba(sv)",
+                VM_SLICE,
+                "true",
+                "2",
+                "MemoryHigh",
+                "t",
+                "100",
+                "MemoryMax",
+                "t",
+                "200"
+            ]
+        );
+    }
+
+    #[test]
+    fn mem_total_parses_from_meminfo() {
+        assert_eq!(
+            parse_mem_total_bytes("MemTotal:       16384000 kB\nMemFree: 1 kB\n"),
+            Some(16384000 * 1024)
+        );
+        assert_eq!(parse_mem_total_bytes("MemFree: 1 kB\n"), None);
     }
 
     // A wedged busctl (systemd stuck on a dying cgroup) must not pin the thread:
