@@ -30,9 +30,13 @@ where the value comes from, what the guest sees, what happens to each request, a
 
 **1. Preflight.** Read-only, and it never prints the value or its length.
 
+The examples bind `httpbin.org`, which echoes the headers it receives, so a first run with a test
+value shows the substitution end to end. For a real key, bind your API's host instead; step 4 says
+why.
+
 ```bash
 export API_TOKEN=...          # however your secrets manager hands it over
-scripts/preflight.sh --var API_TOKEN --host api.example.com
+scripts/preflight.sh --var API_TOKEN --host httpbin.org
 ```
 
 Every script here reads the value from its own environment, so keep it exported in the shell that
@@ -58,17 +62,17 @@ would refuse it anyway, with a clearer message.
 start`, and that is the value the machine uses until its next start.
 
 ```bash
-scripts/create-credentialed.sh --var API_TOKEN --host api.example.com
+scripts/create-credentialed.sh --var API_TOKEN --host httpbin.org
 ```
 
 ```
 workload_ready_after_s=1
 guest_sees=placeholder
-binding=api-token host=api.example.com
+binding=api-token host=httpbin.org
 result=up
 ```
 
-The command it runs is `smolvm machine create ... --credential api-token=API_TOKEN@api.example.com`
+The command it runs is `smolvm machine create ... --credential api-token=API_TOKEN@httpbin.org`
 and then `machine start`. `--credential` implies `--net`. In a Smolfile the same binding is a
 `[[network.credentials]]` table, in `docs/credential-substitution.md`.
 
@@ -79,7 +83,7 @@ any workload of yours runs in it: the guest search hands the value to a `grep` i
 length of the search, so a workload that can replace `grep` could read it.
 
 ```bash
-scripts/verify-containment.sh --var API_TOKEN --host api.example.com --other-host example.org
+scripts/verify-containment.sh --var API_TOKEN --host httpbin.org --other-host postman-echo.com
 ```
 
 ```
@@ -105,11 +109,14 @@ its usage journal on the host, and fails if any file there cannot be read;
 
 ```bash
 smolvm machine exec --name smolskill-cred -- sh -c \
-  'curl -sS -H "Authorization: Bearer $API_TOKEN" https://api.example.com/v1/me'
+  'curl -sS -H "Authorization: Bearer $API_TOKEN" https://httpbin.org/headers'
 ```
 
-That is the first request that carries the value, and it goes only to the host you bound. Judge it
-by the API's answer, the way you would without smolvm.
+That is the first request that carries the value, and it goes only to the host you bound: the
+echoed `Authorization` header holds `Bearer` and the value, while the same request to
+`postman-echo.com` echoes the placeholder. An echo endpoint hands the key back into the guest in its
+response body, so send it only a test value. With a real key, call your own API and judge it by the
+API's answer, the way you would without smolvm.
 
 **5. Clean up.**
 
@@ -119,6 +126,21 @@ scripts/cleanup.sh --purge
 
 `cleanup.sh` waits up to 20 seconds, polling the machine list, and prints `waiting=up to 20s`
 first: an ephemeral machine's entry retires after its run returns.
+
+## The binding in other forms
+
+- **A whole header, from v1.31.0.** With `--credential api-auth=API_AUTH@httpbin.org:set-header=authorization`
+  the host sets `Authorization` to the complete value of `API_AUTH`, `Bearer <key>` included, on
+  every request to the bound hosts, replacing whatever the guest sent. It is for a client that
+  cannot send a placeholder, such as a `git clone`; the guest variable still holds an unused
+  placeholder.
+
+- **The SDKs, from `smolmachines` 1.25.1** for Python, TypeScript and Rust: a credential in the
+  machine's config binds as `--credential` does, with a name, the guest variable, exact host names,
+  an optional value and optional methods; there is no body or set-header form, and the Go SDK has
+  none. In Python, `MachineConfig(credentials=[CredentialSpec(name="api-token", env_var="API_TOKEN",
+  hosts=["httpbin.org"], value=os.environ["API_TOKEN"])])`; without `value`, the process's own
+  `env_var` is read at each start.
 
 ## When the workload has to read the value
 
