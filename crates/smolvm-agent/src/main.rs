@@ -2721,6 +2721,7 @@ fn handle_request(
             if attach::available() {
                 capabilities.push(smolvm_protocol::ATTACH_MOUNT_CAPABILITY.to_string());
             }
+            capabilities.push(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY.to_string());
             // The guest kernel publishes this parameter when its timer driver
             // follows a change of counter rate after a restore.
             if std::path::Path::new("/sys/module/arm_arch_timer/parameters/follows_counter_rate")
@@ -2794,6 +2795,12 @@ fn handle_request(
         AgentRequest::ListAttachedMounts => AgentResponse::Ok {
             data: serde_json::to_value(attach::list()).ok(),
         },
+        AgentRequest::InstallCredentialTrust { ca_pem } => {
+            match credentials::install_live(&ca_pem) {
+                Ok(()) => AgentResponse::Ok { data: None },
+                Err(e) => AgentResponse::error(e, smolvm_protocol::error_codes::FILE_IO_FAILED),
+            }
+        }
 
         AgentRequest::BranchpointWait { timeout_ms } => {
             let markers = branchpoint::Markers::standard();
@@ -5579,6 +5586,28 @@ fn container_workdir_path(
 ///
 /// Returning `None` means this is a fresh container and should use the normal
 /// OCI runtime path. Unprivileged workloads deliberately never call this path.
+/// The environment a command run in a restored clone's container gets: the
+/// container init's own (`raw`, as `/proc/<pid>/environ` holds it) with
+/// `launch` layered over it. A credential placeholder the init inherited is
+/// left out unless `launch` hands it again: the host sends every binding the
+/// machine has now, so one it no longer sends was removed after the snapshot,
+/// and its variable must not reappear in new commands.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn restored_exec_environment(raw: &[u8], launch: &[(String, String)]) -> Vec<(String, String)> {
+    let mut environment = raw
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(_, value)| !value.starts_with(smolvm_protocol::credentials::PLACEHOLDER_PREFIX))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<Vec<_>>();
+    for (key, value) in launch {
+        environment.retain(|(existing, _)| existing != key);
+        environment.push((key.clone(), value.clone()));
+    }
+    environment
+}
+
 #[cfg(target_os = "linux")]
 fn restored_container_exec_command(
     container_id: &str,
@@ -5595,16 +5624,7 @@ fn restored_container_exec_command(
     let host_workdir = container_workdir_path(&root, guest_workdir)?;
 
     let target_environment = std::fs::read(format!("/proc/{pid}/environ"))?;
-    let mut environment = target_environment
-        .split(|byte| *byte == 0)
-        .filter_map(|entry| std::str::from_utf8(entry).ok())
-        .filter_map(|entry| entry.split_once('='))
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect::<Vec<_>>();
-    for (key, value) in &launch.env {
-        environment.retain(|(existing, _)| existing != key);
-        environment.push((key.clone(), value.clone()));
-    }
+    let environment = restored_exec_environment(&target_environment, &launch.env);
     let environment = crun::augmented_exec_env(&environment, container_id);
 
     // The uid:gid plus the user's supplementary groups from the container's own
@@ -9471,6 +9491,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_restored_clone_drops_inherited_placeholders_the_host_no_longer_sends() {
+        let raw =
+            b"PATH=/bin\0A_TOKEN=SMOL_PLACEHOLDER_A_1\0B_TOKEN=SMOL_PLACEHOLDER_B_2\0HOME=/root\0";
+        let launch = vec![
+            ("B_TOKEN".to_string(), "SMOL_PLACEHOLDER_B_2".to_string()),
+            ("C_TOKEN".to_string(), "SMOL_PLACEHOLDER_C_3".to_string()),
+        ];
+        let env = restored_exec_environment(raw, &launch);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["PATH", "HOME", "B_TOKEN", "C_TOKEN"]);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

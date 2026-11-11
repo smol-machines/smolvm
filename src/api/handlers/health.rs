@@ -49,8 +49,13 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> 
         machines,
         uptime_seconds: uptime,
         nested_virt: state.nested_virt_allowed(),
+        capabilities: SERVER_CAPABILITIES.to_vec(),
     })
 }
+
+/// What `/health` advertises in `capabilities`: features a control plane
+/// checks for instead of comparing versions.
+pub const SERVER_CAPABILITIES: &[&str] = &[crate::credentials::CREDENTIAL_BINDINGS_CAPABILITY];
 
 /// Readiness probe that exercises the **blocking pool** — the resource VM
 /// start/exec/stop dispatch depends on.
@@ -90,5 +95,20 @@ mod tests {
     #[tokio::test]
     async fn readyz_ok_when_pool_responsive() {
         assert_eq!(readyz().await, StatusCode::OK);
+    }
+
+    /// A control plane learns that bindings can be replaced from the health
+    /// response, under a stable name, not from the version.
+    #[tokio::test]
+    async fn health_advertises_replaceable_credential_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let state = Arc::new(ApiState::with_db(db));
+        let Json(health) = health(State(state)).await;
+        let json = serde_json::to_value(&health).unwrap();
+        assert_eq!(
+            json["capabilities"],
+            serde_json::json!(["credential-bindings-v1"])
+        );
     }
 }

@@ -656,6 +656,9 @@ pub struct LaunchConfig<'a> {
     /// the machine CA read-only at the guest credentials directory and, on
     /// virtio-net, starts the interceptor that HTTPS flows are redirected to.
     pub credentials: Option<&'a crate::credentials::CredentialLaunch>,
+    /// Who the machine is, so bindings it gains while it runs resolve for it
+    /// and widen its lineage's CA. `None` outside a named machine.
+    pub credential_identity: Option<&'a crate::credentials::CredentialIdentity>,
     /// Launch-scoped host service for all outbound TCP streams.
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     /// Use the versioned mediated-egress protocol for the external binding.
@@ -710,6 +713,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_telemetry,
         pod_net,
         credentials,
+        credential_identity,
         external_interceptor,
         mediated_egress,
         mediated_parent_id,
@@ -821,9 +825,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         }
     }
     // Only the public CA is exposed; the signing key stays in the parent dir.
+    // A boot restoring saved memory taken without the CA device leaves it out
+    // (the device set must match); the host hands the guest the CA instead.
     if let Some(credentials) = credentials {
         credentials.ensure_ca()?;
-        mounts_vec.push(credentials.guest_ca_mount());
+        if credentials.ca_boot_mount {
+            mounts_vec.push(credentials.guest_ca_mount());
+        }
     }
     let mounts: &[crate::data::storage::HostMount] = &mounts_vec;
 
@@ -1298,6 +1306,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         interceptor.endpoint(),
                     ));
                     _credential_interceptor = Some(interceptor);
+                } else if external_interceptor.is_none()
+                    && network_plan.outbound
+                    && pod_net.is_none()
+                {
+                    // No bindings yet: serve the credentials socket anyway, so
+                    // the machine's first bindings start an interceptor while
+                    // it runs and the relay sends HTTPS through it from then on.
+                    if let (Some(dir), Some(identity)) =
+                        (vsock_socket.parent(), credential_identity)
+                    {
+                        let slot = smolvm_network::LateHttpsIntercept::new();
+                        guest_network.late_https_intercept = Some(slot);
+                        crate::credentials::serve_without_bindings(dir, (*identity).clone(), slot);
+                    }
                 }
                 if let Some(endpoint) = external_interceptor {
                     guest_network.intercept = Some(if *mediated_egress {
@@ -3285,8 +3307,18 @@ mod tests {
         };
         let resources = VmResources::default();
         assert!(validate_external_interceptor(&endpoint, &resources, false, false).is_ok());
+        // Bindings never turn networking on; on a networked machine they
+        // steer the default backend to virtio-net.
         assert_eq!(
             select_network_plan(&resources, false, 0, true).backend,
+            crate::network::EffectiveNetworkBackend::None
+        );
+        let networked = VmResources {
+            network: true,
+            ..VmResources::default()
+        };
+        assert_eq!(
+            select_network_plan(&networked, false, 0, true).backend,
             crate::network::EffectiveNetworkBackend::VirtioNet
         );
         for addr in ["0.0.0.0:1234", "192.0.2.1:1234", "127.0.0.1:0"] {

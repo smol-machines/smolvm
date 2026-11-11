@@ -127,6 +127,9 @@ pub struct TcpRelayTable {
     /// Redirect selected streams after egress admits their real destination.
     /// `None` relays every flow directly.
     intercept: Option<crate::StreamInterception>,
+    /// Credential interceptor published after boot, used for HTTPS while
+    /// `intercept` is unset.
+    late_https_intercept: Option<crate::LateHttpsIntercept>,
     /// Guest ports already reported as refusing published connections, so a
     /// client retrying in a loop produces one warning rather than one per
     /// attempt.
@@ -491,6 +494,7 @@ impl TcpRelayTable {
             gateway_ips,
             host_service,
             intercept: None,
+            late_https_intercept: None,
             unaccepted_guest_ports: HashSet::new(),
             reactor: None,
             next_flow_id: 0,
@@ -572,6 +576,22 @@ impl TcpRelayTable {
         self
     }
 
+    /// Route HTTPS through a credential interceptor once one is published in
+    /// `slot`, while no other interception is configured.
+    pub fn with_late_https_intercept(mut self, slot: Option<crate::LateHttpsIntercept>) -> Self {
+        self.late_https_intercept = slot;
+        self
+    }
+
+    /// The interception in force for a flow opened now.
+    fn current_intercept(&self) -> Option<crate::StreamInterception> {
+        self.intercept.or_else(|| {
+            self.late_https_intercept
+                .and_then(|slot| slot.get())
+                .map(crate::StreamInterception::Https)
+        })
+    }
+
     /// Relay target for a guest-initiated flow that egress already admitted.
     fn outbound_target(&self, destination: SocketAddr) -> RelayTarget {
         // The dedicated rollout ingress is a smolvm-owned service on the
@@ -612,7 +632,7 @@ impl TcpRelayTable {
             }
             _ => {}
         }
-        match self.intercept {
+        match self.current_intercept() {
             Some(crate::StreamInterception::Https(endpoint))
                 if destination.port() == INTERCEPTED_PORT
                     && !self.gateway_ips.contains(&destination.ip()) =>
@@ -2785,6 +2805,35 @@ mod tests {
         assert!(
             matches!(plain.outbound_target(https), RelayTarget::Connect(addr) if addr == https)
         );
+    }
+
+    /// A machine that booted without a credential interceptor relays HTTPS
+    /// directly until one is published, and through it from the next flow on.
+    #[test]
+    fn https_flows_follow_an_interceptor_published_after_boot() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            token: [7; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let gateway = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        let slot = crate::LateHttpsIntercept::new();
+        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None)
+            .with_late_https_intercept(Some(slot));
+        let https = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let http = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 80);
+        assert!(
+            matches!(table.outbound_target(https), RelayTarget::Connect(addr) if addr == https)
+        );
+        slot.set(endpoint);
+        assert!(matches!(
+            table.outbound_target(https),
+            RelayTarget::Intercept { endpoint: e, destination } if destination == https && e == endpoint
+        ));
+        assert!(matches!(table.outbound_target(http), RelayTarget::Connect(addr) if addr == http));
+        assert!(matches!(
+            table.outbound_target(SocketAddr::new(gateway, 443)),
+            RelayTarget::Connect(addr) if addr.ip().is_loopback()
+        ));
     }
 
     /// `--block-private --allow-private 100.81.17.207/32` with a `--credential`

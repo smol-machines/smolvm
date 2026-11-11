@@ -22,7 +22,7 @@ use crate::sni::{peek_client_hello, Peek, MAX_CLIENT_HELLO};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{
     header, server::conn::http1, service::service_fn, Method, Request, Response, StatusCode,
@@ -34,7 +34,7 @@ use smolvm_protocol::intercept::{
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -46,6 +46,14 @@ const REQUEST_LIMIT: usize = 8 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SESSIONS: usize = 256;
+/// Longest a guest may leave a request body to a credential host idle: one
+/// that stops sending is answered `408` rather than held open; one that keeps
+/// sending, however slowly, is never cut off.
+const BODY_IDLE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(60)
+};
 const MAX_CACHED_CLIENTS: usize = 64;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -67,16 +75,82 @@ pub struct InterceptorConfig {
 /// A running interceptor. Dropping it stops the listener and every session.
 pub struct Interceptor {
     endpoint: InterceptEndpoint,
+    state: Arc<State>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-struct State {
-    machine: String,
+/// Changes a running interceptor's bindings and CA. Cloneable; outlives
+/// nothing: once the [`Interceptor`] is dropped, changes have no effect.
+#[derive(Clone)]
+pub struct InterceptorControl(Arc<State>);
+
+/// The bindings an interceptor enforces, swapped as one value so a request
+/// never sees one binding's policy beside another's placeholders.
+struct Bindings {
     policy: CredentialPolicy,
     /// placeholder → binding name
-    bindings_by_placeholder: HashMap<String, String>,
-    ca: MachineCa,
+    by_placeholder: HashMap<String, String>,
+    /// binding name → placeholder
+    placeholders: HashMap<String, String>,
+    /// binding name → generation of the secret behind it: kept across a swap
+    /// that keeps the binding's secret, new otherwise.
+    generations: HashMap<String, u64>,
+}
+
+impl Bindings {
+    fn new(
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+        generations: HashMap<String, u64>,
+    ) -> Self {
+        let placeholders: HashMap<String, String> = placeholders
+            .iter()
+            .filter(|(binding, _)| policy.binding(binding).is_some())
+            .map(|(binding, placeholder)| (binding.clone(), placeholder.clone()))
+            .collect();
+        Self {
+            by_placeholder: placeholders
+                .iter()
+                .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
+                .collect(),
+            placeholders,
+            generations,
+            policy,
+        }
+    }
+
+    /// Whether `name` is the very same binding in `self` and `other`: the
+    /// same definition, placeholder and secret generation.
+    fn same_binding(&self, other: &Bindings, name: &str) -> bool {
+        self.policy.binding(name).is_some()
+            && self.policy.binding(name) == other.policy.binding(name)
+            && self.placeholders.get(name) == other.placeholders.get(name)
+            && self.generations.get(name) == other.generations.get(name)
+    }
+}
+
+/// Source of fresh secret generations, shared by every interceptor of the
+/// process.
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn fresh_generations(policy: &CredentialPolicy) -> HashMap<String, u64> {
+    policy
+        .credentials
+        .iter()
+        .map(|b| {
+            (
+                b.name.clone(),
+                NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+struct State {
+    machine: String,
+    bindings: RwLock<Arc<Bindings>>,
+    ca: RwLock<Arc<MachineCa>>,
     resolver: Arc<dyn CredentialResolver>,
     endpoint: InterceptEndpoint,
     leaves: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
@@ -103,13 +177,11 @@ impl Interceptor {
             .collect::<Result<Vec<_>>>()?;
         let state = Arc::new(State {
             machine: config.machine,
-            bindings_by_placeholder: config
-                .placeholders
-                .iter()
-                .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
-                .collect(),
-            policy: config.policy,
-            ca: config.ca,
+            bindings: RwLock::new(Arc::new({
+                let generations = fresh_generations(&config.policy);
+                Bindings::new(config.policy, &config.placeholders, generations)
+            })),
+            ca: RwLock::new(Arc::new(config.ca)),
             resolver,
             endpoint,
             leaves: Mutex::new(HashMap::new()),
@@ -118,6 +190,7 @@ impl Interceptor {
             sessions: Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS)),
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = state.clone();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("smolvm-credentials")
@@ -136,7 +209,7 @@ impl Interceptor {
                         }
                     };
                     tokio::select! {
-                        _ = accept_loop(state, listener) => {}
+                        _ = accept_loop(served, listener) => {}
                         _ = shutdown_rx => {}
                     }
                 });
@@ -145,6 +218,7 @@ impl Interceptor {
             .context("interceptor thread")?;
         Ok(Self {
             endpoint,
+            state,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -153,6 +227,61 @@ impl Interceptor {
     /// Where the network backend should redirect flows, and with which token.
     pub fn endpoint(&self) -> InterceptEndpoint {
         self.endpoint
+    }
+
+    /// A handle that changes this interceptor's bindings and CA while it runs.
+    pub fn control(&self) -> InterceptorControl {
+        InterceptorControl(self.state.clone())
+    }
+}
+
+impl InterceptorControl {
+    /// Enforce `policy` with `placeholders` from the next request on, every
+    /// binding with a new secret. See [`Self::replace_bindings_keeping`].
+    pub fn replace_bindings(
+        &self,
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+    ) {
+        self.replace_bindings_keeping(policy, placeholders, &[]);
+    }
+
+    /// Enforce `policy` with `placeholders` from the next request on. The
+    /// bindings named in `kept` keep the secret they had (the caller kept
+    /// their source and value); every other one has a new secret.
+    ///
+    /// A request in flight that resolved a binding's value is sent only if
+    /// that binding is still the very same one (definition, placeholder and
+    /// secret) once the value is in hand; otherwise it is refused with a
+    /// `503` rather than sent with a value it was not checked against. A swap
+    /// that leaves a request's binding alone (an unrelated addition, an
+    /// identical re-send) does not disturb it. A caller that also changes
+    /// the resolver's values must do both under the lock its resolver takes
+    /// to read them, so no resolution sees one without the other. A host no
+    /// binding allows any more is spliced through untouched on its next
+    /// connection, and a placeholder whose binding is gone is refused.
+    pub fn replace_bindings_keeping(
+        &self,
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+        kept: &[String],
+    ) {
+        let mut slot = self.0.bindings.write().unwrap_or_else(|e| e.into_inner());
+        let mut generations = fresh_generations(&policy);
+        for name in kept {
+            let same = slot.policy.binding(name) == policy.binding(name)
+                && slot.placeholders.get(name) == placeholders.get(name);
+            if let (true, Some(old)) = (same, slot.generations.get(name)) {
+                generations.insert(name.clone(), *old);
+            }
+        }
+        *slot = Arc::new(Bindings::new(policy, placeholders, generations));
+    }
+
+    /// Sign leaves with `ca` from the next handshake on.
+    pub fn replace_ca(&self, ca: MachineCa) {
+        *self.0.ca.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(ca);
+        self.0.leaves.lock().expect("leaf cache").clear();
     }
 }
 
@@ -226,8 +355,16 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
     .await
     .context("client hello timeout")??;
 
+    let intercepted = |host: &str| {
+        state
+            .bindings()
+            .policy
+            .bindings_for_host(host)
+            .next()
+            .is_some()
+    };
     match peek {
-        Peek::ServerName(host) if state.policy.bindings_for_host(&host).next().is_some() => {
+        Peek::ServerName(host) if intercepted(&host) => {
             // The upstream client opens its own verified connection.
             drop(upstream);
             terminate(state, stream, buffered, host, destination).await
@@ -300,6 +437,27 @@ async fn terminate(
 }
 
 impl State {
+    fn bindings(&self) -> Arc<Bindings> {
+        self.bindings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Whether binding `name` of `seen` is still in force, unchanged. A value
+    /// is resolved by binding name; checked after resolving, this proves the
+    /// value belongs to the binding the request was checked against, not to
+    /// a binding of the same name that replaced it meanwhile (the controller
+    /// swaps bindings and the resolver's values as one step).
+    fn binding_unchanged(&self, seen: &Arc<Bindings>, name: &str) -> bool {
+        let now = self.bindings();
+        Arc::ptr_eq(seen, &now) || seen.same_binding(&now, name)
+    }
+
+    fn ca(&self) -> Arc<MachineCa> {
+        self.ca.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Ask the resolver for `binding`'s value for this request. The inner
     /// `Err` is the reply to send the guest when it has none.
     async fn resolve(
@@ -335,7 +493,7 @@ impl State {
         if let Some(config) = self.leaves.lock().expect("leaf cache").get(host) {
             return Ok(config.clone());
         }
-        let (chain, key) = self.ca.issue_leaf(host)?;
+        let (chain, key) = self.ca().issue_leaf(host)?;
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -434,6 +592,9 @@ impl State {
             return Ok(reply);
         }
 
+        // One view of the bindings for the whole request, so a replacement
+        // landing mid-request never pairs one policy with other placeholders.
+        let bindings = self.bindings();
         let (parts, body) = request.into_parts();
         let target = parts
             .uri
@@ -451,14 +612,9 @@ impl State {
             Ok(found) => found,
             Err(reason) => return Ok(text(StatusCode::FORBIDDEN, reason)),
         };
-        let body = match Limited::new(body, REQUEST_LIMIT).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => {
-                return Ok(text(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "smolvm credentials: request body exceeds 8 MiB",
-                ))
-            }
+        let body = match read_body(body).await {
+            Ok(body) => body,
+            Err(reply) => return Ok(*reply),
         };
         let body_placeholder = match find_body_placeholder(&body) {
             Ok(found) => found,
@@ -482,13 +638,13 @@ impl State {
             .map(|(_, placeholder)| placeholder)
             .or(body_placeholder.as_ref())
         {
-            let Some(binding_name) = self.bindings_by_placeholder.get(placeholder) else {
+            let Some(binding_name) = bindings.by_placeholder.get(placeholder) else {
                 return Ok(text(
                     StatusCode::FORBIDDEN,
                     "smolvm credentials: unknown placeholder",
                 ));
             };
-            let binding = self
+            let binding = bindings
                 .policy
                 .binding(binding_name)
                 .context("binding vanished from policy")?;
@@ -544,6 +700,9 @@ impl State {
                 Ok(secret) => secret,
                 Err(reply) => return Ok(reply),
             };
+            if !self.binding_unchanged(&bindings, binding_name) {
+                return Ok(bindings_changed());
+            }
             if let Some((header_name, _)) = &substitution {
                 let current = headers
                     .get(header_name)
@@ -576,7 +735,7 @@ impl State {
 
         // Header-setting bindings: the host supplies the whole value and it
         // replaces whatever the guest sent, placeholder or not.
-        for binding in self.policy.header_bindings(host, parts.method.as_str()) {
+        for binding in bindings.policy.header_bindings(host, parts.method.as_str()) {
             let header_name = binding
                 .set_header
                 .as_deref()
@@ -594,6 +753,9 @@ impl State {
                 Ok(secret) => secret,
                 Err(reply) => return Ok(reply),
             };
+            if !self.binding_unchanged(&bindings, &binding.name) {
+                return Ok(bindings_changed());
+            }
             let (Ok(name), Ok(mut value)) = (
                 header::HeaderName::from_bytes(header_name.as_bytes()),
                 header::HeaderValue::from_bytes(secret.as_bytes()),
@@ -763,6 +925,49 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
     }
     headers.remove("keep-alive");
     headers.remove("proxy-connection");
+}
+
+/// Buffer a request body of at most [`REQUEST_LIMIT`] bytes, giving up on one
+/// that sends nothing for [`BODY_IDLE_TIMEOUT`].
+async fn read_body(mut body: Incoming) -> std::result::Result<Bytes, Box<Reply>> {
+    let mut buffered = Vec::new();
+    loop {
+        match tokio::time::timeout(BODY_IDLE_TIMEOUT, body.frame()).await {
+            Err(_) => {
+                return Err(Box::new(text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "smolvm credentials: request body stalled",
+                )))
+            }
+            Ok(None) => return Ok(Bytes::from(buffered)),
+            Ok(Some(Err(_))) => {
+                return Err(Box::new(text(
+                    StatusCode::BAD_REQUEST,
+                    "smolvm credentials: request body could not be read",
+                )))
+            }
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    if buffered.len() + data.len() > REQUEST_LIMIT {
+                        return Err(Box::new(text(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "smolvm credentials: request body exceeds 8 MiB",
+                        )));
+                    }
+                    buffered.extend_from_slice(&data);
+                }
+            }
+        }
+    }
+}
+
+/// The reply to a request whose bindings were replaced while it was being
+/// handled: nothing was sent upstream, and a retry runs under the new ones.
+fn bindings_changed() -> Reply {
+    text(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "smolvm credentials: credential bindings changed during the request; retry",
+    )
 }
 
 fn text(status: StatusCode, message: &'static str) -> Reply {
@@ -1149,6 +1354,295 @@ mod tests {
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(seen[0].0, format!("Bearer {}", f.placeholder));
         assert_eq!(seen[0].1, "/raw");
+    }
+
+    /// Bindings and the CA change under a running interceptor: a kept
+    /// binding keeps substituting with its placeholder, a new one substitutes
+    /// on its own host under the new CA, and a removed one's host is spliced
+    /// through untouched from its next connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaced_bindings_take_effect_on_the_next_request() {
+        let binding = |name: &str, host: &str| CredentialBinding {
+            name: name.into(),
+            environment_variable: format!("{}_TOKEN", name.to_uppercase()),
+            allowed_hosts: vec![host.into()],
+            injection_location: InjectionLocation::default(),
+            methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+            set_header: None,
+        };
+        let f = fixture_with_policy(
+            CredentialPolicy {
+                credentials: vec![binding("svc", CRED_HOST)],
+            },
+            CRED_HOST,
+            StaticResolver::new()
+                .with("svc", "svc-secret")
+                .with("other", "other-secret"),
+        )
+        .await;
+        let request = |host: &str, placeholder: &str| {
+            format!(
+                "GET /p HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let control = f.interceptor.control();
+        let other_placeholder = crate::policy::generate_placeholder("other");
+        let wider = MachineCa::generate(
+            "test-machine",
+            &[CRED_HOST.to_string(), OTHER_HOST.to_string()],
+        )
+        .unwrap();
+        let wider_pem = wider.certificate_pem().to_string();
+        control.replace_ca(wider);
+        control.replace_bindings(
+            CredentialPolicy {
+                credentials: vec![binding("svc", CRED_HOST), binding("other", OTHER_HOST)],
+            },
+            &[
+                ("svc".to_string(), f.placeholder.clone()),
+                ("other".to_string(), other_placeholder.clone()),
+            ]
+            .into(),
+        );
+        let kept = guest_request(
+            &f,
+            wider_pem.as_bytes(),
+            CRED_HOST,
+            &request(CRED_HOST, &f.placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(kept.starts_with("HTTP/1.1 200"), "{kept}");
+        let added = guest_request(
+            &f,
+            wider_pem.as_bytes(),
+            OTHER_HOST,
+            &request(OTHER_HOST, &other_placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+
+        control.replace_bindings(
+            CredentialPolicy {
+                credentials: vec![binding("other", OTHER_HOST)],
+            },
+            &[("other".to_string(), other_placeholder.clone())].into(),
+        );
+        // Trusting only the upstream's certificate proves the flow was spliced.
+        let removed = guest_request(
+            &f,
+            &f.upstream.cert_pem,
+            CRED_HOST,
+            &request(CRED_HOST, &f.placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(removed.starts_with("HTTP/1.1 200"), "{removed}");
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter()
+                .map(|(auth, _)| auth.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Bearer svc-secret".to_string(),
+                "Bearer other-secret".to_string(),
+                format!("Bearer {}", f.placeholder),
+            ]
+        );
+    }
+
+    /// A resolver that holds every resolution until released, so a test can
+    /// replace the bindings while a request is between check and send.
+    struct GatedResolver {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl CredentialResolver for GatedResolver {
+        fn resolve(
+            &self,
+            _request: &CredentialRequest,
+        ) -> std::result::Result<zeroize::Zeroizing<String>, crate::resolver::ResolveError>
+        {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(zeroize::Zeroizing::new("value-of-the-old-binding".into()))
+        }
+    }
+
+    fn svc_policy() -> CredentialPolicy {
+        CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "svc".into(),
+                environment_variable: "SVC_TOKEN".into(),
+                allowed_hosts: vec![CRED_HOST.into()],
+                injection_location: InjectionLocation::default(),
+                methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+                set_header: None,
+            }],
+        }
+    }
+
+    /// Run one request for `svc` whose resolution is held until `swap` has
+    /// changed the bindings, and return the response.
+    async fn request_across_a_swap(
+        swap: impl FnOnce(&InterceptorControl, &CredentialPolicy, &BTreeMap<String, String>)
+            + Send
+            + 'static,
+    ) -> (String, Fixture) {
+        let upstream = start_upstream().await;
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let placeholder = placeholders["svc"].clone();
+        let ca = MachineCa::generate(
+            "test-machine",
+            &[CRED_HOST.to_string(), OTHER_HOST.to_string()],
+        )
+        .unwrap();
+        let ca_pem = ca.certificate_pem().to_string();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: policy.clone(),
+                placeholders: placeholders.clone(),
+                ca,
+                upstream_roots_pem: vec![upstream.cert_pem.clone()],
+            },
+            Arc::new(GatedResolver {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+        )
+        .unwrap();
+        let f = Fixture {
+            upstream,
+            interceptor,
+            placeholder: placeholder.clone(),
+            ca_pem,
+        };
+        let control = f.interceptor.control();
+        let swapper = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            swap(&control, &policy, &placeholders);
+            release_tx.send(()).unwrap();
+        });
+        let request = format!(
+            "GET /p HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        swapper.join().unwrap();
+        (response, f)
+    }
+
+    /// Bindings replaced while a request resolves its value refuse the
+    /// request when its own binding changed: the value was resolved by name
+    /// and may belong to the binding that replaced the one it was checked
+    /// against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_whose_bindings_change_while_it_resolves_is_refused() {
+        let (response, f) = request_across_a_swap(|control, policy, placeholders| {
+            // The same name, now bound elsewhere.
+            let mut moved = policy.clone();
+            moved.credentials[0].allowed_hosts = vec![OTHER_HOST.into()];
+            control.replace_bindings(moved, placeholders);
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("changed during the request"),
+            "{response}"
+        );
+        assert!(
+            f.upstream.seen.lock().unwrap().is_empty(),
+            "nothing went upstream"
+        );
+
+        // The same binding, but its secret was replaced (not kept).
+        let (response, _f) = request_across_a_swap(|control, policy, placeholders| {
+            control.replace_bindings(policy.clone(), placeholders);
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    }
+
+    /// A swap that leaves a request's own binding and its secret alone (an
+    /// unrelated addition, an identical re-send) does not disturb it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swap_that_keeps_the_requests_binding_lets_it_through() {
+        let (response, f) = request_across_a_swap(|control, policy, placeholders| {
+            let mut more = policy.clone();
+            let mut other = more.credentials[0].clone();
+            other.name = "other".into();
+            other.environment_variable = "OTHER_TOKEN".into();
+            other.allowed_hosts = vec![OTHER_HOST.into()];
+            more.credentials.push(other);
+            let mut placeholders = placeholders.clone();
+            placeholders.insert("other".into(), crate::policy::generate_placeholder("other"));
+            control.replace_bindings_keeping(more, &placeholders, &["svc".to_string()]);
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            f.upstream.seen.lock().unwrap()[0].0,
+            "Bearer value-of-the-old-binding"
+        );
+        let (response, _f) = request_across_a_swap(|control, policy, placeholders| {
+            control.replace_bindings_keeping(policy.clone(), placeholders, &["svc".to_string()]);
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// A body that keeps arriving, however slowly, is read whole; one that
+    /// stops is answered `408`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_idle_request_body_times_out() {
+        let f = fixture().await;
+        let send = |gaps: Vec<u64>| {
+            let endpoint = f.interceptor.endpoint();
+            let upstream = f.upstream.addr;
+            let ca_pem = f.ca_pem.clone();
+            let placeholder = f.placeholder.clone();
+            async move {
+                let mut tcp = TcpStream::connect(endpoint.addr).await.unwrap();
+                tcp.write_all(&endpoint.preamble(upstream)).await.unwrap();
+                let mut verdict = [0u8; 1];
+                tcp.read_exact(&mut verdict).await.unwrap();
+                let connector = TlsConnector::from(client_config(ca_pem.as_bytes()));
+                let mut tls = connector
+                    .connect(ServerName::try_from(CRED_HOST.to_string()).unwrap(), tcp)
+                    .await
+                    .unwrap();
+                let chunks = gaps.len() + 1;
+                tls.write_all(
+                    format!(
+                        "POST /p HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {placeholder}\r\nContent-Length: {chunks}\r\nConnection: close\r\n\r\nx"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+                for gap in gaps {
+                    tokio::time::sleep(Duration::from_millis(gap)).await;
+                    if tls.write_all(b"x").await.is_err() {
+                        break;
+                    }
+                }
+                let mut out = Vec::new();
+                let _ = tls.read_to_end(&mut out).await;
+                String::from_utf8_lossy(&out).into_owned()
+            }
+        };
+        // Four 300 ms gaps: longer than the idle limit in all, never idle.
+        let slow = send(vec![300, 300, 300, 300]).await;
+        assert!(slow.starts_with("HTTP/1.1 200"), "{slow}");
+        let stalled = send(vec![900]).await;
+        assert!(stalled.starts_with("HTTP/1.1 408"), "{stalled}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

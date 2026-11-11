@@ -3937,8 +3937,12 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         // interceptor and the workload's requests carry the bare placeholder
         // upstream. Bindings and placeholders are not secret; the value is
         // resolved from the restore host's environment.
-        credential_policy: vm.credential_policy.clone().filter(|p| !p.is_empty()),
+        // An empty policy is kept: the machine had bindings, so its boot has
+        // the CA device and the interceptor, which the restore must recreate.
+        credential_policy: vm.credential_policy.clone(),
         credential_placeholders: vm.credential_placeholders.clone(),
+        credential_ca_device: Some(vm.credential_ca_boot_device()),
+        guest_credential_trust: vm.guest_credential_trust,
     }
 }
 

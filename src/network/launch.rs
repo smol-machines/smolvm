@@ -117,9 +117,11 @@ pub fn plan_launch_network(
 
 /// [`plan_launch_network`] for a machine that may also carry a credential
 /// policy. Credential substitution is enforced by the host-side virtio-net
-/// stack, so a policy implies networking and steers the default backend to
+/// stack, so a policy steers the default backend of a networked machine to
 /// virtio-net exactly as an egress allow-list does; an explicit backend choice
-/// is still honored (TSI then needs the libkrun interception hook).
+/// is still honored (TSI then needs the libkrun interception hook). A policy
+/// never turns networking or egress on: a credential only travels over the
+/// network the machine already has.
 pub fn plan_launch_network_with(
     resources: &VmResources,
     dns_filter_hosts: Option<&[String]>,
@@ -143,8 +145,7 @@ pub fn plan_launch_network_with(
         || has_cidr_policy
         || has_dns_filter
         || has_fabric
-        || has_guest_subnet
-        || has_credentials;
+        || has_guest_subnet;
 
     if !wants_network {
         return LaunchNetworkPlan {
@@ -154,12 +155,8 @@ pub fn plan_launch_network_with(
     }
     // Ports and the host service are inbound paths; everything else here is a
     // request for egress, possibly narrowed by its own allow-list.
-    let outbound = resources.network
-        || has_cidr_policy
-        || has_dns_filter
-        || has_fabric
-        || has_guest_subnet
-        || has_credentials;
+    let outbound =
+        resources.network || has_cidr_policy || has_dns_filter || has_fabric || has_guest_subnet;
 
     // Published ports need the inbound path, which only virtio-net provides.
     // When the caller didn't pick a backend explicitly, default to virtio-net
@@ -295,6 +292,21 @@ pub(crate) fn serve_control_socket(
     max_request_bytes: u64,
     apply: impl Fn(&str) -> Result<(), String> + Send + 'static,
 ) {
+    serve_control_socket_with_reply(path, thread_name, max_request_bytes, move |request| {
+        apply(request).map(|()| String::new())
+    });
+}
+
+/// [`serve_control_socket`] for requests that answer with data: a non-empty
+/// `Ok` follows the `ok` line. The socket is made private to this process's
+/// user: only the host, never another machine's process, may change a
+/// machine.
+pub(crate) fn serve_control_socket_with_reply(
+    path: std::path::PathBuf,
+    thread_name: &str,
+    max_request_bytes: u64,
+    apply: impl Fn(&str) -> Result<String, String> + Send + 'static,
+) {
     use std::io::{Read, Write};
     let listener = match crate::platform::uds::UdsListener::bind(&path) {
         Ok(listener) => listener,
@@ -303,6 +315,14 @@ pub(crate) fn serve_control_socket(
             return;
         }
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!(path = %path.display(), %error, "control socket left with default mode");
+        }
+    }
     let spawned = std::thread::Builder::new()
         .name(thread_name.into())
         .spawn(move || {
@@ -317,7 +337,8 @@ pub(crate) fn serve_control_socket(
                     .read_to_string(&mut request)
                 {
                     Ok(_) => match apply(&request) {
-                        Ok(()) => "ok\n".to_string(),
+                        Ok(data) if data.is_empty() => "ok\n".to_string(),
+                        Ok(data) => format!("ok\n{data}\n"),
                         Err(reason) => format!("error: {reason}\n"),
                     },
                     Err(error) => format!("error: {error}\n"),
@@ -456,7 +477,12 @@ mod tests {
         assert!(plan_launch_network(&allow_listed, None, 1).outbound);
         let hosts = ["api.example.com".to_string()];
         assert!(plan_launch_network(&resources(), Some(&hosts), 1).outbound);
-        assert!(plan_launch_network_with(&resources(), None, 1, true).outbound);
+        // Credential bindings never open egress a machine does not have.
+        assert!(!plan_launch_network_with(&resources(), None, 1, true).outbound);
+        assert_eq!(
+            plan_launch_network_with(&resources(), None, 0, true).backend,
+            EffectiveNetworkBackend::None
+        );
     }
 
     #[test]

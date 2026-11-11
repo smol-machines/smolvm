@@ -144,6 +144,9 @@ pub struct VirtioPollConfig {
     pub host_service: Option<crate::GatewayHostService>,
     /// Host interceptor and the outbound streams routed through it.
     pub intercept: Option<crate::StreamInterception>,
+    /// Credential interceptor published after boot; see
+    /// [`crate::GuestNetworkConfig::late_https_intercept`].
+    pub late_https_intercept: Option<crate::LateHttpsIntercept>,
     /// IP-level MTU.
     pub mtu: usize,
 }
@@ -322,7 +325,8 @@ fn run_network_stack(
         config.host_service,
     )
     .with_published_port_seed(port_seed)
-    .with_intercept(config.intercept);
+    .with_intercept(config.intercept)
+    .with_late_https_intercept(config.late_https_intercept);
     match reactor {
         Ok(reactor) => relays = relays.with_reactor(reactor),
         Err(error) => virtio_net_log!(
@@ -1582,6 +1586,7 @@ mod tests {
             upstream_resolvers: [None; crate::MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
+            late_https_intercept: None,
             mtu: 1500,
         };
         let queues = NetworkFrameQueues::shared(32);

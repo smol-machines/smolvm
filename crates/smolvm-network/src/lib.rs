@@ -217,7 +217,63 @@ pub struct GuestNetworkConfig {
     /// Host interceptor and the outbound streams routed through it. Each stream
     /// carries an authenticated preamble naming its original destination.
     pub intercept: Option<StreamInterception>,
+    /// Where a credential interceptor started after boot is published, for a
+    /// machine that booted without one. While it is empty every flow is
+    /// relayed directly; once set, HTTPS flows go through the interceptor as
+    /// with [`StreamInterception::Https`]. Ignored when `intercept` is set.
+    pub late_https_intercept: Option<LateHttpsIntercept>,
 }
+
+/// A slot a running machine's credential interceptor is published in after
+/// boot. Copyable and comparable by identity, so it can ride in the static
+/// network configuration; one is made per boot process and lives as long as
+/// it does.
+#[derive(Clone, Copy)]
+pub struct LateHttpsIntercept(&'static std::sync::RwLock<Option<InterceptEndpoint>>);
+
+impl LateHttpsIntercept {
+    /// A new, empty slot. It is never freed: make one per boot process.
+    pub fn new() -> Self {
+        Self(Box::leak(Box::new(std::sync::RwLock::new(None))))
+    }
+
+    /// Redirect HTTPS flows opened from now on to `endpoint`.
+    pub fn set(&self, endpoint: InterceptEndpoint) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some(endpoint);
+    }
+
+    /// Relay HTTPS flows opened from now on directly again.
+    pub fn clear(&self) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The interceptor HTTPS flows go to, once one was published.
+    pub fn get(&self) -> Option<InterceptEndpoint> {
+        *self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Default for LateHttpsIntercept {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for LateHttpsIntercept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LateHttpsIntercept")
+            .field(&self.get())
+            .finish()
+    }
+}
+
+impl PartialEq for LateHttpsIntercept {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for LateHttpsIntercept {}
 
 /// Exact guest gateway port mapped to one smolvm-owned host loopback port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +304,7 @@ impl GuestNetworkConfig {
             upstream_resolvers: [None; MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
+            late_https_intercept: None,
         }
     }
 }
@@ -678,6 +735,7 @@ pub fn start_virtio_network(
             upstream_resolvers: guest_network.upstream_resolvers,
             host_service: guest_network.host_service,
             intercept: guest_network.intercept,
+            late_https_intercept: guest_network.late_https_intercept,
             mtu: 1500,
         },
         Some(tcp_receiver),

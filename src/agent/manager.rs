@@ -667,16 +667,26 @@ pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()
 }
 
 /// Hand running machine `name` new values for its credential bindings, by
-/// binding name: its next request to a bound host uses them.
+/// binding name: its next request to a bound host uses them. `expect` is the
+/// bindings the values were read for (the record's, under the caller's lock):
+/// a value whose binding has changed in the boot process since is refused,
+/// so it never reaches a binding that replaced the one it was meant for.
 pub fn apply_live_credential_values(
     name: &str,
     values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+    expect: &crate::credentials::CredentialPolicy,
 ) -> Result<()> {
     let values: std::collections::BTreeMap<&str, &str> = values
         .iter()
         .map(|(binding, value)| (binding.as_str(), value.as_str()))
         .collect();
-    let request = zeroize::Zeroizing::new(serde_json::json!({ "values": values }).to_string());
+    let expect: std::collections::BTreeMap<&str, &crate::credentials::CredentialBinding> = values
+        .keys()
+        .filter_map(|binding| expect.binding(binding).map(|b| (*binding, b)))
+        .collect();
+    let request = zeroize::Zeroizing::new(
+        serde_json::json!({ "values": values, "expect": expect }).to_string(),
+    );
     send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
         Error::config(
             "credentials",
@@ -687,7 +697,90 @@ pub fn apply_live_credential_values(
     })
 }
 
+/// Replace running machine `name`'s credential bindings through its
+/// credentials socket: the boot process widens the CA as needed and swaps
+/// policy, placeholders and resolver state at once, starting an interceptor
+/// if the machine booted without bindings. Answers with the CA certificate.
+pub fn apply_live_credential_policy(
+    name: &str,
+    message: &crate::credentials::BindingsMessage,
+) -> Result<crate::credentials::BindingsReply> {
+    let request = serde_json::json!({ "bindings": message }).to_string();
+    let fail = |reason: String| {
+        Error::config(
+            "credentials",
+            format!(
+                "could not change machine '{name}''s credential bindings while it runs: {reason}"
+            ),
+        )
+    };
+    let reply = send_live_request(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(
+        |reason| {
+            // A boot process from before binding changes knows only values.
+            if reason == "malformed request" {
+                fail(
+                    "this machine was started before live binding changes were supported and \
+                     needs a restart"
+                        .to_string(),
+                )
+            } else {
+                fail(reason)
+            }
+        },
+    )?;
+    serde_json::from_str(&reply).map_err(|e| fail(format!("unreadable answer: {e}")))
+}
+
+/// Return running machine `name`'s boot process to exactly the bindings it
+/// had before the last ones it was sent.
+pub fn roll_back_live_credential_policy(name: &str) -> Result<()> {
+    send_live_change(
+        name,
+        crate::credentials::CREDENTIALS_SOCKET,
+        r#"{"rollback":true}"#,
+    )
+    .map_err(|reason| {
+        Error::config(
+            "credentials",
+            format!("could not restore machine '{name}''s credential bindings: {reason}"),
+        )
+    })
+}
+
+/// Have running machine `name`'s guest trust `pem` as its credential CA,
+/// in the machine root and every workload container.
+pub fn install_live_credential_trust(name: &str, pem: &str) -> Result<()> {
+    let mut client = AgentManager::for_vm(name)?.connect()?;
+    if !client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)? {
+        return Err(Error::config(
+            "credentials",
+            format!(
+                "machine '{name}' runs a guest agent that cannot take a credential CA while it \
+                 runs; restart it to apply bindings for new hosts"
+            ),
+        ));
+    }
+    client.install_credential_trust(pem)
+}
+
+/// Whether running machine `name`'s guest can take a credential CA live.
+pub fn supports_live_credential_trust(name: &str) -> Result<bool> {
+    AgentManager::for_vm(name)?
+        .connect()?
+        .supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)
+}
+
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    send_live_request(name, socket, rendered).map(|_| ())
+}
+
+/// Send `rendered` to one of running machine `name`'s control sockets and
+/// return what followed its `ok`.
+fn send_live_request(
+    name: &str,
+    socket: &str,
+    rendered: &str,
+) -> std::result::Result<String, String> {
     use std::io::{Read, Write};
     let path = vm_data_dir(name).join(socket);
     let mut stream =
@@ -697,7 +790,7 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
             },
         )?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .and_then(|()| stream.write_all(rendered.as_bytes()))
         .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
         .map_err(|e| e.to_string())?;
@@ -705,9 +798,11 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
     stream
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
-    match reply.trim() {
-        "ok" => Ok(()),
-        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+    let reply = reply.trim();
+    match reply.split_once('\n') {
+        Some(("ok", data)) => Ok(data.trim().to_string()),
+        None if reply == "ok" => Ok(String::new()),
+        _ => Err(reply.strip_prefix("error: ").unwrap_or(reply).to_string()),
     }
 }
 
@@ -3022,6 +3117,14 @@ impl AgentManager {
                 features.pod_netns.is_some(),
             )?;
         }
+        let mut credential_identity = None;
+        // Held until this boot is up: a change to the machine's bindings
+        // waits for it, and this boot never reads bindings a change is
+        // replacing.
+        let _bindings_lock = match self.name() {
+            Some(name) => Some(crate::credentials::lock_bindings(name)?),
+            None => None,
+        };
         if let Some(name) = self.name() {
             let db = crate::db::SmolvmDb::open()?;
             if let Some(record) = db.get_vm(name)? {
@@ -3073,6 +3176,39 @@ impl AgentManager {
                         r.agent_rootfs_digest = Some(rootfs_digest.clone());
                         r.agent_rootfs_path = Some(rootfs_path.clone());
                     })?;
+                }
+                // A fresh boot mounts the credential CA as a device; a restore
+                // must rebuild the device set its saved memory was taken with,
+                // which has the CA only if that boot mounted it.
+                let restoring = features.snapshot_dir.is_some();
+                let identity = crate::credentials::CredentialIdentity::of(name, &record);
+                // The record, read under the lock, decides the bindings this
+                // boot enforces, whatever the caller loaded earlier (an API
+                // entry, a supervisor restart): a change made by another
+                // process since must not be booted over.
+                if record.credential_policy.is_some() {
+                    features.credentials =
+                        crate::credentials::CredentialLaunch::for_record(name, &record);
+                } else if restoring && record.credential_ca_boot_device() {
+                    // No binding any more, but the saved guest has the CA
+                    // device: recreate it, with an interceptor that has none.
+                    features.credentials =
+                        Some(crate::credentials::CredentialLaunch::without_bindings(
+                            &identity,
+                            record.credentials_supplied_by_api,
+                        ));
+                } else {
+                    // A record without bindings boots none, whatever a caller
+                    // loaded before they were removed.
+                    features.credentials = None;
+                }
+                if let Some(launch) = features.credentials.as_mut() {
+                    launch.ca_boot_mount = !restoring || record.credential_ca_boot_device();
+                }
+                credential_identity = Some(identity);
+                let ca_device = features.credentials.is_some();
+                if !restoring && record.credential_ca_device != Some(ca_device) {
+                    db.update_vm(name, |r| r.credential_ca_device = Some(ca_device))?;
                 }
                 if record.mediated_egress_required {
                     // A persisted mediated boundary cannot be downgraded by
@@ -3453,6 +3589,20 @@ impl AgentManager {
             None
         };
 
+        // The guest trusts the CA it was last given; a restored one may have
+        // been saved before the CA was widened, or before the machine had
+        // bindings at all. Settled once the guest answers.
+        let launched_credentials = features
+            .credentials
+            .clone()
+            .map(|launch| (launch, features.snapshot_dir.is_some()));
+        let trusted_ca = match (self.name(), &launched_credentials) {
+            (Some(name), Some(_)) => crate::db::SmolvmDb::open()?
+                .get_vm(name)?
+                .and_then(|record| record.credential_ca_trusted),
+            _ => None,
+        };
+
         // Supplied credential values ride in the boot process's own
         // environment, never in the boot config written below.
         let credential_env = features
@@ -3489,6 +3639,7 @@ impl AgentManager {
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
+            credential_identity,
             external_interceptor: features.external_interceptor,
             mediated_egress: features.mediated_egress,
             mediated_parent_id: features.mediated_parent_id,
@@ -3787,7 +3938,94 @@ impl AgentManager {
         if let (Err(_), Some(name)) = (&launched, adopted_scope) {
             release_failed_launch_scope(name, child_pid);
         }
+        if let (Ok(()), Some((launch, restored))) = (&launched, launched_credentials) {
+            self.settle_credential_trust(&launch, restored, trusted_ca.as_deref());
+        }
+        if launched.is_ok() {
+            self.record_guest_credential_trust();
+        }
         launched
+    }
+
+    /// Make sure the guest that just answered trusts `launch`'s current CA,
+    /// and record which certificate that is. A fresh boot read it from its CA
+    /// mount; a restore is handed it unless the guest was saved already
+    /// trusting this very certificate.
+    fn settle_credential_trust(
+        &self,
+        launch: &crate::credentials::CredentialLaunch,
+        restored: bool,
+        trusted: Option<&str>,
+    ) {
+        let Some(name) = self.name() else {
+            return;
+        };
+        let pem = match launch.ca_certificate_pem() {
+            Ok(pem) => pem,
+            Err(error) => {
+                tracing::warn!(%error, "credential CA unreadable after boot");
+                return;
+            }
+        };
+        let current = crate::credentials::CredentialLaunch::ca_fingerprint(&pem);
+        if trusted == Some(current.as_str()) {
+            return;
+        }
+        if restored {
+            if let Err(error) = self.install_credential_trust(&pem) {
+                if launch.ca_boot_mount {
+                    tracing::warn!(%error, "restored guest keeps the credential CA it was saved with");
+                } else {
+                    tracing::error!(%error, "restored guest does not trust the credential CA; requests to bound hosts will fail TLS until it restarts");
+                }
+                return;
+            }
+        }
+        let recorded = crate::db::SmolvmDb::open()
+            .and_then(|db| db.update_vm(name, |r| r.credential_ca_trusted = Some(current)));
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "could not record the credential CA the guest trusts");
+        }
+    }
+
+    /// Record whether the guest that just answered can be handed a credential
+    /// CA while it runs, so a change to the bindings of a machine resuming
+    /// memory saved from this boot knows whether its guest can take them.
+    fn record_guest_credential_trust(&self) {
+        let Some(name) = self.name() else {
+            return;
+        };
+        let capable = match self.connect().and_then(|mut client| {
+            client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)
+        }) {
+            Ok(capable) => capable,
+            Err(error) => {
+                tracing::debug!(%error, "could not ask the guest agent what it supports");
+                return;
+            }
+        };
+        let recorded = crate::db::SmolvmDb::open().and_then(|db| {
+            db.update_vm(name, |r| {
+                if r.guest_credential_trust != Some(capable) {
+                    r.guest_credential_trust = Some(capable);
+                }
+            })
+        });
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "could not record the guest agent's credential support");
+        }
+    }
+
+    /// Hand the running guest `pem` as its credential CA.
+    fn install_credential_trust(&self, pem: &str) -> Result<()> {
+        let mut client = self.connect()?;
+        if !client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)? {
+            return Err(Error::agent(
+                "install credential trust",
+                "the guest agent predates live credential trust",
+            ));
+        }
+        client.install_credential_trust(pem)
     }
 
     /// Like `ensure_running_with_full_config` but uses subprocess launch.

@@ -2044,6 +2044,26 @@ impl AgentClient {
         }
     }
 
+    /// Have the guest trust the machine's credential CA `ca_pem` from now on,
+    /// in the machine root and every workload container. Needs
+    /// [`smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY`].
+    pub fn install_credential_trust(&mut self, ca_pem: &str) -> Result<()> {
+        match self.request(&AgentRequest::InstallCredentialTrust {
+            ca_pem: ca_pem.to_string(),
+        })? {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, code } => Err(agent_error(
+                "install credential trust",
+                message,
+                code.as_deref(),
+            )),
+            other => Err(Error::agent(
+                "install credential trust",
+                format!("unexpected response: {other:?}"),
+            )),
+        }
+    }
+
     /// The host directories attached to the running machine.
     pub fn attached_mounts(&mut self) -> Result<Vec<smolvm_protocol::AttachedMount>> {
         let resp = self.request(&AgentRequest::ListAttachedMounts)?;

@@ -826,6 +826,13 @@ pub struct HealthResponse {
     /// Whether this server runs nested-virtualization machines (started with
     /// `--allow-nested-virt`), so a fleet scheduler can place them here.
     pub nested_virt: bool,
+    /// Features this server supports that a control plane may need to know
+    /// about before using them, so it never has to infer them from `version`.
+    /// `credential-bindings-v1`: `PUT /api/v1/machines/{name}/credentials`
+    /// replaces a machine's credential bindings in any state, live on a
+    /// running one.
+    #[schema(example = json!(["credential-bindings-v1"]))]
+    pub capabilities: Vec<&'static str>,
 }
 
 /// Machine counts for health response.
@@ -1618,6 +1625,20 @@ impl ExternalInterceptorSpec {
             token,
         })
     }
+}
+
+/// A machine's complete set of credential bindings, replacing the ones it has.
+///
+/// Each binding is the object `credentials.credentials[]` takes at create:
+/// `name`, `environment_variable`, `allowed_hosts`, and optionally
+/// `injection_location`, `methods` and `set_header`. Validated as create
+/// validates them. An empty list removes every binding.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetCredentialsRequest {
+    /// The bindings the machine has from now on, in order.
+    #[schema(value_type = Vec<Object>)]
+    pub credentials: Vec<smolvm_protocol::credentials::CredentialBinding>,
 }
 
 /// Values for a machine's credential bindings, by binding name.

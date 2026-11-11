@@ -545,6 +545,10 @@ pub const ONLINE_FILESYSTEM_GROWTH_CAPABILITY: &str = "online-filesystem-growth-
 /// (`AttachMount`/`DetachMount`).
 pub const ATTACH_MOUNT_CAPABILITY: &str = "attach-mount-v1";
 
+/// Agent installs a machine credential CA the host sends while the machine
+/// runs (`InstallCredentialTrust`).
+pub const CREDENTIAL_TRUST_CAPABILITY: &str = "credential-trust-v1";
+
 /// Virtio-fs tag of the live device serving read-write attached mounts.
 pub const ATTACH_TAG_RW: &str = "smolvm_attach_rw";
 /// Virtio-fs tag of the live device serving read-only attached mounts.
@@ -642,6 +646,18 @@ pub enum AgentRequest {
     /// List the attached mounts, as `Ok` data holding a JSON array of
     /// [`AttachedMount`].
     ListAttachedMounts,
+    /// Trust the machine's credential CA, given as PEM, from now on: write it
+    /// at [`credentials::GUEST_CA_DIR`]`/`[`credentials::GUEST_CA_FILE`] where
+    /// that is not the CA's own read-only mount, and rebuild the trust bundle
+    /// at [`credentials::GUEST_CA_BUNDLE`], in the machine root and in every
+    /// running workload container. Containers created later get both. Sent
+    /// when a running machine gains its first credential binding, when its CA
+    /// is widened to cover a new host, and after a restore whose saved guest
+    /// trusts an earlier certificate. Holds only the public certificate.
+    InstallCredentialTrust {
+        /// The CA certificate, PEM.
+        ca_pem: String,
+    },
     /// Ping to check if agent is alive.
     Ping,
 
@@ -1213,6 +1229,7 @@ impl AgentRequest {
             ),
             AgentRequest::DetachMount { target } => format!("DetachMount {{ target: {target} }}"),
             AgentRequest::ListAttachedMounts => "ListAttachedMounts".into(),
+            AgentRequest::InstallCredentialTrust { .. } => "InstallCredentialTrust".into(),
             AgentRequest::Ping => "Ping".into(),
             AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
             AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),

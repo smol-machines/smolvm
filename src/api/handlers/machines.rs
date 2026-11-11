@@ -45,7 +45,8 @@ use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialValuesRequest, DeleteQuery, DeleteResponse,
     EgressEventsResponse, ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest,
     ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
-    ResourceSpec, SetCpuLimitRequest, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
+    ResourceSpec, SetCpuLimitRequest, SetCredentialsRequest, SetPortsRequest, StartMachineQuery,
+    UpdateEgressRequest,
 };
 use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -4001,7 +4002,7 @@ pub async fn start_machine(
         let mut command = record.entrypoint.clone();
         command.extend(record.cmd.clone());
         let mut env = record.env.clone();
-        env.extend(super::record_secret_refs_env(&entry)?);
+        env.extend(super::record_secret_refs_env(&entry, Some(&record))?);
         // Remote volumes mount inside the workload container; build the mount
         // script here and let the agent run it ahead of the image-resolved
         // command, so a service image's own entrypoint is preserved.
@@ -6188,17 +6189,80 @@ pub async fn put_credential_values(
     // gets the new ones directly; the held copy covers its next boot.
     let running = record.actual_state() == RecordState::Running;
     let live = running.then(|| values.clone());
-    crate::credentials::supply_values(&name, values);
+    let policy = record.credential_policy.clone().unwrap_or_default();
+    crate::credentials::supply_values(&name, values, &policy, &record.credential_placeholders);
     if let Some(values) = live {
         let machine = name.clone();
         tokio::task::spawn_blocking(move || {
-            crate::agent::apply_live_credential_values(&machine, &values)
+            crate::agent::apply_live_credential_values(&machine, &values, &policy)
         })
         .await
         .map_err(|error| ApiError::internal(format!("credential values task failed: {error}")))?
         .map_err(|error| ApiError::Conflict(error.to_string()))?;
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Replace a machine's credential bindings, live when it runs.
+///
+/// The bindings in the body become exactly the machine's bindings, validated
+/// as create validates them (a credential host must fall under the machine's
+/// `allowedHosts`, if it has them), on a machine that already has network
+/// egress: bindings never turn networking on. They are stored, so every later
+/// start, resume, restore and branch uses them. A running machine enforces
+/// them from its next request: a binding keeps its placeholder while its name
+/// stays, and its value unless its variable changed (new hosts or a header
+/// keep it); a new name gets a placeholder its new commands see and no value
+/// until `PUT …/credential-values` supplies one; a removed one stops being
+/// substituted at once and loses its value.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/credentials",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = SetCredentialsRequest,
+    responses(
+        (status = 200, description = "Bindings replaced; a running machine already enforces them", body = MachineInfo),
+        (status = 400, description = "Invalid bindings, as create would refuse them, or a machine without network egress", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "The machine is mid-transition, or runs in a way that cannot take its first binding live (no network device, TSI, inbound-only, or a guest agent too old for new hosts); nothing changed", body = ApiErrorResponse)
+    )
+)]
+pub async fn set_machine_credentials(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetCredentialsRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock_owned().await;
+    let db = state.db().clone();
+    let policy = crate::credentials::CredentialPolicy {
+        credentials: req.credentials,
+    };
+    let machine = name.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        crate::credentials::set_bindings(&db, &machine, policy, crate::machine_spec::Caller::Api)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("credentials task failed: {error}")))?
+    .map_err(|error| match error {
+        crate::credentials::BindingsError::Invalid(e) => ApiError::BadRequest(e.to_string()),
+        crate::credentials::BindingsError::Conflict(e) => ApiError::Conflict(e.to_string()),
+        crate::credentials::BindingsError::Failed(e) => ApiError::from(e),
+    })?;
+    // Commands started through this server read the bindings from here.
+    if let Ok(entry) = state.get_machine(&name) {
+        let mut entry = entry.lock();
+        entry.credentials = crate::credentials::CredentialLaunch::for_record(&name, &record);
+        entry.resources.credentials = record.credential_policy.clone();
+        entry.network = record.network;
+        entry.resources.network = Some(record.network);
+        entry.resources.network_backend = record.network_backend;
+        entry.secret_refs = record.secret_refs.clone();
+    }
+    Ok(Json(record_to_info(&name, &record)))
 }
 
 /// Replace a machine's published ports, live when it runs.
@@ -8590,6 +8654,126 @@ mod tests {
         let req = SetPortsRequest { ports: vec![] };
         let result = set_machine_ports(State(state), Path("nope".into()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn put_credentials_replaces_the_bindings_of_a_stopped_machine() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "cred-vm", Some(20), Some(5));
+        // A binding grants no reachability: refused until the machine has it.
+        let refused = put_credentials(
+            &state,
+            "cred-vm",
+            vec![serde_json::json!({"name": "a", "environment_variable": "A_KEY", "allowed_hosts": ["api.a.com"]})],
+        )
+        .await;
+        assert!(matches!(refused.unwrap_err(), ApiError::BadRequest(_)));
+        assert!(!state.db().get_vm("cred-vm").unwrap().unwrap().network);
+        state
+            .db()
+            .update_vm("cred-vm", |r| r.network = true)
+            .unwrap();
+        let request = |body: serde_json::Value| -> SetCredentialsRequest {
+            serde_json::from_value(body).unwrap()
+        };
+        let binding = |name: &str, var: &str, host: &str| serde_json::json!({"name": name, "environment_variable": var, "allowed_hosts": [host]});
+
+        put_credentials(&state, "cred-vm", vec![binding("a", "A_KEY", "api.a.com")])
+            .await
+            .unwrap();
+        let first = state.db().get_vm("cred-vm").unwrap().unwrap();
+        let a = first.credential_placeholders["a"].clone();
+        assert!(first.credentials_supplied_by_api);
+
+        put_credentials(
+            &state,
+            "cred-vm",
+            vec![
+                binding("a", "A_KEY", "api.a.com"),
+                binding("b", "B_KEY", "api.b.com"),
+            ],
+        )
+        .await
+        .unwrap();
+        let both = state.db().get_vm("cred-vm").unwrap().unwrap();
+        assert_eq!(both.credential_placeholders["a"], a);
+        assert_eq!(both.credential_policy.unwrap().credentials.len(), 2);
+
+        // Invalid bindings are refused as create refuses them, changing nothing.
+        let result = put_credentials(&state, "cred-vm", vec![binding("c", "C_KEY", "*.com")]).await;
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+        let unknown_field = serde_json::from_value::<SetCredentialsRequest>(
+            serde_json::json!({"credentials": [], "extra": true}),
+        );
+        assert!(unknown_field.is_err());
+        let result = put_credentials(&state, "nope", vec![]).await;
+        assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+
+        let info = set_machine_credentials(
+            State(state.clone()),
+            Path("cred-vm".into()),
+            Json(request(serde_json::json!({"credentials": []}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.name, "cred-vm");
+        let none = state.db().get_vm("cred-vm").unwrap().unwrap();
+        assert_eq!(none.credential_policy, None, "no binding leaves no policy");
+        assert!(none.credential_placeholders.is_empty());
+    }
+
+    /// Exec environments read the bindings, and the references they
+    /// withhold, from the record: a change the CLI or an embedder made since
+    /// this server loaded its entry is honoured, and a reference a removed
+    /// binding fed never reaches the guest.
+    #[test]
+    fn exec_environments_follow_the_record_not_the_loaded_entry() {
+        use crate::machine_spec::Caller;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("gh");
+        std::fs::write(&secret, "ghp_operator").unwrap();
+        let mut record = VmRecord::new("stale-entry".into(), 1, 512, vec![], vec![], true);
+        record
+            .secret_refs
+            .insert("GH_TOKEN".into(), crate::secrets::file_ref(secret));
+        let bound = record
+            .with_credential_bindings(
+                crate::credentials::CredentialPolicy {
+                    credentials: vec![crate::credentials::parse_credential_flag(
+                        "gh=GH_TOKEN@api.github.com",
+                    )
+                    .unwrap()],
+                },
+                Caller::Cli,
+            )
+            .unwrap();
+        let manager = AgentManager::for_vm("stale-entry").unwrap();
+        let entry = Arc::new(parking_lot::Mutex::new(machine_entry_from_record(
+            &bound, manager,
+        )));
+        // Another process removed the binding; the entry still has it.
+        let removed = bound
+            .with_credential_bindings(Default::default(), Caller::Api)
+            .unwrap();
+        let env = super::super::record_secret_refs_env(&entry, Some(&removed)).unwrap();
+        assert!(env.iter().all(|(_, v)| v != "ghp_operator"), "{env:?}");
+        assert!(env.iter().all(|(k, _)| k != "GH_TOKEN"), "{env:?}");
+        let env = super::super::record_secret_refs_env(&entry, Some(&bound)).unwrap();
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "GH_TOKEN" && v.starts_with("SMOL_PLACEHOLDER_GH_")));
+    }
+
+    async fn put_credentials(
+        state: &Arc<ApiState>,
+        name: &str,
+        bindings: Vec<serde_json::Value>,
+    ) -> Result<MachineInfo, ApiError> {
+        let request: SetCredentialsRequest =
+            serde_json::from_value(serde_json::json!({ "credentials": bindings })).unwrap();
+        set_machine_credentials(State(state.clone()), Path(name.into()), Json(request))
+            .await
+            .map(|Json(info)| info)
     }
 
     #[tokio::test]

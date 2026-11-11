@@ -786,6 +786,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         egress_refresh_hosts: config.dns_filter_hosts.clone(),
         pod_net: pod_net_launch,
         credentials: config.credentials.as_ref(),
+        credential_identity: config.credential_identity.as_ref(),
         external_interceptor: config.external_interceptor,
         mediated_egress: config.mediated_egress,
         mediated_parent_id: config.mediated_parent_id,

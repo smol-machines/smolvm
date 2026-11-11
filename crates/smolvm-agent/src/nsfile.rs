@@ -119,6 +119,7 @@ pub fn run_helper() -> i32 {
         "mount-cache" => helper_mount_cache(&path, &args),
         "remount-shm" => helper_remount_shm(&path, &args),
         "detach-mount" => helper_detach_mount(&path),
+        "write-inplace" => helper_write_inplace(&path),
         _ => Err("unknown op".to_string()),
     };
     match result {
@@ -492,6 +493,116 @@ fn mount_cache_everywhere(args: &[String]) -> Result<(), String> {
         .map(String::from)
         .to_vec()
     })
+}
+
+/// Overwrite `path` in place with stdin, creating it and its parent
+/// directories when missing. Unlike `write`, which renames a staged copy over
+/// the target, this keeps the target's inode, so it works on a file that is
+/// itself a bind mount; a read-only one is reported as `ERR readonly`.
+fn helper_write_inplace(path: &str) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read input: {e}"))?;
+    let target = Path::new(path);
+    if let Some(dir) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| read_only_or(e, dir))?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(target)
+        .and_then(|mut file| file.write_all(&bytes))
+        .map_err(|e| read_only_or(e, target))?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(b"OK\n").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())
+}
+
+fn read_only_or(error: std::io::Error, path: &Path) -> String {
+    #[cfg(target_os = "linux")]
+    if error.raw_os_error() == Some(libc::EROFS) {
+        return "readonly".to_string();
+    }
+    format!("{}: {error}", path.display())
+}
+
+/// Why writing a file in a container failed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum ContainerWriteError {
+    /// The path is on a read-only mount there.
+    ReadOnly,
+    /// Anything else.
+    Failed(String),
+}
+
+/// Overwrite `path` in place in the mount namespace of container `pid`.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_in_container(
+    pid: u32,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), ContainerWriteError> {
+    let mut child = Command::new(AGENT_BINARY)
+        .args([HELPER_ARG, "write-inplace", &pid.to_string(), path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| ContainerWriteError::Failed(format!("spawn ns-file helper: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(bytes)
+            .map_err(|e| ContainerWriteError::Failed(format!("ns-file helper input: {e}")))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| ContainerWriteError::Failed(format!("ns-file helper: {e}")))?;
+    let reply = String::from_utf8_lossy(&output.stdout);
+    let reply = reply.trim();
+    match reply.strip_prefix("ERR ") {
+        None if output.status.success() => Ok(()),
+        Some("readonly") => Err(ContainerWriteError::ReadOnly),
+        Some(reason) => Err(ContainerWriteError::Failed(reason.to_string())),
+        None => Err(ContainerWriteError::Failed(format!(
+            "ns-file helper exited with {}",
+            output.status
+        ))),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn write_in_container(
+    _pid: u32,
+    _path: &str,
+    _bytes: &[u8],
+) -> Result<(), ContainerWriteError> {
+    Err(ContainerWriteError::Failed(
+        "mount namespaces are Linux-only".to_string(),
+    ))
+}
+
+/// One PID per distinct mount namespace among the machine's crun containers,
+/// leaving out the agent's own and the VM's.
+#[cfg(target_os = "linux")]
+pub(crate) fn container_namespace_pids() -> Vec<u32> {
+    let own = std::fs::read_link("/proc/self/ns/mnt").ok();
+    let skip = [own, std::fs::read_link("/proc/1/ns/mnt").ok()];
+    let containers = live_containers().into_iter().filter_map(|pid| {
+        std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+            .ok()
+            .map(|ns| (pid, ns))
+    });
+    namespaces_to_enter(containers, &skip)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn container_namespace_pids() -> Vec<u32> {
+    Vec::new()
 }
 
 /// Run this binary with `helper_args(pid)` once per distinct mount namespace

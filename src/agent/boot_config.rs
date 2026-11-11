@@ -96,6 +96,10 @@ pub struct BootConfig {
     /// the interceptor beside the network stack and mounts the machine CA.
     #[serde(default)]
     pub credentials: Option<crate::credentials::CredentialLaunch>,
+    /// Who the machine is, for credential bindings it gains while it runs
+    /// when it booted without any. Never read from the credentials socket.
+    #[serde(default)]
+    pub credential_identity: Option<crate::credentials::CredentialIdentity>,
     /// Launch-scoped host interceptor; never copied to the machine record.
     #[serde(default)]
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,

@@ -1459,11 +1459,52 @@ impl EmbeddedRuntime {
             let running =
                 crate::agent::state_probe::resolve_state(name, &record) == RecordState::Running;
             let live = running.then(|| values.clone());
-            crate::credentials::supply_values(name, values);
+            let policy = record.credential_policy.clone().unwrap_or_default();
+            crate::credentials::supply_values(
+                name,
+                values,
+                &policy,
+                &record.credential_placeholders,
+            );
             match live {
-                Some(values) => crate::agent::apply_live_credential_values(name, &values),
+                Some(values) => crate::agent::apply_live_credential_values(name, &values, &policy),
                 None => Ok(()),
             }
+        })
+    }
+
+    /// Replace `name`'s credential bindings with `policy`, exactly: the
+    /// bindings it has from now on, validated as
+    /// [`Self::create_machine_with_credentials`] validates them, and stored
+    /// so every later start, resume, restore and branch uses them. An empty
+    /// policy removes every binding.
+    ///
+    /// A running machine enforces them from its next request: a binding keeps
+    /// its placeholder while its name stays, so processes already holding it
+    /// keep working, and its value unless its variable changed (new hosts or
+    /// a header keep it); a new name gets a placeholder that new commands
+    /// see, and is substituted on its hosts once a value is supplied with
+    /// [`Self::supply_credential_values`]; a removed one stops being
+    /// substituted at once, and the value held for it is dropped. The machine
+    /// must already have network egress. A machine
+    /// that booted without bindings gains them live when it runs on
+    /// virtio-net with outbound access; otherwise the call fails, changes
+    /// nothing, and names the reason. Values always come from what is
+    /// supplied, never from this process's environment.
+    pub fn set_credential_bindings(
+        &self,
+        name: &str,
+        policy: crate::credentials::CredentialPolicy,
+    ) -> Result<()> {
+        self.with_name_lock(name, || {
+            crate::credentials::set_bindings(
+                &self.db,
+                name,
+                policy,
+                crate::machine_spec::Caller::Embedded,
+            )
+            .map(|_| ())
+            .map_err(Error::from)
         })
     }
 
@@ -2042,6 +2083,83 @@ mod tests {
             .supply_credential_values("bound", one("github"))
             .unwrap();
         crate::credentials::forget_values("bound");
+    }
+
+    /// Bindings replaced on a stopped machine are stored for its next boot:
+    /// kept ones keep their placeholders, values held for removed ones are
+    /// dropped, and they stay supplied, never read from this process.
+    #[test]
+    fn credential_bindings_are_replaced_and_stored() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let policy = |specs: &[&str]| crate::credentials::CredentialPolicy {
+            credentials: specs
+                .iter()
+                .map(|spec| crate::credentials::parse_credential_flag(spec).unwrap())
+                .collect(),
+        };
+        assert!(runtime
+            .set_credential_bindings("absent", policy(&["a=A@a.example.com"]))
+            .is_err());
+        let mut spec = test_spec("rebound", true);
+        spec.allowed_hosts = vec!["example.com".into()];
+        runtime
+            .create_machine_with_credentials(
+                spec,
+                Vec::new(),
+                None,
+                None,
+                policy(&["a=A_KEY@a.example.com"]),
+            )
+            .unwrap();
+        let before = control::get_record(&runtime.db, "rebound").unwrap();
+        runtime
+            .supply_credential_values(
+                "rebound",
+                std::collections::BTreeMap::from([("a".to_string(), "va".to_string())]),
+            )
+            .unwrap();
+
+        runtime
+            .set_credential_bindings(
+                "rebound",
+                policy(&["a=A_KEY@a.example.com", "b=B_KEY@b.example.com"]),
+            )
+            .unwrap();
+        let both = control::get_record(&runtime.db, "rebound").unwrap();
+        assert_eq!(
+            both.credential_placeholders["a"],
+            before.credential_placeholders["a"]
+        );
+        assert!(both.credential_placeholders.contains_key("b"));
+        assert!(both.credentials_supplied_by_api);
+        let env = control::credential_env(&both);
+        assert!(env.iter().any(|(k, _)| k == "B_KEY"), "{env:?}");
+
+        // A host outside the machine's allow list is refused, as at create.
+        let refused = runtime
+            .set_credential_bindings("rebound", policy(&["c=C_KEY@api.github.com"]))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("network allow_hosts"), "{refused}");
+
+        runtime
+            .set_credential_bindings("rebound", policy(&["b=B_KEY@b.example.com"]))
+            .unwrap();
+        let only_b = control::get_record(&runtime.db, "rebound").unwrap();
+        assert!(!only_b.credential_placeholders.contains_key("a"));
+        // The value held for the removed binding is gone.
+        let refused = runtime
+            .supply_credential_values(
+                "rebound",
+                std::collections::BTreeMap::from([("a".to_string(), "va".to_string())]),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("no credential binding 'a'"), "{refused}");
+        // Replacing bindings never makes this process create or widen a CA:
+        // that is the boot process's job, as the machine's own user.
+        assert!(!crate::credentials::ca_dir("rebound").exists());
+        crate::credentials::forget_values("rebound");
     }
 
     #[test]
