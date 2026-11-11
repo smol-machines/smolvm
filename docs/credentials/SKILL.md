@@ -254,6 +254,24 @@ with `is not reachable under the machine's network allow_hosts`. From v1.26.0 `*
 accepted, and an IP address is refused with `must be a lowercase DNS name, optionally` followed by
 the wildcard form.
 
+## Re-verified on v1.34.1
+
+Run 2026-11-11 PT against v1.34.1 from the published release, checksum checked, with a test value
+bound to `httpbin.org`, on macOS 27.2 arm64 in a `HOME` in daily use, with four other machines and
+89 pack template disks and memory images over 1 GiB in smolvm's data directory, and on Lima
+`linux-kvm` (Ubuntu 24.04 aarch64) under a fresh `HOME`. Both hosts, every step: `result=contained`,
+the guest's `GET /headers` to `httpbin.org` came back carrying the test value and the one to
+`postman-echo.com` the placeholder, and `cleanup.sh --purge` deleted only its own machines and
+removed its state file. On macOS a `:set-header=authorization` binding sent the test value to
+`httpbin.org` on a request with no header and on one with a forged `Authorization`. On 2026-11-10 on
+macOS, the Python SDK (`smolmachines` 1.32.4) with a `CredentialSpec` carrying `value=` gave the
+guest a placeholder and sent the test value to `httpbin.org` and the placeholder elsewhere.
+
+On the used Mac the record search as the packet had it on v1.34.0 ran 5 minutes on one 8 GiB checkpoint memory image
+before it was stopped, and printed `value_in_record=ok (0)`; the search now reads 24 files and
+`verify-containment.sh` takes 2 s. A copy of the test value planted in the machine's directory made
+it fail with `actual=1`, and a file there it could not read failed it with exit 2, on both hosts.
+
 ## Re-verified on v1.34.0
 
 Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
@@ -290,7 +308,8 @@ macOS, bound to a local HTTPS server with a throwaway value: `result=contained` 
 checks, the `Cookie` and forged placeholders refused with `403`, and the request carrying the
 placeholder answered `502 smolvm credentials: upstream request failed`, because the server's
 certificate was self-signed; the server received nothing. With the disk images left out of the
-record search, `verify-containment.sh` and the rest of the procedure took 25 s.
+record search, `verify-containment.sh` and the rest of the procedure took 25 s, in a `HOME` that held
+no other machine's disks; "Re-verified on v1.34.1" has a host that did.
 
 ## What was not run
 
