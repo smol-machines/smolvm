@@ -98,6 +98,24 @@ Logs and JSON observations remain in the printed temporary directory. Add
 `--expect-bug` when testing the previous implementation to reproduce its false
 success and missing records. This test does not assert a total pool capacity limit.
 
+## Memory pressure pause and resume (Linux)
+
+`test_api_memory_pressure_resume.py` starts a dedicated server with private
+state in its own systemd user scope and moves that scope's `MemoryMax`, which
+the memory pressure guard reads as the host's available memory. It checks that
+the guard pauses a branch child (never its source) when memory runs short, and
+resumes the same execution when memory recovers:
+
+```bash
+SMOLVM_LIB_DIR=/path/to/lib SMOLVM_AGENT_ROOTFS=/path/to/agent-rootfs \
+  python3 tests/test_api_memory_pressure_resume.py /path/to/smolvm
+```
+
+It needs KVM access and a systemd user manager that delegates the memory
+controller, and skips otherwise. No image is pulled. Add `--expect-bug` when
+testing the previous implementation to reproduce its failure: every guard
+resume finds the VM lock still held by the server, and the child stays paused.
+
 ---
 
 ## Benchmarks
