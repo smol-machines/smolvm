@@ -123,6 +123,13 @@ impl VmHandle {
         }
     }
 
+    /// Stop a VM that is about to be deleted, without requiring the guest to
+    /// confirm the shutdown.
+    pub fn stop_for_delete(&mut self) -> Result<()> {
+        self.client = None;
+        self.manager.stop_for_delete()
+    }
+
     /// Let a CLI-started VM outlive the process that launched it.
     pub fn detach(self) {
         self.manager.detach();

@@ -129,15 +129,27 @@ impl State {
         // machine until these filesystems have been recovered.
         self.rollback(ops)?;
         for mount in mounts {
-            if let Err(error) = ops.freeze(mount) {
-                let rollback = self.rollback(ops).err();
-                return Err(io::Error::other(format!(
-                    "freeze {}: {error}{}",
-                    mount.target.display(),
-                    rollback.map(|e| format!("; {e}")).unwrap_or_default()
-                )));
+            match ops.freeze(mount) {
+                Ok(()) => self.frozen.push(mount.clone()),
+                // A filesystem that turned read-only after an error still
+                // lists as writable, but it accepts no more writes: nothing is
+                // left to flush and no freeze to undo, and refusing here would
+                // leave the machine impossible to stop.
+                Err(error) if error.raw_os_error() == Some(libc::EROFS) => {
+                    tracing::warn!(
+                        mount = %mount.target.display(),
+                        "filesystem is read-only after an error; shutting down without freezing it"
+                    );
+                }
+                Err(error) => {
+                    let rollback = self.rollback(ops).err();
+                    return Err(io::Error::other(format!(
+                        "freeze {}: {error}{}",
+                        mount.target.display(),
+                        rollback.map(|e| format!("; {e}")).unwrap_or_default()
+                    )));
+                }
             }
-            self.frozen.push(mount.clone());
         }
         self.complete = true;
         Ok(())
@@ -228,6 +240,7 @@ mod tests {
     struct Fake {
         calls: Vec<String>,
         fail_freeze: Option<String>,
+        read_only: Option<String>,
         fail_thaw: bool,
     }
     impl Operations for Fake {
@@ -236,6 +249,8 @@ mod tests {
                 .push(format!("freeze {}", mount.target.display()));
             if self.fail_freeze.as_deref() == mount.target.to_str() {
                 Err(io::Error::other("freeze failed"))
+            } else if self.read_only.as_deref() == mount.target.to_str() {
+                Err(io::Error::from_raw_os_error(libc::EROFS))
             } else {
                 Ok(())
             }
@@ -272,6 +287,26 @@ mod tests {
         assert_eq!(
             ops.calls,
             ["freeze /storage", "freeze /oldroot/mnt/overlay"]
+        );
+    }
+
+    #[test]
+    fn read_only_filesystem_is_left_unfrozen() {
+        let mut state = State::default();
+        let mut ops = Fake {
+            read_only: Some("/storage".into()),
+            ..Fake::default()
+        };
+        state.freeze(&mounts(), &mut ops).unwrap();
+        assert!(state.complete);
+        assert_eq!(
+            ops.calls,
+            ["freeze /storage", "freeze /oldroot/mnt/overlay"]
+        );
+        assert_eq!(state.frozen.len(), 1);
+        assert_eq!(
+            state.frozen[0].target,
+            PathBuf::from("/oldroot/mnt/overlay")
         );
     }
 

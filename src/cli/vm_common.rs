@@ -1761,7 +1761,7 @@ fn start_vm_named_with_db(
             // Normal start path. Kill any orphaned _boot-vm process left by
             // a previous failed start — if one is holding ports/sockets, this
             // fresh start would hit the same error without this cleanup.
-            kill_orphaned_boot_process(name);
+            smolvm::agent::kill_orphaned_boot_process(name);
         }
     }
 
@@ -2522,7 +2522,7 @@ pub fn stop_vm_named_with_timeout(
             // never persisted). Check the on-disk PID file and, if the
             // process is alive and its argv matches this VM's boot config
             // path, kill it so the user doesn't have to hunt it manually.
-            kill_orphaned_boot_process(name);
+            smolvm::agent::kill_orphaned_boot_process(name);
             println!("Machine '{}' is not running (state: {})", name, other);
             return Ok(());
         }
@@ -2566,58 +2566,6 @@ pub fn stop_vm_named_with_timeout(
 
     println!("Stopped machine: {}", name);
     Ok(())
-}
-
-/// Kill an orphaned `_boot-vm` process for a machine that the DB thinks is
-/// not running.
-///
-/// When `machine start` fails after spawning the `_boot-vm` child (e.g.,
-/// EADDRINUSE in the virtio-net runtime), `finalize_launch` kills the child
-/// with SIGTERM + SIGKILL. But if that cleanup itself fails (or a pre-fix
-/// binary left an orphan), this fallback catches it: read the on-disk PID
-/// file, verify the process argv matches this VM's boot-config path, and
-/// kill it. Best-effort — never fails the caller.
-fn kill_orphaned_boot_process(name: &str) {
-    let data_dir = smolvm::agent::vm_data_dir(name);
-    let pid_file = data_dir.join("agent.pid");
-    let boot_config = data_dir.join("boot-config.json");
-
-    let content = match std::fs::read_to_string(&pid_file) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let pid: i32 = match content.lines().next().and_then(|l| l.trim().parse().ok()) {
-        Some(p) => p,
-        None => return,
-    };
-
-    if !smolvm::process::is_alive(pid) {
-        // Stale PID file — clean it up.
-        let _ = std::fs::remove_file(&pid_file);
-        return;
-    }
-
-    // Verify the process is actually our _boot-vm for this VM (not a
-    // recycled PID belonging to something else).
-    if !smolvm::process::cmdline_contains(pid, &boot_config.to_string_lossy()) {
-        return;
-    }
-
-    eprintln!(
-        "Killing orphaned _boot-vm process (PID {}) for machine '{}'",
-        pid, name
-    );
-    if let Err(e) = smolvm::process::stop_vm_process(
-        pid,
-        std::time::Duration::from_secs(2),
-        smolvm::process::VM_SIGKILL_TIMEOUT,
-    ) {
-        tracing::warn!(
-            pid, error = %e,
-            "failed to kill orphaned _boot-vm process"
-        );
-    }
-    let _ = std::fs::remove_file(&pid_file);
 }
 
 /// Stop the default machine.
@@ -2910,7 +2858,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 }
                 // The machine is being deleted, so its workload has nothing
                 // to save: kill it at once rather than wait out its timeout.
-                manager.stop_with_timeout(std::time::Duration::ZERO)?;
+                manager.stop_for_delete()?;
                 if record.pid.is_some_and(smolvm::process::is_alive) {
                     return Err(smolvm::Error::agent(
                         "delete machine",
@@ -2930,7 +2878,12 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 // so reap the paused VMM before removing its record.
                 smolvm::agent::state_probe::recover_unreachable_machine(&record)?;
             }
-            _ => {}
+            _ => {
+                // A start that failed after the machine booted can leave its
+                // process alive with the record never marked running; removing
+                // the record now would orphan that process for good.
+                smolvm::agent::kill_orphaned_boot_process(name);
+            }
         }
     }
 
