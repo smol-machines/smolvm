@@ -90,10 +90,11 @@ fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
 /// the slice on demand the first time a scope names it.
 pub const VM_SLICE: &str = "smolvm.slice";
 
-/// Share of the [`VM_SLICE`] memory cap (percent) above which the memory
-/// pressure guard proactively reclaims the slice's page cache, and above which
-/// branch admission stops counting that page cache as free. One constant so
-/// the two cannot drift.
+/// Share of the [`VM_SLICE`] memory limit that page cache is kept below by
+/// proactive reclaim. Cache above this line counts as free headroom for
+/// branch admission; cache below it does not, because the kernel enforces the
+/// limit on all of `memory.current` and reaching it makes VM threads reclaim
+/// synchronously while they hold filesystem locks.
 pub const VM_SLICE_RECLAIM_TARGET_PERCENT: u64 = 85;
 
 /// Online CPUs on hosts at least this large keep a few CPUs free of VMs by
