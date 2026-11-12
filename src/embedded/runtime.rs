@@ -1089,6 +1089,9 @@ impl EmbeddedRuntime {
                 // A graceful stop already synchronized staged mounts. Do not
                 // reconnect to the now-absent agent and fail a subsequent delete.
                 self.remove_cached_handle(name)?;
+                // A start that failed after the machine booted can leave its
+                // process alive; end it before its record and disks go.
+                crate::agent::kill_orphaned_boot_process(name);
             } else if let Some(handle) = self.remove_cached_handle(name)? {
                 let mut handle = lock_handle(&handle)?;
                 if !record.staged_mounts.is_empty() {

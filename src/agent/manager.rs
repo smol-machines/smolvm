@@ -428,6 +428,42 @@ fn branchable_from(record: &crate::config::VmRecord, running_forkable: Option<bo
     running_forkable.unwrap_or_else(|| record.forkable_on_start())
 }
 
+/// Kill the VM process a machine's pid file still names although its record
+/// says the machine is not running.
+///
+/// A start that fails after the VM booted stops it again, but a guest that
+/// cannot confirm the shutdown is left alive while its record never became
+/// running. Starting, stopping or deleting such a machine must end that
+/// process first. The process is signalled only when its argv carries this
+/// machine's boot-config path, so a recycled PID is never touched.
+/// Best-effort: returns the PID it ended, if any.
+pub fn kill_orphaned_boot_process(name: &str) -> Option<Pid> {
+    let data_dir = vm_data_dir(name);
+    let pid_file = data_dir.join("agent.pid");
+    let boot_config = data_dir.join("boot-config.json");
+
+    let content = std::fs::read_to_string(&pid_file).ok()?;
+    let pid: Pid = content.lines().next()?.trim().parse().ok()?;
+
+    if !process::is_alive(pid) {
+        // Stale PID file — clean it up.
+        let _ = std::fs::remove_file(&pid_file);
+        return None;
+    }
+    if !process::cmdline_contains(pid, &boot_config.to_string_lossy()) {
+        return None;
+    }
+
+    tracing::warn!(pid, machine = name, "killing orphaned _boot-vm process");
+    if let Err(error) =
+        process::stop_vm_process(pid, Duration::from_secs(2), process::VM_SIGKILL_TIMEOUT)
+    {
+        tracing::warn!(pid, %error, "failed to kill orphaned _boot-vm process");
+    }
+    let _ = std::fs::remove_file(&pid_file);
+    Some(pid)
+}
+
 /// Reclaim CUDA transport state after a named VM process is confirmed dead.
 ///
 /// Some teardown paths terminate a VMM directly because its guest agent is
