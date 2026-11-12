@@ -17,9 +17,13 @@
 //!
 //! Nothing is mapped for a root workload, or when the share's root already
 //! belongs to the workload user and group, or for anything that is not a
-//! virtio-fs share (a staged copy, a disk volume, the cache disk). A share that
-//! cannot be mapped is bound as it is, with a warning: the workload starts
-//! either way.
+//! virtio-fs share (a staged copy, a disk volume, the cache disk). Nothing is
+//! mapped for a share whose root belongs to root either: a host that runs
+//! smolvm as root stores each file under the id the workload used, the way a
+//! container bind mount does, and directories prepared for that keep working;
+//! a host user that is not root could not write to such a directory anyway. A
+//! share that cannot be mapped is bound as it is, with a warning: the workload
+//! starts either way.
 //!
 //! The swap is exact both ways, which has one visible edge: a file the host
 //! records as owned by the workload's uid shows up as owned by the host uid
@@ -45,15 +49,16 @@ struct OwnerMapping {
 /// The mapping a workload running as `workload` (uid, gid) needs for a share
 /// whose root belongs to `share` (uid, gid), or `None` when it is bound as it is.
 ///
-/// A root workload reads and writes anything already, and a share whose root
-/// has the workload's user and group needs nothing. Swapping the group as well
+/// A root workload reads and writes anything already, a share whose root has
+/// the workload's user and group needs nothing, and a share whose root belongs
+/// to root keeps the host's ids as they are. Swapping the group as well
 /// gives new files the group the host's own files have, so group permissions
 /// keep meaning what they mean on the host.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn owner_mapping(share: (u32, u32), workload: (u32, u32)) -> Option<OwnerMapping> {
     let (share_uid, share_gid) = share;
     let (uid, gid) = workload;
-    if uid == 0 || uid == u32::MAX || share_uid == u32::MAX {
+    if uid == 0 || uid == u32::MAX || share_uid == 0 || share_uid == u32::MAX {
         return None;
     }
     let uid = (uid != share_uid).then_some((share_uid, uid));
@@ -523,11 +528,14 @@ mod tests {
                 gid: None,
             })
         );
-        // A root-owned share is mapped like any other.
+        // A root-owned share keeps the host's ids, whatever its group.
+        assert_eq!(owner_mapping((0, 0), (1000, 1000)), None);
+        assert_eq!(owner_mapping((0, 20), (1000, 1000)), None);
+        // Only the owner decides that: a group of 0 is swapped like any other.
         assert_eq!(
-            owner_mapping((0, 0), (1000, 1000)),
+            owner_mapping((501, 0), (1000, 1000)),
             Some(OwnerMapping {
-                uid: Some((0, 1000)),
+                uid: Some((501, 1000)),
                 gid: Some((0, 1000)),
             })
         );
