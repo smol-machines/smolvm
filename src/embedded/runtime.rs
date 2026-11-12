@@ -2146,6 +2146,7 @@ mod tests {
                         "github=GH_TOKEN@github.com",
                     )
                     .unwrap()],
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -2164,6 +2165,44 @@ mod tests {
         crate::credentials::forget_values("bound");
     }
 
+    /// Bindings set through the embedder carry no request rules; the
+    /// machine's own must survive the change.
+    #[test]
+    fn credential_bindings_change_keeps_request_rules() {
+        use smolvm_protocol::request_rules::{Action, RequestRule};
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let binding = |flag: &str| crate::credentials::parse_credential_flag(flag).unwrap();
+        let rule = RequestRule::parse(Action::Deny, "DELETE github.com/repos/*").unwrap();
+        let mut spec = test_spec("ruled", true);
+        spec.allowed_hosts = vec!["github.com".into()];
+        runtime
+            .create_machine_with_credentials(
+                spec,
+                Vec::new(),
+                None,
+                None,
+                crate::credentials::CredentialPolicy {
+                    credentials: vec![binding("github=GH_TOKEN@github.com")],
+                    request_rules: vec![rule.clone()],
+                },
+            )
+            .unwrap();
+
+        let set = runtime
+            .set_credential_bindings(
+                "ruled",
+                crate::credentials::CredentialPolicy {
+                    credentials: vec![binding("gh=GH2@github.com")],
+                    ..Default::default()
+                },
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+        let policy = set.record.credential_policy.unwrap();
+        assert_eq!(policy.credentials[0].name, "gh");
+        assert_eq!(policy.request_rules, vec![rule]);
+    }
+
     #[test]
     fn credential_bindings_change_on_a_stopped_machine_and_keep_held_values() {
         let runtime = EmbeddedRuntime::with_db(test_db());
@@ -2172,6 +2211,7 @@ mod tests {
                 .iter()
                 .map(|f| crate::credentials::parse_credential_flag(f).unwrap())
                 .collect(),
+            ..Default::default()
         };
         let one = |binding: &str, value: &str| {
             std::collections::BTreeMap::from([(binding.to_string(), value.to_string())])
