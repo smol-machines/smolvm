@@ -3406,7 +3406,87 @@ fn require_resize_memory_controller(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// What the VM slice holds and may hold, read from its cgroup files.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmSliceMemory {
+    /// `memory.high` (`None` = no limit).
+    high_bytes: Option<u64>,
+    /// `memory.max` (`None` = no limit).
+    max_bytes: Option<u64>,
+    /// `memory.current`, page cache included.
+    current_bytes: u64,
+    /// Page cache the kernel can drop: `file` minus `shmem` from `memory.stat`
+    /// (guest RAM is shmem and counts under `file`).
+    reclaimable_cache_bytes: u64,
+}
+
+/// Host memory still available to VMs once the VM slice's own limit is
+/// counted, in the units `available_bytes` uses (host memory, the reserve the
+/// slice keeps out of reach included), or `None` when the slice has no limit.
+///
+/// The slice is used up to `limit = min(high, max)`; past that the kernel
+/// throttles or reclaims inside VM threads that may hold filesystem locks, and
+/// the node's own API stalls behind them. Page cache counts as free only above
+/// [`crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT`] of the limit,
+/// where proactive reclaim keeps it; below that line the kernel still charges it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn vm_slice_available_bytes(total_bytes: u64, slice: &VmSliceMemory) -> Option<u64> {
+    let limit = match (slice.high_bytes, slice.max_bytes) {
+        (Some(high), Some(max)) => high.min(max),
+        (Some(limit), None) | (None, Some(limit)) => limit,
+        (None, None) => return None,
+    };
+    let reclaim_line = (u128::from(limit)
+        * u128::from(crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT)
+        / 100) as u64;
+    let without_cache = slice
+        .current_bytes
+        .saturating_sub(slice.reclaimable_cache_bytes);
+    let used = without_cache.max(slice.current_bytes.min(reclaim_line));
+    // Memory outside the slice's hard cap is what the host keeps for itself;
+    // callers subtract their own reserve from the result, so add it back here.
+    let outside_slice = total_bytes.saturating_sub(slice.max_bytes.unwrap_or(limit));
+    Some(limit.saturating_sub(used).saturating_add(outside_slice))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cgroup_limit(contents: &str) -> Option<Option<u64>> {
+    match contents.trim() {
+        "max" => Some(None),
+        value => value.parse::<u64>().ok().map(Some),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_memory_stat_field(contents: &str, field: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == field).then(|| value.trim().parse::<u64>().ok())?
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_vm_slice_memory() -> Option<VmSliceMemory> {
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(crate::systemd_scope::VM_SLICE);
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+    let stat = read("memory.stat")?;
+    let file = parse_memory_stat_field(&stat, "file")?;
+    let shmem = parse_memory_stat_field(&stat, "shmem").unwrap_or(0);
+    Some(VmSliceMemory {
+        high_bytes: parse_cgroup_limit(&read("memory.high")?)?,
+        max_bytes: parse_cgroup_limit(&read("memory.max")?)?,
+        current_bytes: read("memory.current")?.trim().parse().ok()?,
+        reclaimable_cache_bytes: file.saturating_sub(shmem),
+    })
+}
+
 /// Report effective host memory available to SmolVM.
+///
+/// On a node that runs VMs in [`crate::systemd_scope::VM_SLICE`], this is also
+/// bounded by that slice's limit: VMs (branch children included) are charged
+/// there, not to this process's cgroup, and host `MemAvailable` counts the
+/// node's own page cache as free while the slice is already at its limit.
 pub fn host_memory_stats() -> Option<HostMemoryStats> {
     #[cfg(target_os = "linux")]
     {
@@ -3416,6 +3496,11 @@ pub fn host_memory_stats() -> Option<HostMemoryStats> {
                 stats.total_bytes = stats.total_bytes.min(limit);
                 stats.available_bytes = stats.available_bytes.min(headroom);
             }
+        }
+        if let Some(available) = read_vm_slice_memory()
+            .and_then(|slice| vm_slice_available_bytes(stats.total_bytes, &slice))
+        {
+            stats.available_bytes = stats.available_bytes.min(available);
         }
         Some(stats)
     }
@@ -6027,6 +6112,77 @@ mod tests {
         let stats = parse_host_meminfo(sample).expect("parse meminfo");
         assert_eq!(stats.total_bytes, 16_384_000 * 1024);
         assert_eq!(stats.available_bytes, 4_096_000 * 1024);
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn slice(high: Option<u64>, max: Option<u64>, current: u64, cache: u64) -> VmSliceMemory {
+        VmSliceMemory {
+            high_bytes: high.map(|g| g * GIB),
+            max_bytes: max.map(|g| g * GIB),
+            current_bytes: current * GIB,
+            reclaimable_cache_bytes: cache * GIB,
+        }
+    }
+
+    #[test]
+    fn vm_slice_without_a_limit_does_not_bound_available_memory() {
+        assert_eq!(
+            vm_slice_available_bytes(755 * GIB, &slice(None, None, 700, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn vm_slice_at_its_throttle_has_no_headroom_however_much_the_host_caches() {
+        // x86-xfs-worker-0 on 2026-11-12: high 702 GiB, max 710 GiB on a 755 GiB
+        // host, the slice at its throttle while MemAvailable still looked large.
+        let available = vm_slice_available_bytes(755 * GIB, &slice(Some(702), Some(710), 702, 0));
+        assert_eq!(
+            available,
+            Some(45 * GIB),
+            "only the host's own reserve is left"
+        );
+    }
+
+    #[test]
+    fn vm_slice_page_cache_counts_as_free_only_above_the_reclaim_line() {
+        let limit = 700;
+        let line = limit * crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT / 100;
+        // 680 GiB used, 300 GiB of it cache: the cache above the line is free,
+        // the cache below it is not.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 680, 300)).unwrap();
+        assert_eq!(available, (limit - line) * GIB);
+        // Mostly guest RAM: what is not cache counts in full.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 680, 10)).unwrap();
+        assert_eq!(available, (limit - 670) * GIB);
+        // Below the line nothing changes: memory.current is what counts.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 200, 150)).unwrap();
+        assert_eq!(available, (limit - 200) * GIB);
+    }
+
+    #[test]
+    fn vm_slice_uses_memory_max_when_memory_high_is_unlimited() {
+        let available = vm_slice_available_bytes(755 * GIB, &slice(None, Some(710), 600, 0));
+        assert_eq!(available, Some((710 - 600 + 45) * GIB));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_files_parse() {
+        assert_eq!(parse_cgroup_limit("max\n"), Some(None));
+        assert_eq!(
+            parse_cgroup_limit("753583259648\n"),
+            Some(Some(753_583_259_648))
+        );
+        assert_eq!(parse_cgroup_limit("bogus"), None);
+        let stat = "anon 10737418240\nfile 109521666048\nshmem 78383153152\nfile_mapped 1\n";
+        assert_eq!(parse_memory_stat_field(stat, "file"), Some(109_521_666_048));
+        assert_eq!(parse_memory_stat_field(stat, "shmem"), Some(78_383_153_152));
+        assert_eq!(parse_memory_stat_field(stat, "file_dirty"), None);
     }
 
     #[cfg(target_os = "linux")]
