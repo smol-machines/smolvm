@@ -914,13 +914,85 @@ pub fn spawn_egress_flush(
     path: std::path::PathBuf,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
-    std::thread::spawn(move || loop {
-        let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if let Err(e) = write_egress_telemetry_at(&path, bytes) {
-            tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
+    std::thread::spawn(move || {
+        let mut file = SampleFile::new(path.clone());
+        loop {
+            let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = write_egress_telemetry(&mut file, bytes) {
+                tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
         }
-        std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
     });
+}
+
+/// Bytes every per-VM sample file is padded to with trailing spaces, which
+/// JSON and integer parsing both ignore. A shorter sample then overwrites a
+/// longer one whole, with no truncate between.
+const SAMPLE_FILE_PAD: usize = 1024;
+
+/// A small per-VM sample file a thread in the VM subprocess rewrites every
+/// few seconds, kept open and overwritten in place.
+///
+/// These files used to be written to a temp file renamed over the old one.
+/// On XFS each such rename frees the replaced inode through the allocation
+/// group's AGI buffer and holds the directory's lock meanwhile; on 2026-11-12
+/// a VMM throttled for memory inside an XFS create held that AGI lock, every
+/// VMM's sampler queued on it holding its VM directory's lock, and serve
+/// blocked opening files in those directories. An in-place overwrite of
+/// already allocated bytes creates, frees and renames nothing. One `write` of
+/// the whole padded buffer is atomic against a reader on XFS (buffered reads
+/// and writes take the inode's I/O lock); elsewhere a torn read fails to parse
+/// and reads as no sample, as a missing file does.
+struct SampleFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    buf: Vec<u8>,
+}
+
+impl SampleFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: None,
+            buf: Vec::with_capacity(SAMPLE_FILE_PAD),
+        }
+    }
+
+    /// Replace the file's content with `content`.
+    fn write(&mut self, content: &[u8]) -> std::io::Result<()> {
+        self.buf.clear();
+        self.buf.extend_from_slice(content);
+        let len = self.buf.len().max(SAMPLE_FILE_PAD);
+        self.buf.resize(len, b' ');
+        if self.file.is_none() {
+            self.file = Some(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&self.path)?,
+            );
+        }
+        let file = self.file.as_mut().expect("opened above");
+        let written = overwrite_whole(file, &self.buf);
+        if written.is_err() {
+            // Reopen next time (the file may have been removed).
+            self.file = None;
+        }
+        written
+    }
+}
+
+fn overwrite_whole(file: &mut std::fs::File, buf: &[u8]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(buf)?;
+    // Only a file left longer by an older writer needs trimming.
+    if file.metadata()?.len() > buf.len() as u64 {
+        file.set_len(buf.len() as u64)?;
+    }
+    Ok(())
 }
 
 /// Open TCP flows of a running machine, as last flushed by its network stack.
@@ -963,9 +1035,8 @@ impl EgressFlowSummary {
 const EGRESS_FLOWS_STALE_SECS: u64 = 120;
 
 /// Spawn a detached thread (in the VM subprocess) that rewrites the per-VM
-/// open-flow summary file from `slot` every [`EGRESS_FLUSH_SECS`]. Each write
-/// goes to a temp file renamed over the old one, so serve never reads a torn
-/// summary. Best-effort, like [`spawn_egress_flush`].
+/// open-flow summary file from `slot` every [`EGRESS_FLUSH_SECS`], in place
+/// (see [`SampleFile`]). Best-effort, like [`spawn_egress_flush`].
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn spawn_egress_flows_flush(
     path: std::path::PathBuf,
@@ -973,29 +1044,30 @@ pub fn spawn_egress_flows_flush(
 ) {
     let spawned = std::thread::Builder::new()
         .name("smolvm-egress-flows".into())
-        .spawn(move || loop {
+        .spawn(move || {
+            let mut file = SampleFile::new(path.clone());
+            loop {
             let latest = slot
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             if let Some((at, summary)) = latest {
                 if let Err(e) =
-                    write_egress_flows(&path, &EgressFlowSummary::from_network(at, &summary))
+                    write_egress_flows(&mut file, &EgressFlowSummary::from_network(at, &summary))
                 {
                     tracing::debug!(path = ?path, error = %e, "egress flow summary flush failed");
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
+            }
         });
     if let Err(e) = spawned {
         tracing::debug!(error = %e, "egress flow summary flusher did not start");
     }
 }
 
-fn write_egress_flows(path: &std::path::Path, summary: &EgressFlowSummary) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(summary)?)?;
-    std::fs::rename(&tmp, path)
+fn write_egress_flows(file: &mut SampleFile, summary: &EgressFlowSummary) -> std::io::Result<()> {
+    file.write(&serde_json::to_vec(summary)?)
 }
 
 /// Read a running machine's open-flow summary written by
@@ -1109,7 +1181,7 @@ impl GuestPressure {
 
 /// Spawn a detached thread (in the VM subprocess) that asks the guest agent
 /// for its pressure stalls every [`PRESSURE_SAMPLE_SECS`] and rewrites `path`
-/// with the answer (temp file + rename, so serve never reads a torn sample).
+/// with the answer, in place (see [`SampleFile`]).
 ///
 /// Best-effort, like [`spawn_egress_flows_flush`]: a guest that is not up yet
 /// or is paused costs one short timeout and the sample is retried next tick.
@@ -1121,6 +1193,7 @@ pub fn spawn_pressure_sampler(vsock_socket: PathBuf, path: PathBuf) {
         .name("smolvm-pressure".into())
         .spawn(move || {
             let mut client: Option<super::AgentClient> = None;
+            let mut file = SampleFile::new(path.clone());
             loop {
                 std::thread::sleep(Duration::from_secs(PRESSURE_SAMPLE_SECS));
                 let connected = match client.as_mut() {
@@ -1140,7 +1213,7 @@ pub fn spawn_pressure_sampler(vsock_socket: PathBuf, path: PathBuf) {
                     Ok(status) => {
                         let sample =
                             GuestPressure::from_status(std::time::SystemTime::now(), status);
-                        if let Err(e) = write_pressure(&path, &sample) {
+                        if let Err(e) = write_pressure(&mut file, &sample) {
                             tracing::debug!(path = ?path, error = %e, "pressure sample write failed");
                         }
                     }
@@ -1175,10 +1248,8 @@ fn sample_pressure(
     }
 }
 
-fn write_pressure(path: &Path, sample: &GuestPressure) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(sample)?)?;
-    std::fs::rename(&tmp, path)
+fn write_pressure(file: &mut SampleFile, sample: &GuestPressure) -> std::io::Result<()> {
+    file.write(&serde_json::to_vec(sample)?)
 }
 
 /// Read a running machine's guest pressure sample written by
@@ -1242,7 +1313,8 @@ mod pressure_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(PRESSURE_FILE);
         let sample = GuestPressure::from_status(std::time::SystemTime::now(), status());
-        write_pressure(&path, &sample).unwrap();
+        write_pressure(&mut SampleFile::new(path.clone()), &sample).unwrap();
+        // Rewritten in place: no staging file, no rename.
         assert!(!path.with_extension("tmp").exists());
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -1254,21 +1326,58 @@ mod pressure_tests {
             None
         );
     }
+
+    #[test]
+    fn a_sample_file_is_overwritten_in_place_and_a_shorter_value_reads_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress");
+        let mut file = SampleFile::new(path.clone());
+        file.write(b"123456789").unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        file.write(b"42").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.len(), SAMPLE_FILE_PAD);
+        assert_eq!(text.trim().parse::<u64>().unwrap(), 42);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                inode,
+                "same inode, no rename"
+            );
+        }
+        // JSON samples parse with the padding.
+        let sample = GuestPressure::from_status(std::time::SystemTime::now(), status());
+        write_pressure(&mut file, &sample).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            parse_guest_pressure(&text, std::time::SystemTime::now()),
+            Some(sample)
+        );
+        // A file left longer by an older writer is trimmed to the padded size.
+        std::fs::write(&path, vec![b'9'; SAMPLE_FILE_PAD * 2]).unwrap();
+        let mut fresh = SampleFile::new(path.clone());
+        fresh.write(b"7").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "7");
+    }
 }
 
-/// Staging path the flusher writes before renaming over the telemetry file.
+/// Staging path older flushers wrote before renaming over the telemetry file;
+/// still removed with it.
 fn egress_telemetry_staging(path: &Path) -> PathBuf {
     path.with_extension("tmp")
 }
 
-/// Replace the telemetry file with `bytes` atomically (write a staging file,
-/// then rename it over the target), so a concurrent reader sees either the
-/// previous value or the new one, never a truncated or partial file.
+/// Replace the telemetry file's value with `bytes`, in place (see
+/// [`SampleFile`]).
 #[cfg_attr(not(unix), allow(dead_code))]
-fn write_egress_telemetry_at(path: &Path, bytes: u64) -> std::io::Result<()> {
-    let staging = egress_telemetry_staging(path);
-    std::fs::write(&staging, bytes.to_string())?;
-    std::fs::rename(&staging, path)
+fn write_egress_telemetry(file: &mut SampleFile, bytes: u64) -> std::io::Result<()> {
+    file.write(bytes.to_string().as_bytes())
 }
 
 /// Drop the previous VMM process's egress total before a new one launches.
@@ -4845,7 +4954,7 @@ mod tests {
                 oldest_outbound_dest: Some("198.51.100.7:3333".parse().unwrap()),
             },
         );
-        write_egress_flows(&path, &summary).unwrap();
+        write_egress_flows(&mut SampleFile::new(path.clone()), &summary).unwrap();
         assert!(!path.with_extension("tmp").exists());
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"oldestOutboundDest\":\"198.51.100.7:3333\""));
@@ -5184,7 +5293,7 @@ mod tests {
         let egress = temp.path().join(EGRESS_TELEMETRY_FILE);
 
         // The previous VMM's final flush is still on disk after it stopped.
-        write_egress_telemetry_at(&egress, 1_000_000).unwrap();
+        write_egress_telemetry(&mut SampleFile::new(egress.clone()), 1_000_000).unwrap();
         assert_eq!(read_egress_telemetry_at(&egress), Some(1_000_000));
 
         // A new launch clears it, so before the new VMM's first flush there is
@@ -5193,7 +5302,7 @@ mod tests {
         assert_eq!(read_egress_telemetry_at(&egress), None);
 
         // After the first flush, only the new run's bytes are reported.
-        write_egress_telemetry_at(&egress, 42).unwrap();
+        write_egress_telemetry(&mut SampleFile::new(egress.clone()), 42).unwrap();
         assert_eq!(read_egress_telemetry_at(&egress), Some(42));
         assert!(!egress_telemetry_staging(&egress).exists());
 
