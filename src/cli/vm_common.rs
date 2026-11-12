@@ -719,12 +719,9 @@ pub(crate) fn warn_hosts_blocked_by_private_floor(
 
 /// [`warn_hosts_blocked_by_private_floor`] for a stored machine.
 pub(crate) fn warn_record_hosts_blocked_by_private_floor(record: &VmRecord) {
-    warn_hosts_blocked_by_private_floor(
-        record.block_private.as_deref(),
-        &record.egress_rules,
-        record.dns_filter_hosts.as_deref(),
-        record.credential_policy.as_ref(),
-    );
+    for host in smolvm::network::private_floor::record_hosts_blocked_by_private_floor(record) {
+        eprintln!("Warning: {}", host.warning());
+    }
 }
 
 /// The record `machine create` would write for these parameters, through

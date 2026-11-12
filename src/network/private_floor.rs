@@ -2,8 +2,9 @@
 //!
 //! `--allow-host` and a credential's host say where a machine should connect,
 //! but only `--allow-private` reopens a private range. A name that resolves
-//! into one is refused at connect time with nothing to say why, so the CLI
-//! asks here before it boots the machine.
+//! into one is refused at connect time with nothing to say why, so every start
+//! asks here first: the CLI prints the answer, the API and embedded starts log
+//! it.
 
 use std::net::IpAddr;
 
@@ -93,6 +94,30 @@ pub fn hosts_blocked_by_private_floor(
             )
         })
         .collect()
+}
+
+/// [`hosts_blocked_by_private_floor`] for a stored machine, resolving its
+/// names now.
+pub fn record_hosts_blocked_by_private_floor(record: &crate::config::VmRecord) -> Vec<BlockedHost> {
+    hosts_blocked_by_private_floor(
+        record.block_private.as_deref(),
+        &record.egress_rules,
+        record.dns_filter_hosts.as_deref(),
+        record.credential_policy.as_ref(),
+        crate::smolfile::resolve_host_to_cidrs,
+    )
+}
+
+/// Log the warning for each host `record` names that its private floor keeps
+/// closed. A start through the API or an embedding program has no terminal to
+/// print to, so the log is where its operator finds out.
+///
+/// Silent on the strict floor `serve` runs with by default: nothing a machine
+/// sets reopens a private range there, so the advice would be wrong.
+pub fn log_record_hosts_blocked_by_private_floor(name: &str, record: &crate::config::VmRecord) {
+    for host in record_hosts_blocked_by_private_floor(record) {
+        tracing::warn!(machine = %name, host = %host.host, "{}", host.warning());
+    }
 }
 
 #[cfg(test)]
