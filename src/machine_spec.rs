@@ -438,6 +438,9 @@ pub struct RestoredState {
     /// The bindings came with the artifact, so their values must be supplied
     /// by the caller, never read from this host's environment.
     pub credentials_from_artifact: bool,
+    /// The captured machine keeps a `local:` image on its storage disk rather
+    /// than mounting host-backed layers.
+    pub packed_image_on_storage: bool,
 }
 
 /// A [`CreateSpec`] with every rule applied: the machine's settings, ready to
@@ -1373,6 +1376,8 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                         .credential_policy
                         .as_ref()
                         .is_some_and(|policy| !policy.is_empty()),
+                    packed_image_on_storage:
+                        crate::portable_checkpoint::checkpoint_image_on_storage(checkpoint),
                 }),
             }
         }
@@ -1643,7 +1648,7 @@ impl ResolvedSpec {
             credentials_supplied_by_api,
             ephemeral,
             source_smolmachine: None,
-            packed_image_on_storage: false,
+            packed_image_on_storage: restored.packed_image_on_storage,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
