@@ -208,17 +208,32 @@ fn canonical_segments(decoded: &str) -> Vec<&str> {
     out
 }
 
+/// Whether `glob` matches the whole canonical `path`. The path is the
+/// guest's, so this never backtracks: it takes time proportional to glob
+/// segments times path segments, however many `**` the glob has.
 fn glob_matches(glob: &str, path: &str) -> bool {
-    fn go(g: &[&str], p: &[&str]) -> bool {
-        match g.split_first() {
-            None => p.is_empty(),
-            Some((&"**", rest)) => (0..=p.len()).any(|n| go(rest, &p[n..])),
-            Some((&"*", rest)) => !p.is_empty() && go(rest, &p[1..]),
-            Some((lit, rest)) => p.first() == Some(lit) && go(rest, &p[1..]),
+    let decoded = percent_decode(path);
+    let path = canonical_segments(&decoded);
+    // `ends[i]`: the glob segments so far can match exactly `path[..i]`.
+    let mut ends = vec![false; path.len() + 1];
+    ends[0] = true;
+    for segment in glob.split('/').filter(|s| !s.is_empty()) {
+        let mut next = vec![false; path.len() + 1];
+        if segment == "**" {
+            // Zero or more segments: every position at or after a reachable one.
+            let mut reachable = false;
+            for (i, end) in ends.iter().enumerate() {
+                reachable |= end;
+                next[i] = reachable;
+            }
+        } else {
+            for (i, part) in path.iter().enumerate() {
+                next[i + 1] = ends[i] && (segment == "*" || segment == *part);
+            }
         }
+        ends = next;
     }
-    let glob: Vec<&str> = glob.split('/').filter(|s| !s.is_empty()).collect();
-    go(&glob, &canonical_segments(&percent_decode(path)))
+    ends[path.len()]
 }
 
 #[cfg(test)]
@@ -295,6 +310,42 @@ mod tests {
         let rules = [allow("a.com/get")];
         assert_eq!(decide(&rules, "a.com", "GET", "/get?a=1"), Decision::Allow);
         assert!(is_deny(decide(&rules, "a.com", "GET", "/get/more")));
+    }
+
+    #[test]
+    fn double_stars_match_any_run_of_segments() {
+        let rules = [allow("a.com/a/**/b/**/c")];
+        for p in [
+            "/a/b/c",
+            "/a/x/b/c",
+            "/a/b/y/z/c",
+            "/a/x/b/b/c",
+            "/a/b/c/b/c",
+        ] {
+            assert_eq!(decide(&rules, "a.com", "GET", p), Decision::Allow, "{p}");
+        }
+        for p in ["/a/c", "/b/c", "/a/b", "/a/b/c/d", "/x/a/b/c"] {
+            assert!(is_deny(decide(&rules, "a.com", "GET", p)), "{p}");
+        }
+        let rules = [allow("a.com/**/**")];
+        assert_eq!(decide(&rules, "a.com", "GET", "/"), Decision::Allow);
+        assert_eq!(decide(&rules, "a.com", "GET", "/x/y"), Decision::Allow);
+    }
+
+    /// The path is the guest's, so matching must not backtrack: a long path
+    /// against a rule with several `**` has to be decided promptly.
+    #[test]
+    fn a_long_path_against_many_double_stars_is_decided_promptly() {
+        let (done, decided) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rules = [deny("a.com/**/a/**/a/**/a/**/a/**/x")];
+            let path = "/a".repeat(20_000);
+            let _ = done.send(decide(&rules, "a.com", "GET", &path));
+        });
+        let decision = decided
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("matching a long path must not backtrack");
+        assert_eq!(decision, Decision::Allow, "no rule path matches");
     }
 
     #[test]
