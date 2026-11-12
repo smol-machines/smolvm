@@ -2027,6 +2027,7 @@ mod tests {
                         "github=GH_TOKEN@github.com",
                     )
                     .unwrap()],
+                    ..Default::default()
                 },
             )
             .unwrap();

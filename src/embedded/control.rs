@@ -241,8 +241,10 @@ impl MachineSpec {
         if let Some(policy) = credentials.filter(|p| !p.is_empty()) {
             // A credential only ever travels over the network the machine has; it
             // grants none. Refuse rather than create a machine whose requests
-            // could never be made.
-            let has_egress = spec.resources.network
+            // could never be made. Request rules alone need no network:
+            // without one they have nothing to apply to.
+            let has_egress = policy.credentials.is_empty()
+                || spec.resources.network
                 || !spec.allowed_hosts.is_empty()
                 || spec
                     .resources
@@ -258,6 +260,7 @@ impl MachineSpec {
             let mut merged = policy.clone();
             if let Some(from_spec) = create.credentials.take() {
                 merged.credentials.extend(from_spec.credentials);
+                merged.request_rules.extend(from_spec.request_rules);
             }
             create.credentials = Some(merged);
             // Values come only from `supply_credential_values`, never from this
@@ -1154,6 +1157,7 @@ mod tests {
                 hosts.join(",")
             ))
             .unwrap()],
+            ..Default::default()
         }
     }
 
@@ -1344,6 +1348,42 @@ mod tests {
             Some(&header_policy())
         )
         .is_err());
+    }
+
+    #[test]
+    fn request_rules_alone_never_enable_the_network() {
+        use smolvm_protocol::request_rules::{Action, RequestRule};
+        let rules_only = crate::credentials::CredentialPolicy {
+            credentials: Vec::new(),
+            request_rules: vec![RequestRule::parse(Action::Deny, "POST a.com").unwrap()],
+        };
+        let db = test_db();
+        let mut spec = test_spec("ruled", false);
+        spec.credentials = Some(rules_only.clone());
+        create_vm(&db, &spec).unwrap();
+        let record = get_record(&db, "ruled").unwrap();
+        assert!(!record.network, "request rules do not imply networking");
+        assert_eq!(record.credential_policy, Some(rules_only.clone()));
+
+        let spec = test_spec("ruled-offline", false);
+        create_vm_with_workload(&db, &spec, Vec::new(), None, None, Some(&rules_only))
+            .expect("rules without egress are accepted, like the CLI and API");
+        assert!(!get_record(&db, "ruled-offline").unwrap().network);
+
+        // An allow list gives the machine egress; its rules must be enforced there.
+        let mut spec = test_spec("ruled-scoped", false);
+        spec.allowed_hosts = vec!["a.com".into()];
+        create_vm_with_workload(&db, &spec, Vec::new(), None, None, Some(&rules_only)).unwrap();
+        let record = get_record(&db, "ruled-scoped").unwrap();
+        let plan = record.launch_network_plan();
+        assert!(plan.outbound);
+        assert_eq!(
+            plan.backend,
+            crate::network::EffectiveNetworkBackend::VirtioNet
+        );
+        assert!(
+            crate::credentials::CredentialLaunch::for_record("ruled-scoped", &record).is_some()
+        );
     }
 
     #[test]

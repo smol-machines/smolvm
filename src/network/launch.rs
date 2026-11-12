@@ -116,10 +116,11 @@ pub fn plan_launch_network(
 }
 
 /// [`plan_launch_network`] for a machine that may also carry a credential
-/// policy. Credential substitution is enforced by the host-side virtio-net
-/// stack, so a policy implies networking and steers the default backend to
-/// virtio-net exactly as an egress allow-list does; an explicit backend choice
-/// is still honored (TSI then needs the libkrun interception hook).
+/// policy; `has_credentials` is its `CredentialPolicy::steers_network`. The
+/// host-side virtio-net stack enforces the policy, so it steers the default
+/// backend to virtio-net as an egress allow-list does, and a binding also
+/// implies networking. An explicit TSI is honored for bindings (it needs the
+/// libkrun interception hook) and refused at launch for request rules.
 pub fn plan_launch_network_with(
     resources: &VmResources,
     dns_filter_hosts: Option<&[String]>,

@@ -724,6 +724,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_refresh_hosts.as_deref(),
         port_mappings.len(),
     )?;
+    if let Some(credentials) = credentials {
+        credentials.check_backend(resources.network_backend)?;
+    }
     if let Some(endpoint) = external_interceptor {
         validate_external_interceptor(
             endpoint,
@@ -1167,7 +1170,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             resources,
             *dns_filter_enabled,
             port_mappings.len(),
-            credentials.is_some() || external_interceptor.is_some(),
+            credentials.is_some_and(|c| c.policy.steers_network(resources.network))
+                || external_interceptor.is_some(),
         );
         // Lives until the VM exits: dropping it would stop substitution.
         let mut _credential_interceptor: Option<smolvm_credentials::Interceptor> = None;
@@ -1297,6 +1301,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     guest_network.intercept = Some(smolvm_network::StreamInterception::Https(
                         interceptor.endpoint(),
                     ));
+                    // HTTP/3 over UDP would skip the rules the interceptor enforces.
+                    guest_network.deny_quic = !credentials.policy.request_rules.is_empty();
                     _credential_interceptor = Some(interceptor);
                 }
                 if let Some(endpoint) = external_interceptor {
@@ -2787,7 +2793,7 @@ pub fn validate_external_interceptor(
     } else if resources.network_name.is_some() || has_pod_network {
         Some("external interception cannot use named or pod networks")
     } else if has_credentials {
-        Some("external interception cannot be combined with built-in credential bindings")
+        Some("external interception cannot be combined with built-in credential bindings or request rules")
     } else {
         None
     };

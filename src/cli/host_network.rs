@@ -96,7 +96,7 @@ impl HostNetwork {
                 // bundle (image roots + the machine CA); the two cannot both win.
                 return Err(smolvm::Error::config(
                     "--trust-host-certs",
-                    "cannot be combined with --credential yet: both set the machine's trust bundle",
+                    "cannot be combined with --credential or request rules yet: both set the machine's trust bundle",
                 ));
             }
             let pem = host_trust_bundle()?;

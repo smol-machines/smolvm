@@ -449,11 +449,11 @@ pub fn build_create_spec(
             allowed_hosts: (!sf_allow_hosts.is_empty()).then_some(sf_allow_hosts),
             block_private,
             egress_rules,
-            credentials: (!network.credentials.is_empty()).then_some(
-                smolvm::credentials::CredentialPolicy {
+            credentials: (!network.credentials.is_empty() || !network.requests.is_empty())
+                .then_some(smolvm::credentials::CredentialPolicy {
                     credentials: network.credentials,
-                },
-            ),
+                    request_rules: network.requests,
+                }),
             credentials_supplied_only: false,
             published_sockets: Vec::new(),
             gpu: sf_gpu.unwrap_or(false),
@@ -760,7 +760,13 @@ pub fn resolve_pack_config_with_defaults(
         smolfile_path,
     } = inputs;
     let sf = match smolfile_path {
-        Some(path) => load(&path)?,
+        Some(path) => {
+            let sf = load(&path)?;
+            if sf.network.as_ref().is_some_and(|n| !n.requests.is_empty()) {
+                tracing::warn!("pack create drops the Smolfile's [[network.requests]] rules");
+            }
+            sf
+        }
         None => {
             return Ok(PackConfig {
                 image: cli_image,
@@ -1059,6 +1065,23 @@ init = ["echo init"]
                 ("169.254.169.254/32", smolvm_protocol::RuleAction::Deny),
             ]
         );
+    }
+
+    #[test]
+    fn network_requests_become_request_rules_without_implying_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[[network.requests]]\naction = \"allow\"\nhosts = [\"a.com\"]\nmethods = [\"GET\"]\n",
+        )
+        .unwrap();
+
+        let params = build_from_smolfile(path).unwrap();
+        assert!(!params.net, "a request rule never opens the network");
+        let policy = params.credential_policy.expect("rules recorded");
+        assert!(policy.credentials.is_empty());
+        assert_eq!(policy.request_rules[0].hosts, vec!["a.com"]);
     }
 
     #[test]

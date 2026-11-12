@@ -144,6 +144,8 @@ pub struct VirtioPollConfig {
     pub host_service: Option<crate::GatewayHostService>,
     /// Host interceptor and the outbound streams routed through it.
     pub intercept: Option<crate::StreamInterception>,
+    /// Drop guest UDP to port 443 unless `--allow-udp` admits it.
+    pub deny_quic: bool,
     /// IP-level MTU.
     pub mtu: usize,
 }
@@ -484,8 +486,13 @@ fn run_network_stack(
                     // is silently dropped (a guest sees a normal UDP black hole),
                     // but the denial is recorded in the boot log — these lines are
                     // the machine's egress audit trail (`read_egress_denials`).
-                    let mut relay_allowed =
-                        udp_relay::should_relay_udp(destination, &datagram_egress);
+                    // QUIC would carry HTTPS past the request-rule interceptor,
+                    // so only `--allow-udp` admits it; clients fall back to TCP.
+                    let mut relay_allowed = if config.deny_quic && destination.port() == 443 {
+                        datagram_egress.udp_rule_allows(destination.ip(), 443)
+                    } else {
+                        udp_relay::should_relay_udp(destination, &datagram_egress)
+                    };
                     if !relay_allowed && destination.port() != 53 {
                         egress.record_denial("sendto", &destination);
                     }
@@ -1582,6 +1589,7 @@ mod tests {
             upstream_resolvers: [None; crate::MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
+            deny_quic: false,
             mtu: 1500,
         };
         let queues = NetworkFrameQueues::shared(32);

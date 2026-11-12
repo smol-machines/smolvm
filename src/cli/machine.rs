@@ -22,6 +22,7 @@ use smolvm::data::network::{PortMapping, PortMappingSpec, PortProtocol, MAX_PORT
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
+use smolvm_protocol::request_rules::{Action, RequestRule};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -113,6 +114,44 @@ fn merge_cli_credentials(
     params.net = true;
     params.credential_policy = Some(policy);
     Ok(())
+}
+
+/// `--allow-request` / `--deny-request`, shared by `machine run` and `create`.
+#[derive(Args, Debug)]
+pub struct RequestRuleArgs {
+    /// Allow HTTPS requests: [METHODS] HOST[/PATH], e.g. 'GET,HEAD api.github.com/repos/**'.
+    /// Once a host has allow rules, other requests to it get 403. Does not imply
+    /// --net or make the host reachable (can be used multiple times).
+    #[arg(long = "allow-request", value_name = "SPEC",
+        value_parser = |spec: &str| RequestRule::parse(Action::Allow, spec))]
+    pub allow_request: Vec<RequestRule>,
+
+    /// Deny HTTPS requests: [METHODS] HOST[/PATH]; a deny wins over any allow.
+    /// Does not imply --net (can be used multiple times).
+    #[arg(long = "deny-request", value_name = "SPEC",
+        value_parser = |spec: &str| RequestRule::parse(Action::Deny, spec))]
+    pub deny_request: Vec<RequestRule>,
+}
+
+impl RequestRuleArgs {
+    fn is_empty(&self) -> bool {
+        self.allow_request.is_empty() && self.deny_request.is_empty()
+    }
+
+    /// Every rule, allows first.
+    fn rules(&self) -> Vec<RequestRule> {
+        (self.allow_request.iter())
+            .chain(&self.deny_request)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Add `--allow-request`/`--deny-request` rules after any Smolfile
+/// `[[network.requests]]`. Unlike a credential, a rule does not imply the network.
+fn merge_cli_request_rules(params: &mut vm_common::CreateVmParams, cli: &RequestRuleArgs) {
+    params.credential_policy =
+        smolvm::credentials::with_request_rules(params.credential_policy.take(), &cli.rules());
 }
 
 fn resolve_egress_flags(
@@ -542,7 +581,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_udp", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain",
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_udp", "allow_host", "allow_host_pattern", "allow_request", "deny_request", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain",
             // The one-shot pack runner has no way to apply these, so they are
             // refused by name rather than dropped; `machine create --from`
             // takes every one of them.
@@ -696,6 +735,9 @@ pub struct RunCmd {
         help_heading = "Network"
     )]
     pub allow_host_pattern: Vec<String>,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub request_rules: RequestRuleArgs,
 
     /// Pass this host's proxy into the workload: HTTPS_PROXY/HTTP_PROXY/
     /// ALL_PROXY/NO_PROXY from the environment, or on macOS the system proxy.
@@ -1374,7 +1416,7 @@ impl RunCmd {
         let host = crate::cli::host_network::HostNetwork::resolve(
             self.use_host_proxy,
             self.trust_host_certs,
-            !self.credential.is_empty(),
+            !self.credential.is_empty() || !self.request_rules.is_empty(),
         )?;
         self.env = host
             .env
@@ -1542,6 +1584,7 @@ impl RunCmd {
             (None, some) => some,
         };
         merge_cli_credentials(&mut params, &self.credential)?;
+        merge_cli_request_rules(&mut params, &self.request_rules);
         // Ephemeral machines boot before their record exists: mint placeholders
         // now so the launch, the workload env and the record all agree.
         vm_common::prepare_params_credentials(&mut params)?;
@@ -2781,6 +2824,75 @@ mod tests {
         assert_eq!(binding.environment_variable, "GITHUB_AUTH");
     }
 
+    #[test]
+    fn request_rules_reach_the_record_without_opening_the_network() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "rules",
+            "--allow-request",
+            "GET a.com/x/**",
+            "--deny-request",
+            "a.com/x/admin",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        let mut params = crate::cli::smolfile::build_create_params(
+            "rules".into(),
+            None,
+            None,
+            vec![],
+            None,
+            None,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        merge_cli_request_rules(&mut params, &cmd.request_rules);
+
+        let mut record = vm_common::build_vm_record(&params).unwrap();
+        let rules = &record.credential_policy.as_ref().unwrap().request_rules;
+        assert_eq!(rules.len(), 2);
+        assert!(!record.launch_network_plan().has_network());
+        let launch = smolvm::credentials::CredentialLaunch::for_record("rules", &record)
+            .expect("rules alone still start the interceptor");
+        assert_eq!(&launch.policy.request_rules, rules);
+        record.network = true;
+        assert_eq!(
+            record.launch_network_plan().backend,
+            smolvm::network::EffectiveNetworkBackend::VirtioNet
+        );
+
+        let endpoint = smolvm_protocol::InterceptEndpoint {
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            token: [1; 32],
+        };
+        let err = smolvm::agent::validate_external_interceptor(
+            &endpoint,
+            &record.vm_resources(),
+            record.credential_policy.is_some(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("request rules"), "{err}");
+    }
+
     /// `machine monitor` flags override the machine's Smolfile `[health]`
     /// values, which override the defaults.
     #[test]
@@ -3881,6 +3993,79 @@ mod tests {
     }
 
     #[test]
+    fn request_rule_flags_parse_on_create_and_run() {
+        use smolvm_protocol::request_rules::Action;
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "rules",
+            "--allow-request",
+            "GET,HEAD api.github.com/repos/**",
+            "--allow-request",
+            "a.com",
+            "--deny-request",
+            "DELETE api.github.com",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.request_rules.allow_request.len(), 2);
+        assert_eq!(
+            cmd.request_rules.allow_request[0].methods,
+            vec!["GET", "HEAD"]
+        );
+        assert_eq!(cmd.request_rules.allow_request[0].paths, vec!["/repos/**"]);
+        assert_eq!(cmd.request_rules.deny_request[0].action, Action::Deny);
+        assert!(!cmd.net, "a request rule never implies --net");
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--image",
+            "alpine",
+            "--deny-request",
+            "POST a.com/x",
+            "--deny-request",
+            "b.com",
+        ]);
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert_eq!(cmd.request_rules.deny_request.len(), 2);
+        assert!(cmd
+            .request_rules
+            .deny_request
+            .iter()
+            .all(|r| r.action == Action::Deny));
+
+        for bad in ["", "GET a.com x", "https://a.com", "GET,,HEAD a.com"] {
+            assert!(
+                TestMachineCli::try_parse_from([
+                    "machine",
+                    "create",
+                    "--name",
+                    "rules",
+                    "--allow-request",
+                    bad,
+                ])
+                .is_err(),
+                "{bad:?}"
+            );
+        }
+        // A packed artifact run has nowhere to keep the rules.
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "run",
+            "--from",
+            "app.smolmachine",
+            "--allow-request",
+            "a.com",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn block_io_defaults_to_unset_and_accepts_async() {
         let cli = TestMachineCli::parse_from(["machine", "create", "--name", "default"]);
         let MachineCmd::Create(cmd) = cli.command else {
@@ -4652,6 +4837,9 @@ pub struct CreateCmd {
     #[arg(long = "allow-host-pattern", value_name = "PATTERN")]
     pub allow_host_pattern: Vec<String>,
 
+    #[command(flatten)]
+    pub request_rules: RequestRuleArgs,
+
     /// Pass this host's proxy into the workload: HTTPS_PROXY/HTTP_PROXY/
     /// ALL_PROXY/NO_PROXY from the environment, or on macOS the system proxy.
     /// A proxy on the host's loopback is rewritten to an address the guest can
@@ -4916,7 +5104,7 @@ impl CreateCmd {
         let host = crate::cli::host_network::HostNetwork::resolve(
             self.use_host_proxy,
             self.trust_host_certs,
-            !self.credential.is_empty(),
+            !self.credential.is_empty() || !self.request_rules.is_empty(),
         )?;
         self.env = host
             .env
@@ -5061,6 +5249,7 @@ impl CreateCmd {
             use_host_proxy: _,
             trust_host_certs: _,
             credential,
+            request_rules,
             outbound_localhost_only,
             block_private,
             allow_private,
@@ -5196,6 +5385,9 @@ impl CreateCmd {
             }
             cli.net = true;
         }
+        // After any Smolfile `[[network.requests]]`. A rule never implies the network.
+        cli.credentials =
+            smolvm::credentials::with_request_rules(cli.credentials.take(), &request_rules.rules());
         cli.published_sockets = parse_published_sockets(expose_socket, mount_socket)?;
         // CLI `--secret-*` refs win over Smolfile `[secrets]` of the same name.
         for (key, r) in parse_cli_secret_refs(secret_env, secret_file, secret_keychain)? {
@@ -6365,9 +6557,10 @@ impl LogsCmd {
 
 /// Show the machine's egress denials.
 ///
-/// Lists outbound connects and sendtos the egress policy refused — the record
-/// of what a confined workload tried and failed to reach. Empty for machines
-/// without an egress policy, or with no denials.
+/// Lists outbound connects and sendtos the egress policy refused, and HTTPS
+/// requests a request rule refused — the record of what a confined workload
+/// tried and failed to reach. Empty for machines without an egress policy, or
+/// with no denials.
 #[derive(Args, Debug)]
 pub struct EgressEventsCmd {
     /// Machine to inspect (default: "default")

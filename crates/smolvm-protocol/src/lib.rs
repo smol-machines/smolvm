@@ -60,6 +60,7 @@ pub mod image_ref;
 pub mod intercept;
 pub mod mediated_egress;
 pub mod publish_socket;
+pub mod request_rules;
 pub mod resolv;
 pub mod retry;
 pub mod secrets;

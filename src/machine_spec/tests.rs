@@ -635,6 +635,13 @@ fn policy(environment_variable: &str) -> CredentialPolicy {
     .unwrap()
 }
 
+fn rules_policy() -> CredentialPolicy {
+    serde_json::from_str(
+        r#"{"request_rules":[{"action":"allow","hosts":["api.github.com"],"methods":["GET"]}]}"#,
+    )
+    .unwrap()
+}
+
 fn test_cache_disk(tmp: &str) -> CacheDisk {
     CacheDisk::parse(&format!("{tmp}/file:/cache")).unwrap()
 }
@@ -1024,6 +1031,19 @@ fn cases() -> Vec<Case> {
         .api(|_| json(serde_json::json!({"credentials": {"credentials": [{"name": "gh", "environment_variable": "GH_TOKEN", "allowed_hosts": ["api.github.com"]}]}})))
         .embedded(|e, _| e.spec.credentials = Some(policy("GH_TOKEN")))
         .checkpoint(Refused("credential bindings")),
+        // Request rules ride in the credential policy and never open the network.
+        case!(
+            credentials,
+            |s, _| s.credentials = Some(rules_policy()),
+            |r| !r.network
+                && r.credential_policy
+                    .as_ref()
+                    .is_some_and(|p| p.request_rules.len() == 1)
+        )
+        .cli(&["--allow-request", "GET api.github.com"])
+        .api(|_| json(serde_json::json!({"requestRules": [{"action": "allow", "hosts": ["api.github.com"], "methods": ["GET"]}]})))
+        .embedded(|e, _| e.credentials = Some(rules_policy()))
+        .checkpoint(Refused("request rules")),
         case!(
             credentials_supplied_only,
             |s, _| {

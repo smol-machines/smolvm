@@ -346,6 +346,7 @@ impl CreateSpec {
             credentials: match (self.credentials, credentials) {
                 (Some(mut base), Some(top)) => {
                     base.credentials.extend(top.credentials);
+                    base.request_rules.extend(top.request_rules);
                     Some(base)
                 }
                 (base, top) => top.or(base),
@@ -886,9 +887,10 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
     }
     let gpu_vram_mib = crate::data::resources::validate_gpu_vram_mib(gpu_vram_mib)
         .map_err(|error| Error::config("create machine", format!("gpu_vram: {error}")))?;
+    // A binding needs the network; request rules only filter one the machine has.
     let has_credentials = credentials
         .as_ref()
-        .is_some_and(|policy| !policy.is_empty());
+        .is_some_and(|policy| !policy.credentials.is_empty());
     let credentials = credentials.filter(|policy| !policy.is_empty());
     let explicit_command = entrypoint.is_some() || cmd.is_some();
     // Any option that only makes sense with a network turns it on.
@@ -1206,6 +1208,16 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 .with_rules(&egress_rules)
                 .map_err(|reason| Error::config("restore checkpoint egress rules", reason))?;
             let _ = credentials_supplied_only;
+            if credentials
+                .as_ref()
+                .is_some_and(|policy| policy.credentials.is_empty())
+            {
+                return Err(fixed(
+                    "request rules",
+                    "the checkpoint's machine CA is not constrained to sign for the hosts \
+                     new rules name; it keeps the rules it was captured with",
+                ));
+            }
             if credentials.is_some() {
                 return Err(fixed(
                     "credential bindings",

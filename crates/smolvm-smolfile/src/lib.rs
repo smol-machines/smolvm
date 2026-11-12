@@ -72,6 +72,7 @@
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
 //! | `deny_cidrs` | string[] | Denied CIDR ranges, checked before any allow |
 //! | `credentials` | table[] | Credential bindings (see below) |
+//! | `requests` | table[] | HTTPS request rules: `action` (`allow`/`deny`), `hosts`, optional `methods` and `paths` |
 //!
 //! #### `[[network.credentials]]` — Credential substitution
 //!
@@ -399,6 +400,10 @@ pub struct NetworkConfig {
     /// real value on HTTPS requests to the binding's `allowed_hosts` only.
     #[serde(default)]
     pub credentials: Vec<smolvm_protocol::CredentialBinding>,
+    /// HTTPS method and path rules (`[[network.requests]]`), enforced by the
+    /// host interceptor. They never imply `net` or make a host reachable.
+    #[serde(default)]
+    pub requests: Vec<smolvm_protocol::request_rules::RequestRule>,
 }
 
 /// Branchable launch and CUDA branch-capacity policy.
@@ -806,6 +811,36 @@ enabled = true
     fn parse_rejects_unknown_fields() {
         let err = parse("bogus_field = true");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_network_requests() {
+        use smolvm_protocol::request_rules::Action;
+        let sf = parse(
+            r#"
+[[network.requests]]
+action = "allow"
+hosts = ["api.github.com"]
+methods = ["GET"]
+paths = ["/repos/**"]
+
+[[network.requests]]
+action = "deny"
+hosts = ["*.example.com"]
+"#,
+        )
+        .unwrap();
+        let requests = sf.network.unwrap().requests;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].action, Action::Allow);
+        assert_eq!(requests[0].paths, vec!["/repos/**"]);
+        assert_eq!(requests[1].action, Action::Deny);
+        assert!(requests[1].methods.is_empty());
+
+        assert!(parse(
+            "[[network.requests]]\naction = \"allow\"\nhosts = [\"a.com\"]\npath = [\"/x\"]\n"
+        )
+        .is_err());
     }
 
     #[test]
