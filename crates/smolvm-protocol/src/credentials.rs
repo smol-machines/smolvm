@@ -140,6 +140,10 @@ impl CredentialBinding {
 pub struct CredentialPolicy {
     /// Bindings the machine may use, in declaration order.
     pub credentials: Vec<CredentialBinding>,
+    /// HTTPS method and path rules the interceptor enforces. A rule never
+    /// makes a host reachable; it narrows what the network already allows.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub request_rules: Vec<crate::request_rules::RequestRule>,
 }
 
 /// Why a policy was refused.
@@ -159,9 +163,16 @@ fn refuse(message: String) -> Result<(), PolicyError> {
 }
 
 impl CredentialPolicy {
-    /// No bindings.
+    /// No bindings and no request rules.
     pub fn is_empty(&self) -> bool {
-        self.credentials.is_empty()
+        self.credentials.is_empty() && self.request_rules.is_empty()
+    }
+
+    /// Whether the policy shapes the machine's network plan: a binding
+    /// creates a network, request rules only steer an existing one to
+    /// virtio-net. The interceptor starts for any policy on a network.
+    pub fn steers_network(&self, network: bool) -> bool {
+        !self.credentials.is_empty() || (network && !self.request_rules.is_empty())
     }
 
     /// Validate structure and, when the machine also restricts egress by
@@ -241,6 +252,10 @@ impl CredentialPolicy {
             if !binding.injection_location.header && !binding.injection_location.body {
                 return refuse(format!("credential {name:?} enables no injection location"));
             }
+        }
+        for rule in &self.request_rules {
+            rule.validate()
+                .map_err(|e| PolicyError(format!("request rule {:?}: {e}", rule.hosts)))?;
         }
         // Two bindings setting the same header for the same host would leave
         // which value is sent up to declaration order; refuse the ambiguity.
@@ -465,6 +480,7 @@ mod tests {
     fn form_body_location_is_opt_in_and_can_be_used_without_header_injection() {
         let mut policy = CredentialPolicy {
             credentials: vec![notion()],
+            ..Default::default()
         };
         assert!(!policy.credentials[0].injection_location.body);
         policy.credentials[0].injection_location = InjectionLocation {
@@ -483,6 +499,7 @@ mod tests {
     fn credential_hosts_must_sit_inside_the_network_allow_list() {
         let policy = CredentialPolicy {
             credentials: vec![notion()],
+            ..Default::default()
         };
         policy.validate(Some(&["notion.com".to_string()])).unwrap();
         policy
@@ -504,6 +521,7 @@ mod tests {
         b.allowed_hosts = vec!["*.notion.com".to_string()];
         let policy = CredentialPolicy {
             credentials: vec![b],
+            ..Default::default()
         };
         for allowed in ["notion.com", "*.notion.com", "*.com"] {
             policy.validate(Some(&[allowed.to_string()])).unwrap();
@@ -531,6 +549,7 @@ mod tests {
             b.allowed_hosts = vec![host.to_string()];
             let policy = CredentialPolicy {
                 credentials: vec![b],
+                ..Default::default()
             };
             assert!(policy.validate(None).is_err(), "{host:?} accepted");
         }
@@ -538,6 +557,7 @@ mod tests {
         b.allowed_hosts.clear();
         let policy = CredentialPolicy {
             credentials: vec![b],
+            ..Default::default()
         };
         assert!(policy
             .validate(None)
@@ -550,6 +570,7 @@ mod tests {
     fn rejects_duplicates_and_bad_names() {
         let policy = CredentialPolicy {
             credentials: vec![notion(), notion()],
+            ..Default::default()
         };
         assert!(policy
             .validate(None)
@@ -560,6 +581,7 @@ mod tests {
         other.name = "notion-2".into();
         let policy = CredentialPolicy {
             credentials: vec![notion(), other],
+            ..Default::default()
         };
         assert!(policy
             .validate(None)
@@ -570,6 +592,7 @@ mod tests {
         bad.environment_variable = "1BAD".into();
         let policy = CredentialPolicy {
             credentials: vec![bad],
+            ..Default::default()
         };
         assert!(policy
             .validate(None)
@@ -586,6 +609,7 @@ mod tests {
         github.allowed_hosts = vec!["api.github.com".into()];
         let policy = CredentialPolicy {
             credentials: vec![notion(), github],
+            ..Default::default()
         };
         let placeholders: BTreeMap<String, String> = [
             (
@@ -642,6 +666,7 @@ mod tests {
         b.allowed_hosts = vec!["*.notion.com".into()];
         let policy = CredentialPolicy {
             credentials: vec![b],
+            ..Default::default()
         };
         policy.validate(None).unwrap();
         policy.validate(Some(&["notion.com".to_string()])).unwrap();
@@ -657,6 +682,7 @@ mod tests {
                 header_setter("git", "authorization", &["github.com", "*.github.com"]),
                 notion(),
             ],
+            ..Default::default()
         };
         policy.validate(None).unwrap();
         let placeholders: BTreeMap<String, String> = [
@@ -691,6 +717,7 @@ mod tests {
         ] {
             let policy = CredentialPolicy {
                 credentials: vec![header_setter("a", header, &["api.a.com"])],
+                ..Default::default()
             };
             assert!(policy.validate(None).is_err(), "{header:?} accepted");
         }
@@ -699,6 +726,7 @@ mod tests {
                 header_setter("a", "authorization", &["*.github.com"]),
                 header_setter("b", "authorization", &["api.github.com"]),
             ],
+            ..Default::default()
         };
         assert!(conflicting
             .validate(None)
@@ -711,8 +739,38 @@ mod tests {
                 header_setter("b", "authorization", &["api.notion.com"]),
                 header_setter("c", "x-api-key", &["api.github.com"]),
             ],
+            ..Default::default()
         };
         distinct.validate(None).unwrap();
+    }
+
+    #[test]
+    fn request_rules_alone_steer_only_a_network_the_machine_has() {
+        use crate::request_rules::{Action, RequestRule};
+        let policy: CredentialPolicy = serde_json::from_str(
+            r#"{"request_rules":[{"action":"allow","hosts":["a.com"],"methods":["GET"]}]}"#,
+        )
+        .unwrap();
+        assert!(!policy.is_empty());
+        policy.validate(None).unwrap();
+        // A rule never makes a host reachable, so it never opens the network.
+        assert!(policy.steers_network(true));
+        assert!(!policy.steers_network(false));
+        let bindings = CredentialPolicy {
+            credentials: vec![notion()],
+            ..Default::default()
+        };
+        assert!(bindings.steers_network(false));
+        assert!(!CredentialPolicy::default().steers_network(true));
+
+        let bad = CredentialPolicy {
+            request_rules: vec![RequestRule {
+                paths: vec!["no-slash".into()],
+                ..RequestRule::parse(Action::Deny, "a.com").unwrap()
+            }],
+            ..Default::default()
+        };
+        assert!(bad.validate(None).is_err());
     }
 
     #[test]
@@ -721,6 +779,7 @@ mod tests {
         b.environment_variable.clear();
         let policy = CredentialPolicy {
             credentials: vec![b],
+            ..Default::default()
         };
         assert!(policy.validate(None).is_err());
     }
