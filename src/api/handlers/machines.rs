@@ -3879,6 +3879,10 @@ pub async fn start_machine(
         None => crate::registry::PullAuth::FromConfig,
     };
     let (manager, pid) = tokio::task::spawn_blocking(move || {
+        crate::network::private_floor::log_record_hosts_blocked_by_private_floor(
+            &name_clone,
+            &restore_record,
+        );
         let mut seed_image = seed_image;
         if let Some(image) = preseeded_image {
             match crate::image_seed::revalidate_seed(&name_clone, &image, &seed_auth) {

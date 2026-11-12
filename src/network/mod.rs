@@ -5,6 +5,8 @@ pub mod backend;
 /// Launch-time backend planning and request validation rules.
 pub mod launch;
 pub mod port_forward;
+/// Named hosts that `--block-private` leaves unreachable.
+pub mod private_floor;
 
 pub use backend::NetworkBackend;
 pub use launch::{

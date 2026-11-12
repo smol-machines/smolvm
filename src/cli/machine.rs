@@ -1552,6 +1552,12 @@ impl RunCmd {
         {
             params.secret_refs.insert(key, r);
         }
+        vm_common::warn_hosts_blocked_by_private_floor(
+            params.block_private.as_deref(),
+            &params.egress_rules,
+            params.dns_filter_hosts.as_deref(),
+            params.credential_policy.as_ref(),
+        );
         // A detached run leaves a machine behind, recorded by the rules
         // `machine create` applies; refuse what they refuse before booting.
         if self.detach {
@@ -4990,6 +4996,7 @@ impl CreateCmd {
             .clone()
             .unwrap_or_else(smolvm::util::generate_machine_name);
         let record = resolved.to_record(&name)?;
+        vm_common::warn_record_hosts_blocked_by_private_floor(&record);
         let reservation = vm_common::CreateVmReservation::reserve(&name)?;
         reservation.commit(&record)?;
         Ok(record)
@@ -5349,6 +5356,7 @@ impl CreateCmd {
         };
 
         let mut record = resolved.to_record(&name)?;
+        vm_common::warn_record_hosts_blocked_by_private_floor(&record);
         // The pack whose layers this machine mounts. An ordinary checkpoint's
         // transport pack is never an OCI-layer source and must not add a
         // virtiofs device; a packed-layer checkpoint's source pack is attached
