@@ -2933,7 +2933,10 @@ async fn create_machine_to_end(
         &resolved.vm_resources(),
         resolved.allowed_hosts.as_deref(),
         resolved.ports.len(),
-        resolved.credentials.is_some(),
+        resolved
+            .credentials
+            .as_ref()
+            .is_some_and(|p| p.steers_network(resolved.net)),
     )
     .has_network();
 
@@ -3383,9 +3386,10 @@ pub struct EgressEventsQuery {
     pub limit: Option<usize>,
 }
 
-/// List the machine's egress denials — outbound connects and sendtos its
-/// egress policy refused. Empty for a machine with no policy, no denials, or
-/// one that has never booted.
+/// List the machine's egress denials — outbound connects, sendtos and
+/// lookups its egress policy refused, and HTTPS requests a request rule
+/// refused. Empty for a machine with no policy, no denials, or one that has
+/// never booted.
 #[utoipa::path(
     get,
     path = "/api/v1/machines/{name}/egress-events",
@@ -7465,6 +7469,7 @@ pub(crate) fn create_spec_from_request(
         egress_rules,
         allowed_hosts,
         credentials,
+        request_rules,
         network_backend,
         guest_subnet,
         restart,
@@ -7549,7 +7554,7 @@ pub(crate) fn create_spec_from_request(
         allowed_cidrs: allowed_cidrs.clone(),
         allowed_hosts: allowed_hosts.clone(),
         egress_rules: egress_rules.clone(),
-        credentials: credentials.clone(),
+        credentials: crate::credentials::with_request_rules(credentials.clone(), request_rules),
         // Values arrive over the API, never from this server's environment.
         credentials_supplied_only: true,
         gpu: *gpu,

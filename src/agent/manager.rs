@@ -586,7 +586,8 @@ pub const EGRESS_FLOWS_FILE: &str = "egress-flows";
 pub const EGRESS_TELEMETRY_FILE: &str = "egress";
 
 /// Per-VM egress denial audit log: `<vm_data_dir>/egress-denials.log`. The
-/// virtio-net runtime appends one line per denied connect/sendto/resolve
+/// virtio-net runtime appends one line per denied connect/sendto/resolve,
+/// and the HTTPS interceptor one per request a request rule refuses
 /// (append mode, so prior boots survive; rotated once past 8 MiB). Dedicated
 /// so ordinary connection chatter in the boot log can never evict an audit
 /// event. Resolved from the name on both sides of the process boundary, like
@@ -712,15 +713,18 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's
-/// connect or sendto toward `dest`.
+/// connect, sendto or lookup toward `dest`, or a request rule refused an
+/// HTTPS request.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EgressDenial {
     /// Denial time as logged by the VMM (RFC 3339, microsecond precision), or
     /// empty when the line carried no parseable timestamp.
     pub timestamp: String,
-    /// The refused operation: `connect` (TCP) or `sendto` (UDP).
+    /// The refused operation: `connect` (TCP), `sendto` (UDP), `resolve`
+    /// (DNS) or `request` (HTTPS, by a request rule).
     pub operation: String,
-    /// The destination the guest tried to reach, as `ip:port`.
+    /// The destination the guest tried to reach: `ip:port`, the name of a
+    /// lookup, or `METHOD https://host/path` for a request.
     pub dest: String,
 }
 
@@ -761,6 +765,8 @@ pub fn read_egress_denials(name: &str, limit: usize) -> Vec<EgressDenial> {
 ///   `egress policy denied connect to <ip:port>`
 ///   `egress policy denied sendto <ip:port>`
 ///   `egress policy denied resolve <hostname>`
+/// and the HTTPS interceptor one for a request a request rule refused:
+///   `egress policy denied request <METHOD> https://<host><path>`
 /// Matching is anchored on the `egress policy denied ` marker rather than the
 /// prefix, so surrounding format drift can't silently discard events; libkrun's
 /// TSI muxer logs the same marker, so those parse too if they ever appear.
@@ -768,7 +774,7 @@ fn parse_egress_denial_line(line: &str) -> Option<EgressDenial> {
     const MARKER: &str = "egress policy denied ";
     let after = &line[line.find(MARKER)? + MARKER.len()..];
     let (operation, rest) = after.split_once(' ')?;
-    if operation != "connect" && operation != "sendto" && operation != "resolve" {
+    if !["connect", "sendto", "resolve", "request"].contains(&operation) {
         return None;
     }
     let dest = rest.strip_prefix("to ").unwrap_or(rest).trim();
@@ -5609,6 +5615,20 @@ mod tests {
         );
     }
 
+    /// A request the interceptor refused is written in the shape the reader
+    /// parses, without its query string.
+    #[test]
+    fn a_refused_request_is_recorded_as_an_egress_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join(smolvm_network::EGRESS_DENIALS_LOG);
+        smolvm_network::record_request_denial(&log, "POST", "httpbin.org", "/post?token=x");
+        let line = std::fs::read_to_string(&log).unwrap();
+        let event = parse_egress_denial_line(line.trim_end()).expect("parses");
+        assert_eq!(event.operation, "request");
+        assert_eq!(event.dest, "POST https://httpbin.org/post");
+        assert!(!event.timestamp.is_empty());
+    }
+
     /// The three denial shapes the virtio-net runtime emits parse into
     /// structured events — and libkrun's muxer format parses too — while
     /// everything else in a boot log is ignored.
@@ -5635,6 +5655,13 @@ mod tests {
         .expect("resolve line parses");
         assert_eq!(resolve.operation, "resolve");
         assert_eq!(resolve.dest, "evil.example.com");
+
+        let request = parse_egress_denial_line(
+            "[2026-08-14T03:13:11Z]: egress policy denied request POST https://httpbin.org/post",
+        )
+        .expect("request line parses");
+        assert_eq!(request.operation, "request");
+        assert_eq!(request.dest, "POST https://httpbin.org/post");
 
         // libkrun's TSI muxer format (env_logger) parses as well.
         let muxer = parse_egress_denial_line(

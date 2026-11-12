@@ -1687,7 +1687,9 @@ impl VmRecord {
             &self.vm_resources(),
             self.dns_filter_hosts.as_deref(),
             self.ports.len() + self.udp_ports.len(),
-            self.credential_policy.is_some(),
+            self.credential_policy
+                .as_ref()
+                .is_some_and(|p| p.steers_network(self.network)),
         )
     }
 

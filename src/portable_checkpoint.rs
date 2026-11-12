@@ -8766,6 +8766,7 @@ mod tests {
                 "mytok=MY_API_TOKEN@httpbin.org",
             )
             .unwrap()],
+            ..Default::default()
         });
         let network = checkpoint_network(&record);
         assert_eq!(network.backend.as_deref(), Some("virtio-net"));

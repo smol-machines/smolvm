@@ -1059,6 +1059,12 @@ pub struct CreateMachineRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Object>)]
     pub credentials: Option<smolvm_protocol::CredentialPolicy>,
+    /// HTTPS method and path rules enforced by the host interceptor, each
+    /// `{action: "allow"|"deny", hosts, methods?, paths?}`. A denied request
+    /// gets 403. Rules never enable the network or make a host reachable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub request_rules: Vec<smolvm_protocol::request_rules::RequestRule>,
     /// Network backend: `tsi` (outbound-only) or `virtio-net`.
     ///
     /// When omitted, machines created through the API default to `virtio-net`:
@@ -2113,6 +2119,26 @@ mod deny_unknown_field_tests {
             serde_json::from_value::<CreateMachineRequest>(serde_json::json!({
                 "name": "sandbox", "image": "alpine",
                 "restart": {"policee": "always"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn create_request_takes_request_rules() {
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "sandbox", "image": "alpine",
+            "requestRules": [
+                {"action": "allow", "hosts": ["api.github.com"], "methods": ["GET"]},
+                {"action": "deny", "hosts": ["api.github.com"], "paths": ["/admin/**"]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(req.request_rules.len(), 2);
+        assert!(
+            serde_json::from_value::<CreateMachineRequest>(serde_json::json!({
+                "name": "sandbox",
+                "requestRules": [{"action": "allow", "hosts": ["a.com"], "path": ["/x"]}]
             }))
             .is_err()
         );

@@ -191,6 +191,8 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--block-private` | | run, create | Block private and internal destinations, keep the public internet (implies --net) |
 | `--allow-private` | | run, create | Re-open one private CIDR under `--block-private` |
 | `--deny-cidr` | | run, create | Deny egress to a CIDR, checked before anything is allowed (implies --net) |
+| `--allow-request` | | run, create | HTTPS request rule `[METHODS ]HOST[/PATH-GLOB]`: a host with an allow rule needs a match (does not imply --net) |
+| `--deny-request` | | run, create | HTTPS request rule in the same form; a matching deny refuses and wins over any allow |
 | `--allow-udp` | | run, create, update | Allow UDP to `CIDR[:PORT[-END]]`, also under an egress interceptor; a deny still wins (implies --net) |
 | `--allow-host` | | run, create, update | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create, update | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
@@ -257,6 +259,12 @@ which otherwise denies every datagram. Every deny is checked first, the
 metadata floor and `--block-private` still apply (only `--allow-private`
 re-opens a private range), and DNS keeps its own path. It implies `--net`;
 the Smolfile form is `[network] allow_udp`.
+`--allow-request` / `--deny-request` `[METHODS ]HOST[/PATH-GLOB]` limit the
+methods and paths used on a host over HTTPS (port 443): a host with an allow
+rule needs a match, a matching deny wins, and a refusal is a `403`. Rules never
+make a host reachable or imply `--net`; the Smolfile form is
+`[[network.requests]]`, the API field `requestRules`, and `machine update`
+cannot change them yet. Details: `docs/throwaway-machine/README.md`.
 Every rule, the Smolfile keys and `--guest-subnet`:
 `docs/throwaway-machine/README.md`.
 

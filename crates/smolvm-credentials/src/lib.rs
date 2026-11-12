@@ -20,7 +20,7 @@ pub mod resolver;
 pub use smolvm_protocol::sni;
 
 pub use ca::MachineCa;
-pub use intercept::{Interceptor, InterceptorConfig};
+pub use intercept::{Interceptor, InterceptorConfig, RefusalSink};
 pub use policy::{
     generate_placeholders, CredentialBinding, CredentialPolicy, InjectionLocation, PolicyError,
 };

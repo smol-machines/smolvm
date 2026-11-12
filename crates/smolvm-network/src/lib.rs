@@ -84,7 +84,7 @@ pub mod udp_publish;
 pub mod udp_relay;
 pub mod watchlist;
 
-pub use egress::EgressPolicy;
+pub use egress::{record_request_denial, EgressPolicy};
 
 use socket2::Socket;
 use std::fmt;
@@ -217,6 +217,9 @@ pub struct GuestNetworkConfig {
     /// Host interceptor and the outbound streams routed through it. Each stream
     /// carries an authenticated preamble naming its original destination.
     pub intercept: Option<StreamInterception>,
+    /// Drop guest UDP to port 443 (QUIC) unless `--allow-udp` admits it, so
+    /// HTTPS cannot route around request rules enforced by the interceptor.
+    pub deny_quic: bool,
 }
 
 /// Exact guest gateway port mapped to one smolvm-owned host loopback port.
@@ -248,6 +251,7 @@ impl GuestNetworkConfig {
             upstream_resolvers: [None; MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
+            deny_quic: false,
         }
     }
 }
@@ -678,6 +682,7 @@ pub fn start_virtio_network(
             upstream_resolvers: guest_network.upstream_resolvers,
             host_service: guest_network.host_service,
             intercept: guest_network.intercept,
+            deny_quic: guest_network.deny_quic,
             mtu: 1500,
         },
         Some(tcp_receiver),

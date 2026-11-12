@@ -17,6 +17,7 @@ use smolvm_credentials::{
 pub use smolvm_protocol::credentials::{
     CredentialBinding, CredentialPolicy, GUEST_CA_DIR, GUEST_TRUST_ENV,
 };
+use smolvm_protocol::request_rules::RequestRule;
 use smolvm_protocol::SecretRef;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -108,6 +109,19 @@ pub fn workload_env(
     (refs, env)
 }
 
+/// Add request rules to a machine's policy, creating one when it has none.
+pub fn with_request_rules(
+    policy: Option<CredentialPolicy>,
+    rules: &[RequestRule],
+) -> Option<CredentialPolicy> {
+    if rules.is_empty() {
+        return policy;
+    }
+    let mut policy = policy.unwrap_or_default();
+    policy.request_rules.extend_from_slice(rules);
+    Some(policy)
+}
+
 /// Everything the boot process needs to run a machine's interceptor. Carried
 /// in the boot config; holds references, never values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,18 +210,41 @@ impl CredentialLaunch {
         }
         // A wildcard's parent is the subtree the CA may sign in; the name
         // constraint on it already covers every subdomain.
-        let hosts: Vec<String> = self
-            .policy
+        MachineCa::generate(&self.ca_owner, &self.ca_hosts())
+            .and_then(|ca| ca.save(&self.ca_dir))
+            .map_err(|e| Error::config("credentials", format!("machine CA: {e:#}")))
+    }
+
+    /// Refuse request rules on an explicit TSI backend: only the virtio-net
+    /// stack drops QUIC, which would carry HTTPS past the rules.
+    pub fn check_backend(&self, backend: Option<crate::network::NetworkBackend>) -> Result<()> {
+        if backend == Some(crate::network::NetworkBackend::Tsi)
+            && !self.policy.request_rules.is_empty()
+        {
+            return Err(Error::config(
+                "request rules",
+                "request rules require the virtio-net backend; remove --net-backend tsi or set it to virtio-net",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Subtrees the CA may sign in: every binding host and request-rule host.
+    fn ca_hosts(&self) -> Vec<String> {
+        self.policy
             .credentials
             .iter()
             .flat_map(|binding| binding.allowed_hosts.iter())
+            .chain(
+                self.policy
+                    .request_rules
+                    .iter()
+                    .flat_map(|rule| rule.hosts.iter()),
+            )
             .map(|host| smolvm_protocol::credentials::host_subtree(host).to_string())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .collect();
-        MachineCa::generate(&self.ca_owner, &hosts)
-            .and_then(|ca| ca.save(&self.ca_dir))
-            .map_err(|e| Error::config("credentials", format!("machine CA: {e:#}")))
+            .collect()
     }
 
     /// Read-only mount exposing only the public CA to the guest.
@@ -222,7 +259,8 @@ impl CredentialLaunch {
 
     /// Start the interceptor for this machine. The returned handle must live
     /// as long as the VM; dropping it stops substitution. With the machine's
-    /// data directory, it also serves [`CREDENTIALS_SOCKET`] there.
+    /// data directory, it also serves [`CREDENTIALS_SOCKET`] there and records
+    /// requests a request rule refuses in the egress denial log.
     pub fn start_interceptor(&self, vm_dir: Option<&Path>) -> Result<Interceptor> {
         let ca = MachineCa::load(&self.ca_dir, &self.ca_owner)
             .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?;
@@ -230,6 +268,12 @@ impl CredentialLaunch {
         if let Some(dir) = vm_dir {
             serve_live_values(dir, &self.policy, live.clone());
         }
+        let denial_log = vm_dir.map(|dir| dir.join(smolvm_network::EGRESS_DENIALS_LOG));
+        let on_refused = denial_log.map(|log| -> smolvm_credentials::RefusalSink {
+            Arc::new(move |method, host, target| {
+                smolvm_network::record_request_denial(&log, method, host, target)
+            })
+        });
         Interceptor::spawn(
             InterceptorConfig {
                 machine: self.machine.clone(),
@@ -237,6 +281,7 @@ impl CredentialLaunch {
                 placeholders: self.placeholders.clone(),
                 ca,
                 upstream_roots_pem: Vec::new(),
+                on_refused,
             },
             Arc::new(SecretRefResolver {
                 sources: self.sources.clone(),
@@ -530,6 +575,7 @@ mod tests {
         std::fs::write(&path, "booted").unwrap();
         let policy = CredentialPolicy {
             credentials: vec![parse_credential_flag("github=GH_TOKEN@github.com").unwrap()],
+            ..Default::default()
         };
         let live = LiveValues::default();
         serve_live_values(dir.path(), &policy, live.clone());
@@ -597,6 +643,7 @@ mod tests {
                 parse_credential_flag("a=A_KEY@api.a.com").unwrap(),
                 parse_credential_flag("b=B_KEY@api.b.com").unwrap(),
             ],
+            ..Default::default()
         };
         let mut launch = CredentialLaunch::from_parts(
             machine,
@@ -608,6 +655,31 @@ mod tests {
         .unwrap();
         launch.supplied_only = supplied_only;
         launch
+    }
+
+    #[test]
+    fn ca_hosts_are_the_union_of_binding_and_request_rule_hosts() {
+        use smolvm_protocol::request_rules::Action;
+        let mut l = launch("m", false);
+        l.policy.request_rules = vec![
+            RequestRule::parse(Action::Allow, "GET api.a.com").unwrap(),
+            RequestRule::parse(Action::Deny, "DELETE *.c.com").unwrap(),
+        ];
+        assert_eq!(l.ca_hosts(), vec!["api.a.com", "api.b.com", "c.com"]);
+    }
+
+    #[test]
+    fn request_rules_refuse_an_explicit_tsi_backend() {
+        use crate::network::NetworkBackend;
+        use smolvm_protocol::request_rules::Action;
+        let mut l = launch("m", false);
+        // Bindings alone keep working on TSI.
+        l.check_backend(Some(NetworkBackend::Tsi)).unwrap();
+        l.policy.request_rules = vec![RequestRule::parse(Action::Deny, "POST a.com").unwrap()];
+        l.check_backend(None).unwrap();
+        l.check_backend(Some(NetworkBackend::VirtioNet)).unwrap();
+        let err = l.check_backend(Some(NetworkBackend::Tsi)).unwrap_err();
+        assert!(err.to_string().contains("virtio-net"), "{err}");
     }
 
     #[test]
@@ -653,6 +725,7 @@ mod tests {
         );
         let policy = CredentialPolicy {
             credentials: vec![parse_credential_flag("a=A_KEY@api.a.com").unwrap()],
+            ..Default::default()
         };
         let mut l = CredentialLaunch::from_parts(
             clone,
@@ -701,9 +774,40 @@ mod tests {
     }
 
     #[test]
+    fn request_rules_alone_make_the_guest_trust_the_machine_ca() {
+        use smolvm_protocol::request_rules::Action;
+        let rules = [RequestRule::parse(Action::Allow, "GET a.com").unwrap()];
+        assert_eq!(with_request_rules(None, &[]), None);
+        let policy = with_request_rules(None, &rules).expect("a policy for the rules");
+        assert_eq!(policy.request_rules, rules);
+        let placeholders = prepare_policy(&policy, None).unwrap();
+        assert!(placeholders.is_empty());
+        let (_, env) = workload_env(Some(&policy), &placeholders, &BTreeMap::new());
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "SSL_CERT_FILE" && v == "/run/smolvm/ca-bundle.pem"));
+        let launch =
+            CredentialLaunch::from_parts("m", &policy, &placeholders, &BTreeMap::new(), None)
+                .expect("rules alone launch the interceptor");
+        assert_eq!(launch.ca_hosts(), vec!["a.com"]);
+
+        // Rules extend an existing policy rather than replacing its bindings.
+        let bindings = CredentialPolicy {
+            credentials: vec![parse_credential_flag("n=N_KEY@api.notion.com").unwrap()],
+            ..Default::default()
+        };
+        let merged = with_request_rules(Some(bindings), &rules).unwrap();
+        assert_eq!(
+            (merged.credentials.len(), merged.request_rules.len()),
+            (1, 1)
+        );
+    }
+
+    #[test]
     fn bound_variables_get_placeholders_never_their_secret() {
         let policy = CredentialPolicy {
             credentials: vec![parse_credential_flag("n=N_KEY@api.notion.com").unwrap()],
+            ..Default::default()
         };
         let placeholders = prepare_policy(&policy, Some(&["notion.com".to_string()])).unwrap();
         let refs: BTreeMap<String, SecretRef> = [

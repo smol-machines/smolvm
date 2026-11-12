@@ -446,6 +446,17 @@ fn append_audit_line(path: &std::path::Path, message: &str) {
     }
 }
 
+/// Record an HTTPS request the interceptor refused under a request rule in
+/// the denial log at `path`, beside the stack's own denials. The query is
+/// left out: it can carry secrets and plays no part in matching.
+pub fn record_request_denial(path: &std::path::Path, method: &str, host: &str, target: &str) {
+    let path_only = target.split(['?', '#']).next().unwrap_or("");
+    append_audit_line(
+        path,
+        &format!("egress policy denied request {method} https://{host}{path_only}"),
+    );
+}
+
 impl std::fmt::Debug for EgressPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -663,6 +674,21 @@ impl EgressPolicy {
                     cidr.contains(ip) || mapped.is_some_and(|v4| cidr.contains(v4))
                 })
         })
+    }
+
+    /// Whether an explicit UDP allow rule (`--allow-udp`) admits a datagram to
+    /// `ip`:`port`, with every deny and the floor still applying. The allow
+    /// list alone does not count.
+    pub fn udp_rule_allows(&self, ip: IpAddr, port: u16) -> bool {
+        self.rule_action(FlowTransport::Udp, ip, Some(port)) == Some(RuleAction::Allow)
+            && self.compiled_rules().iter().any(|rule| {
+                rule.transport == Some(FlowTransport::Udp)
+                    && rule.action == RuleAction::Allow
+                    && rule.cidr.is_none_or(|cidr| cidr.contains(ip))
+                    && rule
+                        .ports
+                        .is_none_or(|ports| (ports.start..=ports.end).contains(&port))
+            })
     }
 
     /// Attach the structured decision record for a host-minted launch.
@@ -1462,6 +1488,29 @@ mod tests {
         assert!(!udp("192.0.2.10:3478"));
         assert!(udp("10.1.2.3:123"));
         assert!(policy.is_restricted());
+    }
+
+    #[test]
+    fn request_rules_drop_quic_unless_allow_udp_admits_it() {
+        let udp =
+            |ip: &str, policy: &EgressPolicy| policy.udp_rule_allows(ip.parse().unwrap(), 443);
+        let open = EgressPolicy::unrestricted();
+        assert!(!udp("203.0.113.5", &open), "QUIC is dropped");
+        assert!(!udp("2001:db8::1", &open), "over IPv6 too");
+        assert!(crate::udp_relay::should_relay_udp(
+            "203.0.113.5:443".parse().unwrap(),
+            &open
+        ));
+
+        let opted_in = EgressPolicy::unrestricted()
+            .with_rules(&[
+                deny_cidr("192.0.2.128/25"),
+                udp_allow("192.0.2.0/24", Some((443, 443))),
+            ])
+            .unwrap();
+        assert!(udp("192.0.2.10", &opted_in), "--allow-udp wins");
+        assert!(!udp("192.0.2.200", &opted_in), "a deny still wins");
+        assert!(!udp("198.51.100.7", &opted_in), "outside the allow");
     }
 
     #[test]
