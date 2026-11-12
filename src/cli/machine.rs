@@ -1367,6 +1367,22 @@ fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error)
     }
 }
 
+/// Synchronize a foreground run's staged mounts back to the host once its
+/// command has ended. A session that ended because the reader of our output
+/// went away (`run -i ... | head`) closed its connection so the agent would
+/// kill the command; that case synchronizes over a new one, as after any
+/// other exit.
+fn sync_staged_mounts_after_run(
+    mounts: &[HostMount],
+    client: &mut AgentClient,
+    manager: &AgentManager,
+) -> smolvm::Result<()> {
+    if client.session_reader_gone() {
+        *client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+    }
+    smolvm::staged_mount::sync_mounts(mounts, client)
+}
+
 impl RunCmd {
     pub fn run(mut self) -> smolvm::Result<()> {
         use smolvm::Error;
@@ -2402,7 +2418,8 @@ impl RunCmd {
                 };
 
                 if mounts.iter().any(|mount| mount.staged) {
-                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                    if let Err(error) = sync_staged_mounts_after_run(&mounts, &mut client, &manager)
+                    {
                         // Preserve the VM and its ephemeral DB record so the
                         // guest-local copy remains recoverable and sync can be
                         // retried by machine name.
@@ -2553,7 +2570,8 @@ impl RunCmd {
                     exit_code
                 };
                 if mounts.iter().any(|mount| mount.staged) {
-                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                    if let Err(error) = sync_staged_mounts_after_run(&mounts, &mut client, &manager)
+                    {
                         manager.detach();
                         return Err(Error::agent(
                             "sync staged mounts",
