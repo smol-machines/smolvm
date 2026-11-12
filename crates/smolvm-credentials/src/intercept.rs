@@ -14,6 +14,17 @@
 //! Only the placeholder is replaced; the guest supplies `Bearer ` or any other
 //! surrounding syntax. A placeholder anywhere other than an ordinary request
 //! header is refused so it can never travel upstream unreplaced.
+//!
+//! With a [`GuestTunnel`], the interceptor also serves HTTPS the machine's NIC
+//! would not carry in the clear (a VPN route such as Tailscale's, a container's
+//! forwarded traffic, a local proxy): the guest agent hands each such
+//! connection over a Unix socket, and the upstream connection is opened back
+//! through the guest so it takes the workload's route (see
+//! [`smolvm_protocol::intercept::tunnel`]). TLS to the upstream is still made
+//! and verified here.
+
+// The credential tunnel is Unix-only; elsewhere its plumbing is unused.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use crate::ca::MachineCa;
 use crate::policy::{CredentialPolicy, PLACEHOLDER_PREFIX};
@@ -28,23 +39,36 @@ use hyper::{
     header, server::conn::http1, service::service_fn, Method, Request, Response, StatusCode,
 };
 use hyper_util::rt::TokioIo;
+use smolvm_protocol::intercept::tunnel::Flow;
 use smolvm_protocol::intercept::{
     connect_verdict, preamble_len, InterceptEndpoint, HEADER_LEN, TOKEN_LEN,
 };
+#[cfg(unix)]
+use smolvm_protocol::intercept::{tunnel, VERDICT_CONNECTED};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio_rustls::TlsAcceptor;
 
 /// Largest request body forwarded with substitution.
 const REQUEST_LIMIT: usize = 8 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a tunnelled flow's own address gets before its server name is
+/// dialed too, as a client's happy-eyeballs fallback would.
+#[cfg(unix)]
+const FALLBACK_AFTER: Duration = Duration::from_millis(300);
 const MAX_SESSIONS: usize = 256;
 const MAX_CACHED_CLIENTS: usize = 64;
 
@@ -62,6 +86,36 @@ pub struct InterceptorConfig {
     /// Extra PEM roots trusted for upstream connections, for private services.
     /// Public roots stay enabled.
     pub upstream_roots_pem: Vec<Vec<u8>>,
+    /// Serve HTTPS the guest routes through other interfaces too.
+    pub guest_tunnel: Option<GuestTunnel>,
+}
+
+/// The host ends of the credential tunnel (see the module docs).
+#[derive(Clone, Debug)]
+pub struct GuestTunnel {
+    /// Unix socket the interceptor listens on; the guest agent's redirected
+    /// connections arrive here, each prefixed with its tunnel line.
+    pub flows: PathBuf,
+    /// Unix socket that reaches the guest agent's dial service; connecting
+    /// and writing a tunnel line opens an upstream from inside the guest.
+    pub dial: PathBuf,
+    /// Private directory for the per-connection sockets the upstream HTTP
+    /// client dials through the guest.
+    pub relay_dir: PathBuf,
+}
+
+/// A connection the interceptor can relay: TCP, or a Unix socket into the guest.
+trait Io: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Io for T {}
+
+/// How a flow's upstream connection is opened.
+#[derive(Clone)]
+enum Route<'a> {
+    /// From this host, to the destination the backend admitted.
+    Direct(SocketAddr),
+    /// From inside the guest, through its dial service at this socket, along
+    /// the route the guest named for this flow.
+    Guest(&'a Path, Flow),
 }
 
 /// A running interceptor. Dropping it stops the listener and every session.
@@ -83,6 +137,8 @@ struct State {
     clients: Mutex<HashMap<(String, SocketAddr), reqwest::Client>>,
     upstream_roots: Vec<reqwest::Certificate>,
     sessions: Arc<tokio::sync::Semaphore>,
+    guest_tunnel: Option<GuestTunnel>,
+    relay_seq: AtomicU64,
 }
 
 impl Interceptor {
@@ -116,7 +172,22 @@ impl Interceptor {
             clients: Mutex::new(HashMap::new()),
             upstream_roots,
             sessions: Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS)),
+            guest_tunnel: config.guest_tunnel.clone(),
+            relay_seq: AtomicU64::new(0),
         });
+        // Bind before the VM boots, so the guest's first redirected flow finds
+        // the socket.
+        #[cfg(unix)]
+        let tunnel_listener = match &config.guest_tunnel {
+            Some(tunnel) => {
+                let _ = std::fs::remove_file(&tunnel.flows);
+                let listener = std::os::unix::net::UnixListener::bind(&tunnel.flows)
+                    .with_context(|| format!("bind {}", tunnel.flows.display()))?;
+                listener.set_nonblocking(true)?;
+                Some(listener)
+            }
+            None => None,
+        };
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -135,8 +206,22 @@ impl Interceptor {
                             return;
                         }
                     };
+                    #[cfg(unix)]
+                    let tunnel = async {
+                        match tunnel_listener.map(UnixListener::from_std) {
+                            Some(Ok(listener)) => tunnel_accept_loop(state.clone(), listener).await,
+                            Some(Err(e)) => {
+                                tracing::error!(error = %e, "credential tunnel listener");
+                                std::future::pending().await
+                            }
+                            None => std::future::pending().await,
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let tunnel = std::future::pending::<()>();
                     tokio::select! {
-                        _ = accept_loop(state, listener) => {}
+                        _ = accept_loop(state.clone(), listener) => {}
+                        _ = tunnel => {}
                         _ = shutdown_rx => {}
                     }
                 });
@@ -191,25 +276,130 @@ async fn accept_loop(state: Arc<State>, listener: TcpListener) {
     }
 }
 
-async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
-    let _ = stream.set_nodelay(true);
-    let destination = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_preamble(&state, &mut stream))
-        .await
-        .context("preamble timeout")??;
+#[cfg(unix)]
+async fn tunnel_accept_loop(state: Arc<State>, listener: UnixListener) {
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                tracing::warn!(error = %e, "credential tunnel accept");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = state.sessions.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = handle_tunnel_flow(state, stream).await {
+                tracing::debug!(error = %e, "credential tunnel flow ended");
+            }
+        });
+    }
+}
 
-    // Reach the destination before the guest's connect completes, and report
-    // the outcome, so an unreachable destination fails the guest's connect
-    // (letting it try another address) instead of an established stream.
-    let upstream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(destination))
+#[cfg(unix)]
+/// A connection the guest agent caught off the NIC (a VPN, a container, a
+/// local proxy): its
+/// upstream is opened back through the guest, along the workload's route.
+async fn handle_tunnel_flow(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
+    let flow = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_flow_line(&mut stream))
         .await
-        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
-    stream.write_all(&[connect_verdict(&upstream)]).await?;
-    let upstream = upstream.context("upstream connect")?;
+        .context("tunnel line timeout")??;
+    let tunnel = state
+        .guest_tunnel
+        .clone()
+        .context("credential tunnel is not configured")?;
+    let port = flow.target.port();
+    let (upstream, flow, buffered) = dial_with_fallback(&tunnel.dial, flow, &mut stream).await?;
+    serve_flow(
+        state,
+        stream,
+        upstream,
+        port,
+        Route::Guest(&tunnel.dial, flow),
+        buffered,
+    )
+    .await
+}
 
+/// Open `flow`'s upstream through the guest, falling back the way the
+/// workload's own client would have.
+///
+/// The guest's connect already completed against the agent, so an
+/// unreachable address cannot fail it the way it would have failed the
+/// client's (which then tries the name's next address: an exit node with no
+/// IPv6, say). When the address the client chose has not connected after
+/// [`FALLBACK_AFTER`], or failed, the interceptor also dials the TLS server
+/// name from the client's hello through the same route, and the first
+/// connection wins. Returns the upstream, the flow it took, and the client
+/// bytes read to find the name.
+#[cfg(unix)]
+async fn dial_with_fallback(
+    dial: &Path,
+    flow: Flow,
+    stream: &mut UnixStream,
+) -> Result<(UnixStream, Flow, Vec<u8>)> {
+    let first = flow.clone();
+    let mut original = Box::pin(async move { dial_guest(dial, &first).await });
+    let early = tokio::select! {
+        result = &mut original => Some(result),
+        _ = tokio::time::sleep(FALLBACK_AFTER) => None,
+    };
+    if let Some(Ok(upstream)) = early {
+        return Ok((upstream, flow, Vec::new()));
+    }
     let mut buffered = Vec::with_capacity(2048);
-    let peek = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let named = match read_client_hello(stream, &mut buffered).await {
+        Ok(Peek::ServerName(host)) => Some(Flow {
+            target: tunnel::Target::Name(host, flow.target.port()),
+            route: flow.route.clone(),
+        }),
+        _ => None,
+    };
+    let Some(named) = named.filter(|named| named.target != flow.target) else {
+        let upstream = match early {
+            Some(result) => result,
+            None => original.await,
+        };
+        return Ok((
+            upstream.context("upstream connect through the guest")?,
+            flow,
+            buffered,
+        ));
+    };
+    if let Some(Err(e)) = early {
+        tracing::debug!(target = %flow.target, error = %e, "credential tunnel: trying the server name");
+        let upstream = dial_guest(dial, &named)
+            .await
+            .context("upstream connect through the guest")?;
+        return Ok((upstream, named, buffered));
+    }
+    let second = named.clone();
+    let mut by_name = Box::pin(async move { dial_guest(dial, &second).await });
+    tokio::select! {
+        result = &mut original => match result {
+            Ok(upstream) => Ok((upstream, flow, buffered)),
+            Err(_) => Ok((by_name.await.context("upstream connect through the guest")?, named, buffered)),
+        },
+        result = &mut by_name => match result {
+            Ok(upstream) => Ok((upstream, named, buffered)),
+            Err(_) => Ok((original.await.context("upstream connect through the guest")?, flow, buffered)),
+        },
+    }
+}
+
+/// Read until the client's TLS hello names its server, or shows it will not.
+async fn read_client_hello<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+) -> Result<Peek> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         loop {
-            match peek_client_hello(&buffered) {
+            match peek_client_hello(buffered) {
                 Peek::Incomplete if buffered.len() < MAX_CLIENT_HELLO => {
                     let mut chunk = [0u8; 4096];
                     let n = stream.read(&mut chunk).await?;
@@ -224,13 +414,51 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
         }
     })
     .await
-    .context("client hello timeout")??;
+    .context("client hello timeout")?
+}
+
+async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
+    let _ = stream.set_nodelay(true);
+    let destination = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_preamble(&state, &mut stream))
+        .await
+        .context("preamble timeout")??;
+
+    // Reach the destination before the guest's connect completes, and report
+    // the outcome, so an unreachable destination fails the guest's connect
+    // (letting it try another address) instead of an established stream.
+    let upstream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(destination))
+        .await
+        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
+    stream.write_all(&[connect_verdict(&upstream)]).await?;
+    let upstream = upstream.context("upstream connect")?;
+    let _ = upstream.set_nodelay(true);
+    serve_flow(
+        state,
+        stream,
+        upstream,
+        destination.port(),
+        Route::Direct(destination),
+        Vec::new(),
+    )
+    .await
+}
+
+/// Terminate a credential host's TLS or splice anything else to `upstream`.
+async fn serve_flow<S: Io, U: Io>(
+    state: Arc<State>,
+    mut stream: S,
+    upstream: U,
+    port: u16,
+    route: Route<'_>,
+    mut buffered: Vec<u8>,
+) -> Result<()> {
+    let peek = read_client_hello(&mut stream, &mut buffered).await?;
 
     match peek {
         Peek::ServerName(host) if state.policy.bindings_for_host(&host).next().is_some() => {
             // The upstream client opens its own verified connection.
             drop(upstream);
-            terminate(state, stream, buffered, host, destination).await
+            terminate(state, stream, buffered, host, port, route).await
         }
         Peek::ServerName(_) | Peek::NoServerName | Peek::Incomplete => {
             passthrough(stream, upstream, buffered).await
@@ -248,23 +476,100 @@ async fn read_preamble(state: &State, stream: &mut TcpStream) -> Result<SocketAd
     Ok(state.endpoint.read_preamble(&full[..])?)
 }
 
-async fn passthrough(
-    mut guest: TcpStream,
-    mut upstream: TcpStream,
-    buffered: Vec<u8>,
-) -> Result<()> {
-    let _ = upstream.set_nodelay(true);
+#[cfg(unix)]
+/// Read the credential tunnel's line without consuming more.
+async fn read_flow_line<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Flow> {
+    let mut line = Vec::with_capacity(64);
+    loop {
+        let byte = stream.read_u8().await?;
+        if byte == b'\n' {
+            return Ok(Flow::parse(&line)?);
+        }
+        line.push(byte);
+        if line.len() > tunnel::MAX_LINE {
+            anyhow::bail!("credential tunnel line too long");
+        }
+    }
+}
+
+#[cfg(unix)]
+/// Open `flow`'s upstream from inside the guest through its dial service.
+async fn dial_guest(dial: &Path, flow: &Flow) -> std::io::Result<UnixStream> {
+    let connect = async {
+        let mut stream = UnixStream::connect(dial).await?;
+        stream.write_all(flow.line().as_bytes()).await?;
+        match stream.read_u8().await? {
+            VERDICT_CONNECTED => Ok(stream),
+            errno => Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("the guest could not reach {} (errno {errno})", flow.target),
+            )),
+        }
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT + Duration::from_secs(5), connect)
+        .await
+        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+}
+
+/// A Unix socket whose every connection is relayed through the guest to one
+/// destination, so the upstream HTTP client (which dials a socket path, not a
+/// stream it is handed) reaches it along the guest's route. It lives as long
+/// as the guest connection it serves.
+struct GuestRelay {
+    path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl GuestRelay {
+    fn bind(state: &State, dial: &Path, flow: Flow) -> Result<Self> {
+        let dir = &state
+            .guest_tunnel
+            .as_ref()
+            .context("credential tunnel is not configured")?
+            .relay_dir;
+        let seq = state.relay_seq.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("cred-relay-{seq}.sock"));
+        let _ = std::fs::remove_file(&path);
+        let listener =
+            UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
+        let dial = dial.to_path_buf();
+        let task = tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let dial = dial.clone();
+                let flow = flow.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut upstream) = dial_guest(&dial, &flow).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    }
+                });
+            }
+        });
+        Ok(Self { path, task })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GuestRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn passthrough<S: Io, U: Io>(mut guest: S, mut upstream: U, buffered: Vec<u8>) -> Result<()> {
     upstream.write_all(&buffered).await?;
     let _ = tokio::io::copy_bidirectional(&mut guest, &mut upstream).await;
     Ok(())
 }
 
-async fn terminate(
+async fn terminate<S: Io>(
     state: Arc<State>,
-    stream: TcpStream,
+    stream: S,
     buffered: Vec<u8>,
     host: String,
-    destination: SocketAddr,
+    port: u16,
+    route: Route<'_>,
 ) -> Result<()> {
     let tls_config = state.leaf_config(&host)?;
     let tls = tokio::time::timeout(
@@ -273,12 +578,27 @@ async fn terminate(
     )
     .await
     .context("guest TLS handshake timeout")??;
+    // Through the guest, this connection gets a client of its own pinned to a
+    // relay that dials the destination from inside the guest; the relay goes
+    // away with the connection.
+    let (relay, client): (Option<GuestRelay>, _) = match route {
+        Route::Direct(destination) => (None, state.client_for(&host, destination)?),
+        #[cfg(unix)]
+        Route::Guest(dial, flow) => {
+            let relay = GuestRelay::bind(&state, dial, flow)?;
+            let client = state.build_client(&host, Upstream::Unix(&relay.path))?;
+            (Some(relay), client)
+        }
+        #[cfg(not(unix))]
+        Route::Guest(..) => anyhow::bail!("the credential tunnel needs Unix sockets"),
+    };
     let host = Arc::new(host);
     let service = service_fn(move |request: Request<Incoming>| {
         let state = state.clone();
         let host = host.clone();
+        let client = client.clone();
         async move {
-            let reply = match state.forward(&host, destination, request).await {
+            let reply = match state.forward(&host, port, &client, request).await {
                 Ok(reply) => reply,
                 Err(e) => {
                     tracing::warn!(machine = %state.machine, host = %host, error = %e, "credential forward failed");
@@ -291,12 +611,22 @@ async fn terminate(
             Ok::<_, std::convert::Infallible>(reply)
         }
     });
-    http1::Builder::new()
+    let served = http1::Builder::new()
         .keep_alive(true)
         .serve_connection(TokioIo::new(tls), service)
         .await
-        .context("serve intercepted connection")?;
-    Ok(())
+        .context("serve intercepted connection");
+    drop(relay);
+    served
+}
+
+/// Where an upstream client connects.
+#[derive(Clone, Copy)]
+enum Upstream<'a> {
+    /// The destination the guest resolved, directly from this host.
+    Address(SocketAddr),
+    /// A relay socket that reaches the destination through the guest.
+    Unix(&'a Path),
 }
 
 impl State {
@@ -306,7 +636,7 @@ impl State {
         &self,
         binding: &str,
         host: &str,
-        destination: SocketAddr,
+        port: u16,
         method: &str,
         path: &str,
     ) -> Result<std::result::Result<zeroize::Zeroizing<String>, Reply>> {
@@ -315,7 +645,7 @@ impl State {
             machine: self.machine.clone(),
             binding: binding.to_string(),
             host: host.to_string(),
-            port: destination.port(),
+            port,
             method: method.to_string(),
             path: path.to_string(),
         };
@@ -360,17 +690,7 @@ impl State {
         if let Some(client) = clients.get(&key) {
             return Ok(client.clone());
         }
-        let mut builder = reqwest::Client::builder()
-            .use_rustls_tls()
-            .no_proxy()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .resolve(host, destination);
-        for root in &self.upstream_roots {
-            builder = builder.add_root_certificate(root.clone());
-        }
-        let client = builder.build().context("upstream client")?;
+        let client = self.build_client(host, Upstream::Address(destination))?;
         if clients.len() >= MAX_CACHED_CLIENTS {
             clients.clear();
         }
@@ -378,16 +698,51 @@ impl State {
         Ok(client)
     }
 
+    /// An upstream client that verifies `host`'s certificate whatever it
+    /// connects to.
+    fn build_client(&self, host: &str, upstream: Upstream<'_>) -> Result<reqwest::Client> {
+        let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .no_proxy()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT);
+        builder = match upstream {
+            Upstream::Address(destination) => builder.resolve(host, destination),
+            #[cfg(unix)]
+            Upstream::Unix(path) => builder.unix_socket(path),
+            #[cfg(not(unix))]
+            Upstream::Unix(_) => anyhow::bail!("the credential tunnel needs Unix sockets"),
+        };
+        for root in &self.upstream_roots {
+            builder = builder.add_root_certificate(root.clone());
+        }
+        if let Upstream::Unix(_) = upstream {
+            // Through the guest, the connection may come back out the
+            // machine's NIC in the clear (a VPN that forwards locally, say)
+            // and meet this interceptor's own termination, which presents a
+            // leaf from the machine CA. Trusting that CA here is safe: its key
+            // never leaves the host, so the guest relaying these bytes cannot
+            // present a certificate it signed.
+            builder = builder.add_root_certificate(
+                reqwest::Certificate::from_pem(self.ca.certificate_pem().as_bytes())
+                    .context("machine CA as an upstream root")?,
+            );
+        }
+        builder.build().context("upstream client")
+    }
+
     async fn forward(
         &self,
         host: &str,
-        destination: SocketAddr,
+        port: u16,
+        client: &reqwest::Client,
         request: Request<Incoming>,
     ) -> Result<Reply> {
-        let authority = if destination.port() == 443 {
+        let authority = if port == 443 {
             host.to_string()
         } else {
-            format!("{host}:{}", destination.port())
+            format!("{host}:{port}")
         };
         let websocket_upgrade = request
             .headers()
@@ -532,13 +887,7 @@ impl State {
                 }
             }
             let secret = match self
-                .resolve(
-                    binding_name,
-                    host,
-                    destination,
-                    parts.method.as_str(),
-                    &target,
-                )
+                .resolve(binding_name, host, port, parts.method.as_str(), &target)
                 .await?
             {
                 Ok(secret) => secret,
@@ -582,13 +931,7 @@ impl State {
                 .as_deref()
                 .context("header binding without a header")?;
             let secret = match self
-                .resolve(
-                    &binding.name,
-                    host,
-                    destination,
-                    parts.method.as_str(),
-                    &target,
-                )
+                .resolve(&binding.name, host, port, parts.method.as_str(), &target)
                 .await?
             {
                 Ok(secret) => secret,
@@ -612,7 +955,6 @@ impl State {
         headers.remove(header::HOST);
         headers.remove(header::CONTENT_LENGTH);
 
-        let client = self.client_for(host, destination)?;
         let upstream = client
             .request(parts.method, format!("https://{authority}{target}"))
             .headers(headers)
@@ -979,6 +1321,7 @@ mod tests {
                 placeholders,
                 ca,
                 upstream_roots_pem: vec![upstream.cert_pem.clone()],
+                guest_tunnel: None,
             },
             Arc::new(resolver),
         )
@@ -1149,6 +1492,336 @@ mod tests {
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(seen[0].0, format!("Bearer {}", f.placeholder));
         assert_eq!(seen[0].1, "/raw");
+    }
+
+    /// What the fake guest does with a dial.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum GuestPath {
+        /// Connect straight to the target, as through a VPN.
+        Out,
+        /// Hand the connection to the interceptor's own NIC listener, as a VPN
+        /// that forwards back out the machine's NIC in the clear would.
+        BackOutTheNic(InterceptEndpoint),
+    }
+
+    /// The guest end of the credential tunnel: a dial service that, like the
+    /// guest agent, reads a tunnel line, connects, answers a verdict and
+    /// relays. A name target reaches `name_addr`. Records every line.
+    #[cfg(unix)]
+    struct FakeGuest {
+        dir: tempfile::TempDir,
+        dials: Arc<Mutex<Vec<Flow>>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeGuest {
+        fn start(name_addr: SocketAddr, path: Arc<Mutex<GuestPath>>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let dial = UnixListener::bind(dir.path().join("dial.sock")).unwrap();
+            let dials = Arc::new(Mutex::new(Vec::new()));
+            let recorded = dials.clone();
+            tokio::spawn(async move {
+                while let Ok((mut host, _)) = dial.accept().await {
+                    let recorded = recorded.clone();
+                    let path = *path.lock().unwrap();
+                    tokio::spawn(async move {
+                        let flow = read_flow_line(&mut host).await.unwrap();
+                        recorded.lock().unwrap().push(flow.clone());
+                        let target = match flow.target {
+                            tunnel::Target::Addr(addr) => addr,
+                            tunnel::Target::Name(..) => name_addr,
+                        };
+                        let upstream = match path {
+                            GuestPath::Out => TcpStream::connect(target).await,
+                            GuestPath::BackOutTheNic(endpoint) => {
+                                async {
+                                    let mut nic = TcpStream::connect(endpoint.addr).await?;
+                                    nic.write_all(&endpoint.preamble(target)).await?;
+                                    assert_eq!(nic.read_u8().await?, 0);
+                                    Ok(nic)
+                                }
+                                .await
+                            }
+                        };
+                        host.write_all(&[connect_verdict(&upstream)]).await.unwrap();
+                        if let Ok(mut upstream) = upstream {
+                            let _ = tokio::io::copy_bidirectional(&mut host, &mut upstream).await;
+                        }
+                    });
+                }
+            });
+            Self { dir, dials }
+        }
+
+        fn tunnel(&self) -> GuestTunnel {
+            GuestTunnel {
+                flows: self.dir.path().join("flows.sock"),
+                dial: self.dir.path().join("dial.sock"),
+                relay_dir: self.dir.path().to_path_buf(),
+            }
+        }
+    }
+
+    /// Like [`fixture`], with the credential tunnel's host ends served.
+    #[cfg(unix)]
+    async fn tunnel_fixture() -> (Fixture, FakeGuest, Arc<Mutex<GuestPath>>) {
+        let upstream = start_upstream().await;
+        let path = Arc::new(Mutex::new(GuestPath::Out));
+        let guest = FakeGuest::start(upstream.addr, path.clone());
+        let policy = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "svc".into(),
+                environment_variable: "SVC_TOKEN".into(),
+                allowed_hosts: vec![CRED_HOST.into()],
+                injection_location: InjectionLocation::default(),
+                methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+                set_header: None,
+            }],
+        };
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let placeholder = placeholders.values().next().cloned().unwrap();
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let ca_pem = ca.certificate_pem().to_string();
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy,
+                placeholders,
+                ca,
+                upstream_roots_pem: vec![upstream.cert_pem.clone()],
+                guest_tunnel: Some(guest.tunnel()),
+            },
+            Arc::new(StaticResolver::new().with("svc", "real-secret")),
+        )
+        .unwrap();
+        let fixture = Fixture {
+            upstream,
+            interceptor,
+            placeholder,
+            ca_pem,
+        };
+        (fixture, guest, path)
+    }
+
+    /// Hand a connection over the tunnel the way the guest agent does, then
+    /// speak TLS+HTTP/1.1 as the workload.
+    #[cfg(unix)]
+    async fn tunnel_request(
+        guest: &FakeGuest,
+        line: &str,
+        trusted_pem: &[u8],
+        sni: &str,
+        request: &str,
+    ) -> std::io::Result<String> {
+        let mut stream = UnixStream::connect(guest.tunnel().flows).await?;
+        stream.write_all(line.as_bytes()).await?;
+        let connector = TlsConnector::from(client_config(trusted_pem));
+        let name = ServerName::try_from(sni.to_string()).unwrap();
+        let mut tls = connector.connect(name, stream).await?;
+        tls.write_all(request.as_bytes()).await?;
+        let mut out = Vec::new();
+        let _ = tls.read_to_end(&mut out).await;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    #[cfg(unix)]
+    fn bound_request(f: &Fixture) -> String {
+        format!(
+            "GET /v1/me HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            f.placeholder
+        )
+    }
+
+    /// A workload that routes a credential host through a VPN still gets the
+    /// value substituted, and the upstream is dialed from inside the guest,
+    /// along the route the guest named, so it takes the workload's path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn substitutes_through_the_tunnel_and_dials_upstream_from_the_guest() {
+        let (f, guest, _) = tunnel_fixture().await;
+        let line = format!("{} ns:7\n", f.upstream.addr);
+        let response = tunnel_request(
+            &guest,
+            &line,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &bound_request(&f),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            f.upstream.seen.lock().unwrap().clone(),
+            vec![("Bearer real-secret".to_string(), "/v1/me".to_string())]
+        );
+        let dials = guest.dials.lock().unwrap().clone();
+        assert!(
+            !dials.is_empty(),
+            "the upstream was not dialed through the guest"
+        );
+        assert!(
+            dials.iter().all(|d| d.line() == line),
+            "every dial must carry the flow's own route back: {dials:?}"
+        );
+        // The per-connection relay socket goes away with the connection.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let leftover: Vec<_> = std::fs::read_dir(guest.dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("cred-relay-"))
+            .collect();
+        assert!(leftover.is_empty(), "{leftover:?}");
+    }
+
+    /// A proxy request names its destination; the line carries the name and
+    /// the substitution still applies.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn substitutes_for_a_named_target_from_a_proxy() {
+        let (f, guest, _) = tunnel_fixture().await;
+        let line = format!("{CRED_HOST}:443 px:3\n");
+        let response = tunnel_request(
+            &guest,
+            &line,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &bound_request(&f),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(f.upstream.seen.lock().unwrap()[0].0, "Bearer real-secret");
+        assert!(guest.dials.lock().unwrap().iter().all(|d| d.line() == line));
+    }
+
+    /// A VPN that sends the connection back out the machine's NIC in the clear
+    /// meets the interceptor twice: the second termination presents a machine
+    /// CA leaf, which the first trusts, and the value arrives once.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn substitutes_when_the_tunnel_comes_back_out_the_nic() {
+        let (f, guest, path) = tunnel_fixture().await;
+        *path.lock().unwrap() = GuestPath::BackOutTheNic(f.interceptor.endpoint());
+        let line = format!("{} ns:1\n", f.upstream.addr);
+        let response = tunnel_request(
+            &guest,
+            &line,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &bound_request(&f),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            f.upstream.seen.lock().unwrap().clone(),
+            vec![("Bearer real-secret".to_string(), "/v1/me".to_string())]
+        );
+    }
+
+    /// The machine CA is trusted only on the guest route: directly, a machine
+    /// CA leaf is no upstream at all.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_direct_route_does_not_trust_the_machine_ca() {
+        let f = fixture().await;
+        // A direct flow whose destination is the interceptor itself, which
+        // presents a machine CA leaf, must fail rather than be trusted.
+        let mut tcp = TcpStream::connect(f.interceptor.endpoint().addr)
+            .await
+            .unwrap();
+        tcp.write_all(
+            &f.interceptor
+                .endpoint()
+                .preamble(f.interceptor.endpoint().addr),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tcp.read_u8().await.unwrap(), 0);
+        let connector = TlsConnector::from(client_config(f.ca_pem.as_bytes()));
+        let name = ServerName::try_from(CRED_HOST.to_string()).unwrap();
+        let mut tls = connector.connect(name, tcp).await.unwrap();
+        tls.write_all(bound_request(&f).as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        let _ = tls.read_to_end(&mut out).await;
+        let response = String::from_utf8_lossy(&out);
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn splices_other_hosts_through_the_tunnel_untouched() {
+        let (f, guest, _) = tunnel_fixture().await;
+        let request = format!(
+            "GET /raw HTTP/1.1\r\nHost: {OTHER_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            f.placeholder
+        );
+        let line = format!("{} ns:2\n", f.upstream.addr);
+        let response = tunnel_request(&guest, &line, &f.upstream.cert_pem, OTHER_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(seen[0].0, format!("Bearer {}", f.placeholder));
+        assert_eq!(guest.dials.lock().unwrap().len(), 1);
+    }
+
+    /// The address the workload chose is unreachable through its route (an
+    /// exit node without IPv6, say): the interceptor dials the TLS server
+    /// name through the same route, as the client's fallback would have.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_address_falls_back_to_the_server_name() {
+        let (f, guest, _) = tunnel_fixture().await;
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unreachable = closed.local_addr().unwrap();
+        drop(closed);
+        let line = format!("{unreachable} ns:4\n");
+        let response = tunnel_request(
+            &guest,
+            &line,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &bound_request(&f),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(f.upstream.seen.lock().unwrap()[0].0, "Bearer real-secret");
+        let dials = guest.dials.lock().unwrap().clone();
+        assert!(
+            dials
+                .iter()
+                .any(|d| d.line() == format!("{CRED_HOST}:{} ns:4\n", unreachable.port())),
+            "{dials:?}"
+        );
+    }
+
+    /// When the guest cannot reach the destination, the flow closes; nothing
+    /// is sent from the host instead.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_tunnel_destination_closes_the_flow() {
+        let (f, guest, _) = tunnel_fixture().await;
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unreachable = closed.local_addr().unwrap();
+        drop(closed);
+        let mut stream = UnixStream::connect(guest.tunnel().flows).await.unwrap();
+        stream
+            .write_all(format!("{unreachable} ns:1\n").as_bytes())
+            .await
+            .unwrap();
+        // Not TLS, so there is no server name to fall back to.
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut out = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut out))
+            .await
+            .expect("the flow was not closed")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

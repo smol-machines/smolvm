@@ -123,6 +123,12 @@ pub const SHM_SIZE: &str = "SMOLVM_SHM_SIZE";
 /// Enables the guest-side port forwarder on [`crate::ports::PORT_FORWARD`].
 pub const PORT_FORWARD: &str = "SMOLVM_PORT_FORWARD";
 
+/// Enables the guest side of the credential tunnel
+/// ([`crate::ports::CREDENTIAL_TUNNEL`] and [`crate::ports::CREDENTIAL_DIAL`]):
+/// HTTPS the machine's NIC would not carry in the clear reaches the
+/// credential interceptor too. See [`crate::intercept::tunnel`].
+pub const CREDENTIAL_TUNNEL: &str = "SMOLVM_CREDENTIAL_TUNNEL";
+
 /// Validate a `--shm-size` value and return it as a tmpfs `size=` value: a
 /// byte count with an optional `k`, `m` or `g` suffix (`512m`, `2g`), or a
 /// share of guest RAM from 1% to 100% (`25%`). The host and the agent both

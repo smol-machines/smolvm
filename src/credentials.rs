@@ -11,6 +11,7 @@ use crate::config::VmRecord;
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+pub use smolvm_credentials::intercept::GuestTunnel;
 use smolvm_credentials::{
     CredentialRequest, CredentialResolver, Interceptor, InterceptorConfig, MachineCa, ResolveError,
 };
@@ -25,6 +26,16 @@ use std::sync::{Arc, Mutex};
 /// Socket in a running machine's data directory that takes new values for its
 /// bindings, so a rotated credential reaches a machine without a restart.
 pub const CREDENTIALS_SOCKET: &str = "credentials.sock";
+
+/// Socket in the machine's data directory where the interceptor takes HTTPS
+/// the guest caught off the NIC: a VPN, a container, a local proxy (guest vsock
+/// [`ports::CREDENTIAL_TUNNEL`](smolvm_protocol::ports::CREDENTIAL_TUNNEL)).
+pub const CREDENTIAL_TUNNEL_SOCKET: &str = "cred-tunnel.sock";
+
+/// Socket in the machine's data directory that reaches the guest agent's dial
+/// service (guest vsock
+/// [`ports::CREDENTIAL_DIAL`](smolvm_protocol::ports::CREDENTIAL_DIAL)).
+pub const CREDENTIAL_DIAL_SOCKET: &str = "cred-dial.sock";
 
 /// Largest request the credentials socket reads: every binding's value is at
 /// most a few KiB.
@@ -222,8 +233,15 @@ impl CredentialLaunch {
 
     /// Start the interceptor for this machine. The returned handle must live
     /// as long as the VM; dropping it stops substitution. With the machine's
-    /// data directory, it also serves [`CREDENTIALS_SOCKET`] there.
-    pub fn start_interceptor(&self, vm_dir: Option<&Path>) -> Result<Interceptor> {
+    /// data directory, it also serves [`CREDENTIALS_SOCKET`] there, and with
+    /// `guest_tunnel` the host ends of the credential tunnel
+    /// ([`CREDENTIAL_TUNNEL_SOCKET`], dialing out through
+    /// [`CREDENTIAL_DIAL_SOCKET`]).
+    pub fn start_interceptor(
+        &self,
+        vm_dir: Option<&Path>,
+        guest_tunnel: Option<&GuestTunnel>,
+    ) -> Result<Interceptor> {
         let ca = MachineCa::load(&self.ca_dir, &self.ca_owner)
             .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?;
         let live = LiveValues::default();
@@ -237,6 +255,7 @@ impl CredentialLaunch {
                 placeholders: self.placeholders.clone(),
                 ca,
                 upstream_roots_pem: Vec::new(),
+                guest_tunnel: guest_tunnel.cloned(),
             },
             Arc::new(SecretRefResolver {
                 sources: self.sources.clone(),
@@ -245,6 +264,28 @@ impl CredentialLaunch {
         )
         .map_err(|e| Error::config("credentials", format!("start interceptor: {e:#}")))
     }
+}
+
+/// The credential tunnel's host sockets in `vm_dir`, or `None` (with a
+/// warning) when a socket path would be too long for this host.
+pub fn guest_tunnel_in(vm_dir: &Path) -> Option<GuestTunnel> {
+    let tunnel = GuestTunnel {
+        flows: vm_dir.join(CREDENTIAL_TUNNEL_SOCKET),
+        dial: vm_dir.join(CREDENTIAL_DIAL_SOCKET),
+        relay_dir: vm_dir.to_path_buf(),
+    };
+    // The per-connection relay sockets are the longest names the tunnel uses.
+    let longest = vm_dir.join("cred-relay-18446744073709551615.sock");
+    for path in [&tunnel.flows, &tunnel.dial, &longest] {
+        if let Err(e) = crate::agent::launcher_dynamic::check_socket_path_len(path) {
+            tracing::warn!(
+                "credential tunnel disabled; HTTPS the guest sends through its own VPN, a container or a local proxy \
+                 will not have credentials substituted: {e}"
+            );
+            return None;
+        }
+    }
+    Some(tunnel)
 }
 
 /// Values handed to this process for its machines' bindings, by machine name

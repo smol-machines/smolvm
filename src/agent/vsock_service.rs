@@ -34,6 +34,9 @@ pub struct VsockServiceInputs<'a> {
     /// Host socket the workload's output is appended from. When set, the
     /// guest agent forwards a detached workload's stdout and stderr to it.
     pub workload_log_socket: Option<&'a Path>,
+    /// Host ends of the credential tunnel. When set, the guest agent hands
+    /// the interceptor HTTPS the NIC would not carry in the clear.
+    pub credential_tunnel: Option<&'a crate::credentials::GuestTunnel>,
 }
 
 /// A service resolved to "on" for a launch: the concrete wiring the launcher
@@ -149,6 +152,37 @@ impl VsockService for WorkloadLogService {
     }
 }
 
+/// Credential tunnel, guest to host: the agent hands the interceptor each HTTPS
+/// connection the NIC would not carry in the clear (a VPN, a container's
+/// forwarded traffic, a local proxy).
+struct CredentialTunnelService;
+impl VsockService for CredentialTunnelService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.credential_tunnel.map(|tunnel| ActiveVsockService {
+            name: "credential tunnel",
+            port: ports::CREDENTIAL_TUNNEL,
+            listen: false,
+            socket: &tunnel.flows,
+            guest_env: &[(guest_env::CREDENTIAL_TUNNEL, guest_env::VALUE_ON)],
+        })
+    }
+}
+
+/// Credential tunnel, host to guest: the interceptor opens those connections'
+/// upstreams from inside the guest, along the workload's route.
+struct CredentialDialService;
+impl VsockService for CredentialDialService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.credential_tunnel.map(|tunnel| ActiveVsockService {
+            name: "credential tunnel dial",
+            port: ports::CREDENTIAL_DIAL,
+            listen: true,
+            socket: &tunnel.dial,
+            guest_env: &[],
+        })
+    }
+}
+
 /// All known vsock services. Add a capability by appending one entry.
 pub fn registry() -> &'static [&'static dyn VsockService] {
     &[
@@ -157,6 +191,8 @@ pub fn registry() -> &'static [&'static dyn VsockService] {
         &DockerSocketService,
         &PortForwardService,
         &WorkloadLogService,
+        &CredentialTunnelService,
+        &CredentialDialService,
     ]
 }
 
@@ -173,6 +209,7 @@ mod tests {
             docker_socket: None,
             port_forward_socket: None,
             workload_log_socket: None,
+            credential_tunnel: None,
         };
 
         let active = registry()
@@ -185,5 +222,42 @@ mod tests {
         assert!(!active.listen);
         assert_eq!(active.socket, socket);
         assert_eq!(active.guest_env, &[("SMOLVM_SSH_AGENT", "1")]);
+    }
+
+    #[test]
+    fn credential_tunnel_bridges_both_directions_and_activates_the_agent() {
+        let tunnel = crate::credentials::GuestTunnel {
+            flows: "/vm/cred-tunnel.sock".into(),
+            dial: "/vm/cred-dial.sock".into(),
+            relay_dir: "/vm".into(),
+        };
+        let inputs = VsockServiceInputs {
+            ssh_agent_socket: None,
+            cuda_socket: None,
+            docker_socket: None,
+            port_forward_socket: None,
+            workload_log_socket: None,
+            credential_tunnel: Some(&tunnel),
+        };
+        let active: Vec<_> = registry()
+            .iter()
+            .filter_map(|service| service.resolve(&inputs))
+            .collect();
+        assert_eq!(active.len(), 2);
+        let flows = &active[0];
+        assert_eq!(flows.port, ports::CREDENTIAL_TUNNEL);
+        assert!(
+            !flows.listen,
+            "the guest connects out; the interceptor listens"
+        );
+        assert_eq!(flows.socket, tunnel.flows.as_path());
+        assert_eq!(
+            flows.guest_env,
+            &[(guest_env::CREDENTIAL_TUNNEL, guest_env::VALUE_ON)]
+        );
+        let dial = &active[1];
+        assert_eq!(dial.port, ports::CREDENTIAL_DIAL);
+        assert!(dial.listen, "the host connects in; the guest agent listens");
+        assert_eq!(dial.socket, tunnel.dial.as_path());
     }
 }

@@ -723,6 +723,7 @@ pub fn launch_agent_vm_dynamic(
         docker_socket: None,
         port_forward_socket: None,
         workload_log_socket: None,
+        credential_tunnel: None,
     };
     let active_vsock: Vec<_> = vsock_service::registry()
         .iter()
