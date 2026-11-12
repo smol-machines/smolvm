@@ -223,6 +223,9 @@ host log, never in the response.
 
 A request to an allowed host that carries no placeholder is forwarded as is.
 
+To limit which methods and paths a machine may use on a host, add
+[request rules](throwaway-machine/README.md#request-rules); they apply before substitution.
+
 ## Branching and checkpoints
 
 `machine branch` children inherit the golden's placeholders and trust the same
