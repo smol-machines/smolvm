@@ -3870,6 +3870,8 @@ pub async fn start_machine(
         && record.golden.is_none())
     .then(|| record.image.clone())
     .flatten();
+    let pull_platform = record.image_platform().map(str::to_owned);
+    let seeds_platform = crate::image_seed::serves_platform(pull_platform.as_deref());
     let start_has_credentials = registry_auth.is_some();
     let seed_auth = match &registry_auth {
         Some(auth) => crate::registry::PullAuth::Basic {
@@ -3880,17 +3882,22 @@ pub async fn start_machine(
     };
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let mut seed_image = seed_image;
+        let seedable_image = |image: &str| {
+            seeds_platform
+                .then(|| crate::image_seed::seedable_image(&name_clone, Some(image), storage_gb))
+                .flatten()
+        };
         if let Some(image) = preseeded_image {
             match crate::image_seed::revalidate_seed(&name_clone, &image, &seed_auth) {
                 Ok(true) => {}
                 Ok(false) => {
-                    seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                    seed_image = seedable_image(&image);
                 }
                 Err(error) => {
                     // The rejected disk is gone, so the machine can take a seed
                     // of the image it boots now, such as its host-fetched archive.
                     tracing::warn!(machine = %name_clone, %error, "pre-created image seed rejected");
-                    seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                    seed_image = seedable_image(&image);
                 }
             }
             // A fresh machine still has the blank disk its create made. When
@@ -3904,7 +3911,7 @@ pub async fn start_machine(
                     start_has_credentials,
                 )
             {
-                seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                seed_image = seedable_image(&image);
             }
         }
         if let Some(image) = seed_image {
@@ -4043,6 +4050,9 @@ pub async fn start_machine(
                 let mut opts = crate::agent::PullOptions::new().use_registry_config(true);
                 if let Some(auth) = pull_auth {
                     opts = opts.auth(auth);
+                }
+                if let Some(platform) = pull_platform {
+                    opts = opts.oci_platform(platform);
                 }
                 c.pull(&image_pull, opts)?;
             }

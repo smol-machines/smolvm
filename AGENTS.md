@@ -195,6 +195,8 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-host` | | run, create, update | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create, update | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create, pack run | Forward host SSH agent (git/ssh without exposing keys) |
+| `--rosetta` | | run, create | Run x86_64 Linux images on Apple Silicon through Rosetta 2. Pulls `linux/amd64` unless `--oci-platform` says otherwise. |
+| `--oci-platform` | | run, create, pack create | Image platform to pull from a multi-arch image (`os/arch`, e.g. `linux/amd64`). Recorded on the machine and used on every start. |
 | `--nested` | | run, create | Let the guest run its own VMs (nested KVM). Off by default; it exposes the host kernel's nested-KVM code to the guest, so enable it only for trusted workloads. |
 | `--state-dir` | | every command (Linux) | Keep all smolvm state under one directory instead of the default ones, e.g. to run a second engine version beside an installed one |
 | `--stop-on-exit` | | create | Stop the machine when its workload exits, whatever the exit status |

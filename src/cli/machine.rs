@@ -1520,6 +1520,8 @@ impl RunCmd {
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
+        params.rosetta = params.rosetta || self.rosetta;
+        params.oci_platform = self.oci_platform.clone();
         params.guest_subnet = self.guest_subnet.clone();
         if let Some(durability) = self.disk_durability {
             params.disk_durability = durability;
@@ -1978,9 +1980,14 @@ impl RunCmd {
         // concurrent run whose directory this must not remove.
         let mut unstarted_data_dir =
             (!self.detach).then(|| vm_common::UnstartedRunDataDir::new(&vm_name));
+        // A seed holds the guest's own architecture; a run that pulls another
+        // platform (Rosetta pulls linux/amd64) would only pull again over it.
+        let seeds_platform = smolvm::image_seed::serves_platform(
+            smolvm::vm::rosetta::image_platform(params.oci_platform.as_deref(), params.rosetta),
+        );
         smolvm::image_seed::seed_ephemeral_run_with_trust(
             &vm_name,
-            seed_image.as_deref(),
+            seed_image.as_deref().filter(|_| seeds_platform),
             params.storage_gb,
             self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
@@ -2124,11 +2131,8 @@ impl RunCmd {
         // is an x86_64 binary to translate; an explicit --oci-platform still wins.
         // Without this, a multi-arch image resolves to the guest-native arm64
         // variant and Rosetta has nothing to do.
-        let rosetta_requested = self.rosetta || params.rosetta;
-        let effective_platform: Option<String> = self
-            .oci_platform
-            .clone()
-            .or_else(|| rosetta_requested.then(|| "linux/amd64".to_string()));
+        let effective_platform =
+            smolvm::vm::rosetta::image_platform(params.oci_platform.as_deref(), params.rosetta);
 
         // A registry image is pulled. A local source's layers are already
         // mounted via virtiofs, but its image config (WORKDIR, Env, USER) is
@@ -2138,7 +2142,7 @@ impl RunCmd {
             match crate::cli::pull_with_progress(
                 &mut client,
                 img,
-                effective_platform.as_deref(),
+                effective_platform,
                 self.proxy_opts.resolved_proxy()?.as_deref(),
                 self.proxy_opts.no_proxy().as_deref(),
             ) {
@@ -4710,6 +4714,11 @@ pub struct CreateCmd {
     #[arg(long)]
     pub rosetta: bool,
 
+    /// Image platform to pull for a multi-arch image, for example linux/amd64.
+    /// Defaults to linux/amd64 with --rosetta, else the guest's architecture.
+    #[arg(long = "oci-platform", value_name = "OS/ARCH")]
+    pub oci_platform: Option<String>,
+
     /// Expose a Unix socket the guest listens on to the host (repeatable). The
     /// host reaches it at the given host path, or `<basename>` in
     /// `smolvm machine data-dir` by default. Format: GUEST_PATH[:HOST_PATH].
@@ -5052,6 +5061,7 @@ impl CreateCmd {
             nested_virt,
             gpu_vram_mib,
             rosetta,
+            oci_platform,
             expose_socket,
             mount_socket,
             init,
@@ -5196,6 +5206,9 @@ impl CreateCmd {
         cli.docker_socket |= *docker_socket;
         cli.gpu |= *gpu;
         cli.rosetta |= *rosetta;
+        if oci_platform.is_some() {
+            cli.oci_platform = oci_platform.clone();
+        }
         // CLI --gpu-vram takes precedence over Smolfile gpu_vram.
         if gpu_vram_mib.is_some() {
             cli.gpu_vram_mib = *gpu_vram_mib;
