@@ -69,6 +69,13 @@ allow_private = ["10.20.0.0/16"]      # private ranges re-opened under block_pri
 deny_cidrs = ["169.254.169.254"]      # denied before any allow (implies net)
 allow_udp = ["1.1.1.1:123", "192.0.2.0/24:3478-3480"]  # UDP to CIDR[:PORT[-END]], also under an egress interceptor (implies net)
 
+# HTTPS request rules, one table per rule; a rule never makes a host reachable
+[[network.requests]]
+action = "allow"                      # "allow" or "deny"; a host with an allow rule needs a match, deny wins
+hosts = ["api.example.com"]           # exact name or "*.domain" (subdomains only)
+methods = ["GET", "HEAD"]             # optional; default every method
+paths = ["/v1/**"]                    # optional; "*" is one segment, "**" any number; default every path
+
 # Dev profile (used by `machine run` and `machine create`)
 [dev]
 volumes = ["./src:/app"]              # replaces the top-level list when set

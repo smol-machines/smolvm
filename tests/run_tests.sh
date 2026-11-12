@@ -27,6 +27,7 @@
 #   cli             test_cli.sh
 #   api             test_api.sh
 #   virtio-net      test_virtio_net.sh
+#   request-rules   test_request_rules.sh  (requires internet access to httpbin.org)
 #   smolfile        test_smolfile.sh
 #   secrets         test_secrets.sh
 #   pack            test_pack.sh
@@ -68,6 +69,7 @@ get_suite() {
         cli)         echo "$SCRIPT_DIR/test_cli.sh" ;;
         api)         echo "$SCRIPT_DIR/test_api.sh" ;;
         virtio-net)  echo "$SCRIPT_DIR/test_virtio_net.sh" ;;
+        request-rules) echo "$SCRIPT_DIR/test_request_rules.sh" ;;
         smolfile)    echo "$SCRIPT_DIR/test_smolfile.sh" ;;
         secrets)     echo "$SCRIPT_DIR/test_secrets.sh" ;;
         pack)        echo "$SCRIPT_DIR/test_pack.sh" ;;
@@ -158,7 +160,7 @@ else
         get_suite "$group" > /dev/null || {
             echo "Unknown group: $group"
             echo "Feature suites: bare db network volumes ports storage resources reliability run image local-image fork-base packed"
-            echo "Extended suites: cli api virtio-net smolfile pack pack-quick gpu scale"
+            echo "Extended suites: cli api virtio-net request-rules smolfile pack pack-quick gpu scale"
             echo "Other: bench"
             exit 1
         }
