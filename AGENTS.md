@@ -240,7 +240,10 @@ mappings.
 `--block-private` keeps the public internet open but blocks the LAN, cloud
 metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
 `--allow-private CIDR` re-opens one private range, such as an internal
-registry. Metadata stays blocked either way. Both imply `--net` and use the
+registry. Metadata stays blocked either way. Naming a private host with
+`--allow-host` or a credential does not re-open its address: add
+`--allow-private` for it, and `create`, `run` and `start` warn when a named
+host resolves only to blocked addresses. Both imply `--net` and use the
 virtio-net backend; the Smolfile form is `[network] block_private = true` and
 `allow_private = ["10.20.0.0/16"]`.
 `--deny-cidr CIDR` refuses a range even where an allow would admit it,

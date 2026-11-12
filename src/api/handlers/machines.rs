@@ -3881,6 +3881,10 @@ pub async fn start_machine(
         None => crate::registry::PullAuth::FromConfig,
     };
     let (manager, pid) = tokio::task::spawn_blocking(move || {
+        crate::network::private_floor::log_record_hosts_blocked_by_private_floor(
+            &name_clone,
+            &restore_record,
+        );
         let mut seed_image = seed_image;
         let seedable_image = |image: &str| {
             seeds_platform

@@ -699,6 +699,34 @@ impl CreateVmParams {
     }
 }
 
+/// Warn about each host the machine names (`--allow-host`, a credential's
+/// host) that `--block-private` keeps it from reaching, with the
+/// `--allow-private` range that reopens it. Without this the connection is
+/// refused inside the guest and nothing says why.
+pub(crate) fn warn_hosts_blocked_by_private_floor(
+    block_private: Option<&[String]>,
+    egress_rules: &[smolvm_protocol::EgressRule],
+    allowed_hosts: Option<&[String]>,
+    credentials: Option<&smolvm::credentials::CredentialPolicy>,
+) {
+    for host in smolvm::network::private_floor::hosts_blocked_by_private_floor(
+        block_private,
+        egress_rules,
+        allowed_hosts,
+        credentials,
+        crate::cli::parsers::resolve_host_to_cidrs,
+    ) {
+        eprintln!("Warning: {}", host.warning());
+    }
+}
+
+/// [`warn_hosts_blocked_by_private_floor`] for a stored machine.
+pub(crate) fn warn_record_hosts_blocked_by_private_floor(record: &VmRecord) {
+    for host in smolvm::network::private_floor::record_hosts_blocked_by_private_floor(record) {
+        eprintln!("Warning: {}", host.warning());
+    }
+}
+
 /// The record `machine create` would write for these parameters, through
 /// the same rules as every other creation path.
 pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
@@ -1799,6 +1827,9 @@ fn start_vm_named_with_db(
             }
         }
     }
+
+    // The addresses may have changed since create, so ask again.
+    warn_record_hosts_blocked_by_private_floor(&record);
 
     // Check for host port conflicts with other running VMs.
     if !ports.is_empty() {
