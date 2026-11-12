@@ -527,11 +527,13 @@ impl EgressPolicy {
             *current = Arc::new(rules);
         }
         if let Ok(mut learned) = list.learned.lock() {
+            // A list with no hosts keeps no learned address.
             learned.retain(|_, entry| {
-                entry
-                    .name
-                    .as_deref()
-                    .is_none_or(|name| next.hostname_allowed(name))
+                entry.name.as_deref().is_none_or(|name| {
+                    next.allowed_hosts
+                        .as_deref()
+                        .is_some_and(|hosts| dns::hostname_allowed(name, hosts))
+                })
             });
         }
         *list.rules.write().unwrap_or_else(|e| e.into_inner()) = next;
@@ -1040,6 +1042,20 @@ mod tests {
             .unwrap();
         assert!(!policy.allows(github));
         assert!(policy.allows(pypi));
+    }
+
+    /// A list left with no hosts has no name filter, which passes every name.
+    #[test]
+    fn replacing_the_last_host_revokes_the_addresses_learned_for_it() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        assert!(policy.allows(github));
+
+        policy
+            .replace_allow_list(&render_live_policy(&["127.0.0.0/8".into()], &[]))
+            .unwrap();
+        assert!(!policy.allows(github));
     }
 
     #[test]
