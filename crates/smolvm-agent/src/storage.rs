@@ -366,9 +366,13 @@ pub fn volume_bind_source(tag: &str) -> PathBuf {
 /// Add each prepared mount to a container spec as a bind of its
 /// [`volume_bind_source`]. crun applies the spec's mounts in order, so a mount
 /// goes ahead of those nested below it (see [`mounts_parents_first`]).
+///
+/// A host directory is bound through [`crate::mount_owner::bind_source`], so a
+/// container whose process is not root sees it owned by its own user.
 pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
+    let (uid, gid) = (spec.process.user.uid, spec.process.user.gid);
     for (tag, container_path, read_only) in mounts_parents_first(mounts) {
-        let source = volume_bind_source(tag);
+        let source = crate::mount_owner::bind_source(&volume_bind_source(tag), uid, gid);
         spec.add_bind_mount(&source.to_string_lossy(), container_path, *read_only);
     }
     // Directories attached while the machine runs reach every container,
@@ -378,6 +382,7 @@ pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, boo
         .map(|(_, target, _)| target.as_str())
         .collect();
     for (source, target, read_only) in crate::attach::container_binds(&targets) {
+        let source = crate::mount_owner::bind_source(&source, uid, gid);
         spec.add_bind_mount(&source.to_string_lossy(), &target, read_only);
     }
 }
@@ -1052,6 +1057,9 @@ pub fn repair_boot_volume_mounts() -> Result<()> {
         if is_mountpoint(&staging) {
             detach_mount(&staging);
         }
+        // Clones of the stale mount are as dead as it is; the next container
+        // gets one of the fresh mount.
+        crate::mount_owner::forget(&staging);
         setup_volume_mounts("/", std::slice::from_ref(mount))?;
         if !is_mountpoint(Path::new(target)) {
             return Err(StorageError::new(format!(
