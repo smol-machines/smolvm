@@ -855,6 +855,23 @@ pub fn stop_vm_with_timeout(
     name: &str,
     stop_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
+    stop_vm_using(db, name, |manager| match stop_timeout {
+        Some(stop_timeout) => manager.stop_with_timeout(stop_timeout),
+        None => manager.stop(),
+    })
+}
+
+/// Stop a persisted VM that is about to be deleted, without requiring the
+/// guest to confirm the shutdown.
+pub(crate) fn stop_vm_for_delete(db: &SmolvmDb, name: &str) -> Result<()> {
+    stop_vm_using(db, name, AgentManager::stop_for_delete)
+}
+
+fn stop_vm_using(
+    db: &SmolvmDb,
+    name: &str,
+    stop: impl FnOnce(&AgentManager) -> Result<()>,
+) -> Result<()> {
     let record = get_record(db, name)?;
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -863,10 +880,7 @@ pub fn stop_vm_with_timeout(
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
         crate::staged_mount::sync_staged_mounts(&record, &mut client)?;
     }
-    match stop_timeout {
-        Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
-        None => manager.stop()?,
-    }
+    stop(&manager)?;
     // Detach the per-machine layers volume if a (possibly cross-tool) bundle start
     // left it mounted. Unconditional on purpose: the embedded record may carry no
     // source_smolmachine even when a CLI/API `machine create <bundle>` extracted and

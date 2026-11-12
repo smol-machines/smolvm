@@ -2910,7 +2910,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 }
                 // The machine is being deleted, so its workload has nothing
                 // to save: kill it at once rather than wait out its timeout.
-                manager.stop_with_timeout(std::time::Duration::ZERO)?;
+                manager.stop_for_delete()?;
                 if record.pid.is_some_and(smolvm::process::is_alive) {
                     return Err(smolvm::Error::agent(
                         "delete machine",

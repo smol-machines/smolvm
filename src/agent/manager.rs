@@ -4205,6 +4205,24 @@ impl AgentManager {
         self.stop_inner(false, Some(stop_timeout))
     }
 
+    /// Stop a machine that is about to be deleted.
+    ///
+    /// The guest is still asked to shut down, so writes to host directories
+    /// land. If it cannot confirm (a disk that turned read-only after an error
+    /// cannot be flushed, for one), the machine is killed instead: its disks are
+    /// removed next, and refusing would leave it impossible to delete.
+    pub fn stop_for_delete(&self) -> Result<()> {
+        let Err(error) = self.stop_with_timeout(Duration::ZERO) else {
+            return Ok(());
+        };
+        tracing::warn!(
+            %error,
+            "guest did not confirm shutdown; killing the machine because it is being deleted"
+        );
+        self.kill_and_wait(process::VM_SIGKILL_TIMEOUT);
+        self.stop_with_timeout(Duration::ZERO)
+    }
+
     /// Stop a machine whose guest is paused and already quiesced.
     ///
     /// A frozen fork base is snapshot-paused: its vCPUs are not running, so its

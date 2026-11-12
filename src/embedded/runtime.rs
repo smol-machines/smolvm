@@ -1095,9 +1095,9 @@ impl EmbeddedRuntime {
                     handle.sync_staged_mounts(&record)?;
                 }
                 // The machine is going away: its workload has nothing to save.
-                handle.stop_with_timeout(Some(Duration::ZERO))?;
+                handle.stop_for_delete()?;
             } else {
-                control::stop_vm_with_timeout(&self.db, name, Some(Duration::ZERO))?;
+                control::stop_vm_for_delete(&self.db, name)?;
             }
 
             // Idempotent: deleting an already-deleted machine is a no-op success
