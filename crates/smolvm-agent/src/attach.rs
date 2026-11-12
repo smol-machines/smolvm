@@ -196,7 +196,9 @@ pub fn detach(target: &str) -> Result<(), String> {
         crate::nsfile::detach_in_every_container(target)?;
     }
     unmount_in_root(target)?;
-    attached.remove(index);
+    let mount = attached.remove(index);
+    // The host removes the share next; nothing here may keep it mounted.
+    crate::mount_owner::forget(&device_dir(mount.read_only).join(&mount.share));
     Ok(())
 }
 

@@ -96,6 +96,7 @@ mod forkpoint;
 mod io_target;
 #[cfg(target_os = "linux")]
 mod memory_trim;
+mod mount_owner;
 mod network;
 mod nsfile;
 mod oci;
