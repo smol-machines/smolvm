@@ -533,6 +533,9 @@ pub struct CreateVmParams {
     pub gpu_vram_mib: Option<u32>,
     /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
     pub rosetta: bool,
+    /// Image platform to pull (`os/arch`). None = Rosetta's when it is on,
+    /// else the guest's own.
+    pub oci_platform: Option<String>,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Credential bindings (from `--credential` / `[[network.credentials]]`).
@@ -791,6 +794,7 @@ impl CreateVmParams {
             gpu,
             gpu_vram_mib,
             rosetta,
+            oci_platform,
             dns_filter_hosts,
             credential_policy,
             // Minted when the record is written.
@@ -849,6 +853,7 @@ impl CreateVmParams {
             gpu,
             gpu_vram_mib,
             rosetta,
+            oci_platform,
             nested_virt,
             cuda,
             docker_socket,
@@ -1990,7 +1995,7 @@ fn start_vm_named_with_db(
             Some(crate::cli::pull_with_progress_as(
                 &mut client,
                 image,
-                None,
+                record.image_platform(),
                 proxy,
                 no_proxy,
                 registry_auth,
@@ -2369,7 +2374,7 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
                 Some(crate::cli::pull_with_progress(
                     &mut client,
                     image,
-                    None,
+                    record.image_platform(),
                     proxy,
                     no_proxy,
                 )?)

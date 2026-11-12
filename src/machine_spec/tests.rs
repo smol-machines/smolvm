@@ -215,6 +215,53 @@ fn options_that_need_a_network_turn_it_on() {
 }
 
 #[test]
+fn an_image_platform_is_os_arch_with_an_optional_variant() {
+    for platform in ["linux/amd64", "linux/arm64", "linux/arm/v7"] {
+        let spec = CreateSpec {
+            oci_platform: Some(platform.into()),
+            ..Default::default()
+        };
+        let record = fresh(spec, Src::Image);
+        assert_eq!(record.oci_platform.as_deref(), Some(platform));
+        assert_eq!(record.image_platform(), Some(platform));
+    }
+    for platform in ["", "amd64", "linux/", "/amd64", "linux amd64", "a/b/c/d"] {
+        let spec = CreateSpec {
+            oci_platform: Some(platform.into()),
+            ..Default::default()
+        };
+        assert!(
+            refusal(spec, Src::Image).contains("os/arch"),
+            "{platform:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rosetta_machine_pulls_amd64_on_every_start() {
+    let rosetta = CreateSpec {
+        rosetta: true,
+        ..Default::default()
+    };
+    let record = fresh(rosetta.clone(), Src::Image);
+    assert_eq!(record.oci_platform, None);
+    assert_eq!(record.image_platform(), Some("linux/amd64"));
+
+    let asked = CreateSpec {
+        oci_platform: Some("linux/arm64".into()),
+        ..rosetta
+    };
+    assert_eq!(
+        fresh(asked, Src::Image).image_platform(),
+        Some("linux/arm64")
+    );
+    assert_eq!(
+        fresh(CreateSpec::default(), Src::Image).image_platform(),
+        None
+    );
+}
+
+#[test]
 fn keeping_an_identity_needs_a_checkpoint() {
     let spec = CreateSpec {
         keep_identity: true,
@@ -645,6 +692,7 @@ fn cases() -> Vec<Case> {
         gpu,
         gpu_vram_mib,
         rosetta,
+        oci_platform,
         nested_virt,
         cuda,
         docker_socket,
@@ -1027,6 +1075,13 @@ fn cases() -> Vec<Case> {
             .cli(&["--rosetta"])
             .embedded(|e, _| e.spec.resources.rosetta = true)
             .checkpoint(Refused("rosetta")),
+        case!(
+            oci_platform,
+            |s, _| s.oci_platform = Some("linux/amd64".into()),
+            |r| r.oci_platform.as_deref() == Some("linux/amd64")
+        )
+        .cli(&["--oci-platform", "linux/amd64"])
+        .checkpoint(Refused("image platform")),
         case!(nested_virt, |s, _| s.nested_virt = true, |r| r.nested_virt == Some(true))
             .cli(&["--nested"])
             .api(|_| json(serde_json::json!({"nestedVirt": true})))
