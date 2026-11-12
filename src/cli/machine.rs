@@ -3636,6 +3636,75 @@ mod tests {
         assert!(format!("{parsed}").contains("/dev/nvme1n1"));
     }
 
+    fn parse_update(extra: &[&'static str]) -> UpdateCmd {
+        let argv = [&["machine", "update", "--name", "l"][..], extra].concat();
+        let MachineCmd::Update(cmd) = TestMachineCli::parse_from(argv).command else {
+            panic!("expected machine update command");
+        };
+        cmd
+    }
+
+    #[test]
+    fn update_changes_labels_alone_in_any_state() {
+        assert!(parse_update(&["--label", "kit=git"]).changes_only_labels());
+        assert!(parse_update(&["--remove-label", "kit"]).changes_only_labels());
+        assert!(!parse_update(&["--label", "kit=git", "--cpus", "2"]).changes_only_labels());
+        // A running machine applies an allow-list or port change alone, so a
+        // label beside one must not ride along unapplied.
+        let mixed = parse_update(&["--label", "kit=git", "--allow-host", "pypi.org"]);
+        assert!(!mixed.changes_only_labels() && !mixed.changes_only_egress());
+        let mixed = parse_update(&["--label", "kit=git", "-p", "3000:3000"]);
+        assert!(!mixed.changes_only_labels() && !mixed.changes_only_ports());
+    }
+
+    #[test]
+    fn update_sets_and_removes_labels() {
+        let apply = |extra: &[&'static str], labels: &mut _| {
+            let cmd = parse_update(extra);
+            let set = smolvm::util::parse_labels(&cmd.labels).unwrap();
+            cmd.apply_labels(labels, &set)
+        };
+        let mut labels: std::collections::BTreeMap<String, String> =
+            [("owner", "exo"), ("kit", "git"), ("old", "1")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let changes = apply(
+            &[
+                "--label",
+                "kit=git,node",
+                "--label",
+                "new=a=b",
+                "--remove-label",
+                "old",
+                "--remove-label",
+                "absent",
+            ],
+            &mut labels,
+        );
+        assert_eq!(
+            labels.into_iter().collect::<Vec<_>>(),
+            [("kit", "git,node"), ("new", "a=b"), ("owner", "exo")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        assert_eq!(
+            changes,
+            [
+                "  removed label: old",
+                "  label: kit=git,node",
+                "  label: new=a=b"
+            ]
+        );
+
+        // A key removed and set in one update ends up set.
+        let mut labels = std::collections::BTreeMap::new();
+        apply(
+            &["--remove-label", "kit", "--label", "kit=git"],
+            &mut labels,
+        );
+        assert_eq!(labels.get("kit").map(String::as_str), Some("git"));
+    }
+
     #[test]
     fn update_changes_ports_alone_on_a_running_machine() {
         use smolvm::config::VmRecord;
@@ -6698,6 +6767,15 @@ pub struct UpdateCmd {
     /// Remove every guest resolv.conf option.
     #[arg(long)]
     pub clear_dns_options: bool,
+
+    /// Set a label, replacing any value the key had (repeatable). Labels are
+    /// host-side metadata, so they alone can change while the machine runs.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
+    /// Remove a label by key (repeatable). A key the machine lacks is ignored.
+    #[arg(long = "remove-label", value_name = "KEY")]
+    pub remove_labels: Vec<String>,
 }
 
 impl UpdateCmd {
@@ -6726,16 +6804,72 @@ impl UpdateCmd {
     /// Whether this update changes the allow list and nothing else, one of the
     /// changes a running machine takes.
     fn changes_only_egress(&self) -> bool {
-        let (egress, ports, other) = self.changed_settings();
-        egress && !ports && !other
+        let (egress, ports, labels, other) = self.changed_settings();
+        egress && !ports && !labels && !other
+    }
+
+    fn changes_only_labels(&self) -> bool {
+        let (egress, ports, labels, other) = self.changed_settings();
+        labels && !egress && !ports && !other
+    }
+
+    /// Apply this update's label changes to `labels`: `--remove-label` keys
+    /// first, then the parsed `--label` entries in `set`, so a key removed and
+    /// set at once ends up set. Returns a line per change.
+    fn apply_labels(
+        &self,
+        labels: &mut std::collections::BTreeMap<String, String>,
+        set: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
+        let mut changes = Vec::new();
+        for key in &self.remove_labels {
+            if labels.remove(key).is_some() && !set.contains_key(key) {
+                changes.push(format!("  removed label: {key}"));
+            }
+        }
+        for (key, value) in set {
+            changes.push(format!("  label: {key}={value}"));
+            labels.insert(key.clone(), value.clone());
+        }
+        changes
+    }
+
+    /// Save a label-only update. Labels never reach the guest, so the
+    /// machine's state does not matter.
+    fn update_labels(
+        &self,
+        db: &smolvm::db::SmolvmDb,
+        set: &std::collections::BTreeMap<String, String>,
+    ) -> smolvm::Result<()> {
+        let mut changes = Vec::new();
+        let saved = db.update_vm(&self.name, |r| {
+            changes = self.apply_labels(&mut r.labels, set);
+        })?;
+        if saved.is_none() {
+            return Err(smolvm::Error::config(
+                "update",
+                format!("machine '{}' disappeared during update", self.name),
+            ));
+        }
+        if changes.is_empty() {
+            println!("No changes specified.");
+            return Ok(());
+        }
+        println!("Updated machine '{}':", self.name);
+        for change in &changes {
+            println!("{change}");
+        }
+        Ok(())
     }
 
     fn changes_only_ports(&self) -> bool {
-        let (egress, ports, other) = self.changed_settings();
-        ports && !egress && !other
+        let (egress, ports, labels, other) = self.changed_settings();
+        ports && !egress && !labels && !other
     }
 
-    fn changed_settings(&self) -> (bool, bool, bool) {
+    /// Which kinds of setting this update changes: the allow list, published
+    /// ports, labels, and anything else (which needs a stopped machine).
+    fn changed_settings(&self) -> (bool, bool, bool, bool) {
         let Self {
             name: _,
             volume,
@@ -6771,6 +6905,8 @@ impl UpdateCmd {
             dns_option,
             clear_dns_options,
             shm_size,
+            labels,
+            remove_labels,
         } = self;
         let egress = *net
             || *outbound_localhost_only
@@ -6803,7 +6939,8 @@ impl UpdateCmd {
             || !dns_option.is_empty()
             || *clear_dns_options
             || shm_size.is_some();
-        (egress, ports, other)
+        let labels = !labels.is_empty() || !remove_labels.is_empty();
+        (egress, ports, labels, other)
     }
 
     fn next_ports(&self, record: &smolvm::config::VmRecord) -> smolvm::Result<Vec<PortMapping>> {
@@ -6954,7 +7091,11 @@ impl UpdateCmd {
             smolvm::Error::config("update", format!("machine '{}' not found", self.name))
         })?;
 
+        let set_labels = smolvm::util::parse_labels(&self.labels)?;
         let state = record.actual_state();
+        if self.changes_only_labels() {
+            return self.update_labels(&db, &set_labels);
+        }
         if state == RecordState::Running && self.changes_only_egress() {
             return self.update_running_egress(&db, &record);
         }
@@ -7262,6 +7403,8 @@ impl UpdateCmd {
                 changes.push(format!("  workdir: {}", wd));
                 r.workdir = Some(wd.clone());
             }
+
+            changes.extend(self.apply_labels(&mut r.labels, &set_labels));
 
             // Resolver options
             if !self.dns_option.is_empty() {
