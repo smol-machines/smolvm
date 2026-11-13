@@ -303,6 +303,7 @@ pub fn set_egress_policy(
         r.network = updated.network;
         r.allowed_cidrs = updated.allowed_cidrs.clone();
         r.dns_filter_hosts = updated.dns_filter_hosts.clone();
+        r.egress_rules = updated.egress_rules.clone();
     })?;
     Ok(())
 }

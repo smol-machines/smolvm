@@ -1102,11 +1102,44 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 ));
             }
             let pack = PackDefaults::of(manifest);
+            let crate::pack_export::ValidatedManifestEgress {
+                allowed_cidrs: pack_allowed_cidrs,
+                dns_filter_hosts: pack_allowed_hosts,
+                egress_rules: pack_egress_rules,
+            } = crate::pack_export::validated_manifest_egress(manifest)?;
             let (entrypoint, cmd) = if explicit_command {
                 (entrypoint.unwrap_or_default(), cmd.unwrap_or_default())
             } else {
                 (pack.entrypoint, pack.cmd)
             };
+            // An explicit allow list (CIDRs or hostnames) replaces the pack's
+            // allow list as a unit so old baked host IPs do not stay open.
+            let (allowed_cidrs, allowed_hosts) =
+                if allowed_cidrs.is_some() || allowed_hosts.is_some() {
+                    (allowed_cidrs, allowed_hosts)
+                } else {
+                    (pack_allowed_cidrs, pack_allowed_hosts)
+                };
+            let egress_rules = if egress_rules.is_empty() {
+                pack_egress_rules
+            } else if caller == Caller::Cli {
+                let mut combined: Vec<_> = egress_rules
+                    .iter()
+                    .filter(|r| r.action == smolvm_protocol::RuleAction::Deny)
+                    .cloned()
+                    .collect();
+                combined.extend(pack_egress_rules);
+                combined.extend(
+                    egress_rules
+                        .into_iter()
+                        .filter(|r| r.action != smolvm_protocol::RuleAction::Deny),
+                );
+                combined
+            } else {
+                egress_rules
+            };
+            let has_pack_egress =
+                allowed_cidrs.is_some() || allowed_hosts.is_some() || !egress_rules.is_empty();
             ResolvedSpec {
                 caller,
                 image: pack.image,
@@ -1143,7 +1176,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 mounts,
                 remote_volumes,
                 disk_volumes,
-                net: net || implied_net || pack.net,
+                net: net || implied_net || pack.net || has_pack_egress,
                 network_backend,
                 dns,
                 dns_options,
