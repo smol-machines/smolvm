@@ -86,6 +86,14 @@ need `-p`. Without `--auto-ports`, declare host-to-guest ports at create time an
 host must reach. Rules and limits: "Ports that appear on their own" in
 [`throwaway-machine`](../throwaway-machine/README.md).
 
+## x86_64 images on Apple silicon
+
+Create the machine with `--rosetta` and `docker run --platform linux/amd64` runs x86_64 images
+through Rosetta in every container Docker starts, with nothing to configure in the daemon:
+`docker run --rm --platform linux/amd64 alpine uname -m` prints `x86_64`, and amd64 `node`,
+`python` and `postgres` images run. The program keeps the PID it was started with, so PID 1
+semantics, `pg_ctl -w` and `docker stop` behave as on a native image.
+
 ## Platforms
 
 This does not work on Windows, up to and including v1.22.2: the bundled guest kernel has neither
