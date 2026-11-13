@@ -3,6 +3,9 @@
 //! Published ports are for the host's own clients, so they bind loopback:
 //! `127.0.0.1` plus `[::1]` when the host has IPv6. `SMOLVM_PUBLISH_ADDR`
 //! widens that for fleet nodes whose ingress proxy connects from another host.
+//! A mapping that names its own address (the Docker engine's
+//! `-p 0.0.0.0:8080:80`) binds that address instead: the IPv4 wildcard also
+//! takes the IPv6 wildcard, any other address only itself.
 //!
 //! macOS lets an unprivileged process bind a port below 1024 only on the
 //! wildcard address, so `-p 80:80` failed with "Permission denied" on a Mac.
@@ -49,7 +52,8 @@ fn is_loopback(ip: IpAddr) -> bool {
 /// best-effort so hosts without IPv6 still publish normally.
 #[derive(Debug)]
 pub struct BoundSockets<S> {
-    /// The IPv4 socket.
+    /// The IPv4 socket (the only socket of a mapping that names an IPv6
+    /// address).
     pub v4: S,
     /// The IPv6 socket, when the host has IPv6.
     pub v6: Option<S>,
@@ -67,7 +71,13 @@ impl<S> BoundSockets<S> {
 
 /// Bind the TCP listeners of published host port `port`.
 pub fn bind_tcp(port: u16) -> io::Result<BoundSockets<TcpListener>> {
-    bind_with(port, publish_addr(), |addr| {
+    bind_tcp_on(port, None)
+}
+
+/// Bind the TCP listeners of published host port `port` on `listen`, or on
+/// the default publish address.
+pub fn bind_tcp_on(port: u16, listen: Option<IpAddr>) -> io::Result<BoundSockets<TcpListener>> {
+    bind_listen(port, listen, |addr| {
         let socket = new_socket(addr, Type::STREAM, Protocol::TCP)?;
         // The kernel caps this at somaxconn; ask for as much as it allows.
         socket.listen(i32::MAX)?;
@@ -77,9 +87,57 @@ pub fn bind_tcp(port: u16) -> io::Result<BoundSockets<TcpListener>> {
 
 /// Bind the UDP sockets of published host port `port`.
 pub fn bind_udp(port: u16) -> io::Result<BoundSockets<UdpSocket>> {
-    bind_with(port, publish_addr(), |addr| {
+    bind_udp_on(port, None)
+}
+
+/// Bind the UDP sockets of published host port `port` on `listen`, or on
+/// the default publish address.
+pub fn bind_udp_on(port: u16, listen: Option<IpAddr>) -> io::Result<BoundSockets<UdpSocket>> {
+    bind_listen(port, listen, |addr| {
         Ok(new_socket(addr, Type::DGRAM, Protocol::UDP)?.into())
     })
+}
+
+/// The address a mapping's port is published on, for messages.
+pub fn listen_display(listen: Option<IpAddr>) -> String {
+    match listen {
+        Some(IpAddr::V6(v6)) => format!("[{v6}]"),
+        Some(IpAddr::V4(v4)) => v4.to_string(),
+        None => publish_addr().to_string(),
+    }
+}
+
+/// [`bind_with`] for a mapping: the default address keeps its rules, the
+/// IPv4 wildcard also takes the IPv6 wildcard (every interface), and any
+/// other address binds only itself. A refused loopback bind below 1024 on
+/// macOS falls back to the wildcard with non-loopback peers dropped, as the
+/// default does.
+fn bind_listen<S>(
+    port: u16,
+    listen: Option<IpAddr>,
+    bind: impl Fn(SocketAddr) -> io::Result<S>,
+) -> io::Result<BoundSockets<S>> {
+    let only = |socket, loopback_only| BoundSockets {
+        v4: socket,
+        v6: None,
+        loopback_only,
+    };
+    match listen {
+        None => bind_with(port, publish_addr(), bind),
+        Some(IpAddr::V4(v4)) if v4.is_unspecified() => bind_with(port, v4, bind),
+        Some(addr) => match bind(SocketAddr::new(addr, port)) {
+            Ok(socket) => Ok(only(socket, false)),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied && addr.is_loopback() => {
+                let wildcard = match addr {
+                    IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                };
+                let socket = bind(SocketAddr::new(wildcard, port)).map_err(|_| err)?;
+                Ok(only(socket, true))
+            }
+            Err(err) => Err(err),
+        },
+    }
 }
 
 fn new_socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> io::Result<Socket> {
@@ -178,6 +236,28 @@ mod tests {
         assert_eq!(bound.v4, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(bound.v6, Some("[::1]:8080".parse().unwrap()));
         assert!(!bound.loopback_only);
+    }
+
+    #[test]
+    fn a_named_address_binds_only_itself() {
+        let bound = bind_listen(8080, Some("192.168.1.5".parse().unwrap()), mac_like).unwrap();
+        assert_eq!(bound.v4, "192.168.1.5:8080".parse().unwrap());
+        assert!(bound.v6.is_none());
+        let bound = bind_listen(8080, Some("127.0.0.1".parse().unwrap()), mac_like).unwrap();
+        assert_eq!(bound.v4, "127.0.0.1:8080".parse().unwrap());
+        assert!(bound.v6.is_none());
+        let bound = bind_listen(8080, Some("::1".parse().unwrap()), mac_like).unwrap();
+        assert_eq!(bound.v4, "[::1]:8080".parse().unwrap());
+        let refused = bind_listen(80, Some("127.0.0.1".parse().unwrap()), mac_like).unwrap();
+        assert_eq!(refused.v4, "0.0.0.0:80".parse().unwrap());
+        assert!(refused.loopback_only);
+    }
+
+    #[test]
+    fn the_ipv4_wildcard_listens_on_every_interface() {
+        let bound = bind_listen(8080, Some("0.0.0.0".parse().unwrap()), mac_like).unwrap();
+        assert_eq!(bound.v4, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(bound.v6, Some("[::]:8080".parse().unwrap()));
     }
 
     #[test]

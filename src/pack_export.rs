@@ -528,6 +528,7 @@ impl ExportVm {
                 egress_rules: Vec::new(),
                 network_name: None,
                 guest_subnet: None,
+                switch: None,
             },
             features,
         ) {
@@ -1642,6 +1643,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             // resolver to configure.
             network: false,
             network_backend: None,
+            switch: None,
             dns: None,
             dns_options: Vec::new(),
             shm_size: None,

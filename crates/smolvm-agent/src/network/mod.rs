@@ -1,7 +1,8 @@
 //! Guest-side virtio-net configuration from `SMOLVM_NETWORK_*`.
 //!
 //! Context
-//! =======
+//! }
+
 //!
 //! The host side of the virtio-net design decides whether a VM should use:
 //! - the legacy TSI networking path, or
@@ -136,6 +137,70 @@ pub fn configure_from_env() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Make the interface's extra addresses (beyond the one it booted with)
+/// exactly `addresses` (`a.b.c.d/len` or `ipv6/len` each), adding and
+/// removing as needed.
+pub fn set_extra_addresses(addresses: &[String]) -> Result<(), String> {
+    let mut parsed = Vec::with_capacity(addresses.len());
+    for entry in addresses {
+        let (ip, len) = entry
+            .split_once('/')
+            .ok_or_else(|| format!("address '{entry}' must be address/len"))?;
+        let ip: std::net::IpAddr = ip
+            .parse()
+            .map_err(|_| format!("address '{entry}' is not an IP address"))?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        let len: u8 = len
+            .parse()
+            .ok()
+            .filter(|len| *len <= max)
+            .ok_or_else(|| format!("address '{entry}' has an invalid prefix length"))?;
+        parsed.push((ip, len));
+    }
+    linux::set_extra_addresses("eth0", &parsed)
+}
+
+/// The resolver (and its options) [`set_primary_address`] moved the guest
+/// to. New container overlays get it instead of the one the guest booted
+/// with, which its environment still names.
+static RESOLVER: std::sync::Mutex<Option<(String, Vec<String>)>> = std::sync::Mutex::new(None);
+
+/// The resolver the guest moved to after boot, if it moved.
+pub fn moved_resolver() -> Option<(String, Vec<String>)> {
+    RESOLVER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Replace the interface's primary IPv4 address (the one it booted with),
+/// its default route and the resolver: `address` is `a.b.c.d/len`.
+pub fn set_primary_address(
+    address: &str,
+    gateway: &str,
+    dns: &str,
+    dns_options: &[String],
+) -> Result<(), String> {
+    let (ip, len) = address
+        .split_once('/')
+        .ok_or_else(|| format!("address '{address}' must be a.b.c.d/len"))?;
+    let ip: Ipv4Addr = ip
+        .parse()
+        .map_err(|_| format!("address '{address}' is not IPv4"))?;
+    let len: u8 = len
+        .parse()
+        .ok()
+        .filter(|len| *len <= 32)
+        .ok_or_else(|| format!("address '{address}' has an invalid prefix length"))?;
+    let gateway: Ipv4Addr = gateway
+        .parse()
+        .map_err(|_| format!("gateway '{gateway}' is not IPv4"))?;
+    let dns: Ipv4Addr = dns
+        .parse()
+        .map_err(|_| format!("resolver '{dns}' is not IPv4"))?;
+    linux::set_primary_address("eth0", ip, len, gateway, dns, dns_options)?;
+    *RESOLVER.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((dns.to_string(), dns_options.to_vec()));
+    Ok(())
+}
+
 /// The link MTU the host asked for, or 1500 when it did not say.
 fn env_mtu() -> Result<u16, String> {
     match std::env::var(guest_env::MTU) {
@@ -257,6 +322,24 @@ mod linux {
         _gateway_mac: Option<[u8; 6]>,
         _ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
         _dns_server: Ipv4Addr,
+    ) -> Result<(), String> {
+        Err("guest virtio networking is only supported on Linux".to_string())
+    }
+
+    pub fn set_extra_addresses(
+        _ifname: &str,
+        _addresses: &[(std::net::IpAddr, u8)],
+    ) -> Result<(), String> {
+        Err("guest virtio networking is only supported on Linux".to_string())
+    }
+
+    pub fn set_primary_address(
+        _ifname: &str,
+        _address: Ipv4Addr,
+        _prefix_len: u8,
+        _gateway: Ipv4Addr,
+        _dns: Ipv4Addr,
+        _dns_options: &[String],
     ) -> Result<(), String> {
         Err("guest virtio networking is only supported on Linux".to_string())
     }

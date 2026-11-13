@@ -53,17 +53,18 @@ impl BoundTcpPorts {
     pub fn bind(mappings: &[PortMapping]) -> io::Result<Self> {
         let mut bound = Vec::with_capacity(mappings.len());
         for mapping in mappings {
-            let sockets = publish_bind::bind_tcp(mapping.host).map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!(
-                        "cannot publish host TCP {}:{} to guest TCP {}: {err}",
-                        publish_bind::publish_addr(),
-                        mapping.host,
-                        mapping.guest,
-                    ),
-                )
-            })?;
+            let sockets =
+                publish_bind::bind_tcp_on(mapping.host, mapping.listen).map_err(|err| {
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "cannot publish host TCP {}:{} to guest TCP {}: {err}",
+                            publish_bind::listen_display(mapping.listen),
+                            mapping.host,
+                            mapping.guest,
+                        ),
+                    )
+                })?;
             bound.push((*mapping, sockets));
         }
         Ok(Self(bound))

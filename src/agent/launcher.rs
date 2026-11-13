@@ -16,9 +16,7 @@ use crate::util::{libkrun_filename, libkrunfw_filename};
 
 use crate::agent::vsock_service;
 use smolvm_network::PortMapping as VirtioPortMapping;
-use smolvm_network::{
-    start_virtio_network, BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime,
-};
+use smolvm_network::{BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime};
 use smolvm_protocol::{guest_env, ports};
 use socket2::Socket;
 #[cfg(windows)]
@@ -267,6 +265,9 @@ pub struct LaunchFeatures {
     /// the VM data dir (`DOCKER_HOST=unix://…`). The guest agent proxies each
     /// host connection to its in-guest `/var/run/docker.sock`.
     pub expose_docker: bool,
+    /// Publish the TCP ports the guest listens on at the same host port on
+    /// loopback while they listen. Set only by the local CLI's launches.
+    pub auto_ports: Option<crate::data::network::AutoPorts>,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
@@ -616,6 +617,9 @@ pub struct LaunchConfig<'a> {
     pub docker_socket: Option<&'a Path>,
     /// Host socket the guest forwards the workload's stdout and stderr to.
     pub workload_log_socket: Option<&'a Path>,
+    /// Publish the TCP ports the guest listens on (see
+    /// [`crate::network::auto_ports`]).
+    pub auto_ports: Option<&'a crate::data::network::AutoPorts>,
     /// User-published Unix-socket bridges. The launcher resolves each `expose`
     /// socket's host path against the per-VM dir (the vsock socket's parent),
     /// assigns a vsock port (`ports::PUBLISH_SOCKET_BASE + i`), wires libkrun,
@@ -700,6 +704,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         cuda_socket,
         docker_socket,
         workload_log_socket,
+        auto_ports,
         published_sockets,
         packed_layers_dir,
         packed_layers_dax_window,
@@ -815,6 +820,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         target: std::path::PathBuf::from("/opt/smolvm-ring"),
                         read_only: false,
                         staged: false,
+                        recorded_ownership: false,
                     });
                 }
             }
@@ -1368,6 +1374,36 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     guest_network.dns_server = lease.gateway_ip;
                     fabric_lease = Some(lease);
                 }
+                // A machine on a container switch boots with its primary
+                // network's address; the engine adds the others once it runs.
+                #[cfg(unix)]
+                let switch_endpoint = resources.switch.as_ref().map(|attachment| {
+                    smolvm_network::switch::SwitchEndpoint {
+                        dir: attachment.dir.clone(),
+                        id: attachment.endpoint.clone(),
+                    }
+                });
+                #[cfg(unix)]
+                if let Some((primary, ip)) = switch_endpoint.as_ref().and_then(|endpoint| {
+                    endpoint
+                        .read_members()
+                        .into_iter()
+                        .find_map(|m| match m.ip {
+                            std::net::IpAddr::V4(ip) => Some((m, ip)),
+                            std::net::IpAddr::V6(_) => None,
+                        })
+                }) {
+                    let mask = if primary.prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - u32::from(primary.prefix.min(32)))
+                    };
+                    let gateway = std::net::Ipv4Addr::from((u32::from(ip) & mask) + 1);
+                    guest_network.guest_ip = ip;
+                    guest_network.gateway_ip = gateway;
+                    guest_network.prefix_len = primary.prefix;
+                    guest_network.dns_server = gateway;
+                }
                 let mut guest_mac = guest_network.guest_mac;
 
                 // Kubernetes pod networking: adopt the CNI interface's IP/prefix/
@@ -1515,12 +1551,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             let host_stream = Socket::from_raw_fd(host_fd);
                             let runtime = match BoundPublishedPorts::bind(&virtio_port_mappings)
                                 .and_then(|ports| {
-                                    start_virtio_network(
+                                    smolvm_network::start_virtio_network_on(
                                         host_stream,
                                         guest_network,
                                         ports,
                                         egress,
                                         fabric_lease,
+                                        #[cfg(unix)]
+                                        switch_endpoint,
                                     )
                                 }) {
                                 Ok(runtime) => runtime,
@@ -1625,7 +1663,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     let spawn = std::thread::Builder::new()
                         .name("smolvm-net-accept".into())
                         .spawn(move || match listener.accept() {
-                            Ok((sock, _)) => match start_virtio_network(
+                            Ok((sock, _)) => match smolvm_network::start_virtio_network(
                                 sock,
                                 guest_network,
                                 published_ports,
@@ -1855,11 +1893,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // below to inject each service's guest-side activation env vars, so the
         // host and guest sides cannot drift.
         // A machine without virtio-net has no host listeners of its own, so the
-        // ports it publishes while running go through the port forwarder. A
-        // socket path too long for the platform only costs that live change.
-        let port_forward_socket = if network_plan.backend == EffectiveNetworkBackend::VirtioNet {
-            None
-        } else {
+        // ports it publishes while running go through the port forwarder. Auto
+        // ports use the forwarder on every backend: it reaches a guest port at
+        // the guest's loopback, where dev servers often listen. A socket path
+        // too long for the platform only costs those live changes.
+        let live_ports_via_forwarder = network_plan.backend != EffectiveNetworkBackend::VirtioNet;
+        let port_forward_socket = if live_ports_via_forwarder || auto_ports.is_some() {
             vsock_socket
                 .parent()
                 .map(|dir| dir.join(crate::network::port_forward::PORT_FORWARD_SOCKET))
@@ -1868,21 +1907,49 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         .inspect_err(|e| tracing::warn!("live port forwarding disabled: {e}"))
                         .is_ok()
                 })
+        } else {
+            None
         };
+        let mut auto_ports_socket = None;
+        // What a previous boot published is not this boot's.
+        if let Some(dir) = vsock_socket.parent() {
+            let _ = std::fs::remove_file(dir.join(crate::network::auto_ports::AUTO_PORTS_FILE));
+        }
         if let (Some(socket), Some(dir)) = (&port_forward_socket, vsock_socket.parent()) {
             let _ = std::fs::remove_file(socket);
-            match crate::network::port_forward::PortForwarder::new(socket) {
-                Ok(forwarder) => {
-                    crate::network::port_forward::serve_forwarded_ports_control(forwarder, dir)
+            if live_ports_via_forwarder {
+                match crate::network::port_forward::PortForwarder::new(socket) {
+                    Ok(forwarder) => {
+                        crate::network::port_forward::serve_forwarded_ports_control(forwarder, dir)
+                    }
+                    Err(e) => tracing::warn!("live port forwarding disabled: {e}"),
                 }
-                Err(e) => tracing::warn!("live port forwarding disabled: {e}"),
             }
+            if let Some(auto) = auto_ports {
+                let tcp: Vec<smolvm_network::PortMapping> = port_mappings
+                    .iter()
+                    .filter(|m| m.protocol == crate::data::network::PortProtocol::Tcp)
+                    .map(|m| smolvm_network::PortMapping::new(m.host, m.guest))
+                    .collect();
+                crate::network::auto_ports::note_declared_ports(&tcp);
+                let reports = dir.join(crate::network::auto_ports::AUTO_PORTS_SOCKET);
+                match super::launcher_dynamic::check_socket_path_len(&reports) {
+                    Ok(()) => {
+                        auto_ports_socket =
+                            crate::network::auto_ports::start(dir, socket, &auto.exclude)
+                    }
+                    Err(e) => tracing::warn!("auto ports disabled: {e}"),
+                }
+            }
+        } else if auto_ports.is_some() {
+            tracing::warn!("auto ports disabled: no port forwarding socket for this machine");
         }
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),
             docker_socket: docker_socket.as_deref(),
             port_forward_socket: port_forward_socket.as_deref(),
+            auto_ports_socket: auto_ports_socket.as_deref(),
             workload_log_socket: workload_log_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()
@@ -2151,6 +2218,36 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // the COW wall entirely. The shared policy keeps this launcher,
             // packed VMs, and the direct backend on the same window size.
             let dax_window = super::virtiofs::user_mount_dax_window(&mount.target);
+            // A share whose ownership is recorded in an xattr asks the Linux
+            // server for it explicitly (the macOS server always does this).
+            if cfg!(target_os = "linux") && mount.recorded_ownership {
+                let Some(add_virtiofs4) = krun.add_virtiofs4 else {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        "recorded ownership requires libkrun with krun_add_virtiofs4",
+                    ));
+                };
+                if add_virtiofs4(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                    super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
+                ) < 0
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        format!(
+                            "krun_add_virtiofs4 failed for '{}' - requested mount cannot be attached",
+                            mount.source.display()
+                        ),
+                    ));
+                }
+                continue;
+            }
             // Read-only mounts must be enforced host-side by the virtiofs
             // device (krun_add_virtiofs3's read_only flag), not only by the
             // guest's bind-remount: a root process in the guest can undo a
@@ -3224,11 +3321,21 @@ pub(crate) fn virtio_port_mapping(mapping: &PortMapping) -> VirtioPortMapping {
         crate::data::network::PortProtocol::Udp => smolvm_network::PortProtocol::Udp,
     };
     VirtioPortMapping::with_protocol(mapping.host, mapping.guest, protocol)
+        .listening_on(mapping.listen)
 }
 
 /// libkrun's TSI port map as `HOST:GUEST` strings. TSI publishes only TCP, so a
 /// UDP mapping refuses the launch instead of being dropped without a word.
 pub(crate) fn tsi_port_map(mappings: &[PortMapping]) -> Result<Vec<CString>> {
+    if let Some(named) = mappings.iter().find(|m| m.listen.is_some()) {
+        return Err(Error::config(
+            "publish port",
+            format!(
+                "port {} names a listen address, which needs the virtio-net network backend",
+                named.label()
+            ),
+        ));
+    }
     if let Some(udp) = mappings
         .iter()
         .find(|m| m.protocol == crate::data::network::PortProtocol::Udp)

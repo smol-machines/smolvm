@@ -1929,6 +1929,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         shm_size: None,
         network_name: None,
         guest_subnet: spec.guest_subnet.clone(),
+        switch: None,
     }
 }
 

@@ -132,6 +132,7 @@ smolvm pack pull REF [-o PATH]                    # pull .smolmachine into the c
 smolvm pack list [--json]                         # pulled artifacts and their paths
 
 smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
+smolvm engine start|stop|status                   # Docker Engine API: docker, compose, Testcontainers (docs/docker-engine.md)
 smolvm config registries edit                     # registry auth
 smolvm completion bash|zsh|fish|powershell|elvish # print a shell completion script
 smolvm <any command> --error-format json        # failures as {"error":{"code":"NOT_FOUND","message":…}}
@@ -184,6 +185,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--volume` | `-v` | run, create, update, pack run | Mount host dir: `HOST:GUEST[:ro]`, or `GUEST` alone for a directory on the machine's own disk (`-v /var/lib/docker`), which starts with the image's owner and mode at that path |
 | `--allow-system-mounts` | | run, create, update, pack run | Permit trusted read-only `/etc` and `/var/log` mounts below `/host` |
 | `--port` | `-p` | run, create, update, pack run | Port mapping: `HOST:GUEST`, or `HOST:GUEST/udp` for UDP |
+| `--auto-ports` | | run, create, update | Publish every TCP port the guest listens on at the same port on host loopback while it listens (off by default) |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
 | `--interactive` | `-i` | run, exec, pack run | Keep stdin open |
 | `--tty` | `-t` | run, exec, pack run | Allocate pseudo-TTY |
@@ -237,6 +239,17 @@ ports listen on `127.0.0.1` and `[::1]`; a port below 1024, which macOS lets a
 normal user bind only on the wildcard address, listens there and drops every
 connection that is not from this host. A machine can publish up to 4096
 mappings.
+`--auto-ports` on `machine run`/`create` (Smolfile `auto_ports = true`, `machine update
+--auto-ports` when stopped) publishes every TCP port a process in the machine listens on, at the
+same port on `127.0.0.1`/`[::1]`, within about a second of `listen()` and until it stops
+listening: dev servers (also ones bound to the guest's `127.0.0.1`), image workloads, and
+`docker run -p` inside the machine (Compose, Testcontainers). Off by default; a host port already
+in use is skipped and logged, never moved; ports below 1024 and `--auto-ports-exclude PORT` are
+left out; a `-p` mapping keeps its guest port. `machine status` marks them `auto`, and
+`machine ls --json` lists them under `auto_ports`. Only machines the local CLI starts use it (not
+`smolvm serve`, the SDKs, or a running branch), on TSI and virtio-net alike; a port in a separate
+network namespace, or Docker with `"userland-proxy": false`, is not seen. Details:
+`docs/throwaway-machine/README.md`.
 `--block-private` keeps the public internet open but blocks the LAN, cloud
 metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
 `--allow-private CIDR` re-opens one private range, such as an internal

@@ -681,7 +681,9 @@ fn cases() -> Vec<Case> {
         dns_options,
         network_name,
         guest_subnet,
+        switch,
         ports,
+        auto_ports,
         allowed_cidrs,
         allowed_hosts,
         block_private,
@@ -889,6 +891,7 @@ fn cases() -> Vec<Case> {
                     target: "/data".into(),
                     read_only: true,
                     staged: false,
+                    recorded_ownership: false,
                 }]
             },
             |r| r.mounts.len() == 1
@@ -901,6 +904,7 @@ fn cases() -> Vec<Case> {
                 target: "/data".into(),
                 read_only: true,
                 staged: false,
+                recorded_ownership: false,
             }]
         })
         .checkpoint(Refused("volume mounts")),
@@ -983,6 +987,14 @@ fn cases() -> Vec<Case> {
         .api(|_| json(serde_json::json!({"ports": [{"host": 8081, "guest": 81}]})))
         .embedded(|e, _| e.spec.ports = vec![PortMapping::new(8081, 81)])
         .checkpoint(Refused("ports")),
+        // Host-side and local-CLI only: no API or embedded way to ask for it.
+        case!(
+            auto_ports,
+            |s, _| s.auto_ports = Some(AutoPorts::excluding([5432])),
+            |r| r.auto_ports.as_ref().is_some_and(|a| a.exclude == [5432])
+        )
+        .cli(&["--auto-ports-exclude", "5432"])
+        .checkpoint(Refused("auto ports")),
         case!(
             allowed_cidrs,
             |s, _| s.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]),
@@ -1133,6 +1145,22 @@ fn cases() -> Vec<Case> {
             .embedded(|e, _| e.spec.detached = true),
         case!(runtime_managed, |s, _| s.runtime_managed = true, |r| r.runtime_managed)
             .embedded(|e, _| e.spec.runtime_managed = true),
+        case!(
+            switch,
+            |s, _| {
+                s.switch = Some(crate::data::network::SwitchAttachment {
+                    dir: "/sw".into(),
+                    endpoint: "e1".into(),
+                })
+            },
+            |r| r.switch.as_ref().is_some_and(|s| s.endpoint == "e1") && r.network
+        )
+        .embedded(|e, _| {
+            e.spec.resources.switch = Some(crate::data::network::SwitchAttachment {
+                dir: "/sw".into(),
+                endpoint: "e1".into(),
+            })
+        }),
         case!(
             labels,
             |s, _| {

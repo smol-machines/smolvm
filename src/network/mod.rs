@@ -1,5 +1,6 @@
 //! Network configuration and backend selection.
 
+pub mod auto_ports;
 /// Backend selection and serialization helpers.
 pub mod backend;
 /// Launch-time backend planning and request validation rules.

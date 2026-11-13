@@ -330,6 +330,7 @@ pub fn docker_config_mount() -> Option<HostMount> {
         target: PathBuf::from("/root/.docker"),
         read_only: true,
         staged: false,
+        recorded_ownership: false,
     })
 }
 
@@ -3601,6 +3602,7 @@ impl AgentManager {
             // the machine's resources (the embedded SDK/CLI path sets the latter).
             cuda: features.cuda || resources_for_config.cuda,
             expose_docker: features.expose_docker,
+            auto_ports: features.auto_ports,
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,

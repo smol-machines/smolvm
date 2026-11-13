@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{PublishedSocketConfig, RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::credentials::CredentialPolicy;
 use crate::data::disk::{AttachedDisk, CacheDisk};
-use crate::data::network::PortMapping;
+use crate::data::network::{AutoPorts, PortMapping};
 use crate::data::resources::{
     default_microvm_memory_mib, BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT,
 };
@@ -144,8 +144,12 @@ pub struct CreateSpec {
     pub network_name: Option<String>,
     /// Canonical guest link subnet.
     pub guest_subnet: Option<String>,
+    /// Container switch to join (virtio-net only).
+    pub switch: Option<crate::data::network::SwitchAttachment>,
     /// Published ports (TCP and UDP).
     pub ports: Vec<PortMapping>,
+    /// Publish whatever TCP ports the guest listens on, while it does.
+    pub auto_ports: Option<AutoPorts>,
     /// Egress CIDR allow-list (`Some([])` denies everything).
     pub allowed_cidrs: Option<Vec<String>>,
     /// Egress hostname allow-list.
@@ -271,7 +275,9 @@ impl CreateSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
+            auto_ports,
             allowed_cidrs,
             allowed_hosts,
             block_private,
@@ -338,7 +344,12 @@ impl CreateSpec {
             dns_options: replace(self.dns_options, dns_options),
             network_name: network_name.or(self.network_name),
             guest_subnet: guest_subnet.or(self.guest_subnet),
+            switch: switch.or(self.switch),
             ports: list(self.ports, ports),
+            auto_ports: match (self.auto_ports, auto_ports) {
+                (Some(base), Some(top)) => Some(base.merged(top)),
+                (base, top) => top.or(base),
+            },
             allowed_cidrs: opt_list(self.allowed_cidrs, allowed_cidrs),
             allowed_hosts: opt_list(self.allowed_hosts, allowed_hosts),
             block_private: opt_list(self.block_private, block_private),
@@ -519,8 +530,12 @@ pub struct ResolvedSpec {
     pub network_name: Option<String>,
     /// Guest subnet.
     pub guest_subnet: Option<String>,
+    /// Container switch.
+    pub switch: Option<crate::data::network::SwitchAttachment>,
     /// Published ports.
     pub ports: Vec<PortMapping>,
+    /// Automatic port publishing.
+    pub auto_ports: Option<AutoPorts>,
     /// CIDR allow-list.
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostname allow-list.
@@ -762,7 +777,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         dns_options,
         network_name,
         guest_subnet,
+        switch,
         ports,
+        auto_ports,
         allowed_cidrs,
         allowed_hosts,
         block_private,
@@ -897,6 +914,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         || dns.is_some()
         || network_name.is_some()
         || guest_subnet.is_some()
+        || switch.is_some()
         || !egress_rules.is_empty()
         || allowed_cidrs
             .as_ref()
@@ -966,7 +984,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
@@ -1047,7 +1067,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
@@ -1145,6 +1167,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 return Err(fixed("a CUDA branch pool", TOPOLOGY));
             }
             let docker_socket = same_flag("the Docker socket", docker_socket, false)?;
+            if auto_ports.is_some() {
+                return Err(fixed(
+                    "auto ports",
+                    "the captured guest agent runs without its listening-port watcher",
+                ));
+            }
             let ssh_agent = same_flag("SSH agent forwarding", ssh_agent, false)?;
 
             // Network. An egress policy asks for networking too.
@@ -1226,10 +1254,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 .ports
                 .iter()
                 .map(|port| PortMapping::new(port.host, port.guest))
-                .chain(captured_net.udp_ports.iter().map(|port| PortMapping {
-                    host: port.host,
-                    guest: port.guest,
-                    protocol: crate::data::network::PortProtocol::Udp,
+                .chain(captured_net.udp_ports.iter().map(|port| {
+                    PortMapping::with_protocol(
+                        port.host,
+                        port.guest,
+                        crate::data::network::PortProtocol::Udp,
+                    )
                 }))
                 .collect();
             let ports = if ports.is_empty() {
@@ -1264,6 +1294,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                     target: target.into(),
                     read_only,
                     staged: false,
+                    recorded_ownership: false,
                 })
                 .collect();
 
@@ -1335,7 +1366,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports: None,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
@@ -1442,6 +1475,7 @@ impl ResolvedSpec {
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
+            switch: self.switch.clone(),
         }
     }
 
@@ -1464,6 +1498,7 @@ impl ResolvedSpec {
         record.dns_filter_hosts = self.allowed_hosts.clone();
         record.network_name = self.network_name.clone();
         record.guest_subnet = self.guest_subnet.clone();
+        record.switch = self.switch.clone();
         record.network_backend = self.network_backend;
         record.set_port_mappings(&self.ports);
         record.credential_policy = self.credentials.clone();
@@ -1526,7 +1561,9 @@ impl ResolvedSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
+            auto_ports,
             allowed_cidrs,
             allowed_hosts,
             block_private,
@@ -1554,7 +1591,9 @@ impl ResolvedSpec {
         } = self.clone();
         let restored = restored.unwrap_or_default();
         let is_restore = self.restored.is_some();
+        let recorded_ownership_mounts = mounts.iter().any(|m| m.recorded_ownership);
         let (mounts, staged_mounts) = HostMount::split_storage_tuples(&mounts);
+        let listen_addresses = PortMapping::listen_addresses(&ports);
         let (ports, udp_ports) = PortMapping::split_tuples(&ports);
         let credential_placeholders = match credentials.as_ref() {
             // A restored workload already holds its placeholders.
@@ -1584,9 +1623,11 @@ impl ResolvedSpec {
             block_private,
             mounts,
             staged_mounts,
+            recorded_ownership: recorded_ownership_mounts,
             staged_mounts_detached_from: None,
             ports,
             udp_ports,
+            listen_addresses,
             published_sockets,
             network: net,
             gpu: gpu.then_some(true),
@@ -1614,6 +1655,7 @@ impl ResolvedSpec {
             shm_size,
             network_name,
             guest_subnet,
+            switch,
             image,
             entrypoint,
             cmd,
@@ -1635,6 +1677,7 @@ impl ResolvedSpec {
             cuda_vram_limit_mib,
             cuda_preload_modules: false,
             docker_socket,
+            auto_ports,
             dns_filter_hosts: allowed_hosts,
             credential_policy: credentials,
             external_interceptor_required: restored.mediated_egress_required,

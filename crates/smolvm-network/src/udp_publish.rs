@@ -123,12 +123,12 @@ struct PublishedSocket {
 
 /// Bind the host sockets of one published UDP mapping.
 pub fn bind_udp_port(mapping: &PortMapping) -> std::io::Result<BoundSockets<HostUdpSocket>> {
-    publish_bind::bind_udp(mapping.host).map_err(|err| {
+    publish_bind::bind_udp_on(mapping.host, mapping.listen).map_err(|err| {
         std::io::Error::new(
             err.kind(),
             format!(
                 "cannot publish host UDP {}:{} to guest UDP {}: {err}",
-                publish_bind::publish_addr(),
+                publish_bind::listen_display(mapping.listen),
                 mapping.host,
                 mapping.guest,
             ),

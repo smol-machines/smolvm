@@ -37,8 +37,8 @@
 
 #[cfg(unix)]
 pub use imp::{
-    discard_unbooted_storage, prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage,
-    seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    discard_unbooted_storage, ensure_image_seed, prewarm_recent_seeds, revalidate_seed, seed_root,
+    seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
 
 /// Whether a seed can serve a pull for `platform`. A seed holds the image for
@@ -508,6 +508,32 @@ mod imp {
             prune(&root, max_bytes(), &seed);
         }
         Ok(true)
+    }
+
+    /// Make sure the seed of `image` exists, building it with `exe` when it
+    /// does not, without giving it to any machine yet. A container engine
+    /// calls this on `docker pull`, so the image's containers start on it.
+    pub fn ensure_image_seed(
+        exe: &Path,
+        image: &str,
+        auth: &PullAuth,
+        digest_ttl: Option<u64>,
+    ) -> Result<()> {
+        let EnsuredSeed {
+            root,
+            key_dir,
+            cache,
+            built,
+        } = ensure_seed(exe, image, auth, digest_ttl, None, None, false, None)?;
+        // Prune takes the cache's exclusive lock: let go of the shared one.
+        drop(cache);
+        note_recent_image(&root, image);
+        if built {
+            if let Some((seed, _)) = seed_disk(&key_dir) {
+                prune(&root, max_bytes(), &seed);
+            }
+        }
+        Ok(())
     }
 
     /// The size of the seed a disk of `storage_gb` needs when it is below the

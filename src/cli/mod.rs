@@ -5,6 +5,9 @@ pub mod cleanup_ephemeral;
 pub mod completion;
 pub mod config;
 pub mod cp_tree;
+#[cfg(unix)]
+pub mod engine;
+pub mod engine_integration;
 pub mod host_network;
 pub mod machine;
 pub mod openapi;

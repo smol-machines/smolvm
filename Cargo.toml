@@ -47,6 +47,8 @@ smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.34.1" }
 smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.34.1" }
 smolvm-pack = { path = "crates/smolvm-pack", version = "1.34.1" }
 smolvm-registry = { path = "crates/smolvm-registry", version = "1.34.1" }
+smolvm-oci-layer = { path = "crates/smolvm-oci-layer", version = "1.34.1" }
+flate2 = "1"
 smolfile = { path = "crates/smolvm-smolfile", version = "1.34.1" }
 thiserror = "1"
 # `string` lets `smolvm completion` rebuild the command tree from owned
@@ -99,6 +101,9 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 # Wraps a response body so serve counts a request until it has been sent.
 http-body = "1"
+# Hijacked connections (attach, exec) of the Docker Engine API.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"

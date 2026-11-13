@@ -86,7 +86,9 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod attach;
+mod auto_ports;
 mod branchpoint;
+mod container;
 mod credentials;
 mod cuda;
 mod dirwatch;
@@ -110,6 +112,7 @@ mod publish_socket;
 mod relay;
 mod retry;
 mod rosetta;
+mod rosetta_tracer;
 mod s3mount;
 mod ssh_agent;
 mod storage;
@@ -347,6 +350,9 @@ fn main() {
     }
     if process::container_init_requested() {
         std::process::exit(process::run_container_init());
+    }
+    if rosetta_tracer::requested() {
+        std::process::exit(rosetta_tracer::run());
     }
     if forkpoint::worker_ready_helper_requested() {
         std::process::exit(forkpoint::run_worker_ready_helper());
@@ -638,6 +644,11 @@ fn main() {
     // Forward ports published while the machine runs (no virtio-net).
     if port_forward::is_enabled() {
         port_forward::start();
+    }
+
+    // Report listening TCP ports so the host publishes them (`--auto-ports`).
+    if auto_ports::is_enabled() {
+        auto_ports::start();
     }
 
     // Start any user-published Unix-socket bridges (`--expose-socket` /
@@ -2180,7 +2191,12 @@ static WORK_SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
 /// Whether a request waits for a work slot. Liveness pings and shutdown never
 /// queue behind real work.
 fn needs_work_slot(request: &AgentRequest) -> bool {
-    !matches!(request, AgentRequest::Ping | AgentRequest::Shutdown { .. })
+    // A container's init holds its connection for the container's whole life,
+    // like a daemon, not like a unit of work.
+    !matches!(
+        request,
+        AgentRequest::Ping | AgentRequest::Shutdown { .. } | AgentRequest::ContainerStart(_)
+    )
 }
 
 /// A counting semaphore for bounding concurrent connection handlers.
@@ -2521,6 +2537,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // ContainerStart runs a container's command as its init and streams
+        // its I/O on this connection until it exits.
+        if let AgentRequest::ContainerStart(spec) = request {
+            container::handle_container_start(stream, *spec)?;
+            continue;
+        }
+
         // PodStart streams the pod container's (or exec process's) I/O on
         // this connection — Started → Stdout/Stderr → Exited, with Stdin and
         // Resize handled by the interactive pumps — like interactive Run.
@@ -2578,6 +2601,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         } = request
         {
             handle_streaming_archive_directory(stream, path, target.as_ref())?;
+            continue;
+        }
+
+        if let AgentRequest::ContainerDiff { ref overlay_id } = request {
+            handle_streaming_container_diff(stream, overlay_id)?;
             continue;
         }
 
@@ -3046,12 +3074,12 @@ fn handle_request(
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
-        AgentRequest::FileRead { .. } | AgentRequest::ArchiveDirectory { .. } => {
-            AgentResponse::error(
-                "streaming read must be handled at connection level",
-                error_codes::INTERNAL_ERROR,
-            )
-        }
+        AgentRequest::FileRead { .. }
+        | AgentRequest::ArchiveDirectory { .. }
+        | AgentRequest::ContainerDiff { .. } => AgentResponse::error(
+            "streaming read must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // Pod-container lifecycle (containerd shim v2 datapath, see pod.rs).
         AgentRequest::PodCreate {
@@ -3086,6 +3114,44 @@ fn handle_request(
         AgentRequest::PodStats { id } => pod::handle_pod_stats(&id),
 
         AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
+
+        AgentRequest::ContainerStart(_) => AgentResponse::error(
+            "ContainerStart is a streaming request",
+            error_codes::INVALID_REQUEST,
+        ),
+
+        AgentRequest::ContainerSignal {
+            overlay_id,
+            signal,
+            all,
+        } => container::handle_container_signal(&overlay_id, &signal, all),
+
+        AgentRequest::ContainerTop { overlay_id } => container::handle_container_top(&overlay_id),
+
+        AgentRequest::ContainerArchive {
+            image,
+            overlay_id,
+            archive,
+            destination,
+            image_source,
+        } => container::handle_container_archive(
+            &image,
+            &overlay_id,
+            &archive,
+            &destination,
+            image_source.as_ref(),
+        ),
+
+        AgentRequest::SetInterfaceAddresses { addresses } => {
+            container::handle_set_interface_addresses(&addresses)
+        }
+
+        AgentRequest::SetPrimaryAddress {
+            address,
+            gateway,
+            dns,
+            dns_options,
+        } => container::handle_set_primary_address(&address, &gateway, &dns, &dns_options),
     }
 }
 
@@ -4154,6 +4220,55 @@ fn handle_streaming_archive_directory(
     }
 }
 
+/// Stream a container's changes as one image layer (`ContainerDiff`): the
+/// layer is written to a file on the storage disk first, since building it
+/// walks the whole upper directory, then sent in chunks.
+fn handle_streaming_container_diff(
+    stream: &mut impl ReadWrite,
+    overlay_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let built = container::build_container_diff(overlay_id);
+    let path = match built {
+        Ok(path) => path,
+        Err(message) => {
+            send_response(
+                stream,
+                &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+    let file = std::fs::File::open(&path);
+    let _ = std::fs::remove_file(&path);
+    let mut file = match file {
+        Ok(file) => file,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("open container diff: {error}"),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    send_data_chunks_body(
+        stream,
+        &mut file,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read container diff",
+        error_codes::FILE_IO_FAILED,
+    )?;
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: Vec::new(),
+            done: true,
+        },
+    )
+}
+
 /// Handle an interactive run session with streaming I/O.
 fn handle_interactive_run(
     stream: &mut impl ReadWrite,
@@ -4273,6 +4388,33 @@ fn handle_interactive_run(
             }
         };
 
+    // A command that is not there fails the request, with the text a
+    // container engine reports, rather than starting and exiting at once.
+    if let Some(program) = launch.command.first() {
+        let path = launch
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
+            });
+        #[cfg(target_os = "linux")]
+        if let Err(e) = container::check_executable(
+            std::path::Path::new(&prepared.rootfs_path),
+            program,
+            launch.workdir.as_deref(),
+            &path,
+        ) {
+            maybe_cleanup(&prepared.workload_id);
+            send_response(stream, &AgentResponse::error(e, error_codes::SPAWN_FAILED))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (program, path);
+    }
+
     // Spawn the command with crun
     let (mut child, pty_master) = match spawn_interactive_command(
         &prepared.rootfs_path,
@@ -4365,9 +4507,16 @@ impl ResolvedLaunch {
         user: Option<String>,
         s3_volumes: Vec<smolvm_protocol::S3Volume>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!("image not found: {image}").into()
-        })?;
+        let info = match storage::query_image(image)? {
+            Some(info) => info,
+            // An image this machine's store does not hold, with the command
+            // given: a session joining a container started from an image
+            // shared into the machine (the Docker engine's containers in
+            // another container's machine), whose settings the caller already
+            // merged. Preparing its overlay still fails for anything else.
+            None if !command.is_empty() => smolvm_protocol::ImageInfo::default(),
+            None => return Err(format!("image not found: {image}").into()),
+        };
         let command = if command.is_empty() {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
@@ -4442,6 +4591,30 @@ fn write_oci_bundle(
     unprivileged: bool,
     container_init: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let spec = build_oci_spec(
+        rootfs_path,
+        launch,
+        mounts,
+        tty,
+        unprivileged,
+        container_init,
+    )?;
+    spec.write_to(bundle_path)
+        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
+
+    Ok(oci::generate_container_id())
+}
+
+/// The OCI spec [`write_oci_bundle`] writes, for callers that add to it first.
+#[cfg(target_os = "linux")]
+fn build_oci_spec(
+    rootfs_path: &std::path::Path,
+    launch: &ResolvedLaunch,
+    mounts: &[(String, String, bool)],
+    tty: bool,
+    unprivileged: bool,
+    container_init: bool,
+) -> Result<oci::OciSpec, Box<dyn std::error::Error>> {
     let workdir_str = launch.workdir.as_deref().unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
     let mut spec = oci::OciSpec::new(
@@ -4487,10 +4660,7 @@ fn write_oci_bundle(
     cuda::inject_into_container(&mut spec, rootfs_path);
     vulkan::inject_into_container(&mut spec, rootfs_path);
     credentials::inject_into_container(&mut spec, rootfs_path, mounts);
-    spec.write_to(bundle_path)
-        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
-
-    Ok(oci::generate_container_id())
+    Ok(spec)
 }
 
 /// Handle a detached run request: start a container in the background and
