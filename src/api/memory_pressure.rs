@@ -796,6 +796,7 @@ async fn pause(state: &Arc<ApiState>, name: &str, reason: String) -> bool {
     tracing::warn!(machine = %name, %reason, "pausing the newest branch child to relieve memory");
     let db = state.db().clone();
     let (name2, reason2) = (name.to_string(), reason);
+    let state2 = Arc::clone(state);
     let outcome = tokio::task::spawn_blocking(move || {
         let runtime = crate::embedded::EmbeddedRuntime::with_db(db.clone());
         let operation = format!(
@@ -806,6 +807,11 @@ async fn pause(state: &Arc<ApiState>, name: &str, reason: String) -> bool {
                 .unwrap_or(0)
         );
         runtime.pause_machine_with_operation(&name2, &operation)?;
+        // The pause stopped the VMM, but the registry's manager still holds
+        // vm.lock; release it as the HTTP pause does, or no resume can start.
+        if let Ok(entry) = state2.get_machine(&name2) {
+            entry.lock().manager.mark_stopped();
+        }
         db.update_vm(&name2, |record| record.pause_reason = Some(reason2))?;
         Ok::<(), crate::Error>(())
     })
@@ -834,8 +840,19 @@ async fn resume(state: &Arc<ApiState>, name: &str) -> bool {
     };
     let db = state.db().clone();
     let name2 = name.to_string();
+    let state2 = Arc::clone(state);
     let outcome = tokio::task::spawn_blocking(move || {
         let runtime = crate::embedded::EmbeddedRuntime::with_db(db.clone());
+        // As the HTTP resume does: a paused machine has no live VMM, so the
+        // registry must not keep the vm.lock the restore is about to take.
+        let alive = db
+            .get_vm(&name2)?
+            .is_some_and(|record| record.is_process_alive());
+        if !alive {
+            if let Ok(entry) = state2.get_machine(&name2) {
+                entry.lock().manager.mark_stopped();
+            }
+        }
         // detached: the restored VMM must outlive this runtime handle
         runtime.resume_machine_detached(&name2)?;
         db.update_vm(&name2, |record| record.pause_reason = None)?;
