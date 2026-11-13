@@ -7,6 +7,8 @@ pub mod config;
 pub mod cp_tree;
 #[cfg(unix)]
 pub mod engine;
+#[cfg(unix)]
+mod engine_activation;
 pub mod engine_integration;
 pub mod host_network;
 pub mod machine;

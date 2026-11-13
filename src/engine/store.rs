@@ -12,7 +12,17 @@ pub(crate) struct Store {
 
 impl Store {
     pub(crate) fn open(root: &Path) -> crate::Result<Self> {
-        for dir in ["containers", "images", "volumes", "networks"] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(root)?;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        for dir in [
+            "containers",
+            "images",
+            "volumes",
+            "networks",
+            "execs",
+            "events",
+        ] {
             std::fs::create_dir_all(root.join(dir))?;
         }
         Ok(Self {
@@ -96,7 +106,7 @@ impl Store {
 fn write_json<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| crate::Error::config("engine record", e.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("{}.tmp", super::util::new_id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())

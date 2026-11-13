@@ -1,6 +1,6 @@
 //! `smolvm engine`: serve the Docker Engine API from smolvm itself.
 //!
-//! `smolvm engine start` runs the engine in the background, creates and
+//! `smolvm engine` registers an on-demand API socket, creates and
 //! selects the `smol` docker context, and names the socket for
 //! Testcontainers, so `docker`, `docker compose`, Testcontainers and Dev
 //! Containers use it with nothing else set. Every container is a machine.
@@ -16,18 +16,24 @@ use super::engine_integration as integration;
 /// another.
 const DEFAULT_SOCKET: &str = "/var/run/docker.sock";
 
-/// Serve the Docker Engine API: every container is a machine
+/// Configure automatic Docker API activation: every container is a machine
 #[derive(Args, Debug)]
 pub struct EngineCmd {
     #[command(subcommand)]
-    action: EngineAction,
+    action: Option<EngineAction>,
 }
 
 #[derive(Subcommand, Debug)]
 enum EngineAction {
-    /// Start the engine in the background and point docker at it
+    /// Register the on-demand Docker socket and point docker at it
+    #[command(hide = true)]
     Start(SocketArg),
-    /// Stop the engine; running containers stop with it
+    #[command(hide = true)]
+    Register(SocketArg),
+    #[command(hide = true)]
+    Unregister(SocketArg),
+    /// Disconnect the adapter; machines continue running
+    #[command(hide = true)]
     Stop(SocketArg),
     /// Show whether the engine runs and where it listens
     Status {
@@ -38,7 +44,15 @@ enum EngineAction {
         json: bool,
     },
     /// Run the engine in the foreground
+    #[command(hide = true)]
     Serve(SocketArg),
+    #[command(hide = true)]
+    Supervise {
+        #[command(flatten)]
+        socket: SocketArg,
+        #[arg(long)]
+        id: String,
+    },
     /// Link /var/run/docker.sock to the engine's socket (runs sudo)
     LinkSocket {
         #[command(flatten)]
@@ -57,6 +71,8 @@ struct SocketArg {
     /// Unix socket the engine listens on [default: ~/.smolvm/run/docker.sock]
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    root: Option<PathBuf>,
 }
 
 impl SocketArg {
@@ -65,6 +81,9 @@ impl SocketArg {
         if let Some(socket) = &self.socket {
             config.socket = socket.clone();
         }
+        if let Some(root) = &self.root {
+            config.root = root.clone();
+        }
         Ok(config)
     }
 }
@@ -72,9 +91,22 @@ impl SocketArg {
 impl EngineCmd {
     /// Run the subcommand.
     pub fn run(self) -> smolvm::Result<()> {
-        match self.action {
+        let action = self.action.unwrap_or(EngineAction::Start(SocketArg {
+            socket: None,
+            root: None,
+        }));
+        match action {
+            EngineAction::Supervise { socket, id } => {
+                let config = socket.config()?;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(smolvm::engine::supervise(config, id))
+            }
             EngineAction::Serve(s) => serve(s.config()?),
             EngineAction::Start(s) => start(s.config()?),
+            EngineAction::Register(s) => super::engine_activation::install(&s.config()?),
+            EngineAction::Unregister(s) => super::engine_activation::uninstall(&s.config()?),
             EngineAction::Stop(s) => stop(s.config()?),
             EngineAction::Status { socket, json } => status(socket.config()?, json),
             EngineAction::LinkSocket {
@@ -99,19 +131,8 @@ fn pid_file(config: &smolvm::engine::EngineConfig) -> PathBuf {
     config.root.join("engine.pid")
 }
 
-fn log_file(config: &smolvm::engine::EngineConfig) -> PathBuf {
-    config.root.join("engine.log")
-}
-
 fn start(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
-    if integration::engine_ready(&config.socket) {
-        println!(
-            "The engine is already running on {}.",
-            config.socket.display()
-        );
-    } else {
-        spawn_engine(&config)?;
-    }
+    super::engine_activation::install(&config)?;
     let home =
         dirs::home_dir().ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
     let docker_dir =
@@ -148,59 +169,6 @@ fn start(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
     Ok(())
 }
 
-/// Run `smolvm engine serve` detached, logging to the engine's log file, and
-/// wait until it answers.
-fn spawn_engine(config: &smolvm::engine::EngineConfig) -> smolvm::Result<()> {
-    use std::os::unix::process::CommandExt;
-    std::fs::create_dir_all(&config.root)?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file(config))?;
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("engine")
-        .arg("serve")
-        .arg("--socket")
-        .arg(&config.socket)
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    // SAFETY: setsid in the child before exec; no allocation or locking.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn()?;
-    std::fs::write(pid_file(config), child.id().to_string())?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while std::time::Instant::now() < deadline {
-        if integration::engine_ready(&config.socket) {
-            println!("The engine is running on {}.", config.socket.display());
-            return Ok(());
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(smolvm::Error::config(
-                "start engine",
-                format!(
-                    "the engine exited ({status}); see {}",
-                    log_file(config).display()
-                ),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(smolvm::Error::config(
-        "start engine",
-        format!(
-            "the engine did not answer within 60 s; see {}",
-            log_file(config).display()
-        ),
-    ))
-}
-
 fn engine_pid(config: &smolvm::engine::EngineConfig) -> Option<i32> {
     let pid: i32 = std::fs::read_to_string(pid_file(config))
         .ok()?
@@ -219,7 +187,7 @@ fn stop(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
     };
     // SAFETY: SIGTERM to the engine process this command recorded starting.
     unsafe { libc::kill(pid, libc::SIGTERM) };
-    // Running containers get their stop timeout to exit first.
+    // Only the adapter exits; workload supervisors continue running.
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while std::time::Instant::now() < deadline {
         // SAFETY: signal 0 only checks that the process exists.
@@ -237,29 +205,24 @@ fn stop(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
 }
 
 fn status(config: smolvm::engine::EngineConfig, json: bool) -> smolvm::Result<()> {
-    let running = integration::engine_ready(&config.socket);
-    let version = running
-        .then(|| integration::engine_version(&config.socket))
-        .flatten();
+    let ready = super::engine_activation::registered(&config);
+    let pid = engine_pid(&config);
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "running": running,
-                "socket": config.socket,
-                "root": config.root,
-                "pid": engine_pid(&config),
-                "dockerVersion": version,
+                "ready": ready, "running": pid.is_some(), "socket": config.socket,
+                "root": config.root, "pid": pid, "dockerVersion": smolvm::engine::API_VERSION,
             })
         );
-    } else if running {
+    } else if ready {
         println!(
-            "The engine is running on {} (Docker API {}).",
+            "Docker API ready on {} (starts automatically; adapter {}).",
             config.socket.display(),
-            smolvm::engine::API_VERSION
+            if pid.is_some() { "active" } else { "idle" }
         );
     } else {
-        println!("The engine is not running. Start it with `smolvm engine start`.");
+        println!("Docker socket is not registered. Run `smolvm engine` once to configure it.");
     }
     Ok(())
 }

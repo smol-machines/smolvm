@@ -271,6 +271,15 @@ pub(crate) struct Images {
 }
 
 impl Images {
+    pub(crate) fn refresh(&self, store: &Store) -> crate::Result<()> {
+        *self.records.write() = store
+            .load_objects::<ImageRecord>("images")?
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
+        Ok(())
+    }
+
     pub(crate) fn load(store: &Store) -> crate::Result<Self> {
         let records = store
             .load_objects::<ImageRecord>("images")?
