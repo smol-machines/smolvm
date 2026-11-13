@@ -14,14 +14,22 @@
 //! Only the placeholder is replaced; the guest supplies `Bearer ` or any other
 //! surrounding syntax. A placeholder anywhere other than an ordinary request
 //! header is refused so it can never travel upstream unreplaced.
+//!
+//! Every response from a credential host is scrubbed of the values its
+//! bindings carry (see [`crate::scrub`]), so a host that reflects a request's
+//! credential cannot hand it to the guest. To keep that check complete,
+//! requests ask for an uncompressed whole response: `Accept-Encoding` is set to
+//! `identity` and range requests are dropped, and a response that is still
+//! encoded is refused.
 
 use crate::ca::MachineCa;
 use crate::policy::{CredentialPolicy, PLACEHOLDER_PREFIX};
 use crate::resolver::{CredentialRequest, CredentialResolver};
+use crate::scrub::{Scrubber, Secret};
 use crate::sni::{peek_client_hello, Peek, MAX_CLIENT_HELLO};
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{
@@ -47,6 +55,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SESSIONS: usize = 256;
 const MAX_CACHED_CLIENTS: usize = 64;
+/// Values remembered per binding for scrubbing: a rotated credential's old
+/// value may still be stored upstream.
+const MAX_REMEMBERED_VALUES: usize = 4;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Reply = Response<BoxBody<Bytes, BoxError>>;
@@ -76,6 +87,11 @@ struct State {
     policy: CredentialPolicy,
     /// placeholder → binding name
     bindings_by_placeholder: HashMap<String, String>,
+    /// binding name → placeholder
+    placeholders: BTreeMap<String, String>,
+    /// binding name → values it has resolved to in this process, newest last.
+    /// An entry with no values is a binding that could not be resolved.
+    resolved: Mutex<HashMap<String, Vec<zeroize::Zeroizing<String>>>>,
     ca: MachineCa,
     resolver: Arc<dyn CredentialResolver>,
     endpoint: InterceptEndpoint,
@@ -108,6 +124,8 @@ impl Interceptor {
                 .iter()
                 .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
                 .collect(),
+            placeholders: config.placeholders,
+            resolved: Mutex::new(HashMap::new()),
             policy: config.policy,
             ca: config.ca,
             resolver,
@@ -322,6 +340,7 @@ impl State {
         let resolved = tokio::task::spawn_blocking(move || resolver.resolve(&request))
             .await
             .context("resolver task")?;
+        self.remember(binding, resolved.as_ref().ok());
         Ok(resolved.map_err(|e| {
             tracing::warn!(machine = %self.machine, binding, host, error = %e, "credential resolution failed");
             text(
@@ -329,6 +348,70 @@ impl State {
                 "smolvm credentials: credential unavailable",
             )
         }))
+    }
+
+    /// Note what `binding` resolved to, or that it did not resolve.
+    fn remember(&self, binding: &str, value: Option<&zeroize::Zeroizing<String>>) {
+        let mut resolved = self.resolved.lock().expect("resolved values");
+        let values = resolved.entry(binding.to_string()).or_default();
+        if let Some(value) = value {
+            if !values.iter().any(|known| known == value) {
+                if values.len() == MAX_REMEMBERED_VALUES {
+                    values.remove(0);
+                }
+                values.push(value.clone());
+            }
+        }
+    }
+
+    /// A scrubber for every value the bindings covering `host` may carry,
+    /// resolving the ones this process has not seen yet. A guest that stored a
+    /// value with one request could read it back with another that injects
+    /// nothing, so every response from the host is checked.
+    async fn scrubber_for(
+        &self,
+        host: &str,
+        destination: SocketAddr,
+        method: &str,
+        path: &str,
+    ) -> Result<Option<Scrubber>> {
+        let unseen: Vec<String> = {
+            let resolved = self.resolved.lock().expect("resolved values");
+            self.policy
+                .bindings_for_host(host)
+                .filter(|b| !resolved.contains_key(&b.name))
+                .map(|b| b.name.clone())
+                .collect()
+        };
+        for binding in unseen {
+            // Recorded either way by `resolve`; a failure only means there is
+            // nothing of this binding's to look for.
+            let _ = self
+                .resolve(&binding, host, destination, method, path)
+                .await?;
+        }
+        let resolved = self.resolved.lock().expect("resolved values");
+        let secrets: Vec<Secret<'_>> = self
+            .policy
+            .bindings_for_host(host)
+            .flat_map(|b| {
+                // A header-setting binding's guest never holds a placeholder.
+                let placeholder = b
+                    .set_header
+                    .is_none()
+                    .then(|| self.placeholders.get(&b.name).map(String::as_str))
+                    .flatten();
+                resolved
+                    .get(&b.name)
+                    .into_iter()
+                    .flatten()
+                    .map(move |value| Secret {
+                        value: value.as_bytes(),
+                        placeholder,
+                    })
+            })
+            .collect();
+        Ok(Scrubber::new(&secrets))
     }
 
     fn leaf_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
@@ -611,6 +694,16 @@ impl State {
         strip_hop_headers(&mut headers);
         headers.remove(header::HOST);
         headers.remove(header::CONTENT_LENGTH);
+        // The response is checked for credential values, which needs it whole
+        // and readable: a partial range could carry a value in pieces too
+        // short to match, and a compressed body hides it.
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            header::HeaderValue::from_static("identity"),
+        );
+        headers.remove(header::RANGE);
+        headers.remove(header::IF_RANGE);
+        let method = parts.method.clone();
 
         let client = self.client_for(host, destination)?;
         let upstream = client
@@ -623,13 +716,64 @@ impl State {
         let status = upstream.status();
         let mut response_headers = upstream.headers().clone();
         strip_hop_headers(&mut response_headers);
-        let body = StreamBody::new(
-            upstream
-                .bytes_stream()
-                .map_ok(Frame::data)
-                .map_err(|e| Box::new(e) as BoxError),
-        );
-        let mut reply = Response::new(BodyExt::boxed(body));
+        let Some(scrubber) = self
+            .scrubber_for(host, destination, method.as_str(), &target)
+            .await?
+        else {
+            let body = StreamBody::new(
+                upstream
+                    .bytes_stream()
+                    .map_ok(Frame::data)
+                    .map_err(|e| Box::new(e) as BoxError),
+            );
+            let mut reply = Response::new(BodyExt::boxed(body));
+            *reply.status_mut() = status;
+            *reply.headers_mut() = response_headers;
+            return Ok(reply);
+        };
+        let has_body = method != Method::HEAD
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::NOT_MODIFIED;
+        let encoded = response_headers
+            .get_all(header::CONTENT_ENCODING)
+            .iter()
+            .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
+        if has_body && encoded {
+            tracing::warn!(machine = %self.machine, host, "credential host sent an encoded response; refused");
+            return Ok(text(
+                StatusCode::BAD_GATEWAY,
+                "smolvm credentials: the response was compressed and could not be checked for credentials",
+            ));
+        }
+        let mut header_hits = 0;
+        for value in response_headers.values_mut() {
+            if let Some(clean) = scrubber.scrub(value.as_bytes()) {
+                header_hits += 1;
+                *value = header::HeaderValue::from_bytes(&clean)
+                    .unwrap_or_else(|_| header::HeaderValue::from_static("[smolvm-redacted]"));
+            }
+        }
+        if header_hits > 0 {
+            tracing::warn!(machine = %self.machine, host, count = header_hits, "credential value removed from response headers");
+        }
+        let body: BoxBody<Bytes, BoxError> = if has_body {
+            // Scrubbing changes the length, so the body goes out chunked.
+            response_headers.remove(header::CONTENT_LENGTH);
+            BodyExt::boxed(StreamBody::new(
+                scrubbed(
+                    upstream.bytes_stream(),
+                    scrubber,
+                    self.machine.clone(),
+                    host.to_string(),
+                )
+                .map_ok(Frame::data),
+            ))
+        } else {
+            BodyExt::boxed(
+                Full::new(Bytes::new()).map_err(|never: std::convert::Infallible| match never {}),
+            )
+        };
+        let mut reply = Response::new(body);
         *reply.status_mut() = status;
         *reply.headers_mut() = response_headers;
         Ok(reply)
@@ -637,6 +781,75 @@ impl State {
 }
 
 use smolvm_protocol::credentials::PROTECTED_HEADERS;
+
+/// `body` with every credential form `scrubber` knows replaced. Holds back the
+/// tail of each chunk that could start a form the next chunk finishes.
+fn scrubbed<S>(
+    body: S,
+    scrubber: Scrubber,
+    machine: String,
+    host: String,
+) -> impl Stream<Item = std::result::Result<Bytes, BoxError>> + Send
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Send + Unpin + 'static,
+{
+    struct Scan<S> {
+        body: S,
+        carry: Vec<u8>,
+        hits: usize,
+        done: bool,
+    }
+    let scrubber = Arc::new(scrubber);
+    futures_util::stream::unfold(
+        Scan {
+            body,
+            carry: Vec::new(),
+            hits: 0,
+            done: false,
+        },
+        move |mut scan| {
+            let scrubber = scrubber.clone();
+            let (machine, host) = (machine.clone(), host.clone());
+            async move {
+                if scan.done {
+                    return None;
+                }
+                loop {
+                    match scan.body.next().await {
+                        Some(Ok(chunk)) => {
+                            scan.carry.extend_from_slice(&chunk);
+                            let mut out = Vec::with_capacity(scan.carry.len());
+                            let (used, hits) = scrubber.scan(&scan.carry, false, &mut out);
+                            scan.carry.drain(..used);
+                            scan.hits += hits;
+                            if !out.is_empty() {
+                                return Some((Ok(Bytes::from(out)), scan));
+                            }
+                        }
+                        Some(Err(e)) => {
+                            scan.done = true;
+                            return Some((Err(Box::new(e) as BoxError), scan));
+                        }
+                        None => {
+                            scan.done = true;
+                            let mut out = Vec::with_capacity(scan.carry.len());
+                            let (_, hits) = scrubber.scan(&scan.carry, true, &mut out);
+                            scan.hits += hits;
+                            scan.carry.clear();
+                            if scan.hits > 0 {
+                                tracing::warn!(machine = %machine, host = %host, count = scan.hits, "credential value removed from a response body");
+                            }
+                            if out.is_empty() {
+                                return None;
+                            }
+                            return Some((Ok(Bytes::from(out)), scan));
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
 
 /// Locate the single placeholder in the request headers.
 ///
@@ -907,20 +1120,60 @@ mod tests {
                         let recorded = recorded.clone();
                         let recorded_bodies = recorded_bodies.clone();
                         async move {
-                            let auth = request
-                                .headers()
-                                .get(header::AUTHORIZATION)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
+                            let get = |name: header::HeaderName| {
+                                request
+                                    .headers()
+                                    .get(name)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string()
+                            };
+                            let auth = get(header::AUTHORIZATION);
+                            let (encoding, range) =
+                                (get(header::ACCEPT_ENCODING), get(header::RANGE));
                             let path = request.uri().path().to_string();
                             let body = request.into_body().collect().await.unwrap().to_bytes();
                             recorded_bodies
                                 .lock()
                                 .unwrap()
                                 .push(String::from_utf8_lossy(&body).into_owned());
-                            recorded.lock().unwrap().push((auth, path.clone()));
-                            Ok::<_, std::convert::Infallible>(text(StatusCode::OK, "upstream ok"))
+                            recorded.lock().unwrap().push((auth.clone(), path.clone()));
+                            Ok::<_, std::convert::Infallible>(match path.as_str() {
+                                // An httpbin-style echo, in the body and a header.
+                                "/echo" => {
+                                    let mut reply = text(StatusCode::OK, "");
+                                    *reply.body_mut() = Full::new(Bytes::from(format!(
+                                        "{{\"headers\":{{\"Authorization\":\"{auth}\",\"Accept-Encoding\":\"{encoding}\",\"Range\":\"{range}\"}}}}"
+                                    )))
+                                    .map_err(|never| match never {})
+                                    .boxed();
+                                    reply.headers_mut().insert(
+                                        "x-echo",
+                                        header::HeaderValue::from_str(&auth).unwrap(),
+                                    );
+                                    reply
+                                }
+                                "/echo-b64" => {
+                                    use base64::Engine;
+                                    let mut reply = text(StatusCode::OK, "");
+                                    *reply.body_mut() = Full::new(Bytes::from(
+                                        base64::engine::general_purpose::STANDARD
+                                            .encode(format!("Authorization: {auth}; seen")),
+                                    ))
+                                    .map_err(|never| match never {})
+                                    .boxed();
+                                    reply
+                                }
+                                "/gzip" => {
+                                    let mut reply = text(StatusCode::OK, "pretend-gzip");
+                                    reply.headers_mut().insert(
+                                        header::CONTENT_ENCODING,
+                                        header::HeaderValue::from_static("gzip"),
+                                    );
+                                    reply
+                                }
+                                _ => text(StatusCode::OK, "upstream ok"),
+                            })
                         }
                     });
                     let _ = http1::Builder::new()
@@ -1039,7 +1292,7 @@ mod tests {
             .await
             .unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(response.ends_with("upstream ok"), "{response}");
+        assert_eq!(response_body(&response), "upstream ok", "{response}");
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(
             seen,
@@ -1395,6 +1648,98 @@ mod tests {
             "interceptor kept a connection with a forged token open"
         );
         assert!(f.upstream.seen.lock().unwrap().is_empty());
+    }
+
+    /// Body of a raw HTTP/1.1 response, chunked or not.
+    fn response_body(response: &str) -> String {
+        let (head, body) = response.split_once("\r\n\r\n").unwrap_or((response, ""));
+        if !head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            return body.to_string();
+        }
+        let mut out = String::new();
+        let mut rest = body;
+        while let Some((size, after)) = rest.split_once("\r\n") {
+            let size = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+            if size == 0 {
+                break;
+            }
+            out.push_str(&after[..size]);
+            rest = &after[size + 2..];
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reflected_placeholder_value_comes_back_as_the_placeholder() {
+        let f = fixture_with_secret("ghp_reflectedsecret0123").await;
+        let request = format!(
+            "GET /echo HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nAccept-Encoding: gzip, br\r\nRange: bytes=0-9\r\nConnection: close\r\n\r\n",
+            f.placeholder
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains("ghp_reflectedsecret0123"), "{response}");
+        let body = response_body(&response);
+        assert!(
+            body.contains(&format!("\"Authorization\":\"Bearer {}\"", f.placeholder)),
+            "{body}"
+        );
+        // The upstream was asked for an uncompressed, whole response.
+        assert!(body.contains("\"Accept-Encoding\":\"identity\""), "{body}");
+        assert!(body.contains("\"Range\":\"\""), "{body}");
+        assert!(
+            response.to_ascii_lowercase().contains(&format!(
+                "x-echo: bearer {}",
+                f.placeholder.to_ascii_lowercase()
+            )),
+            "{response}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reflected_header_value_is_redacted_even_base64_encoded() {
+        let f = header_fixture().await;
+        for path in ["/echo", "/echo-b64"] {
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
+            let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+                .await
+                .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(!response.contains("aW5qZWN0ZWQ="), "{path}: {response}");
+            assert!(response.contains("[smolvm-redacted]"), "{path}: {response}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_value_stored_by_one_request_is_scrubbed_from_one_that_injects_nothing() {
+        // Placeholder binding: a request without the placeholder injects
+        // nothing, yet its response is still checked.
+        let f = fixture_with_secret("ghp_storedsecret45678").await;
+        let request = format!(
+            "GET /echo HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: ghp_storedsecret45678\r\nConnection: close\r\n\r\n"
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(!response.contains("ghp_storedsecret45678"), "{response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_encoded_response_from_a_credential_host_is_refused() {
+        let f = fixture().await;
+        let request =
+            format!("GET /gzip HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(!response.contains("pretend-gzip"), "{response}");
     }
 
     #[test]

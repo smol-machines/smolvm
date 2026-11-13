@@ -30,5 +30,6 @@ tracing = { workspace = true }
 zeroize = "1"
 
 [dev-dependencies]
+base64 = { workspace = true }
 x509-parser = "0.18"
 tempfile = "3"
