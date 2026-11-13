@@ -5506,6 +5506,7 @@ impl CreateCmd {
                 {
                     image.apply(&mut record);
                 }
+                smolvm::portable_checkpoint::mark_image_on_storage(checkpoint, &mut record);
             }
 
             reservation.commit(&record)?;
