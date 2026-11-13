@@ -152,9 +152,11 @@ the VM alive for retry: agent operation failed: shutdown ack: freeze /oldroot/mn
 exit 1, still `running`. `scripts/cleanup.sh --reap` killed its VM process, and `delete --force`
 then removed the machine and its directory. `--reap` kills every VM process under this `HOME`.
 
-Zero-byte files named `.<name>.fork-operation.lock` or `.<name>.fork-operation.pause-operation.lock`
-stay in the same directory after a machine that was paused or checkpointed is deleted. They are
-not directories and the leak check does not count them. On Linux every delete also prints
+`smolvm machine delete` removes the zero-byte `.<name>.fork-operation.lock` and
+`.<name>.fork-operation.pause-operation.lock` files of machines that are gone. A machine that was
+paused or checkpointed and is deleted through the API or the embedded SDK leaves them in the same
+directory until a later `smolvm machine delete`. They are not directories and the leak check does
+not count them. On Linux every delete also prints
 `WARN unable to lock UID registry; retaining assignment` and still deletes.
 
 ## On macOS, do not `rm -rf` the pack cache by hand
