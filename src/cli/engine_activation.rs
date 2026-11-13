@@ -266,6 +266,7 @@ fn launch_agent(config: &EngineConfig, exe: &Path, name: &str) -> String {
 <key>EnvironmentVariables</key><dict>{env}</dict>
 <key>Sockets</key><dict><key>Docker</key><dict><key>SockPathName</key><string>{}</string><key>SockPathMode</key><integer>384</integer></dict></dict>
 <key>AbandonProcessGroup</key><true/>
+<key>ThrottleInterval</key><integer>1</integer>
 <key>Umask</key><integer>63</integer>
 <key>StandardOutPath</key><string>{}</string>
 <key>StandardErrorPath</key><string>{}</string>
@@ -293,6 +294,7 @@ mod tests {
         assert!(unit.contains("KillMode=process"));
         assert!(!unit.contains("Restart=always"));
         let plist = launch_agent(&c, Path::new("/path & other/smolvm"), "test");
+        assert!(plist.contains("<key>ThrottleInterval</key><integer>1</integer>"));
         assert!(plist.contains("/path &amp; other/smolvm"));
         assert!(plist.contains("<key>AbandonProcessGroup</key><true/>"));
         assert!(!plist.contains("KeepAlive"));
