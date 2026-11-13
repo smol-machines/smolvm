@@ -2161,12 +2161,25 @@ fn capture_with_completion(
         && stop_after_capture
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_HELD_CAPABILITIES")
             .is_ok_and(|reply| reply.trim() == "OK held-windows-in-place-v1");
+    // A packed machine whose RAM is a layered generation (a branch) can take
+    // the deferred save after all: capturing a generation never rebases its
+    // device windows. The VMM declines when the RAM is not layered, and an
+    // older VMM does not know the command; both fall back to SAVE below. SAVE
+    // read a branch's RAM through its mapping, which filled the source's RAM
+    // and DAX-window files, and paused the guest for the whole write.
+    let layered_deferred_save = !use_deferred_save
+        && !frozen
+        && !held_in_place
+        && !stop_after_capture
+        && !cfg!(target_os = "windows");
     // A frozen source is saved as it stands and never resumed: its branches
     // map its RAM.
     let command = if frozen {
         "SAVE_FROZEN"
     } else if held_in_place {
         "PREPARE_SAVE_HELD"
+    } else if layered_deferred_save {
+        "PREPARE_SAVE_LAYERED"
     } else if !use_deferred_save {
         "SAVE"
     } else if stop_after_capture {
@@ -2214,7 +2227,8 @@ fn capture_with_completion(
     {
         reply = send("PREPARE_SAVE")?;
     }
-    let prepared = (use_deferred_save || held_in_place) && reply.starts_with("OK");
+    let prepared =
+        (use_deferred_save || held_in_place || layered_deferred_save) && reply.starts_with("OK");
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     // A packed machine whose held save failed goes back to SAVE, never to the
     // rebasing PREPARE_SAVE.
@@ -2223,9 +2237,10 @@ fn capture_with_completion(
         tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
     if !reply.starts_with("OK") {
+        let vmm_alive = vm.pid.map(crate::process::is_alive);
         return Err(Error::agent(
             "checkpoint machine",
-            format!("libkrun save failed: {reply}"),
+            describe_failed_save(&reply, vmm_alive),
         ));
     }
     let mut pause = SavedVmPause {
@@ -3378,6 +3393,21 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
 /// Whether a machine mounts image layers from the host over the packed-layers
 /// virtio-fs device: a `.smolmachine`'s layers, or a local image archive or
 /// directory (including a registry image the host fetched for it).
+/// What a failed save reply tells the user. The VMM answers every command, so
+/// an empty reply means its control socket closed mid-save: the VM process
+/// died, most often killed for memory. That used to read "libkrun save failed: "
+/// with nothing after it.
+fn describe_failed_save(reply: &str, vmm_alive: Option<bool>) -> String {
+    let reply = reply.trim();
+    if !reply.is_empty() {
+        return format!("libkrun save failed: {reply}");
+    }
+    match vmm_alive {
+        Some(false) => "libkrun save failed: the VM process exited during the save, most likely killed for memory; the machine is stopped and can be started again".to_string(),
+        _ => "libkrun save failed: the VM process closed its control socket without answering".to_string(),
+    }
+}
+
 fn mounts_image_layers(vm: &VmRecord) -> bool {
     if vm.packed_image_on_storage {
         return false;
@@ -6683,6 +6713,17 @@ pub(crate) fn test_checkpoint_manifest() -> PortableCheckpointManifest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_save_with_no_reply_says_the_vm_process_died() {
+        assert_eq!(
+            describe_failed_save("ERR EIO capture VM: boom\n", Some(true)),
+            "libkrun save failed: ERR EIO capture VM: boom"
+        );
+        assert!(describe_failed_save("", Some(false)).contains("VM process exited during the save"));
+        assert!(describe_failed_save("  \n", None).contains("closed its control socket"));
+        assert!(!describe_failed_save("", Some(false)).ends_with(": "));
+    }
+
     #[test]
     fn a_declined_deferred_save_falls_back_to_a_synchronous_one() {
         // libkrun's reply for a fork clone, whose RAM has no file generation.
