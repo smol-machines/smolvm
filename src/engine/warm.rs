@@ -46,6 +46,7 @@ pub(crate) const BASE_LABEL: &str = "smolvm.engine/base";
 /// How long a base stays ready without a container branching from it.
 const BASE_OWNER: &str = "smolvm.engine/base-owner";
 const BASE_READY: &str = "smolvm.engine/base-ready";
+const BASE_ENGINE: &str = "smolvm.engine/base-engine";
 const IDLE: Duration = Duration::from_secs(120);
 
 /// Containers of one image (and size) running when another starts before
@@ -246,6 +247,10 @@ fn build(engine: &Arc<Engine>, template: &VmRecord, key: &str, name: &str) {
             .ok_or_else(|| crate::Error::config("warm base", "the container has no image"))?;
         let mut labels = BTreeMap::new();
         labels.insert(BASE_LABEL.to_string(), key.to_string());
+        labels.insert(
+            BASE_ENGINE.into(),
+            engine.config.root.to_string_lossy().into_owned(),
+        );
         if let Some(owner) = &engine.owner {
             labels.insert(BASE_OWNER.into(), owner.clone());
         }
@@ -352,6 +357,10 @@ pub(crate) fn collect(engine: &Arc<Engine>) {
             .get(BASE_OWNER)
             .is_some_and(|owner| engine.owner.as_ref() != Some(owner));
         if !vm.labels.contains_key(BASE_LABEL)
+            || vm
+                .labels
+                .get(BASE_ENGINE)
+                .is_some_and(|root| root != engine.config.root.to_string_lossy().as_ref())
             || current.contains(&name)
             || (another_owner && vm.is_process_alive())
         {
@@ -429,6 +438,8 @@ fn shared_base(engine: &Engine, key: &str) -> Option<String> {
         .into_iter()
         .find(|(_, vm)| {
             vm.labels.get(BASE_LABEL).map(String::as_str) == Some(key)
+                && vm.labels.get(BASE_ENGINE).map(String::as_str)
+                    == Some(engine.config.root.to_string_lossy().as_ref())
                 && vm.labels.contains_key(BASE_READY)
                 && vm.is_process_alive()
         })
