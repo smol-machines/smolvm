@@ -353,7 +353,15 @@ test_named_volume_readonly_metadata() {
         test "$(stat -c %a /data/proc)" = 555
         chmod 0755 /data/proc
         test "$(stat -c %a /data/proc)" = 755
-    '
+        mkdir -m 000 /data/empty
+        test "$(stat -c %a /data/empty)" = 0
+        chmod 0755 /data/empty
+        (umask 0777; touch /data/zero)
+        printf payload > /data/zero
+        test "$(stat -c %a /data/zero)" = 0
+    ' || return 1
+    # Host access for the server must not grant access to an unprivileged guest.
+    run --rm -u 65534:65534 -v "$vol:/data" alpine sh -ec '! cat /data/zero 2>/dev/null'
 }
 
 test_new_volume_takes_the_image_content() {
