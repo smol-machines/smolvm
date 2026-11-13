@@ -964,6 +964,36 @@ pub struct ForkVmOptions<'a> {
     pub labels: &'a [(String, String)],
 }
 
+/// Refuse to boot `name` from the CLI when its credential bindings take values
+/// only from an API or SDK caller, or from the checkpoint it was restored from.
+/// This process never holds such values, so the machine would intercept HTTPS
+/// to the bound hosts without adding a single credential, and the workload
+/// would see only failed requests. An external interceptor brings its own.
+pub(crate) fn require_host_credential_values(
+    name: &str,
+    record: &smolvm::config::VmRecord,
+    external_interceptor: bool,
+) -> smolvm::Result<()> {
+    if external_interceptor || !record.credentials_supplied_by_api {
+        return Ok(());
+    }
+    let Some(policy) = record.credential_policy.as_ref().filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let bindings: Vec<&str> = policy.credentials.iter().map(|b| b.name.as_str()).collect();
+    Err(smolvm::Error::config(
+        "credentials",
+        format!(
+            "machine '{name}' reads the values of its credential bindings ({}) only from the \
+             API or SDK that created it, or from no one if it was restored from a checkpoint, \
+             so started from the CLI it would intercept HTTPS without adding them; restore it \
+             with `machine create --from <checkpoint> --credential …` naming the same bindings \
+             to read their values from this host",
+            bindings.join(", ")
+        ),
+    ))
+}
+
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
     let source_policy = if options.freeze_source {
         smolvm::agent::fork::ForkSourcePolicy::Freeze
@@ -983,6 +1013,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
                 "source requires --egress-interceptor and SMOLVM_INTERCEPTOR_TOKEN for each child",
             ));
         }
+        require_host_credential_values(golden, &record, options.external_interceptor.is_some())?;
         if !record.remote_volumes.is_empty() {
             return Err(smolvm::Error::config(
                 "machine fork",
@@ -1136,6 +1167,7 @@ pub fn fork_vm_batch(
                 "source requires --egress-interceptor and SMOLVM_INTERCEPTOR_TOKEN for each child",
             ));
         }
+        require_host_credential_values(golden, &record, external_interceptor.is_some())?;
         if !record.remote_volumes.is_empty() {
             return Err(smolvm::Error::config(
                 "machine fork",
@@ -1692,6 +1724,7 @@ fn start_vm_named_with_db(
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    require_host_credential_values(name, &record, external_interceptor.is_some())?;
     // A durable checkpoint restores the already-running guest and workload just
     // like an in-memory fork snapshot. Capture this before finalization consumes
     // the one-shot payload, so the workload is not launched twice.

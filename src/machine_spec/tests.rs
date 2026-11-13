@@ -1300,6 +1300,114 @@ fn front_spec(
     })
 }
 
+/// A checkpoint whose network captured one `gh` binding.
+fn credentialed_checkpoint_manifest() -> PackManifest {
+    let mut manifest = checkpoint_manifest();
+    let network = manifest
+        .checkpoint
+        .as_mut()
+        .and_then(|c| c.network.as_mut())
+        .unwrap();
+    network.credential_policy = Some(policy("GH_TOKEN"));
+    network.credential_placeholders =
+        BTreeMap::from([("gh".to_string(), "SMOL_PLACEHOLDER_GH_1".to_string())]);
+    manifest
+}
+
+/// A checkpoint's bindings read this host's environment only when the CLI
+/// user names each one exactly as captured; the guest keeps its placeholders.
+#[test]
+fn a_cli_restore_reauthorizes_the_checkpoints_own_bindings_and_nothing_else() {
+    let manifest = credentialed_checkpoint_manifest();
+    let restore = |credentials: Option<CredentialPolicy>, caller: Caller| {
+        resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                credentials,
+                ..CreateSpec::default()
+            },
+            caller,
+        )
+        .and_then(|spec| spec.to_record("m"))
+    };
+
+    // Without the flag the bindings stay supplied-only, as before.
+    let silent = restore(None, Caller::Cli).unwrap();
+    assert!(silent.credentials_supplied_by_api);
+
+    // The same binding, named from the CLI, reads this host's environment.
+    let reauthorized = restore(Some(policy("GH_TOKEN")), Caller::Cli).unwrap();
+    assert!(!reauthorized.credentials_supplied_by_api);
+    assert_eq!(
+        reauthorized
+            .credential_placeholders
+            .get("gh")
+            .map(String::as_str),
+        Some("SMOL_PLACEHOLDER_GH_1"),
+        "the guest's placeholders are kept"
+    );
+
+    // A different variable, an extra host, or another binding is refused.
+    let mut other_host = policy("GH_TOKEN");
+    other_host.credentials[0]
+        .allowed_hosts
+        .push("attacker.example".into());
+    let mut other_name = policy("GH_TOKEN");
+    other_name.credentials[0].name = "other".into();
+    for (requested, why) in [
+        (
+            policy("AWS_SECRET_ACCESS_KEY"),
+            "was captured as gh=gh_token@api.github.com",
+        ),
+        (other_host, "was captured as gh=gh_token@api.github.com"),
+        (other_name, "no binding named 'other'"),
+    ] {
+        let error = restore(Some(requested), Caller::Cli)
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains(why), "{error}");
+    }
+
+    // Naming only some of the captured bindings is refused.
+    let mut two = credentialed_checkpoint_manifest();
+    let network = two
+        .checkpoint
+        .as_mut()
+        .and_then(|c| c.network.as_mut())
+        .unwrap();
+    let mut npm = policy("NPM_TOKEN").credentials.remove(0);
+    npm.name = "npm".into();
+    network
+        .credential_policy
+        .as_mut()
+        .unwrap()
+        .credentials
+        .push(npm);
+    network
+        .credential_placeholders
+        .insert("npm".into(), "SMOL_PLACEHOLDER_NPM_2".into());
+    let error = resolve(
+        SpecSource::from_manifest(&two),
+        CreateSpec {
+            credentials: Some(policy("GH_TOKEN")),
+            ..CreateSpec::default()
+        },
+        Caller::Cli,
+    )
+    .and_then(|spec| spec.to_record("m"))
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("binding 'npm'"), "{error}");
+
+    // An API or SDK caller never gets this host's environment.
+    for caller in [Caller::Api, Caller::Embedded] {
+        let error = restore(Some(policy("GH_TOKEN")), caller)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("credential bindings"), "{caller:?}: {error}");
+    }
+}
+
 /// Every option, on every creation path (`machine create` flags and
 /// Smolfile, the serve API's create request, the embedded runtime the SDKs
 /// drive, and the spec an SDK sends for a pack), from every source (an
