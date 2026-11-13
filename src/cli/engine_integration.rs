@@ -604,7 +604,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn engine_probe_speaks_http_over_the_socket() {
-        use std::io::Read;
+        use std::io::BufRead;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -614,11 +614,18 @@ mod tests {
                 "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"Version\":\"29.0.1\"}",
             ] {
                 let (mut conn, _) = listener.accept().unwrap();
-                let mut request = [0u8; 256];
-                let n = conn.read(&mut request).unwrap();
-                assert!(std::str::from_utf8(&request[..n])
-                    .unwrap()
-                    .starts_with("GET /"));
+                // A stream read may return just "GET " while write!'s next
+                // fragment is still in flight. Consume the complete headers
+                // before checking the request or closing the connection.
+                conn.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut reader = std::io::BufReader::new(&mut conn);
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert_ne!(reader.read_until(b'\n', &mut request).unwrap(), 0);
+                    assert!(request.len() <= 4096);
+                }
+                assert!(request.starts_with(b"GET /"));
                 conn.write_all(reply.as_bytes()).unwrap();
             }
         });
