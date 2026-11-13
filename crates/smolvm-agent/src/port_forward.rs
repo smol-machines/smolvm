@@ -3,8 +3,8 @@
 //! A machine without virtio-net has no host-side listener of its own, so the
 //! host relays each connection to a live-published port over vsock: the guest
 //! listens on [`ports::PORT_FORWARD`], reads the target guest port as one
-//! decimal line, connects to `127.0.0.1:<port>` and relays both ways. Enabled by
-//! [`guest_env::PORT_FORWARD`]. A connection to a port nothing listens on is
+//! decimal line, connects to `127.0.0.1:<port>` (else `[::1]:<port>`) and
+//! relays both ways. Enabled by [`guest_env::PORT_FORWARD`]. A connection to a port nothing listens on is
 //! dropped, which the host client sees as a closed connection.
 
 use smolvm_protocol::{guest_env, ports};
@@ -61,7 +61,10 @@ fn run() -> io::Result<()> {
 
 fn forward(mut host: crate::vsock::VsockStream) -> io::Result<()> {
     let port = read_target_port(&mut host)?;
-    let guest = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    // A server bound to `[::1]` only (some dev servers resolve `localhost` to
+    // it) refuses the IPv4 loopback, so try it second.
+    let guest = std::net::TcpStream::connect(("127.0.0.1", port))
+        .or_else(|_| std::net::TcpStream::connect(("::1", port)))?;
     crate::relay::relay_half_close(host, guest)
 }
 

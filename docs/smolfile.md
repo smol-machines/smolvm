@@ -113,7 +113,7 @@ GCP_CREDS    = { from_file = "/abs/creds.json" }  # absolute host file (at launc
 Credential bindings are `[[network.credentials]]` tables, described in
 [credential substitution](credential-substitution.md). The other accepted keys
 are `net_backend`, `rosetta`, `cuda`, `auto_graph`, `docker_socket`,
-`block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
+`auto_ports`, `auto_ports_exclude`, `block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
 tables; `machine create --help` describes the flag each one mirrors.
 
 ## User names and numeric IDs

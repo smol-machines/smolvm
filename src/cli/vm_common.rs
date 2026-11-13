@@ -533,6 +533,8 @@ pub struct CreateVmParams {
     pub waypipe_bin: Option<String>,
     /// Bridge the guest X11 socket straight to the host X server over vsock.
     pub x11: bool,
+    /// Publish the TCP ports the guest listens on (`--auto-ports`).
+    pub auto_ports: Option<smolvm::data::network::AutoPorts>,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     /// Expose host virtualization extensions so the guest can run KVM.
     pub nested_virt: bool,
@@ -541,6 +543,9 @@ pub struct CreateVmParams {
     pub gpu_vram_mib: Option<u32>,
     /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
     pub rosetta: bool,
+    /// Image platform to pull (`os/arch`). None = Rosetta's when it is on,
+    /// else the guest's own.
+    pub oci_platform: Option<String>,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Credential bindings (from `--credential` / `[[network.credentials]]`).
@@ -704,6 +709,34 @@ impl CreateVmParams {
     }
 }
 
+/// Warn about each host the machine names (`--allow-host`, a credential's
+/// host) that `--block-private` keeps it from reaching, with the
+/// `--allow-private` range that reopens it. Without this the connection is
+/// refused inside the guest and nothing says why.
+pub(crate) fn warn_hosts_blocked_by_private_floor(
+    block_private: Option<&[String]>,
+    egress_rules: &[smolvm_protocol::EgressRule],
+    allowed_hosts: Option<&[String]>,
+    credentials: Option<&smolvm::credentials::CredentialPolicy>,
+) {
+    for host in smolvm::network::private_floor::hosts_blocked_by_private_floor(
+        block_private,
+        egress_rules,
+        allowed_hosts,
+        credentials,
+        crate::cli::parsers::resolve_host_to_cidrs,
+    ) {
+        eprintln!("Warning: {}", host.warning());
+    }
+}
+
+/// [`warn_hosts_blocked_by_private_floor`] for a stored machine.
+pub(crate) fn warn_record_hosts_blocked_by_private_floor(record: &VmRecord) {
+    for host in smolvm::network::private_floor::record_hosts_blocked_by_private_floor(record) {
+        eprintln!("Warning: {}", host.warning());
+    }
+}
+
 /// The record `machine create` would write for these parameters, through
 /// the same rules as every other creation path.
 pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
@@ -770,10 +803,12 @@ impl CreateVmParams {
             waypipe,
             waypipe_bin,
             x11,
+            auto_ports,
             nested_virt,
             gpu,
             gpu_vram_mib,
             rosetta,
+            oci_platform,
             dns_filter_hosts,
             credential_policy,
             // Minted when the record is written.
@@ -821,7 +856,9 @@ impl CreateVmParams {
             dns_options,
             network_name,
             guest_subnet,
+            switch: None,
             ports: port,
+            auto_ports,
             allowed_cidrs,
             allowed_hosts: dns_filter_hosts,
             block_private,
@@ -832,6 +869,7 @@ impl CreateVmParams {
             gpu,
             gpu_vram_mib,
             rosetta,
+            oci_platform,
             nested_virt,
             cuda,
             docker_socket,
@@ -1809,6 +1847,9 @@ fn start_vm_named_with_db(
         }
     }
 
+    // The addresses may have changed since create, so ask again.
+    warn_record_hosts_blocked_by_private_floor(&record);
+
     // Check for host port conflicts with other running VMs.
     if !ports.is_empty() {
         check_port_conflicts(name, &ports, db)?;
@@ -1840,7 +1881,15 @@ fn start_vm_named_with_db(
     } else {
         String::new()
     };
-    eprintln!("Starting machine '{}'{}{}...", name, mount_info, port_info);
+    let auto_info = if record.auto_ports.is_some() {
+        " (auto ports on)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "Starting machine '{}'{}{}{}...",
+        name, mount_info, port_info, auto_info
+    );
 
     // Resolve SSH agent socket path if enabled
     let ssh_agent_socket = if record.ssh_agent {
@@ -1866,6 +1915,9 @@ fn start_vm_named_with_db(
         ssh_agent_socket,
         cuda: record.cuda,
         expose_docker: record.docker_socket,
+        // Only here, the CLI's own start: `smolvm serve` and the SDK runtime
+        // start machines without auto ports, whatever the record asks.
+        auto_ports: record.auto_ports.clone(),
         published_sockets: record.published_sockets.clone(),
         waypipe: record.waypipe,
         waypipe_bin: record.waypipe_bin.clone(),
@@ -1976,7 +2028,7 @@ fn start_vm_named_with_db(
             Some(crate::cli::pull_with_progress_as(
                 &mut client,
                 image,
-                None,
+                record.image_platform(),
                 proxy,
                 no_proxy,
                 registry_auth,
@@ -2355,7 +2407,7 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
                 Some(crate::cli::pull_with_progress(
                     &mut client,
                     image,
-                    None,
+                    record.image_platform(),
                     proxy,
                     no_proxy,
                 )?)
@@ -2825,6 +2877,40 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     let db = SmolvmDb::open()?;
     let dependent_clones = db.dependent_clones(name)?;
     ensure_fork_base_delete_is_safe(name, &dependent_clones, options.cascade)?;
+
+    // Confirm deletion unless --force (or --cascade, which is already an
+    // explicit "remove this and its clones" and runs unattended). Ask before
+    // anything below touches the machine: a refused or declined delete must
+    // leave a running machine running, so the stop comes after this.
+    if !force && !options.cascade {
+        // Without a terminal there is nobody to answer the prompt: the read
+        // below would see EOF, take it as "no", and return Ok — leaving a
+        // script that believed it had cleaned up with a machine still on disk.
+        // Refuse loudly instead, and name the flag the caller needs.
+        if !std::io::stdin().is_terminal() {
+            return Err(smolvm::Error::agent(
+                "delete",
+                format!(
+                    "machine '{name}' needs confirmation but stdin is not a terminal; \
+                     pass --force to delete it, or --cascade to remove it together with \
+                     any machines branched from it"
+                ),
+            ));
+        }
+        eprint!("Delete machine '{}'? [y/N] ", name);
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let input = input.trim().to_lowercase();
+            if input != "y" && input != "yes" {
+                println!("Cancelled");
+                return Ok(());
+            }
+        } else {
+            println!("Cancelled");
+            return Ok(());
+        }
+    }
+
     if !dependent_clones.is_empty() && options.cascade {
         // Delete the full lineage deepest-first. Every qcow2 overlay must
         // disappear before the parent image that backs it.
@@ -2878,37 +2964,6 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 smolvm::agent::state_probe::recover_unreachable_machine(&record)?;
             }
             _ => {}
-        }
-    }
-
-    // Confirm deletion unless --force (or --cascade, which is already an
-    // explicit "remove this and its clones" and runs unattended).
-    if !force && !options.cascade {
-        // Without a terminal there is nobody to answer the prompt: the read
-        // below would see EOF, take it as "no", and return Ok — leaving a
-        // script that believed it had cleaned up with a machine still on disk.
-        // Refuse loudly instead, and name the flag the caller needs.
-        if !std::io::stdin().is_terminal() {
-            return Err(smolvm::Error::agent(
-                "delete",
-                format!(
-                    "machine '{name}' needs confirmation but stdin is not a terminal; \
-                     pass --force to delete it, or --cascade to remove it together with \
-                     any machines branched from it"
-                ),
-            ));
-        }
-        eprint!("Delete machine '{}'? [y/N] ", name);
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok() {
-            let input = input.trim().to_lowercase();
-            if input != "y" && input != "yes" {
-                println!("Cancelled");
-                return Ok(());
-            }
-        } else {
-            println!("Cancelled");
-            return Ok(());
         }
     }
 
@@ -3029,6 +3084,11 @@ pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
         for (host, guest, state) in published_port_states(&label, &manager) {
             output.push_str(&state.describe(host, guest));
         }
+        if let Some(auto) =
+            smolvm::network::auto_ports::read_state(&smolvm::agent::vm_data_dir(&label))
+        {
+            output.push_str(&describe_auto_ports(&auto));
+        }
         output
     } else if let Some(ref n) = name {
         // Agent not reachable. Report the precise state from the registry
@@ -3056,6 +3116,45 @@ pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
     };
 
     write_status_output(&output)
+}
+
+/// `machine status` lines for what auto ports published, marked `auto`.
+fn describe_auto_ports(state: &smolvm::network::auto_ports::AutoPortsState) -> String {
+    let mut lines = String::new();
+    for port in &state.published {
+        lines.push_str(&format!("  port {port} -> {port}: auto\n"));
+    }
+    for skipped in &state.skipped {
+        lines.push_str(&format!(
+            "  port {}: listening, not published automatically ({})\n",
+            skipped.port, skipped.reason
+        ));
+    }
+    lines
+}
+
+/// The `auto_ports` object of a machine's JSON status: its settings, and
+/// while it runs the ports published (each marked `auto`) and the listening
+/// ones left unpublished.
+fn auto_ports_json(
+    name: &str,
+    record: &VmRecord,
+    state: &RecordState,
+) -> Option<serde_json::Value> {
+    let settings = record.auto_ports.as_ref()?;
+    let live = (*state == RecordState::Running)
+        .then(|| smolvm::network::auto_ports::read_state(&smolvm::agent::vm_data_dir(name)))
+        .flatten()
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "exclude": settings.exclude,
+        "ports": live
+            .published
+            .iter()
+            .map(|port| serde_json::json!({"host": port, "guest": port, "auto": true}))
+            .collect::<Vec<_>>(),
+        "skipped": live.skipped,
+    }))
 }
 
 /// A closed pipe means the reader has enough status output. It is not a VM
@@ -3546,6 +3645,10 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     }
     if !record.dns_options.is_empty() {
         fields.insert("dns_options".into(), serde_json::json!(record.dns_options));
+    }
+    // Present only on a machine with auto ports; see `auto_ports_json`.
+    if let Some(auto) = auto_ports_json(name, record, &actual_state) {
+        fields.insert("auto_ports".into(), auto);
     }
     if let Some(exit) = smolvm::vm_exit::read(&smolvm::agent::vm_data_dir(name)) {
         fields.insert("last_exit".into(), serde_json::json!(exit));

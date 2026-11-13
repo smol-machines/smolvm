@@ -29,6 +29,8 @@
 //! | `disk_durability` | `"full"` or `"deferred"` | No | Whether a guest `fsync` waits for the host disk (`full`, default) or guest writes reach it on the host's schedule (`deferred`; a host crash can lose recent writes). |
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
+//! | `auto_ports` | bool | No | Publish every TCP port the guest listens on at the same port on host loopback while it listens (default: false). |
+//! | `auto_ports_exclude` | int[] | No | Guest ports `auto_ports` never publishes; implies `auto_ports`. |
 //! | `ports` | string[] | No | Port mappings (`"host:guest"` or equal-length `"host-start-host-end:guest-start-guest-end"` ranges). Prefer `[dev] ports`. |
 //! | `volumes` | string[] | No | Volume mounts (`"host:guest[:ro|rw|staged]"`). Prefer `[dev] volumes`. |
 //! | `init` | string[] | No | Commands run once, on the machine's first start. Prefer `[dev] init`. |
@@ -323,6 +325,13 @@ pub struct Smolfile {
     /// Bridge the guest X11 socket straight to the host X server over vsock, so
     /// guest X11 apps render on the host X server with no waypipe involved.
     pub x11: Option<bool>,
+    /// Publish every TCP port the guest listens on at the same port on the
+    /// host's loopback while it listens, like `--auto-ports`.
+    pub auto_ports: Option<bool>,
+    /// Guest ports `auto_ports` never publishes; setting any implies
+    /// `auto_ports = true`.
+    #[serde(default)]
+    pub auto_ports_exclude: Vec<u16>,
     /// Storage disk size in GiB.
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.
@@ -798,6 +807,19 @@ enabled = true
 "#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_auto_ports_fields() {
+        let sf = parse("auto_ports = true\nauto_ports_exclude = [5432, 6379]").unwrap();
+        assert_eq!(sf.auto_ports, Some(true));
+        assert_eq!(sf.auto_ports_exclude, [5432, 6379]);
+
+        let sf = parse("").unwrap();
+        assert_eq!(sf.auto_ports, None);
+        assert!(sf.auto_ports_exclude.is_empty());
+
+        assert!(parse("auto_ports_exclude = [70000]").is_err());
     }
 
     #[test]

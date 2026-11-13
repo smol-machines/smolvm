@@ -1473,6 +1473,9 @@ mod tests {
 
     #[test]
     fn trim_keeps_the_newest_unleased_extractions_and_every_leased_one() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         const DIGEST_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         const DIGEST_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let temp = tempfile::tempdir().unwrap();
@@ -1502,6 +1505,9 @@ mod tests {
 
     #[test]
     fn trim_survives_leases_on_pre_digest_and_vanished_extractions() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         const DIGEST_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("vms");
@@ -1534,6 +1540,9 @@ mod tests {
 
     #[test]
     fn trim_budget_counts_only_what_removal_frees() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("vms");
         let (restored, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
@@ -1567,6 +1576,9 @@ mod tests {
 
     #[test]
     fn trim_leaves_prepared_captures_and_waits_for_no_one() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("vms");
         let (prepared, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
@@ -1587,6 +1599,9 @@ mod tests {
 
     #[test]
     fn a_branch_links_its_source_extraction_while_a_trim_sizes_the_cache() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("vms");
         let (leased, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
@@ -1614,6 +1629,9 @@ mod tests {
 
     #[test]
     fn trim_keeps_an_extraction_leased_while_it_was_scanning() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("vms");
         let (shared, cow) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
@@ -1630,6 +1648,9 @@ mod tests {
 
     #[test]
     fn trim_keeps_an_extraction_used_again_while_it_was_scanning() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("vms");
         let (shared, cow) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
@@ -1653,6 +1674,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn trim_waits_for_a_ram_write_back_and_then_removes_its_marker() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("vms");
         let (writing, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);

@@ -818,6 +818,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         cuda_socket: cuda_socket.as_deref(),
         docker_socket: docker_socket.as_deref(),
         workload_log_socket: workload_log_socket.as_deref(),
+        auto_ports: config.auto_ports.as_ref(),
         published_sockets: &config.published_sockets,
         waypipe_socket: waypipe_socket.as_deref(),
         waypipe_bin: config.waypipe_bin.as_deref(),

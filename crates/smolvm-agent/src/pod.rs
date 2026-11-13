@@ -345,7 +345,7 @@ fn crun_state_pid(id: &str) -> Option<u32> {
 /// process, so this is normally a few ms; the deadline caps a container that
 /// exits instantly (nothing to wait for) so Start still returns promptly.
 #[cfg(target_os = "linux")]
-fn wait_for_crun_running(id: &str, child: &mut std::process::Child) -> Option<u32> {
+pub(crate) fn wait_for_crun_running(id: &str, child: &mut std::process::Child) -> Option<u32> {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -402,7 +402,7 @@ fn proc_parent_pairs() -> Vec<(u32, u32)> {
 /// `root` plus all its descendants, from a single /proc snapshot. Used for
 /// `PodPids` — with the crun cgroup manager disabled there is no per-container
 /// cgroup.procs file to read, so the process tree under init IS the container.
-fn descendant_pids(root: u32) -> Vec<u32> {
+pub(crate) fn descendant_pids(root: u32) -> Vec<u32> {
     let pairs = proc_parent_pairs();
     let mut pids = vec![root];
     let mut i = 0;

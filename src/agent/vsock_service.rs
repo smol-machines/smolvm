@@ -41,6 +41,9 @@ pub struct VsockServiceInputs<'a> {
     /// runs. libkrun *listens* on this path and forwards each connection to the
     /// guest's port forwarder.
     pub port_forward_socket: Option<&'a Path>,
+    /// Host socket the guest reports its listening TCP ports to, for auto
+    /// ports. The host listens on this path; the guest connects out.
+    pub auto_ports_socket: Option<&'a Path>,
     /// Host socket the workload's output is appended from. When set, the
     /// guest agent forwards a detached workload's stdout and stderr to it.
     pub workload_log_socket: Option<&'a Path>,
@@ -197,6 +200,22 @@ impl VsockService for PortForwardService {
     }
 }
 
+/// Auto ports: the guest agent connects out and reports the TCP ports it
+/// listens on whenever they change; the host publishes them through the
+/// port forwarder.
+struct AutoPortsService;
+impl VsockService for AutoPortsService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.auto_ports_socket.map(|socket| ActiveVsockService {
+            name: "auto ports",
+            port: ports::AUTO_PORTS,
+            listen: false,
+            socket,
+            guest_env: &[(guest_env::AUTO_PORTS, guest_env::VALUE_ON)],
+        })
+    }
+}
+
 /// Workload logs: the guest agent connects out and streams a detached
 /// workload's stdout and stderr to a host listener that appends them to the
 /// machine's `workload.log`.
@@ -222,6 +241,7 @@ pub fn registry() -> &'static [&'static dyn VsockService] {
         &X11Service,
         &DockerSocketService,
         &PortForwardService,
+        &AutoPortsService,
         &WorkloadLogService,
     ]
 }
@@ -238,6 +258,7 @@ mod tests {
             cuda_socket: None,
             docker_socket: None,
             port_forward_socket: None,
+            auto_ports_socket: None,
             workload_log_socket: None,
             waypipe_socket: None,
             x11_socket: None,
@@ -253,5 +274,32 @@ mod tests {
         assert!(!active.listen);
         assert_eq!(active.socket, socket);
         assert_eq!(active.guest_env, &[("SMOLVM_SSH_AGENT", "1")]);
+    }
+
+    #[test]
+    fn auto_ports_entry_takes_guest_reports_and_activates_the_watcher() {
+        let socket = Path::new("/tmp/auto-ports.sock");
+        let inputs = VsockServiceInputs {
+            ssh_agent_socket: None,
+            cuda_socket: None,
+            docker_socket: None,
+            port_forward_socket: None,
+            auto_ports_socket: Some(socket),
+            workload_log_socket: None,
+            waypipe_socket: None,
+            x11_socket: None,
+        };
+        let active: Vec<_> = registry()
+            .iter()
+            .filter_map(|service| service.resolve(&inputs))
+            .collect();
+        assert_eq!(active.len(), 1, "only the auto ports service resolves");
+        assert_eq!(active[0].port, ports::AUTO_PORTS);
+        assert!(!active[0].listen, "the guest connects out");
+        assert_eq!(active[0].socket, socket);
+        assert_eq!(
+            active[0].guest_env,
+            &[(guest_env::AUTO_PORTS, guest_env::VALUE_ON)]
+        );
     }
 }

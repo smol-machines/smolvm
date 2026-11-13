@@ -58,6 +58,8 @@ Show guest GUI apps on the host desktop with `--waypipe` or `--x11`, see [GUI fo
 
 Declare a machine in a [Smolfile](docs/smolfile.md): image, resources, ports, mounts and network policy in one checked-in file.
 
+Start it with `--auto-ports` and every TCP port a process inside listens on appears on `127.0.0.1` at the same number while it listens, so dev servers, `docker compose` and Testcontainers inside the machine need no `-p`, see [publishing ports](docs/throwaway-machine/README.md#ports-that-appear-on-their-own---auto-ports).
+
 Embeddable
 ----------
 

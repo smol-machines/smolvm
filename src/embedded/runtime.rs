@@ -1287,7 +1287,7 @@ impl EmbeddedRuntime {
         let s3_volumes = self.s3_volumes_for(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.pull_image(image)?;
+        handle.pull_image(image, record.image_platform())?;
         handle.run_config(
             RunConfig::new(image, command)
                 .with_env(env)
@@ -1301,9 +1301,10 @@ impl EmbeddedRuntime {
 
     /// Pull an OCI image into the machine's storage.
     pub fn pull_image(&self, name: &str, image: &str) -> Result<ImageInfo> {
+        let record = control::get_record(&self.db, name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.pull_image(image)
+        handle.pull_image(image, record.image_platform())
     }
 
     /// Every machine in this host's shared DB, in name order. The DB is shared

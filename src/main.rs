@@ -57,6 +57,11 @@ enum Commands {
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
 
+    /// Serve the Docker Engine API: docker, Compose and Testcontainers run
+    /// every container as a machine
+    #[cfg(unix)]
+    Engine(cli::engine::EngineCmd),
+
     /// Print a shell completion script to stdout
     #[command(after_help = cli::completion::AFTER_HELP)]
     Completion {
@@ -259,6 +264,8 @@ fn run_cli() {
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
+        #[cfg(unix)]
+        Commands::Engine(cmd) => cmd.run(),
         Commands::Completion { shell } => {
             let mut cmd = cli::completion::without_hidden(&Cli::command());
             cli::completion::print(shell, &mut cmd).map_err(smolvm::Error::Io)

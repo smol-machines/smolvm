@@ -113,6 +113,14 @@ pub const GATEWAY6: &str = "SMOLVM_NETWORK_GATEWAY6";
 pub const PREFIX_LEN6: &str = "SMOLVM_NETWORK_PREFIX_LEN6";
 /// Guest-visible DNS server IPv4 address.
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
+/// Link MTU for `eth0`. Optional: absent means 1500, which is what a host
+/// without this key expects.
+pub const MTU: &str = "SMOLVM_NETWORK_MTU";
+/// The MTU of the link between the guest and smolvm's own gateway. That gateway
+/// ends every TCP connection on the host, so the internet's 1500 never applies
+/// on this hop; a 64 KB link carries a download in ~40x fewer packets, and each
+/// packet costs CPU in the guest and in the host stack alike.
+pub const GATEWAY_LINK_MTU: u16 = 65520;
 /// Resolver `options` for the guest's `/etc/resolv.conf`, space-separated
 /// (`--dns-option`, repeatable), e.g. `timeout:1 attempts:3 rotate use-vc`.
 /// Every writer of resolv.conf appends them as one `options` line.
@@ -122,6 +130,9 @@ pub const DNS_OPTIONS: &str = "SMOLVM_NETWORK_DNS_OPTIONS";
 pub const SHM_SIZE: &str = "SMOLVM_SHM_SIZE";
 /// Enables the guest-side port forwarder on [`crate::ports::PORT_FORWARD`].
 pub const PORT_FORWARD: &str = "SMOLVM_PORT_FORWARD";
+/// Enables the guest's listening-port watcher, which reports its TCP
+/// listeners on [`crate::ports::AUTO_PORTS`] so the host publishes them.
+pub const AUTO_PORTS: &str = "SMOLVM_AUTO_PORTS";
 
 /// Validate a `--shm-size` value and return it as a tmpfs `size=` value: a
 /// byte count with an optional `k`, `m` or `g` suffix (`512m`, `2g`), or a
@@ -167,6 +178,12 @@ pub const CACHE_DISK: &str = "SMOLVM_CACHE_DISK";
 /// [`crate::disk_volume::encode`]. The agent binds a per-path directory on the
 /// disk at each one in every workload. Absent means none.
 pub const DISK_VOLUMES: &str = "SMOLVM_DISK_VOLUMES";
+
+/// Ceiling, in microseconds, for the guest kernel's poll before it parks an
+/// idle CPU (`/proc/smolvm-idle-poll-us`). The agent writes it at boot; absent
+/// means the kernel's default, no polling. The host sets it where the wake
+/// from a parked CPU has been measured to dominate a virtio-fs round trip.
+pub const IDLE_POLL_US: &str = "SMOLVM_IDLE_POLL_US";
 
 /// Enables forwarding a detached workload's stdout and stderr to the host over
 /// the `ports::WORKLOAD_LOGS` vsock port, where the host appends them to the

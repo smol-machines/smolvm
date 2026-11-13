@@ -157,6 +157,24 @@ fn resolve_egress_flags(
 /// absolute `from_file` paths. A key that appears more than once — across or
 /// within the two flags — is a hard error, since silently keeping the last
 /// occurrence would mask a typo.
+/// `--auto-ports` and `--auto-ports-exclude` laid over what a Smolfile asked
+/// for: either flag turns auto ports on, and the exclusions add up.
+fn merge_auto_ports_flags(
+    base: Option<smolvm::data::network::AutoPorts>,
+    flag: bool,
+    exclude: &[u16],
+) -> Option<smolvm::data::network::AutoPorts> {
+    use smolvm::data::network::AutoPorts;
+    if !flag && exclude.is_empty() {
+        return base;
+    }
+    let flags = AutoPorts::excluding(exclude.iter().copied());
+    Some(match base {
+        Some(base) => base.merged(flags),
+        None => flags,
+    })
+}
+
 /// Parse `--expose-socket`/`--mount-socket` specs into published-socket configs.
 ///
 /// - `--expose-socket GUEST_PATH[:HOST_PATH]`: expose a guest-listening socket to
@@ -546,7 +564,7 @@ pub struct RunCmd {
             // The one-shot pack runner has no way to apply these, so they are
             // refused by name rather than dropped; `machine create --from`
             // takes every one of them.
-            "block_private", "allow_private", "allow_host_loopback", "nested_virt", "rosetta", "shm_size", "guest_subnet", "network_name", "disk_durability", "disk", "cache_disk", "docker_socket", "waypipe", "x11", "expose_socket", "mount_socket", "init"],
+            "block_private", "allow_private", "allow_host_loopback", "nested_virt", "rosetta", "shm_size", "guest_subnet", "network_name", "disk_durability", "disk", "cache_disk", "docker_socket", "waypipe", "x11", "auto_ports", "auto_ports_exclude", "expose_socket", "mount_socket", "init"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -854,6 +872,22 @@ pub struct RunCmd {
     /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
     #[arg(long, help_heading = "Network")]
     pub docker_socket: bool,
+
+    /// Publish every TCP port a process in the machine listens on at the same
+    /// port on host loopback while it listens (dev servers, `docker run -p`).
+    /// A host port already in use is skipped; ports below 1024 are not
+    /// published automatically.
+    #[arg(long, help_heading = "Network")]
+    pub auto_ports: bool,
+
+    /// Never publish this guest port automatically (repeatable). Implies
+    /// --auto-ports.
+    #[arg(
+        long = "auto-ports-exclude",
+        value_name = "PORT",
+        help_heading = "Network"
+    )]
+    pub auto_ports_exclude: Vec<u16>,
 
     /// Expose a Unix socket the guest listens on to the host (repeatable). The
     /// host reaches it at the given host path, or `<basename>` in
@@ -1547,6 +1581,8 @@ impl RunCmd {
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
+        params.rosetta = params.rosetta || self.rosetta;
+        params.oci_platform = self.oci_platform.clone();
         params.guest_subnet = self.guest_subnet.clone();
         if let Some(durability) = self.disk_durability {
             params.disk_durability = durability;
@@ -1572,6 +1608,11 @@ impl RunCmd {
         vm_common::prepare_params_credentials(&mut params)?;
         params.published_sockets =
             parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
+        params.auto_ports = merge_auto_ports_flags(
+            params.auto_ports.take(),
+            self.auto_ports,
+            &self.auto_ports_exclude,
+        );
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins).
         for (key, r) in
@@ -1579,6 +1620,12 @@ impl RunCmd {
         {
             params.secret_refs.insert(key, r);
         }
+        vm_common::warn_hosts_blocked_by_private_floor(
+            params.block_private.as_deref(),
+            &params.egress_rules,
+            params.dns_filter_hosts.as_deref(),
+            params.credential_policy.as_ref(),
+        );
         // A detached run leaves a machine behind, recorded by the rules
         // `machine create` applies; refuse what they refuse before booting.
         if self.detach {
@@ -1943,6 +1990,7 @@ impl RunCmd {
             shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
+            switch: None,
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             nested_virt: self.nested_virt,
@@ -2005,9 +2053,14 @@ impl RunCmd {
         // concurrent run whose directory this must not remove.
         let mut unstarted_data_dir =
             (!self.detach).then(|| vm_common::UnstartedRunDataDir::new(&vm_name));
+        // A seed holds the guest's own architecture; a run that pulls another
+        // platform (Rosetta pulls linux/amd64) would only pull again over it.
+        let seeds_platform = smolvm::image_seed::serves_platform(
+            smolvm::vm::rosetta::image_platform(params.oci_platform.as_deref(), params.rosetta),
+        );
         smolvm::image_seed::seed_ephemeral_run_with_trust(
             &vm_name,
-            seed_image.as_deref(),
+            seed_image.as_deref().filter(|_| seeds_platform),
             params.storage_gb,
             self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
@@ -2062,6 +2115,7 @@ impl RunCmd {
             waypipe: self.waypipe.is_some() || params.waypipe,
             waypipe_bin: self.waypipe.clone().or_else(|| params.waypipe_bin.clone()),
             x11: self.x11 || params.x11,
+            auto_ports: params.auto_ports.clone(),
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             credentials: params.credential_policy.as_ref().and_then(|policy| {
                 smolvm::credentials::CredentialLaunch::from_parts(
@@ -2165,6 +2219,12 @@ impl RunCmd {
             );
         }
 
+        if params.auto_ports.is_some() {
+            eprintln!(
+                "Auto ports on: a TCP port the machine listens on appears at 127.0.0.1:<same port>"
+            );
+        }
+
         // Register the ephemeral VM for tracking (machine list, orphan cleanup),
         // keyed by the VM's OWN name. The orphan sweep only has the DB record and
         // locates the disks via `vm_data_dir(record.name)`, so the record name
@@ -2199,11 +2259,8 @@ impl RunCmd {
         // is an x86_64 binary to translate; an explicit --oci-platform still wins.
         // Without this, a multi-arch image resolves to the guest-native arm64
         // variant and Rosetta has nothing to do.
-        let rosetta_requested = self.rosetta || params.rosetta;
-        let effective_platform: Option<String> = self
-            .oci_platform
-            .clone()
-            .or_else(|| rosetta_requested.then(|| "linux/amd64".to_string()));
+        let effective_platform =
+            smolvm::vm::rosetta::image_platform(params.oci_platform.as_deref(), params.rosetta);
 
         // A registry image is pulled. A local source's layers are already
         // mounted via virtiofs, but its image config (WORKDIR, Env, USER) is
@@ -2213,7 +2270,7 @@ impl RunCmd {
             match crate::cli::pull_with_progress(
                 &mut client,
                 img,
-                effective_platform.as_deref(),
+                effective_platform,
                 self.proxy_opts.resolved_proxy()?.as_deref(),
                 self.proxy_opts.no_proxy().as_deref(),
             ) {
@@ -4813,6 +4870,11 @@ pub struct CreateCmd {
     #[arg(long)]
     pub rosetta: bool,
 
+    /// Image platform to pull for a multi-arch image, for example linux/amd64.
+    /// Defaults to linux/amd64 with --rosetta, else the guest's architecture.
+    #[arg(long = "oci-platform", value_name = "OS/ARCH")]
+    pub oci_platform: Option<String>,
+
     /// Expose a Unix socket the guest listens on to the host (repeatable). The
     /// host reaches it at the given host path, or `<basename>` in
     /// `smolvm machine data-dir` by default. Format: GUEST_PATH[:HOST_PATH].
@@ -4889,6 +4951,18 @@ pub struct CreateCmd {
     /// that X server socket. Requires a running host X server.
     #[arg(long)]
     pub x11: bool,
+
+    /// Publish every TCP port a process in the machine listens on at the same
+    /// port on host loopback while it listens (dev servers, `docker run -p`).
+    /// A host port already in use is skipped; ports below 1024 are not
+    /// published automatically. Applies when the CLI starts the machine.
+    #[arg(long)]
+    pub auto_ports: bool,
+
+    /// Never publish this guest port automatically (repeatable). Implies
+    /// --auto-ports.
+    #[arg(long = "auto-ports-exclude", value_name = "PORT")]
+    pub auto_ports_exclude: Vec<u16>,
 
     /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
     /// each launch. Only the reference is persisted, never the value.
@@ -5107,6 +5181,7 @@ impl CreateCmd {
             .clone()
             .unwrap_or_else(smolvm::util::generate_machine_name);
         let record = resolved.to_record(&name)?;
+        vm_common::warn_record_hosts_blocked_by_private_floor(&record);
         let reservation = vm_common::CreateVmReservation::reserve(&name)?;
         reservation.commit(&record)?;
         Ok(record)
@@ -5169,6 +5244,7 @@ impl CreateCmd {
             nested_virt,
             gpu_vram_mib,
             rosetta,
+            oci_platform,
             expose_socket,
             mount_socket,
             init,
@@ -5184,6 +5260,8 @@ impl CreateCmd {
             docker_socket,
             waypipe,
             x11,
+            auto_ports,
+            auto_ports_exclude,
             secret_env,
             secret_file,
             secret_keychain,
@@ -5318,8 +5396,13 @@ impl CreateCmd {
             cli.waypipe_bin = Some(bin.clone());
         }
         cli.x11 |= *x11;
+        cli.auto_ports =
+            merge_auto_ports_flags(cli.auto_ports.take(), *auto_ports, auto_ports_exclude);
         cli.gpu |= *gpu;
         cli.rosetta |= *rosetta;
+        if oci_platform.is_some() {
+            cli.oci_platform = oci_platform.clone();
+        }
         // CLI --gpu-vram takes precedence over Smolfile gpu_vram.
         if gpu_vram_mib.is_some() {
             cli.gpu_vram_mib = *gpu_vram_mib;
@@ -5473,6 +5556,7 @@ impl CreateCmd {
         };
 
         let mut record = resolved.to_record(&name)?;
+        vm_common::warn_record_hosts_blocked_by_private_floor(&record);
         // The pack whose layers this machine mounts. An ordinary checkpoint's
         // transport pack is never an OCI-layer source and must not add a
         // virtiofs device; a packed-layer checkpoint's source pack is attached
@@ -5609,6 +5693,7 @@ impl CreateCmd {
                 {
                     image.apply(&mut record);
                 }
+                smolvm::portable_checkpoint::mark_image_on_storage(checkpoint, &mut record);
             }
 
             reservation.commit(&record)?;
@@ -6628,6 +6713,7 @@ impl ResizeCmd {
 ///   smolvm machine update --name myvm --remove-volume ./src:/app
 ///   smolvm machine update --name myvm --net -e DEBUG=1
 ///   smolvm machine update --name myvm --allow-host pypi.org   # while running
+///   smolvm machine update --name myvm --auto-ports
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
@@ -6657,6 +6743,20 @@ pub struct UpdateCmd {
     /// Remove port mapping or one-to-one range
     #[arg(long, value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     pub remove_port: Vec<PortMappingSpec>,
+
+    /// Publish every TCP port the guest listens on at the same host port on
+    /// loopback, from the next start
+    #[arg(long)]
+    pub auto_ports: bool,
+
+    /// Stop publishing listening ports automatically, from the next start
+    #[arg(long, conflicts_with_all = ["auto_ports", "auto_ports_exclude"])]
+    pub no_auto_ports: bool,
+
+    /// Replace the guest ports auto ports never publish (repeatable).
+    /// Implies --auto-ports.
+    #[arg(long = "auto-ports-exclude", value_name = "PORT")]
+    pub auto_ports_exclude: Vec<u16>,
 
     /// Set vCPU count
     #[arg(long, value_name = "N")]
@@ -6846,6 +6946,9 @@ impl UpdateCmd {
             remove_volume,
             port,
             remove_port,
+            auto_ports,
+            no_auto_ports,
+            auto_ports_exclude,
             cpus,
             mem,
             net,
@@ -6888,6 +6991,9 @@ impl UpdateCmd {
         let ports = !port.is_empty() || !remove_port.is_empty();
         let other = !volume.is_empty()
             || !remove_volume.is_empty()
+            || *auto_ports
+            || *no_auto_ports
+            || !auto_ports_exclude.is_empty()
             || cpus.is_some()
             || mem.is_some()
             || *no_net
@@ -7235,6 +7341,32 @@ impl UpdateCmd {
                 }
             }
             r.set_port_mappings(&ports);
+            if self.no_auto_ports && r.auto_ports.is_some() {
+                changes.push("  auto ports: disabled".to_string());
+                r.auto_ports = None;
+            }
+            if self.auto_ports || !self.auto_ports_exclude.is_empty() {
+                let next = smolvm::data::network::AutoPorts::excluding(
+                    if self.auto_ports_exclude.is_empty() {
+                        r.auto_ports.take().unwrap_or_default().exclude
+                    } else {
+                        self.auto_ports_exclude.clone()
+                    },
+                );
+                changes.push(if next.exclude.is_empty() {
+                    "  auto ports: enabled".to_string()
+                } else {
+                    format!(
+                        "  auto ports: enabled, excluding {}",
+                        next.exclude
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+                r.auto_ports = Some(next);
+            }
 
             // Resources
             if let Some(cpus) = self.cpus {

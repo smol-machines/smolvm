@@ -190,6 +190,35 @@ pub fn attach(
     })
 }
 
+/// Add the host directory `source` to the running machine `name`'s live
+/// device under `share`, without binding it anywhere: the caller binds it
+/// into a container itself (the Docker engine's containers that run in
+/// another container's machine). `share` is ASCII letters and digits.
+pub fn add_share(name: &str, share: &str, source: &Path, read_only: bool) -> Result<()> {
+    if share.is_empty() || !share.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(Error::config(
+            "attach share",
+            format!("invalid share name {share:?}"),
+        ));
+    }
+    let source = std::fs::canonicalize(source).map_err(|e| {
+        Error::config(
+            "attach share",
+            format!("host path {}: {e}", source.display()),
+        )
+    })?;
+    control(
+        name,
+        &format!("SHARE_ADD {} {share} {}", tag(read_only), source.display()),
+    )
+    .map(|_| ())
+}
+
+/// Remove a share [`add_share`] added, revoking the guest's access to it.
+pub fn remove_share(name: &str, share: &str, read_only: bool) -> Result<()> {
+    control(name, &format!("SHARE_REMOVE {} {share}", tag(read_only))).map(|_| ())
+}
+
 /// Unmount the attached mount at `target` from the running machine `name`.
 pub fn detach(name: &str, target: &Path) -> Result<AttachedMount> {
     let target = normalize_target(target)?;

@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{PublishedSocketConfig, RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::credentials::CredentialPolicy;
 use crate::data::disk::{AttachedDisk, CacheDisk};
-use crate::data::network::PortMapping;
+use crate::data::network::{AutoPorts, PortMapping};
 use crate::data::resources::{
     default_microvm_memory_mib, BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT,
 };
@@ -71,6 +71,10 @@ pub struct CreateSpec {
     pub workdir: Option<String>,
     /// User the workload runs as (name or `uid[:gid]`).
     pub user: Option<String>,
+    /// Platform (`os/arch`) of the image to pull when the reference is
+    /// multi-arch. Unset, a Rosetta machine pulls `linux/amd64` and any other
+    /// machine the guest's own architecture.
+    pub oci_platform: Option<String>,
     /// Commands run once, on the machine's first start.
     pub init: Vec<String>,
     /// Secret references resolved into the environment at each start. Only
@@ -140,8 +144,12 @@ pub struct CreateSpec {
     pub network_name: Option<String>,
     /// Canonical guest link subnet.
     pub guest_subnet: Option<String>,
+    /// Container switch to join (virtio-net only).
+    pub switch: Option<crate::data::network::SwitchAttachment>,
     /// Published ports (TCP and UDP).
     pub ports: Vec<PortMapping>,
+    /// Publish whatever TCP ports the guest listens on, while it does.
+    pub auto_ports: Option<AutoPorts>,
     /// Egress CIDR allow-list (`Some([])` denies everything).
     pub allowed_cidrs: Option<Vec<String>>,
     /// Egress hostname allow-list.
@@ -242,6 +250,7 @@ impl CreateSpec {
             env,
             workdir,
             user,
+            oci_platform,
             init,
             secret_refs,
             restart_policy,
@@ -273,7 +282,9 @@ impl CreateSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
+            auto_ports,
             allowed_cidrs,
             allowed_hosts,
             block_private,
@@ -311,6 +322,7 @@ impl CreateSpec {
             env: merge_env(self.env, env),
             workdir: workdir.or(self.workdir),
             user: user.or(self.user),
+            oci_platform: oci_platform.or(self.oci_platform),
             init: list(self.init, init),
             secret_refs: map(self.secret_refs, secret_refs),
             restart_policy: restart_policy.or(self.restart_policy),
@@ -342,7 +354,12 @@ impl CreateSpec {
             dns_options: replace(self.dns_options, dns_options),
             network_name: network_name.or(self.network_name),
             guest_subnet: guest_subnet.or(self.guest_subnet),
+            switch: switch.or(self.switch),
             ports: list(self.ports, ports),
+            auto_ports: match (self.auto_ports, auto_ports) {
+                (Some(base), Some(top)) => Some(base.merged(top)),
+                (base, top) => top.or(base),
+            },
             allowed_cidrs: opt_list(self.allowed_cidrs, allowed_cidrs),
             allowed_hosts: opt_list(self.allowed_hosts, allowed_hosts),
             block_private: opt_list(self.block_private, block_private),
@@ -466,6 +483,8 @@ pub struct ResolvedSpec {
     pub workdir: Option<String>,
     /// Workload user.
     pub user: Option<String>,
+    /// Platform of the image to pull.
+    pub oci_platform: Option<String>,
     /// First-start commands.
     pub init: Vec<String>,
     /// Secret references.
@@ -524,8 +543,12 @@ pub struct ResolvedSpec {
     pub network_name: Option<String>,
     /// Guest subnet.
     pub guest_subnet: Option<String>,
+    /// Container switch.
+    pub switch: Option<crate::data::network::SwitchAttachment>,
     /// Published ports.
     pub ports: Vec<PortMapping>,
+    /// Automatic port publishing.
+    pub auto_ports: Option<AutoPorts>,
     /// CIDR allow-list.
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostname allow-list.
@@ -705,6 +728,28 @@ fn bind_secret_refs(
     Ok(explicit)
 }
 
+/// An image platform is `os/arch` with an optional variant, as registries
+/// spell it (`linux/amd64`, `linux/arm/v7`). Checked at create because the
+/// value is only used on the first start, where a typo would be far from its
+/// cause.
+fn validate_oci_platform(platform: &str) -> std::result::Result<(), String> {
+    let parts: Vec<&str> = platform.split('/').collect();
+    let well_formed = (2..=3).contains(&parts.len())
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        });
+    if well_formed {
+        Ok(())
+    } else {
+        Err(format!(
+            "image platform '{platform}' is not of the form os/arch, for example linux/amd64"
+        ))
+    }
+}
+
 /// Resolve `spec` for a machine made from `source` by `caller`.
 ///
 /// This is pure: it reads nothing but its arguments (a checkpoint's host
@@ -719,6 +764,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         env,
         workdir,
         user,
+        oci_platform,
         init,
         secret_refs,
         restart_policy,
@@ -750,7 +796,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         dns_options,
         network_name,
         guest_subnet,
+        switch,
         ports,
+        auto_ports,
         allowed_cidrs,
         allowed_hosts,
         block_private,
@@ -786,6 +834,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
     }
     crate::workload::validate_stop_settings(stop_signal.as_deref(), stop_timeout_secs)
         .map_err(|error| Error::config("create machine", error))?;
+    if let Some(platform) = oci_platform.as_deref() {
+        validate_oci_platform(platform).map_err(|error| Error::config("create machine", error))?;
+    }
     for option in &dns_options {
         smolvm_protocol::resolv::validate_option(option)
             .map_err(|error| Error::config("create machine", error))?;
@@ -885,6 +936,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         || dns.is_some()
         || network_name.is_some()
         || guest_subnet.is_some()
+        || switch.is_some()
         || !egress_rules.is_empty()
         || allowed_cidrs
             .as_ref()
@@ -920,6 +972,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 env,
                 workdir,
                 user,
+                oci_platform,
                 init,
                 secret_refs,
                 restart: restart_from(
@@ -953,7 +1006,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
@@ -1003,6 +1058,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 env: merge_env(pack.env, env),
                 workdir: workdir.or(pack.workdir),
                 user: user.or(pack.user),
+                oci_platform,
                 init,
                 secret_refs: bind_secret_refs(pack.secret_refs, secret_refs)?,
                 restart: restart_from(
@@ -1036,7 +1092,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
@@ -1080,6 +1138,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 return Err(fixed(
                     "init commands",
                     "the captured guest already ran its first start",
+                ));
+            }
+            if oci_platform.is_some() {
+                return Err(fixed(
+                    "the image platform",
+                    "the captured guest already holds its image",
                 ));
             }
             let user = same(
@@ -1137,6 +1201,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 false,
             )?;
             let x11 = same_flag("the X11 bridge", x11, false)?;
+            if auto_ports.is_some() {
+                return Err(fixed(
+                    "auto ports",
+                    "the captured guest agent runs without its listening-port watcher",
+                ));
+            }
             let ssh_agent = same_flag("SSH agent forwarding", ssh_agent, false)?;
 
             // Network. An egress policy asks for networking too.
@@ -1218,10 +1288,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 .ports
                 .iter()
                 .map(|port| PortMapping::new(port.host, port.guest))
-                .chain(captured_net.udp_ports.iter().map(|port| PortMapping {
-                    host: port.host,
-                    guest: port.guest,
-                    protocol: crate::data::network::PortProtocol::Udp,
+                .chain(captured_net.udp_ports.iter().map(|port| {
+                    PortMapping::with_protocol(
+                        port.host,
+                        port.guest,
+                        crate::data::network::PortProtocol::Udp,
+                    )
                 }))
                 .collect();
             let ports = if ports.is_empty() {
@@ -1256,6 +1328,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                     target: target.into(),
                     read_only,
                     staged: false,
+                    recorded_ownership: false,
                 })
                 .collect();
 
@@ -1268,6 +1341,8 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 env: merge_env(pack.env, env),
                 workdir: workdir.or(pack.workdir),
                 user,
+                // A captured guest already holds its image.
+                oci_platform: None,
                 init: Vec::new(),
                 secret_refs: bind_secret_refs(pack.secret_refs, secret_refs)?,
                 restart: match workload {
@@ -1325,7 +1400,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports: None,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
@@ -1444,6 +1521,7 @@ impl ResolvedSpec {
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
+            switch: self.switch.clone(),
         }
     }
 
@@ -1466,6 +1544,7 @@ impl ResolvedSpec {
         record.dns_filter_hosts = self.allowed_hosts.clone();
         record.network_name = self.network_name.clone();
         record.guest_subnet = self.guest_subnet.clone();
+        record.switch = self.switch.clone();
         record.network_backend = self.network_backend;
         record.set_port_mappings(&self.ports);
         record.credential_policy = self.credentials.clone();
@@ -1498,6 +1577,7 @@ impl ResolvedSpec {
             env,
             workdir,
             user,
+            oci_platform,
             init,
             secret_refs,
             restart,
@@ -1527,7 +1607,9 @@ impl ResolvedSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
+            auto_ports,
             allowed_cidrs,
             allowed_hosts,
             block_private,
@@ -1558,7 +1640,9 @@ impl ResolvedSpec {
         } = self.clone();
         let restored = restored.unwrap_or_default();
         let is_restore = self.restored.is_some();
+        let recorded_ownership_mounts = mounts.iter().any(|m| m.recorded_ownership);
         let (mounts, staged_mounts) = HostMount::split_storage_tuples(&mounts);
+        let listen_addresses = PortMapping::listen_addresses(&ports);
         let (ports, udp_ports) = PortMapping::split_tuples(&ports);
         let credential_placeholders = match credentials.as_ref() {
             // A restored workload already holds its placeholders.
@@ -1588,9 +1672,11 @@ impl ResolvedSpec {
             block_private,
             mounts,
             staged_mounts,
+            recorded_ownership: recorded_ownership_mounts,
             staged_mounts_detached_from: None,
             ports,
             udp_ports,
+            listen_addresses,
             published_sockets,
             network: net,
             gpu: gpu.then_some(true),
@@ -1607,6 +1693,7 @@ impl ResolvedSpec {
             secret_refs,
             workdir,
             user,
+            oci_platform,
             storage_gb,
             overlay_gb,
             allowed_cidrs,
@@ -1617,6 +1704,7 @@ impl ResolvedSpec {
             shm_size,
             network_name,
             guest_subnet,
+            switch,
             image,
             entrypoint,
             cmd,
@@ -1641,6 +1729,7 @@ impl ResolvedSpec {
             waypipe,
             waypipe_bin,
             x11,
+            auto_ports,
             dns_filter_hosts: allowed_hosts,
             credential_policy: credentials,
             external_interceptor_required: restored.mediated_egress_required,

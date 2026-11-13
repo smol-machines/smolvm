@@ -722,6 +722,7 @@ pub fn launch_agent_vm_dynamic(
         cuda_socket: config.cuda_socket,
         docker_socket: None,
         port_forward_socket: None,
+        auto_ports_socket: None,
         workload_log_socket: None,
         waypipe_socket: None,
         x11_socket: None,
@@ -879,6 +880,7 @@ pub fn launch_agent_vm_dynamic(
         &config.resources.dns_options,
         None,
     ));
+    env_strings.extend(crate::agent::guest_idle_poll_env());
     env_strings.extend(crate::agent::guest_workload_env(
         config.resources.shm_size.as_deref(),
     ));
@@ -953,17 +955,36 @@ pub fn launch_agent_vm_dynamic(
         );
 
         let dax_window = super::virtiofs::user_mount_dax_window(Path::new(&mount.guest_path));
+        // A watched share keeps missing names for a second (see the mount
+        // loop in `launcher.rs`); needs krun_add_virtiofs4.
+        let negative_entries = !mount.staged && super::fsnotify_watch::watching_enabled();
         // SAFETY: ctx is valid, tag and host_path are valid C strings
-        if unsafe {
-            add_virtiofs3(
-                ctx,
-                tag.as_ptr(),
-                host_path.as_ptr(),
-                dax_window,
-                mount.read_only,
-            )
-        } < 0
-        {
+        let mut added = -libc::EINVAL;
+        if let (true, Some(add_virtiofs4)) = (negative_entries, krun.add_virtiofs4) {
+            added = unsafe {
+                add_virtiofs4(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                    super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
+                )
+            };
+        }
+        // EINVAL also means a libkrun that does not know the flag: attach as before.
+        if added == -libc::EINVAL {
+            added = unsafe {
+                add_virtiofs3(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                )
+            };
+        }
+        if added < 0 {
             free_ctx_on_err!(format!(
                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
                 mount.tag

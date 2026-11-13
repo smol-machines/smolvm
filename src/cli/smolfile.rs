@@ -198,6 +198,8 @@ pub fn build_create_spec(
         waypipe: sf_waypipe,
         waypipe_bin: sf_waypipe_bin,
         x11: sf_x11,
+        auto_ports: sf_auto_ports,
+        auto_ports_exclude: sf_auto_ports_exclude,
         storage: sf_storage,
         overlay: sf_overlay,
         block_io: sf_block_io,
@@ -447,7 +449,15 @@ pub fn build_create_spec(
             dns_options: Vec::new(),
             network_name: cli_network_name,
             guest_subnet: None,
+            switch: None,
             ports,
+            // An exclude list asks for auto ports unless they are turned off.
+            auto_ports: match sf_auto_ports {
+                Some(true) => true,
+                Some(false) => false,
+                None => !sf_auto_ports_exclude.is_empty(),
+            }
+            .then(|| smolvm::data::network::AutoPorts::excluding(sf_auto_ports_exclude)),
             allowed_cidrs,
             allowed_hosts: (!sf_allow_hosts.is_empty()).then_some(sf_allow_hosts),
             block_private,
@@ -462,6 +472,8 @@ pub fn build_create_spec(
             gpu: sf_gpu.unwrap_or(false),
             gpu_vram_mib: sf_gpu_vram,
             rosetta: sf_rosetta.unwrap_or(false),
+            // A flag only: `[artifact].oci_platform` is what a pack is built for.
+            oci_platform: None,
             nested_virt: false,
             cuda,
             docker_socket: sf_docker_socket.unwrap_or(false),
@@ -575,7 +587,10 @@ pub fn build_create_params(
         dns_options,
         network_name,
         guest_subnet,
+        // Only an engine puts machines on a container switch.
+        switch: _,
         ports,
+        auto_ports,
         allowed_cidrs,
         allowed_hosts,
         block_private,
@@ -587,6 +602,7 @@ pub fn build_create_params(
         gpu,
         gpu_vram_mib,
         rosetta,
+        oci_platform,
         nested_virt,
         cuda,
         docker_socket,
@@ -657,9 +673,11 @@ pub fn build_create_params(
         waypipe,
         waypipe_bin,
         x11,
+        auto_ports,
         gpu,
         gpu_vram_mib,
         rosetta,
+        oci_platform,
         dns_filter_hosts: allowed_hosts,
         credential_policy: credentials,
         credential_placeholders: Default::default(),
@@ -1382,6 +1400,31 @@ init = ["echo init"]
         assert!(record.forkable_on_start());
         assert_eq!(record.cuda_fork_pool_size, Some(8));
         assert_eq!(record.cuda_vram_limit_mib, Some(6144));
+    }
+
+    #[test]
+    fn auto_ports_smolfile_reaches_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("auto_ports = true\n", Some(vec![])),
+            (
+                "auto_ports_exclude = [6379, 5432, 6379]\n",
+                Some(vec![5432, 6379]),
+            ),
+            ("auto_ports = false\nauto_ports_exclude = [5432]\n", None),
+            ("net = true\n", None),
+        ];
+        for (contents, expected) in cases {
+            let path = dir.path().join("Smolfile");
+            std::fs::write(&path, contents).unwrap();
+            let params = build_from_smolfile(path).unwrap();
+            let record = crate::cli::vm_common::build_vm_record(&params).unwrap();
+            assert_eq!(
+                record.auto_ports.map(|auto| auto.exclude),
+                expected,
+                "{contents:?}"
+            );
+        }
     }
 
     #[test]

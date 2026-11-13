@@ -8,6 +8,12 @@
     client.py churn HOST PORT[-LAST] TOTAL CONCURRENCY
         Open and close TOTAL connections, CONCURRENCY at a time, each one
         echoing a byte before it closes. Prints one JSON line.
+    client.py http HOST PORT TOTAL CONCURRENCY
+        TOTAL short HTTP/1.1 GETs to a real server, CONCURRENCY at a time
+        (1 = one after another), each read to EOF and checked for a complete
+        response with a status below 400. Half ask the server to close first (Connection: close);
+        the other half half-close their own side right after the request. A
+        reset or a short body fails. Prints one JSON line.
 
 Connections rotate over the ports so a long churn is not capped by the
 TIME-WAIT tuples of a single destination. $INFLIGHT bounds the connects in
@@ -168,8 +174,56 @@ def churn(total, concurrency):
     return {"seconds": round(seconds, 1), "per_second": round(total / max(seconds, 0.001))}
 
 
+def http(total, concurrency):
+    import concurrent.futures
+    import re
+
+    host_port = int(ports[0])
+
+    def one(index):
+        half_close = index % 2 == 1
+        request = (
+            "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: smolvm-test\r\n"
+            "Connection: close\r\n\r\n" % host
+        ).encode()
+        try:
+            sock = socket.create_connection((host, host_port), timeout=20)
+        except OSError as e:
+            return "connect:" + (errname(e.errno) if e.errno else type(e).__name__)
+        try:
+            sock.sendall(request)
+            if half_close:
+                sock.shutdown(socket.SHUT_WR)
+            data = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError as e:
+            return "recv:" + (errname(e.errno) if e.errno else type(e).__name__)
+        finally:
+            sock.close()
+        head, _, body = data.partition(b"\r\n\r\n")
+        status = re.match(rb"HTTP/1\.[01] (\d{3})", head)
+        if not status or int(status.group(1)) >= 400:
+            return "status:" + (head[:12].decode(errors="replace") or "empty")
+        length = re.search(rb"(?im)^content-length:\s*(\d+)", head)
+        if length and len(body) != int(length.group(1)):
+            return "short_body"
+        return "ok_half_closed" if half_close else "ok_server_closed"
+
+    began = time.time()
+    with concurrent.futures.ThreadPoolExecutor(concurrency) as pool:
+        for outcome in pool.map(one, range(total)):
+            result[outcome] += 1
+    return {"seconds": round(time.time() - began, 1)}
+
+
 if mode == "hold":
     extra = hold(int(sys.argv[4]), float(sys.argv[5]))
+elif mode == "http":
+    extra = http(int(sys.argv[4]), int(sys.argv[5]))
 else:
     extra = churn(int(sys.argv[4]), int(sys.argv[5]))
 print(json.dumps({"mode": mode, "result": dict(result), **extra}), flush=True)

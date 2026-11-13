@@ -53,17 +53,18 @@ impl BoundTcpPorts {
     pub fn bind(mappings: &[PortMapping]) -> io::Result<Self> {
         let mut bound = Vec::with_capacity(mappings.len());
         for mapping in mappings {
-            let sockets = publish_bind::bind_tcp(mapping.host).map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!(
-                        "cannot publish host TCP {}:{} to guest TCP {}: {err}",
-                        publish_bind::publish_addr(),
-                        mapping.host,
-                        mapping.guest,
-                    ),
-                )
-            })?;
+            let sockets =
+                publish_bind::bind_tcp_on(mapping.host, mapping.listen).map_err(|err| {
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "cannot publish host TCP {}:{} to guest TCP {}: {err}",
+                            publish_bind::listen_display(mapping.listen),
+                            mapping.host,
+                            mapping.guest,
+                        ),
+                    )
+                })?;
             bound.push((*mapping, sockets));
         }
         Ok(Self(bound))
@@ -379,12 +380,21 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::mpsc;
 
+    /// A port free right now, from below the ephemeral range (32768 and up on
+    /// Linux, 49152 on macOS). A port the kernel picks with bind(0) is an
+    /// ephemeral one, and the outbound connections other tests in this
+    /// process open take ephemeral ports too, so one could land on it before
+    /// the test binds it again.
     fn free_port() -> u16 {
-        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let start = 20_000 + std::process::id() % 6_000;
+        loop {
+            let offset = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let port = (20_000 + (start - 20_000 + offset) % 12_000) as u16;
+            if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+                return port;
+            }
+        }
     }
 
     fn start(mappings: &[PortMapping]) -> (TcpAcceptorSet, mpsc::Receiver<AcceptedConnection>) {

@@ -215,6 +215,53 @@ fn options_that_need_a_network_turn_it_on() {
 }
 
 #[test]
+fn an_image_platform_is_os_arch_with_an_optional_variant() {
+    for platform in ["linux/amd64", "linux/arm64", "linux/arm/v7"] {
+        let spec = CreateSpec {
+            oci_platform: Some(platform.into()),
+            ..Default::default()
+        };
+        let record = fresh(spec, Src::Image);
+        assert_eq!(record.oci_platform.as_deref(), Some(platform));
+        assert_eq!(record.image_platform(), Some(platform));
+    }
+    for platform in ["", "amd64", "linux/", "/amd64", "linux amd64", "a/b/c/d"] {
+        let spec = CreateSpec {
+            oci_platform: Some(platform.into()),
+            ..Default::default()
+        };
+        assert!(
+            refusal(spec, Src::Image).contains("os/arch"),
+            "{platform:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rosetta_machine_pulls_amd64_on_every_start() {
+    let rosetta = CreateSpec {
+        rosetta: true,
+        ..Default::default()
+    };
+    let record = fresh(rosetta.clone(), Src::Image);
+    assert_eq!(record.oci_platform, None);
+    assert_eq!(record.image_platform(), Some("linux/amd64"));
+
+    let asked = CreateSpec {
+        oci_platform: Some("linux/arm64".into()),
+        ..rosetta
+    };
+    assert_eq!(
+        fresh(asked, Src::Image).image_platform(),
+        Some("linux/arm64")
+    );
+    assert_eq!(
+        fresh(CreateSpec::default(), Src::Image).image_platform(),
+        None
+    );
+}
+
+#[test]
 fn keeping_an_identity_needs_a_checkpoint() {
     let spec = CreateSpec {
         keep_identity: true,
@@ -654,7 +701,9 @@ fn cases() -> Vec<Case> {
         dns_options,
         network_name,
         guest_subnet,
+        switch,
         ports,
+        auto_ports,
         allowed_cidrs,
         allowed_hosts,
         block_private,
@@ -665,6 +714,7 @@ fn cases() -> Vec<Case> {
         gpu,
         gpu_vram_mib,
         rosetta,
+        oci_platform,
         nested_virt,
         cuda,
         docker_socket,
@@ -864,6 +914,7 @@ fn cases() -> Vec<Case> {
                     target: "/data".into(),
                     read_only: true,
                     staged: false,
+                    recorded_ownership: false,
                 }]
             },
             |r| r.mounts.len() == 1
@@ -876,6 +927,7 @@ fn cases() -> Vec<Case> {
                 target: "/data".into(),
                 read_only: true,
                 staged: false,
+                recorded_ownership: false,
             }]
         })
         .checkpoint(Refused("volume mounts")),
@@ -958,6 +1010,14 @@ fn cases() -> Vec<Case> {
         .api(|_| json(serde_json::json!({"ports": [{"host": 8081, "guest": 81}]})))
         .embedded(|e, _| e.spec.ports = vec![PortMapping::new(8081, 81)])
         .checkpoint(Refused("ports")),
+        // Host-side and local-CLI only: no API or embedded way to ask for it.
+        case!(
+            auto_ports,
+            |s, _| s.auto_ports = Some(AutoPorts::excluding([5432])),
+            |r| r.auto_ports.as_ref().is_some_and(|a| a.exclude == [5432])
+        )
+        .cli(&["--auto-ports-exclude", "5432"])
+        .checkpoint(Refused("auto ports")),
         case!(
             allowed_cidrs,
             |s, _| s.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]),
@@ -1050,6 +1110,13 @@ fn cases() -> Vec<Case> {
             .cli(&["--rosetta"])
             .embedded(|e, _| e.spec.resources.rosetta = true)
             .checkpoint(Refused("rosetta")),
+        case!(
+            oci_platform,
+            |s, _| s.oci_platform = Some("linux/amd64".into()),
+            |r| r.oci_platform.as_deref() == Some("linux/amd64")
+        )
+        .cli(&["--oci-platform", "linux/amd64"])
+        .checkpoint(Refused("image platform")),
         case!(nested_virt, |s, _| s.nested_virt = true, |r| r.nested_virt == Some(true))
             .cli(&["--nested"])
             .api(|_| json(serde_json::json!({"nestedVirt": true})))
@@ -1117,6 +1184,22 @@ fn cases() -> Vec<Case> {
             .embedded(|e, _| e.spec.detached = true),
         case!(runtime_managed, |s, _| s.runtime_managed = true, |r| r.runtime_managed)
             .embedded(|e, _| e.spec.runtime_managed = true),
+        case!(
+            switch,
+            |s, _| {
+                s.switch = Some(crate::data::network::SwitchAttachment {
+                    dir: "/sw".into(),
+                    endpoint: "e1".into(),
+                })
+            },
+            |r| r.switch.as_ref().is_some_and(|s| s.endpoint == "e1") && r.network
+        )
+        .embedded(|e, _| {
+            e.spec.resources.switch = Some(crate::data::network::SwitchAttachment {
+                dir: "/sw".into(),
+                endpoint: "e1".into(),
+            })
+        }),
         case!(
             labels,
             |s, _| {

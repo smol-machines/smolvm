@@ -642,6 +642,29 @@ impl EgressPolicy {
         }
     }
 
+    /// Whether `--block-private` alone keeps TCP from `ip`: the address is
+    /// private and no allow rule covers it, so an `--allow-private` range
+    /// would reopen it. False for cloud metadata and on the strict floor,
+    /// which no exception reopens.
+    pub fn private_floor_blocks(&self, ip: IpAddr) -> bool {
+        if self.floor != FloorMode::Private || !is_floored(ip, self.floor) || is_link_local(ip) {
+            return false;
+        }
+        let mapped = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
+        !self.compiled_rules().iter().any(|rule| {
+            rule.action == RuleAction::Allow
+                && rule
+                    .transport
+                    .is_none_or(|value| value == FlowTransport::Tcp)
+                && rule.cidr.is_none_or(|cidr| {
+                    cidr.contains(ip) || mapped.is_some_and(|v4| cidr.contains(v4))
+                })
+        })
+    }
+
     /// Attach the structured decision record for a host-minted launch.
     pub fn with_mediation_audit(
         mut self,
@@ -1275,6 +1298,50 @@ mod tests {
                 assert!(udp("203.0.113.5:443"));
             }
         }
+    }
+
+    #[test]
+    fn private_floor_blocks_only_what_an_exception_would_reopen() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let mut local = EgressPolicy::new(Some(&["100.64.0.9/32".to_string()]), None);
+        local.floor = FloorMode::MetadataAndLoopback;
+        assert!(!local.private_floor_blocks(ip("100.64.0.9")));
+
+        let blocked = local.clone().with_private_floor(&[]).unwrap();
+        // Named on the allow list, yet the floor still refuses it.
+        assert!(!blocked.allows_flow(FlowTransport::Tcp, ip("100.64.0.9"), Some(443)));
+        assert!(blocked.private_floor_blocks(ip("100.64.0.9")));
+        assert!(blocked.private_floor_blocks(ip("192.168.1.1")));
+        assert!(blocked.private_floor_blocks(ip("fd7a:115c:a1e0::1")));
+        assert!(blocked.private_floor_blocks(ip("::ffff:10.0.0.1")));
+        assert!(!blocked.private_floor_blocks(ip("203.0.113.5")));
+        assert!(!blocked.private_floor_blocks(ip("169.254.169.254")));
+
+        let reopened = local
+            .clone()
+            .with_private_floor(&[
+                "100.64.0.0/10".to_string(),
+                "fd7a:115c:a1e0::/48".to_string(),
+            ])
+            .unwrap();
+        assert!(reopened.allows_flow(FlowTransport::Tcp, ip("100.64.0.9"), Some(443)));
+        assert!(!reopened.private_floor_blocks(ip("100.64.0.9")));
+        assert!(!reopened.private_floor_blocks(ip("fd7a:115c:a1e0::1")));
+        assert!(reopened.private_floor_blocks(ip("192.168.1.1")));
+
+        // A UDP rule never reopens a private range for TCP.
+        let mut udp_only = EgressPolicy::unrestricted()
+            .with_rules(&[udp_allow("10.0.0.0/8", None)])
+            .unwrap();
+        udp_only.floor = FloorMode::MetadataAndLoopback;
+        let udp_only = udp_only.with_private_floor(&[]).unwrap();
+        assert!(udp_only.private_floor_blocks(ip("10.1.2.3")));
+
+        // The strict floor is not ours to reopen.
+        let mut strict = EgressPolicy::unrestricted();
+        strict.floor = FloorMode::Strict;
+        let strict = strict.with_private_floor(&[]).unwrap();
+        assert!(!strict.private_floor_blocks(ip("10.1.2.3")));
     }
 
     #[test]

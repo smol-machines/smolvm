@@ -635,6 +635,14 @@ install_smolvm() {
         done
     fi
 
+    # User installs register an OS-owned Docker socket; no resident engine starts.
+    # System installs keep native/server operation independent of a user session.
+    if [[ "$SYSTEM_INSTALL" != true ]] && "$prefix/smolvm" engine --help 2>/dev/null | grep -q 'automatic Docker API activation'; then
+        if ! "$prefix/smolvm" engine; then
+            warn "Docker socket registration failed; run 'smolvm engine' in your user session to finish setup."
+        fi
+    fi
+
     # Create symlinks in bin directory. `smol` is the primary, user-facing CLI;
     # `smolvm` remains available as the lower-level engine command.
     mkdir -p "$BIN_DIR"
@@ -697,6 +705,9 @@ modify_path() {
 
 # Uninstall smolvm
 uninstall_smolvm() {
+    if [[ -x "$1/smolvm" ]]; then
+        "$1/smolvm" engine unregister >/dev/null 2>&1 || true
+    fi
     local prefix="$1"
 
     info "Uninstalling smolvm..."
