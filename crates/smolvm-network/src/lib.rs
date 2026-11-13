@@ -723,7 +723,7 @@ pub fn start_virtio_network_on(
             upstream_resolvers: guest_network.upstream_resolvers,
             host_service: guest_network.host_service,
             intercept: guest_network.intercept,
-            mtu: 1500,
+            mtu: usize::from(smolvm_protocol::guest_env::GATEWAY_LINK_MTU),
         },
         Some(tcp_receiver),
         udp_publish,

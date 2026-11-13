@@ -333,6 +333,7 @@ pub(crate) fn start_vm_with_interceptor(
         get_record(db, name)?,
         &crate::registry::PullAuth::FromConfig,
     )?;
+    crate::network::private_floor::log_record_hosts_blocked_by_private_floor(name, &record);
     // A fresh registry-image machine starts on a shared seed of its image, as
     // the CLI and API do, so an SDK create skips the in-guest pull.
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);

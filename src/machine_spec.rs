@@ -71,6 +71,10 @@ pub struct CreateSpec {
     pub workdir: Option<String>,
     /// User the workload runs as (name or `uid[:gid]`).
     pub user: Option<String>,
+    /// Platform (`os/arch`) of the image to pull when the reference is
+    /// multi-arch. Unset, a Rosetta machine pulls `linux/amd64` and any other
+    /// machine the guest's own architecture.
+    pub oci_platform: Option<String>,
     /// Commands run once, on the machine's first start.
     pub init: Vec<String>,
     /// Secret references resolved into the environment at each start. Only
@@ -237,6 +241,7 @@ impl CreateSpec {
             env,
             workdir,
             user,
+            oci_platform,
             init,
             secret_refs,
             restart_policy,
@@ -304,6 +309,7 @@ impl CreateSpec {
             env: merge_env(self.env, env),
             workdir: workdir.or(self.workdir),
             user: user.or(self.user),
+            oci_platform: oci_platform.or(self.oci_platform),
             init: list(self.init, init),
             secret_refs: map(self.secret_refs, secret_refs),
             restart_policy: restart_policy.or(self.restart_policy),
@@ -457,6 +463,8 @@ pub struct ResolvedSpec {
     pub workdir: Option<String>,
     /// Workload user.
     pub user: Option<String>,
+    /// Platform of the image to pull.
+    pub oci_platform: Option<String>,
     /// First-start commands.
     pub init: Vec<String>,
     /// Secret references.
@@ -692,6 +700,28 @@ fn bind_secret_refs(
     Ok(explicit)
 }
 
+/// An image platform is `os/arch` with an optional variant, as registries
+/// spell it (`linux/amd64`, `linux/arm/v7`). Checked at create because the
+/// value is only used on the first start, where a typo would be far from its
+/// cause.
+fn validate_oci_platform(platform: &str) -> std::result::Result<(), String> {
+    let parts: Vec<&str> = platform.split('/').collect();
+    let well_formed = (2..=3).contains(&parts.len())
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        });
+    if well_formed {
+        Ok(())
+    } else {
+        Err(format!(
+            "image platform '{platform}' is not of the form os/arch, for example linux/amd64"
+        ))
+    }
+}
+
 /// Resolve `spec` for a machine made from `source` by `caller`.
 ///
 /// This is pure: it reads nothing but its arguments (a checkpoint's host
@@ -706,6 +736,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         env,
         workdir,
         user,
+        oci_platform,
         init,
         secret_refs,
         restart_policy,
@@ -771,6 +802,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
     }
     crate::workload::validate_stop_settings(stop_signal.as_deref(), stop_timeout_secs)
         .map_err(|error| Error::config("create machine", error))?;
+    if let Some(platform) = oci_platform.as_deref() {
+        validate_oci_platform(platform).map_err(|error| Error::config("create machine", error))?;
+    }
     for option in &dns_options {
         smolvm_protocol::resolv::validate_option(option)
             .map_err(|error| Error::config("create machine", error))?;
@@ -906,6 +940,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 env,
                 workdir,
                 user,
+                oci_platform,
                 init,
                 secret_refs,
                 restart: restart_from(
@@ -987,6 +1022,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 env: merge_env(pack.env, env),
                 workdir: workdir.or(pack.workdir),
                 user: user.or(pack.user),
+                oci_platform,
                 init,
                 secret_refs: bind_secret_refs(pack.secret_refs, secret_refs)?,
                 restart: restart_from(
@@ -1062,6 +1098,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 return Err(fixed(
                     "init commands",
                     "the captured guest already ran its first start",
+                ));
+            }
+            if oci_platform.is_some() {
+                return Err(fixed(
+                    "the image platform",
+                    "the captured guest already holds its image",
                 ));
             }
             let user = same(
@@ -1247,6 +1289,8 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 env: merge_env(pack.env, env),
                 workdir: workdir.or(pack.workdir),
                 user,
+                // A captured guest already holds its image.
+                oci_platform: None,
                 init: Vec::new(),
                 secret_refs: bind_secret_refs(pack.secret_refs, secret_refs)?,
                 restart: match workload {
@@ -1468,6 +1512,7 @@ impl ResolvedSpec {
             env,
             workdir,
             user,
+            oci_platform,
             init,
             secret_refs,
             restart,
@@ -1579,6 +1624,7 @@ impl ResolvedSpec {
             secret_refs,
             workdir,
             user,
+            oci_platform,
             storage_gb,
             overlay_gb,
             allowed_cidrs,

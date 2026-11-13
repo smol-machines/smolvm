@@ -1001,6 +1001,7 @@ pub fn restore_from_path_with(
         if let Some(image) = fetch_checkpoint_host_image_blocking(checkpoint)? {
             image.apply(&mut record);
         }
+        mark_image_on_storage(checkpoint, &mut record);
         if !reservation
             .db
             .commit_reserved_vm(name, &reservation.token, &record)?
@@ -2069,6 +2070,7 @@ fn capture_with_completion(
                     format!("{}: {error}", cache.base.display()),
                 )
             })?;
+            ensure_cache_layers_on_base(&crate::agent::vm_data_dir(name), &base)?;
             let identity = smolvm_pack::format::CheckpointCacheDisk {
                 base: cache.base_name(),
                 sha256: cache.base_digest()?,
@@ -3386,6 +3388,26 @@ fn mounts_image_layers(vm: &VmRecord) -> bool {
             .as_deref()
             .and_then(crate::data::image_source::packed_layers_dir_for_ref)
             .is_some()
+}
+
+/// Whether a checkpoint names no host-side image layers: no pack to mount and
+/// no host-fetched image to serve. Capture refuses a machine that mounts a
+/// `local:` image from the host unless one of those two names it, so a
+/// checkpoint of a machine with a `local:` image and neither one captured a
+/// machine whose image was prepared on its own storage disk, which the
+/// checkpoint carries.
+pub fn carries_no_host_layers(checkpoint: &PortableCheckpointManifest) -> bool {
+    checkpoint.packed_layers.is_none() && checkpoint.host_image.is_none()
+}
+
+/// Mark a restored machine's image as living on its storage disk when the
+/// checkpoint says so (see [`carries_no_host_layers`]). The record does not
+/// travel with the checkpoint, so without this the restored machine mounts the
+/// capturing host's `local:` archive path, which this host does not have.
+pub fn mark_image_on_storage(checkpoint: &PortableCheckpointManifest, record: &mut VmRecord) {
+    if carries_no_host_layers(checkpoint) && record.local_image_layers_dir().is_some() {
+        record.packed_image_on_storage = true;
+    }
 }
 
 /// Identify the registry image a machine boots from a host-fetched archive, if
@@ -4879,10 +4901,7 @@ fn stage_disk_chains_with_links(
                         // Every layer above a cache base is qcow2; anything
                         // else is a base, and not the one the machine records.
                         if role == "cache" && next_format != "qcow2" {
-                            return Err(Error::agent(
-                                "stage checkpoint disk",
-                                "the cache disk's layers do not sit on its recorded base",
-                            ));
+                            return Err(cache_layers_off_base(cache_base, &backing_source));
                         }
                         let next_target = disk_target(role, index + 1, next_format)?;
                         Some((backing_source, next_format, next_target))
@@ -4976,10 +4995,7 @@ fn stage_disk_chains_with_links(
             ));
         }
         if role == "cache" && !reached_cache_base {
-            return Err(Error::agent(
-                "stage checkpoint disk",
-                "the cache disk's layers do not sit on its recorded base",
-            ));
+            return Err(cache_layers_off_base(cache_base, &source));
         }
         disks.push(CheckpointDisk {
             role: role.to_string(),
@@ -4993,6 +5009,52 @@ fn stage_disk_chains_with_links(
         ));
     }
     Ok((disks, deferred))
+}
+
+/// What a capture refuses when a machine's cache layers end somewhere other
+/// than the base it records.
+const CACHE_LAYERS_OFF_BASE: &str = "the cache disk's layers do not sit on its recorded base";
+
+/// The refusal for a cache chain that ends at `bottom` instead of on `base`.
+///
+/// A checkpoint names the cache base instead of carrying it, so such a chain
+/// cannot be captured, now or on any retry: it is the request that cannot be
+/// served (400), not a node fault, and the message says where the chain ends.
+fn cache_layers_off_base(base: Option<&Path>, bottom: &Path) -> Error {
+    let base = base.map_or_else(|| "(none)".into(), |base| base.display().to_string());
+    Error::config(
+        "checkpoint cache disk",
+        format!(
+            "{CACHE_LAYERS_OFF_BASE} {base}: they end at {}. A checkpoint names that base \
+             instead of carrying it, so this machine cannot be checkpointed and retrying \
+             will not help; a machine created on the cache disk again can be",
+            bottom.display()
+        ),
+    )
+}
+
+/// Refuse, before the source is paused, a cache disk whose layers do not end
+/// on `base`: staging would fail on it after the guest's memory was saved.
+fn ensure_cache_layers_on_base(vm_data: &Path, base: &Path) -> Result<()> {
+    let (mut layer, _) =
+        crate::agent::resolve_disk_image(vm_data, crate::data::storage::CACHE_DISK_FILENAME);
+    if !layer.is_file() {
+        // Staging reports a missing cache layer as the incomplete disk set.
+        return Ok(());
+    }
+    for _ in 0..64 {
+        if layer.canonicalize().is_ok_and(|layer| layer == base) {
+            return Ok(());
+        }
+        if detect_disk_format(&layer, None)? != "qcow2" {
+            break;
+        }
+        match inspect_qcow2(&layer)?.0 {
+            Some(backing) => layer = resolve_backing_path(&layer, &backing),
+            None => break,
+        }
+    }
+    Err(cache_layers_off_base(Some(base), &layer))
 }
 
 /// Bytes a file occupies on disk, which for a sparse image is its data.
@@ -8816,6 +8878,39 @@ mod tests {
         record
     }
 
+    // A machine created on a Mac from a `.smolmachine` of a local archive has its
+    // image on its storage disk under a `local:` reference, and its checkpoint
+    // names no pack and no fetched image. Restored elsewhere it must keep
+    // booting that disk, not look for the capturing host's archive cache.
+    #[test]
+    fn a_local_image_on_storage_stays_on_storage_after_restore() {
+        let checkpoint = minimal_checkpoint_manifest();
+        assert!(carries_no_host_layers(&checkpoint));
+        let mut restored = no_network_machine("local:caa470fc");
+        assert!(restored.local_image_layers_dir().is_some());
+        mark_image_on_storage(&checkpoint, &mut restored);
+        assert!(restored.packed_image_on_storage);
+        assert!(restored.local_image_layers_dir().is_none());
+
+        // A registry image is left alone.
+        let mut registry = no_network_machine("alpine:3.20");
+        mark_image_on_storage(&checkpoint, &mut registry);
+        assert!(!registry.packed_image_on_storage);
+
+        // A checkpoint that names its host layers keeps mounting them.
+        let mut with_image = checkpoint.clone();
+        with_image.host_image = Some(CheckpointHostImage {
+            reference: "alpine:3.20@sha256:feedface".to_string(),
+            config_digest: "sha256:c0ffee".to_string(),
+            archive_size: 1,
+            archive_mtime: 1,
+        });
+        assert!(!carries_no_host_layers(&with_image));
+        let mut fetched = no_network_machine("local:caa470fc");
+        mark_image_on_storage(&with_image, &mut fetched);
+        assert!(!fetched.packed_image_on_storage);
+    }
+
     #[test]
     fn a_host_fetched_registry_image_can_be_captured() {
         let mut record = no_network_machine("python:3.12-slim-bookworm");
@@ -9103,12 +9198,50 @@ mod tests {
         ) else {
             panic!("a cache layer over another base was captured");
         };
-        assert!(
-            error
-                .to_string()
-                .contains("do not sit on its recorded base"),
-            "{error}"
-        );
+        // No retry can capture it: refused as the request, naming the bottom.
+        assert!(matches!(error, Error::Config { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(CACHE_LAYERS_OFF_BASE), "{message}");
+        assert!(message.contains("deps-v1.raw"), "{message}");
+    }
+
+    /// A cache chain a flatten folded its base into (a layer with no backing)
+    /// is refused before the source is paused, naming where the chain ends,
+    /// while a chain that reaches its base, branched or not, passes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cache_chain_off_its_base_is_refused_before_the_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cdisk-v87.raw");
+        std::fs::File::create(&base)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        let base = base.canonicalize().unwrap();
+        for branched in [false, true] {
+            let vm = dir.path().join(format!("vm-{branched}"));
+            cache_disk_machine(&vm, &base, branched);
+            ensure_cache_layers_on_base(&vm, &base).unwrap();
+        }
+        // No cache layer yet: left to staging.
+        let bare = dir.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        ensure_cache_layers_on_base(&bare, &base).unwrap();
+
+        let vm = dir.path().join("flattened");
+        std::fs::create_dir_all(vm.join("d/456c85d3")).unwrap();
+        let folded = vm.join("d/456c85d3/cache.base.qcow2");
+        std::fs::File::create(&folded)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        create_qcow2(&vm.join("cache.qcow2"), folded.to_str().unwrap(), "raw");
+        let error = ensure_cache_layers_on_base(&vm, &base).unwrap_err();
+        assert!(matches!(error, Error::Config { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(CACHE_LAYERS_OFF_BASE), "{message}");
+        assert!(message.contains("d/456c85d3/cache.base.qcow2"), "{message}");
+        assert!(message.contains("cdisk-v87.raw"), "{message}");
     }
 
     #[test]

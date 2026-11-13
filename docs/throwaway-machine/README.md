@@ -99,6 +99,11 @@ and can be used more than once. In a Smolfile they are `[network] block_private 
 address was reachable with `--net`, blocked with `--block-private`, and reachable again with
 `--allow-private <that address>/32`, while `example.com` stayed reachable throughout.
 
+`--allow-host` and a credential's host do not re-open a private address under `--block-private`: a
+name that resolves into a private range stays unreachable until `--allow-private` covers it.
+`machine create`, `run` and `start` print a warning that names the host, its addresses and the
+`--allow-private` range to add.
+
 `--deny-cidr <CIDR>` refuses a range before anything is allowed. `--allow-udp
 <CIDR>[:<PORT>[-<END>]]` admits UDP to a range, on every port or only the ones named, such as
 `--allow-udp 1.1.1.1:123` for NTP or `--allow-udp 192.0.2.0/24:3478-3480` for a TURN relay; write

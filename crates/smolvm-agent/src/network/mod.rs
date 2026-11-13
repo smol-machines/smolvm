@@ -1,7 +1,8 @@
 //! Guest-side virtio-net configuration from `SMOLVM_NETWORK_*`.
 //!
 //! Context
-//! =======
+//! }
+
 //!
 //! The host side of the virtio-net design decides whether a VM should use:
 //! - the legacy TSI networking path, or
@@ -120,11 +121,12 @@ pub fn configure_from_env() -> Result<bool, String> {
     let gateway_mac = env_optional_mac(guest_env::GATEWAY_MAC)?;
     let dns_server = env_ipv4(guest_env::DNS)?;
     let ipv6 = env_ipv6_config()?;
+    let mtu = env_mtu()?;
 
     linux::configure_interface(
         "eth0",
         guest_mac,
-        1500,
+        mtu,
         guest_ip,
         prefix_len,
         gateway,
@@ -197,6 +199,17 @@ pub fn set_primary_address(
     *RESOLVER.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((dns.to_string(), dns_options.to_vec()));
     Ok(())
+}
+
+/// The link MTU the host asked for, or 1500 when it did not say.
+fn env_mtu() -> Result<u16, String> {
+    match std::env::var(guest_env::MTU) {
+        Ok(value) if !value.is_empty() => match value.parse::<u16>() {
+            Ok(mtu) if mtu >= 1280 => Ok(mtu),
+            _ => Err(format!("invalid {} value: {}", guest_env::MTU, value)),
+        },
+        _ => Ok(1500),
+    }
 }
 
 /// Parse the optional IPv6 trio. All three vars must be present together; a

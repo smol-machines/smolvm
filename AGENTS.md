@@ -196,6 +196,8 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-host` | | run, create, update | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create, update | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create, pack run | Forward host SSH agent (git/ssh without exposing keys) |
+| `--rosetta` | | run, create | Run x86_64 Linux images on Apple Silicon through Rosetta 2. Pulls `linux/amd64` unless `--oci-platform` says otherwise. |
+| `--oci-platform` | | run, create, pack create | Image platform to pull from a multi-arch image (`os/arch`, e.g. `linux/amd64`). Recorded on the machine and used on every start. |
 | `--nested` | | run, create | Let the guest run its own VMs (nested KVM). Off by default; it exposes the host kernel's nested-KVM code to the guest, so enable it only for trusted workloads. |
 | `--state-dir` | | every command (Linux) | Keep all smolvm state under one directory instead of the default ones, e.g. to run a second engine version beside an installed one |
 | `--stop-on-exit` | | create | Stop the machine when its workload exits, whatever the exit status |
@@ -239,7 +241,10 @@ mappings.
 `--block-private` keeps the public internet open but blocks the LAN, cloud
 metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
 `--allow-private CIDR` re-opens one private range, such as an internal
-registry. Metadata stays blocked either way. Both imply `--net` and use the
+registry. Metadata stays blocked either way. Naming a private host with
+`--allow-host` or a credential does not re-open its address: add
+`--allow-private` for it, and `create`, `run` and `start` warn when a named
+host resolves only to blocked addresses. Both imply `--net` and use the
 virtio-net backend; the Smolfile form is `[network] block_private = true` and
 `allow_private = ["10.20.0.0/16"]`.
 `--deny-cidr CIDR` refuses a range even where an allow would admit it,
@@ -555,4 +560,5 @@ can create and run machines. Machines that ask for nested virtualization
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine mount add` mounts into a running machine.** The host directory appears at the guest path at once, in the machine and in every workload container, with no restart; `:ro` is enforced by the host. It lasts until the machine stops (use `machine update -v` to keep a mount), a branch inherits it, and `mount rm` revokes the guest's access, open files included. `POST/GET/DELETE /api/v1/machines/:name/mounts` does the same over the API.
+- **A mounted host directory belongs to the workload user.** When an image-based machine runs as a non-root user (image `USER`, Smolfile `user`, or `-u`), each `-v` directory appears owned by that user inside the machine, so it is writable without `chown`; on the host the files stay owned by the host user. Root workloads, bare machines and host directories owned by root see the host's ownership unchanged.
 - **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped, except for allow-list changes (`--allow-host`, `--allow-host-pattern`, `--allow-cidr`, `--remove-allow-host`, `--remove-allow-cidr`, `--allow-udp`, `--remove-allow-udp`) on a machine started with an allow list: those apply to its next connection, datagram or DNS lookup and persist across restarts. Lifting the allow list entirely still needs a stop.

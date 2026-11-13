@@ -560,6 +560,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub rosetta: Option<bool>,
 
+    /// Platform (`os/arch`) asked for the machine's image at create. `None`
+    /// leaves the choice to [`VmRecord::image_platform`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci_platform: Option<String>,
+
     /// Restart configuration.
     #[serde(default)]
     pub restart: RestartConfig,
@@ -946,6 +951,16 @@ impl VmRecord {
         }
     }
 
+    /// The platform this machine's image is pulled for, or `None` for the
+    /// guest's own architecture. Every pull of the image has to agree on it:
+    /// the guest keeps one platform per reference and re-pulls on a mismatch.
+    pub fn image_platform(&self) -> Option<&str> {
+        crate::vm::rosetta::image_platform(
+            self.oci_platform.as_deref(),
+            self.rosetta.unwrap_or(false),
+        )
+    }
+
     /// Host identity owner; guest overlay names only serve as a legacy fallback.
     pub fn vm_uid_owner(&self) -> Option<&str> {
         self.host_uid_owner
@@ -1002,6 +1017,7 @@ impl VmRecord {
             gpu_vram_mib: None,
             nested_virt: None,
             rosetta: None,
+            oci_platform: None,
             restart: RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
@@ -1109,6 +1125,7 @@ impl VmRecord {
             gpu_vram_mib: None,
             nested_virt: None,
             rosetta: None,
+            oci_platform: None,
             restart,
             last_exit_code: None,
             init: Vec::new(),

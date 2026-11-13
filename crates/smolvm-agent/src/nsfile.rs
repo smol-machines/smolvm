@@ -45,7 +45,12 @@ use std::process::{Command, Stdio};
 /// argv marker selecting the namespace helper instead of the PID-1 agent.
 const HELPER_ARG: &str = "ns-file";
 /// This binary, re-executed for the helper.
-const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
+pub(crate) const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
+/// argv after the binary for the helper that only waits on its stdin: started
+/// in a new user namespace, it is the process that namespace exists through
+/// while the agent sets it up (see [`crate::mount_owner`]).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const USERNS_HOLD_ARGS: [&str; 2] = [HELPER_ARG, "userns-hold"];
 
 /// Whether this invocation is the namespace file helper.
 ///
@@ -88,6 +93,12 @@ pub fn run_helper() -> i32 {
                 1
             }
         };
+    }
+    // argv: [bin, "ns-file", "userns-hold"] — exits when the agent closes
+    // its stdin.
+    if args.get(2).map(String::as_str) == Some(USERNS_HOLD_ARGS[1]) {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        return 0;
     }
     // argv: [bin, "ns-file", op, pid, path, (mode), (uid), (gid)]
     if args.len() < 5 {
@@ -134,13 +145,13 @@ pub fn run_helper() -> i32 {
 /// (asm-generic). Named here because the musl `libc` the agent builds against
 /// does not export them.
 #[cfg(target_os = "linux")]
-const SYS_OPEN_TREE: libc::c_long = 428;
+pub(crate) const SYS_OPEN_TREE: libc::c_long = 428;
 #[cfg(target_os = "linux")]
-const SYS_MOVE_MOUNT: libc::c_long = 429;
+pub(crate) const SYS_MOVE_MOUNT: libc::c_long = 429;
 #[cfg(target_os = "linux")]
-const OPEN_TREE_CLONE: libc::c_uint = 1;
+pub(crate) const OPEN_TREE_CLONE: libc::c_uint = 1;
 #[cfg(target_os = "linux")]
-const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
+pub(crate) const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
 
 /// Clone the attached share at `source` as a detached mount, enter the
 /// container's mount namespace, and attach the clone at `target` there. The
@@ -277,20 +288,45 @@ pub(crate) fn attach_in_every_container(
     target: &str,
     read_only: bool,
 ) -> Result<(), String> {
-    let source = source.to_string_lossy().into_owned();
     let mode = if read_only { "ro" } else { "rw" };
     in_every_container(|pid| {
+        // Each container gets the share as a new container of its user would
+        // (see `storage::add_volume_bind_mounts`).
+        let source = match container_user(pid) {
+            Some((uid, gid)) => crate::mount_owner::bind_source(source, uid, gid),
+            None => source.to_path_buf(),
+        };
         [
             "ns-file",
             "attach-mount",
             &pid.to_string(),
             target,
-            &source,
+            &source.to_string_lossy(),
             mode,
         ]
         .map(String::from)
         .to_vec()
     })
+}
+
+/// The uid and gid a container's first process runs as, which is the user the
+/// container was created for.
+#[cfg(target_os = "linux")]
+fn container_user(pid: u32) -> Option<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    Some((status_id(&status, "Uid:")?, status_id(&status, "Gid:")?))
+}
+
+/// The real id on the `Uid:` or `Gid:` line of a `/proc/<pid>/status`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn status_id(status: &str, field: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(field))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Unmount `target` in every workload container.
@@ -1144,6 +1180,15 @@ fn parse_ok_reply(reply: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_container_user_is_the_real_id_of_its_first_process() {
+        let status =
+            "Name:\tsmolvm-agent\nUid:\t1000\t1001\t1002\t1003\nGid:\t100\t101\t102\t103\n";
+        assert_eq!(status_id(status, "Uid:"), Some(1000));
+        assert_eq!(status_id(status, "Gid:"), Some(100));
+        assert_eq!(status_id("Name:\tx\n", "Uid:"), None);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
