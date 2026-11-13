@@ -47,8 +47,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TCP_RX_BUFFER_BYTES: usize = 64 * 1024;
-const TCP_TX_BUFFER_BYTES: usize = 64 * 1024;
+// Room for several 64 KB segments of the gateway link in flight; one 64 KiB
+// buffer held a single segment and stalled each transfer on every ACK.
+const TCP_RX_BUFFER_BYTES: usize = 256 * 1024;
+const TCP_TX_BUFFER_BYTES: usize = 256 * 1024;
 /// Concurrent guest TCP flows one machine may hold by default: a whole
 /// ephemeral port range's worth, so a guest is limited by its own kernel the
 /// way a hosted CI runner is, not by the relay. `SMOLVM_TCP_RELAY_CAPACITY`
