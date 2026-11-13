@@ -2218,9 +2218,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // the COW wall entirely. The shared policy keeps this launcher,
             // packed VMs, and the direct backend on the same window size.
             let dax_window = super::virtiofs::user_mount_dax_window(&mount.target);
-            // A share whose ownership is recorded in an xattr asks the Linux
-            // server for it explicitly (the macOS server always does this).
-            if cfg!(target_os = "linux") && mount.recorded_ownership {
+            // Recorded ownership keeps guest permissions separate from host
+            // access, including on macOS where overlayfs uses mode-000 workdirs.
+            if mount.recorded_ownership {
                 let Some(add_virtiofs4) = krun.add_virtiofs4 else {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(

@@ -305,25 +305,43 @@ test_image_commit_save_load_export_import_push() {
 # builds, and `--load` hands the image back through `docker load`.
 test_buildx_container_builder_builds_and_loads() {
     docker buildx version >/dev/null 2>&1 || return 0
-    local builder="$PREFIX-bx" img="$PREFIX-built:1" out
+    local builder="$PREFIX-bx" img="$PREFIX-built:1" out status=0
     mkdir -p "$WORK/bx"
     echo built-by-buildkit > "$WORK/bx/hello.txt"
-    # A real base image includes read-only directories (such as /proc), whose
-    # ownership BuildKit must preserve while preparing the COPY snapshot.
-    printf 'FROM alpine\nCOPY hello.txt /hello.txt\nRUN cp /hello.txt /result.txt\n' > "$WORK/bx/Dockerfile"
-    docker buildx create --name "$builder" --driver docker-container >/dev/null || return 1
-    docker buildx build --builder "$builder" --load -t "$img" "$WORK/bx" >"$WORK/buildx.log" 2>&1 || {
-        cat "$WORK/buildx.log" >&2
-        docker buildx rm "$builder" >/dev/null 2>&1
-        return 1
-    }
-    local id
-    id=$(docker create "$img" /none) || return 1
-    out=$(docker cp "$id:/result.txt" - | tar -xO) || return 1
-    docker rm "$id" >/dev/null
-    docker buildx rm "$builder" >/dev/null 2>&1
-    docker rmi "$img" >/dev/null 2>&1
-    [[ "$out" == built-by-buildkit ]]
+    # Exercise copy-up, whiteouts and root access to mode-000 paths across
+    # layers, while retaining permission checks for an unprivileged user.
+    cat > "$WORK/bx/Dockerfile" <<'DOCKERFILE'
+FROM alpine
+COPY hello.txt /hello.txt
+RUN cp /hello.txt /result.txt && mkdir /private && echo secret > /private/secret
+RUN rm /hello.txt && chmod 000 /private && cat /private/secret && chmod 000 /result.txt
+RUN cat /result.txt && chmod 644 /result.txt && test ! -e /hello.txt
+USER 65534:65534
+RUN test ! -r /private/secret && cat /result.txt
+DOCKERFILE
+    docker buildx create --name "$builder" --driver docker-container --bootstrap >"$WORK/buildx.log" 2>&1 || status=1
+    if [[ "$status" == 0 ]]; then
+        # Catch the macOS mode-000 workdir regression: a successful build
+        # alone misses silent fallback to native snapshots.
+        docker exec "buildx_buildkit_${builder}0" buildctl debug workers -v >>"$WORK/buildx.log" 2>&1 || status=1
+        if [[ $(uname -s) == Darwin ]]; then
+            has 'org.mobyproject.buildkit.worker.snapshotter:.*overlayfs' <"$WORK/buildx.log" || status=1
+        fi
+    fi
+    if [[ "$status" == 0 ]]; then
+        docker buildx build --builder "$builder" --load -t "$img" "$WORK/bx" >>"$WORK/buildx.log" 2>&1 || status=1
+    fi
+    if [[ "$status" == 0 ]]; then
+        # The builder's volume and cached snapshots must survive a VM restart.
+        docker restart "buildx_buildkit_${builder}0" >>"$WORK/buildx.log" 2>&1 || status=1
+        docker buildx build --builder "$builder" --load -t "$img" "$WORK/bx" >>"$WORK/buildx.log" 2>&1 || status=1
+        out=$(run --rm "$img" sh -c 'test ! -e /hello.txt && test ! -r /private/secret && cat /result.txt') || status=1
+        [[ "$out" == built-by-buildkit ]] || status=1
+    fi
+    [[ "$status" == 0 ]] || cat "$WORK/buildx.log" >&2
+    docker buildx rm "$builder" >/dev/null 2>&1 || true
+    docker rmi "$img" >/dev/null 2>&1 || true
+    return "$status"
 }
 
 test_build_is_refused_clearly() {
