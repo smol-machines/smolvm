@@ -627,7 +627,11 @@ run_test "events stream the lifecycle" test_events_stream_lifecycle || true
 run_test "filters and labels" test_filters_and_labels || true
 run_test "images list, inspect, tag, remove" test_image_list_inspect_tag_remove || true
 run_test "commit, save, load, export, import, push" test_image_commit_save_load_export_import_push || true
-run_test "buildx container builder builds and loads" test_buildx_container_builder_builds_and_loads || true
+if docker buildx version >/dev/null 2>&1; then
+    run_test "buildx container builder builds and loads" test_buildx_container_builder_builds_and_loads || true
+else
+    log_skip "buildx container builder builds and loads: docker buildx is not installed"
+fi
 run_test "build is refused clearly" test_build_is_refused_clearly || true
 run_test "named volume persists" test_named_volume_persists || true
 run_test "new volume takes the image content" test_new_volume_takes_the_image_content || true
@@ -640,7 +644,11 @@ run_test "default bridge: by address, no names" test_default_bridge_by_address_w
 run_test "--network container: shares a network" test_network_container_mode || true
 run_test "IPv6 networks" test_ipv6_networks || true
 run_test "host.docker.internal reaches the host" test_host_docker_internal || true
-run_test "compose: health-check dependency, two networks" test_compose_healthcheck_dependency_two_networks || true
+if docker compose version >/dev/null 2>&1; then
+    run_test "compose: health-check dependency, two networks" test_compose_healthcheck_dependency_two_networks || true
+else
+    log_skip "compose: health-check dependency, two networks: docker compose is not installed"
+fi
 run_test "repeated starts keep their own addresses" test_repeated_starts_keep_their_own_addresses || true
 run_test "docker socket inside a container" test_socket_inside_container || true
 run_test "container starts a sibling through the socket" test_container_starts_a_sibling_through_the_socket || true
