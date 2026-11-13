@@ -19,8 +19,9 @@
 //! bindings carry (see [`crate::scrub`]), so a host that reflects a request's
 //! credential cannot hand it to the guest. To keep that check complete,
 //! requests ask for an uncompressed whole response: `Accept-Encoding` is set to
-//! `identity` and range requests are dropped, and a response that is still
-//! encoded is refused.
+//! `identity` and range requests are dropped. A server that compresses anyway
+//! has a gzip or deflate body decoded before the check; any other encoding is
+//! refused.
 
 use crate::ca::MachineCa;
 use crate::policy::{CredentialPolicy, PLACEHOLDER_PREFIX};
@@ -58,6 +59,11 @@ const MAX_CACHED_CLIENTS: usize = 64;
 /// Values remembered per binding for scrubbing: a rotated credential's old
 /// value may still be stored upstream.
 const MAX_REMEMBERED_VALUES: usize = 4;
+/// Largest compressed body decoded for scrubbing, from a server that ignored
+/// `Accept-Encoding: identity`.
+const ENCODED_LIMIT: usize = 64 * 1024 * 1024;
+/// Largest body such a decode may produce.
+const DECODED_LIMIT: u64 = 256 * 1024 * 1024;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Reply = Response<BoxBody<Bytes, BoxError>>;
@@ -734,17 +740,25 @@ impl State {
         let has_body = method != Method::HEAD
             && status != StatusCode::NO_CONTENT
             && status != StatusCode::NOT_MODIFIED;
-        let encoded = response_headers
+        let encodings: Vec<String> = response_headers
             .get_all(header::CONTENT_ENCODING)
             .iter()
-            .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
-        if has_body && encoded {
-            tracing::warn!(machine = %self.machine, host, "credential host sent an encoded response; refused");
-            return Ok(text(
-                StatusCode::BAD_GATEWAY,
-                "smolvm credentials: the response was compressed and could not be checked for credentials",
-            ));
-        }
+            .flat_map(|v| v.to_str().unwrap_or("unreadable").split(','))
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| !e.is_empty() && e != "identity")
+            .collect();
+        let decode = match encodings.as_slice() {
+            _ if !has_body => None,
+            [] => None,
+            [one] if matches!(one.as_str(), "gzip" | "x-gzip" | "deflate") => Some(one.clone()),
+            _ => {
+                tracing::warn!(machine = %self.machine, host, encodings = ?encodings, "credential host sent an encoding that cannot be checked; refused");
+                return Ok(text(
+                    StatusCode::BAD_GATEWAY,
+                    "smolvm credentials: the response was compressed and could not be checked for credentials",
+                ));
+            }
+        };
         let mut header_hits = 0;
         for value in response_headers.values_mut() {
             if let Some(clean) = scrubber.scrub(value.as_bytes()) {
@@ -756,7 +770,47 @@ impl State {
         if header_hits > 0 {
             tracing::warn!(machine = %self.machine, host, count = header_hits, "credential value removed from response headers");
         }
-        let body: BoxBody<Bytes, BoxError> = if has_body {
+        let body: BoxBody<Bytes, BoxError> = if let Some(encoding) = decode {
+            // The server compressed despite being asked not to: decode the
+            // whole body, scrub it, and send it uncompressed.
+            let compressed = match Limited::new(
+                StreamBody::new(upstream.bytes_stream().map_ok(Frame::data)),
+                ENCODED_LIMIT,
+            )
+            .collect()
+            .await
+            {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => {
+                    return Ok(text(
+                        StatusCode::BAD_GATEWAY,
+                        "smolvm credentials: the compressed response was too large to check for credentials",
+                    ))
+                }
+            };
+            let Ok(Ok(plain)) =
+                tokio::task::spawn_blocking(move || decode_body(&encoding, &compressed)).await
+            else {
+                return Ok(text(
+                    StatusCode::BAD_GATEWAY,
+                    "smolvm credentials: the compressed response could not be decoded to check it for credentials",
+                ));
+            };
+            let mut clean = Vec::with_capacity(plain.len());
+            let (_, hits) = scrubber.scan(&plain, true, &mut clean);
+            if hits > 0 {
+                tracing::warn!(machine = %self.machine, host, count = hits, "credential value removed from a response body");
+            }
+            response_headers.remove(header::CONTENT_ENCODING);
+            response_headers.insert(
+                header::CONTENT_LENGTH,
+                header::HeaderValue::from(clean.len()),
+            );
+            BodyExt::boxed(
+                Full::new(Bytes::from(clean))
+                    .map_err(|never: std::convert::Infallible| match never {}),
+            )
+        } else if has_body {
             // Scrubbing changes the length, so the body goes out chunked.
             response_headers.remove(header::CONTENT_LENGTH);
             BodyExt::boxed(StreamBody::new(
@@ -781,6 +835,26 @@ impl State {
 }
 
 use smolvm_protocol::credentials::PROTECTED_HEADERS;
+
+/// Decode a gzip or deflate body, refusing one that would grow past
+/// [`DECODED_LIMIT`]. `deflate` is zlib-wrapped per the HTTP spec, but some
+/// servers send it raw, so both are accepted.
+fn decode_body(encoding: &str, compressed: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let read = |reader: &mut dyn Read| {
+        let mut out = Vec::new();
+        reader.take(DECODED_LIMIT + 1).read_to_end(&mut out)?;
+        if out.len() as u64 > DECODED_LIMIT {
+            return Err(std::io::Error::other("decoded body exceeds the limit"));
+        }
+        Ok(out)
+    };
+    match encoding {
+        "deflate" => read(&mut flate2::read::ZlibDecoder::new(compressed))
+            .or_else(|_| read(&mut flate2::read::DeflateDecoder::new(compressed))),
+        _ => read(&mut flate2::read::GzDecoder::new(compressed)),
+    }
+}
 
 /// `body` with every credential form `scrubber` knows replaced. Holds back the
 /// tail of each chunk that could start a form the next chunk finishes.
@@ -1164,11 +1238,30 @@ mod tests {
                                     .boxed();
                                     reply
                                 }
+                                // A server that compresses whatever it is asked.
                                 "/gzip" => {
-                                    let mut reply = text(StatusCode::OK, "pretend-gzip");
+                                    use std::io::Write;
+                                    let mut gz = flate2::write::GzEncoder::new(
+                                        Vec::new(),
+                                        flate2::Compression::default(),
+                                    );
+                                    gz.write_all(format!("echo {auth}").as_bytes()).unwrap();
+                                    let mut reply = text(StatusCode::OK, "");
+                                    *reply.body_mut() =
+                                        Full::new(Bytes::from(gz.finish().unwrap()))
+                                            .map_err(|never| match never {})
+                                            .boxed();
                                     reply.headers_mut().insert(
                                         header::CONTENT_ENCODING,
                                         header::HeaderValue::from_static("gzip"),
+                                    );
+                                    reply
+                                }
+                                "/brotli" => {
+                                    let mut reply = text(StatusCode::OK, "pretend-brotli");
+                                    reply.headers_mut().insert(
+                                        header::CONTENT_ENCODING,
+                                        header::HeaderValue::from_static("br"),
                                     );
                                     reply
                                 }
@@ -1731,15 +1824,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_encoded_response_from_a_credential_host_is_refused() {
+    async fn a_gzip_response_sent_anyway_is_decoded_and_scrubbed() {
+        let f = fixture_with_secret("ghp_gzippedsecret9876").await;
+        let request = format!(
+            "GET /gzip HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            f.placeholder
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            !response.to_ascii_lowercase().contains("content-encoding"),
+            "{response}"
+        );
+        assert_eq!(
+            response_body(&response),
+            format!("echo Bearer {}", f.placeholder),
+            "{response}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_encoding_that_cannot_be_checked_is_refused() {
         let f = fixture().await;
         let request =
-            format!("GET /gzip HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
+            format!("GET /brotli HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
         let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
             .await
             .unwrap();
         assert!(response.starts_with("HTTP/1.1 502"), "{response}");
-        assert!(!response.contains("pretend-gzip"), "{response}");
+        assert!(!response.contains("pretend-brotli"), "{response}");
+    }
+
+    #[test]
+    fn a_decompression_bomb_is_refused() {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        let zeros = vec![0u8; 1 << 20];
+        for _ in 0..(DECODED_LIMIT >> 20) + 1 {
+            gz.write_all(&zeros).unwrap();
+        }
+        let bomb = gz.finish().unwrap();
+        assert!(bomb.len() < ENCODED_LIMIT);
+        assert!(decode_body("gzip", &bomb).is_err());
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(b"zlib-wrapped").unwrap();
+        assert_eq!(
+            decode_body("deflate", &z.finish().unwrap()).unwrap(),
+            b"zlib-wrapped"
+        );
+        let mut raw =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        raw.write_all(b"raw deflate").unwrap();
+        assert_eq!(
+            decode_body("deflate", &raw.finish().unwrap()).unwrap(),
+            b"raw deflate"
+        );
     }
 
     #[test]
