@@ -348,12 +348,11 @@ fn activated_listener() -> std::io::Result<Option<tokio::net::UnixListener>> {
             return Err(std::io::Error::other("expected one activation socket"));
         }
         // SAFETY: successful call returned exactly one descriptor and a malloc-owned array.
-        let fd = unsafe {
+        unsafe {
             let fd = *fds;
             libc::free(fds.cast());
             fd
-        };
-        fd
+        }
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return Ok(None);
