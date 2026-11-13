@@ -265,6 +265,9 @@ pub struct LaunchFeatures {
     /// the VM data dir (`DOCKER_HOST=unix://…`). The guest agent proxies each
     /// host connection to its in-guest `/var/run/docker.sock`.
     pub expose_docker: bool,
+    /// Publish the TCP ports the guest listens on at the same host port on
+    /// loopback while they listen. Set only by the local CLI's launches.
+    pub auto_ports: Option<crate::data::network::AutoPorts>,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
@@ -614,6 +617,9 @@ pub struct LaunchConfig<'a> {
     pub docker_socket: Option<&'a Path>,
     /// Host socket the guest forwards the workload's stdout and stderr to.
     pub workload_log_socket: Option<&'a Path>,
+    /// Publish the TCP ports the guest listens on (see
+    /// [`crate::network::auto_ports`]).
+    pub auto_ports: Option<&'a crate::data::network::AutoPorts>,
     /// User-published Unix-socket bridges. The launcher resolves each `expose`
     /// socket's host path against the per-VM dir (the vsock socket's parent),
     /// assigns a vsock port (`ports::PUBLISH_SOCKET_BASE + i`), wires libkrun,
@@ -698,6 +704,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         cuda_socket,
         docker_socket,
         workload_log_socket,
+        auto_ports,
         published_sockets,
         packed_layers_dir,
         packed_layers_dax_window,
@@ -1886,11 +1893,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // below to inject each service's guest-side activation env vars, so the
         // host and guest sides cannot drift.
         // A machine without virtio-net has no host listeners of its own, so the
-        // ports it publishes while running go through the port forwarder. A
-        // socket path too long for the platform only costs that live change.
-        let port_forward_socket = if network_plan.backend == EffectiveNetworkBackend::VirtioNet {
-            None
-        } else {
+        // ports it publishes while running go through the port forwarder. Auto
+        // ports use the forwarder on every backend: it reaches a guest port at
+        // the guest's loopback, where dev servers often listen. A socket path
+        // too long for the platform only costs those live changes.
+        let live_ports_via_forwarder = network_plan.backend != EffectiveNetworkBackend::VirtioNet;
+        let port_forward_socket = if live_ports_via_forwarder || auto_ports.is_some() {
             vsock_socket
                 .parent()
                 .map(|dir| dir.join(crate::network::port_forward::PORT_FORWARD_SOCKET))
@@ -1899,21 +1907,49 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         .inspect_err(|e| tracing::warn!("live port forwarding disabled: {e}"))
                         .is_ok()
                 })
+        } else {
+            None
         };
+        let mut auto_ports_socket = None;
+        // What a previous boot published is not this boot's.
+        if let Some(dir) = vsock_socket.parent() {
+            let _ = std::fs::remove_file(dir.join(crate::network::auto_ports::AUTO_PORTS_FILE));
+        }
         if let (Some(socket), Some(dir)) = (&port_forward_socket, vsock_socket.parent()) {
             let _ = std::fs::remove_file(socket);
-            match crate::network::port_forward::PortForwarder::new(socket) {
-                Ok(forwarder) => {
-                    crate::network::port_forward::serve_forwarded_ports_control(forwarder, dir)
+            if live_ports_via_forwarder {
+                match crate::network::port_forward::PortForwarder::new(socket) {
+                    Ok(forwarder) => {
+                        crate::network::port_forward::serve_forwarded_ports_control(forwarder, dir)
+                    }
+                    Err(e) => tracing::warn!("live port forwarding disabled: {e}"),
                 }
-                Err(e) => tracing::warn!("live port forwarding disabled: {e}"),
             }
+            if let Some(auto) = auto_ports {
+                let tcp: Vec<smolvm_network::PortMapping> = port_mappings
+                    .iter()
+                    .filter(|m| m.protocol == crate::data::network::PortProtocol::Tcp)
+                    .map(|m| smolvm_network::PortMapping::new(m.host, m.guest))
+                    .collect();
+                crate::network::auto_ports::note_declared_ports(&tcp);
+                let reports = dir.join(crate::network::auto_ports::AUTO_PORTS_SOCKET);
+                match super::launcher_dynamic::check_socket_path_len(&reports) {
+                    Ok(()) => {
+                        auto_ports_socket =
+                            crate::network::auto_ports::start(dir, socket, &auto.exclude)
+                    }
+                    Err(e) => tracing::warn!("auto ports disabled: {e}"),
+                }
+            }
+        } else if auto_ports.is_some() {
+            tracing::warn!("auto ports disabled: no port forwarding socket for this machine");
         }
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),
             docker_socket: docker_socket.as_deref(),
             port_forward_socket: port_forward_socket.as_deref(),
+            auto_ports_socket: auto_ports_socket.as_deref(),
             workload_log_socket: workload_log_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()

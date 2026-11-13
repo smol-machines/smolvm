@@ -754,6 +754,12 @@ pub struct VmRecord {
     #[serde(default)]
     pub docker_socket: bool,
 
+    /// Publish every TCP port the guest listens on at the same host port on
+    /// loopback while it listens (`--auto-ports`). Applied only when the local
+    /// CLI starts the machine, never by `smolvm serve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_ports: Option<crate::data::network::AutoPorts>,
+
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1059,6 +1065,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            auto_ports: None,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
@@ -1167,6 +1174,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            auto_ports: None,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,

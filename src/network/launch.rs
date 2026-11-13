@@ -284,6 +284,8 @@ pub(crate) fn serve_ports_requests(
         move |request| {
             let next = smolvm_network::parse_port_mappings(request)?;
             replace(&next)?;
+            // Auto ports leave a port `-p` now publishes to that mapping.
+            super::auto_ports::note_declared_ports(&next);
             tracing::info!(ports = %smolvm_network::render_port_mappings(&next).trim_end(), "published ports replaced");
             Ok(())
         },

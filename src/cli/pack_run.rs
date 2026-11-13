@@ -828,6 +828,7 @@ impl PackRunCmd {
                 ssh_agent_socket,
                 cuda: false,
                 expose_docker: false,
+                auto_ports: None,
                 published_sockets: Vec::new(),
                 dns_filter_hosts: self
                     .egress
@@ -2024,6 +2025,7 @@ fn run_from_cache(
             ssh_agent_socket,
             cuda: false,
             expose_docker: false,
+            auto_ports: None,
             published_sockets: Vec::new(),
             dns_filter_hosts: None,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
@@ -2423,6 +2425,7 @@ fn daemon_start(
             ssh_agent_socket: ssh_agent_socket.clone(),
             cuda: false,
             expose_docker: false,
+            auto_ports: None,
             published_sockets: Vec::new(),
             dns_filter_hosts: None,
             packed_layers_dir: Some(layers_dir.to_path_buf()),

@@ -50,6 +50,7 @@ pub struct S3Volume {
     pub session_token: Option<String>,
 }
 
+pub mod auto_ports;
 pub mod credentials;
 pub mod disk_volume;
 pub mod egress_rule;
@@ -302,6 +303,10 @@ pub mod ports {
     /// on this port, reads the target guest port as one decimal line, then
     /// relays the connection to `127.0.0.1:<port>` inside the guest.
     pub const PORT_FORWARD: u32 = 6005;
+    /// Automatic port publishing: the guest connects OUT to this port and
+    /// sends the set of TCP ports it listens on whenever that set changes
+    /// (see [`crate::auto_ports`]). Outbound, like the readiness doorbell.
+    pub const AUTO_PORTS: u32 = 6006;
     /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
     /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
     pub const CUDA: u32 = 7000;
