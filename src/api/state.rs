@@ -224,6 +224,10 @@ pub struct MachineRegistration {
     /// Size in GiB of the storage disk the packed image was prepared on, when
     /// it was.
     pub packed_storage_gib: Option<u64>,
+    /// A restored checkpoint that names no host-side image layers (see
+    /// [`crate::portable_checkpoint::carries_no_host_layers`]): a `local:`
+    /// image then lives on the restored storage disk.
+    pub checkpoint_without_host_layers: bool,
 }
 
 /// RAII guard for machine name reservation.
@@ -1212,6 +1216,9 @@ impl ApiState {
         }
         if let Some(image) = reg.host_image {
             image.apply(&mut record);
+        }
+        if reg.checkpoint_without_host_layers && record.local_image_layers_dir().is_some() {
+            record.packed_image_on_storage = true;
         }
 
         // Complete the cross-process create reservation and insert the VM row

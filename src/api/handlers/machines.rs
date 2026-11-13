@@ -3245,6 +3245,9 @@ async fn create_machine_to_end(
             source_smolmachine
         },
         packed_storage_gib,
+        checkpoint_without_host_layers: manifest_checkpoint
+            .as_ref()
+            .is_some_and(crate::portable_checkpoint::carries_no_host_layers),
     });
     if let Err(e) = complete_result {
         let data_dir = vm_data_dir(&name);

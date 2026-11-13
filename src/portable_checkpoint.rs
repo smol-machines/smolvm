@@ -1001,6 +1001,7 @@ pub fn restore_from_path_with(
         if let Some(image) = fetch_checkpoint_host_image_blocking(checkpoint)? {
             image.apply(&mut record);
         }
+        mark_image_on_storage(checkpoint, &mut record);
         if !reservation
             .db
             .commit_reserved_vm(name, &reservation.token, &record)?
@@ -3387,6 +3388,26 @@ fn mounts_image_layers(vm: &VmRecord) -> bool {
             .as_deref()
             .and_then(crate::data::image_source::packed_layers_dir_for_ref)
             .is_some()
+}
+
+/// Whether a checkpoint names no host-side image layers: no pack to mount and
+/// no host-fetched image to serve. Capture refuses a machine that mounts a
+/// `local:` image from the host unless one of those two names it, so a
+/// checkpoint of a machine with a `local:` image and neither one captured a
+/// machine whose image was prepared on its own storage disk, which the
+/// checkpoint carries.
+pub fn carries_no_host_layers(checkpoint: &PortableCheckpointManifest) -> bool {
+    checkpoint.packed_layers.is_none() && checkpoint.host_image.is_none()
+}
+
+/// Mark a restored machine's image as living on its storage disk when the
+/// checkpoint says so (see [`carries_no_host_layers`]). The record does not
+/// travel with the checkpoint, so without this the restored machine mounts the
+/// capturing host's `local:` archive path, which this host does not have.
+pub fn mark_image_on_storage(checkpoint: &PortableCheckpointManifest, record: &mut VmRecord) {
+    if carries_no_host_layers(checkpoint) && record.local_image_layers_dir().is_some() {
+        record.packed_image_on_storage = true;
+    }
 }
 
 /// Identify the registry image a machine boots from a host-fetched archive, if
@@ -8855,6 +8876,39 @@ mod tests {
         );
         record.image = Some(image.to_string());
         record
+    }
+
+    // A machine created on a Mac from a `.smolmachine` of a local archive has its
+    // image on its storage disk under a `local:` reference, and its checkpoint
+    // names no pack and no fetched image. Restored elsewhere it must keep
+    // booting that disk, not look for the capturing host's archive cache.
+    #[test]
+    fn a_local_image_on_storage_stays_on_storage_after_restore() {
+        let checkpoint = minimal_checkpoint_manifest();
+        assert!(carries_no_host_layers(&checkpoint));
+        let mut restored = no_network_machine("local:caa470fc");
+        assert!(restored.local_image_layers_dir().is_some());
+        mark_image_on_storage(&checkpoint, &mut restored);
+        assert!(restored.packed_image_on_storage);
+        assert!(restored.local_image_layers_dir().is_none());
+
+        // A registry image is left alone.
+        let mut registry = no_network_machine("alpine:3.20");
+        mark_image_on_storage(&checkpoint, &mut registry);
+        assert!(!registry.packed_image_on_storage);
+
+        // A checkpoint that names its host layers keeps mounting them.
+        let mut with_image = checkpoint.clone();
+        with_image.host_image = Some(CheckpointHostImage {
+            reference: "alpine:3.20@sha256:feedface".to_string(),
+            config_digest: "sha256:c0ffee".to_string(),
+            archive_size: 1,
+            archive_mtime: 1,
+        });
+        assert!(!carries_no_host_layers(&with_image));
+        let mut fetched = no_network_machine("local:caa470fc");
+        mark_image_on_storage(&with_image, &mut fetched);
+        assert!(!fetched.packed_image_on_storage);
     }
 
     #[test]
