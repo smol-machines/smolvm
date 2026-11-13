@@ -37,6 +37,7 @@ trap 'exit 143' TERM
 
 fail() {
     echo "FAIL: $*" >&2
+    dk logs pg >&2 || true
     "$SMOLVM_BIN" machine logs --name "$vm_name" --tail 40 >&2 || true
     exit 1
 }
@@ -76,11 +77,11 @@ pass "node and python amd64 images run"
 # 3. postgres: its entrypoint waits for the server by PID (pg_ctl -w).
 dk run -d --name pg --platform linux/amd64 -e POSTGRES_PASSWORD=pw postgres:16-alpine >/dev/null
 for ((attempt = 0; attempt < 90; attempt++)); do
-    dk logs pg 2>&1 | grep -q 'init process complete' && break
-    dk logs pg 2>&1 | grep -q 'did not start in time' && break
+    dk logs pg 2>&1 | grep -c 'init process complete' >/dev/null && break
+    dk logs pg 2>&1 | grep -c 'did not start in time' >/dev/null && break
     sleep 1
 done
-dk logs pg 2>&1 | grep -q 'init process complete' || fail "amd64 postgres never finished init"
+dk logs pg 2>&1 | grep -c 'init process complete' >/dev/null || fail "amd64 postgres never finished init"
 for ((attempt = 0; attempt < 30; attempt++)); do
     dk exec pg pg_isready -U postgres >/dev/null 2>&1 && break
     sleep 1

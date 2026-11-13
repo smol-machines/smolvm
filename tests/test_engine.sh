@@ -310,7 +310,8 @@ test_buildx_container_builder_builds_and_loads() {
     echo built-by-buildkit > "$WORK/bx/hello.txt"
     printf 'FROM scratch\nCOPY hello.txt /hello.txt\n' > "$WORK/bx/Dockerfile"
     docker buildx create --name "$builder" --driver docker-container >/dev/null || return 1
-    docker buildx build --builder "$builder" --load -t "$img" "$WORK/bx" >/dev/null 2>&1 || {
+    docker buildx build --builder "$builder" --load -t "$img" "$WORK/bx" >"$WORK/buildx.log" 2>&1 || {
+        cat "$WORK/buildx.log" >&2
         docker buildx rm "$builder" >/dev/null 2>&1
         return 1
     }

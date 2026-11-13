@@ -18,7 +18,8 @@ rest, as the clients run them, and only their status is checked.
 
 SOCKET is the engine's Unix socket. The images the fixtures use (alpine,
 nginx:alpine, postgres:16-alpine, python:3.12-alpine, node:22-alpine,
-testcontainers/ryuk:0.14.0) are pulled on the way, as the clients pulled them.
+testcontainers/ryuk:0.14.0) are pulled before replay where a fixture expects them already cached, or
+on the way where the fixture recorded the pull.
 
 To re-record a fixture: run the engine with SMOLVM_ENGINE_RECORD set, run the
 client, then replace host paths with the placeholders below.
@@ -104,6 +105,10 @@ class Conn:
 
     def close(self):
         try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
             self.sock.close()
         except OSError:
             pass
@@ -163,6 +168,7 @@ class Replay:
         }
         self.failures = []
         self.threads = []
+        self.stream_connections = []
 
     def substitute(self, text, encoded=False):
         for k, v in self.values.items():
@@ -201,20 +207,26 @@ class Replay:
 
     def stream(self, index, r):
         method, target, body, headers = self.request(r)
-        conn = Conn(self.socket, timeout=90)
+        conn = None
+        answered = False
         try:
+            conn = Conn(self.socket, timeout=90)
+            self.stream_connections.append(conn)
             conn.send(method, target, body, headers)
             status, _ = conn.head()
+            answered = True
             if status != r["status"]:
                 self.failures.append(f"#{index} {method} {r['path']}: status {status}, recorded {r['status']}")
             if r.get("upgrade"):
                 # The client's input ends; output runs until the process does.
                 conn.sock.shutdown(socket.SHUT_WR)
             conn.drain()
-        except (socket.timeout, OSError, EOFError):
-            pass
+        except (socket.timeout, OSError, EOFError) as e:
+            if not answered:
+                self.failures.append(f"#{index} {method} {r['path']}: no stream answer ({e})")
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     @staticmethod
     def upload_name(rows, index):
@@ -276,8 +288,14 @@ class Replay:
                 self.learn(r["response"], actual)
                 for e in shape_errors(r["response"], actual):
                     self.failures.append(f"#{index} {method} {r['path']}: {e}")
+        # Events and log-follow streams may stay open forever. Their status
+        # has been checked; close them once the recorded client is finished.
+        for conn in self.stream_connections:
+            conn.close()
         for t in self.threads + waits:
-            t.join(timeout=120)
+            t.join(timeout=5)
+            if t.is_alive():
+                self.failures.append("stream did not finish after its connection was closed")
 
 
 def cleanup(socket_path, ids):
@@ -295,6 +313,30 @@ def cleanup(socket_path, ids):
                 conn.close()
 
 
+def prepare_images(socket_path, rows):
+    """Fixtures recorded successful inspections of images already in cache."""
+    images = {
+        match.group(1)
+        for r in rows
+        if r["method"] == "GET" and r["status"] == 200
+        and (match := re.fullmatch(r"(?:/v[0-9.]+)?/images/(.+)/json", r["path"]))
+    }
+    for ref in sorted(images):
+        conn = Conn(socket_path)
+        try:
+            conn.send("POST", "/images/create?" + urllib.parse.urlencode({"fromImage": ref}))
+            status, headers = conn.head()
+            body = conn.body(headers)
+            if status != 200:
+                raise RuntimeError(f"preparing {ref}: HTTP {status}: {body[:200]!r}")
+            for line in body.splitlines():
+                reply = json.loads(line)
+                if reply.get("error"):
+                    raise RuntimeError(f"preparing {ref}: {reply['error']}")
+        finally:
+            conn.close()
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -305,6 +347,7 @@ def main():
     for name in names:
         path = name if os.path.sep in name else os.path.join(FIXTURES, name)
         rows = [json.loads(l) for l in open(path) if l.strip()]
+        prepare_images(socket_path, rows)
         with tempfile.TemporaryDirectory() as tmp:
             workspace = os.path.join(tmp, "workspace")
             os.makedirs(os.path.join(workspace, ".devcontainer"))

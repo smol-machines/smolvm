@@ -890,6 +890,7 @@ fn append_empty<W: std::io::Write>(
 
 /// Whether overlayfs marked `dir` opaque: it hides the same directory in
 /// the image.
+#[cfg(target_os = "linux")]
 fn is_opaque(dir: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
@@ -910,6 +911,12 @@ fn is_opaque(dir: &std::path::Path) -> bool {
             return true;
         }
     }
+    false
+}
+
+// The agent runs on Linux; macOS builds its host-side unit-test stub.
+#[cfg(not(target_os = "linux"))]
+fn is_opaque(_dir: &std::path::Path) -> bool {
     false
 }
 
