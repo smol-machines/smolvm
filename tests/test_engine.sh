@@ -310,14 +310,18 @@ test_buildx_container_builder_builds_and_loads() {
     echo built-by-buildkit > "$WORK/bx/hello.txt"
     # Exercise copy-up, whiteouts and root access to mode-000 paths across
     # layers, while retaining permission checks for an unprivileged user.
+    # COPY between stages must also walk a merged tree containing whiteouts.
     cat > "$WORK/bx/Dockerfile" <<'DOCKERFILE'
-FROM alpine
+FROM alpine AS build
 COPY hello.txt /hello.txt
 RUN cp /hello.txt /result.txt && mkdir /private && echo secret > /private/secret
 RUN rm /hello.txt && chmod 000 /private && cat /private/secret && chmod 000 /result.txt
 RUN cat /result.txt && chmod 644 /result.txt && test ! -e /hello.txt
 USER 65534:65534
 RUN test ! -r /private/secret && cat /result.txt
+FROM alpine
+COPY --from=build /result.txt /result.txt
+USER 65534:65534
 DOCKERFILE
     docker buildx create --name "$builder" --driver docker-container --bootstrap >"$WORK/buildx.log" 2>&1 || status=1
     if [[ "$status" == 0 ]]; then
