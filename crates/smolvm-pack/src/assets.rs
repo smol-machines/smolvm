@@ -335,6 +335,7 @@ pub fn legacy_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> 
 }
 
 /// Mode every symlink counts with in [`agent_rootfs_digest`].
+#[cfg(unix)]
 const SYMLINK_DIGEST_MODE: u32 = 0o777;
 
 fn rootfs_digest(rootfs_dir: &Path, symlink_own_mode: bool) -> std::io::Result<String> {
@@ -2149,7 +2150,6 @@ mod tests {
         assert!(staging.join("layers").exists());
     }
 
-    #[cfg(unix)]
     #[cfg(target_os = "macos")]
     #[test]
     fn a_symlinks_own_mode_does_not_change_the_rootfs_digest() {
@@ -2188,6 +2188,7 @@ mod tests {
         assert_ne!(legacy_agent_rootfs_digest(&root).unwrap(), linux_like);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_rootfs_digest_names_content_not_times_owners_or_markers() {
         use std::os::unix::fs::PermissionsExt;
