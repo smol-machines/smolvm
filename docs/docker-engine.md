@@ -177,10 +177,9 @@ socket: mounts are devices a machine boots with.
 
 ## Building images
 
-The engine does not build images. `POST /build` (`DOCKER_BUILDKIT=0 docker build`, `docker
-compose build` with `DOCKER_BUILDKIT=0`), `/session` and `/grpc` answer with an error that says
-so. Build the image elsewhere, push it to a registry the engine can pull from,
-and refer to it by name.
+The engine does not embed a builder: the legacy `POST /build`, `/session` and `/grpc`
+endpoints return an unsupported-operation error. Use Buildx's `docker-container` driver to
+run BuildKit inside a smol machine and load the result back into the engine.
 
 What the clients send, for whoever adds builds:
 
@@ -190,9 +189,7 @@ What the clients send, for whoever adds builds:
   starts a container from it, and talks BuildKit's gRPC to it through `docker exec`. Against this
   engine that container is an ordinary container, so this path needs no build endpoint at all:
   `docker buildx create --driver docker-container` then `docker buildx build --load` builds, and
-  the image comes back through `docker load`. A `RUN` step does not work there yet: BuildKit keeps
-  its snapshots in a volume, and the snapshot mounts it makes in a host-directory volume are
-  refused.
+  the image comes back through `docker load`, including builds with `RUN` steps.
 - `DOCKER_BUILDKIT=0 docker build` uses the classic `POST /build?t=<tag>&dockerfile=<path>` with
   the build context as a tar body, and reads a JSON progress stream back.
 - `docker compose build` hands the build to buildx (`bake`), with the same two paths;
@@ -204,3 +201,13 @@ What the clients send, for whoever adds builds:
 
 - Network drivers other than `bridge`, and IPv6 on the default `bridge` network.
 - Changing an internal network's egress after a container on it was created.
+
+## Validate process lifetime
+
+Against an isolated, registered test engine, set `DOCKER_HOST` and
+`SMOLVM_ENGINE_TEST_ROOT` to its socket and state directory, then run
+`python3 tests/test_engine_lifecycle.py`; it kills the adapter, checks workload survival,
+and verifies that supervisors exit after cleanup. On macOS, also run
+`python3 tests/test_engine_warm_lifecycle.py` to check that a warm branch outlives its
+original workload owner and releases its base when the final branch is removed.
+Run these tests sequentially on an engine without other workloads.
