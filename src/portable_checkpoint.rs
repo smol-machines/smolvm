@@ -1499,6 +1499,88 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Scratch left by checkpoint work older than this was abandoned by a process
+/// that died: no capture or transfer runs that long.
+const ABANDONED_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Delete the `checkpoint-staging-*` and `checkpoint-transfer-*` directories,
+/// and tmpfs RAM capture directories, that a capture killed midway left
+/// behind. A restart or a host reset used to leave them forever (~135 GB on a
+/// node after the 2026-11-09 and 11-10 resets). Only entries untouched for
+/// [`ABANDONED_SCRATCH_AGE`] go, so a capture another process is running now
+/// keeps its scratch. Returns how many were removed.
+pub fn sweep_abandoned_checkpoint_scratch() -> usize {
+    let root = std::env::var_os("SMOLVM_PACK_STAGING")
+        .map(PathBuf::from)
+        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")));
+    let mut removed = 0;
+    if let Some(root) = root {
+        removed += sweep_abandoned_scratch_in(
+            &root,
+            &["checkpoint-staging-", "checkpoint-transfer-"],
+            ABANDONED_SCRATCH_AGE,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        removed +=
+            sweep_abandoned_scratch_in(Path::new(CAPTURE_TMPFS_ROOT), &[""], ABANDONED_SCRATCH_AGE);
+    }
+    removed
+}
+
+fn sweep_abandoned_scratch_in(root: &Path, prefixes: &[&str], age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() || !newest_mtime_is_older_than(&entry.path(), age) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                tracing::warn!(path = %entry.path().display(), %error, "could not remove abandoned checkpoint scratch")
+            }
+        }
+    }
+    removed
+}
+
+/// Whether nothing under `dir` (itself included) was modified within `age`.
+fn newest_mtime_is_older_than(dir: &Path, age: std::time::Duration) -> bool {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(age) else {
+        return false;
+    };
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata
+            .modified()
+            .map_or(true, |modified| modified > cutoff)
+        {
+            return false;
+        }
+        if metadata.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                stack.extend(entries.flatten().map(|entry| entry.path()));
+            }
+        }
+    }
+    true
+}
+
 // SAVE runs in the already-confined VMM, not in the privileged API service.
 // Its output must be inside the machine's writable directory and owned by the
 // same lineage UID. Never grant the VMM access to service-owned pack libraries.
@@ -1569,16 +1651,75 @@ pub fn capture_tmpfs_root() -> Option<PathBuf> {
     None
 }
 
+/// A RAM image capture's directory, and the share of tmpfs it holds while
+/// it is on tmpfs.
+struct RuntimeCapture {
+    dir: tempfile::TempDir,
+    _tmpfs: Option<TmpfsReservation>,
+}
+
+impl RuntimeCapture {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl From<tempfile::TempDir> for RuntimeCapture {
+    fn from(dir: tempfile::TempDir) -> Self {
+        Self { dir, _tmpfs: None }
+    }
+}
+
+/// Bytes of `/dev/shm` promised to RAM images being written now. Each capture
+/// checked free space on its own, so a burst of concurrent captures all saw
+/// the same room and overflowed tmpfs together ("guest-memory dump: No space
+/// left on device", 29 times in a burst on 2026-11-12).
+static TMPFS_RESERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A share of [`TMPFS_RESERVED`], returned on drop.
+struct TmpfsReservation(u64);
+
+impl Drop for TmpfsReservation {
+    fn drop(&mut self) {
+        TMPFS_RESERVED.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Reserve `needed` bytes of tmpfs that currently has `free`, counting what
+/// other captures have already reserved. `None` when it does not fit.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn reserve_tmpfs(needed: u64, free: u64) -> Option<TmpfsReservation> {
+    use std::sync::atomic::Ordering;
+    let mut reserved = TMPFS_RESERVED.load(Ordering::Acquire);
+    loop {
+        if free <= reserved.saturating_add(needed) {
+            return None;
+        }
+        match TMPFS_RESERVED.compare_exchange_weak(
+            reserved,
+            reserved + needed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(TmpfsReservation(needed)),
+            Err(current) => reserved = current,
+        }
+    }
+}
+
 /// [`runtime_capture_dir`] on tmpfs when the service runs as root and tmpfs
-/// has room for the whole RAM image with margin; otherwise in the VM's data
-/// directory as usual.
-fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
+/// has room for the whole RAM image with margin, after what concurrent
+/// captures have reserved; otherwise in the VM's data directory as usual.
+fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<RuntimeCapture> {
     #[cfg(target_os = "linux")]
     {
         let needed = u64::from(vm.mem) * 1024 * 1024 * 5 / 4 + (1 << 30);
         let root = capture_tmpfs_root();
-        let usable = root.is_some()
-            && free_bytes(Path::new("/dev/shm")).is_some_and(|free| free > needed)
+        let reservation = root
+            .as_ref()
+            .and_then(|_| free_bytes(Path::new("/dev/shm")))
+            .and_then(|free| reserve_tmpfs(needed, free));
+        let usable = reservation.is_some()
             // tmpfs pages are RAM: never push the host into swap for this.
             && std::fs::read_to_string("/proc/meminfo")
                 .ok()
@@ -1602,14 +1743,19 @@ fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<tem
             .transpose()
             .map_err(|error| Error::agent("resolve checkpoint uid", error.to_string()))?;
             match runtime_capture_dir_at(&root, ids) {
-                Ok(directory) => return Ok(directory),
+                Ok(dir) => {
+                    return Ok(RuntimeCapture {
+                        dir,
+                        _tmpfs: reservation,
+                    })
+                }
                 Err(error) => {
                     tracing::warn!(%error, "tmpfs runtime capture unavailable; using the data directory")
                 }
             }
         }
     }
-    runtime_capture_dir(name, vm)
+    runtime_capture_dir(name, vm).map(RuntimeCapture::from)
 }
 
 fn runtime_capture_dir_at(data: &Path, ids: Option<(u32, u32)>) -> Result<tempfile::TempDir> {
@@ -2110,7 +2256,7 @@ fn capture_with_completion(
     let runtime_capture = if options.store_dir.is_some() {
         runtime_capture_dir_preferring_tmpfs(name, vm)?
     } else {
-        runtime_capture_dir(name, vm)?
+        RuntimeCapture::from(runtime_capture_dir(name, vm)?)
     };
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
     #[cfg(target_os = "linux")]
@@ -7403,6 +7549,70 @@ mod tests {
             assert!(error.to_string().contains("checksum mismatch"), "{error}");
             assert!(db.get_vm("checksum-test").unwrap().is_none());
         }
+    }
+
+    // Concurrent captures share tmpfs: each reservation counts the others, so
+    // a burst cannot promise the same free bytes twice, and a finished capture
+    // gives its share back.
+    #[test]
+    fn tmpfs_reservations_cannot_oversubscribe_free_space() {
+        let gib = 1u64 << 30;
+        let base = TMPFS_RESERVED.load(std::sync::atomic::Ordering::Acquire);
+        let free = base + 10 * gib;
+        let first = reserve_tmpfs(4 * gib, free).expect("fits alone");
+        let second = reserve_tmpfs(4 * gib, free).expect("fits beside the first");
+        assert!(
+            reserve_tmpfs(4 * gib, free).is_none(),
+            "a third would overflow"
+        );
+        drop(first);
+        let third = reserve_tmpfs(4 * gib, free).expect("fits once the first ended");
+        drop((second, third));
+        assert_eq!(
+            TMPFS_RESERVED.load(std::sync::atomic::Ordering::Acquire),
+            base
+        );
+    }
+
+    #[test]
+    fn only_old_checkpoint_scratch_is_swept() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["checkpoint-staging-old", "checkpoint-transfer-new", "vms"] {
+            std::fs::create_dir_all(root.path().join(dir).join("inner")).unwrap();
+            std::fs::write(root.path().join(dir).join("inner/file"), b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600);
+        for path in [
+            root.path().join("checkpoint-staging-old/inner/file"),
+            root.path().join("checkpoint-staging-old/inner"),
+            root.path().join("checkpoint-staging-old"),
+            root.path().join("vms/inner/file"),
+            root.path().join("vms/inner"),
+            root.path().join("vms"),
+        ] {
+            std::fs::File::options()
+                .read(true)
+                .open(&path)
+                .or_else(|_| std::fs::File::open(&path))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let removed = sweep_abandoned_scratch_in(
+            root.path(),
+            &["checkpoint-staging-", "checkpoint-transfer-"],
+            ABANDONED_SCRATCH_AGE,
+        );
+        assert_eq!(removed, 1);
+        assert!(!root.path().join("checkpoint-staging-old").exists());
+        assert!(
+            root.path().join("checkpoint-transfer-new").exists(),
+            "recent scratch stays"
+        );
+        assert!(
+            root.path().join("vms").exists(),
+            "other directories are never touched"
+        );
     }
 
     #[test]

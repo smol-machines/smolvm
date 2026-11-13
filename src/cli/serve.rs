@@ -546,6 +546,10 @@ impl ServeStartCmd {
         if reclaimed > 0 {
             println!("Reclaimed {reclaimed} dangling VM data dir(es)");
         }
+        let swept = smolvm::portable_checkpoint::sweep_abandoned_checkpoint_scratch();
+        if swept > 0 {
+            println!("Removed {swept} abandoned checkpoint scratch dir(s)");
+        }
         // A previous run may have stopped while restored checkpoint RAM was
         // still being written back; finish that in the background.
         smolvm::portable_checkpoint::resume_deferred_restore_syncs();
