@@ -122,7 +122,7 @@ def kind(v):
 def shape_errors(recorded, actual, where="$"):
     """Fields of `recorded` that `actual` lacks or carries with another type."""
     errors = []
-    if recorded is None or actual is None:
+    if recorded is None:
         return errors
     if kind(recorded) != kind(actual):
         return [f"{where}: recorded {kind(recorded)}, got {kind(actual)}"]
