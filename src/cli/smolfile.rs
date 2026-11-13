@@ -345,12 +345,13 @@ pub fn build_create_spec(
     // CLI extends
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
-    // --allow-cidr / --allow-host / [network] / --dns implies --net
+    // --allow-cidr / --allow-host / [network] / --dns / --network implies --net
     let net = net
         || !allowed_cidrs_vec.is_empty()
         || !sf_allow_hosts.is_empty()
         || !network.credentials.is_empty()
-        || cli_dns.is_some();
+        || cli_dns.is_some()
+        || cli_network_name.is_some();
     let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
     let block_private = (network.block_private || !network.allow_private.is_empty())
         .then(|| network.allow_private.clone());
@@ -1735,5 +1736,41 @@ mod cli_entrypoint_tests {
         .expect("resolves");
 
         assert_eq!(cfg.entrypoint, vec!["/app/run"]);
+    }
+
+    #[test]
+    fn cli_network_name_enables_networking_when_a_smolfile_is_loaded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "image = \"alpine\"\n").expect("write");
+
+        let params = super::build_create_params(
+            "m".to_string(),
+            None,
+            None,
+            vec![],
+            None,
+            None,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            Some("fabric".to_string()),
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(path),
+            None,
+            None,
+            None,
+            vec![],
+            Default::default(),
+        )
+        .expect("params");
+
+        assert!(params.net);
+        assert_eq!(params.network_name.as_deref(), Some("fabric"));
     }
 }

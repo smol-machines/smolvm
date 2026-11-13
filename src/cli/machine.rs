@@ -1088,6 +1088,45 @@ fn image_bakeable(image: Option<&str>) -> bool {
     )
 }
 
+/// Whether `params` and the run's CLI-only flags only ask for options that the
+/// one-shot packed launcher (`PackRunCmd`) can apply. Any option that
+/// `machine run --from` refuses in `conflicts_with_all` (or that only the
+/// direct `RunConfig` / `AgentManager` path wires up) takes the direct path so
+/// the option is honored instead of dropped.
+fn can_run_via_packed_launcher(
+    params: &vm_common::CreateVmParams,
+    allow_host_loopback: bool,
+    docker_config: bool,
+    unprivileged: bool,
+) -> bool {
+    let has_remote_volume = smolvm::data::storage::split_disk_volume_specs(&params.volume)
+        .ok()
+        .and_then(|(volume_specs, _)| smolvm::remote_volume::split_specs(&volume_specs).ok())
+        .is_some_and(|(_, remote_volumes)| !remote_volumes.is_empty());
+
+    params
+        .credential_policy
+        .as_ref()
+        .is_none_or(|policy| policy.is_empty())
+        && !params.gpu
+        && params.gpu_vram_mib.is_none()
+        && !params.rosetta
+        && params.oci_platform.is_none()
+        && !params.nested_virt
+        && params.shm_size.is_none()
+        && params.guest_subnet.is_none()
+        && params.network_name.is_none()
+        && params.disk_durability == smolvm::data::resources::DiskDurability::default()
+        && params.disks.is_empty()
+        && params.cache_disk.is_none()
+        && !params.docker_socket
+        && params.published_sockets.is_empty()
+        && !allow_host_loopback
+        && !docker_config
+        && !unprivileged
+        && !has_remote_volume
+}
+
 /// Build the bake's `machine start` argv, forwarding the run's `--proxy` /
 /// `--no-proxy` so the one-time init pull reaches the registry through the same
 /// proxy the outer run uses. Without this, a Smolfile with `init` steps pulls
@@ -1368,6 +1407,106 @@ fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error)
 }
 
 impl RunCmd {
+    fn build_params(&mut self, vm_name: &str) -> smolvm::Result<vm_common::CreateVmParams> {
+        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
+            std::mem::take(&mut self.allow_cidr),
+            std::mem::take(&mut self.allow_host),
+            std::mem::take(&mut self.allow_host_pattern),
+            self.outbound_localhost_only,
+            self.net || self.allow_host_loopback,
+        )?;
+
+        let mut params = crate::cli::smolfile::build_create_params(
+            vm_name.to_string(),
+            self.image.clone(),
+            None,
+            self.command.clone(),
+            self.cpus,
+            self.mem,
+            std::mem::take(&mut self.volume),
+            std::mem::take(&mut self.port),
+            net,
+            self.net_backend,
+            self.dns,
+            self.network_name.clone(),
+            self.init.clone(),
+            std::mem::take(&mut self.env),
+            self.workdir.clone(),
+            self.user.clone(),
+            self.smolfile.clone(),
+            self.storage,
+            self.overlay,
+            self.block_io,
+            cli_allow_cidrs,
+            // Ephemeral runs are not addressable later, so they carry no labels;
+            // `machine create` is the path an orchestrator labels.
+            Default::default(),
+        )?;
+        params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
+        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
+        params.dns_options = self.dns_option.clone();
+        params.shm_size = self.shm_size.clone();
+        params.prepend_deny_cidrs(&self.deny_cidr);
+        params.append_allow_udp(&self.allow_udp);
+        // `build_create_params` fills resources from the Smolfile, so a CLI-only
+        // flag has to be merged here or it never reaches the record.
+        params.nested_virt = params.nested_virt || self.nested_virt;
+        params.rosetta = params.rosetta || self.rosetta;
+        params.oci_platform = self.oci_platform.clone();
+        params.guest_subnet = self.guest_subnet.clone();
+        if self.guest_subnet.is_some() {
+            params.net = true;
+        }
+        if let Some(durability) = self.disk_durability {
+            params.disk_durability = durability;
+        }
+        params.disks = parse_attached_disks(&self.disk)?;
+        params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
+        params.allow_system_mounts = self.allow_system_mounts;
+        if self.auto_graph {
+            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
+            params.cuda = true;
+        }
+        params.ssh_agent |= self.ssh_agent;
+        params.cuda |= self.cuda;
+        params.docker_socket |= self.docker_socket;
+        params.gpu |= self.gpu;
+        if self.gpu_vram_mib.is_some() {
+            params.gpu_vram_mib = self.gpu_vram_mib;
+        }
+        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
+            (Some(mut from_smolfile), Some(mut from_cli)) => {
+                from_smolfile.append(&mut from_cli);
+                Some(from_smolfile)
+            }
+            (Some(from_smolfile), None) => Some(from_smolfile),
+            (None, some) => some,
+        };
+        merge_cli_credentials(&mut params, &self.credential)?;
+        // Ephemeral machines boot before their record exists: mint placeholders
+        // now so the launch, the workload env and the record all agree.
+        vm_common::prepare_params_credentials(&mut params)?;
+        params.published_sockets =
+            parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
+        // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
+        // `[secrets]` of the same name (CLI wins).
+        for (key, r) in
+            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?
+        {
+            params.secret_refs.insert(key, r);
+        }
+        vm_common::warn_hosts_blocked_by_private_floor(
+            params.block_private.as_deref(),
+            &params.egress_rules,
+            params.dns_filter_hosts.as_deref(),
+            params.credential_policy.as_ref(),
+        );
+        // Validate against the same rules `machine create` applies before
+        // booting, whether the run is detached or ephemeral.
+        vm_common::build_vm_record(&params)?;
+        Ok(params)
+    }
+
     pub fn run(mut self) -> smolvm::Result<()> {
         use smolvm::Error;
 
@@ -1477,94 +1616,7 @@ impl RunCmd {
         if self.allow_host_loopback {
             std::env::set_var("SMOLVM_ALLOW_HOST_LOOPBACK", "1");
         }
-        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
-            self.allow_cidr,
-            self.allow_host,
-            self.allow_host_pattern,
-            self.outbound_localhost_only,
-            self.net || self.allow_host_loopback,
-        )?;
-
-        let mut params = crate::cli::smolfile::build_create_params(
-            vm_name.clone(),
-            self.image.clone(),
-            None,
-            self.command.clone(),
-            self.cpus,
-            self.mem,
-            self.volume,
-            self.port,
-            net,
-            self.net_backend,
-            self.dns,
-            self.network_name.clone(),
-            self.init.clone(),
-            self.env,
-            self.workdir,
-            self.user,
-            self.smolfile.clone(),
-            self.storage,
-            self.overlay,
-            self.block_io,
-            cli_allow_cidrs,
-            // Ephemeral runs are not addressable later, so they carry no labels;
-            // `machine create` is the path an orchestrator labels.
-            Default::default(),
-        )?;
-        params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
-        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
-        params.dns_options = self.dns_option.clone();
-        params.shm_size = self.shm_size.clone();
-        params.prepend_deny_cidrs(&self.deny_cidr);
-        params.append_allow_udp(&self.allow_udp);
-        // `build_create_params` fills resources from the Smolfile, so a CLI-only
-        // flag has to be merged here or it never reaches the record.
-        params.nested_virt = params.nested_virt || self.nested_virt;
-        params.rosetta = params.rosetta || self.rosetta;
-        params.oci_platform = self.oci_platform.clone();
-        params.guest_subnet = self.guest_subnet.clone();
-        if let Some(durability) = self.disk_durability {
-            params.disk_durability = durability;
-        }
-        params.disks = parse_attached_disks(&self.disk)?;
-        params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
-        params.allow_system_mounts = self.allow_system_mounts;
-        if self.auto_graph {
-            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
-            params.cuda = true;
-        }
-        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
-            (Some(mut from_smolfile), Some(mut from_cli)) => {
-                from_smolfile.append(&mut from_cli);
-                Some(from_smolfile)
-            }
-            (Some(from_smolfile), None) => Some(from_smolfile),
-            (None, some) => some,
-        };
-        merge_cli_credentials(&mut params, &self.credential)?;
-        // Ephemeral machines boot before their record exists: mint placeholders
-        // now so the launch, the workload env and the record all agree.
-        vm_common::prepare_params_credentials(&mut params)?;
-        params.published_sockets =
-            parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
-        // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
-        // `[secrets]` of the same name (CLI wins).
-        for (key, r) in
-            parse_cli_secret_refs(&self.secret_env, &self.secret_file, &self.secret_keychain)?
-        {
-            params.secret_refs.insert(key, r);
-        }
-        vm_common::warn_hosts_blocked_by_private_floor(
-            params.block_private.as_deref(),
-            &params.egress_rules,
-            params.dns_filter_hosts.as_deref(),
-            params.credential_policy.as_ref(),
-        );
-        // A detached run leaves a machine behind, recorded by the rules
-        // `machine create` applies; refuse what they refuse before booting.
-        if self.detach {
-            vm_common::build_vm_record(&params)?;
-        }
+        let params = self.build_params(&vm_name)?;
 
         // A registry --image can name a smolmachine PACK artifact (e.g.
         // registry.smolmachines.com/library/alpine), whose single "layer" is a
@@ -1621,7 +1673,7 @@ impl RunCmd {
                         .collect(),
                     net: params.net,
                     net_backend: params.network_backend,
-                    ssh_agent: self.ssh_agent || params.ssh_agent,
+                    ssh_agent: params.ssh_agent,
                     dns: params.dns,
                     dns_option: params.dns_options.clone(),
                     cpus: Some(params.cpus),
@@ -1632,7 +1684,7 @@ impl RunCmd {
                     force_extract: false,
                     info: false,
                     debug: false,
-                    cuda: self.cuda || params.cuda,
+                    cuda: params.cuda,
                     auto_graph: self.auto_graph,
                     // A user-supplied artifact's manifest keeps deciding the
                     // network default (no override), but any allow-list / DNS
@@ -1667,13 +1719,16 @@ impl RunCmd {
         // the OCI image itself is cached on the host and repeat ephemeral runs skip
         // the pull — the same bake path, just with an empty init layer.
         // A cached bake runs through the packed launcher, which cannot
-        // substitute credentials, so a credentialed run takes the direct path.
+        // substitute credentials or apply options `machine run --from` refuses,
+        // so those runs take the direct path.
         if !self.no_init_cache
             && !self.detach
-            && params
-                .credential_policy
-                .as_ref()
-                .is_none_or(|policy| policy.is_empty())
+            && can_run_via_packed_launcher(
+                &params,
+                self.allow_host_loopback,
+                self.docker_config,
+                self.unprivileged,
+            )
             && image_bakeable(params.image.as_deref())
             && (!params.init.is_empty() || self.oci_cache)
         {
@@ -2315,13 +2370,6 @@ impl RunCmd {
                                 r.image = Some(img.clone());
                                 r.entrypoint = Vec::new();
                                 r.cmd = command.clone();
-                                r.ssh_agent |= self.ssh_agent;
-                                r.cuda |= self.cuda;
-                                r.docker_socket |= self.docker_socket;
-                                if self.gpu {
-                                    r.gpu = Some(true);
-                                }
-                                r.gpu_vram_mib = self.gpu_vram_mib.or(r.gpu_vram_mib);
                                 o
                             }),
                         )
@@ -2466,18 +2514,8 @@ impl RunCmd {
                                 staged_mounts,
                                 port_tuples,
                             )?;
-                            // A one-shot run keeps no image on its record; the
-                            // command line flags may enable features on top of
-                            // what the Smolfile asked for.
-                            let r = &mut o.record;
-                            r.image = None;
-                            r.ssh_agent |= self.ssh_agent;
-                            r.cuda |= self.cuda;
-                            r.docker_socket |= self.docker_socket;
-                            if self.gpu {
-                                r.gpu = Some(true);
-                            }
-                            r.gpu_vram_mib = self.gpu_vram_mib.or(r.gpu_vram_mib);
+                            // A bare run keeps no image on its record.
+                            o.record.image = None;
                             o
                         }),
                     )?;
@@ -4071,6 +4109,137 @@ mod tests {
         assert!(hot.exists(), "the just-baked entry is always kept");
         assert!(cold.exists(), "a touched (recently-used) entry survives");
         assert!(!mid.exists(), "the least-recently-used entry is evicted");
+    }
+
+    #[test]
+    fn run_build_params_merges_device_flags_and_validates_before_boot() {
+        let parse_run = |argv: &[&str]| {
+            let cli = TestMachineCli::parse_from(argv);
+            let MachineCmd::Run(cmd) = cli.command else {
+                panic!("expected machine run command");
+            };
+            cmd
+        };
+
+        let mut cmd = parse_run(&[
+            "machine",
+            "run",
+            "--image",
+            "alpine",
+            "--gpu",
+            "--gpu-vram",
+            "8192",
+            "--ssh-agent",
+            "--cuda",
+            "--docker-socket",
+            "--guest-subnet",
+            "10.200.0.0/30",
+            "--",
+            "true",
+        ]);
+        let params = cmd.build_params("run-test").expect("valid params");
+        assert!(params.gpu);
+        assert_eq!(params.gpu_vram_mib, Some(8192));
+        assert!(params.ssh_agent);
+        assert!(params.cuda);
+        assert!(params.docker_socket);
+        assert!(params.net, "--guest-subnet implies --net");
+        assert_eq!(params.guest_subnet.as_deref(), Some("10.200.0.0/30"));
+
+        // Invalid OCI platform is refused before booting, even on an ephemeral run.
+        let mut bad_platform = parse_run(&[
+            "machine",
+            "run",
+            "--image",
+            "alpine",
+            "--oci-platform",
+            "not-a-platform",
+            "--",
+            "true",
+        ]);
+        assert!(bad_platform.build_params("run-bad-platform").is_err());
+
+        // Remote volumes without --net are refused up front during param validation,
+        // while --guest-subnet satisfies their network requirement.
+        let mut s3_no_net = parse_run(&[
+            "machine",
+            "run",
+            "--image",
+            "alpine",
+            "-v",
+            "s3://bucket/prefix:/data:ro",
+            "--",
+            "true",
+        ]);
+        assert!(s3_no_net.build_params("run-s3-no-net").is_err());
+
+        let mut s3_with_subnet = parse_run(&[
+            "machine",
+            "run",
+            "--image",
+            "alpine",
+            "--guest-subnet",
+            "10.200.0.0/30",
+            "-v",
+            "s3://bucket/prefix:/data:ro",
+            "--",
+            "true",
+        ]);
+        assert!(s3_with_subnet.build_params("run-s3-subnet").is_ok());
+    }
+
+    #[test]
+    fn packed_launcher_gate_skips_options_pack_run_cannot_apply() {
+        let parse_run = |argv: &[&str]| {
+            let cli = TestMachineCli::parse_from(argv);
+            let MachineCmd::Run(cmd) = cli.command else {
+                panic!("expected machine run command");
+            };
+            cmd
+        };
+
+        let mut plain = parse_run(&[
+            "machine", "run", "--image", "alpine", "--init", "true", "--", "echo",
+        ]);
+        let params = plain.build_params("plain").expect("params");
+        assert!(can_run_via_packed_launcher(
+            &params,
+            plain.allow_host_loopback,
+            plain.docker_config,
+            plain.unprivileged,
+        ));
+
+        for extra in [
+            &["--gpu"][..],
+            &["--rosetta"],
+            &["--oci-platform", "linux/amd64"],
+            &["--nested"],
+            &["--shm-size", "1g"],
+            &["--guest-subnet", "10.200.0.0/30"],
+            &["--network", "fabric"],
+            &["--disk-durability", "deferred"],
+            &["--docker-socket"],
+            &["--expose-socket", "/run/app.sock"],
+            &["--allow-host-loopback"],
+            &["--docker-config"],
+            &["--unprivileged"],
+            &["--net", "-v", "s3://bucket/prefix:/data:ro"],
+        ] {
+            let mut argv = vec!["machine", "run", "--image", "alpine", "--init", "true"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["--", "echo"]);
+            let mut cmd = parse_run(&argv);
+            let params = cmd.build_params("gated").expect("params");
+            assert!(
+                !can_run_via_packed_launcher(
+                    &params,
+                    cmd.allow_host_loopback,
+                    cmd.docker_config,
+                    cmd.unprivileged,
+                ),
+                "{extra:?} must bypass the packed launcher"
+            );
+        }
     }
 }
 
