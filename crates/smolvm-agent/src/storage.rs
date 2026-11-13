@@ -4485,6 +4485,10 @@ impl OverlaySetup {
     /// remounts it preserving the upper layer (which contains previous changes).
     /// If the overlay does not exist at all, creates it fresh.
     fn execute_or_remount(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
+        // Requests run on their own threads, and two remounts of one overlay
+        // clear the work directory under each other's mount.
+        static PREPARE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _prepare = PREPARE.lock().unwrap_or_else(|e| e.into_inner());
         let mut restored_fork = false;
         // Already mounted — reuse it only if it actually answers lookups.
         if self.merged_path.exists() && is_mountpoint(&self.merged_path) {
@@ -8723,5 +8727,61 @@ mod tests {
         assert!(!names.iter().any(|name| name == "deleted"));
 
         let _ = std::process::Command::new("umount").arg(&merged).status();
+    }
+
+    /// Two requests for a persistent overlay that is not mounted, as after a
+    /// restart, must both get it mounted once. Needs root + Linux overlayfs, so
+    /// it's `#[ignore]`d; run on a Linux host with:
+    ///   cargo test -p smolvm-agent -- --ignored concurrent_remounts_mount_the_overlay_once
+    #[test]
+    #[ignore = "requires root + Linux overlayfs"]
+    #[cfg(target_os = "linux")]
+    fn concurrent_remounts_mount_the_overlay_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer");
+        std::fs::create_dir_all(&layer).unwrap();
+        std::fs::write(layer.join("file"), b"x").unwrap();
+        let lowerdirs = vec![layer.to_string_lossy().into_owned()];
+        let root = tmp.path().join("overlay");
+        let merged = root.join("merged");
+        let setup = || OverlaySetup {
+            workload_id: "persistent-race".to_string(),
+            overlay_root: root.clone(),
+            upper_path: root.join("upper"),
+            work_path: root.join("work"),
+            merged_path: merged.clone(),
+        };
+        setup().execute_or_remount(lowerdirs.clone()).unwrap();
+
+        for round in 0..20 {
+            assert!(Command::new("umount")
+                .arg(&merged)
+                .status()
+                .unwrap()
+                .success());
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let remounts: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            setup().execute_or_remount(lowerdirs.clone())
+                        })
+                    })
+                    .collect();
+                for remount in remounts {
+                    if let Err(e) = remount.join().unwrap() {
+                        panic!("round {round}: {e}");
+                    }
+                }
+            });
+            let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+            let mounts = mountinfo
+                .lines()
+                .filter(|line| line.split_whitespace().nth(4) == merged.to_str())
+                .count();
+            assert_eq!(mounts, 1, "round {round}");
+        }
+        let _ = Command::new("umount").arg(&merged).status();
     }
 }
