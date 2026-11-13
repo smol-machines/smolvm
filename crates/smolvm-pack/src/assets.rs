@@ -318,9 +318,34 @@ fn compression_slots(parallelism: usize) -> usize {
 /// tar skips them. This names the userland a guest booted with: a checkpoint
 /// records it and a restore boots the rootfs with that digest, since the
 /// captured processes keep that userland mapped.
+///
+/// A symlink counts with mode `0o777` whatever its own bits: Linux gives every
+/// symlink those and ignores them, while macOS keeps the bits it was created
+/// with, so a tree packed on a Mac and unpacked on Linux would otherwise never
+/// have the digest the Mac recorded.
 pub fn agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    rootfs_digest(rootfs_dir, false)
+}
+
+/// [`agent_rootfs_digest`] as smolvm 1.34.3 and older computed it, counting a
+/// symlink's own mode bits. On Linux it is always equal to the current digest;
+/// on macOS it is the digest machines started there before the change recorded.
+pub fn legacy_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    rootfs_digest(rootfs_dir, true)
+}
+
+/// Mode every symlink counts with in [`agent_rootfs_digest`].
+const SYMLINK_DIGEST_MODE: u32 = 0o777;
+
+fn rootfs_digest(rootfs_dir: &Path, symlink_own_mode: bool) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
-    fn walk(dir: &Path, relative: &Path, top: bool, hash: &mut Sha256) -> std::io::Result<()> {
+    fn walk(
+        dir: &Path,
+        relative: &Path,
+        top: bool,
+        symlink_own_mode: bool,
+        hash: &mut Sha256,
+    ) -> std::io::Result<()> {
         let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
@@ -337,18 +362,25 @@ pub fn agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
             let relative = relative.join(&name);
             hash.update(relative.to_string_lossy().as_bytes());
             hash.update([0]);
+            let kind = metadata.file_type();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                hash.update((metadata.mode() & 0o7777).to_le_bytes());
+                let mode = if kind.is_symlink() && !symlink_own_mode {
+                    SYMLINK_DIGEST_MODE
+                } else {
+                    metadata.mode() & 0o7777
+                };
+                hash.update(mode.to_le_bytes());
             }
-            let kind = metadata.file_type();
+            #[cfg(not(unix))]
+            let _ = symlink_own_mode;
             if kind.is_symlink() {
                 hash.update(b"l");
                 hash.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
             } else if kind.is_dir() {
                 hash.update(b"d");
-                walk(&path, &relative, false, hash)?;
+                walk(&path, &relative, false, symlink_own_mode, hash)?;
             } else if kind.is_file() {
                 hash.update(b"f");
                 hash.update(metadata.len().to_le_bytes());
@@ -366,7 +398,7 @@ pub fn agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
     }
     let mut hash = Sha256::new();
     hash.update(b"smolvm-agent-rootfs-v1\0");
-    walk(rootfs_dir, Path::new(""), true, &mut hash)?;
+    walk(rootfs_dir, Path::new(""), true, symlink_own_mode, &mut hash)?;
     Ok(format!("sha256:{:x}", hash.finalize()))
 }
 
@@ -378,7 +410,9 @@ pub fn cached_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> 
     let cached = rootfs_metadata_hash(rootfs_dir).and_then(|hash| {
         let dir = dirs::cache_dir()?
             .join("smolvm")
-            .join("agent-rootfs-digests");
+            // v2: symlinks count with one fixed mode (see agent_rootfs_digest),
+            // so a value cached before that change may be wrong on macOS.
+            .join("agent-rootfs-digests-v2");
         fs::create_dir_all(&dir).ok()?;
         Some(dir.join(hash))
     });
@@ -2116,6 +2150,44 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_symlinks_own_mode_does_not_change_the_rootfs_digest() {
+        // macOS keeps a symlink's mode bits and Linux reports 0o777 for every
+        // one, so a tree packed on a Mac and unpacked on Linux must keep its
+        // digest. The legacy digest still counts them, for machines that
+        // recorded it.
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rootfs");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/busybox"), b"busybox").unwrap();
+        std::os::unix::fs::symlink("busybox", root.join("bin/sh")).unwrap();
+        let set_link_mode = |mode: libc::mode_t| {
+            let path = CString::new(root.join("bin/sh").as_os_str().as_bytes()).unwrap();
+            let set = unsafe {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    mode,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+        };
+        set_link_mode(0o777);
+        let linux_like = agent_rootfs_digest(&root).unwrap();
+        let legacy_linux_like = legacy_agent_rootfs_digest(&root).unwrap();
+        assert_eq!(
+            legacy_linux_like, linux_like,
+            "the formulas agree on a 0o777 symlink"
+        );
+        set_link_mode(0o700);
+        assert_eq!(agent_rootfs_digest(&root).unwrap(), linux_like);
+        assert_ne!(legacy_agent_rootfs_digest(&root).unwrap(), linux_like);
+    }
+
     #[test]
     fn a_rootfs_digest_names_content_not_times_owners_or_markers() {
         use std::os::unix::fs::PermissionsExt;
