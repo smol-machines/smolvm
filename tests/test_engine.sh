@@ -308,7 +308,9 @@ test_buildx_container_builder_builds_and_loads() {
     local builder="$PREFIX-bx" img="$PREFIX-built:1" out
     mkdir -p "$WORK/bx"
     echo built-by-buildkit > "$WORK/bx/hello.txt"
-    printf 'FROM scratch\nCOPY hello.txt /hello.txt\n' > "$WORK/bx/Dockerfile"
+    # A real base image includes read-only directories (such as /proc), whose
+    # ownership BuildKit must preserve while preparing the COPY snapshot.
+    printf 'FROM alpine\nCOPY hello.txt /hello.txt\nRUN cp /hello.txt /result.txt\n' > "$WORK/bx/Dockerfile"
     docker buildx create --name "$builder" --driver docker-container >/dev/null || return 1
     docker buildx build --builder "$builder" --load -t "$img" "$WORK/bx" >"$WORK/buildx.log" 2>&1 || {
         cat "$WORK/buildx.log" >&2
@@ -317,7 +319,7 @@ test_buildx_container_builder_builds_and_loads() {
     }
     local id
     id=$(docker create "$img" /none) || return 1
-    out=$(docker cp "$id:/hello.txt" - | tar -xO) || return 1
+    out=$(docker cp "$id:/result.txt" - | tar -xO) || return 1
     docker rm "$id" >/dev/null
     docker buildx rm "$builder" >/dev/null 2>&1
     docker rmi "$img" >/dev/null 2>&1
@@ -339,6 +341,19 @@ test_named_volume_persists() {
     run --rm -v "$vol:/data" alpine sh -c 'echo kept > /data/f' || return 1
     [[ "$(run --rm -v "$vol:/data" alpine cat /data/f)" == kept ]] || return 1
     docker volume inspect -f '{{.Driver}}' "$vol" | has -x local
+}
+
+test_named_volume_readonly_metadata() {
+    local vol="$PREFIX-readonly-meta"
+    docker volume create --label "$PREFIX" "$vol" >/dev/null || return 1
+    run --rm -v "$vol:/data" alpine sh -ec '
+        mkdir /data/proc
+        chmod 0555 /data/proc
+        chown 0:0 /data/proc
+        test "$(stat -c %a /data/proc)" = 555
+        chmod 0755 /data/proc
+        test "$(stat -c %a /data/proc)" = 755
+    '
 }
 
 test_new_volume_takes_the_image_content() {
@@ -635,6 +650,7 @@ else
 fi
 run_test "build is refused clearly" test_build_is_refused_clearly || true
 run_test "named volume persists" test_named_volume_persists || true
+run_test "named volume permits read-only metadata updates" test_named_volume_readonly_metadata || true
 run_test "new volume takes the image content" test_new_volume_takes_the_image_content || true
 run_test "image volumes are anonymous volumes" test_image_volumes_are_anonymous_volumes || true
 run_test "bind mounts: dir, file, read-only" test_bind_mounts_dir_file_readonly || true
