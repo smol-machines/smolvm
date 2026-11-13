@@ -180,6 +180,9 @@ socket: mounts are devices a machine boots with.
 The engine does not embed a builder: the legacy `POST /build`, `/session` and `/grpc`
 endpoints return an unsupported-operation error. Use Buildx's `docker-container` driver to
 run BuildKit inside a smol machine and load the result back into the engine.
+On macOS, BuildKit automatically uses overlayfs snapshots; recorded guest
+permissions preserve host access to its mode-000 work directories, avoiding
+fallback to the native snapshotter and its full directory copies.
 
 What the clients send, for whoever adds builds:
 
