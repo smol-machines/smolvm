@@ -263,13 +263,23 @@ async fn dispatch_inner(
             ("POST", "create" | "prune") | ("GET", "json")
         );
         if !collection {
-            let id = component(id)?;
-            target = Some(
-                engine
-                    .find_container(&id)
-                    .ok_or_else(|| ApiError::no_such_container(&id))?
-                    .id(),
-            );
+            let suffix = &rest[id.len()..];
+            let name = component(id)?;
+            let id = engine
+                .find_container(&name)
+                .ok_or_else(|| ApiError::no_such_container(&name))?
+                .id();
+            // Canonical IDs also avoid static route collisions for names such
+            // as "create" when the supervisor receives DELETE /containers/{id}.
+            let query = req
+                .uri()
+                .query()
+                .map(|q| format!("?{q}"))
+                .unwrap_or_default();
+            *req.uri_mut() = format!("/containers/{id}{suffix}{query}")
+                .parse()
+                .map_err(internal)?;
+            target = Some(id);
         }
     } else if let Some(rest) = path.strip_prefix("/exec/") {
         let id = rest.split('/').next().unwrap_or("");
