@@ -525,6 +525,14 @@ pub struct CreateVmParams {
     pub cuda_vram_limit_mib: Option<u64>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
+    /// Enable waypipe Wayland forwarding over vsock (guest GUI apps on the host
+    /// compositor).
+    pub waypipe: bool,
+    /// Which `waypipe` binary the guest daemon runs: `None`/`"host"` shares the
+    /// host binary, `"container"` uses the image's own, or an absolute path.
+    pub waypipe_bin: Option<String>,
+    /// Bridge the guest X11 socket straight to the host X server over vsock.
+    pub x11: bool,
     /// Publish the TCP ports the guest listens on (`--auto-ports`).
     pub auto_ports: Option<smolvm::data::network::AutoPorts>,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
@@ -792,6 +800,9 @@ impl CreateVmParams {
             cuda_fork_pool_size,
             cuda_vram_limit_mib,
             docker_socket,
+            waypipe,
+            waypipe_bin,
+            x11,
             auto_ports,
             nested_virt,
             gpu,
@@ -862,6 +873,9 @@ impl CreateVmParams {
             nested_virt,
             cuda,
             docker_socket,
+            waypipe,
+            waypipe_bin,
+            x11,
             ssh_agent,
             forkable,
             cuda_fork_pool_size,
@@ -1905,6 +1919,9 @@ fn start_vm_named_with_db(
         // start machines without auto ports, whatever the record asks.
         auto_ports: record.auto_ports.clone(),
         published_sockets: record.published_sockets.clone(),
+        waypipe: record.waypipe,
+        waypipe_bin: record.waypipe_bin.clone(),
+        x11: record.x11,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
         external_interceptor,
