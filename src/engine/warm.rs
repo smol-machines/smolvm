@@ -44,6 +44,9 @@ use crate::config::VmRecord;
 pub(crate) const BASE_LABEL: &str = "smolvm.engine/base";
 
 /// How long a base stays ready without a container branching from it.
+const BASE_OWNER: &str = "smolvm.engine/base-owner";
+const BASE_READY: &str = "smolvm.engine/base-ready";
+const BASE_ENGINE: &str = "smolvm.engine/base-engine";
 const IDLE: Duration = Duration::from_secs(120);
 
 /// Containers of one image (and size) running when another starts before
@@ -125,12 +128,13 @@ fn adjust(clone: &mut VmRecord, own: &VmRecord) {
 impl Bases {
     /// Whether the machine would branch from a ready base, so creating it
     /// need not seed its storage.
-    pub(crate) fn ready_for(&self, vm: &VmRecord) -> bool {
+    pub(crate) fn ready_for(&self, engine: &Engine, vm: &VmRecord) -> bool {
         key(vm).is_some_and(|key| {
-            matches!(
-                self.inner.lock().get(&key).map(|b| &b.status),
-                Some(Status::Ready(_))
-            )
+            shared_base(engine, &key).is_some()
+                || matches!(
+                    self.inner.lock().get(&key).map(|b| &b.status),
+                    Some(Status::Ready(_))
+                )
         })
     }
 
@@ -166,7 +170,11 @@ impl Bases {
             let name = format!("docker-base-{}", &super::util::new_id()[..12]);
             base.status = Status::Building(name.clone());
             let (engine, vm, key) = (engine.clone(), vm.clone(), key.to_string());
-            std::thread::spawn(move || build(&engine, &vm, &key, &name));
+            let activity = engine.activity.hold();
+            std::thread::spawn(move || {
+                let _activity = activity;
+                build(&engine, &vm, &key, &name);
+            });
         }
         None
     }
@@ -239,6 +247,13 @@ fn build(engine: &Arc<Engine>, template: &VmRecord, key: &str, name: &str) {
             .ok_or_else(|| crate::Error::config("warm base", "the container has no image"))?;
         let mut labels = BTreeMap::new();
         labels.insert(BASE_LABEL.to_string(), key.to_string());
+        labels.insert(
+            BASE_ENGINE.into(),
+            engine.config.root.to_string_lossy().into_owned(),
+        );
+        if let Some(owner) = &engine.owner {
+            labels.insert(BASE_OWNER.into(), owner.clone());
+        }
         let spec = crate::machine_spec::CreateSpec {
             net: true,
             network_backend: Some(crate::network::NetworkBackend::VirtioNet),
@@ -269,6 +284,9 @@ fn build(engine: &Arc<Engine>, template: &VmRecord, key: &str, name: &str) {
         Ok(handle) => {
             tracing::info!(base = %name, %key, "warm base ready");
             engine.bases.handles.lock().insert(name.clone(), handle);
+            let _ = engine.db.update_vm(&name, |vm| {
+                vm.labels.insert(BASE_READY.into(), "true".into());
+            });
             engine.bases.set(key, Status::Ready(name));
         }
         Err(error) => {
@@ -293,12 +311,15 @@ pub(crate) fn branch(
     if !enabled() {
         return None;
     }
+    let _gate = base_lock(engine)?;
     let own = engine.db.get_vm(machine).ok().flatten()?;
     if own.golden.is_some() {
         return None;
     }
     let key = key(&own)?;
-    let base = engine.bases.note_start(engine, &own, &key)?;
+    // A ready base belongs to a workload supervisor, not the disposable adapter.
+    let shared = shared_base(engine, &key);
+    let base = shared.or_else(|| engine.bases.note_start(engine, &own, &key))?;
     // The created machine's record says what the container needs; the
     // branch takes its place under the same name.
     if let Err(error) = crate::embedded::control::delete_vm(&engine.db, machine) {
@@ -323,12 +344,26 @@ pub(crate) fn branch(
 /// Stop retired bases no running container depends on, and delete the ones
 /// no container depends on at all.
 pub(crate) fn collect(engine: &Arc<Engine>) {
+    let Some(_gate) = base_lock(engine) else {
+        return;
+    };
     let current = engine.bases.current();
     let Ok(vms) = engine.db.list_vms() else {
         return;
     };
     for (name, vm) in vms {
-        if !vm.labels.contains_key(BASE_LABEL) || current.contains(&name) {
+        let another_owner = vm
+            .labels
+            .get(BASE_OWNER)
+            .is_some_and(|owner| engine.owner.as_ref() != Some(owner));
+        if !vm.labels.contains_key(BASE_LABEL)
+            || vm
+                .labels
+                .get(BASE_ENGINE)
+                .is_some_and(|root| root != engine.config.root.to_string_lossy().as_ref())
+            || current.contains(&name)
+            || (another_owner && vm.is_process_alive())
+        {
             continue;
         }
         let dependents = engine.db.dependent_clones(&name).unwrap_or_default();
@@ -393,6 +428,82 @@ pub(crate) async fn shutdown(engine: &Arc<Engine>) {
     engine.bases.retire_all();
     let e = engine.clone();
     let _ = tokio::task::spawn_blocking(move || collect(&e)).await;
+}
+
+fn shared_base(engine: &Engine, key: &str) -> Option<String> {
+    engine
+        .db
+        .list_vms()
+        .ok()?
+        .into_iter()
+        .find(|(_, vm)| {
+            vm.labels.get(BASE_LABEL).map(String::as_str) == Some(key)
+                && vm.labels.get(BASE_ENGINE).map(String::as_str)
+                    == Some(engine.config.root.to_string_lossy().as_ref())
+                && vm.labels.contains_key(BASE_READY)
+                && vm.is_process_alive()
+        })
+        .map(|(name, _)| name)
+}
+
+// Branch selection and base collection must not race across supervisors.
+// Both callers already run on blocking threads.
+fn base_lock(engine: &Engine) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(engine.config.root.join("warm.lock"))
+        .ok()?;
+    // SAFETY: the lock borrows a live descriptor and retains no pointers.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return None;
+    }
+    Some(file)
+}
+
+/// Prevent new branches before allowing an idle owner to exit.
+pub(crate) fn prepare_idle_exit(engine: &Engine) -> bool {
+    let Some(_gate) = base_lock(engine) else {
+        return false;
+    };
+    if has_live_dependents(engine) {
+        return false;
+    }
+    for name in engine.bases.handles.lock().keys() {
+        if engine
+            .db
+            .update_vm(name, |vm| {
+                vm.labels.remove(BASE_READY);
+            })
+            .is_err()
+        {
+            return false;
+        }
+    }
+    engine.bases.retire_all();
+    true
+}
+
+/// A supervisor may outlive its first workload while branches still need its base.
+pub(crate) fn has_live_dependents(engine: &Engine) -> bool {
+    engine.bases.handles.lock().keys().any(|base| {
+        engine
+            .db
+            .dependent_clones(base)
+            .unwrap_or_default()
+            .iter()
+            .any(|name| {
+                engine
+                    .db
+                    .get_vm(name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|vm| vm.is_process_alive())
+            })
+    })
 }
 
 #[cfg(test)]

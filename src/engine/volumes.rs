@@ -35,6 +35,15 @@ pub(crate) struct Volumes {
 }
 
 impl Volumes {
+    pub(crate) fn refresh(&self, store: &Store) -> crate::Result<()> {
+        *self.records.write() = store
+            .load_objects::<VolumeRecord>("volumes")?
+            .into_iter()
+            .map(|r| (r.name.clone(), r))
+            .collect();
+        Ok(())
+    }
+
     pub(crate) fn load(store: &Store) -> crate::Result<Self> {
         let records = store
             .load_objects::<VolumeRecord>("volumes")?

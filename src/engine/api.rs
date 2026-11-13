@@ -77,9 +77,12 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
         .route("/distribution/{*rest}", get(distribution))
         .merge(super::network::routes())
         .fallback(not_found)
-        .with_state(engine);
+        .with_state(engine.clone());
     let mut outer = Router::new()
         .fallback_service(api)
+        .layer(axum::middleware::from_fn(move |req, next| {
+            super::supervisor::dispatch(engine.clone(), req, next)
+        }))
         .layer(axum::middleware::map_request(strip_version));
     if let Some(path) = std::env::var_os("SMOLVM_ENGINE_RECORD") {
         let recorder = Arc::new(Recorder {
@@ -484,57 +487,42 @@ async fn events(State(engine): S, Query(q): Q) -> ApiResult<Response> {
             .unwrap_or(0)
     };
     let until_nanos = until.map(nanos);
-    let mut rx = engine.events.subscribe();
-    let backlog = since
-        .map(|s| engine.events.since(nanos(s)))
-        .unwrap_or_default();
     let (tx, body) = super::stream::json_lines();
     tokio::spawn(async move {
-        let mut last = 0i64;
-        for e in backlog {
-            if until_nanos.is_some_and(|u| e.time_nano > u) {
-                return;
-            }
-            last = e.time_nano;
-            if super::events::matches(&e, &f)
-                && tx
-                    .send(serde_json::to_value(&e).unwrap_or_default())
-                    .await
-                    .is_err()
-            {
-                return;
-            }
-        }
-        let deadline = until.map(|u| {
-            let left = u
-                .duration_since(std::time::SystemTime::now())
-                .unwrap_or_default();
-            tokio::time::Instant::now() + left
-        });
+        let mut last = since
+            .map(nanos)
+            .unwrap_or_else(|| nanos(std::time::SystemTime::now()));
+        let mut seen = std::collections::HashSet::new();
         loop {
-            let next = async {
-                match deadline {
-                    Some(d) => tokio::time::timeout_at(d, rx.recv()).await.ok(),
-                    None => Some(rx.recv().await),
+            for e in engine.events.since(last) {
+                if e.time_nano < last {
+                    continue;
                 }
-            };
-            match next.await {
-                None => return,
-                Some(Ok(e)) => {
-                    if e.time_nano <= last {
-                        continue;
-                    }
-                    if super::events::matches(&e, &f)
-                        && tx
-                            .send(serde_json::to_value(&e).unwrap_or_default())
-                            .await
-                            .is_err()
-                    {
-                        return;
-                    }
+                if until_nanos.is_some_and(|u| e.time_nano > u) {
+                    return;
                 }
-                Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Some(Err(_)) => return,
+                if e.time_nano > last {
+                    seen.clear();
+                    last = e.time_nano;
+                }
+                if !seen.insert(e.cursor.clone()) {
+                    continue;
+                }
+                if super::events::matches(&e, &f)
+                    && tx
+                        .send(serde_json::to_value(&e).unwrap_or_default())
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            }
+            if until.is_some_and(|u| std::time::SystemTime::now() >= u) {
+                return;
+            }
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
     });
@@ -707,7 +695,11 @@ async fn container_wait(
     // before it starts the container can go on to start it.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     tokio::spawn(async move {
-        let body = match super::containers::wait(&c, &condition).await {
+        let result = tokio::select! {
+            result = super::containers::wait(&c, &condition) => result,
+            _ = tx.closed() => return,
+        };
+        let body = match result {
             Ok(code) => serde_json::json!({"StatusCode": code, "Error": null}),
             Err(e) => serde_json::json!({"StatusCode": -1, "Error": {"Message": e.message}}),
         };
@@ -732,7 +724,7 @@ async fn container_rename(
     let name = q
         .get("name")
         .ok_or_else(|| ApiError::bad_request("name is required"))?;
-    super::containers::rename(&engine, &c, name)?;
+    super::containers::rename(&engine, &c, name).await?;
     Ok(no_content())
 }
 
@@ -797,7 +789,11 @@ async fn container_attach(
     let c2 = c.clone();
     tokio::spawn(async move {
         let Some(session) = session.await else { return };
-        let super::stream::Session { input, mut output } = session;
+        let super::stream::Session {
+            input,
+            mut output,
+            _activity,
+        } = session;
         let mut attrs = record.event_attributes();
         attrs.remove("__");
         eng.events
@@ -834,7 +830,11 @@ async fn container_attach(
             return;
         }
         loop {
-            match live.recv().await {
+            let event = tokio::select! {
+                event = live.recv() => event,
+                _ = output.closed() => return,
+            };
+            match event {
                 Ok(super::runtime::Output::Data(s, data)) => {
                     if (s == 1 && !want_stdout) || (s == 2 && !want_stderr) {
                         continue;

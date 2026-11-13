@@ -163,6 +163,9 @@ pub(crate) struct ContainerRecord {
     /// The digest-pinned reference the machine runs.
     pub pull_ref: String,
     pub machine: String,
+    /// Published by the workload supervisor for other machines joining it.
+    #[serde(default)]
+    pub agent_socket: Option<PathBuf>,
     /// The effective config: the client's merged over the image's.
     pub config: ContainerConfig,
     pub host_config: HostConfig,
@@ -321,22 +324,33 @@ impl Container {
 
     pub(crate) fn is_running(&self) -> bool {
         self.running.lock().is_some()
+            || matches!(
+                self.record.lock().state.status.as_str(),
+                "running" | "paused"
+            )
     }
 
     /// The agent socket while the container runs.
     pub(crate) fn socket(&self) -> Option<PathBuf> {
-        self.running.lock().as_ref().map(|r| r.socket.clone())
+        self.running
+            .lock()
+            .as_ref()
+            .map(|r| r.socket.clone())
+            .or_else(|| {
+                let r = self.record.lock();
+                matches!(r.state.status.as_str(), "running" | "paused")
+                    .then(|| r.agent_socket.clone())
+                    .flatten()
+            })
     }
 
     /// Change the record and persist it.
     pub(crate) fn update(&self, engine: &Engine, f: impl FnOnce(&mut ContainerRecord)) {
-        let snapshot = {
-            let mut record = self.record.lock();
-            f(&mut record);
-            record.clone()
-        };
-        if let Err(e) = engine.store.save_container(&snapshot) {
-            tracing::warn!(container = %snapshot.id, error = %e, "could not save container record");
+        let mut record = self.record.lock();
+        f(&mut record);
+        // The record has one supervisor writer; keep its updates ordered on disk too.
+        if let Err(e) = engine.store.save_container(&record) {
+            tracing::warn!(container = %record.id, error = %e, "could not save container record");
         }
     }
 
@@ -366,6 +380,12 @@ pub(crate) async fn create(
     raw_host_config: serde_json::Value,
     platform: Option<String>,
 ) -> ApiResult<(String, Vec<String>)> {
+    let _catalog = super::supervisor::lock(engine.config.root.join("containers.lock"))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    engine
+        .refresh()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let image = engine
         .images
         .resolve(&req.config.image)
@@ -514,6 +534,7 @@ pub(crate) async fn create(
         image_id: image.id.clone(),
         pull_ref: image.pull_ref.clone(),
         machine: machine.clone(),
+        agent_socket: None,
         config,
         host_config,
         host_config_raw: raw_host_config,
@@ -552,7 +573,7 @@ pub(crate) async fn create(
             .get_vm(&machine_for_task)
             .ok()
             .flatten()
-            .is_some_and(|vm| e.bases.ready_for(&vm));
+            .is_some_and(|vm| e.bases.ready_for(&e, &vm));
         let builder = if branches { None } else { crate::image_seed::builder_exe().ok() };
         if let Some(exe) = builder {
             if let Err(error) = crate::image_seed::seed_storage(
@@ -1213,6 +1234,11 @@ pub(crate) async fn start(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult
 }
 
 async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<bool> {
+    if engine.owner.as_deref() != Some(c.id().as_str()) {
+        return Err(ApiError::internal(
+            "only the owning supervisor may start this workload",
+        ));
+    }
     if c.is_running() {
         return Ok(false);
     }
@@ -1377,6 +1403,7 @@ async fn run_container(
             .unwrap_or(0),
     };
     c.update(engine, |r| {
+        r.agent_socket = Some(socket.clone());
         r.state.status = "running".into();
         r.state.pid = pid;
         r.state.exit_code = 0;
@@ -1435,6 +1462,7 @@ async fn run_container(
 /// A start that failed leaves an auto-remove container to be removed, as the
 /// client that asked for `--rm` waits for exactly that.
 fn remove_after_failed_start(engine: &Arc<Engine>, c: &Arc<Container>) {
+    let _ = c.output.send(Output::End);
     if c.record().host_config.auto_remove {
         let (e, c) = (engine.clone(), c.clone());
         tokio::spawn(async move {
@@ -1911,6 +1939,18 @@ pub(crate) async fn remove(
     force: bool,
     volumes: bool,
 ) -> ApiResult<()> {
+    if engine.owner.is_none() {
+        let request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/containers/{}?force={force}&v={volumes}", c.id()))
+            .body(axum::body::Body::empty())
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let response = super::supervisor::forward(engine, &c.id(), request).await?;
+        if !response.status().is_success() {
+            return Err(ApiError::internal("supervisor refused container removal"));
+        }
+        return Ok(());
+    }
     let _op = c.op.lock().await;
     let record = c.record();
     if c.is_running() || record.state.status == "restarting" {
@@ -1956,6 +1996,7 @@ pub(crate) async fn remove(
             }
         }
     }
+    let _ = c.output.send(Output::End);
     c.emit(engine, "destroy", &[]);
     c.exits.send_modify(|s| s.removed = true);
     Ok(())
@@ -1963,11 +2004,13 @@ pub(crate) async fn remove(
 
 /// Whether any container mounts the volume.
 pub(crate) fn volume_in_use(engine: &Engine, name: &str) -> bool {
-    engine.containers.read().values().any(|c| {
-        c.record()
-            .mounts
-            .iter()
-            .any(|m| m.kind == "volume" && m.source == name)
+    // Other supervisors may have created references since this process last served a request.
+    engine.store.load_containers().map_or(true, |records| {
+        records.iter().any(|r| {
+            r.mounts
+                .iter()
+                .any(|m| m.kind == "volume" && m.source == name)
+        })
     })
 }
 
@@ -2040,7 +2083,13 @@ pub(crate) async fn pause(engine: &Arc<Engine>, c: &Arc<Container>, pause: bool)
 }
 
 /// `POST /containers/{id}/rename`.
-pub(crate) fn rename(engine: &Engine, c: &Container, new_name: &str) -> ApiResult<()> {
+pub(crate) async fn rename(engine: &Engine, c: &Container, new_name: &str) -> ApiResult<()> {
+    let _catalog = super::supervisor::lock(engine.config.root.join("containers.lock"))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    engine
+        .refresh()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let new_name = new_name.trim_start_matches('/');
     if !super::util::valid_container_name(new_name) {
         return Err(ApiError::bad_request(format!(
@@ -2157,6 +2206,9 @@ async fn health_loop(engine: Arc<Engine>, c: Arc<Container>, h: HealthConfig) {
 pub(crate) async fn recover(engine: &Arc<Engine>) {
     let containers: Vec<Arc<Container>> = engine.containers.read().values().cloned().collect();
     for c in containers {
+        if engine.owner.as_deref() != Some(c.id().as_str()) {
+            continue;
+        }
         let record = c.record();
         let was_running = matches!(
             record.state.status.as_str(),
@@ -2184,7 +2236,7 @@ pub(crate) async fn recover(engine: &Arc<Engine>) {
             "unless-stopped" => !record.user_stopped,
             "on-failure" => was_running,
             _ => false,
-        } && (was_running || policy == "always");
+        } && was_running;
         c.update(engine, |r| {
             r.running_at_shutdown = false;
             if restart {
@@ -2208,7 +2260,7 @@ pub(crate) async fn shutdown_all(engine: &Arc<Engine>) {
         .containers
         .read()
         .values()
-        .filter(|c| c.is_running())
+        .filter(|c| engine.owner.as_deref() == Some(c.id().as_str()) && c.is_running())
         .cloned()
         .collect();
     let mut tasks = Vec::new();

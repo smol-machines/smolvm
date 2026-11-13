@@ -124,11 +124,18 @@ pub(crate) struct Networks {
     records: parking_lot::RwLock<HashMap<String, NetworkRecord>>,
     /// The switch directory.
     dir: PathBuf,
-    /// Serializes address allocation and switch writes.
-    lock: tokio::sync::Mutex<()>,
 }
 
 impl Networks {
+    pub(crate) fn refresh(&self, store: &Store) -> crate::Result<()> {
+        *self.records.write() = store
+            .load_objects::<NetworkRecord>("networks")?
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
+        Ok(())
+    }
+
     pub(crate) fn load(store: &Store, socket: &Path) -> crate::Result<Self> {
         let mut records: HashMap<String, NetworkRecord> = store
             .load_objects::<NetworkRecord>("networks")?
@@ -171,13 +178,12 @@ impl Networks {
             .parent()
             .map(|p| p.join("sw"))
             .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-sw"));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Routes belong to running machines and survive API adapter restarts.
         std::fs::create_dir_all(dir.join("ep"))?;
         std::fs::create_dir_all(dir.join("n"))?;
         Ok(Self {
             records: parking_lot::RwLock::new(records),
             dir,
-            lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -638,7 +644,7 @@ fn allocate6(
 /// Give a container its addresses before its machine boots, and put it on
 /// the switch.
 pub(crate) async fn before_start(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<()> {
-    let _lock = engine.networks.lock.lock().await;
+    let _lock = lock_network(engine).await?;
     let record = c.record();
     let mut assigned: Vec<(String, EndpointRecord)> = Vec::new();
     for (name, mut ep) in ordered(&record) {
@@ -763,7 +769,9 @@ async fn set_addresses(socket: &Path, addresses: Vec<String>) -> ApiResult<()> {
 
 /// Release a stopped container's addresses.
 pub(crate) async fn after_stop(engine: &Arc<Engine>, c: &Arc<Container>) {
-    let _lock = engine.networks.lock.lock().await;
+    let Ok(_lock) = lock_network(engine).await else {
+        return;
+    };
     let record = c.record();
     unlink_all(engine, &record);
     let names: Vec<String> = record.networks.keys().cloned().collect();
@@ -1204,7 +1212,7 @@ async fn create(
     use axum::response::IntoResponse;
     let req: NetworkCreateRequest = super::util::parse_body(&body)?;
     let record = {
-        let _lock = engine.networks.lock.lock().await;
+        let _lock = lock_network(&engine).await?;
         engine.networks.create(&engine.store, req)?
     };
     network_event(&engine, "create", &record, None);
@@ -1245,7 +1253,7 @@ async fn remove(
         ));
     }
     {
-        let _lock = engine.networks.lock.lock().await;
+        let _lock = lock_network(&engine).await?;
         engine.networks.remove(&engine.store, &n.id);
     }
     network_event(&engine, "destroy", &n, None);
@@ -1263,7 +1271,7 @@ async fn prune(
             continue;
         }
         {
-            let _lock = engine.networks.lock.lock().await;
+            let _lock = lock_network(&engine).await?;
             engine.networks.remove(&engine.store, &n.id);
         }
         network_event(&engine, "destroy", &n, None);
@@ -1305,7 +1313,7 @@ async fn connect(
     let mut ep = endpoint_for(&n, &settings, &record.name);
     if c.is_running() {
         let record = {
-            let _lock = engine.networks.lock.lock().await;
+            let _lock = lock_network(&engine).await?;
             let ip = allocate(&engine, &n, &ep.requested_ip, &record.id)?;
             let (_, len) = n.net().unwrap_or((Ipv4Addr::UNSPECIFIED, 16));
             ep.ip = ip.to_string();
@@ -1361,7 +1369,7 @@ async fn disconnect(
         ));
     }
     {
-        let _lock = engine.networks.lock.lock().await;
+        let _lock = lock_network(&engine).await?;
         unlink_all(&engine, &record);
         c.update(&engine, |r| {
             r.networks.remove(&n.name);
@@ -1378,6 +1386,16 @@ async fn disconnect(
     }
     network_event(&engine, "disconnect", &n, Some(&record.id));
     Ok(axum::http::StatusCode::OK)
+}
+
+async fn lock_network(engine: &Engine) -> ApiResult<std::fs::File> {
+    let guard = super::supervisor::lock(engine.store.root().join("network.lock"))
+        .await
+        .map_err(|e| ApiError::internal(format!("lock networks: {e}")))?;
+    engine
+        .refresh()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(guard)
 }
 
 #[cfg(test)]

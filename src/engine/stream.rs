@@ -28,21 +28,32 @@ pub(crate) fn frame(stream: u8, payload: &[u8]) -> Vec<u8> {
 
 /// Where a hijacked session's output goes.
 pub(crate) enum Sink {
-    Raw(Box<dyn AsyncWrite + Unpin + Send>),
+    Raw(
+        Box<dyn AsyncWrite + Unpin + Send>,
+        Option<super::supervisor::Peer>,
+    ),
     Body(tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>),
 }
 
 impl Sink {
+    pub(crate) async fn closed(&mut self) {
+        match self {
+            Sink::Raw(_, Some(peer)) => peer.closed().await,
+            Sink::Raw(_, None) => std::future::pending().await,
+            Sink::Body(tx) => tx.closed().await,
+        }
+    }
+
     /// Write `bytes`; `false` once the client has gone.
     pub(crate) async fn write(&mut self, bytes: Vec<u8>) -> bool {
         match self {
-            Sink::Raw(w) => w.write_all(&bytes).await.is_ok() && w.flush().await.is_ok(),
+            Sink::Raw(w, _) => w.write_all(&bytes).await.is_ok() && w.flush().await.is_ok(),
             Sink::Body(tx) => tx.send(Ok(Bytes::from(bytes))).await.is_ok(),
         }
     }
 
     pub(crate) async fn close(self) {
-        if let Sink::Raw(mut w) = self {
+        if let Sink::Raw(mut w, _) = self {
             let _ = w.shutdown().await;
         }
     }
@@ -50,6 +61,7 @@ impl Sink {
 
 /// A hijacked session: the client's input (when it upgraded) and its output.
 pub(crate) struct Session {
+    pub(crate) _activity: Option<super::supervisor::ActivityGuard>,
     pub input: Option<Box<dyn AsyncRead + Unpin + Send>>,
     pub output: Sink,
 }
@@ -77,6 +89,14 @@ pub(crate) fn hijack(
     Response,
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<Session>> + Send>>,
 ) {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<super::supervisor::Peer>>()
+        .map(|p| p.0.clone());
+    let activity = req
+        .extensions()
+        .get::<std::sync::Arc<super::supervisor::Activity>>()
+        .map(|a| a.hold());
     if wants_upgrade(&req) {
         let on_upgrade = hyper::upgrade::on(&mut req);
         let response = Response::builder()
@@ -91,8 +111,9 @@ pub(crate) fn hijack(
             let io = hyper_util::rt::TokioIo::new(upgraded);
             let (r, w) = tokio::io::split(io);
             Some(Session {
+                _activity: activity,
                 input: Some(Box::new(r) as Box<dyn AsyncRead + Unpin + Send>),
-                output: Sink::Raw(Box::new(w)),
+                output: Sink::Raw(Box::new(w), peer),
             })
         });
         (response, session)
@@ -105,6 +126,7 @@ pub(crate) fn hijack(
             .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
         let session = Box::pin(async move {
             Some(Session {
+                _activity: activity,
                 input: None,
                 output: Sink::Body(tx),
             })

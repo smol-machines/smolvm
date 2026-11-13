@@ -47,6 +47,7 @@ pub(crate) fn create(engine: &Engine, c: &Container, req: ExecCreateRequest) -> 
         state: parking_lot::Mutex::new(ExecState::default()),
         input: InputQueue::default(),
     });
+    persist(engine, &exec);
     engine.execs.lock().insert(id.clone(), exec);
     let record = c.record();
     let mut attrs = record.event_attributes();
@@ -145,6 +146,7 @@ pub(crate) async fn start(
         state.started = true;
         state.running = true;
     }
+    persist(engine, &exec);
     let socket = c
         .socket()
         .ok_or_else(|| ApiError::conflict(format!("container {} is not running", c.id())))?;
@@ -192,6 +194,7 @@ pub(crate) async fn start(
                 state.running = false;
                 state.exit_code = Some(code);
             }
+            persist(engine, &exec);
             let message = format!("OCI runtime exec failed: exec failed: {message}\r\n");
             if body.detach {
                 return Err(ApiError::internal(message.trim_end().to_string()));
@@ -247,6 +250,7 @@ pub(crate) async fn start(
                 state.running = false;
                 state.exit_code = Some(code);
             }
+            persist(&engine, &exec);
             let mut attrs = attrs;
             attrs.insert("exitCode".into(), code.to_string());
             engine
@@ -278,7 +282,11 @@ pub(crate) async fn start(
             finish(130);
             return;
         };
-        let super::stream::Session { input, mut output } = session;
+        let super::stream::Session {
+            input,
+            mut output,
+            _activity,
+        } = session;
         if let Some(input) = input {
             if exec2.config.attach_stdin {
                 let exec3 = exec2.clone();
@@ -406,5 +414,11 @@ pub(crate) async fn run_capture(
             -1,
             format!("Health check exceeded timeout ({}s)", timeout.as_secs_f64()),
         )),
+    }
+}
+
+fn persist(engine: &Engine, exec: &Exec) {
+    if let Err(error) = engine.store.save_object("execs", &exec.id, &inspect(exec)) {
+        tracing::warn!(%error, "persist exec state");
     }
 }

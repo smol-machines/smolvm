@@ -4,43 +4,64 @@
 Testcontainers and VS Code Dev Containers talk to it as they talk to a Docker daemon, and nothing
 runs Docker: every container is a smol machine booted from its image.
 
-## Start it
+## Use it
+
+User installations register the Docker socket automatically on macOS and on Linux with a
+systemd user session; Docker connections start the API adapter only when needed.
+For a source build or an existing installation, run the setup command once:
 
 ```bash
-smolvm engine start
+smolvm engine
 docker run --rm alpine echo hello
 ```
 
-`smolvm engine start` runs the engine in the background (its log is `engine/engine.log` in the
-smolvm data directory), creates the docker context `smol` for its socket and selects it, and
-writes `docker.host` to `~/.testcontainers.properties` unless that file already names another
-daemon. It prints what it changed, including the context it replaced, so `docker context use
-<previous>` switches back.
+Setup registers the socket, selects the `smol` Docker context, and writes `docker.host` to
+`~/.testcontainers.properties` unless that file already names another runtime. It reports
+which context it replaced; `docker context use <previous>` switches back. No manual engine
+startup or persistent central daemon is needed after setup.
 
-Without the context, point a client at the socket yourself:
+A client that does not use Docker contexts can use the same socket:
 
 ```bash
 export DOCKER_HOST=unix://$HOME/.smolvm/run/docker.sock
 ```
 
-Testcontainers needs nothing else: with `DOCKER_HOST` set (or the properties file), the Node,
-Python, Go and Java libraries start their containers and their Ryuk reaper in machines.
-
-Some tools only look at `/var/run/docker.sock`. `smolvm engine link-socket` links that path to the
-engine's socket, through `sudo`; `--print` shows the command instead, and an existing
-`/var/run/docker.sock` that is not a link to the engine is left alone unless `--force` is given.
+Testcontainers uses that endpoint to start containers and its Ryuk reaper in machines.
+For clients fixed to `/var/run/docker.sock`, `smolvm engine link-socket` links that path to the
+same OS-owned socket through `sudo`, preserving an existing endpoint unless `--force` is used.
 
 | Command | What it does |
 |---|---|
-| `smolvm engine start` | start in the background, select the `smol` context |
-| `smolvm engine status [--json]` | whether it runs, its socket and process |
-| `smolvm engine stop` | stop it; running containers stop with it, as with a daemon without live restore |
-| `smolvm engine serve` | run in the foreground |
-| `smolvm engine link-socket` | link `/var/run/docker.sock` to the engine's socket |
+| `smolvm engine` | configure automatic activation and Docker client integration |
+| `smolvm engine status [--json]` | show registration and adapter activity without waking it |
+| `smolvm engine link-socket` | link `/var/run/docker.sock` to the same endpoint |
 
-Each takes `--socket PATH` for a socket other than `~/.smolvm/run/docker.sock`. The engine keeps
-its records under the smolvm data directory, in `engine/`: one JSON file per container, image,
-volume and network, and each container's log in Docker's `json-file` format.
+The default socket is `~/.smolvm/run/docker.sock`. Container, image, network, volume, exec,
+and event records are stored under the smolvm data directory in `engine/`.
+
+## Process lifetime
+
+The native machine CLI operates directly on machines. Docker clients use a disposable HTTP
+adapter, started by `launchd` on macOS or a user `systemd` socket on Linux. After ten seconds
+without requests or streams, the adapter exits, even if machines are running. An attached
+terminal, followed log, events subscription, image transfer, or build keeps it alive until
+that operation ends. The OS keeps the listening socket while the adapter is absent.
+
+Each Docker workload has a supervisor that owns its VM handle, I/O, health checks and restart
+policy. Killing or restarting the adapter does not stop containers, published ports or
+container networking. The next adapter reads durable records and reconnects to those
+supervisors, including exec sessions created before the adapter disappeared. Supervisors
+exit after their workloads and outstanding requests finish; one that owns a shared warm
+base remains while running branches still need it. No SmolVM process stays resident when
+nothing needs it. Native machine operations do not depend on socket activation.
+
+`docker stop` and `docker compose down` remain explicit workload operations. Adapter shutdown is never an instruction to stop workloads. The former engine
+start/stop commands are hidden compatibility commands: start performs setup and stop disconnects
+only the adapter. Internal serve/supervise commands are service-manager entry points.
+
+When upgrading from the old central engine, stop its containers before replacing its service;
+that older process owns their runtime handles and cannot transfer them to the new supervisors.
+Registration refuses to replace an occupied socket rather than killing those workloads.
 
 ## What a container is
 
@@ -143,7 +164,7 @@ the image branch from it instead of booting. A branched container starts from th
 and disks and shares them until it writes: on a Mac, an `alpine` container that sleeps costs
 about 55 MB of its own memory branched and about 230 MB booted, while the base costs about as much
 as one booted container. A branch starts no faster than a boot, so an image run one container at
-a time never gets a base. A base unused for two minutes is retired; it is stopped once no
+a time never gets a base. A base belongs to its workload supervisor, so adapter exits do not retire it; an unused base is retired after two minutes; it is stopped once no
 container branched from it runs, and deleted with the last one.
 
 Branching is on for macOS. On Linux, a branch's disks are copy-on-write overlay images that take
@@ -156,10 +177,9 @@ socket: mounts are devices a machine boots with.
 
 ## Building images
 
-The engine does not build images. `POST /build` (`DOCKER_BUILDKIT=0 docker build`, `docker
-compose build` with `DOCKER_BUILDKIT=0`), `/session` and `/grpc` answer with an error that says
-so. Build the image elsewhere, push it to a registry the engine can pull from,
-and refer to it by name.
+The engine does not embed a builder: the legacy `POST /build`, `/session` and `/grpc`
+endpoints return an unsupported-operation error. Use Buildx's `docker-container` driver to
+run BuildKit inside a smol machine and load the result back into the engine.
 
 What the clients send, for whoever adds builds:
 
@@ -169,9 +189,7 @@ What the clients send, for whoever adds builds:
   starts a container from it, and talks BuildKit's gRPC to it through `docker exec`. Against this
   engine that container is an ordinary container, so this path needs no build endpoint at all:
   `docker buildx create --driver docker-container` then `docker buildx build --load` builds, and
-  the image comes back through `docker load`. A `RUN` step does not work there yet: BuildKit keeps
-  its snapshots in a volume, and the snapshot mounts it makes in a host-directory volume are
-  refused.
+  the image comes back through `docker load`, including builds with `RUN` steps.
 - `DOCKER_BUILDKIT=0 docker build` uses the classic `POST /build?t=<tag>&dockerfile=<path>` with
   the build context as a tar body, and reads a JSON progress stream back.
 - `docker compose build` hands the build to buildx (`bake`), with the same two paths;
@@ -183,3 +201,13 @@ What the clients send, for whoever adds builds:
 
 - Network drivers other than `bridge`, and IPv6 on the default `bridge` network.
 - Changing an internal network's egress after a container on it was created.
+
+## Validate process lifetime
+
+Against an isolated, registered test engine, set `DOCKER_HOST` and
+`SMOLVM_ENGINE_TEST_ROOT` to its socket and state directory, then run
+`python3 tests/test_engine_lifecycle.py`; it kills the adapter, checks workload survival,
+and verifies that supervisors exit after cleanup. On macOS, also run
+`python3 tests/test_engine_warm_lifecycle.py` to check that a warm branch outlives its
+original workload owner and releases its base when the final branch is removed.
+Run these tests sequentially on an engine without other workloads.

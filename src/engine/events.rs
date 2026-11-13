@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::filters::Filters;
 
@@ -10,15 +10,17 @@ use super::filters::Filters;
 const HISTORY: usize = 2048;
 
 /// One event, in the shape the Docker API streams.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Event {
+    #[serde(skip)]
+    pub cursor: String,
     #[serde(rename = "Type")]
-    pub kind: &'static str,
+    pub kind: String,
     #[serde(rename = "Action")]
     pub action: String,
     #[serde(rename = "Actor")]
     pub actor: Actor,
-    pub scope: &'static str,
+    pub scope: String,
     pub time: i64,
     #[serde(rename = "timeNano")]
     pub time_nano: i64,
@@ -32,7 +34,7 @@ pub(crate) struct Event {
 }
 
 /// The object an event is about.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Actor {
     #[serde(rename = "ID")]
     pub id: String,
@@ -40,22 +42,29 @@ pub(crate) struct Actor {
     pub attributes: BTreeMap<String, String>,
 }
 
-/// The event bus: a broadcast channel plus a short history.
+/// A bounded history shared by the adapter and workload supervisors.
 pub(crate) struct Events {
-    sender: tokio::sync::broadcast::Sender<Event>,
+    root: Option<std::path::PathBuf>,
     history: parking_lot::Mutex<VecDeque<Event>>,
 }
 
 impl Events {
+    pub(crate) fn persistent(root: &std::path::Path) -> crate::Result<Self> {
+        let dir = root.join("events");
+        std::fs::create_dir_all(&dir)?;
+        let mut events = Self::new();
+        events.root = Some(dir);
+        Ok(events)
+    }
+
     pub(crate) fn new() -> Self {
-        let (sender, _) = tokio::sync::broadcast::channel(1024);
         Self {
-            sender,
+            root: None,
             history: parking_lot::Mutex::new(VecDeque::with_capacity(HISTORY)),
         }
     }
 
-    /// Record and broadcast an event.
+    /// Persist an event for current subscribers and reconnecting clients.
     pub(crate) fn emit(
         &self,
         kind: &'static str,
@@ -69,7 +78,8 @@ impl Events {
         let action = action.into();
         let container = kind == "container";
         let event = Event {
-            kind,
+            cursor: super::util::new_id(),
+            kind: kind.into(),
             status: container.then(|| action.clone()),
             id: container.then(|| id.to_string()),
             from: container
@@ -80,10 +90,20 @@ impl Events {
                 id: id.to_string(),
                 attributes,
             },
-            scope: "local",
+            scope: "local".into(),
             time: now.as_secs() as i64,
             time_nano: now.as_nanos() as i64,
         };
+        if let Some(root) = &self.root {
+            let name = format!("{}-{}.json", event.time_nano, event.cursor);
+            let path = root.join(name);
+            let temp = path.with_extension("tmp");
+            if let Ok(bytes) = serde_json::to_vec(&event) {
+                if std::fs::write(&temp, bytes).is_ok() {
+                    let _ = std::fs::rename(temp, path);
+                }
+            }
+        }
         {
             let mut history = self.history.lock();
             if history.len() == HISTORY {
@@ -91,15 +111,39 @@ impl Events {
             }
             history.push_back(event.clone());
         }
-        let _ = self.sender.send(event);
-    }
-
-    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
-        self.sender.subscribe()
     }
 
     /// Past events at or after `since_nanos`.
     pub(crate) fn since(&self, since_nanos: i64) -> Vec<Event> {
+        if let Some(root) = &self.root {
+            let mut paths: Vec<_> = std::fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|s| s == "json"))
+                .collect();
+            paths.sort();
+            let excess = paths.len().saturating_sub(HISTORY);
+            for path in &paths[..excess] {
+                let _ = std::fs::remove_file(path);
+            }
+            return paths[excess..]
+                .iter()
+                .filter_map(|p| {
+                    let name = p.file_name()?.to_str()?;
+                    let timestamp: i64 = name.split_once('-')?.0.parse().ok()?;
+                    if timestamp < since_nanos {
+                        return None;
+                    }
+                    let bytes = std::fs::read(p).ok()?;
+                    let mut event: Event = serde_json::from_slice(&bytes).ok()?;
+                    event.cursor = p.file_name()?.to_string_lossy().into_owned();
+                    Some(event)
+                })
+                .filter(|e| e.time_nano >= since_nanos)
+                .collect();
+        }
         self.history
             .lock()
             .iter()
@@ -150,5 +194,26 @@ mod tests {
         assert!(matches(e, &f));
         let f = Filters::parse(Some(r#"{"container":["other"]}"#)).unwrap();
         assert!(!matches(e, &f));
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    #[test]
+    fn independent_process_views_recover_events_after_the_emitter_goes_away() {
+        let root = tempfile::tempdir().unwrap();
+        let writer = Events::persistent(root.path()).unwrap();
+        writer.emit("container", "start", "one", BTreeMap::new());
+        drop(writer);
+        let reader = Events::persistent(root.path()).unwrap();
+        let events = reader.since(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor.id, "one");
+        assert!(!events[0].cursor.is_empty());
+        assert!(serde_json::to_value(&events[0])
+            .unwrap()
+            .get("cursor")
+            .is_none());
     }
 }

@@ -41,6 +41,7 @@ mod network;
 mod runtime;
 mod store;
 mod stream;
+mod supervisor;
 mod util;
 mod volumes;
 mod warm;
@@ -82,6 +83,9 @@ pub fn default_socket_path(home: &Path) -> PathBuf {
 /// Shared engine state. Handlers hold it behind an `Arc`.
 pub(crate) struct Engine {
     pub(crate) config: EngineConfig,
+    /// Only a workload supervisor may own a live VM.
+    pub(crate) owner: Option<String>,
+    pub(crate) activity: Arc<supervisor::Activity>,
     pub(crate) db: crate::db::SmolvmDb,
     pub(crate) store: store::Store,
     pub(crate) containers: parking_lot::RwLock<HashMap<String, Arc<containers::Container>>>,
@@ -94,14 +98,17 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    fn open(config: EngineConfig) -> crate::Result<Arc<Self>> {
+    fn open(config: EngineConfig, owner: Option<String>) -> crate::Result<Arc<Self>> {
         let store = store::Store::open(&config.root)?;
         let db = crate::db::SmolvmDb::open()?;
         let images = images::Images::load(&store)?;
         let volumes = volumes::Volumes::load(&store)?;
         let networks = network::Networks::load(&store, &config.socket)?;
         let engine = Arc::new(Self {
+            events: events::Events::persistent(&config.root)?,
             config,
+            owner,
+            activity: Arc::new(supervisor::Activity::default()),
             db,
             store,
             containers: parking_lot::RwLock::new(HashMap::new()),
@@ -109,7 +116,6 @@ impl Engine {
             volumes,
             networks,
             execs: parking_lot::Mutex::new(HashMap::new()),
-            events: events::Events::new(),
             bases: warm::Bases::default(),
         });
         for record in engine.store.load_containers()? {
@@ -120,6 +126,24 @@ impl Engine {
                 .insert(container.id().to_string(), container);
         }
         Ok(engine)
+    }
+
+    /// Reattach to durable state without replacing the supervisor's live object.
+    fn refresh(&self) -> crate::Result<()> {
+        let records = self.store.load_containers()?;
+        let mut containers = self.containers.write();
+        let owner = self.owner.as_deref();
+        containers.retain(|id, _| owner == Some(id.as_str()));
+        for record in records {
+            containers
+                .entry(record.id.clone())
+                .or_insert_with(|| containers::Container::from_record(record));
+        }
+        drop(containers);
+        self.images.refresh(&self.store)?;
+        self.volumes.refresh(&self.store)?;
+        self.networks.refresh(&self.store)?;
+        Ok(())
     }
 
     /// The container named by a full id, a unique id prefix, or a name.
@@ -140,51 +164,14 @@ impl Engine {
     }
 }
 
-/// Serve the Docker Engine API on `config.socket` until SIGINT or SIGTERM.
-/// Running containers are stopped on the way out, as a Docker daemon without
-/// live restore stops them.
+/// Serve the disposable Docker API adapter; workloads run in their own processes.
 pub async fn serve(config: EngineConfig) -> crate::Result<()> {
-    let engine = tokio::task::spawn_blocking(move || Engine::open(config))
-        .await
-        .map_err(|e| crate::Error::config("engine", e.to_string()))??;
-    containers::recover(&engine).await;
-    // Bases left by an earlier run are retired: none is ready any more.
-    warm::shutdown(&engine).await;
-    warm::spawn_reaper(&engine);
+    supervisor::serve(config, None).await
+}
 
-    let listener = bind_socket(&engine.config.socket)?;
-    tracing::info!(socket = %engine.config.socket.display(), "engine listening");
-    let app = api::router(engine.clone());
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(crate::Error::Io)?;
-    let mut graceful = stop_rx.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = graceful.wait_for(|stop| *stop).await;
-    });
-    let mut server = std::pin::pin!(std::future::IntoFuture::into_future(server));
-    let served = tokio::select! {
-        result = &mut server => result,
-        _ = async {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-        } => {
-            let _ = stop_tx.send(true);
-            // Long-lived streams (events, logs, attach) never finish on their
-            // own; give requests a moment, then go.
-            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await {
-                Ok(result) => result,
-                Err(_) => Ok(()),
-            }
-        }
-    };
-    drop(stop_rx);
-    containers::shutdown_all(&engine).await;
-    warm::shutdown(&engine).await;
-    let _ = std::fs::remove_file(&engine.config.socket);
-    served.map_err(crate::Error::Io)
+/// Internal workload process; not a second user-facing engine mode.
+pub async fn supervise(config: EngineConfig, id: String) -> crate::Result<()> {
+    supervisor::serve(config, Some(id)).await
 }
 
 /// Bind the API socket, replacing a stale one. The socket is private to the
