@@ -113,6 +113,14 @@ pub const GATEWAY6: &str = "SMOLVM_NETWORK_GATEWAY6";
 pub const PREFIX_LEN6: &str = "SMOLVM_NETWORK_PREFIX_LEN6";
 /// Guest-visible DNS server IPv4 address.
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
+/// Link MTU for `eth0`. Optional: absent means 1500, which is what a host
+/// without this key expects.
+pub const MTU: &str = "SMOLVM_NETWORK_MTU";
+/// The MTU of the link between the guest and smolvm's own gateway. That gateway
+/// ends every TCP connection on the host, so the internet's 1500 never applies
+/// on this hop; a 64 KB link carries a download in ~40x fewer packets, and each
+/// packet costs CPU in the guest and in the host stack alike.
+pub const GATEWAY_LINK_MTU: u16 = 65520;
 /// Resolver `options` for the guest's `/etc/resolv.conf`, space-separated
 /// (`--dns-option`, repeatable), e.g. `timeout:1 attempts:3 rotate use-vc`.
 /// Every writer of resolv.conf appends them as one `options` line.

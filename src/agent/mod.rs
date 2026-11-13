@@ -282,6 +282,11 @@ pub(crate) fn guest_network_env(
             push(guest_env::PREFIX_LEN6, n.prefix_len6.to_string());
         }
         push(guest_env::DNS, n.dns_server.to_string());
+        // smolvm's own gateway takes large frames; a pod's tap is a real 1500
+        // link, so the guest keeps the default there.
+        if gateway_mac.is_none() {
+            push(guest_env::MTU, guest_env::GATEWAY_LINK_MTU.to_string());
+        }
     } else if let Some(dns) = crate::data::network::effective_dns(
         dns_override,
         crate::network::EffectiveNetworkBackend::Tsi,
