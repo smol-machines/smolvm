@@ -3428,7 +3428,9 @@ name = "smolvm-credentials"
 version = "1.34.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
+ "flate2",
  "futures-util",
  "getrandom 0.3.4",
  "http-body-util",
