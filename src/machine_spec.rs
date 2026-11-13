@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{PublishedSocketConfig, RecordState, RestartConfig, RestartPolicy, VmRecord};
-use crate::credentials::CredentialPolicy;
+use crate::credentials::{CredentialBinding, CredentialPolicy};
 use crate::data::disk::{AttachedDisk, CacheDisk};
 use crate::data::network::{AutoPorts, PortMapping};
 use crate::data::resources::{
@@ -446,8 +446,9 @@ pub struct RestoredState {
     pub checkpoint_head: Option<String>,
     /// The captured machine routed egress through a host mediator.
     pub mediated_egress_required: bool,
-    /// The bindings came with the artifact, so their values must be supplied
-    /// by the caller, never read from this host's environment.
+    /// The bindings came with the artifact and the host user did not
+    /// re-authorize them, so their values must be supplied by the caller,
+    /// never read from this host's environment.
     pub credentials_from_artifact: bool,
 }
 
@@ -582,6 +583,87 @@ pub struct ResolvedSpec {
     pub labels: BTreeMap<String, String>,
     /// State a restored checkpoint already holds.
     pub restored: Option<RestoredState>,
+}
+
+/// Check that `requested` names every binding `captured` holds, each exactly
+/// as captured: same environment variable, hosts, header and injection
+/// location. Methods stay as captured; a flag cannot name them. Anything else
+/// would let the restore read or send a value the checkpoint never bound.
+fn reauthorize_captured_credentials(
+    captured: Option<&CredentialPolicy>,
+    requested: &CredentialPolicy,
+) -> Result<()> {
+    let refuse = |why: String| {
+        Error::config(
+            "create from a checkpoint",
+            format!(
+                "credential bindings on a restore can only re-authorize the checkpoint's own: {why}"
+            ),
+        )
+    };
+    let Some(captured) = captured.filter(|p| !p.is_empty()) else {
+        return Err(refuse("the checkpoint was captured without any".into()));
+    };
+    let hosts = |b: &CredentialBinding| {
+        let mut hosts: Vec<String> = b
+            .allowed_hosts
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    };
+    for want in &requested.credentials {
+        let Some(have) = captured.credentials.iter().find(|b| b.name == want.name) else {
+            return Err(refuse(format!(
+                "the checkpoint has no binding named '{}'",
+                want.name
+            )));
+        };
+        if have.environment_variable != want.environment_variable
+            || hosts(have) != hosts(want)
+            || have.set_header.as_deref().map(str::to_ascii_lowercase)
+                != want.set_header.as_deref().map(str::to_ascii_lowercase)
+            || have.injection_location != want.injection_location
+        {
+            return Err(refuse(format!(
+                "binding '{}' was captured as {}, which this flag does not match",
+                have.name,
+                describe_binding(have)
+            )));
+        }
+    }
+    if let Some(missing) = captured.credentials.iter().find(|have| {
+        !requested
+            .credentials
+            .iter()
+            .any(|want| want.name == have.name)
+    }) {
+        return Err(refuse(format!(
+            "binding '{}' ({}) is not named; name every binding the checkpoint holds",
+            missing.name,
+            describe_binding(missing)
+        )));
+    }
+    Ok(())
+}
+
+/// A binding in `--credential` form.
+fn describe_binding(b: &CredentialBinding) -> String {
+    let mut out = format!(
+        "{}={}@{}",
+        b.name,
+        b.environment_variable,
+        b.allowed_hosts.join(",")
+    );
+    if b.injection_location.body {
+        out.push_str(":body");
+    }
+    if let Some(header) = &b.set_header {
+        out.push_str(&format!(":set-header={header}"));
+    }
+    out
 }
 
 /// Refuse `field` on a live checkpoint restore.
@@ -1234,13 +1316,28 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 .with_rules(&egress_rules)
                 .map_err(|reason| Error::config("restore checkpoint egress rules", reason))?;
             let _ = credentials_supplied_only;
-            if credentials.is_some() {
-                return Err(fixed(
-                    "credential bindings",
-                    "the captured workload holds the placeholders of the bindings it was \
-                     captured with, and new bindings would mint ones it never received",
-                ));
-            }
+            // A checkpoint's bindings never read this host's environment on the
+            // artifact's say-so: one could name any variable and any host. The
+            // host user re-authorizes them by naming each binding exactly as
+            // captured, so the values read and the hosts they go to are the
+            // user's choice; the guest keeps the placeholders it holds.
+            let host_values = match credentials {
+                None => false,
+                Some(requested) if caller == Caller::Cli => {
+                    reauthorize_captured_credentials(
+                        captured_net.credential_policy.as_ref(),
+                        &requested,
+                    )?;
+                    true
+                }
+                Some(_) => {
+                    return Err(fixed(
+                        "credential bindings",
+                        "the captured workload holds the placeholders of the bindings it was \
+                         captured with, and new bindings would mint ones it never received",
+                    ));
+                }
+            };
             let credentials = captured_net.credential_policy.clone();
             if let Some(policy) = &credentials {
                 // The artifact is untrusted: hold its policy to create's rules.
@@ -1374,8 +1471,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 block_private,
                 egress_rules,
                 credentials,
-                // Bindings a checkpoint brings never read this host's environment.
-                credentials_supplied_only: true,
+                // Bindings a checkpoint brings read this host's environment
+                // only once the host user has re-authorized them.
+                credentials_supplied_only: !host_values,
                 published_sockets: Vec::new(),
                 gpu,
                 gpu_vram_mib: None,
@@ -1402,10 +1500,11 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                         .as_ref()
                         .map(|lineage| lineage.id.clone()),
                     mediated_egress_required: captured_net.mediated_egress_required,
-                    credentials_from_artifact: captured_net
-                        .credential_policy
-                        .as_ref()
-                        .is_some_and(|policy| !policy.is_empty()),
+                    credentials_from_artifact: !host_values
+                        && captured_net
+                            .credential_policy
+                            .as_ref()
+                            .is_some_and(|policy| !policy.is_empty()),
                 }),
             }
         }
