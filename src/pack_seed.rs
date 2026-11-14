@@ -48,6 +48,12 @@ mod imp {
     use crate::{Error, Result};
 
     const FORMAT: u32 = 2;
+    /// Where the agent looks for a pack's workspace seed in its layers share.
+    const WORKSPACE_SEED_DIR: &str = "workspace-seed";
+    const WORKSPACE_SEED_FILE: &str = "workspace.tar";
+    /// Written by the agent once it has seeded `/storage/workspace`.
+    #[cfg(target_os = "macos")]
+    const WORKSPACE_SEEDED_MARKER: &str = ".smolvm-workspace-seeded";
     const GIB: u64 = 1024 * 1024 * 1024;
 
     #[derive(Serialize, Deserialize)]
@@ -122,6 +128,13 @@ mod imp {
             .map(|(layer, id)| (layer.path.clone(), (id, layer.size)))
             .collect();
         let declared: BTreeSet<_> = pending.keys().cloned().collect();
+        // The helper's agent seeds `/storage/workspace` from this path on boot,
+        // as a machine's first boot would.
+        let mut workspace = manifest
+            .assets
+            .workspace_seed
+            .as_ref()
+            .map(|seed| (seed.path.clone(), seed.size));
         let mut archive = tar::Archive::new(reader);
         fs::create_dir_all(output).map_err(fail)?;
         let max_bytes = extraction_limit("SMOLVM_PACK_MAX_EXTRACT_BYTES", 128 * GIB);
@@ -139,6 +152,23 @@ mod imp {
                 return Err(fail("pack exceeds extraction entry limit"));
             }
             let path = entry.path().map_err(fail)?.to_string_lossy().into_owned();
+            if let Some((_, expected)) = workspace.take_if(|(seed, _)| *seed == path) {
+                if !entry.header().entry_type().is_file() || entry.size() != expected {
+                    return Err(fail(
+                        "workspace seed type or length differs from its manifest",
+                    ));
+                }
+                fs::create_dir_all(output.join(WORKSPACE_SEED_DIR)).map_err(fail)?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(output.join(WORKSPACE_SEED_DIR).join(WORKSPACE_SEED_FILE))
+                    .map_err(fail)?;
+                if io::copy(&mut entry, &mut file).map_err(fail)? != expected {
+                    return Err(fail("truncated workspace seed"));
+                }
+                continue;
+            }
             let Some((id, expected)) = pending.remove(&path) else {
                 if declared.contains(&path) {
                     return Err(fail("duplicate packed layer archive"));
@@ -161,6 +191,9 @@ mod imp {
         }
         if !pending.is_empty() {
             return Err(fail("pack is missing a declared layer"));
+        }
+        if workspace.is_some() {
+            return Err(fail("pack is missing its declared workspace seed"));
         }
         fs::write(output.join("layer-order"), ids.join("\n")).map_err(fail)
     }
@@ -216,23 +249,14 @@ mod imp {
                 tars.push(path);
             }
         }
-        // Whiteouts hide files in the layers below them, which the helper's tar
-        // does not do. A pack's only layer has none below: smolvm writes it as
-        // a merged view, so a `.wh.` name in it is a file the machine holds (a
-        // container runtime's overlay data, say), which tar extracts as such.
-        let has_lower_layers = tars.len() > 1;
+        let workspace = layers.join(WORKSPACE_SEED_DIR).join(WORKSPACE_SEED_FILE);
+        if workspace.is_file() {
+            tars.push(workspace);
+        }
         for path in tars {
             let mut archive = tar::Archive::new(LayerReader::open(&path).map_err(fail)?);
             for entry in archive.entries_with_seek().map_err(fail)? {
                 let entry = entry.map_err(fail)?;
-                if has_lower_layers
-                    && entry
-                        .path()?
-                        .file_name()
-                        .is_some_and(|name| name.as_encoded_bytes().starts_with(b".wh."))
-                {
-                    return Ok(None);
-                }
                 entries = entries.saturating_add(1);
                 bytes = bytes.saturating_add(entry.size());
                 if entries > max_entries {
@@ -349,8 +373,17 @@ mod imp {
         let mut client = builder.manager.connect()?;
         let ids = layer_ids(manifest)?;
         let mut script = "set -eu; mkdir -p /storage/layers /storage/configs /storage/manifests /storage/image-metadata; ".to_string();
+        // A pack's only layer is a merged view, so its `.wh.` names are files
+        // the machine held, which tar extracts as such.
         for id in &ids {
             script.push_str(&format!("mkdir -p /storage/layers/{id}; tar --extract --numeric-owner --xattrs --xattrs-include='*' --blocking-factor=1024 --file=/packed_layers/{id}.tar --directory=/storage/layers/{id}; printf ok > /storage/layers/{id}.ok; "));
+        }
+        // The agent seeded the workspace when the storage disk mounted; its
+        // marker is the proof, since a failed seed only logs a warning.
+        if manifest.assets.workspace_seed.is_some() {
+            script.push_str(&format!(
+                "test -e /storage/workspace/{WORKSPACE_SEEDED_MARKER}; "
+            ));
         }
         let (code, _, stderr) = client.vm_exec(
             vec!["sh".into(), "-c".into(), script],
@@ -699,10 +732,12 @@ mod imp {
         let mut file = File::open(sidecar).map_err(fail)?;
         let source_identity = identity(&file.metadata().map_err(fail)?);
         let manifest = read_manifest(&mut file)?;
+        // A stacked layer's `.wh.` names are whiteouts over the layers below,
+        // which the helper's tar leaves as files, so only single-layer packs,
+        // which smolvm has written since v1.6.11, are prepared here.
         if manifest.mode != PackMode::Container
             || manifest.checkpoint.is_some()
             || manifest.assets.layers.len() != 1
-            || manifest.assets.workspace_seed.is_some()
         {
             return Ok(None);
         }
@@ -1056,7 +1091,7 @@ mod imp {
         }
 
         #[test]
-        fn storage_seed_defers_whiteouts_over_lower_layers_to_the_layer_extractor() {
+        fn storage_seed_takes_a_single_layer_with_wh_names() {
             let write_layer = |dir: &Path, name: &str| {
                 let mut archive = tar::Builder::new(File::create(dir.join(name)).unwrap());
                 let mut header = tar::Header::new_gnu();
@@ -1072,11 +1107,6 @@ mod imp {
             let single = tempfile::tempdir().unwrap();
             write_layer(single.path(), "layer.tar");
             assert!(storage_budget(single.path()).unwrap().is_some());
-            // Over another layer it is a whiteout, which the helper cannot apply.
-            let stacked = tempfile::tempdir().unwrap();
-            write_layer(stacked.path(), "a.tar");
-            write_layer(stacked.path(), "b.tar");
-            assert!(storage_budget(stacked.path()).unwrap().is_none());
         }
 
         #[test]
