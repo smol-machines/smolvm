@@ -19,8 +19,10 @@ smolvm machine branch --from rollback --name candidate
 Checkpoints are written as `.checkpoint`; the earlier `.smolcheckpoint` name is
 still accepted.
 
-Start the source with `machine start --branchable` before capturing it. Capture
-checks the runtime and guest-agent capabilities before pausing the source.
+On macOS and Linux any running machine can be captured; starting the source
+with `machine start --branchable` only makes the pause shorter. Native Windows
+does not support `--store` yet. Capture checks the runtime and guest-agent
+capabilities before pausing the source.
 Normal portable-checkpoint restrictions still apply, including host-platform,
 CPU and device compatibility. A checkpoint can move from an arm64 Mac to arm64
 Linux (see [Moving a running machine from a Mac to Linux](mac-to-linux.md)); it
