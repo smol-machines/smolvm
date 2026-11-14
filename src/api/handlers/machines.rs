@@ -1575,33 +1575,89 @@ async fn upload_checkpoint_file(
                 let file = file.clone();
                 let progress = progress.clone();
                 async move {
-                    let body = reqwest::Body::wrap_stream(checkpoint_part_stream(
-                        file, start, length, progress,
-                    ));
-                    let response = client
-                        .put(url)
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(header::CONTENT_LENGTH, length)
-                        .body(body)
-                        .send()
-                        .await
-                        .map_err(|error| {
-                            ApiError::internal(format!(
-                                "upload checkpoint part {index} to object store: {}",
-                                error.without_url()
-                            ))
-                        })?;
-                    if !response.status().is_success() {
-                        return Err(ApiError::internal(format!(
-                            "object store refused checkpoint part {index}: {}",
-                            response.status()
-                        )));
-                    }
-                    Ok(())
+                    put_checkpoint_part(
+                        &client,
+                        url,
+                        file,
+                        (index, start, length),
+                        progress,
+                        PART_RETRY_BACKOFF,
+                    )
+                    .await
                 }
             });
     futures_util::future::try_join_all(uploads).await?;
     Ok(size)
+}
+
+/// Tries per checkpoint part. Each part is a whole PUT to its own pre-signed
+/// URL, so sending it again replaces the object and is safe to repeat. Object
+/// stores answer a small share of PUTs with 503 or 429 and expect the client
+/// to retry. Without retries, one refused part threw away minutes of upload
+/// work and failed the whole publish.
+const PART_UPLOAD_ATTEMPTS: u32 = 5;
+
+/// First wait before retrying a part; it doubles on each later try.
+const PART_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Whether the object store's answer to a part is worth sending again.
+fn retryable_part_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+/// PUT one part of a checkpoint artifact, retrying transient failures.
+async fn put_checkpoint_part(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    file: Arc<std::fs::File>,
+    (index, start, length): (usize, u64, u64),
+    progress: crate::api::progress::Progress,
+    backoff: Duration,
+) -> Result<(), ApiError> {
+    let mut wait = backoff;
+    for attempt in 1..=PART_UPLOAD_ATTEMPTS {
+        let body = reqwest::Body::wrap_stream(checkpoint_part_stream(
+            file.clone(),
+            start,
+            length,
+            progress.clone(),
+        ));
+        let failure = match client
+            .put(url.clone())
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, length)
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) if retryable_part_status(response.status()) => format!(
+                "object store refused checkpoint part {index}: {}",
+                response.status()
+            ),
+            Ok(response) => {
+                return Err(ApiError::internal(format!(
+                    "object store refused checkpoint part {index}: {}",
+                    response.status()
+                )))
+            }
+            Err(error) => format!(
+                "upload checkpoint part {index} to object store: {}",
+                error.without_url()
+            ),
+        };
+        if attempt == PART_UPLOAD_ATTEMPTS {
+            return Err(ApiError::internal(format!(
+                "{failure} (after {attempt} attempts)"
+            )));
+        }
+        tracing::warn!(part = index, attempt, error = %failure, "retrying checkpoint part upload");
+        tokio::time::sleep(wait).await;
+        wait *= 2;
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// Create a machine by streaming a `.checkpoint` into this node.
@@ -1668,7 +1724,126 @@ fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
 
 #[cfg(test)]
 mod checkpoint_upload_tests {
-    use super::{checked_upload_urls, checkpoint_part_stream, upload_part_ranges};
+    use super::{
+        checked_upload_urls, checkpoint_part_stream, put_checkpoint_part, upload_part_ranges,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Serve PUTs on loopback, answering the first `refusals` with `status` and
+    /// later ones with 200 after checking the body. Returns the URL and a
+    /// count of requests seen.
+    async fn flaky_store(
+        refusals: usize,
+        status: u16,
+        expect: Vec<u8>,
+    ) -> (reqwest::Url, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                let expect = expect.clone();
+                let mut raw = Vec::new();
+                let mut buf = [0_u8; 65536];
+                let head_end = loop {
+                    let read = sock.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..read]);
+                    if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                while raw.len() - head_end < expect.len() {
+                    let read = sock.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                }
+                assert_eq!(
+                    &raw[head_end..],
+                    &expect[..],
+                    "attempt {n} sent the whole part"
+                );
+                let code = if n < refusals { status } else { 200 };
+                let reply =
+                    format!("HTTP/1.1 {code} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                sock.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}/part").parse().unwrap(), seen)
+    }
+
+    fn part_file(content: &[u8]) -> (tempfile::TempDir, Arc<std::fs::File>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        std::fs::write(&path, content).unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        (dir, file)
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_refuses_once_is_sent_again() {
+        let content: Vec<u8> = (0..300_000_u32).map(|i| (i % 253) as u8).collect();
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(2, 503, content[1000..201_000].to_vec()).await;
+        put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (14, 1000, 200_000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_rejects_outright_is_not_retried() {
+        let content = vec![7_u8; 1000];
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(usize::MAX, 403, content.clone()).await;
+        let error = put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (0, 0, 1000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("403"), "{error:?}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_keeps_refusing_fails_after_the_last_attempt() {
+        let content = vec![9_u8; 1000];
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(usize::MAX, 503, content.clone()).await;
+        let error = put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (3, 0, 1000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("after 5 attempts"),
+            "{error:?}"
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 5);
+    }
 
     /// Parts read at once from one descriptor reassemble the file exactly, even
     /// after its name is gone, as when a resume consumes a paused checkpoint.

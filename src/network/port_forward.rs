@@ -66,6 +66,13 @@ impl PortForwarder {
         self.tcp.replace(ports).map_err(|error| error.to_string())
     }
 
+    /// Publish an OS-allocated loopback TCP listener without a bind race.
+    pub fn publish_atomic(&self, guest: u16) -> Result<PortMapping, String> {
+        self.tcp
+            .publish_atomic(guest)
+            .map_err(|error| error.to_string())
+    }
+
     /// The forwarded mappings.
     pub fn mappings(&self) -> Vec<PortMapping> {
         self.tcp.mappings()
@@ -101,15 +108,20 @@ fn relay(client: TcpStream, socket: &Path, guest: u16) -> std::io::Result<()> {
 /// Serve the ports control socket in `vm_dir` with `ports`, the way the
 /// virtio-net runtime serves it: each request is the full set of mappings.
 pub fn serve_forwarded_ports_control(forwarder: PortForwarder, vm_dir: &Path) {
-    super::launch::serve_ports_requests(vm_dir, move |next| {
-        if next
-            .iter()
-            .any(|mapping| mapping.protocol == smolvm_network::PortProtocol::Udp)
-        {
-            return Err("UDP ports can only change while the machine is stopped".to_string());
-        }
-        forwarder.replace(next)
-    });
+    let allocator = forwarder.clone();
+    super::launch::serve_ports_requests(
+        vm_dir,
+        move |guest| allocator.publish_atomic(guest),
+        move |next| {
+            if next
+                .iter()
+                .any(|mapping| mapping.protocol == smolvm_network::PortProtocol::Udp)
+            {
+                return Err("UDP ports can only change while the machine is stopped".to_string());
+            }
+            forwarder.replace(next)
+        },
+    );
 }
 
 #[cfg(all(test, unix))]
@@ -139,6 +151,25 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn atomic_publication_keeps_distinct_loopback_listeners_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(PORT_FORWARD_SOCKET);
+        fake_guest(&socket);
+        let forwarder = PortForwarder::new(&socket).unwrap();
+        let a = forwarder.publish_atomic(8000).unwrap();
+        let b = forwarder.publish_atomic(8001).unwrap();
+        assert_ne!(a.host, 0);
+        assert_ne!(a.host, b.host);
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, a.host)).is_err());
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, b.host)).is_err());
+        assert_eq!(ask(a.host, "first"), "8000:first");
+        assert_eq!(ask(b.host, "second"), "8001:second");
+        assert_eq!(forwarder.mappings(), vec![a, b]);
+        assert!(forwarder.publish_atomic(0).is_err());
+        assert_eq!(forwarder.mappings(), vec![a, b]);
     }
 
     fn free_port() -> u16 {

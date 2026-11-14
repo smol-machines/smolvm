@@ -6,9 +6,9 @@ runs Docker: every container is a smol machine booted from its image.
 
 ## Use it
 
-User installations register the Docker socket automatically on macOS and on Linux with a
-systemd user session; Docker connections start the API adapter only when needed.
-For a source build or an existing installation, run the setup command once:
+The Docker Engine API is opt-in: installing or upgrading smolvm never touches your Docker
+setup. Run the setup command once, on macOS or on Linux with a systemd user session; Docker
+connections then start the API adapter only when needed:
 
 ```bash
 smolvm engine

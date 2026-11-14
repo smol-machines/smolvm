@@ -1726,6 +1726,7 @@ impl ResolvedSpec {
             staged_mounts_detached_from: None,
             ports,
             udp_ports,
+            allocated_ports: Vec::new(),
             listen_addresses,
             published_sockets,
             network: net,

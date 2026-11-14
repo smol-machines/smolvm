@@ -140,10 +140,9 @@ install_from_dir() {
     mkdir -p "$BIN_DIR"
     ln -sf "$INSTALL_PREFIX/smolvm" "$BIN_DIR/smolvm"
 
+    # The Docker Engine API is opt-in: `smolvm engine` switches the Docker context.
     if "$INSTALL_PREFIX/smolvm" engine --help 2>/dev/null | grep -q 'automatic Docker API activation'; then
-        if ! "$INSTALL_PREFIX/smolvm" engine; then
-            warn "Docker socket registration failed; run 'smolvm engine' in your user session to finish setup."
-        fi
+        info "To run docker on smolvm, run 'smolvm engine' (it switches your Docker context to 'smol')."
     fi
 
     success "Installed smolvm to $INSTALL_PREFIX"
