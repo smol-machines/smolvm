@@ -75,7 +75,7 @@ mod linux {
             .arg(&destination)
             .spawn()
             .unwrap();
-        let pid = child.id() as i32;
+        let pid = i32::try_from(child.id()).unwrap();
         // A real notification proves the framework has already waitpid'd this
         // specific child. No sleep or probabilistic scheduling assertion.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -123,15 +123,19 @@ mod linux {
                 if crate::reaper::configuration().no_reaper {
                     exited_without_reaping(&child);
                 } else {
+                    let expected_pid = i32::try_from(child.id()).unwrap();
                     runtime.block_on(async {
                         tokio::time::timeout(Duration::from_secs(5), async {
                             loop {
                                 let event = events.rx.recv().await.unwrap();
-                                if matches!(event.subject, Subject::Pid(pid) if pid == child.id() as i32) {
+                                if matches!(event.subject, Subject::Pid(pid) if pid == expected_pid)
+                                {
                                     break;
                                 }
                             }
-                        }).await.unwrap();
+                        })
+                        .await
+                        .unwrap();
                     });
                 }
                 runtime.block_on(monitor_unsubscribe(events.id)).unwrap();
@@ -171,49 +175,53 @@ mod linux {
                 assert_eq!(child.wait().unwrap().code(), Some(*code));
             }
 
-            let root = tempfile::tempdir().unwrap();
-            let source = root.path().join("source");
-            let destination = root.path().join("copy");
-            fs::create_dir(&source).unwrap();
-            fs::write(source.join("payload"), [0, 255, 128, 17]).unwrap();
-            fs::set_permissions(source.join("payload"), fs::Permissions::from_mode(0o640)).unwrap();
-            symlink("payload", source.join("link")).unwrap();
-            assert!(Command::new("cp")
-                .args(["-aT", "--reflink=auto"])
-                .arg(&source)
-                .arg(&destination)
-                .status()
-                .unwrap()
-                .success());
-            assert_eq!(
-                fs::read(destination.join("payload")).unwrap(),
-                [0, 255, 128, 17]
-            );
-            assert_eq!(
-                fs::read_link(destination.join("link")).unwrap(),
-                Path::new("payload")
-            );
-            assert_eq!(
-                fs::metadata(destination.join("payload"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o640
-            );
-            let before = fs::metadata(source.join("payload")).unwrap();
-            let copied = fs::metadata(destination.join("payload")).unwrap();
-            assert_eq!((copied.uid(), copied.gid()), (before.uid(), before.gid()));
-            assert_eq!(copied.modified().unwrap(), before.modified().unwrap());
-            assert!(Command::new("chmod")
-                .args(["-R", "a+rX"])
-                .arg(&destination)
-                .status()
-                .unwrap()
-                .success());
+            copied_files_preserve_metadata();
         })
         .await
         .unwrap();
+    }
+
+    fn copied_files_preserve_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("copy");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("payload"), [0, 255, 128, 17]).unwrap();
+        fs::set_permissions(source.join("payload"), fs::Permissions::from_mode(0o640)).unwrap();
+        symlink("payload", source.join("link")).unwrap();
+        assert!(Command::new("cp")
+            .args(["-aT", "--reflink=auto"])
+            .arg(&source)
+            .arg(&destination)
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            fs::read(destination.join("payload")).unwrap(),
+            [0, 255, 128, 17]
+        );
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            Path::new("payload")
+        );
+        assert_eq!(
+            fs::metadata(destination.join("payload"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        let before = fs::metadata(source.join("payload")).unwrap();
+        let copied = fs::metadata(destination.join("payload")).unwrap();
+        assert_eq!((copied.uid(), copied.gid()), (before.uid(), before.gid()));
+        assert_eq!(copied.modified().unwrap(), before.modified().unwrap());
+        assert!(Command::new("chmod")
+            .args(["-R", "a+rX"])
+            .arg(&destination)
+            .status()
+            .unwrap()
+            .success());
     }
 
     async fn detached_vm_exit() {
@@ -222,8 +230,8 @@ mod linux {
             .args(["-c", "exit 23"])
             .spawn()
             .unwrap();
-        let pid = child.id();
-        smolvm::process::register_vm_child(pid as i32, None);
+        let pid = i32::try_from(child.id()).unwrap();
+        smolvm::process::register_vm_child(pid, None);
         drop(child);
         // No liveness query or explicit sweep: the shim's background reaper
         // must drain its detached VM registration and retain the actual exit.
@@ -234,7 +242,7 @@ mod linux {
         })
         .await
         .expect("registered VM child was left as a zombie");
-        assert_eq!(smolvm::process::try_wait(pid as i32), Some(23));
+        assert_eq!(smolvm::process::try_wait(pid), Some(23));
     }
 
     async fn orphan_ownership() {
@@ -259,7 +267,7 @@ mod linux {
         let pid = fs::read_to_string(pid_file).unwrap();
         let stat = format!("/proc/{}/stat", pid.trim());
         if let Ok(value) = fs::read_to_string(&stat) {
-            let ppid: u32 = value
+            let parent_pid: u32 = value
                 .rsplit_once(')')
                 .unwrap()
                 .1
@@ -268,7 +276,7 @@ mod linux {
                 .unwrap()
                 .parse()
                 .unwrap();
-            assert_ne!(ppid, std::process::id());
+            assert_ne!(parent_pid, std::process::id());
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             while Path::new(&stat).exists() {
