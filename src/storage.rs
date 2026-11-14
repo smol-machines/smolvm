@@ -552,7 +552,12 @@ impl<K: DiskType> VmDisk<K> {
             std::fs::create_dir_all(parent)?;
         }
 
-        let size_bytes = size_gb * BYTES_PER_GIB;
+        let size_bytes = size_gb.checked_mul(BYTES_PER_GIB).ok_or_else(|| {
+            Error::config(
+                format!("validate {} size", K::NAME),
+                format!("disk size {size_gb} GiB overflows the addressable byte range"),
+            )
+        })?;
 
         if path.exists() {
             // An existing disk keeps whatever size it was created at, so a
@@ -566,6 +571,12 @@ impl<K: DiskType> VmDisk<K> {
             if on_disk < size_bytes {
                 expand_disk::<K>(path, size_gb)?;
                 on_disk = std::fs::metadata(path)?.len();
+                if on_disk != size_bytes {
+                    return Err(Error::storage(
+                        format!("verify {} disk size", K::NAME),
+                        format!("requested {size_bytes} bytes, found {on_disk} after expansion"),
+                    ));
+                }
             }
             Ok(Self {
                 path: path.to_path_buf(),
@@ -1395,6 +1406,29 @@ mod tests {
             std::fs::metadata(&disk_path).unwrap().len(),
             2 * BYTES_PER_GIB
         );
+
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn open_or_create_at_repairs_checkpoint_sector_geometry_gap() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_checkpoint_geometry");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("storage.raw");
+        let _ = std::fs::remove_file(&disk_path);
+
+        // libkrun reports disk sizes in 512-byte sectors. A stale image that
+        // is 128 MiB short produces the exact pivot failure seen during live
+        // checkpointing, even though the machine record requests 64 GiB.
+        let requested = 64 * BYTES_PER_GIB;
+        let stale = requested - (128 * 1024 * 1024);
+        disk_utils::create_sparse_disk::<Storage>(&disk_path, stale).unwrap();
+        let disk = StorageDisk::open_or_create_at(&disk_path, 64).unwrap();
+
+        assert_eq!(disk.size_bytes(), requested);
+        assert_eq!(std::fs::metadata(&disk_path).unwrap().len(), requested);
+        assert_eq!(requested / 512, 134_217_728);
 
         let _ = std::fs::remove_file(&disk_path);
         let _ = std::fs::remove_dir(&temp_dir);
