@@ -1876,15 +1876,21 @@ fn start_vm_named_with_db(
 
     // A fresh registry-image machine starts on a shared seed of its image, so
     // the guest finds the image already pulled. Best-effort: without a seed the
-    // guest pulls as before.
-    smolvm::image_seed::seed_first_start(
-        name,
-        &record,
-        from_snapshot,
-        seed_digest_ttl,
-        proxy,
-        no_proxy,
-    );
+    // guest pulls as before. A Ctrl-C or SIGTERM during a seed build deletes
+    // the builder machine and ends the command; this machine stays created.
+    let interrupted = smolvm::image_seed::interruptible(|| {
+        smolvm::image_seed::seed_first_start(
+            name,
+            &record,
+            from_snapshot,
+            seed_digest_ttl,
+            proxy,
+            no_proxy,
+        )
+    });
+    if let Some(signal) = interrupted {
+        smolvm::image_seed::exit_by_signal(signal);
+    }
 
     // Start agent VM
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
