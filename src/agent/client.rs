@@ -1123,6 +1123,9 @@ pub struct AgentClient {
     /// Cumulative output ceiling of a streaming exec on this connection; see
     /// [`MAX_STREAMING_EXEC_OUTPUT`] and [`Self::set_streaming_output_cap`].
     streaming_output_cap: Option<usize>,
+    /// Set when an interactive session ended because the reader of our output
+    /// went away, which closes this connection; see [`Self::session_reader_gone`].
+    reader_gone: bool,
 }
 
 fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
@@ -1320,6 +1323,7 @@ impl AgentClient {
             file_target: None,
             capabilities: None,
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
+            reader_gone: false,
         }
     }
 }
@@ -1446,6 +1450,7 @@ impl AgentClient {
             file_target: None,
             capabilities: None,
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
+            reader_gone: false,
         })
     }
 
@@ -2490,14 +2495,34 @@ impl AgentClient {
         }
     }
 
+    /// End an interactive session whose output reader has gone: close the
+    /// connection so the agent kills the command now instead of streaming its
+    /// output into a closed pipe, and report exit code 141, as `exec --stream`
+    /// does. The client is unusable afterwards: any further request fails, and
+    /// [`Self::session_reader_gone`] says so.
+    fn end_session_reader_gone(&mut self) -> i32 {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        self.reader_gone = true;
+        141
+    }
+
+    /// Whether an interactive session on this client ended because the reader
+    /// of our output went away. The connection is closed then, so a caller
+    /// with more to ask of the agent (synchronizing staged mounts after
+    /// `machine run -i`) must connect again.
+    pub fn session_reader_gone(&self) -> bool {
+        self.reader_gone
+    }
+
     /// Run an interactive I/O session.
     ///
     /// Sends `request`, waits for `Started`, then runs the poll loop
-    /// streaming stdout/stderr and forwarding stdin until `Exited`.
+    /// streaming stdout/stderr and forwarding stdin until `Exited`, or until
+    /// the reader of our output goes away (exit code 141).
     fn interactive_session(&mut self, request: AgentRequest, tty: bool, op: &str) -> Result<i32> {
         use crate::agent::terminal::{
-            check_sigwinch, flush_retry, get_terminal_size, install_sigwinch_handler, poll_io,
-            stdin_is_tty, write_all_retry, NonBlockingStdin, RawModeGuard,
+            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
+            NonBlockingStdin, RawModeGuard,
         };
         use std::io::{stderr, stdin, stdout, Read};
 
@@ -2567,6 +2592,7 @@ impl AgentClient {
         let mut stdin_buf = [0u8; STDIN_BUF_SIZE];
         let mut stdin_eof = false;
 
+        // `None` when the reader of our output went away before the command exited.
         let exit_code = loop {
             if let Some(e) = writer.take_error() {
                 return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
@@ -2600,15 +2626,17 @@ impl AgentClient {
             if poll_result.socket_ready {
                 match self.receive() {
                     Ok(AgentResponse::Stdout { data }) => {
-                        write_all_retry(&mut stdout(), &data)?;
-                        flush_retry(&mut stdout())?;
+                        if !relay_output(&mut stdout(), &data)? {
+                            break None;
+                        }
                     }
                     Ok(AgentResponse::Stderr { data }) => {
-                        write_all_retry(&mut stderr(), &data)?;
-                        flush_retry(&mut stderr())?;
+                        if !relay_output(&mut stderr(), &data)? {
+                            break None;
+                        }
                     }
                     Ok(AgentResponse::Exited { exit_code, .. }) => {
-                        break exit_code;
+                        break Some(exit_code);
                     }
                     Ok(AgentResponse::Error { message, .. }) => {
                         return Err(Error::agent(op, message));
@@ -2665,6 +2693,13 @@ impl AgentClient {
                     }
                 }
             }
+        };
+
+        let Some(exit_code) = exit_code else {
+            // Stop the writer before closing the connection: its drop puts the
+            // socket's write timeout back, which a closed socket may refuse.
+            drop(writer);
+            return Ok(self.end_session_reader_gone());
         };
 
         Ok(exit_code)
@@ -2834,7 +2869,8 @@ impl AgentClient {
     ///
     /// # Returns
     ///
-    /// The exit code of the command
+    /// The exit code of the command, or 141 when our stdout or stderr reader
+    /// went away; the connection is then closed and the agent kills the command.
     pub fn run_interactive(&mut self, config: RunConfig) -> Result<i32> {
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
         let tty = config.tty;
@@ -3766,6 +3802,7 @@ impl AgentClient {
             file_target: self.file_target.clone(),
             capabilities: self.capabilities.clone(),
             streaming_output_cap: self.streaming_output_cap,
+            reader_gone: self.reader_gone,
         };
         std::thread::scope(|scope| {
             let sender = scope.spawn(move || {
@@ -4179,6 +4216,77 @@ where
     P: FnMut(u64),
 {
     consume_streamed_read_inner(next_response, file_transfer_max_total(), on_progress)
+}
+
+/// Relay a chunk of the command's output to our stdout or stderr. Returns
+/// `Ok(false)` when the reader of our output has gone (`run -i -- yes | head`),
+/// so the session can end with exit code 141, as `exec --stream` does.
+fn relay_output(out: &mut impl std::io::Write, data: &[u8]) -> std::io::Result<bool> {
+    use crate::agent::terminal::{flush_retry, write_all_retry};
+    match write_all_retry(out, data).and_then(|()| flush_retry(out)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod relay_output_tests {
+    use super::relay_output;
+    use std::io::{self, Write};
+
+    struct FailingWriter(io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(self.0))
+        }
+    }
+
+    #[test]
+    fn relay_output_writes_and_continues() {
+        let mut out = Vec::new();
+        assert!(relay_output(&mut out, b"y\n").unwrap());
+        assert_eq!(out, b"y\n");
+    }
+
+    #[test]
+    fn relay_output_stops_quietly_when_the_reader_has_gone() {
+        let mut out = FailingWriter(io::ErrorKind::BrokenPipe);
+        assert!(!relay_output(&mut out, b"y\n").unwrap());
+    }
+
+    #[test]
+    fn relay_output_reports_other_write_errors() {
+        let mut out = FailingWriter(io::ErrorKind::PermissionDenied);
+        let err = relay_output(&mut out, b"y\n").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn ending_a_session_whose_reader_has_gone_disconnects_the_agent() {
+        use super::AgentClient;
+        use crate::platform::uds::UdsStream;
+        use std::io::Read;
+
+        let (client_stream, mut agent_stream) = UdsStream::pair().unwrap();
+        agent_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut client = AgentClient::from_stream(client_stream);
+        assert!(!client.session_reader_gone());
+        assert_eq!(client.end_session_reader_gone(), 141);
+        assert!(client.session_reader_gone());
+        // The agent sees end of stream at once, so it kills the command,
+        // while the client is still alive.
+        let mut buf = [0; 1];
+        assert_eq!(agent_stream.read(&mut buf).unwrap(), 0);
+        drop(client);
+    }
 }
 
 #[cfg(test)]
