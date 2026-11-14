@@ -33,13 +33,13 @@ stdenv.mkDerivation (finalAttrs: {
   inherit src;
 
   kernelSrc = fetchurl {
-    url = "mirror://kernel/linux/kernel/v6.x/linux-6.12.87.tar.xz";
-    hash = "sha256-zBKnZEtM754GYnsp3odT4is9B2cDqbUr6EJj4FyLmDA=";
+    url = "mirror://kernel/linux/kernel/v6.x/linux-6.12.95.tar.xz";
+    hash = "sha256-qejFH8seaV0dNd3liGy6V5y28pyWRsWInznWOEHUufY=";
   };
 
   postPatch = ''
     substituteInPlace Makefile \
-      --replace 'curl $(KERNEL_REMOTE) -o $(KERNEL_TARBALL)' 'ln -s $(kernelSrc) $(KERNEL_TARBALL)'
+      --replace-fail 'curl -fL --retry 5 --retry-delay 5 --retry-all-errors $(KERNEL_REMOTE) -o $(KERNEL_TARBALL)' 'ln -s $(kernelSrc) $(KERNEL_TARBALL)'
   '' + lib.optionalString stdenv.hostPlatform.isDarwin ''
     substituteInPlace Makefile \
       --replace 'for patch in $(KERNEL_PATCHES); do patch -p1 -d $(KERNEL_SOURCES) < "$$patch"; done' 'for patch in $(KERNEL_PATCHES); do patch -p1 -d $(KERNEL_SOURCES) < "$$patch"; done; perl -0pi -e "s/typedef struct \\{\\n\\t__u8 b\\[16\\];\\n\\} uuid_t;/#ifndef __APPLE__\\ntypedef struct {\\n\\t__u8 b[16];\\n} uuid_t;\\n#endif/; s/uuid->b\\[/(*uuid)[/g" $(KERNEL_SOURCES)/scripts/mod/file2alias.c' \
