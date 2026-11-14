@@ -1,0 +1,78 @@
+[package]
+name = "containerd-shim"
+version = "0.11.0"
+authors = [
+    "Maksym Pavlenko <pavlenko.maksym@gmail.com>",
+    "The containerd Authors",
+]
+description = "containerd shim extension"
+keywords = ["containerd", "shim", "containers"]
+categories = ["api-bindings", "asynchronous"]
+
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+async = ["async-trait", "containerd-shim-protos/async", "futures", "tokio"]
+tracing = ["dep:tracing"]
+docs = []
+
+[[example]]
+name = "skeleton_async"
+required-features = ["async"]
+
+[[example]]
+name = "windows-log-reader"
+path = "examples/windows_log_reader.rs"
+
+[dependencies]
+which = { version = "8.0.0", default-features = false, features = ["real-sys"] }
+containerd-shim-protos = { path = "../shim-protos", version = "0.11.0" }
+go-flag = "0.1.0"
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+libc.workspace = true
+log = { workspace = true, features = ["std", "kv_unstable"] }
+nix = { workspace = true, features = [
+    "fs",
+    "socket",
+    "signal",
+    "mount",
+    "sched",
+] }
+oci-spec = { workspace = true, features = ["runtime"] }
+signal-hook = "0.3.18"
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tempfile.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["std", "formatting"] }
+
+# tracing
+tracing = { version = "0.1", default-features = false, optional = true }
+
+# Async dependencies
+async-trait = { workspace = true, optional = true }
+futures = { workspace = true, features = ["std", "alloc"], optional = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "sync", "fs", "io-util", "time", "signal", "io-std"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cgroups-rs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+mio = { version = "1.1", default-features = false, features = ["os-ext", "os-poll"] }
+windows-sys = { version = "0.52.0", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[package.metadata.docs.rs]
+features = ["docs"]
