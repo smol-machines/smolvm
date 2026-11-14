@@ -1838,7 +1838,10 @@ mod checkpoint_upload_tests {
         )
         .await
         .unwrap_err();
-        assert!(format!("{error:?}").contains("after 5 attempts"), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("after 5 attempts"),
+            "{error:?}"
+        );
         assert_eq!(seen.load(Ordering::SeqCst), 5);
     }
 
