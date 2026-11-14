@@ -217,6 +217,29 @@ impl TcpAcceptorSet {
         self.shared.registry().mappings()
     }
 
+    /// Publish `guest` on a host port the OS picks, keeping the listeners it
+    /// was found with: no other process can take the port between its choice
+    /// and its publication, as one could if the caller probed for a free port
+    /// and then asked for it.
+    pub fn publish_atomic(&self, guest: u16) -> io::Result<PortMapping> {
+        if guest == 0 || self.is_closed() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid guest port or closed publisher",
+            ));
+        }
+        let _replacing = self
+            .shared
+            .replacing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (host, sockets) = publish_bind::bind_tcp_allocated()?;
+        let mapping = PortMapping::new(host, guest);
+        let mut registry = self.shared.registry();
+        registry.add(&self.shared.poller, BoundTcpPorts(vec![(mapping, sockets)]))?;
+        Ok(mapping)
+    }
+
     /// Make `next` the published set (TCP mappings only).
     pub fn replace(&self, next: &[PortMapping]) -> io::Result<()> {
         if let Some(udp) = next.iter().find(|m| m.protocol == PortProtocol::Udp) {
@@ -379,6 +402,29 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::sync::mpsc;
+
+    #[test]
+    fn atomic_allocations_remain_owned_across_concurrent_publishers() {
+        let publisher = Arc::new(
+            TcpAcceptorSet::start(BoundTcpPorts::bind(&[]).unwrap(), Box::new(|_| {})).unwrap(),
+        );
+        let workers: Vec<_> = (0..32)
+            .map(|i| {
+                let publisher = publisher.clone();
+                std::thread::spawn(move || publisher.publish_atomic(8000 + i).unwrap())
+            })
+            .collect();
+        let mappings: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        let mut ports: Vec<_> = mappings.iter().map(|m| m.host).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 32);
+        for mapping in mappings {
+            assert!(mapping.host > 0);
+            assert!(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, mapping.host)).is_err());
+        }
+        assert_eq!(publisher.mappings().len(), 32);
+    }
 
     /// A port free right now, from below the ephemeral range (32768 and up on
     /// Linux, 49152 on macOS). A port the kernel picks with bind(0) is an

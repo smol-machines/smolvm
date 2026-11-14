@@ -77,12 +77,34 @@ pub fn bind_tcp(port: u16) -> io::Result<BoundSockets<TcpListener>> {
 /// Bind the TCP listeners of published host port `port` on `listen`, or on
 /// the default publish address.
 pub fn bind_tcp_on(port: u16, listen: Option<IpAddr>) -> io::Result<BoundSockets<TcpListener>> {
-    bind_listen(port, listen, |addr| {
-        let socket = new_socket(addr, Type::STREAM, Protocol::TCP)?;
-        // The kernel caps this at somaxconn; ask for as much as it allows.
-        socket.listen(i32::MAX)?;
-        Ok(socket.into())
-    })
+    bind_listen(port, listen, tcp_listener)
+}
+
+/// Bind the TCP listeners of a published port whose number the OS picks, on
+/// the default publish address: IPv4 takes any free port and IPv6 then takes
+/// the same number when it can. The port is returned with its listeners bound,
+/// so it is never released between being chosen and being published.
+pub fn bind_tcp_allocated() -> io::Result<(u16, BoundSockets<TcpListener>)> {
+    let addr = publish_addr();
+    let v4 = tcp_listener(SocketAddr::from((addr, 0)))?;
+    let port = v4.local_addr()?.port();
+    let v6 = bind_v6(&tcp_listener, companion_v6(addr), port);
+    Ok((
+        port,
+        BoundSockets {
+            v4,
+            v6,
+            loopback_only: false,
+        },
+    ))
+}
+
+/// A listening TCP socket on `addr`.
+fn tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = new_socket(addr, Type::STREAM, Protocol::TCP)?;
+    // The kernel caps this at somaxconn; ask for as much as it allows.
+    socket.listen(i32::MAX)?;
+    Ok(socket.into())
 }
 
 /// Bind the UDP sockets of published host port `port`.
@@ -196,6 +218,20 @@ fn bind_v6<S>(bind: &impl Fn(SocketAddr) -> io::Result<S>, addr: Ipv6Addr, port:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An allocated port arrives bound: nothing else can take it, and IPv6
+    /// loopback, when the host has it, listens on the same number.
+    #[test]
+    fn an_allocated_port_is_returned_bound() {
+        let (port, sockets) = bind_tcp_allocated().unwrap();
+        assert_ne!(port, 0);
+        assert_eq!(sockets.v4.local_addr().unwrap().port(), port);
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err());
+        if let Some(v6) = &sockets.v6 {
+            assert_eq!(v6.local_addr().unwrap().port(), port);
+        }
+        assert!(!sockets.loopback_only);
+    }
 
     #[test]
     fn only_loopback_peers_reach_a_loopback_only_port() {

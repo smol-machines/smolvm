@@ -1648,6 +1648,67 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Publish TCP guest port `guest` of running machine `name` on a host port
+    /// the OS picks, and return it. The listener is bound before the port is
+    /// known, so nothing can take the port in between. The publication lasts
+    /// for this run of the machine: a restart does not bind the port again,
+    /// and the caller publishes anew.
+    pub fn publish_atomic(&self, name: &str, guest: u16) -> Result<u16> {
+        if guest == 0 {
+            return Err(Error::config(
+                "atomic port publication",
+                "guest port must be positive",
+            ));
+        }
+        self.with_name_lock(name, || {
+            let record = control::get_record(&self.db, name)?;
+            let run = match record.pid_start_time {
+                Some(run)
+                    if crate::agent::state_probe::resolve_state(name, &record)
+                        == RecordState::Running =>
+                {
+                    run
+                }
+                _ => {
+                    return Err(Error::config(
+                        "atomic port publication",
+                        "machine must be running",
+                    ))
+                }
+            };
+            if record.ports.len() + record.udp_ports.len() + record.live_allocated_ports().len()
+                >= crate::data::network::MAX_PORT_MAPPINGS
+            {
+                return Err(Error::config(
+                    "atomic port publication",
+                    "too many published ports",
+                ));
+            }
+            let host = match crate::agent::allocate_live_port(name, guest) {
+                Ok(host) => host,
+                Err(error) => {
+                    // The engine may have bound before its reply was lost.
+                    let _ = crate::agent::apply_live_published_ports(name, &record.ports);
+                    return Err(error);
+                }
+            };
+            let saved = self.db.update_vm(name, |r| {
+                // Ports an earlier run picked closed with it.
+                r.allocated_ports.retain(|port| port.run == run);
+                r.allocated_ports
+                    .push(crate::config::AllocatedPort { host, guest, run });
+            });
+            match saved {
+                Ok(Some(_)) => Ok(host),
+                result => {
+                    let _ = crate::agent::apply_live_published_ports(name, &record.ports);
+                    result?;
+                    Err(Error::vm_not_found(name))
+                }
+            }
+        })
+    }
+
     /// Pack the stopped machine `name` into a `.smolmachine` at `output`
     /// (a `.smolmachine` extension is added when missing): its disks and
     /// configuration flattened into an artifact new machines boot from with

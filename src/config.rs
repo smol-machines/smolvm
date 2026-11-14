@@ -417,6 +417,18 @@ impl EgressUpdate {
     }
 }
 
+/// A TCP port published on a host port the engine picked, and the run it
+/// belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatedPort {
+    /// The host port the OS picked.
+    pub host: u16,
+    /// The guest port it forwards to.
+    pub guest: u16,
+    /// Start time of the VM process that bound it ([`VmRecord::pid_start_time`]).
+    pub run: u64,
+}
+
 /// Record of a VM in the registry.
 ///
 /// This stores machine configuration only. Container configuration
@@ -527,6 +539,14 @@ pub struct VmRecord {
     /// TCP mappings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub udp_ports: Vec<(u16, u16)>,
+
+    /// TCP ports published on a host port the engine picked while the machine
+    /// ran (`publish_atomic`). Each lasts only for the run that picked it: the
+    /// OS may hand the number to anyone once that run ends, so no start binds
+    /// one again, and a new run publishes its own. See
+    /// [`Self::live_allocated_ports`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allocated_ports: Vec<AllocatedPort>,
 
     /// Host addresses published ports listen on, for the ports that name
     /// one; the others listen on the default publish address.
@@ -1016,6 +1036,7 @@ impl VmRecord {
             staged_mounts_detached_from: None,
             ports,
             udp_ports: Vec::new(),
+            allocated_ports: Vec::new(),
             listen_addresses: Vec::new(),
             published_sockets: Vec::new(),
             network,
@@ -1125,6 +1146,7 @@ impl VmRecord {
             staged_mounts_detached_from: None,
             ports,
             udp_ports: Vec::new(),
+            allocated_ports: Vec::new(),
             listen_addresses: Vec::new(),
             published_sockets: Vec::new(),
             network,
@@ -1265,6 +1287,20 @@ impl VmRecord {
         // inspectable rather than silently dropping their live mounts.
         mounts.extend(live);
         mounts
+    }
+
+    /// The `(host, guest)` pairs of [`Self::allocated_ports`] that belong to the
+    /// machine's current run. Those of an earlier run are stale: their
+    /// listeners closed with it.
+    pub fn live_allocated_ports(&self) -> Vec<(u16, u16)> {
+        let Some(run) = self.pid_start_time else {
+            return Vec::new();
+        };
+        self.allocated_ports
+            .iter()
+            .filter(|port| port.run == run)
+            .map(|port| (port.host, port.guest))
+            .collect()
     }
 
     /// Convert stored ports to PortMapping format, TCP then UDP.
@@ -1761,6 +1797,36 @@ impl VmRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the current run's picked ports are live; an earlier run's closed
+    /// with it, and a record that is not running has none.
+    #[test]
+    fn only_the_current_runs_allocated_ports_are_live() {
+        let mut record = VmRecord::new("m".into(), 1, 512, vec![], vec![], false);
+        record.allocated_ports = vec![
+            AllocatedPort {
+                host: 49152,
+                guest: 3000,
+                run: 100,
+            },
+            AllocatedPort {
+                host: 49153,
+                guest: 3001,
+                run: 200,
+            },
+        ];
+        assert!(record.live_allocated_ports().is_empty());
+        record.pid_start_time = Some(200);
+        assert_eq!(record.live_allocated_ports(), [(49153, 3001)]);
+        let json = serde_json::to_string(&record).unwrap();
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.allocated_ports, record.allocated_ports);
+        // A record written before the field existed still loads.
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old.as_object_mut().unwrap().remove("allocated_ports");
+        let old: VmRecord = serde_json::from_value(old).unwrap();
+        assert!(old.allocated_ports.is_empty());
+    }
 
     /// UDP mappings live beside the TCP list, so a record without any reads
     /// and writes exactly as before, and an older reader still loads one with.

@@ -559,6 +559,11 @@ impl PublishedPorts {
         self.lock().mappings()
     }
 
+    /// Publish a new loopback TCP listener without releasing its allocated port.
+    pub fn publish_atomic(&self, guest: u16) -> io::Result<PortMapping> {
+        self.lock().publish_atomic(guest)
+    }
+
     /// The UDP mappings bound at start, which stay until the machine stops.
     pub fn udp_mappings(&self) -> Vec<PortMapping> {
         self.udp.to_vec()

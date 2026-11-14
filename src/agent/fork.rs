@@ -3362,6 +3362,8 @@ fn prepare_clone_from_snapshot(
         }
         apply_clone_labels(&mut clone_rec.labels, spec.labels);
 
+        // Ports the source's run picked for itself stay with that run.
+        clone_rec.allocated_ports.clear();
         let mut port_remaps = Vec::new();
         if !spec.pinned_ports.is_empty() {
             clone_rec.ports = spec.pinned_ports.to_vec();
