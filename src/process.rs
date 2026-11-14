@@ -1510,11 +1510,15 @@ pub fn vm_uid_drop_active() -> bool {
 /// privileged with the uid drop active and no XDG override (serve only — a
 /// one-off root CLI invocation shouldn't silently switch roots). Must be called
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn apply_system_data_root(allow_auto: bool) {
+    #[cfg(target_os = "linux")]
+    let overlay_root = overlay_workspace_root();
+    #[cfg(not(target_os = "linux"))]
+    let overlay_root: Option<std::path::PathBuf> = None;
     let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
         std::path::PathBuf::from(explicit)
-    } else if let Some(workspace_root) = overlay_workspace_root() {
+    } else if let Some(workspace_root) = overlay_root {
         // Name the choice so a second pass (`serve` runs one of its own, after
         // HOME has already moved off overlayfs) and every child keep this root
         // instead of falling through to /var/lib/smolvm.
@@ -1559,8 +1563,9 @@ pub fn apply_system_data_root(allow_auto: bool) {
     std::env::remove_var("XDG_CACHE_HOME");
     std::env::remove_var("XDG_DATA_HOME");
     std::env::remove_var("XDG_CONFIG_HOME");
-    if let Some(src) = carry_rootfs_from {
-        let dst = root.join(".local/share/smolvm/agent-rootfs");
+    // Resolved after HOME moved, so it is the relocated data dir on every OS.
+    let rootfs_dst = dirs::data_local_dir().map(|d| d.join("smolvm/agent-rootfs"));
+    if let (Some(src), Some(dst)) = (carry_rootfs_from, rootfs_dst) {
         if src != dst {
             if let Err(e) = sync_agent_rootfs(&src, &dst) {
                 eprintln!(
@@ -1618,7 +1623,7 @@ fn choose_workspace_root(home_fs: Option<i64>, workspace_fs: Option<i64>) -> boo
 }
 
 /// The agent rootfs the installer put in the data dir, when nothing else names one.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
     if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_some()
         || crate::embedded::bundle::agent_rootfs_tar().is_some()
@@ -1633,7 +1638,7 @@ fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
 /// Copy the agent rootfs to `dst` unless the copy there is already current.
 /// The agent binary's size and mtime stand for its version: `cp -a` keeps both,
 /// and an upgrade replaces the binary, so a stale copy is replaced too.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let parent = dst
@@ -1678,8 +1683,8 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
     std::fs::rename(&staging, dst)
 }
 
-/// No-op where the data root isn't applicable (macOS dev).
-#[cfg(not(target_os = "linux"))]
+/// No-op where `HOME` does not root smolvm's paths (Windows).
+#[cfg(not(unix))]
 pub fn apply_system_data_root(_allow_auto: bool) {}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
