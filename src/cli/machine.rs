@@ -2031,15 +2031,24 @@ impl RunCmd {
         let seeds_platform = smolvm::image_seed::serves_platform(
             smolvm::vm::rosetta::image_platform(params.oci_platform.as_deref(), params.rosetta),
         );
-        smolvm::image_seed::seed_ephemeral_run_with_trust(
-            &vm_name,
-            seed_image.as_deref().filter(|_| seeds_platform),
-            params.storage_gb,
-            self.seed_digest_ttl,
-            self.proxy_opts.resolved_proxy()?.as_deref(),
-            self.proxy_opts.no_proxy().as_deref(),
-            self.trust_host_certs,
-        );
+        let seed_proxy = self.proxy_opts.resolved_proxy()?;
+        let seed_no_proxy = self.proxy_opts.no_proxy();
+        let interrupted = smolvm::image_seed::interruptible(|| {
+            smolvm::image_seed::seed_ephemeral_run_with_trust(
+                &vm_name,
+                seed_image.as_deref().filter(|_| seeds_platform),
+                params.storage_gb,
+                self.seed_digest_ttl,
+                seed_proxy.as_deref(),
+                seed_no_proxy.as_deref(),
+                self.trust_host_certs,
+            )
+        });
+        if let Some(signal) = interrupted {
+            // The seed build deleted its builder. Remove this run's data too.
+            drop(unstarted_data_dir);
+            smolvm::image_seed::exit_by_signal(signal);
+        }
 
         let manager =
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
