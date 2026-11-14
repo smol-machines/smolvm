@@ -23,6 +23,12 @@ pub struct ExecOptions {
     /// Text written to the command's stdin, which is then closed. Never
     /// stored on the guest's disk.
     pub stdin: Option<String>,
+    /// Allocate a pseudo-terminal for the command (the CLI's `-t`, and the
+    /// `tty` query parameter of the HTTP API's interactive exec endpoint).
+    /// Only [`crate::embedded::Runtime::exec_interactive_with_options`] acts
+    /// on it: the streaming and buffered variants have no channel to write
+    /// input to, so they ignore it.
+    pub tty: bool,
 }
 
 /// Cancels a running command from another thread.
