@@ -8,11 +8,11 @@ description: Turns an image, or a machine already provisioned, into a single sel
 For macOS first-import performance, storage seed behavior and a file-heavy
 reproduction, see [macOS storage seeds](references/macos-storage-seeds.md).
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.14.6** on Linux aarch64,
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.14.6** on Linux aarch64,
 2026-09-11; the Linux host could not run the packing steps on v1.18.2 or v1.22.2, for the reason in
 "Platform arms". Done means the artifact runs a command in a real VM and, for a machine pack, **the state you installed is still
 inside it**.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 **The assertion that matters is a value, not a boot.** A pack that lost its rootfs still boots,
@@ -243,7 +243,7 @@ Full detail with the evidence in `references/traps.md`. The ones that cost the m
 
 ## Platform arms
 
-- **macOS arm64**: verified on v1.29.0, the SSH agent forwarding included; on v1.22.2 also a branched source, and
+- **macOS arm64**: verified on v1.34.0, the SSH agent forwarding included; on v1.22.2 also a branched source, and
   a pack of a restored machine on v1.18.2. An extra `Signing binary with hypervisor entitlements`
   step runs here that does not on Linux.
 - **Linux aarch64**: verified on v1.14.6. Not run on v1.18.2 or v1.22.2: `pack create --image`
@@ -252,15 +252,14 @@ Full detail with the evidence in `references/traps.md`. The ones that cost the m
   way. That host could not boot guests above 2048 MiB in time, which the `install` packet's traps
   record. The preflight on v1.18.2 said `exporter_memory_ok=yes` there with 10386 MiB free: free
   memory was not what failed, so read the memory lines as hints about the helper VMs only.
-- **Linux x86_64**: verified in the material behind this packet on v1.14.6, including the branched
-  and restored cases. Not re-run here.
-- **Windows x86_64**: `references/windows.md`. **On v1.22.2 an artifact is created and cannot
-  be run there**, re-run on 2026-10-03 on Windows 11 Home build 10.0.26200 UBR 9457: both paths pack, and running any artifact,
-  through its stub, `pack run --sidecar` or `machine create --from`, fails extracting its first
-  layer with `os error 123`. v1.16.1 and v1.14.6 run the same pack on the same host; v1.18.2 and
-  every later release tried fail. On v1.14.6 both paths worked end to end, with the marker read
-  back out of the artifact. The stub is written without `.exe` and will not run until it and its
-  sidecar are renamed.
+- **Linux x86_64**: the scripts verified on v1.34.0, twice, on an NVIDIA A10 cloud host; the
+  branched and restored cases rest on v1.14.6, in the material behind this packet.
+- **Windows x86_64**: `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on
+  Windows 11 Home build 10.0.26200 UBR 9711: both paths pack and run again, through the stub's
+  `run --`, `pack run --sidecar` and `machine create --from`, with the marker read back out of a
+  `--from-vm` artifact, and `--single-file` too. From v1.18.2 to v1.22.2 every artifact failed
+  extracting its first layer with `os error 123`. The stub is still written without `.exe` unless
+  the output is named `<name>.exe`.
 
 **Both hosts run here produce `linux/arm64` artifacts**, so two hosts is two hosts and not two
 artifact architectures. The `linux/amd64` side rests on the x86_64 run above.
@@ -319,6 +318,22 @@ That is the v1.14.6 output, when the export helper was fixed at 8192 MiB. From v
 failure names the figure it asked for and `SMOLVM_EXPORT_HELPER_MEMORY_MIB`, and
 `exporter_memory_mib` is what the binary will ask for, 4096 or less. The recorded note's last
 sentence was never right: `pack create --image` boots its own 8192 MiB VM on every release here.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). On macOS every step: `result=artifacts_good (2
+of 2 artifacts)`, `machine_pack_carried_rootfs=ok (PACKED_STATE_PRESENT)`, and the image artifact's
+`run --ssh-agent` listed the throwaway key. The preflight said `exporter_memory_ok=no` (3661 MiB
+free, 4096 asked) and the machine pack still succeeded. On Linux nothing packed, for the host reason
+in "Platform arms": `pack create --image`'s agent VM and the default-size source both missed the 30
+s boot.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step: `exporter_memory_ok=yes`,
+`result=artifacts_good (2 of 2 artifacts)`, `machine_pack_carried_rootfs=ok (PACKED_STATE_PRESENT)`,
+and the image artifact's `run --ssh-agent` listed the throwaway key.
 
 ## Re-verified on v1.29.0
 

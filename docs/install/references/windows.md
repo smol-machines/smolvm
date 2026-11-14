@@ -10,12 +10,13 @@
 - When a boot fails, read the guest console before cleaning up
 - Other Windows behaviour worth knowing at install time
 
-**Re-run on 2026-10-03 against smolvm v1.22.2** on Windows 11 Home build 10.0.26200 UBR 9457
-x86_64 (Intel Core Ultra 9 185H, 31.6 GB), in an elevated session: the preflight, the boot
-(`HELLO_FROM_WINDOWS`, `Linux 6.12.95 x86_64`, 10.8 s), state that cannot be moved, the
-captured-output trap (still blocked at 60 s; `Start-Process` returned in 4.2 s) and the device
-ceiling all confirmed. Windows has no image seed on v1.22.2, so a run without `--net` stops at the
-pull with `Hint: networking is disabled`. The install step below is v1.22.2's; the other
+**Re-run on 2026-11-09 against smolvm v1.34.0** on Windows 11 Home build 10.0.26200 UBR 9711
+x86_64 (Intel Core Ultra 9 185H, 31.6 GB), in an elevated session: the preflight, the checksum,
+the boot (`HELLO_FROM_WINDOWS`, `Linux 6.18.60 x86_64`, 4.8 s), state that cannot be moved and the
+captured-output trap (still blocked at 60 s; `Start-Process` returned in 1.3 s) all confirmed. The
+device ceiling measured through v1.22.2 is gone at the counts tried: eight mounts and two published
+ports boot together. Windows still has no image seed, so a run without `--net` stops at the pull
+with `Hint: networking is disabled`. The install step and the boot below are v1.34.0's; the other
 transcripts are from the **2026-09-11 run against v1.14.6** on UBR 9445, where everything read the
 same apart from the version. The outputs are reproduced verbatim. Treat it as a record of a run, not as a promise about your host.
 
@@ -63,15 +64,15 @@ unprivileged path could not be exercised.
 Windows does not use `install.sh`.
 
 ```powershell
-$v = '1.22.2'   # the newest release; this is the one last verified here
+$v = '1.34.0'   # the newest release; this is the one last verified here
 Invoke-WebRequest -Uri "https://github.com/smol-machines/smolvm/releases/download/v$v/smolvm-$v-windows-x86_64.zip" -OutFile "$dir\smolvm.zip"
 Invoke-WebRequest -Uri "https://github.com/smol-machines/smolvm/releases/download/v$v/checksums.sha256" -OutFile "$dir\checksums.sha256"
 (Get-FileHash -Algorithm SHA256 -LiteralPath "$dir\smolvm.zip").Hash
 Expand-Archive -LiteralPath "$dir\smolvm.zip" -DestinationPath "$dir\dist"
 ```
 
-Observed on v1.22.2: 41621679 bytes, SHA256
-`a91e82347faf4c343f8f7eded2c8f86e621ca5b37214874c47b18be4a1c8d81c`, matching the release
+Observed on v1.34.0: 43099266 bytes, SHA256
+`8fd7c3a6b2b83ec4e6d19dccff42e763b9ca17f2c0dcec04b37774e7c11bcc59`, matching the release
 checksums exactly.
 
 **The zip contains a nested versioned folder.** The exe is at
@@ -79,7 +80,7 @@ checksums exactly.
 flat layout fails here, and the failure looks like a bad download.
 
 ```powershell
-& "$dir\dist\smolvm-$v-windows-x86_64\smolvm.exe" --version   # smolvm 1.22.2
+& "$dir\dist\smolvm-$v-windows-x86_64\smolvm.exe" --version   # smolvm 1.34.0
 ```
 
 ## 3. Prove the boot
@@ -91,10 +92,10 @@ flat layout fails here, and the failure looks like a bad download.
 Observed, including the image pull:
 
 ```
-Starting ephemeral machine (vm-f0d4c640)...
+Starting ephemeral machine (vm-63d2964c)...
 Pulling image alpine... done.
 HELLO_FROM_WINDOWS
-Linux 6.12.95 x86_64
+Linux 6.18.60 x86_64
 ```
 
 Native Windows runs x86_64 Linux guests. The guest kernel differs from the host, which is the
@@ -164,10 +165,11 @@ Get-Content "$env:LOCALAPPDATA\smolvm\vms\<hash>\agent-console.log" -Tail 40
   `smolvm.exe : Starting ephemeral machine (...)` followed by `NativeCommandError`. The command
   succeeded and `$LASTEXITCODE` is 0. Do not set `$ErrorActionPreference = 'Stop'` around a
   smolvm call, and do not read red text as failure.
-- **Device ceiling on WHP, through v1.22.2.** Four `-v` mounts boot; five fail with `no more IRQs
-  are available`. Published ports add one network device however many there are, as `--allow-host`
-  or `--allow-cidr` do, so four mounts plus two ports fails while two plus two boots. v1.23.0's
-  libkrun gives x86_64 guests IRQs 5 to 23 (#1521); not run on Windows, so its ceiling is unmeasured.
+- **Device ceiling on WHP.** Through v1.22.2 four `-v` mounts booted and five failed with `no
+  more IRQs are available`, and published ports added one network device however many there were,
+  so four mounts plus two ports failed while two plus two booted. v1.23.0's libkrun gives x86_64
+  guests IRQs 5 to 23 (#1521), and on v1.34.0 five, six and eight mounts each boot with `--net`, as
+  do four and eight mounts with two published ports. The new ceiling was not searched for.
 - **Path length was not a problem** in the paths this run exercised: a volume mount from a
   237-character directory worked and nothing broke approaching 260 characters.
 - **The rest of the platform picture**, in the `dev-env`, `local-api` and `gpu-cuda` packets.

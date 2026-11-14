@@ -1,11 +1,27 @@
 # The local API on Windows
 
-**Re-run on 2026-10-03 against smolvm v1.22.2** on Windows 11 Home build 10.0.26200 UBR 9457 x86_64 (Intel Core Ultra 9 185H,
-31.6 GB), in an elevated session; the section "On v1.22.2" has what changed. The rest of this page
-is the **2026-09-11 run against v1.14.6** on UBR 9445.
+**Re-run on 2026-11-09 against smolvm v1.34.0** on Windows 11 Home build 10.0.26200 UBR 9711 x86_64 (Intel Core Ultra 9 185H,
+31.6 GB), in an elevated session; the sections "On v1.34.0" and "On v1.22.2" have what changed.
+The rest of this page is the **2026-09-11 run against v1.14.6** on UBR 9445.
 
 The whole lifecycle works, over **loopback TCP only**. Two v1.22.2 results differ from the v1.14.6
 record below, both of them about a request stopped before it reaches a machine.
+
+## On v1.34.0
+
+- The lifecycle passed again, with the packet's `cmd` that keeps the workload up: create, a file
+  PUT before start, a bodiless start (200), the workload ready at once, `exec` with `exitCode` 0
+  and a failing one with `exitCode` 3 on HTTP 200, the stream (three `data: line` events and
+  `event: exit` with `{"exitCode":0}`), both file round trips (the early PUT read back
+  `PREPAYLOAD`), stop, delete, a 404 with `NOT_FOUND`, and `{"machines":[]}`.
+- **`POST .../pause` fails on a machine started without `branchable`**, with HTTP 500 and
+  `{"error":"libkrun save failed: ERR EIO capture VM: VM snapshot/restore failed: guest-memory
+  dump: The supplied user buffer is not valid for the requested operation. (os error
+  1784)","code":"INTERNAL_ERROR"}`. The machine keeps running. The CLI's `pause` and `checkpoint`
+  fail the same way; the `branch-and-checkpoint` packet's `references/platforms.md` has the
+  releases. Start the machine branchable if it will be paused.
+- `serve openapi` wrote 218701 bytes, `info.version` still `0.5.2`; the rest of the section below
+  held.
 
 ## On v1.22.2
 
@@ -80,9 +96,10 @@ Both were found by getting them wrong. Neither produces a body you can read.
   authentication, so treat the port as equivalent to a shell on the host.
 - **The create field is `network`, not `net`.** The same as everywhere, but it matters more here
   because of the next point.
-- **PowerShell 5.1's `Invoke-WebRequest` drops error bodies.** The server sends
-  `{"error":"...","code":"..."}` as on macOS and Linux, and `curl.exe` reads it; the earlier runs
-  here recorded the bodies as empty for that reason.
+- **PowerShell 5.1's `Invoke-WebRequest` puts error bodies where a quick read misses them.** The
+  server sends `{"error":"...","code":"..."}` as on macOS and Linux. In PowerShell it is in
+  `$_.ErrorDetails.Message` inside `catch`, and `curl.exe` prints it; the earlier runs here read
+  the response another way and recorded the bodies as empty.
 - **`serve openapi` reports `info.version "0.5.2"`** while `/health` on the same server reports
   the binary's version, on v1.22.2 as on v1.14.6, and on macOS too.
 

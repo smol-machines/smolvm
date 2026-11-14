@@ -73,7 +73,7 @@ names this page warns about:
 ```
 POST /api/v1/machines {"name":"...","image":"alpine","network":true,"memory":1024}
 -> 422 Failed to deserialize the JSON body into the target type: memory: unknown field `memory`,
-   expected one of `name`, `cpus`, `memoryMb`, `mounts`, `ports`, `network`, ... at line 1 column 63
+   expected one of `name`, `cpus`, `memoryMb`, `mounts`, `diskVolumes`, `ports`, `network`, ... at line 1 column 63
 ```
 
 The same with `net` reads `net: unknown field \`net\``. The rest of this section is how releases

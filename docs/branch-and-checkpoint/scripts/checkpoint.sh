@@ -85,8 +85,15 @@ fi
 printf '%s\n' "$$" > "$LOCK/pid"
 trap 'rm -rf "$LOCK"' EXIT
 
+# The name has one-second resolution and a capture can take less than that, so a
+# capture right after another waits for the next second rather than collide.
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 output="$OUT/$NAME-$LABEL-$stamp.smolcheckpoint"
+if [ -e "$output" ]; then
+    sleep 1
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    output="$OUT/$NAME-$LABEL-$stamp.smolcheckpoint"
+fi
 if [ -e "$output" ]; then
     printf 'result=FAILED %s already exists; smolvm never overwrites an output, and two captures in one second collide on this name\n' "$output"
     exit 1
@@ -111,7 +118,7 @@ if [ "$rc" -ne 0 ] || ! printf '%s' "$log" | grep -q '(this checkpoint)'; then
     printf 'result=FAILED the capture did not publish; the previous checkpoint is untouched\n'
     case "$out" in
         *"no file-backed regions"*|*"requires file-backed guest RAM"*)
-            printf 'note=on macOS a stored checkpoint needs the machine started with machine start --branchable, and this one was not. The flag cannot be turned on for a running machine.\n' ;;
+            printf 'note=on macOS before v1.24.0 a stored checkpoint needs the machine started with machine start --branchable, and this one was not. The flag cannot be turned on for a running machine.\n' ;;
         *"No space left"*)
             printf 'note=the disk is full. A failed capture publishes nothing, so delete old checkpoints and run machine checkpoint-prune before the next attempt.\n' ;;
     esac

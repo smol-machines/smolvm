@@ -5,10 +5,10 @@ description: Keeps a persistent smolvm machine with its dependencies already ins
 
 # A persistent dev machine
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24; the Linux runs used
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24; the aarch64 runs used
 the Smolfile with `memory = 1024`, for the host reason in "Platform arms". Done means a second `start` is fast, skips provisioning, and the packages installed in
 the first session are still there.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 The whole use case turns on one fact: **`init` runs once, not on every start**, as
@@ -171,13 +171,14 @@ Full detail in `references/traps.md`. The ones that cost the most:
   and once on v1.22.2 at 1024. At 2048 on v1.18.2 the restart failed with `agent did not become
   ready within 30 seconds`: on a small or busy host lower `memory` before suspecting smolvm, and
   check the mount source first (the `install` packet's traps have the numbers).
-- **macOS arm64**: the scripts were run here on v1.29.0 as shipped, and every check passed.
-- **Linux x86_64**: verified on v1.14.2 on an NVIDIA A10 cloud host, not re-run since.
-- **Windows x86_64**: `references/windows.md`, **re-run on 2026-10-03 against v1.22.2** on
-  Windows 11 Home build 10.0.26200 UBR 9457. Create, three stops and three starts, with a marker read back after each start: **a
+- **macOS arm64**: the scripts were run here on v1.34.0 as shipped, and every check passed.
+- **Linux x86_64**: verified on v1.34.0, twice, on an NVIDIA A10 cloud host, with the Smolfile as
+  shipped.
+- **Windows x86_64**: `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on
+  Windows 11 Home build 10.0.26200 UBR 9711. Create, three stops and three starts, with a marker read back after each start: **a
   stopped machine starts again and its state survives**, as on v1.14.6, where on v1.14.2 it did
-  not. That page also carries the WHP device ceiling a Windows preflight needs through v1.22.2:
-  four `-v` mounts, three when a port is published.
+  not. That page also carries the WHP device ceiling a Windows preflight needed through v1.22.2,
+  four `-v` mounts and three when a port is published; v1.34.0 boots eight with two ports.
 
 ## Eval prompts, and what they produced
 
@@ -234,6 +235,19 @@ failures_after_restart=0/20
 
 The changing hash is the tell: the workload container is being relaunched between execs.
 
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts, with the Smolfile as
+shipped: `result=up`, `init_ran_once=ok (yes)`, `package_version=ok (2.34.2)`, `tmp_file=ok (WIPED)`
+and `result=persistent`.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step with the Smolfile as shipped: `result=up`,
+`init_ran_once=ok (yes)`, `package_version=ok (2.34.2)`, `tmp_file=ok (WIPED)` and
+`result=persistent`.
+
 ## Re-verified on v1.29.0
 
 Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
@@ -265,7 +279,6 @@ verified on v1.18.2, at `memory = 1024`.
 - **Windows beyond the restart.** The v1.22.2 run covered create, three stops and starts, the
   marker and `init` running once; the WHP device ceiling was confirmed by the `install`
   packet's Windows run on 2026-10-03.
-- **Linux x86_64.**
 - **`init` after a checkpoint restore.** Nowhere, on any platform.
 - **The `USER` interaction still settling.** `init` runs as root on v1.22.2, and whether the
   image's own `USER` still governs it in some paths is open as

@@ -5,12 +5,12 @@ description: "Stops every smolvm machine a session started, removes smolvm's sta
 
 # Leaving nothing running and nothing behind
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64,
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64,
 2026-09-24. This packet exists on its own because **the obvious cleanup steps fail here**: the
 obvious assertion gives a false failure, the obvious reaper matches the wrong process or nothing
 at all, and killing a wrapper around a run does not stop its machine. Anything that starts machines
 needs this more than it needs any single feature.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 The cleanup scripts of credentials, dev-env, docker-in-machine, gpu-cuda and install are this
@@ -48,11 +48,12 @@ first: an ephemeral machine's entry retires after its run returns.
 Only machines recorded in the state file are deleted, so a machine you or another session created
 by hand is never deleted. A script records what it creates with
 `scripts/cleanup.sh --record <name>`, and names must carry the `smolskill-` prefix or the delete
-is skipped. `--purge` removes the state file once the list is empty.
+is skipped. `--purge` removes the state file once none of the recorded machines is listed,
+whatever other machines the host has.
 
 **When the user asks you to clean up machines they made themselves**, which is what "clean up
-after me" usually means, nothing is recorded and the script reports them as `machines=remaining`
-and leaves them. That is the guard working, not the end of the job. List them, confirm they are
+after me" usually means, nothing is recorded and the script lists them under
+`other_machines=left as they are` and leaves them. That is the guard working, not the end of the job. List them, confirm they are
 the user's and not another session's, and delete each by name. `smolvm machine list --json` gives
 each machine's `created_at`, in Unix seconds, and its image: one created before the user's session
 began, or under a name they do not recognise, is not theirs to delete without asking.
@@ -151,7 +152,9 @@ memory included, in `vms/_restore-base`, after every machine and checkpoint is g
 `verify-clean.sh` reports it as `restore_base=present` rather than as a leak; remove it with
 `rm -rf` once no restore is running.
 From v1.22.0 it is `vms/_restore-checkpoints`, reported as `restore_cache=present`;
-`references/traps.md` has its size and how to turn it off.
+`references/traps.md` has its size and how to turn it off. From v1.31.2 macOS also keeps
+`vms/_pack-templates`, one unpacked template per pack that machines created from it clone, reported
+as `pack_templates=present`; on v1.34.0 the README's pack steps left 385 MB there.
 
 **A machine named `image-seed-<hash>-<pid>` or `init-bake-<hash>-<pid>` is smolvm's own helper.**
 From v1.22.0 the first run of a registry image builds a shared seed of it in a helper machine, and
@@ -178,12 +181,11 @@ session's; delete it by name with `--force`.
 
 ## Platform arms
 
-- **macOS arm64**: the scripts were run here on v1.29.0. **Linux aarch64**: on v1.18.2, and once
+- **macOS arm64**: the scripts were run here on v1.34.0. **Linux aarch64**: on v1.18.2, and once
   on v1.22.2.
-- **Linux x86_64**: the procedure was verified on v1.14.2 on an NVIDIA A10 cloud host. The
-  scripts themselves were not re-run there.
-- **Windows x86_64**: `references/windows.md`, **run on 2026-10-03 against v1.22.2** on
-  Windows 11 Home build 10.0.26200 UBR 9457 as the cleanup after runs that had created
+- **Linux x86_64**: the scripts ran on v1.34.0, twice, on an NVIDIA A10 cloud host.
+- **Windows x86_64**: `references/windows.md`, **re-run on 2026-11-09 against v1.34.0** on
+  Windows 11 Home build 10.0.26200 UBR 9711 as the cleanup after runs that had created
   machines, packs and bakes, after which the profile matched its listing from before them. The
   scripts are bash and do not run there. State cannot be relocated there, and one set of runs left
   30 GB in `%LOCALAPPDATA%\smolvm`.
@@ -212,6 +214,26 @@ vm_process=89092 config=/tmp/u23/Library/Caches/smolvm/vms/ea8c396d10b0f0b9/boot
 $HOME/.smolvm` against the real installation beside the isolated one:
 `protected_untouched_since_2026-10-04:<dir>=ok` for each `--protected` directory, and
 `result=clean`.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). On macOS: an orphaned CLI and its VM, left by
+killing a wrapper, were found by `cleanup.sh` and killed by `--reap`; `verify-clean.sh` then
+reported `vm_dirs=FAIL` for `vms/_pack-templates`, a cache from v1.31.2 that `smolvm serve start`
+does not reclaim, and now reports it as `pack_templates=present`. `--protected` gave `ok` for the
+real installation's three directories. After `--uninstall`, `find` listed
+`Library/Caches/smolvm-image-archives` (21 MB) and the packets' own `.local/state/smolvm-skills`. On
+Linux: the orphaned VM was found and killed by `--reap`, `verify-clean.sh` then said `vm_dirs=FAIL`
+until `smolvm serve start` ran once, and then `result=clean`; `--protected` gave `ok` for the box's
+real data and cache directories, and `--uninstall` left the same two paths.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, as on Linux aarch64: `--reap` killed the orphaned VM,
+`verify-clean.sh` said `machines=FAIL` and `vm_dirs=FAIL` until `smolvm serve start` ran once and
+then `result=clean`, and `--uninstall` left the same two paths. `--protected` was not run there:
+that host had no other installation.
 
 ## Re-verified on v1.29.0
 
@@ -272,7 +294,6 @@ helpers left listed by interrupted and failed first boots. Linux was last verifi
 - **Kubernetes.** `references/kubernetes.md` records a sweep verified on an Ubuntu 22.04 x86_64 k3s
   node on v1.14.2, not re-run since. Its lines for the `RuntimeClass`, the node label and the
   drop-in are read from the repository's k3s scripts at v1.22.2 and were not run.
-- **Linux x86_64.**
 - **The macOS `hdiutil` mount-point case.** `references/traps.md` records that `rm -rf` on the
   pack cache can fail with `Resource busy` and what the uninstaller does about it. No pack was
   created in the runs recorded here, so that path was not exercised.
