@@ -59,6 +59,16 @@ const PAUSED_DISKS_SUFFIX: &str = ".paused-disks";
 /// Suffix of the directory beside a paused machine's data directory that pins
 /// the backing layers its pause artifact references instead of carrying.
 const PAUSED_LAYERS_SUFFIX: &str = ".paused-layers";
+/// Suffix of the directory beside a paused machine's data directory that
+/// keeps its pause's resume inputs unpacked, so a resume on this host need
+/// not decode them from the artifact.
+const PAUSED_RESUME_SUFFIX: &str = ".paused-resume";
+/// The record in that directory naming the artifact its inputs belong to.
+const PAUSED_RESUME_RECORD: &str = "artifact";
+/// Free disk a pause leaves untouched beyond its RAM size when it keeps its
+/// resume inputs: below that, the node's disk matters more than a fast resume.
+#[cfg(target_os = "linux")]
+const KEPT_RESUME_DISK_RESERVE: u64 = 32 << 30;
 
 /// Marks the directory an off-host export of a paused machine builds in,
 /// beside its data directory: `.<data dir>.export-<random>`.
@@ -2284,6 +2294,7 @@ fn capture_with_completion(
     }
     if stop_after_capture {
         remove_paused_disks_marker(&crate::agent::vm_data_dir(name))?;
+        remove_paused_resume(&crate::agent::vm_data_dir(name))?;
         publish_resume_point(PauseCaptureStage::Capturing)?;
     }
     let snapshot_dir = staging_dir.join(ASSET_DIR);
@@ -2483,6 +2494,36 @@ fn capture_with_completion(
             Err(error) => tracing::warn!(%error, "streamed checkpoint will not be retained"),
         }
     }
+
+    // A pause keeps its resume inputs unpacked beside the machine as it packs
+    // them, so a resume on this host installs them without decoding the
+    // artifact. Only a streamed RAM image can be copied as it is packed, and
+    // only while the host keeps a reserve of disk beyond the whole RAM size.
+    #[cfg(target_os = "linux")]
+    let room_to_keep = |stream: &smolvm_pack::checkpoint_stream::CheckpointStream<'_>| {
+        free_bytes(&crate::agent::vm_data_dir(name)).is_some_and(|free| {
+            free >= stream.memory_len().saturating_add(KEPT_RESUME_DISK_RESERVE)
+        })
+    };
+    #[cfg(not(target_os = "linux"))]
+    let room_to_keep = |_: &smolvm_pack::checkpoint_stream::CheckpointStream<'_>| false;
+    let kept_resume = match streamed_memory.as_mut() {
+        Some(stream)
+            if stop_after_capture && stored.is_none() && !retain && room_to_keep(stream) =>
+        {
+            match KeptResume::begin(&crate::agent::vm_data_dir(name)) {
+                Ok((kept, memory)) => {
+                    stream.copy_memory_to(memory);
+                    Some(kept)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "pause will resume by extracting its artifact");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
@@ -2860,6 +2901,12 @@ fn capture_with_completion(
         packer.pack_artifact(output).map(|info| (info, None))
     }
     .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    if let Some(kept) = kept_resume {
+        let copied = streamed_memory
+            .as_ref()
+            .is_some_and(|stream| stream.memory_copied());
+        kept.finish(copied, &snapshot_dir, output);
+    }
     // A streamed capture is retainable only once its RAM copy is complete.
     #[cfg(target_os = "linux")]
     let retain = retain
@@ -4591,6 +4638,196 @@ pub(crate) fn remove_paused_layers(vm_data: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Where a paused machine keeps its resume inputs unpacked: beside its data
+/// directory, like [`paused_disks_marker`], so its VMM cannot replace them.
+fn paused_resume_dir(vm_data: &Path) -> Result<PathBuf> {
+    match (vm_data.parent(), vm_data.file_name()) {
+        (Some(parent), Some(name)) => {
+            Ok(parent.join(format!(".{}{PAUSED_RESUME_SUFFIX}", name.to_string_lossy())))
+        }
+        _ => Err(Error::agent(
+            "keep paused resume inputs",
+            format!("{} has no parent", vm_data.display()),
+        )),
+    }
+}
+
+/// The data directory name a kept-resume directory belongs to, or `None`
+/// when `path` is not one.
+pub(crate) fn paused_resume_owner(path: &Path) -> Option<&str> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix('.')?
+        .strip_suffix(PAUSED_RESUME_SUFFIX)
+        .filter(|name| !name.is_empty())
+}
+
+/// Drop a machine's kept resume inputs.
+pub(crate) fn remove_paused_resume(vm_data: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(paused_resume_dir(vm_data)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The resume inputs a pause keeps unpacked while it packs them: its RAM
+/// image, copied from the stream, and the small files beside it in staging.
+/// The record naming the artifact is written last, so a directory without it
+/// is never used.
+struct KeptResume {
+    dir: PathBuf,
+}
+
+impl KeptResume {
+    /// Start a fresh directory and open the file the RAM image is copied to.
+    fn begin(vm_data: &Path) -> Result<(Self, std::fs::File)> {
+        let dir = paused_resume_dir(vm_data)?;
+        remove_paused_resume(vm_data)?;
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.recursive(true).create(dir.join(ASSET_DIR))?;
+        let memory = create_private_file(&dir.join(ASSET_DIR).join("memory.bin"))?;
+        Ok((Self { dir }, memory))
+    }
+
+    /// Complete the directory once the artifact is packed, or remove it when
+    /// the RAM copy did not finish. The small inputs are copied before the
+    /// staging tree goes; flushing the RAM image runs on its own thread so the
+    /// pause does not wait on it, and the record follows only once it is
+    /// durable. Best-effort: until then, resume extracts the artifact.
+    fn finish(self, copied: bool, staged: &Path, artifact: &Path) {
+        let inputs = self.dir.join(ASSET_DIR);
+        let copy_small = || -> Result<()> {
+            if !copied {
+                return Err(Error::agent(
+                    "keep paused resume inputs",
+                    "RAM copy incomplete",
+                ));
+            }
+            for file in ["checkpoint.bin", "manifest.bin", "credential-ca.json"] {
+                let source = staged.join(file);
+                if !source.exists() {
+                    continue;
+                }
+                let mut input = std::fs::File::open(&source)?;
+                let mut output = create_private_file(&inputs.join(file))?;
+                std::io::copy(&mut input, &mut output)?;
+                output.sync_all()?;
+            }
+            Ok(())
+        };
+        let identity = copy_small().and_then(|()| paused_artifact_identity(artifact));
+        let artifact = artifact.to_path_buf();
+        let publish = move || {
+            let result = identity.and_then(|identity| -> Result<()> {
+                std::fs::File::open(inputs.join("memory.bin"))?.sync_all()?;
+                std::fs::File::open(&inputs)?.sync_all()?;
+                let mut record = create_private_file(&self.dir.join(PAUSED_RESUME_RECORD))?;
+                writeln!(record, "{}", artifact.display())?;
+                record.write_all(identity.as_bytes())?;
+                record.sync_all()?;
+                std::fs::File::open(&self.dir)?.sync_all()?;
+                Ok(())
+            });
+            if let Err(error) = result {
+                tracing::warn!(%error, "pause will resume by extracting its artifact");
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("keep-paused-resume".into())
+            .spawn(publish)
+        {
+            tracing::warn!(%error, "pause will resume by extracting its artifact");
+        }
+    }
+}
+
+#[cfg(unix)]
+/// The identity of a pause artifact this service wrote: its inode and size.
+/// Only a regular file this service owns and no one else can write counts,
+/// so the manifest read from it at resume is the one packed.
+fn paused_artifact_identity(artifact: &Path) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(artifact)?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(Error::agent(
+            "keep paused resume inputs",
+            "artifact is not a private file of this service",
+        ));
+    }
+    Ok(format!(
+        "{} {} {}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len()
+    ))
+}
+
+#[cfg(unix)]
+/// The directory of resume inputs a pause kept for `artifact`, if they are
+/// complete, service-owned and match the checkpoint they will install.
+fn kept_resume_inputs(
+    vm_data: &Path,
+    artifact: &Path,
+    checkpoint: &PortableCheckpointManifest,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = paused_resume_dir(vm_data).ok()?;
+    let owned = |path: &Path, mask: u32| {
+        std::fs::symlink_metadata(path).ok().filter(|metadata| {
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & mask == 0
+        })
+    };
+    owned(&dir, 0o077).filter(|metadata| metadata.is_dir())?;
+    let record = std::fs::read_to_string(dir.join(PAUSED_RESUME_RECORD)).ok()?;
+    owned(&dir.join(PAUSED_RESUME_RECORD), 0o022)?;
+    let (recorded_artifact, recorded_identity) = record.split_once('\n')?;
+    if Path::new(recorded_artifact) != artifact
+        || paused_artifact_identity(artifact).ok()? != recorded_identity
+    {
+        return None;
+    }
+    let assets = expected_assets(checkpoint)
+        .into_iter()
+        .map(|(asset, path)| (asset, path.to_string()))
+        .chain(
+            checkpoint
+                .credential_ca
+                .iter()
+                .map(|asset| (asset, asset.path.clone())),
+        );
+    for (asset, path) in assets {
+        let metadata = owned(&dir.join(path), 0o022)?;
+        if !metadata.is_file() || metadata.len() != asset.size {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+#[cfg(not(unix))]
+fn paused_artifact_identity(_artifact: &Path) -> Result<String> {
+    Err(Error::agent(
+        "keep paused resume inputs",
+        "not supported on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn kept_resume_inputs(
+    _vm_data: &Path,
+    _artifact: &Path,
+    _checkpoint: &PortableCheckpointManifest,
+) -> Option<PathBuf> {
+    None
 }
 
 /// A backing layer a pause artifact references rather than carries.
@@ -6504,6 +6741,22 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .collect();
     skip.push(PathBuf::from("lib"));
     let rootfs_available = pinned_rootfs_available(checkpoint);
+    // The pause kept what the installer reads unpacked: install it from there
+    // rather than decoding the artifact, which is only needed elsewhere.
+    if keep_disks && rootfs_available {
+        if let Some(kept) = kept_resume_inputs(&vm_data, artifact, checkpoint) {
+            tracing::info!(machine = %record.name, phase = "extract", kept = true, elapsed_ms = 0, "paused resume phase completed");
+            clear_stale_restore_state(&vm_data)?;
+            return install_with(
+                &kept,
+                &vm_data,
+                checkpoint,
+                keep_disks,
+                cache_base.as_deref(),
+                None,
+            );
+        }
+    }
     if rootfs_available {
         skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
     }
@@ -8836,6 +9089,76 @@ mod tests {
             paused_disks_marker_owner(&paused_disks_marker(vm).unwrap()),
             Some("0123abcd")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kept_resume_inputs_serve_only_their_own_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = &dir.path().join("0123abcd");
+        std::fs::create_dir(vm).unwrap();
+        let artifact = vm.join("pause-1.smolcheckpoint");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("checkpoint.bin"), b"s").unwrap();
+        std::fs::write(staged.join("manifest.bin"), b"l").unwrap();
+        let checkpoint = test_checkpoint_manifest();
+
+        let (kept, mut memory) = KeptResume::begin(vm).unwrap();
+        memory.write_all(b"m").unwrap();
+        drop(memory);
+        // An unfinished directory has no record and is never used.
+        assert!(kept_resume_inputs(vm, &artifact, &checkpoint).is_none());
+        kept.finish(true, &staged, &artifact);
+        let record = paused_resume_dir(vm).unwrap().join(PAUSED_RESUME_RECORD);
+        for _ in 0..500 {
+            if record.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            kept_resume_inputs(vm, &artifact, &checkpoint),
+            Some(paused_resume_dir(vm).unwrap())
+        );
+        assert!(kept_resume_inputs(vm, &vm.join("other.smolcheckpoint"), &checkpoint).is_none());
+        let mut bigger = test_checkpoint_manifest();
+        bigger.memory.size = 2;
+        assert!(kept_resume_inputs(vm, &artifact, &bigger).is_none());
+
+        // A replaced artifact is a different file, even at the same path.
+        let replacement = vm.join("replacement");
+        std::fs::write(&replacement, b"artifact").unwrap();
+        std::fs::rename(&replacement, &artifact).unwrap();
+        assert!(kept_resume_inputs(vm, &artifact, &checkpoint).is_none());
+
+        assert_eq!(
+            paused_resume_owner(&paused_resume_dir(vm).unwrap()),
+            Some("0123abcd")
+        );
+        remove_paused_resume(vm).unwrap();
+        assert!(!paused_resume_dir(vm).unwrap().exists());
+        remove_paused_resume(vm).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_incomplete_ram_copy_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = &dir.path().join("0123abcd");
+        std::fs::create_dir(vm).unwrap();
+        let artifact = vm.join("pause-1.smolcheckpoint");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        let (kept, _) = KeptResume::begin(vm).unwrap();
+        kept.finish(false, dir.path(), &artifact);
+        for _ in 0..500 {
+            if !paused_resume_dir(vm).unwrap().exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!paused_resume_dir(vm).unwrap().exists());
     }
 
     fn qcow2_header_fixture() -> Vec<u8> {
