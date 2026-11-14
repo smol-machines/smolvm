@@ -338,7 +338,8 @@ const HOST_LAYER_SYMLINKS_MARKER: &str = ".smolvm-host-layer-symlinks";
 /// device nodes without being able to create any of them itself.
 const OVERRIDE_STAT_XATTR: &str = "user.containers.override_stat";
 const OVERLAY_OPAQUE_XATTR: &str = "user.overlay.opaque";
-/// Overlayfs whiteout: a character device with device number 0:0.
+/// Overlayfs whiteout: a character device with device number 0:0. A host that
+/// cannot `mknod` fakes it with [`OVERRIDE_STAT_XATTR`].
 const WHITEOUT_MODE: u32 = 0o020000;
 
 /// Whether this host should extract a pack's layers itself and describe their
@@ -456,6 +457,85 @@ fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> 
             "user xattrs are not supported on this host",
         ))
     }
+}
+
+/// Whether this Linux host can materialize overlay whiteouts natively.
+///
+/// A root host without the per-VM uid drop does not use the
+/// `user.containers.override_stat` path. Its layer trees therefore need the
+/// representation overlayfs itself reads: a 0:0 character device for
+/// `.wh.<name>` and `trusted.overlay.opaque=y` for `.wh..wh..opq`.
+#[cfg(target_os = "linux")]
+fn native_overlay_whiteouts() -> bool {
+    // SAFETY: geteuid only reads the process credentials.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_overlay_whiteouts() -> bool {
+    false
+}
+
+/// Set a trusted overlayfs xattr without following symlinks.
+#[cfg(target_os = "linux")]
+fn set_trusted_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "xattr name"))?;
+    // SAFETY: all pointers are valid for the duration of the call and the
+    // value length matches the byte slice.
+    let rc = unsafe {
+        libc::lsetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Create the native 0:0 overlayfs whiteout character device.
+#[cfg(target_os = "linux")]
+fn create_native_whiteout(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+    // SAFETY: `c_path` is NUL-terminated and the device number is the
+    // overlayfs whiteout's required 0:0.
+    let rc = unsafe {
+        libc::mknod(
+            c_path.as_ptr(),
+            WHITEOUT_MODE as libc::mode_t,
+            libc::makedev(0, 0),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_trusted_xattr(_path: &Path, _name: &str, _value: &[u8]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "trusted overlay xattrs are Linux-only",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_native_whiteout(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native overlay whiteouts are Linux-only",
+    ))
 }
 
 fn record_override_stat(path: &Path, uid: u64, gid: u64, mode: u32) -> std::io::Result<()> {
@@ -1110,6 +1190,10 @@ fn safe_unpack_skipping<R: Read>(
         // (a from-VM export tars the overlay-mounted tree, an image pack is
         // pre-merged), so a `.wh.` name in it is a file the machine holds, such
         // as a container runtime's own overlay data, and is kept as one.
+        //
+        // A root Linux host without the override-xattr path restores ownership
+        // numerically, and can materialize what overlayfs reads natively
+        // instead of describing it.
         if owner_xattr && translate_whiteouts {
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 let parent_rel = entry_path.parent().unwrap_or(Path::new(""));
@@ -1152,6 +1236,51 @@ fn safe_unpack_skipping<R: Read>(
                     record_override_stat(&target, 0, 0, WHITEOUT_MODE)?;
                     report.entries += 1;
                     continue;
+                }
+            }
+        } else if translate_whiteouts && !owner_xattr && native_overlay_whiteouts() {
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                let parent_rel = entry_path.parent().unwrap_or(Path::new(""));
+                if name == ".wh..wh..opq" {
+                    let dir = dest.join(parent_rel);
+                    if !normalize_path(&dir).starts_with(&canonical_dest) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "tar entry '{}' escapes destination directory",
+                                entry_path.display()
+                            ),
+                        ));
+                    }
+                    fs::create_dir_all(&dir)?;
+                    set_trusted_xattr(&dir, "trusted.overlay.opaque", b"y")?;
+                    report.entries += 1;
+                    continue;
+                }
+                if let Some(victim) = name.strip_prefix(".wh.") {
+                    // `.wh..` and `.wh.` are not valid whiteouts: do not let
+                    // them resolve to the parent directory itself.
+                    if !victim.is_empty() && victim != "." && victim != ".." {
+                        let target = dest.join(parent_rel).join(victim);
+                        if !normalize_path(&target).starts_with(&canonical_dest) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "tar entry '{}' escapes destination directory",
+                                    entry_path.display()
+                                ),
+                            ));
+                        }
+                        if let Some(parent) = target.parent() {
+                            fs::create_dir_all(parent)?;
+                            set_mode(parent, 0o755);
+                        }
+                        let _ = fs::remove_file(&target);
+                        let _ = fs::remove_dir_all(&target);
+                        create_native_whiteout(&target)?;
+                        report.entries += 1;
+                        continue;
+                    }
                 }
             }
         }
@@ -7628,6 +7757,98 @@ mod tests {
         assert!(packed_agent_mounts_userxattr("1.16.2"));
         assert!(packed_agent_mounts_userxattr("1.17.0"));
         assert!(packed_agent_mounts_userxattr("2.0.0"));
+    }
+
+    /// Root Linux hosts that do not use the override-xattr path must preserve
+    /// overlayfs whiteouts natively: a `.wh.<name>` is a 0:0 character device,
+    /// and `.wh..wh..opq` marks its parent with trusted.overlay.opaque.
+    ///
+    /// The test is skipped in the ordinary unprivileged test process. Run the
+    /// binary as root with CAP_MKNOD and CAP_SYS_ADMIN, and point `TMPDIR` at a
+    /// filesystem that stores trusted xattrs, so both operations are real.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_layers_translate_whiteouts_to_native_overlay_entries() {
+        if unsafe { libc::geteuid() != 0 } {
+            eprintln!("SKIP: native whiteout test requires root");
+            return;
+        }
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("layer");
+        fs::create_dir_all(&dest).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let probe = dest.join("native-whiteout-probe");
+        if create_native_whiteout(&probe).is_err()
+            || set_trusted_xattr(&dest, "trusted.overlay.opaque", b"y").is_err()
+        {
+            eprintln!("SKIP: this root environment lacks native whiteout capabilities");
+            return;
+        }
+        fs::remove_file(&probe).unwrap();
+        // Do not let the probe's marker affect the assertion below.
+        use std::os::unix::ffi::OsStrExt;
+        let c_dest = std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
+        let c_name = c"trusted.overlay.opaque";
+        // SAFETY: both C strings live for this call.
+        let _ = unsafe { libc::lremovexattr(c_dest.as_ptr(), c_name.as_ptr().cast()) };
+
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_mode(0o755);
+        dir_header.set_size(0);
+        dir_header.set_cksum();
+        builder
+            .append_data(&mut dir_header, "private/", &[][..])
+            .unwrap();
+
+        let mut victim_header = tar::Header::new_gnu();
+        victim_header.set_entry_type(tar::EntryType::Regular);
+        victim_header.set_mode(0o644);
+        victim_header.set_size(3);
+        victim_header.set_cksum();
+        builder
+            .append_data(&mut victim_header, "private/victim", &b"old"[..])
+            .unwrap();
+
+        for name in ["private/.wh.victim", "private/.wh..wh..opq"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append_data(&mut header, name, &[][..]).unwrap();
+        }
+
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let victim = fs::symlink_metadata(dest.join("private/victim")).unwrap();
+        assert!(victim.file_type().is_char_device());
+        assert_eq!(victim.rdev(), libc::makedev(0, 0));
+
+        let path = std::ffi::CString::new(dest.join("private").as_os_str().as_bytes()).unwrap();
+        let name = c"trusted.overlay.opaque";
+        let mut value = [0u8; 8];
+        // SAFETY: all pointers refer to live buffers for the call.
+        let size = unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        assert_eq!(&value[..size as usize], b"y");
     }
 
     /// A cache entry whose layers were staged for the guest: one layer tar,
