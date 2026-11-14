@@ -83,9 +83,18 @@ const POD_SHARE_GUEST_PATH: &str = "/podshare";
 /// stay in lockstep with those constants.
 const POD_SHARE_GUEST_MOUNT: &str = "/run/smolvm/virtiofs/podshare";
 
-/// Default sandbox VM sizing until pod-overhead plumbing lands.
+/// Default sandbox VM sizing, for a pod that does not ask for another.
 const SANDBOX_CPUS: u8 = 2;
 const SANDBOX_MEMORY_MIB: u32 = 1024;
+
+/// Pod annotation sizing the sandbox VM's vCPUs. Like a GPU, the size has to be
+/// known at sandbox creation, before any container and its limits exist.
+const ANN_CPUS: &str = "smolvm.io/cpus";
+/// Pod annotation sizing the sandbox VM's memory, in MiB.
+const ANN_MEMORY_MIB: &str = "smolvm.io/memory-mib";
+/// The range `VmResources` accepts, so a size read here cannot fail the boot.
+const SANDBOX_CPUS_RANGE: std::ops::RangeInclusive<u8> = 1..=16;
+const SANDBOX_MIN_MEMORY_MIB: u32 = 64;
 
 /// Pod annotation opting the sandbox VM into a virtio-gpu device (Venus/Vulkan).
 ///
@@ -93,11 +102,47 @@ const SANDBOX_MEMORY_MIB: u32 = 1024;
 /// `krun_set_gpu_options2` before the VM starts, and there is no hot-plug. That
 /// rules out deriving it from a container's allocated devices, which kubelet
 /// only reports after the sandbox is already running — so the request rides a
-/// pod annotation, which containerd propagates onto the sandbox OCI spec.
+/// pod annotation, which containerd copies onto the sandbox OCI spec when the
+/// runtime's `pod_annotations` allows it.
 const ANN_GPU: &str = "smolvm.io/gpu";
 /// Pod annotation sizing the GPU's shared-memory region, in MiB. Absent → the
 /// engine's default. Ignored unless [`ANN_GPU`] is set.
 const ANN_GPU_VRAM_MIB: &str = "smolvm.io/gpu-vram-mib";
+
+/// Read one size annotation, warning and returning `None` if it is not usable.
+fn size_annotation<T: std::str::FromStr>(
+    annotations: &serde_json::Value,
+    name: &str,
+    usable: impl Fn(&T) -> bool,
+) -> Option<T> {
+    let raw = annotations.get(name)?;
+    let size = raw
+        .as_str()
+        .and_then(|v| v.trim().parse::<T>().ok())
+        .filter(|v| usable(v));
+    if size.is_none() {
+        warn!("{name} is not a usable size; using the default");
+    }
+    size
+}
+
+/// The sandbox VM's vCPUs and memory in MiB, from the sandbox OCI spec.
+///
+/// A bad size falls back to the default rather than failing the pod, as a bad
+/// VRAM size does.
+fn sandbox_vm_size(spec: Option<&serde_json::Value>) -> (u8, u32) {
+    let Some(annotations) = spec.and_then(|v| v.get("annotations")) else {
+        return (SANDBOX_CPUS, SANDBOX_MEMORY_MIB);
+    };
+    (
+        size_annotation(annotations, ANN_CPUS, |c| SANDBOX_CPUS_RANGE.contains(c))
+            .unwrap_or(SANDBOX_CPUS),
+        size_annotation(annotations, ANN_MEMORY_MIB, |m| {
+            *m >= SANDBOX_MIN_MEMORY_MIB
+        })
+        .unwrap_or(SANDBOX_MEMORY_MIB),
+    )
+}
 
 /// A sandbox's GPU request, read off the pod's annotations.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -660,6 +705,7 @@ impl PodBackend for EnginePodBackend {
                 .and_then(|v| v.pointer("/linux/sysctl"))
                 .filter(|v| v.as_object().map(|o| !o.is_empty()).unwrap_or(false))
                 .cloned();
+            let (cpus, memory_mib) = sandbox_vm_size(sandbox_spec.as_ref());
             let gpu = sandbox_gpu_request(sandbox_spec.as_ref());
             if gpu.enabled {
                 info!(
@@ -690,8 +736,8 @@ impl PodBackend for EnginePodBackend {
                 // own images through the CRI, not through the machine record.
                 image: None,
                 resources: VmResources {
-                    cpus: SANDBOX_CPUS,
-                    memory_mib: SANDBOX_MEMORY_MIB,
+                    cpus,
+                    memory_mib,
                     network: true,
                     // virtio-net (not TSI) gives the sandbox a real L2 NIC — the
                     // prerequisite for bridging it to a CNI tap in the pod netns
@@ -1389,6 +1435,62 @@ mod tests {
         assert_eq!(
             sandbox_gpu_request(Some(&spec_with(serde_json::json!({})))),
             GpuRequest::default()
+        );
+    }
+
+    #[test]
+    fn no_size_annotation_keeps_the_default_size() {
+        let default = (SANDBOX_CPUS, SANDBOX_MEMORY_MIB);
+        assert_eq!(sandbox_vm_size(None), default);
+        assert_eq!(sandbox_vm_size(Some(&serde_json::json!({}))), default);
+        assert_eq!(
+            sandbox_vm_size(Some(&spec_with(serde_json::json!({})))),
+            default
+        );
+    }
+
+    #[test]
+    fn size_annotations_set_the_size_independently() {
+        assert_eq!(
+            sandbox_vm_size(Some(&spec_with(
+                serde_json::json!({ ANN_CPUS: "4", ANN_MEMORY_MIB: " 4096 " })
+            ))),
+            (4, 4096)
+        );
+        assert_eq!(
+            sandbox_vm_size(Some(&spec_with(
+                serde_json::json!({ ANN_MEMORY_MIB: "4096" })
+            ))),
+            (SANDBOX_CPUS, 4096)
+        );
+        assert_eq!(
+            sandbox_vm_size(Some(&spec_with(serde_json::json!({ ANN_CPUS: "4" })))),
+            (4, SANDBOX_MEMORY_MIB)
+        );
+    }
+
+    /// A size the VM would refuse, or that is not a size at all, must not cost
+    /// the pod its VM.
+    #[test]
+    fn unusable_sizes_fall_back_to_the_default() {
+        for v in ["0", "17", "300", "-1", "", "4Gi", "many"] {
+            assert_eq!(
+                sandbox_vm_size(Some(&spec_with(serde_json::json!({ ANN_CPUS: v })))).0,
+                SANDBOX_CPUS,
+                "cpus {v:?}"
+            );
+        }
+        for v in ["0", "63", "-1", "", "4Gi", "many"] {
+            assert_eq!(
+                sandbox_vm_size(Some(&spec_with(serde_json::json!({ ANN_MEMORY_MIB: v })))).1,
+                SANDBOX_MEMORY_MIB,
+                "memory {v:?}"
+            );
+        }
+        assert_eq!(
+            sandbox_vm_size(Some(&spec_with(serde_json::json!({ ANN_CPUS: 4 })))).0,
+            SANDBOX_CPUS,
+            "not a string"
         );
     }
 
