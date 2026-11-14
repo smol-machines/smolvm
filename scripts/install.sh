@@ -635,12 +635,11 @@ install_smolvm() {
         done
     fi
 
-    # User installs register an OS-owned Docker socket; no resident engine starts.
-    # System installs keep native/server operation independent of a user session.
+    # The Docker Engine API is opt-in: `smolvm engine` selects the `smol` Docker
+    # context, which would redirect a user's existing docker CLI, so an install
+    # or upgrade never runs it. It only says how.
     if [[ "$SYSTEM_INSTALL" != true ]] && "$prefix/smolvm" engine --help 2>/dev/null | grep -q 'automatic Docker API activation'; then
-        if ! "$prefix/smolvm" engine; then
-            warn "Docker socket registration failed; run 'smolvm engine' in your user session to finish setup."
-        fi
+        info "To run docker, Compose and Testcontainers on smolvm, run 'smolvm engine' (it switches your Docker context to 'smol')."
     fi
 
     # Create symlinks in bin directory. `smol` is the primary, user-facing CLI;
