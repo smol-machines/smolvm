@@ -37,8 +37,9 @@
 
 #[cfg(unix)]
 pub use imp::{
-    discard_unbooted_storage, ensure_image_seed, prewarm_recent_seeds, revalidate_seed, seed_root,
-    seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    discard_unbooted_storage, ensure_image_seed, exit_by_signal, interruptible,
+    prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage, seed_storage_with_trust,
+    seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
 
 /// Whether a seed can serve a pull for `platform`. A seed holds the image for
@@ -94,6 +95,16 @@ pub fn seed_first_start(
             )
         });
     if let Err(error) = seeded {
+        report_no_seed(name, &error);
+    }
+}
+
+/// Log why a start goes on without a seed. An interrupted build is no fallback:
+/// the CLI ends the command (see [`interruptible`]), so nothing pulls.
+fn report_no_seed(name: &str, error: &crate::Error) {
+    if seed_interrupted() {
+        tracing::debug!(machine = name, %error, "image seed build interrupted");
+    } else {
         tracing::warn!(machine = name, %error, "no image seed; pulling in the guest");
     }
 }
@@ -146,8 +157,33 @@ pub fn seed_ephemeral_run_with_trust(
             )
         });
     if let Err(error) = seeded {
-        tracing::warn!(machine = name, %error, "no image seed; pulling in the guest");
+        report_no_seed(name, &error);
     }
+}
+
+/// Whether a signal cut off the seed build of this process (see [`interruptible`]).
+#[cfg(unix)]
+fn seed_interrupted() -> bool {
+    imp::interrupt_signal().is_some()
+}
+
+/// Seeds need a Unix host; elsewhere no seed build can be interrupted.
+#[cfg(not(unix))]
+fn seed_interrupted() -> bool {
+    false
+}
+
+/// Seeds need a Unix host; elsewhere `seed` runs with no signal handling.
+#[cfg(not(unix))]
+pub fn interruptible(seed: impl FnOnce()) -> Option<i32> {
+    seed();
+    None
+}
+
+/// Seeds need a Unix host, so no seed build is interrupted elsewhere.
+#[cfg(not(unix))]
+pub fn exit_by_signal(signal: i32) -> ! {
+    std::process::exit(128 + signal)
 }
 
 /// Seeds need a Unix host; elsewhere nothing seeds.
@@ -212,6 +248,7 @@ mod imp {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
     use sha2::{Digest, Sha256};
 
@@ -227,12 +264,169 @@ mod imp {
     /// Name prefix of the throwaway machines that build seeds.
     pub const SEED_MACHINE_PREFIX: &str = "image-seed-";
 
-    /// A builder machine older than this is left over from a crashed build.
+    /// A builder machine older than this is left over from a crashed build, even
+    /// when its owner's PID now names another process.
     const STALE_BUILDER_SECS: u64 = 30 * 60;
 
     /// Default cap on the seed cache before unreferenced seeds are evicted;
     /// `SMOLVM_IMAGE_SEED_MAX_BYTES` overrides it.
     const DEFAULT_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+    /// The signals [`interruptible`] catches while this process has a builder.
+    const INTERRUPT_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
+
+    /// The signal that cut off this process's seed build, 0 when none did.
+    static INTERRUPT: AtomicI32 = AtomicI32::new(0);
+
+    /// Builds of this process that have a builder machine to delete.
+    static BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The builder step (a `smolvm` child process) running now, 0 when none.
+    static STEP_PID: AtomicI32 = AtomicI32::new(0);
+
+    /// Run `seed`, a CLI seed call, so that SIGINT or SIGTERM during a seed
+    /// build stops the build and deletes its builder machine instead of
+    /// leaving it behind. Returns the signal when one cut the build off; the
+    /// caller then ends the command with [`exit_by_signal`]. A signal outside
+    /// a build has its usual effect at once.
+    ///
+    /// Only the CLI calls this. The API, the SDKs and the server keep their
+    /// own signal handling.
+    pub fn interruptible(seed: impl FnOnce()) -> Option<i32> {
+        INTERRUPT.store(0, Ordering::SeqCst);
+        let handlers = InterruptHandlers::install();
+        seed();
+        drop(handlers);
+        interrupt_signal()
+    }
+
+    /// The signal that cut off this process's seed build, if one did.
+    pub(crate) fn interrupt_signal() -> Option<i32> {
+        match INTERRUPT.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    /// End this process as `signal` would have, after an interrupted build
+    /// has cleaned up, so a shell sees the same exit status as before.
+    pub fn exit_by_signal(signal: i32) -> ! {
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+        std::process::exit(128 + signal)
+    }
+
+    /// The handlers of [`INTERRUPT_SIGNALS`] that were in place before
+    /// [`interruptible`]; dropping this puts them back.
+    struct InterruptHandlers(Vec<(libc::c_int, libc::sigaction)>);
+
+    impl InterruptHandlers {
+        fn install() -> Self {
+            let mut previous = Vec::with_capacity(INTERRUPT_SIGNALS.len());
+            for signal in INTERRUPT_SIGNALS {
+                unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(signal, std::ptr::null(), &mut old) != 0
+                        || old.sa_sigaction == libc::SIG_IGN
+                    {
+                        // An ignored signal (a background job of a
+                        // non-interactive shell ignores SIGINT) stays ignored.
+                        continue;
+                    }
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = on_interrupt as *const () as libc::sighandler_t;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    // The build's own calls see no EINTR; it stops at its
+                    // next step instead.
+                    action.sa_flags = libc::SA_RESTART;
+                    if libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 {
+                        previous.push((signal, old));
+                    }
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for InterruptHandlers {
+        fn drop(&mut self) {
+            for (signal, old) in &self.0 {
+                unsafe { libc::sigaction(*signal, old, std::ptr::null_mut()) };
+            }
+        }
+    }
+
+    /// With no builder in this process, the signal has its usual effect.
+    /// Otherwise record it and stop the running step: a SIGINT makes a
+    /// `machine start` step stop its VM, as a Ctrl-C at a terminal does.
+    /// The build then fails at its next step and deletes the builder.
+    ///
+    /// SAFETY: only atomics, `signal`, `raise` and `kill`, all
+    /// async-signal-safe.
+    extern "C" fn on_interrupt(signal: libc::c_int) {
+        if BUILDS.load(Ordering::SeqCst) == 0 {
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+            return;
+        }
+        INTERRUPT.store(signal, Ordering::SeqCst);
+        let step = STEP_PID.load(Ordering::SeqCst);
+        if step > 0 {
+            unsafe { libc::kill(step, libc::SIGINT) };
+        }
+    }
+
+    /// Fail a build step that would start after a signal.
+    fn check_interrupt() -> Result<()> {
+        match interrupt_signal() {
+            Some(signal) => Err(Error::config(
+                "image seed",
+                format!("build interrupted by signal {signal}"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Counts a build in [`BUILDS`] while it lives.
+    struct Building;
+
+    impl Building {
+        fn start() -> Self {
+            BUILDS.fetch_add(1, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for Building {
+        fn drop(&mut self) {
+            BUILDS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The name of the machine that builds seed `key` for process `pid`.
+    pub(super) fn builder_name(key: &str, pid: u32) -> String {
+        format!("{SEED_MACHINE_PREFIX}{}-{pid}", &key[..16])
+    }
+
+    /// The process that started builder `name`: the PID its name ends with.
+    pub(super) fn builder_owner(name: &str) -> Option<libc::pid_t> {
+        let (_, pid) = name.strip_prefix(SEED_MACHINE_PREFIX)?.rsplit_once('-')?;
+        pid.parse().ok().filter(|pid| *pid > 0)
+    }
+
+    /// Whether the process that started builder `name` no longer runs. A
+    /// process of another user still runs (EPERM); a name with no PID is
+    /// never taken as gone.
+    pub(super) fn builder_owner_gone(name: &str) -> bool {
+        builder_owner(name).is_some_and(|pid| {
+            let probe = unsafe { libc::kill(pid, 0) };
+            probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        })
+    }
 
     /// The image a machine's first start can seed from, or `None` when it cannot
     /// (not a fresh registry-image machine, a clone, a checkpoint restore) or
@@ -860,7 +1054,9 @@ mod imp {
         small_gb: Option<u64>,
     ) -> Result<()> {
         reap_stale_builders(exe);
-        let tmp = format!("{SEED_MACHINE_PREFIX}{}-{}", &key[..16], std::process::id());
+        // From here a signal in the CLI deletes the builder (see `interruptible`).
+        let _building = Building::start();
+        let tmp = builder_name(key, std::process::id());
         let _ = run(exe, &["machine", "delete", "--name", &tmp, "-f"]);
         // Set once the builder's disk format is known.
         let mut staged: Option<(PathBuf, PathBuf)> = None;
@@ -946,7 +1142,7 @@ mod imp {
             run(exe, &["machine", "stop", "--name", &tmp])?;
             stage_builder_disk(&tmp, key_dir, &mut staged)
         })();
-        let _ = run(exe, &["machine", "delete", "--name", &tmp, "-f"]);
+        let _ = run_cleanup(exe, &["machine", "delete", "--name", &tmp, "-f"]);
         let published = built.and_then(|()| {
             let (staging, seed) = staged.as_ref().expect("a built seed is staged");
             publish(staging, seed)
@@ -1295,7 +1491,9 @@ mod imp {
         Some(PathBuf::from(std::ffi::OsStr::from_bytes(&name)))
     }
 
-    /// Delete builder machines left behind by a build that crashed.
+    /// Delete builder machines left behind by a build that crashed or was
+    /// killed: those whose owner process no longer runs, and any old enough
+    /// to be stale whatever their owner.
     fn reap_stale_builders(exe: &Path) {
         let Ok(config) = crate::config::SmolvmConfig::load() else {
             return;
@@ -1304,7 +1502,10 @@ mod imp {
         let stale: Vec<String> = config
             .list_vms()
             .filter(|(name, _)| name.starts_with(SEED_MACHINE_PREFIX))
-            .filter(|(_, record)| now.saturating_sub(record.created_at) >= STALE_BUILDER_SECS)
+            .filter(|(name, record)| {
+                builder_owner_gone(name)
+                    || now.saturating_sub(record.created_at) >= STALE_BUILDER_SECS
+            })
             .map(|(name, _)| name.clone())
             .collect();
         for name in stale {
@@ -1313,16 +1514,31 @@ mod imp {
     }
 
     /// Run one step of a seed build with this smolvm binary, capturing its output so
-    /// the builder's chatter stays off the caller's terminal.
+    /// the builder's chatter stays off the caller's terminal. After a signal
+    /// (see [`interruptible`]) no new step starts.
     fn run(exe: &Path, args: &[&str]) -> Result<()> {
         run_with_input(exe, args, None)
     }
 
     /// [`run`], writing `input` to the step's stdin (and closing it) first.
     fn run_with_input(exe: &Path, args: &[&str], input: Option<&[u8]>) -> Result<()> {
+        check_interrupt()?;
+        run_step(exe, args, input, false)
+    }
+
+    /// Run the step that deletes a builder. It also runs after a signal, in
+    /// its own process group, so a second Ctrl-C at the terminal does not
+    /// cut it off.
+    fn run_cleanup(exe: &Path, args: &[&str]) -> Result<()> {
+        run_step(exe, args, None, true)
+    }
+
+    fn run_step(exe: &Path, args: &[&str], input: Option<&[u8]>, cleanup: bool) -> Result<()> {
         use std::io::Write;
+        use std::os::unix::process::CommandExt;
         let seed_error = |e: std::io::Error| Error::config("image seed", e.to_string());
-        let mut child = std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        command
             .args(args)
             .env("SMOLVM_IMAGE_SEEDS", "0")
             // An embedder's helper variable would tie the builder VM's life to
@@ -1334,14 +1550,28 @@ mod imp {
                 std::process::Stdio::null()
             })
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(seed_error)?;
+            .stderr(std::process::Stdio::piped());
+        if cleanup {
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(seed_error)?;
+        if !cleanup {
+            // The signal handler stops this step. A signal that came before
+            // the handler could see the step stops it here.
+            STEP_PID.store(child.id() as i32, Ordering::SeqCst);
+            if interrupt_signal().is_some() {
+                unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+            }
+        }
         if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
             // A step that exits before reading reports its own error below.
             let _ = stdin.write_all(input);
         }
-        let out = child.wait_with_output().map_err(seed_error)?;
+        let out = child.wait_with_output();
+        if !cleanup {
+            STEP_PID.store(0, Ordering::SeqCst);
+        }
+        let out = out.map_err(seed_error)?;
         if out.status.success() {
             return Ok(());
         }
@@ -1610,6 +1840,31 @@ mod tests {
             eight,
             seed_key("alpine", "sha256:aa", None, Some(8)).unwrap()
         );
+    }
+
+    #[test]
+    fn a_builder_name_carries_its_owner_pid() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let name = builder_name(key, 4242);
+        assert_eq!(name, "image-seed-0123456789abcdef-4242");
+        assert_eq!(builder_owner(&name), Some(4242));
+        // Never a PID that `kill` takes as a process group.
+        assert_eq!(builder_owner("image-seed-0123456789abcdef-0"), None);
+        assert_eq!(builder_owner("image-seed-0123456789abcdef-x1"), None);
+        assert_eq!(builder_owner("image-seed-0123456789abcdef"), None);
+        assert_eq!(builder_owner("init-bake-0123456789abcdef-4242"), None);
+    }
+
+    #[test]
+    fn a_builder_whose_owner_exited_is_reaped_and_a_live_one_is_not() {
+        let me = builder_name("0123456789abcdef", std::process::id());
+        assert!(!builder_owner_gone(&me));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(builder_owner_gone(&builder_name("0123456789abcdef", pid)));
+        // A name with no owner is left to the age rule.
+        assert!(!builder_owner_gone("image-seed-0123456789abcdef"));
     }
 
     #[test]
