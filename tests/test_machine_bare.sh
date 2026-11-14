@@ -346,6 +346,35 @@ test_refused_delete_leaves_machine_running() {
     ensure_data_dir_deleted "$vm_name"
 }
 
+# exec and cp on a paused machine must name resume. They used to print the
+# start hint of a stopped machine, and `machine start` refuses a paused one.
+test_paused_machine_points_exec_and_cp_at_resume() {
+    local vm_name="paused-hint-$$"
+    local exec_output cp_output
+    local exec_rc=0 cp_rc=0
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" --branchable 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine pause --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+
+    exec_output=$($SMOLVM machine exec --name "$vm_name" -- true 2>&1) || exec_rc=$?
+    cp_output=$($SMOLVM machine cp /etc/hostname "$vm_name":/tmp/x 2>&1) || cp_rc=$?
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    [[ $exec_rc -ne 0 && "$exec_output" == *"machine resume --name $vm_name"* && "$exec_output" != *"machine start"* ]] || {
+        echo "exec on a paused machine should name resume, got (rc=$exec_rc): $exec_output"
+        return 1
+    }
+    [[ $cp_rc -ne 0 && "$cp_output" == *"machine resume --name $vm_name"* && "$cp_output" != *"machine start"* ]] || {
+        echo "cp to a paused machine should name resume, got (rc=$cp_rc): $cp_output"
+        return 1
+    }
+    ensure_data_dir_deleted "$vm_name"
+}
+
 test_machine_exec_when_stopped() {
     cleanup_machine
 
@@ -801,6 +830,7 @@ run_test "Exec timeout does not stall VM" test_exec_timeout_does_not_stall_vm ||
 run_test "Named machine" test_machine_named_vm || true
 run_test "Create prints named start hint" test_machine_create_prints_named_start_hint || true
 run_test "Refused delete leaves a running machine running" test_refused_delete_leaves_machine_running || true
+run_test "Paused machine points exec and cp at resume" test_paused_machine_points_exec_and_cp_at_resume || true
 run_test "Exec when stopped fails" test_machine_exec_when_stopped || true
 run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "File upload and download" test_file_upload_download || true
