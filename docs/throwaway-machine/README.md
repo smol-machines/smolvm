@@ -99,6 +99,11 @@ and can be used more than once. In a Smolfile they are `[network] block_private 
 address was reachable with `--net`, blocked with `--block-private`, and reachable again with
 `--allow-private <that address>/32`, while `example.com` stayed reachable throughout.
 
+`--allow-host` and a credential's host do not re-open a private address under `--block-private`: a
+name that resolves into a private range stays unreachable until `--allow-private` covers it.
+`machine create`, `run` and `start` print a warning that names the host, its addresses and the
+`--allow-private` range to add.
+
 `--deny-cidr <CIDR>` refuses a range before anything is allowed. `--allow-udp
 <CIDR>[:<PORT>[-<END>]]` admits UDP to a range, on every port or only the ones named, such as
 `--allow-udp 1.1.1.1:123` for NTP or `--allow-udp 192.0.2.0/24:3478-3480` for a TURN relay; write
@@ -144,6 +149,45 @@ port, and its replies reach that client from the published host port. A session 
 minutes of silence. Datagrams up to 1472 bytes pass; larger ones are dropped, since the gateway
 does not fragment. TCP and UDP may publish the same host port number. A branch gets fresh host
 ports for its source's UDP forwards and prints them; `--port` on a branch pins TCP ports only.
+
+### Ports that appear on their own (`--auto-ports`)
+
+`--auto-ports` on `machine run` or `machine create` (Smolfile `auto_ports = true`, or
+`machine update --auto-ports` on a stopped machine) publishes every TCP port a process in the
+machine listens on, while it listens, with no `-p`:
+
+```bash
+smolvm machine create --name dev --net --auto-ports
+smolvm machine start --name dev
+smolvm machine exec --name dev -- sh -c 'python3 -m http.server 8000 &'
+curl http://127.0.0.1:8000/        # appears within about a second
+smolvm machine status --name dev   # port 8000 -> 8000: auto
+```
+
+The guest agent reads `/proc/net/tcp` and `/proc/net/tcp6` once a second and sends the host
+the set of listening ports whenever it changes; the host publishes guest port `P` at
+`127.0.0.1:P` and `[::1]:P` and closes it when the guest stops listening or the machine stops.
+It reaches the server at the guest's loopback, so a server bound to `127.0.0.1` inside works as
+well as one bound to `0.0.0.0`; one bound to a single other address (a container bridge) does
+not. It works the same on TSI and virtio-net. The rules are predictable rather than clever:
+
+- The host port is the guest port. If something on the host already has it, another machine
+  included, the port is skipped with one warning, and retried on the next change; no other port
+  is chosen. `machine status` and `machine ls --json` (`auto_ports.skipped`) say why.
+- Ports below 1024 are not published automatically (macOS binds them only on the wildcard
+  address); publish those with `-p`. `--auto-ports-exclude PORT` (Smolfile
+  `auto_ports_exclude = [5432]`) leaves a port out, and a guest port already published with `-p`
+  stays with that mapping.
+- Only loopback: auto ports never listen on another host address, and stay off where
+  `SMOLVM_PUBLISH_ADDR` widens published ports.
+- Off by default, and only for machines the local CLI starts: `smolvm serve` and the SDK runtime
+  start a machine without them, and a branch does not inherit them while it runs.
+
+Every server in the guest's own network namespace is seen: dev servers, image workloads (their
+container shares the guest's network), and `docker run -p` inside the machine, whose userland
+proxy listens there. A server in a network namespace of its own is not, and neither is a port
+Docker publishes only with iptables (`"userland-proxy": false`). The guest agent must be from a
+release with auto ports; an older one reports nothing.
 
 ## Mounts are authority
 

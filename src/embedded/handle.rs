@@ -62,9 +62,16 @@ impl VmHandle {
         self.client_mut()?.use_target(target)
     }
 
-    /// Pull an OCI image into the VM storage.
-    pub fn pull_image(&mut self, image: &str) -> Result<ImageInfo> {
-        self.client_mut()?.pull_with_registry_config(image)
+    /// Pull an OCI image into the VM storage for `platform` (`os/arch`), or for
+    /// the guest's own architecture when `None`. A machine keeps one platform
+    /// per reference, so every pull of its image passes
+    /// [`VmRecord::image_platform`].
+    pub fn pull_image(&mut self, image: &str, platform: Option<&str>) -> Result<ImageInfo> {
+        let mut options = crate::agent::PullOptions::new().use_registry_config(true);
+        if let Some(platform) = platform {
+            options = options.oci_platform(platform);
+        }
+        self.client_mut()?.pull(image, options)
     }
 
     /// List cached OCI images in the VM storage.
@@ -78,8 +85,8 @@ impl VmHandle {
         let Some(image) = record.image.as_deref() else {
             return Ok(());
         };
+        self.pull_image(image, record.image_platform())?;
         let client = self.client_mut()?;
-        client.pull_with_registry_config(image)?;
         let mut env = record.env.clone();
         env.extend(crate::embedded::control::credential_env(record));
         crate::workload::launch_image_workload(client, name, record, env)?;
@@ -114,6 +121,14 @@ impl VmHandle {
             Some(stop_timeout) => self.manager.stop_with_timeout(stop_timeout),
             None => self.manager.stop(),
         }
+    }
+
+    /// Stop a VM whose guest is paused (a frozen branch base): its agent
+    /// cannot answer a shutdown request, so the VMM is ended directly.
+    #[cfg(unix)]
+    pub fn stop_paused(&mut self) -> Result<()> {
+        self.client = None;
+        self.manager.stop_paused()
     }
 
     /// Let a CLI-started VM outlive the process that launched it.

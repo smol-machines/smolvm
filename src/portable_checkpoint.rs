@@ -1001,6 +1001,7 @@ pub fn restore_from_path_with(
         if let Some(image) = fetch_checkpoint_host_image_blocking(checkpoint)? {
             image.apply(&mut record);
         }
+        mark_image_on_storage(checkpoint, &mut record);
         if !reservation
             .db
             .commit_reserved_vm(name, &reservation.token, &record)?
@@ -1498,6 +1499,88 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Scratch left by checkpoint work older than this was abandoned by a process
+/// that died: no capture or transfer runs that long.
+const ABANDONED_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Delete the `checkpoint-staging-*` and `checkpoint-transfer-*` directories,
+/// and tmpfs RAM capture directories, that a capture killed midway left
+/// behind. A restart or a host reset used to leave them forever (~135 GB on a
+/// node after the 2026-11-09 and 11-10 resets). Only entries untouched for
+/// [`ABANDONED_SCRATCH_AGE`] go, so a capture another process is running now
+/// keeps its scratch. Returns how many were removed.
+pub fn sweep_abandoned_checkpoint_scratch() -> usize {
+    let root = std::env::var_os("SMOLVM_PACK_STAGING")
+        .map(PathBuf::from)
+        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")));
+    let mut removed = 0;
+    if let Some(root) = root {
+        removed += sweep_abandoned_scratch_in(
+            &root,
+            &["checkpoint-staging-", "checkpoint-transfer-"],
+            ABANDONED_SCRATCH_AGE,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        removed +=
+            sweep_abandoned_scratch_in(Path::new(CAPTURE_TMPFS_ROOT), &[""], ABANDONED_SCRATCH_AGE);
+    }
+    removed
+}
+
+fn sweep_abandoned_scratch_in(root: &Path, prefixes: &[&str], age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() || !newest_mtime_is_older_than(&entry.path(), age) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                tracing::warn!(path = %entry.path().display(), %error, "could not remove abandoned checkpoint scratch")
+            }
+        }
+    }
+    removed
+}
+
+/// Whether nothing under `dir` (itself included) was modified within `age`.
+fn newest_mtime_is_older_than(dir: &Path, age: std::time::Duration) -> bool {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(age) else {
+        return false;
+    };
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata
+            .modified()
+            .map_or(true, |modified| modified > cutoff)
+        {
+            return false;
+        }
+        if metadata.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                stack.extend(entries.flatten().map(|entry| entry.path()));
+            }
+        }
+    }
+    true
+}
+
 // SAVE runs in the already-confined VMM, not in the privileged API service.
 // Its output must be inside the machine's writable directory and owned by the
 // same lineage UID. Never grant the VMM access to service-owned pack libraries.
@@ -1568,16 +1651,75 @@ pub fn capture_tmpfs_root() -> Option<PathBuf> {
     None
 }
 
+/// A RAM image capture's directory, and the share of tmpfs it holds while
+/// it is on tmpfs.
+struct RuntimeCapture {
+    dir: tempfile::TempDir,
+    _tmpfs: Option<TmpfsReservation>,
+}
+
+impl RuntimeCapture {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl From<tempfile::TempDir> for RuntimeCapture {
+    fn from(dir: tempfile::TempDir) -> Self {
+        Self { dir, _tmpfs: None }
+    }
+}
+
+/// Bytes of `/dev/shm` promised to RAM images being written now. Each capture
+/// checked free space on its own, so a burst of concurrent captures all saw
+/// the same room and overflowed tmpfs together ("guest-memory dump: No space
+/// left on device", 29 times in a burst on 2026-11-12).
+static TMPFS_RESERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A share of [`TMPFS_RESERVED`], returned on drop.
+struct TmpfsReservation(u64);
+
+impl Drop for TmpfsReservation {
+    fn drop(&mut self) {
+        TMPFS_RESERVED.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Reserve `needed` bytes of tmpfs that currently has `free`, counting what
+/// other captures have already reserved. `None` when it does not fit.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn reserve_tmpfs(needed: u64, free: u64) -> Option<TmpfsReservation> {
+    use std::sync::atomic::Ordering;
+    let mut reserved = TMPFS_RESERVED.load(Ordering::Acquire);
+    loop {
+        if free <= reserved.saturating_add(needed) {
+            return None;
+        }
+        match TMPFS_RESERVED.compare_exchange_weak(
+            reserved,
+            reserved + needed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(TmpfsReservation(needed)),
+            Err(current) => reserved = current,
+        }
+    }
+}
+
 /// [`runtime_capture_dir`] on tmpfs when the service runs as root and tmpfs
-/// has room for the whole RAM image with margin; otherwise in the VM's data
-/// directory as usual.
-fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
+/// has room for the whole RAM image with margin, after what concurrent
+/// captures have reserved; otherwise in the VM's data directory as usual.
+fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<RuntimeCapture> {
     #[cfg(target_os = "linux")]
     {
         let needed = u64::from(vm.mem) * 1024 * 1024 * 5 / 4 + (1 << 30);
         let root = capture_tmpfs_root();
-        let usable = root.is_some()
-            && free_bytes(Path::new("/dev/shm")).is_some_and(|free| free > needed)
+        let reservation = root
+            .as_ref()
+            .and_then(|_| free_bytes(Path::new("/dev/shm")))
+            .and_then(|free| reserve_tmpfs(needed, free));
+        let usable = reservation.is_some()
             // tmpfs pages are RAM: never push the host into swap for this.
             && std::fs::read_to_string("/proc/meminfo")
                 .ok()
@@ -1601,14 +1743,19 @@ fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<tem
             .transpose()
             .map_err(|error| Error::agent("resolve checkpoint uid", error.to_string()))?;
             match runtime_capture_dir_at(&root, ids) {
-                Ok(directory) => return Ok(directory),
+                Ok(dir) => {
+                    return Ok(RuntimeCapture {
+                        dir,
+                        _tmpfs: reservation,
+                    })
+                }
                 Err(error) => {
                     tracing::warn!(%error, "tmpfs runtime capture unavailable; using the data directory")
                 }
             }
         }
     }
-    runtime_capture_dir(name, vm)
+    runtime_capture_dir(name, vm).map(RuntimeCapture::from)
 }
 
 fn runtime_capture_dir_at(data: &Path, ids: Option<(u32, u32)>) -> Result<tempfile::TempDir> {
@@ -2069,6 +2216,7 @@ fn capture_with_completion(
                     format!("{}: {error}", cache.base.display()),
                 )
             })?;
+            ensure_cache_layers_on_base(&crate::agent::vm_data_dir(name), &base)?;
             let identity = smolvm_pack::format::CheckpointCacheDisk {
                 base: cache.base_name(),
                 sha256: cache.base_digest()?,
@@ -2108,7 +2256,7 @@ fn capture_with_completion(
     let runtime_capture = if options.store_dir.is_some() {
         runtime_capture_dir_preferring_tmpfs(name, vm)?
     } else {
-        runtime_capture_dir(name, vm)?
+        RuntimeCapture::from(runtime_capture_dir(name, vm)?)
     };
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
     #[cfg(target_os = "linux")]
@@ -2159,12 +2307,25 @@ fn capture_with_completion(
         && stop_after_capture
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_HELD_CAPABILITIES")
             .is_ok_and(|reply| reply.trim() == "OK held-windows-in-place-v1");
+    // A packed machine whose RAM is a layered generation (a branch) can take
+    // the deferred save after all: capturing a generation never rebases its
+    // device windows. The VMM declines when the RAM is not layered, and an
+    // older VMM does not know the command; both fall back to SAVE below. SAVE
+    // read a branch's RAM through its mapping, which filled the source's RAM
+    // and DAX-window files, and paused the guest for the whole write.
+    let layered_deferred_save = !use_deferred_save
+        && !frozen
+        && !held_in_place
+        && !stop_after_capture
+        && !cfg!(target_os = "windows");
     // A frozen source is saved as it stands and never resumed: its branches
     // map its RAM.
     let command = if frozen {
         "SAVE_FROZEN"
     } else if held_in_place {
         "PREPARE_SAVE_HELD"
+    } else if layered_deferred_save {
+        "PREPARE_SAVE_LAYERED"
     } else if !use_deferred_save {
         "SAVE"
     } else if stop_after_capture {
@@ -2212,7 +2373,8 @@ fn capture_with_completion(
     {
         reply = send("PREPARE_SAVE")?;
     }
-    let prepared = (use_deferred_save || held_in_place) && reply.starts_with("OK");
+    let prepared =
+        (use_deferred_save || held_in_place || layered_deferred_save) && reply.starts_with("OK");
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     // A packed machine whose held save failed goes back to SAVE, never to the
     // rebasing PREPARE_SAVE.
@@ -2221,9 +2383,10 @@ fn capture_with_completion(
         tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
     if !reply.starts_with("OK") {
+        let vmm_alive = vm.pid.map(crate::process::is_alive);
         return Err(Error::agent(
             "checkpoint machine",
-            format!("libkrun save failed: {reply}"),
+            describe_failed_save(&reply, vmm_alive),
         ));
     }
     let mut pause = SavedVmPause {
@@ -3376,6 +3539,21 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
 /// Whether a machine mounts image layers from the host over the packed-layers
 /// virtio-fs device: a `.smolmachine`'s layers, or a local image archive or
 /// directory (including a registry image the host fetched for it).
+/// What a failed save reply tells the user. The VMM answers every command, so
+/// an empty reply means its control socket closed mid-save: the VM process
+/// died, most often killed for memory. That used to read "libkrun save failed: "
+/// with nothing after it.
+fn describe_failed_save(reply: &str, vmm_alive: Option<bool>) -> String {
+    let reply = reply.trim();
+    if !reply.is_empty() {
+        return format!("libkrun save failed: {reply}");
+    }
+    match vmm_alive {
+        Some(false) => "libkrun save failed: the VM process exited during the save, most likely killed for memory; the machine is stopped and can be started again".to_string(),
+        _ => "libkrun save failed: the VM process closed its control socket without answering".to_string(),
+    }
+}
+
 fn mounts_image_layers(vm: &VmRecord) -> bool {
     if vm.packed_image_on_storage {
         return false;
@@ -3386,6 +3564,26 @@ fn mounts_image_layers(vm: &VmRecord) -> bool {
             .as_deref()
             .and_then(crate::data::image_source::packed_layers_dir_for_ref)
             .is_some()
+}
+
+/// Whether a checkpoint names no host-side image layers: no pack to mount and
+/// no host-fetched image to serve. Capture refuses a machine that mounts a
+/// `local:` image from the host unless one of those two names it, so a
+/// checkpoint of a machine with a `local:` image and neither one captured a
+/// machine whose image was prepared on its own storage disk, which the
+/// checkpoint carries.
+pub fn carries_no_host_layers(checkpoint: &PortableCheckpointManifest) -> bool {
+    checkpoint.packed_layers.is_none() && checkpoint.host_image.is_none()
+}
+
+/// Mark a restored machine's image as living on its storage disk when the
+/// checkpoint says so (see [`carries_no_host_layers`]). The record does not
+/// travel with the checkpoint, so without this the restored machine mounts the
+/// capturing host's `local:` archive path, which this host does not have.
+pub fn mark_image_on_storage(checkpoint: &PortableCheckpointManifest, record: &mut VmRecord) {
+    if carries_no_host_layers(checkpoint) && record.local_image_layers_dir().is_some() {
+        record.packed_image_on_storage = true;
+    }
 }
 
 /// Identify the registry image a machine boots from a host-fetched archive, if
@@ -4879,10 +5077,7 @@ fn stage_disk_chains_with_links(
                         // Every layer above a cache base is qcow2; anything
                         // else is a base, and not the one the machine records.
                         if role == "cache" && next_format != "qcow2" {
-                            return Err(Error::agent(
-                                "stage checkpoint disk",
-                                "the cache disk's layers do not sit on its recorded base",
-                            ));
+                            return Err(cache_layers_off_base(cache_base, &backing_source));
                         }
                         let next_target = disk_target(role, index + 1, next_format)?;
                         Some((backing_source, next_format, next_target))
@@ -4976,10 +5171,7 @@ fn stage_disk_chains_with_links(
             ));
         }
         if role == "cache" && !reached_cache_base {
-            return Err(Error::agent(
-                "stage checkpoint disk",
-                "the cache disk's layers do not sit on its recorded base",
-            ));
+            return Err(cache_layers_off_base(cache_base, &source));
         }
         disks.push(CheckpointDisk {
             role: role.to_string(),
@@ -4993,6 +5185,52 @@ fn stage_disk_chains_with_links(
         ));
     }
     Ok((disks, deferred))
+}
+
+/// What a capture refuses when a machine's cache layers end somewhere other
+/// than the base it records.
+const CACHE_LAYERS_OFF_BASE: &str = "the cache disk's layers do not sit on its recorded base";
+
+/// The refusal for a cache chain that ends at `bottom` instead of on `base`.
+///
+/// A checkpoint names the cache base instead of carrying it, so such a chain
+/// cannot be captured, now or on any retry: it is the request that cannot be
+/// served (400), not a node fault, and the message says where the chain ends.
+fn cache_layers_off_base(base: Option<&Path>, bottom: &Path) -> Error {
+    let base = base.map_or_else(|| "(none)".into(), |base| base.display().to_string());
+    Error::config(
+        "checkpoint cache disk",
+        format!(
+            "{CACHE_LAYERS_OFF_BASE} {base}: they end at {}. A checkpoint names that base \
+             instead of carrying it, so this machine cannot be checkpointed and retrying \
+             will not help; a machine created on the cache disk again can be",
+            bottom.display()
+        ),
+    )
+}
+
+/// Refuse, before the source is paused, a cache disk whose layers do not end
+/// on `base`: staging would fail on it after the guest's memory was saved.
+fn ensure_cache_layers_on_base(vm_data: &Path, base: &Path) -> Result<()> {
+    let (mut layer, _) =
+        crate::agent::resolve_disk_image(vm_data, crate::data::storage::CACHE_DISK_FILENAME);
+    if !layer.is_file() {
+        // Staging reports a missing cache layer as the incomplete disk set.
+        return Ok(());
+    }
+    for _ in 0..64 {
+        if layer.canonicalize().is_ok_and(|layer| layer == base) {
+            return Ok(());
+        }
+        if detect_disk_format(&layer, None)? != "qcow2" {
+            break;
+        }
+        match inspect_qcow2(&layer)?.0 {
+            Some(backing) => layer = resolve_backing_path(&layer, &backing),
+            None => break,
+        }
+    }
+    Err(cache_layers_off_base(Some(base), &layer))
 }
 
 /// Bytes a file occupies on disk, which for a sparse image is its data.
@@ -6622,6 +6860,17 @@ pub(crate) fn test_checkpoint_manifest() -> PortableCheckpointManifest {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_save_with_no_reply_says_the_vm_process_died() {
+        assert_eq!(
+            describe_failed_save("ERR EIO capture VM: boom\n", Some(true)),
+            "libkrun save failed: ERR EIO capture VM: boom"
+        );
+        assert!(describe_failed_save("", Some(false)).contains("VM process exited during the save"));
+        assert!(describe_failed_save("  \n", None).contains("closed its control socket"));
+        assert!(!describe_failed_save("", Some(false)).ends_with(": "));
+    }
+
+    #[test]
     fn a_declined_deferred_save_falls_back_to_a_synchronous_one() {
         // libkrun's reply for a fork clone, whose RAM has no file generation.
         assert!(declined_deferred_save(
@@ -7341,6 +7590,70 @@ mod tests {
             assert!(error.to_string().contains("checksum mismatch"), "{error}");
             assert!(db.get_vm("checksum-test").unwrap().is_none());
         }
+    }
+
+    // Concurrent captures share tmpfs: each reservation counts the others, so
+    // a burst cannot promise the same free bytes twice, and a finished capture
+    // gives its share back.
+    #[test]
+    fn tmpfs_reservations_cannot_oversubscribe_free_space() {
+        let gib = 1u64 << 30;
+        let base = TMPFS_RESERVED.load(std::sync::atomic::Ordering::Acquire);
+        let free = base + 10 * gib;
+        let first = reserve_tmpfs(4 * gib, free).expect("fits alone");
+        let second = reserve_tmpfs(4 * gib, free).expect("fits beside the first");
+        assert!(
+            reserve_tmpfs(4 * gib, free).is_none(),
+            "a third would overflow"
+        );
+        drop(first);
+        let third = reserve_tmpfs(4 * gib, free).expect("fits once the first ended");
+        drop((second, third));
+        assert_eq!(
+            TMPFS_RESERVED.load(std::sync::atomic::Ordering::Acquire),
+            base
+        );
+    }
+
+    #[test]
+    fn only_old_checkpoint_scratch_is_swept() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["checkpoint-staging-old", "checkpoint-transfer-new", "vms"] {
+            std::fs::create_dir_all(root.path().join(dir).join("inner")).unwrap();
+            std::fs::write(root.path().join(dir).join("inner/file"), b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600);
+        for path in [
+            root.path().join("checkpoint-staging-old/inner/file"),
+            root.path().join("checkpoint-staging-old/inner"),
+            root.path().join("checkpoint-staging-old"),
+            root.path().join("vms/inner/file"),
+            root.path().join("vms/inner"),
+            root.path().join("vms"),
+        ] {
+            std::fs::File::options()
+                .read(true)
+                .open(&path)
+                .or_else(|_| std::fs::File::open(&path))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let removed = sweep_abandoned_scratch_in(
+            root.path(),
+            &["checkpoint-staging-", "checkpoint-transfer-"],
+            ABANDONED_SCRATCH_AGE,
+        );
+        assert_eq!(removed, 1);
+        assert!(!root.path().join("checkpoint-staging-old").exists());
+        assert!(
+            root.path().join("checkpoint-transfer-new").exists(),
+            "recent scratch stays"
+        );
+        assert!(
+            root.path().join("vms").exists(),
+            "other directories are never touched"
+        );
     }
 
     #[test]
@@ -8816,6 +9129,39 @@ mod tests {
         record
     }
 
+    // A machine created on a Mac from a `.smolmachine` of a local archive has its
+    // image on its storage disk under a `local:` reference, and its checkpoint
+    // names no pack and no fetched image. Restored elsewhere it must keep
+    // booting that disk, not look for the capturing host's archive cache.
+    #[test]
+    fn a_local_image_on_storage_stays_on_storage_after_restore() {
+        let checkpoint = minimal_checkpoint_manifest();
+        assert!(carries_no_host_layers(&checkpoint));
+        let mut restored = no_network_machine("local:caa470fc");
+        assert!(restored.local_image_layers_dir().is_some());
+        mark_image_on_storage(&checkpoint, &mut restored);
+        assert!(restored.packed_image_on_storage);
+        assert!(restored.local_image_layers_dir().is_none());
+
+        // A registry image is left alone.
+        let mut registry = no_network_machine("alpine:3.20");
+        mark_image_on_storage(&checkpoint, &mut registry);
+        assert!(!registry.packed_image_on_storage);
+
+        // A checkpoint that names its host layers keeps mounting them.
+        let mut with_image = checkpoint.clone();
+        with_image.host_image = Some(CheckpointHostImage {
+            reference: "alpine:3.20@sha256:feedface".to_string(),
+            config_digest: "sha256:c0ffee".to_string(),
+            archive_size: 1,
+            archive_mtime: 1,
+        });
+        assert!(!carries_no_host_layers(&with_image));
+        let mut fetched = no_network_machine("local:caa470fc");
+        mark_image_on_storage(&with_image, &mut fetched);
+        assert!(!fetched.packed_image_on_storage);
+    }
+
     #[test]
     fn a_host_fetched_registry_image_can_be_captured() {
         let mut record = no_network_machine("python:3.12-slim-bookworm");
@@ -9103,12 +9449,50 @@ mod tests {
         ) else {
             panic!("a cache layer over another base was captured");
         };
-        assert!(
-            error
-                .to_string()
-                .contains("do not sit on its recorded base"),
-            "{error}"
-        );
+        // No retry can capture it: refused as the request, naming the bottom.
+        assert!(matches!(error, Error::Config { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(CACHE_LAYERS_OFF_BASE), "{message}");
+        assert!(message.contains("deps-v1.raw"), "{message}");
+    }
+
+    /// A cache chain a flatten folded its base into (a layer with no backing)
+    /// is refused before the source is paused, naming where the chain ends,
+    /// while a chain that reaches its base, branched or not, passes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cache_chain_off_its_base_is_refused_before_the_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cdisk-v87.raw");
+        std::fs::File::create(&base)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        let base = base.canonicalize().unwrap();
+        for branched in [false, true] {
+            let vm = dir.path().join(format!("vm-{branched}"));
+            cache_disk_machine(&vm, &base, branched);
+            ensure_cache_layers_on_base(&vm, &base).unwrap();
+        }
+        // No cache layer yet: left to staging.
+        let bare = dir.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        ensure_cache_layers_on_base(&bare, &base).unwrap();
+
+        let vm = dir.path().join("flattened");
+        std::fs::create_dir_all(vm.join("d/456c85d3")).unwrap();
+        let folded = vm.join("d/456c85d3/cache.base.qcow2");
+        std::fs::File::create(&folded)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        create_qcow2(&vm.join("cache.qcow2"), folded.to_str().unwrap(), "raw");
+        let error = ensure_cache_layers_on_base(&vm, &base).unwrap_err();
+        assert!(matches!(error, Error::Config { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(CACHE_LAYERS_OFF_BASE), "{message}");
+        assert!(message.contains("d/456c85d3/cache.base.qcow2"), "{message}");
+        assert!(message.contains("cdisk-v87.raw"), "{message}");
     }
 
     #[test]

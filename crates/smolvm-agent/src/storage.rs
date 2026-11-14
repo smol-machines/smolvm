@@ -366,9 +366,13 @@ pub fn volume_bind_source(tag: &str) -> PathBuf {
 /// Add each prepared mount to a container spec as a bind of its
 /// [`volume_bind_source`]. crun applies the spec's mounts in order, so a mount
 /// goes ahead of those nested below it (see [`mounts_parents_first`]).
+///
+/// A host directory is bound through [`crate::mount_owner::bind_source`], so a
+/// container whose process is not root sees it owned by its own user.
 pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
+    let (uid, gid) = (spec.process.user.uid, spec.process.user.gid);
     for (tag, container_path, read_only) in mounts_parents_first(mounts) {
-        let source = volume_bind_source(tag);
+        let source = crate::mount_owner::bind_source(&volume_bind_source(tag), uid, gid);
         spec.add_bind_mount(&source.to_string_lossy(), container_path, *read_only);
     }
     // Directories attached while the machine runs reach every container,
@@ -378,8 +382,24 @@ pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, boo
         .map(|(_, target, _)| target.as_str())
         .collect();
     for (source, target, read_only) in crate::attach::container_binds(&targets) {
+        let source = crate::mount_owner::bind_source(&source, uid, gid);
         spec.add_bind_mount(&source.to_string_lossy(), &target, read_only);
     }
+}
+
+/// Mount the boot virtiofs share `tag` at its staging path (once) and return
+/// that path, for callers that bind a file or subdirectory of it themselves.
+#[cfg(target_os = "linux")]
+pub fn mount_share(tag: &str) -> Result<PathBuf> {
+    validate_storage_id(tag, "mount tag")?;
+    let mount_point = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+    std::fs::create_dir_all(&mount_point)?;
+    if !is_mountpoint(&mount_point) {
+        mount_virtiofs(tag, &mount_point).map_err(|e| {
+            StorageError::new(format!("failed to mount virtiofs share '{tag}': {e}"))
+        })?;
+    }
+    Ok(mount_point)
 }
 
 /// Mount a virtiofs device with one policy for every host-backed filesystem:
@@ -1052,6 +1072,9 @@ pub fn repair_boot_volume_mounts() -> Result<()> {
         if is_mountpoint(&staging) {
             detach_mount(&staging);
         }
+        // Clones of the stale mount are as dead as it is; the next container
+        // gets one of the fresh mount.
+        crate::mount_owner::forget(&staging);
         setup_volume_mounts("/", std::slice::from_ref(mount))?;
         if !is_mountpoint(Path::new(target)) {
             return Err(StorageError::new(format!(
@@ -4720,6 +4743,10 @@ fn open_overlay_etc_file(
 }
 
 fn overlay_resolv_conf_contents() -> String {
+    // A machine branched from a base moved to its own network's resolver.
+    if let Some((dns_server, options)) = crate::network::moved_resolver() {
+        return smolvm_protocol::resolv::render(&[dns_server], &options);
+    }
     // Resolver options (`--dns-option`) ride on every file.
     let options = crate::resolv_options();
 
@@ -5155,12 +5182,31 @@ pub fn run_command(
         let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
             .map_err(StorageError::new)?;
 
+        // The keep-alive is PID 1 and runs as root like the main keep-alive
+        // (`crate::KEEPALIVE_USER`); the command itself runs as `identity`.
+        let keepalive_identity = crate::oci::resolve_process_identity(
+            Path::new(&prepared.rootfs_path),
+            Some(crate::KEEPALIVE_USER),
+        )
+        .map_err(StorageError::new)?;
+
         // Build an OCI spec for `cmd` sharing this overlay's rootfs, virtiofs
         // mounts, workspace/storage fallbacks, and the same injections. Used for
         // both the one-shot exec spec and the keep-alive spec so a container the
-        // execs join has the identical mount view as the exec itself.
-        let build_spec = |cmd: &[String], spec_env: &[(String, String)]| {
-            let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
+        // execs join has the identical mount view as the exec itself. The spec
+        // runs as `process_identity` and records `identity` as the workload's.
+        let build_spec = |cmd: &[String],
+                          spec_env: &[(String, String)],
+                          process_identity: &crate::oci::ProcessIdentity| {
+            let mut spec = OciSpec::new(
+                cmd,
+                spec_env,
+                workdir_str,
+                false,
+                process_identity,
+                unprivileged,
+            );
+            spec.set_workload_user(&identity);
             spec.add_vm_devices_if_available();
             add_volume_bind_mounts(&mut spec, mounts);
             add_workspace_fallback(&mut spec, mounts);
@@ -5181,8 +5227,17 @@ pub fn run_command(
 
         // If a main workload container is running for this overlay, join it
         // via crun exec instead of creating a fresh isolated container.
+        // The command joins a keep-alive whose own user is root, so it names
+        // its user, and gets that user's environment (HOME and the rest),
+        // explicitly.
+        let exec_launch = crate::ResolvedLaunch {
+            command: command.to_vec(),
+            env: crate::oci::process_env_for(&identity, env),
+            workdir: workdir.map(str::to_string),
+            user: Some(crate::oci::user_spec_of(&identity)),
+        };
         if let Some(cid) = crate::resolve_main_container(persistent_overlay_id) {
-            let result = run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+            let result = run_exec_in_container(&cid, &exec_launch, timeout_ms, client_fd);
             let _ = mounted_paths;
             return result;
         }
@@ -5201,13 +5256,12 @@ pub fn run_command(
                 "/dev/null".to_string(),
             ];
             match establish_keepalive_container(
-                &build_spec(&keepalive, env),
+                &build_spec(&keepalive, env, &keepalive_identity),
                 &bundle_path,
                 overlay_id,
             ) {
                 Ok(cid) => {
-                    let result =
-                        run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+                    let result = run_exec_in_container(&cid, &exec_launch, timeout_ms, client_fd);
                     let _ = mounted_paths;
                     return result;
                 }
@@ -5218,7 +5272,7 @@ pub fn run_command(
         }
 
         // Ephemeral overlay (or keep-alive setup failed): one-shot fresh container.
-        let spec = build_spec(command, env);
+        let spec = build_spec(command, env, &identity);
         spec.write_to(&bundle_path)
             .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
         let container_id = generate_container_id();
@@ -5341,9 +5395,36 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
     prepare_for_run_persistent_with_progress(image, overlay_id, |_, _| {})
 }
 
+/// Where a persistent overlay's image layers come from.
+#[derive(Debug, Clone, Copy)]
+pub enum LayerSource<'a> {
+    /// The machine's own image: its packed layers when it has them,
+    /// otherwise the image store.
+    Machine,
+    /// The image store, by reference, even on a machine with packed layers.
+    Store,
+    /// A packed-layers directory (or staged local archive) other than the
+    /// machine's own.
+    Packed(&'a Path),
+}
+
 pub fn prepare_for_run_persistent_with_progress<F>(
     image: &str,
     overlay_id: &str,
+    progress: F,
+) -> Result<PreparedOverlayRootfs>
+where
+    F: FnMut(&str, u64),
+{
+    prepare_for_run_persistent_from(image, overlay_id, LayerSource::Machine, progress)
+}
+
+/// [`prepare_for_run_persistent_with_progress`] with the image's layers
+/// taken from `source`.
+pub fn prepare_for_run_persistent_from<F>(
+    image: &str,
+    overlay_id: &str,
+    source: LayerSource<'_>,
     mut progress: F,
 ) -> Result<PreparedOverlayRootfs>
 where
@@ -5352,11 +5433,29 @@ where
     validate_storage_id(overlay_id, "persistent overlay id")?;
     let workload_id = format!("persistent-{}", overlay_id);
 
+    // An overlay already mounted and answering this boot is reused as it
+    // stands; its layers were resolved when it was mounted. A container
+    // started in a machine booted for another image (its exec sessions name
+    // an image this machine's store does not hold) depends on that.
+    let setup = OverlaySetup::new(&workload_id)?;
+    if is_mountpoint(&setup.merged_path) && mounted_overlay_is_healthy(&setup.merged_path) {
+        let overlay = setup.execute_or_remount(Vec::new())?;
+        return Ok(PreparedOverlayRootfs {
+            workload_id,
+            rootfs_path: overlay.rootfs_path,
+        });
+    }
+
     // Resolve image layers (same logic as prepare_overlay). A local image
     // archive is flattened into a rootfs first; a packed-layers dir is used
     // as-is. A packed machine has exactly one image, so only an image-store
     // overlay records and checks which image it was built from.
-    let (lowerdirs, image_store) = if let Some(packed_dir) = get_packed_layers_dir() {
+    let packed = match source {
+        LayerSource::Machine => get_packed_layers_dir().map(PathBuf::as_path),
+        LayerSource::Store => None,
+        LayerSource::Packed(dir) => Some(dir),
+    };
+    let (lowerdirs, image_store) = if let Some(packed_dir) = packed {
         let effective = effective_packed_dir_with_progress(packed_dir, &mut progress)?;
         (get_packed_lowerdirs(&effective)?, false)
     } else {
@@ -5750,25 +5849,37 @@ fn establish_keepalive_container(
     Ok(container_id)
 }
 
-/// Join a running container via `crun exec` (non-interactive).
+/// Join a running container via `crun exec` (non-interactive) as
+/// `launch.user` (a resolved `uid:gid`) with that user's supplementary groups,
+/// the same exec the keep-alive paths in `main` run.
 fn run_exec_in_container(
     container_id: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
+    launch: &crate::ResolvedLaunch,
     timeout_ms: Option<u64>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
-    info!(container_id = %container_id, command = ?command, "joining container via crun exec");
+    info!(container_id = %container_id, command = ?launch.command, "joining container via crun exec");
 
     let exec_pid_file = crate::crun::ExecPidFile::new()
         .map_err(|e| StorageError::new(format!("create crun exec pid file failed: {}", e)))?;
-    let mut child = CrunCommand::exec(container_id, env, command, workdir, false)
-        .pid_file(exec_pid_file.path())
-        .stdin_null()
-        .capture_output()
-        .spawn()
-        .map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
+    #[cfg(target_os = "linux")]
+    let spawned = crate::spawn_crun_foreground_exec(container_id, launch, &exec_pid_file, None)
+        .map_err(|e| e.to_string());
+    #[cfg(not(target_os = "linux"))]
+    let spawned = CrunCommand::exec(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        false,
+    )
+    .user(launch.user.as_deref())
+    .pid_file(exec_pid_file.path())
+    .stdin_null()
+    .capture_output()
+    .spawn()
+    .map_err(|e| e.to_string());
+    let mut child = spawned.map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
 
     // On timeout/disconnect, kill only the exec'd process — NOT the main
     // container. The main container hosts the shared namespace for all execs;

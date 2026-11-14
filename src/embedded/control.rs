@@ -120,6 +120,7 @@ impl MachineSpec {
             shm_size,
             network_name,
             guest_subnet,
+            switch,
         } = resources;
         crate::machine_spec::CreateSpec {
             cmd: (!command.is_empty()).then_some(command),
@@ -141,6 +142,7 @@ impl MachineSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
             allowed_cidrs,
             allowed_hosts: (!allowed_hosts.is_empty()).then_some(allowed_hosts),
@@ -331,6 +333,7 @@ pub(crate) fn start_vm_with_interceptor(
         get_record(db, name)?,
         &crate::registry::PullAuth::FromConfig,
     )?;
+    crate::network::private_floor::log_record_hosts_blocked_by_private_floor(name, &record);
     // A fresh registry-image machine starts on a shared seed of its image, as
     // the CLI and API do, so an SDK create skips the in-guest pull.
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);
@@ -378,6 +381,11 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<Sta
 fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures) -> LaunchFeatures {
     if features.dns_filter_hosts.is_none() {
         features.dns_filter_hosts = record.dns_filter_hosts.clone();
+    }
+    // Socket bridges are part of the machine, as on the CLI start path; a
+    // launch that dropped them left the guest path empty.
+    if features.published_sockets.is_empty() {
+        features.published_sockets = record.published_sockets.clone();
     }
     // A detached machine stays detached on every launch — a plain start after
     // a stop, a resume, a fork clone (which copies the golden's record) — not
@@ -572,6 +580,38 @@ pub(crate) fn fork_vm_with_options(
         None,
         keep_machine_id,
     )
+}
+
+/// Branch the frozen `golden` into a new machine `clone` and boot it, after
+/// `adjust` has changed the clone's record (its ports, network attachment,
+/// labels). The golden stays paused as a base for further branches.
+#[cfg(unix)]
+pub(crate) fn fork_vm_adjusted(
+    db: &SmolvmDb,
+    golden: &str,
+    clone: &str,
+    adjust: impl FnOnce(&mut VmRecord),
+) -> Result<VmHandle> {
+    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
+    let mut prep = crate::agent::fork::prepare_fork(
+        db,
+        golden,
+        clone,
+        &[],
+        false,
+        &[],
+        &std::collections::BTreeMap::new(),
+        &[],
+        crate::agent::fork::ForkSourcePolicy::Freeze,
+    )?;
+    adjust(&mut prep.clone_record);
+    let record = prep.clone_record.clone();
+    if let Err(error) = db.update_vm(clone, |r| *r = record) {
+        let _ = db.remove_vm(clone);
+        let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
+        return Err(error);
+    }
+    boot_prepared_fork(db, clone, prep, false, None, None, false)
 }
 
 fn boot_prepared_fork(

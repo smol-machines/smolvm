@@ -91,6 +91,14 @@ pub struct HostMount {
     /// host/guest coherence for metadata-heavy workload performance.
     #[serde(default)]
     pub staged: bool,
+
+    /// Keep the guest's view of file ownership and mode in an extended
+    /// attribute on the host file instead of the host inode, so a guest's
+    /// `chown` and `chmod` succeed on a host that cannot apply them (an
+    /// unprivileged Linux host; macOS always does this). A container engine
+    /// asks for it, as a container's root expects to own its volumes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded_ownership: bool,
 }
 
 impl HostMount {
@@ -165,6 +173,7 @@ impl HostMount {
             target: target.into(),
             read_only,
             staged: false,
+            recorded_ownership: false,
         };
 
         if !mount.source.exists() {
@@ -394,6 +403,7 @@ impl HostMount {
             target: PathBuf::from(target),
             read_only,
             staged: false,
+            recorded_ownership: false,
         }
     }
 
@@ -404,6 +414,7 @@ impl HostMount {
             target: PathBuf::from(target),
             read_only: false,
             staged: true,
+            recorded_ownership: false,
         }
     }
 
@@ -635,6 +646,7 @@ mod tests {
                 target: PathBuf::from("/guest/path"),
                 read_only: true,
                 staged: false,
+                recorded_ownership: false,
             };
             let err = HostMount::validate(&mount).unwrap_err().to_string();
             assert!(

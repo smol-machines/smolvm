@@ -37,9 +37,18 @@
 
 #[cfg(unix)]
 pub use imp::{
-    discard_unbooted_storage, prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage,
-    seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    discard_unbooted_storage, ensure_image_seed, prewarm_recent_seeds, revalidate_seed, seed_root,
+    seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
+
+/// Whether a seed can serve a pull for `platform`. A seed holds the image for
+/// the guest's own architecture, which is also what `None` asks for. A machine
+/// that pulls another platform (a Rosetta machine pulls `linux/amd64`) starts
+/// without one: the guest would find the wrong architecture and pull again.
+pub fn serves_platform(platform: Option<&str>) -> bool {
+    platform
+        .is_none_or(|platform| platform.eq_ignore_ascii_case(crate::vm::rosetta::native_platform()))
+}
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
 /// so their own executable is not smolvm; they point `SMOLVM_BOOT_BINARY` at the
@@ -234,6 +243,7 @@ mod imp {
             || record.source_smolmachine.is_some()
             || record.vm_uid_owner().is_some()
             || record.golden.is_some()
+            || !super::serves_platform(record.image_platform())
         {
             return None;
         }
@@ -498,6 +508,32 @@ mod imp {
             prune(&root, max_bytes(), &seed);
         }
         Ok(true)
+    }
+
+    /// Make sure the seed of `image` exists, building it with `exe` when it
+    /// does not, without giving it to any machine yet. A container engine
+    /// calls this on `docker pull`, so the image's containers start on it.
+    pub fn ensure_image_seed(
+        exe: &Path,
+        image: &str,
+        auth: &PullAuth,
+        digest_ttl: Option<u64>,
+    ) -> Result<()> {
+        let EnsuredSeed {
+            root,
+            key_dir,
+            cache,
+            built,
+        } = ensure_seed(exe, image, auth, digest_ttl, None, None, false, None)?;
+        // Prune takes the cache's exclusive lock: let go of the shared one.
+        drop(cache);
+        note_recent_image(&root, image);
+        if built {
+            if let Some((seed, _)) = seed_disk(&key_dir) {
+                prune(&root, max_bytes(), &seed);
+            }
+        }
+        Ok(())
     }
 
     /// The size of the seed a disk of `storage_gb` needs when it is below the
@@ -1533,6 +1569,31 @@ mod tests {
         );
         record.image = Some("alpine:3.20".to_string());
         record.mark_image_on_storage();
+        assert_eq!(wants_seed(&record.name, &record, false), None);
+    }
+
+    #[test]
+    fn a_machine_that_pulls_another_platform_does_not_seed() {
+        let native = crate::vm::rosetta::native_platform();
+        assert!(super::serves_platform(None));
+        assert!(super::serves_platform(Some(native)));
+        let other = if native == "linux/arm64" {
+            "linux/amd64"
+        } else {
+            "linux/arm64"
+        };
+        assert!(!super::serves_platform(Some(other)));
+
+        let mut record = crate::config::VmRecord::new(
+            "seed-test-other-platform".to_string(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+        );
+        record.image = Some("alpine:3.20".to_string());
+        record.oci_platform = Some(other.to_string());
         assert_eq!(wants_seed(&record.name, &record, false), None);
     }
 

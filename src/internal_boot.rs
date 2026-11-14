@@ -774,6 +774,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         cuda_socket: cuda_socket.as_deref(),
         docker_socket: docker_socket.as_deref(),
         workload_log_socket: workload_log_socket.as_deref(),
+        auto_ports: config.auto_ports.as_ref(),
         published_sockets: &config.published_sockets,
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         packed_layers_dax_window: config.packed_layers_dax_window,

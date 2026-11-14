@@ -528,6 +528,7 @@ impl ExportVm {
                 egress_rules: Vec::new(),
                 network_name: None,
                 guest_subnet: None,
+                switch: None,
             },
             features,
         ) {
@@ -953,6 +954,9 @@ mod cached_export_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn an_orphaned_export_helper_is_stopped_and_its_scratch_removed() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         // Above any pid_max, so no live process can hold it while tests run in
         // parallel and recycle pids.
@@ -968,7 +972,16 @@ mod cached_export_tests {
 
         let orphan_dir = root.path().join("orphan");
         // Like a real orphan, the helper is not this process's child: its
-        // creator is gone, so init reaps it once it is killed.
+        // creator is gone. Once killed it is a zombie until whoever adopted it
+        // reaps it, and the reaper waits only 5 s for it to go, so this test
+        // process adopts it (it runs alone, so no other test's children are
+        // affected) and reaps exactly it below, instead of relying on an
+        // ancestor that may not reap in time.
+        // SAFETY: prctl with integer arguments.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
         let launched = std::process::Command::new("sh")
             .args([
                 "-c",
@@ -984,10 +997,17 @@ mod cached_export_tests {
             .parse()
             .unwrap();
         scratch(&orphan_dir, helper);
+        let reaper = std::thread::spawn(move || {
+            let mut status = 0;
+            // SAFETY: waits for one pid this process adopted.
+            unsafe { libc::waitpid(helper as libc::pid_t, &mut status, 0) };
+        });
 
         let other_dir = root.path().join("other");
         let mut unrelated = std::process::Command::new("sleep")
             .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         scratch(&other_dir, unrelated.id());
@@ -998,6 +1018,7 @@ mod cached_export_tests {
             !orphan_dir.exists(),
             "the orphaned helper's scratch is removed"
         );
+        reaper.join().unwrap();
         assert!(
             !std::path::Path::new(&format!("/proc/{helper}")).exists(),
             "the orphaned helper is stopped"
@@ -1622,6 +1643,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             // resolver to configure.
             network: false,
             network_backend: None,
+            switch: None,
             dns: None,
             dns_options: Vec::new(),
             shm_size: None,

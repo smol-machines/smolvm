@@ -504,6 +504,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub staged_mounts: Vec<(usize, String, String)>,
 
+    /// The live mounts keep the guest's file ownership in an xattr (see
+    /// [`crate::data::storage::HostMount::recorded_ownership`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded_ownership: bool,
+
     /// The fork source whose host directories this branch's staged working
     /// copies were seeded from. A branch keeps the copies (they live on its own
     /// cloned storage disk and survive restarts, since the mounts stay
@@ -522,6 +527,11 @@ pub struct VmRecord {
     /// TCP mappings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub udp_ports: Vec<(u16, u16)>,
+
+    /// Host addresses published ports listen on, for the ports that name
+    /// one; the others listen on the default publish address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen_addresses: Vec<crate::data::network::ListenAddress>,
 
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     #[serde(default)]
@@ -549,6 +559,11 @@ pub struct VmRecord {
     /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: Option<bool>,
+
+    /// Platform (`os/arch`) asked for the machine's image at create. `None`
+    /// leaves the choice to [`VmRecord::image_platform`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci_platform: Option<String>,
 
     /// Restart configuration.
     #[serde(default)]
@@ -630,6 +645,10 @@ pub struct VmRecord {
     /// IPv4 subnet for the guest link (virtio-net only). None = `100.96.0.0/30`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_subnet: Option<String>,
+
+    /// Container switch this machine joins on start (virtio-net only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch: Option<crate::data::network::SwitchAttachment>,
 
     /// OCI image for auto-container creation on start.
     #[serde(default)]
@@ -734,6 +753,12 @@ pub struct VmRecord {
     /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
     #[serde(default)]
     pub docker_socket: bool,
+
+    /// Publish every TCP port the guest listens on at the same host port on
+    /// loopback while it listens (`--auto-ports`). Applied only when the local
+    /// CLI starts the machine, never by `smolvm serve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_ports: Option<crate::data::network::AutoPorts>,
 
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
@@ -932,6 +957,16 @@ impl VmRecord {
         }
     }
 
+    /// The platform this machine's image is pulled for, or `None` for the
+    /// guest's own architecture. Every pull of the image has to agree on it:
+    /// the guest keeps one platform per reference and re-pulls on a mismatch.
+    pub fn image_platform(&self) -> Option<&str> {
+        crate::vm::rosetta::image_platform(
+            self.oci_platform.as_deref(),
+            self.rosetta.unwrap_or(false),
+        )
+    }
+
     /// Host identity owner; guest overlay names only serve as a legacy fallback.
     pub fn vm_uid_owner(&self) -> Option<&str> {
         self.host_uid_owner
@@ -977,15 +1012,18 @@ impl VmRecord {
             block_private: None,
             mounts,
             staged_mounts: Vec::new(),
+            recorded_ownership: false,
             staged_mounts_detached_from: None,
             ports,
             udp_ports: Vec::new(),
+            listen_addresses: Vec::new(),
             published_sockets: Vec::new(),
             network,
             gpu: None,
             gpu_vram_mib: None,
             nested_virt: None,
             rosetta: None,
+            oci_platform: None,
             restart: RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
@@ -1005,6 +1043,7 @@ impl VmRecord {
             shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -1026,6 +1065,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            auto_ports: None,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
@@ -1081,15 +1121,18 @@ impl VmRecord {
             block_private: None,
             mounts,
             staged_mounts: Vec::new(),
+            recorded_ownership: false,
             staged_mounts_detached_from: None,
             ports,
             udp_ports: Vec::new(),
+            listen_addresses: Vec::new(),
             published_sockets: Vec::new(),
             network,
             gpu: None,
             gpu_vram_mib: None,
             nested_virt: None,
             rosetta: None,
+            oci_platform: None,
             restart,
             last_exit_code: None,
             init: Vec::new(),
@@ -1109,6 +1152,7 @@ impl VmRecord {
             shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -1130,6 +1174,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            auto_ports: None,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
@@ -1191,6 +1236,7 @@ impl VmRecord {
                 target: std::path::PathBuf::from(guest),
                 read_only: *ro,
                 staged: false,
+                recorded_ownership: self.recorded_ownership,
             })
             .collect::<std::collections::VecDeque<_>>();
         let staged = self
@@ -1224,14 +1270,19 @@ impl VmRecord {
     /// Convert stored ports to PortMapping format, TCP then UDP.
     pub fn port_mappings(&self) -> Vec<crate::data::network::PortMapping> {
         use crate::data::network::{PortMapping, PortProtocol};
-        let tcp = self
-            .ports
-            .iter()
-            .map(|(host, guest)| PortMapping::new(*host, *guest));
-        let udp = self
-            .udp_ports
-            .iter()
-            .map(|(host, guest)| PortMapping::with_protocol(*host, *guest, PortProtocol::Udp));
+        let listen = |host: u16, protocol: PortProtocol| {
+            self.listen_addresses
+                .iter()
+                .find(|l| l.host == host && l.protocol == protocol)
+                .map(|l| l.address)
+        };
+        let tcp = self.ports.iter().map(|(host, guest)| {
+            PortMapping::new(*host, *guest).listening_on(listen(*host, PortProtocol::Tcp))
+        });
+        let udp = self.udp_ports.iter().map(|(host, guest)| {
+            PortMapping::with_protocol(*host, *guest, PortProtocol::Udp)
+                .listening_on(listen(*host, PortProtocol::Udp))
+        });
         tcp.chain(udp).collect()
     }
 
@@ -1240,6 +1291,7 @@ impl VmRecord {
         let (tcp, udp) = crate::data::network::PortMapping::split_tuples(mappings);
         self.ports = tcp;
         self.udp_ports = udp;
+        self.listen_addresses = crate::data::network::PortMapping::listen_addresses(mappings);
     }
 
     /// Whether this machine's registry image must be fetched on the HOST before
@@ -1701,6 +1753,7 @@ impl VmRecord {
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
+            switch: self.switch.clone(),
         }
     }
 }

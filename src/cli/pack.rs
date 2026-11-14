@@ -851,6 +851,7 @@ impl PackCreateCmd {
                 shm_size: None,
                 network_name: None,
                 guest_subnet: None,
+                switch: None,
                 gpu: false,
                 nested_virt: false,
                 cuda: false,
@@ -2653,6 +2654,9 @@ mod staging_tests {
     // removes it, but never one a running pack still holds, nor anything else.
     #[test]
     fn only_abandoned_staging_directories_are_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let held = create_staging(root.path()).unwrap();
         let abandoned = root.path().join("pack-staging-abandoned");
