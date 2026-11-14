@@ -1648,7 +1648,11 @@ impl EmbeddedRuntime {
         })
     }
 
-    /// Publish one TCP guest port on an OS-allocated, continuously owned loopback listener.
+    /// Publish TCP guest port `guest` of running machine `name` on a host port
+    /// the OS picks, and return it. The listener is bound before the port is
+    /// known, so nothing can take the port in between. The publication lasts
+    /// for this run of the machine: a restart does not bind the port again,
+    /// and the caller publishes anew.
     pub fn publish_atomic(&self, name: &str, guest: u16) -> Result<u16> {
         if guest == 0 {
             return Err(Error::config(
@@ -1658,13 +1662,21 @@ impl EmbeddedRuntime {
         }
         self.with_name_lock(name, || {
             let record = control::get_record(&self.db, name)?;
-            if crate::agent::state_probe::resolve_state(name, &record) != RecordState::Running {
-                return Err(Error::config(
-                    "atomic port publication",
-                    "machine must be running",
-                ));
-            }
-            if record.ports.len() + record.udp_ports.len()
+            let run = match record.pid_start_time {
+                Some(run)
+                    if crate::agent::state_probe::resolve_state(name, &record)
+                        == RecordState::Running =>
+                {
+                    run
+                }
+                _ => {
+                    return Err(Error::config(
+                        "atomic port publication",
+                        "machine must be running",
+                    ))
+                }
+            };
+            if record.ports.len() + record.udp_ports.len() + record.live_allocated_ports().len()
                 >= crate::data::network::MAX_PORT_MAPPINGS
             {
                 return Err(Error::config(
@@ -1680,7 +1692,13 @@ impl EmbeddedRuntime {
                     return Err(error);
                 }
             };
-            match self.db.update_vm(name, |r| r.ports.push((host, guest))) {
+            let saved = self.db.update_vm(name, |r| {
+                // Ports an earlier run picked closed with it.
+                r.allocated_ports.retain(|port| port.run == run);
+                r.allocated_ports
+                    .push(crate::config::AllocatedPort { host, guest, run });
+            });
+            match saved {
                 Ok(Some(_)) => Ok(host),
                 result => {
                     let _ = crate::agent::apply_live_published_ports(name, &record.ports);

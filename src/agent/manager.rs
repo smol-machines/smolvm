@@ -654,10 +654,13 @@ fn live_egress_refusal(reason: String, with_rules: bool) -> String {
 /// Publish exactly `ports` on a running machine through the ports control
 /// socket its network runtime serves. Returns once the listeners match.
 pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()> {
-    let mappings: Vec<smolvm_network::PortMapping> = ports
-        .iter()
-        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
-        .collect();
+    // A replace names the whole set, so it keeps the ports this run picked
+    // itself: they are not in `ports`, which holds the configured ones.
+    let allocated = crate::db::SmolvmDb::open()?
+        .get_vm(name)?
+        .map(|record| record.live_allocated_ports())
+        .unwrap_or_default();
+    let mappings = published_set(ports, &allocated);
     let rendered = smolvm_network::render_port_mappings(&mappings);
     send_live_change(name, smolvm_network::PORTS_SOCKET, &rendered).map_err(|reason| {
         Error::config(
@@ -665,6 +668,25 @@ pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()
             format!("could not change machine '{name}''s published ports while it runs: {reason}"),
         )
     })
+}
+
+/// The whole TCP set a running machine publishes: its configured `ports`, then
+/// the `allocated` ones its run picked that the configured set does not already
+/// name by host port.
+fn published_set(
+    ports: &[(u16, u16)],
+    allocated: &[(u16, u16)],
+) -> Vec<smolvm_network::PortMapping> {
+    let mut mappings: Vec<smolvm_network::PortMapping> = ports
+        .iter()
+        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
+        .collect();
+    for &(host, guest) in allocated {
+        if !mappings.iter().any(|mapping| mapping.host == host) {
+            mappings.push(smolvm_network::PortMapping::new(host, guest));
+        }
+    }
+    mappings
 }
 
 /// Hand running machine `name` new values for its credential bindings, by
@@ -4934,6 +4956,25 @@ pub(crate) fn vm_boot_executable() -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A live replace keeps the ports this run picked itself, without
+    /// publishing one twice when the configured set already names its host port.
+    #[test]
+    fn a_live_replace_keeps_the_runs_own_ports() {
+        let set = |ports: &[(u16, u16)], allocated: &[(u16, u16)]| -> Vec<(u16, u16)> {
+            super::published_set(ports, allocated)
+                .iter()
+                .map(|m| (m.host, m.guest))
+                .collect()
+        };
+        assert_eq!(
+            set(&[(8080, 80)], &[(49152, 3000)]),
+            [(8080, 80), (49152, 3000)]
+        );
+        assert_eq!(set(&[], &[(49152, 3000)]), [(49152, 3000)]);
+        assert_eq!(set(&[(49152, 3000)], &[(49152, 3000)]), [(49152, 3000)]);
+        assert_eq!(set(&[(8080, 80)], &[]), [(8080, 80)]);
+    }
+
     #[test]
     fn a_running_configuration_says_whether_the_vm_was_launched_forkable() {
         let dir = tempfile::tempdir().unwrap();
@@ -4979,6 +5020,7 @@ mod tests {
     #[test]
     fn egress_flow_summary_round_trips_through_its_file_and_goes_stale() {
         use super::*;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(EGRESS_FLOWS_FILE);
         let taken = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);

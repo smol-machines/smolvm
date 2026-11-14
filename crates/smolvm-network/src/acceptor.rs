@@ -217,7 +217,10 @@ impl TcpAcceptorSet {
         self.shared.registry().mappings()
     }
 
-    /// Bind an OS-allocated loopback TCP port and keep its listener owned.
+    /// Publish `guest` on a host port the OS picks, keeping the listeners it
+    /// was found with: no other process can take the port between its choice
+    /// and its publication, as one could if the caller probed for a free port
+    /// and then asked for it.
     pub fn publish_atomic(&self, guest: u16) -> io::Result<PortMapping> {
         if guest == 0 || self.is_closed() {
             return Err(io::Error::new(
@@ -230,13 +233,8 @@ impl TcpAcceptorSet {
             .replacing
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let v4 = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-        let mapping = PortMapping::new(v4.local_addr()?.port(), guest);
-        let sockets = BoundSockets {
-            v4,
-            v6: None,
-            loopback_only: true,
-        };
+        let (host, sockets) = publish_bind::bind_tcp_allocated()?;
+        let mapping = PortMapping::new(host, guest);
         let mut registry = self.shared.registry();
         registry.add(&self.shared.poller, BoundTcpPorts(vec![(mapping, sockets)]))?;
         Ok(mapping)
@@ -401,9 +399,12 @@ fn accept_batch(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::sync::mpsc;
+
     #[test]
     fn atomic_allocations_remain_owned_across_concurrent_publishers() {
-        use super::*;
         let publisher = Arc::new(
             TcpAcceptorSet::start(BoundTcpPorts::bind(&[]).unwrap(), Box::new(|_| {})).unwrap(),
         );
@@ -424,10 +425,6 @@ mod tests {
         }
         assert_eq!(publisher.mappings().len(), 32);
     }
-
-    use super::*;
-    use std::net::Ipv4Addr;
-    use std::sync::mpsc;
 
     /// A port free right now, from below the ephemeral range (32768 and up on
     /// Linux, 49152 on macOS). A port the kernel picks with bind(0) is an
