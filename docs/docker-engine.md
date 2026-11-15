@@ -20,6 +20,14 @@ Setup registers the socket, selects the `smol` Docker context, and writes `docke
 which context it replaced; `docker context use <previous>` switches back. No manual engine
 startup or persistent central daemon is needed after setup.
 
+Only the default install changes your Docker setup. An engine given its own state directory
+(`--state-dir`, `SMOLVM_DATA_DIR`) or socket, for example a second smolvm version under test,
+registers its socket and prints the `DOCKER_HOST` to use: the Docker context, the Buildx builder
+and `~/.testcontainers.properties` stay as they are. `smolvm --state-dir <dir> engine
+unregister` removes its registration, also after the state directory was deleted. On macOS
+the registration lasts until you log out; run `smolvm --state-dir <dir> engine` again after
+that.
+
 A client that does not use Docker contexts can use the same socket:
 
 ```bash
@@ -35,6 +43,7 @@ same OS-owned socket through `sudo`, preserving an existing endpoint unless `--f
 | `smolvm engine` | configure automatic activation and Docker client integration |
 | `smolvm engine status [--json]` | show registration and adapter activity without waking it |
 | `smolvm engine link-socket` | link `/var/run/docker.sock` to the same endpoint |
+| `smolvm engine unregister` | remove the socket registration; machines continue running |
 
 The default socket is `~/.smolvm/run/docker.sock`. Container, image, network, volume, exec,
 and event records are stored under the smolvm data directory in `engine/`.

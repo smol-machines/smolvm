@@ -1501,6 +1501,17 @@ pub fn vm_uid_drop_active() -> bool {
     false
 }
 
+#[cfg(unix)]
+static EXPLICIT_DATA_ROOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the user named the data root (`--state-dir` or `SMOLVM_DATA_DIR`),
+/// as opposed to smolvm using or choosing its default one. Such a run sits
+/// beside the default install and must leave the user's own setup alone.
+#[cfg(unix)]
+pub fn data_root_is_explicit() -> bool {
+    EXPLICIT_DATA_ROOT.get().copied().unwrap_or(false)
+}
+
 /// Relocate all smolvm state under a single system data root by pointing `HOME`
 /// at it before any path is computed — every `dirs::`-derived path (VM dirs,
 /// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
@@ -1512,6 +1523,9 @@ pub fn vm_uid_drop_active() -> bool {
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
 #[cfg(unix)]
 pub fn apply_system_data_root(allow_auto: bool) {
+    // Only the first pass sees what the user asked for: a later one (serve
+    // runs its own) finds the variable this function set itself.
+    EXPLICIT_DATA_ROOT.get_or_init(|| std::env::var_os("SMOLVM_DATA_DIR").is_some());
     #[cfg(target_os = "linux")]
     let overlay_root = overlay_workspace_root();
     #[cfg(not(target_os = "linux"))]

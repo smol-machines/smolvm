@@ -4,6 +4,10 @@
 //! selects the `smol` docker context, and names the socket for
 //! Testcontainers, so `docker`, `docker compose`, Testcontainers and Dev
 //! Containers use it with nothing else set. Every container is a machine.
+//!
+//! Only the default install changes the user's Docker setup. An engine with
+//! its own state directory or socket (`--state-dir`, `SMOLVM_DATA_DIR`)
+//! runs beside it: it registers its socket and prints how to reach it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,8 +34,6 @@ enum EngineAction {
     Start(SocketArg),
     #[command(hide = true)]
     Register(SocketArg),
-    #[command(hide = true)]
-    Unregister(SocketArg),
     /// Disconnect the adapter; machines continue running
     #[command(hide = true)]
     Stop(SocketArg),
@@ -66,6 +68,8 @@ enum EngineAction {
         #[arg(long)]
         force: bool,
     },
+    /// Remove the Docker socket registration; machines continue running
+    Unregister(SocketArg),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -103,7 +107,9 @@ impl EngineCmd {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(smolvm::engine::supervise(config, id))
+                let result = runtime.block_on(smolvm::engine::supervise(config.clone(), id));
+                forget_deleted(&config);
+                result
             }
             EngineAction::Serve(s) => serve(s.config()?),
             EngineAction::BuildkitServe(s) => tokio::runtime::Builder::new_multi_thread()
@@ -112,11 +118,7 @@ impl EngineCmd {
                 .block_on(smolvm::engine::builder::serve(s.config()?)),
             EngineAction::Start(s) => start(s.config()?),
             EngineAction::Register(s) => register(&s.config()?),
-            EngineAction::Unregister(s) => {
-                let config = s.config()?;
-                super::engine_activation::uninstall(&smolvm::engine::builder::config(&config))?;
-                super::engine_activation::uninstall(&config)
-            }
+            EngineAction::Unregister(s) => unregister(&s.config()?),
             EngineAction::Stop(s) => stop(s.config()?),
             EngineAction::Status { socket, json } => status(socket.config()?, json),
             EngineAction::LinkSocket {
@@ -134,7 +136,86 @@ fn serve(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
         .enable_all()
         .build()
         .map_err(smolvm::Error::Io)?;
-    runtime.block_on(smolvm::engine::serve(config))
+    let result = runtime.block_on(smolvm::engine::serve(config.clone()));
+    forget_deleted(&config);
+    result
+}
+
+fn unregister(config: &smolvm::engine::EngineConfig) -> smolvm::Result<()> {
+    super::engine_activation::uninstall(&smolvm::engine::builder::config(config))?;
+    super::engine_activation::uninstall(config)?;
+    // `--state-dir` creates the directory it names. Unregistering an engine
+    // whose state was already deleted must not leave an empty one behind.
+    if smolvm::process::data_root_is_explicit() {
+        if let Some(dir) = std::env::var_os("SMOLVM_DATA_DIR") {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+    Ok(())
+}
+
+/// Remove the registration of an engine whose socket and state directory
+/// were deleted: nothing can connect to it again, and the service manager
+/// would otherwise list it until the user logs out.
+fn forget_deleted(config: &smolvm::engine::EngineConfig) {
+    if config.socket.exists() || config.root.exists() {
+        return;
+    }
+    for config in [&smolvm::engine::builder::config(config), config] {
+        if super::engine_activation::registered(config) {
+            super::engine_activation::forget(config);
+        }
+    }
+}
+
+/// Whether `config` is the default install's engine: the default socket and
+/// state directory, with no data root the user named. Only that engine may
+/// change the user's Docker context, Buildx builder and Testcontainers
+/// settings; any other one runs beside it.
+fn is_default_install(
+    config: &smolvm::engine::EngineConfig,
+    default: &smolvm::engine::EngineConfig,
+    explicit_data_root: bool,
+) -> bool {
+    !explicit_data_root && config.socket == default.socket && config.root == default.root
+}
+
+/// The arguments that name this engine again, for the commands setup prints.
+fn engine_flags(
+    config: &smolvm::engine::EngineConfig,
+    default: &smolvm::engine::EngineConfig,
+    data_root: Option<&Path>,
+) -> (String, String) {
+    let global = data_root
+        .map(|dir| format!(" --state-dir {}", dir.display()))
+        .unwrap_or_default();
+    let mut local = String::new();
+    if config.socket != default.socket {
+        local.push_str(&format!(" --socket {}", config.socket.display()));
+    }
+    if config.root != default.root {
+        local.push_str(&format!(" --root {}", config.root.display()));
+    }
+    (global, local)
+}
+
+/// What setup prints for an engine beside the default install.
+fn side_by_side_note(
+    config: &smolvm::engine::EngineConfig,
+    default: &smolvm::engine::EngineConfig,
+    data_root: Option<&Path>,
+) -> String {
+    let (global, local) = engine_flags(config, default, data_root);
+    format!(
+        "Docker API ready on {socket} (starts automatically).\n\
+         This engine does not use the default socket and state directory, so your Docker context, \
+         Buildx builder and Testcontainers settings are unchanged. To use it:\n  \
+         export DOCKER_HOST={url}\n\
+         To remove its registration:\n  \
+         smolvm{global} engine unregister{local}",
+        socket = config.socket.display(),
+        url = integration::socket_url(&config.socket),
+    )
 }
 
 fn pid_file(config: &smolvm::engine::EngineConfig) -> PathBuf {
@@ -143,6 +224,18 @@ fn pid_file(config: &smolvm::engine::EngineConfig) -> PathBuf {
 
 fn start(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
     register(&config)?;
+    let default = smolvm::engine::EngineConfig::default_paths()?;
+    let explicit = smolvm::process::data_root_is_explicit();
+    if !is_default_install(&config, &default, explicit) {
+        let data_root = explicit
+            .then(|| std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from))
+            .flatten();
+        println!(
+            "{}",
+            side_by_side_note(&config, &default, data_root.as_deref())
+        );
+        return Ok(());
+    }
     let home =
         dirs::home_dir().ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
     let docker_dir =
@@ -352,6 +445,55 @@ fn matches_native_builder(text: &str, endpoint: &str) -> bool {
             .map(|(_, value)| *value)
             .collect::<Vec<_>>()
             == [endpoint]
+}
+
+#[cfg(test)]
+mod side_by_side_tests {
+    use super::*;
+    use smolvm::engine::EngineConfig;
+
+    fn default() -> EngineConfig {
+        EngineConfig {
+            socket: "/home/me/.smolvm/run/docker.sock".into(),
+            root: "/home/me/.local/share/smolvm/engine".into(),
+        }
+    }
+
+    #[test]
+    fn only_the_default_install_changes_the_docker_setup() {
+        assert!(is_default_install(&default(), &default(), false));
+        // --state-dir or SMOLVM_DATA_DIR: the defaults themselves moved.
+        assert!(!is_default_install(&default(), &default(), true));
+        let socket = EngineConfig {
+            socket: "/tmp/test/docker.sock".into(),
+            ..default()
+        };
+        assert!(!is_default_install(&socket, &default(), false));
+        let root = EngineConfig {
+            root: "/tmp/test/engine".into(),
+            ..default()
+        };
+        assert!(!is_default_install(&root, &default(), false));
+    }
+
+    #[test]
+    fn a_side_by_side_engine_is_told_its_socket_and_how_to_remove_it() {
+        let moved = EngineConfig {
+            socket: "/srv/s/.smolvm/run/docker.sock".into(),
+            root: "/srv/s/.local/share/smolvm/engine".into(),
+        };
+        let note = side_by_side_note(&moved, &moved, Some(Path::new("/srv/s")));
+        assert!(note.contains("export DOCKER_HOST=unix:///srv/s/.smolvm/run/docker.sock"));
+        assert!(note.ends_with("smolvm --state-dir /srv/s engine unregister"));
+        let custom = EngineConfig {
+            socket: "/tmp/x/docker.sock".into(),
+            root: "/tmp/x/engine".into(),
+        };
+        let note = side_by_side_note(&custom, &default(), None);
+        assert!(note.ends_with(
+            "smolvm engine unregister --socket /tmp/x/docker.sock --root /tmp/x/engine"
+        ));
+    }
 }
 
 #[cfg(test)]

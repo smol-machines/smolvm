@@ -136,19 +136,27 @@ pub(super) fn uninstall(config: &EngineConfig) -> smolvm::Result<()> {
     let name = service_name(config);
     let home =
         dirs::home_dir().ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
+    // The service manager keeps a registration made from a state directory
+    // after that directory, and the unit files in it, are deleted. So the
+    // registration is removed by name, whether or not its files are there.
     #[cfg(target_os = "linux")]
     {
         let dir = dirs::config_dir()
             .unwrap_or_else(|| home.join(".config"))
             .join("systemd/user");
-        if dir.join(format!("{name}.socket")).exists() {
-            run(
-                "systemctl",
-                &["--user", "disable", "--now", &format!("{name}.socket")],
-            )?;
-            run("systemctl", &["--user", "stop", &format!("{name}.service")])?;
-            std::fs::remove_file(dir.join(format!("{name}.socket")))?;
-            std::fs::remove_file(dir.join(format!("{name}.service")))?;
+        let (socket, service) = (format!("{name}.socket"), format!("{name}.service"));
+        let files = dir.join(&socket).exists();
+        let disabled = run("systemctl", &["--user", "disable", "--now", &socket]);
+        let stopped = run("systemctl", &["--user", "stop", &service]);
+        let unlinked = run("systemctl", &["--user", "disable", &service]).is_ok();
+        let known = files || disabled.is_ok() || unlinked;
+        if files {
+            disabled?;
+            stopped?;
+        }
+        if known {
+            let _ = std::fs::remove_file(dir.join(&socket));
+            let _ = std::fs::remove_file(dir.join(&service));
             run("systemctl", &["--user", "daemon-reload"])?;
         }
     }
@@ -157,13 +165,51 @@ pub(super) fn uninstall(config: &EngineConfig) -> smolvm::Result<()> {
         let path = home
             .join("Library/LaunchAgents")
             .join(format!("{name}.plist"));
-        if path.exists() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        if registered(config) {
             let domain = format!("gui/{}", unsafe { libc::getuid() });
             run("launchctl", &["bootout", &format!("{domain}/{name}")])?;
-            std::fs::remove_file(path)?;
         }
     }
     Ok(())
+}
+
+/// [`uninstall`] for a caller that may be running in the service: nothing
+/// here waits for the service to stop, which would wait for the caller.
+pub(super) fn forget(config: &EngineConfig) {
+    let name = service_name(config);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = run(
+            "systemctl",
+            &["--user", "disable", &format!("{name}.service")],
+        );
+        let _ = run(
+            "systemctl",
+            &[
+                "--user",
+                "--no-block",
+                "disable",
+                "--now",
+                &format!("{name}.socket"),
+            ],
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let target = format!("gui/{}/{name}", unsafe { libc::getuid() });
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &target])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = name;
 }
 
 pub(super) fn registered(config: &EngineConfig) -> bool {
