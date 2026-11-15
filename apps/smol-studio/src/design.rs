@@ -2,11 +2,12 @@
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 
 pub const INK: Color32 = Color32::from_rgb(17, 17, 17);
-pub const MUTED: Color32 = Color32::from_rgb(85, 85, 85);
+pub const MUTED: Color32 = Color32::from_rgb(104, 106, 111);
+pub const SIDEBAR: Color32 = Color32::from_rgb(245, 245, 246);
 pub const ACCENT: Color32 = Color32::from_rgb(17, 17, 17);
 pub const LINE: Color32 = Color32::from_rgb(226, 226, 227);
 pub const SURFACE: Color32 = Color32::from_rgb(249, 249, 249);
-pub const SELECTED: Color32 = Color32::from_rgb(237, 237, 237);
+pub const SELECTED: Color32 = Color32::from_rgb(235, 236, 238);
 pub const GREEN: Color32 = Color32::from_rgb(44, 122, 63);
 pub const RED: Color32 = Color32::from_rgb(179, 38, 30);
 
@@ -18,6 +19,8 @@ pub enum Icon {
     Settings,
     Image,
     Volume,
+    Project,
+    Network,
 }
 
 pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color32) {
@@ -25,6 +28,37 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
     let stroke = Stroke::new(1.5, color);
     let point = |x: f32, y: f32| r.min + egui::vec2(x * r.width(), y * r.height());
     match kind {
+        Icon::Project => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    point(0.0, 0.16),
+                    point(0.4, 0.16),
+                    point(0.52, 0.32),
+                    point(1.0, 0.32),
+                    point(1.0, 0.9),
+                    point(0.0, 0.9),
+                ],
+                stroke,
+            ));
+        }
+        Icon::Network => {
+            for (a, b) in [
+                (point(0.5, 0.25), point(0.5, 0.55)),
+                (point(0.15, 0.55), point(0.85, 0.55)),
+                (point(0.15, 0.55), point(0.15, 0.75)),
+                (point(0.85, 0.55), point(0.85, 0.75)),
+            ] {
+                painter.line_segment([a, b], stroke);
+            }
+            for (x, y) in [(0.5, 0.12), (0.15, 0.88), (0.85, 0.88)] {
+                painter.rect_stroke(
+                    egui::Rect::from_center_size(point(x, y), rect.size() * 0.24),
+                    2,
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
         Icon::Image => {
             painter.add(egui::Shape::line(
                 vec![
@@ -116,14 +150,18 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
 
 pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::Response {
     let response = ui.add_sized(
-        [ui.available_width(), 38.0],
+        [ui.available_width(), 34.0],
         egui::Button::selectable(selected, "")
             .fill(if selected {
-                SELECTED
+                Color32::WHITE
             } else {
                 Color32::TRANSPARENT
             })
-            .stroke(Stroke::NONE)
+            .stroke(if selected {
+                Stroke::new(1.0, LINE)
+            } else {
+                Stroke::NONE
+            })
             .corner_radius(6),
     );
     response.widget_info(|| {
@@ -145,10 +183,18 @@ pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::
         egui::pos2(rect.left() + 42.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        FontId::proportional(14.0),
+        FontId::proportional(13.0),
         if selected { ACCENT } else { INK },
     );
     response
+}
+
+pub fn nav_group(ui: &mut egui::Ui, label: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        ui.label(RichText::new(label).size(9.5).color(MUTED));
+    });
+    ui.add_space(4.0);
 }
 
 pub fn primary(label: &str) -> egui::Button<'_> {
@@ -242,15 +288,16 @@ pub fn card() -> egui::Frame {
     egui::Frame::new()
         .fill(Color32::WHITE)
         .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(0)
-        .inner_margin(18)
+        .corner_radius(8)
+        .inner_margin(16)
 }
 
 pub fn metric(ui: &mut egui::Ui, label: &str, value: &str, unit: &str) {
     egui::Frame::new()
-        .fill(SURFACE)
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, LINE))
         .inner_margin(16)
-        .corner_radius(6)
+        .corner_radius(8)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(label).size(12.0).color(MUTED));
@@ -310,20 +357,9 @@ pub fn resource_row(
     });
     row_feedback(ui, &response, selected);
     let r = response.rect;
-    if selected {
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(r.min + egui::vec2(0.0, 12.0), egui::vec2(3.0, 40.0)),
-            2,
-            ACCENT,
-        );
-    }
     let icon_rect =
         egui::Rect::from_center_size(egui::pos2(r.left() + 25.0, r.center().y), Vec2::splat(30.0));
-    ui.painter().rect_filled(
-        icon_rect,
-        7,
-        if selected { Color32::WHITE } else { SURFACE },
-    );
+    ui.painter().rect_filled(icon_rect, 7, Color32::TRANSPARENT);
     icon(
         ui.painter(),
         icon_rect.shrink(6.0),
@@ -357,8 +393,71 @@ pub fn resource_row(
     response.on_hover_text(format!("{name}\n{subtitle}\n{state}"))
 }
 
+pub fn resource_heading(ui: &mut egui::Ui, kind: Icon, title: &str, subtitle: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 10, SURFACE);
+        ui.painter()
+            .rect_stroke(rect, 10, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+        icon(ui.painter(), rect.shrink(12.0), kind, MUTED);
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.add(egui::Label::new(heading(title, 21.0)).truncate())
+                .on_hover_text(title);
+            if !subtitle.is_empty() {
+                ui.add(
+                    egui::Label::new(RichText::new(subtitle).size(12.0).color(MUTED)).truncate(),
+                )
+                .on_hover_text(subtitle);
+            }
+        });
+    });
+}
+
+pub fn search(ui: &mut egui::Ui, value: &mut String, hint: &str) {
+    let response = ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin {
+                left: 30,
+                right: 10,
+                top: 9,
+                bottom: 9,
+            }),
+    );
+    let center = egui::pos2(response.rect.left() + 14.0, response.rect.center().y - 1.0);
+    ui.painter()
+        .circle_stroke(center, 4.0, Stroke::new(1.2, MUTED));
+    ui.painter().line_segment(
+        [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
+        Stroke::new(1.2, MUTED),
+    );
+    if ui.is_enabled() && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+        response.request_focus();
+    }
+}
+
+pub fn empty_state(ui: &mut egui::Ui, kind: Icon, title: &str, message: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 14, SURFACE);
+    ui.painter()
+        .rect_stroke(rect, 14, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+    icon(ui.painter(), rect.shrink(15.0), kind, MUTED);
+    ui.add_space(16.0);
+    ui.label(heading(title, 20.0));
+    ui.add_space(6.0);
+    ui.add(egui::Label::new(RichText::new(message).size(13.0).color(MUTED)).wrap());
+}
+
 pub fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(heading(title, 18.0)).on_hover_text(subtitle);
+    ui.allocate_ui_with_layout(
+        egui::vec2(0.0, 34.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(heading(title, 16.0)).on_hover_text(subtitle);
+        },
+    );
 }
 
 pub fn notice(ui: &mut egui::Ui, message: &str) {

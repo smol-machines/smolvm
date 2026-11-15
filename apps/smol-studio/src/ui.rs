@@ -6,7 +6,7 @@ use smol_studio::{
 };
 use std::time::Instant;
 
-use crate::design::{self, ACCENT, GREEN, Icon, MUTED, SURFACE, eyebrow, theme};
+use crate::design::{self, GREEN, Icon, MUTED, SURFACE, eyebrow, theme};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
@@ -176,61 +176,79 @@ impl Studio {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        use smol_studio::docker::Kind;
         egui::Panel::left("navigation")
             .resizable(false)
-            .default_size(176.0)
-            .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
+            .default_size(196.0)
+            .frame(egui::Frame::new().fill(design::SIDEBAR).inner_margin(12))
             .show(ui, |ui| {
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.add(egui::Image::new((self.brand.id(), Vec2::splat(36.0))));
+                    ui.add(egui::Image::new((self.brand.id(), Vec2::splat(32.0))));
                     ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(design::heading("smol machines", 14.0));
-                        ui.label(RichText::new("STUDIO").size(9.0).color(MUTED));
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(design::heading("smol studio", 15.0));
+                        ui.label(RichText::new("by smol machines").size(10.0).color(MUTED));
                     });
                 });
                 ui.add_space(24.0);
-                for (workspace, icon, label) in [
-                    (Workspace::Local, Icon::Machine, "Machines"),
-                    (Workspace::Cloud, Icon::Cloud, "Cloud"),
-                    (Workspace::Containers, Icon::Containers, "Containers"),
-                ] {
-                    if design::nav(ui, self.workspace == workspace, icon, label).clicked() {
-                        self.workspace = workspace;
+                design::nav_group(ui, "WORKSPACE");
+                if design::nav(
+                    ui,
+                    self.workspace == Workspace::Local,
+                    Icon::Machine,
+                    "Machines",
+                )
+                .clicked()
+                {
+                    self.workspace = Workspace::Local;
+                }
+                ui.add_enabled_ui(!self.docker.navigating(), |ui| {
+                    for (destination, icon, label) in [
+                        (Some(Kind::Containers), Icon::Containers, "Containers"),
+                        (None, Icon::Project, "Projects"),
+                    ] {
+                        let selected = self.workspace == Workspace::Containers
+                            && self.docker.destination() == destination;
+                        if design::nav(ui, selected, icon, label).clicked() && !selected {
+                            self.workspace = Workspace::Containers;
+                            self.docker.navigate(&self.runtime, destination);
+                        }
                     }
+                    ui.add_space(18.0);
+                    design::nav_group(ui, "STORAGE & NETWORK");
+                    for (kind, icon, label) in [
+                        (Kind::Images, Icon::Image, "Images"),
+                        (Kind::Volumes, Icon::Volume, "Volumes"),
+                        (Kind::Networks, Icon::Network, "Networks"),
+                    ] {
+                        let selected = self.workspace == Workspace::Containers
+                            && self.docker.destination() == Some(kind);
+                        if design::nav(ui, selected, icon, label).clicked() && !selected {
+                            self.workspace = Workspace::Containers;
+                            self.docker.navigate(&self.runtime, Some(kind));
+                        }
+                    }
+                });
+                ui.add_space(18.0);
+                design::nav_group(ui, "SMOL CLOUD");
+                if design::nav(
+                    ui,
+                    self.workspace == Workspace::Cloud,
+                    Icon::Cloud,
+                    "Cloud machines",
+                )
+                .clicked()
+                {
+                    self.workspace = Workspace::Cloud;
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("Smol Studio  /  Preview")
-                            .size(10.0)
-                            .color(MUTED),
-                    );
-                    ui.add_space(12.0);
+                    ui.add_space(4.0);
                     if design::nav(ui, self.settings, Icon::Settings, "Settings").clicked() {
                         self.settings = true;
                     }
-                    ui.add_space(12.0);
+                    ui.add_space(8.0);
                     ui.separator();
-                    ui.add_space(14.0);
-                    ui.horizontal(|ui| {
-                        let (r, _) = ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            r.center(),
-                            3.0,
-                            if self.inventory_valid { GREEN } else { MUTED },
-                        );
-                        ui.label(
-                            RichText::new(if self.inventory_valid {
-                                "Local connected"
-                            } else {
-                                "Local unavailable"
-                            })
-                            .size(12.0)
-                            .color(MUTED),
-                        );
-                    });
                 });
             });
     }
@@ -240,7 +258,7 @@ impl Studio {
             ui.vertical(|ui| {
                 design::section_title(
                     ui,
-                    "Local machines",
+                    "Machines",
                     "Your development environments, on this computer.",
                 );
             });
@@ -328,21 +346,7 @@ impl Studio {
         else {
             return;
         };
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
-            ui.painter().rect_filled(r, 0, design::SELECTED);
-            design::icon(ui.painter(), r.shrink(11.0), Icon::Machine, ACCENT);
-            ui.add_space(4.0);
-            ui.vertical(|ui| {
-                ui.add(egui::Label::new(design::heading(&m.name, 22.0)).truncate())
-                    .on_hover_text(&m.name);
-                ui.add(
-                    egui::Label::new(RichText::new(m.image_label()).size(12.0).color(MUTED))
-                        .truncate(),
-                )
-                .on_hover_text(m.image_label());
-            });
-        });
+        design::resource_heading(ui, Icon::Machine, &m.name, m.image_label());
         ui.add_space(18.0);
         let enabled = self.pending.is_none() && self.inventory_valid;
         ui.horizontal_wrapped(|ui| {
@@ -491,25 +495,23 @@ impl Studio {
                 ui.add_space(18.0);
                 eyebrow(ui, "MACHINE DETAILS");
                 ui.add_space(10.0);
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(0, 8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        egui::Grid::new("machine_resources")
-                            .num_columns(2)
-                            .min_row_height(18.0)
-                            .spacing([28.0, 12.0])
-                            .show(ui, |ui| {
-                                field(ui, "Shared folders", &m.mounts.to_string());
-                                field(ui, "Published ports", &m.ports.to_string());
-                                if let Some(pid) = m.pid {
-                                    field(ui, "Process ID", &pid.to_string());
-                                }
-                                if let Some(parent) = &m.parent_machine {
-                                    field(ui, "Branched from", parent);
-                                }
-                            });
-                    });
+                design::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::Grid::new("machine_resources")
+                        .num_columns(2)
+                        .min_row_height(18.0)
+                        .spacing([28.0, 12.0])
+                        .show(ui, |ui| {
+                            field(ui, "Shared folders", &m.mounts.to_string());
+                            field(ui, "Published ports", &m.ports.to_string());
+                            if let Some(pid) = m.pid {
+                                field(ui, "Process ID", &pid.to_string());
+                            }
+                            if let Some(parent) = &m.parent_machine {
+                                field(ui, "Branched from", parent);
+                            }
+                        });
+                });
                 ui.add_space(14.0);
                 ui.collapsing("Command line", |ui| {
                     let command =
@@ -843,9 +845,20 @@ impl eframe::App for Studio {
                     ui.label(RichText::new(label).size(11.0).color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new("Machines keep running when you close Studio")
-                                .size(11.0)
-                                .color(MUTED),
+                            RichText::new(if self.inventory_valid {
+                                "Local engine connected"
+                            } else {
+                                "Local engine unavailable"
+                            })
+                            .size(10.0)
+                            .color(MUTED),
+                        )
+                        .on_hover_text("Machines keep running when you close Studio.");
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(5.0), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            r.center(),
+                            2.5,
+                            if self.inventory_valid { GREEN } else { MUTED },
                         );
                     });
                 });
@@ -865,17 +878,12 @@ impl eframe::App for Studio {
                     .show(ui, |ui| self.header(ui));
                 egui::Panel::left("local-list")
                     .resizable(true)
-                    .default_size(258.0)
+                    .default_size(264.0)
                     .min_size(224.0)
                     .max_size(380.0)
                     .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.query)
-                                .hint_text("Search machines…")
-                                .desired_width(f32::INFINITY)
-                                .margin(egui::Margin::symmetric(10, 9)),
-                        );
+                        design::search(ui, &mut self.query, "Search machines…");
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             for (filter, label) in [
@@ -905,22 +913,35 @@ impl eframe::App for Studio {
                         ui.add_space(6.0);
                         self.machine_list(ui);
                     });
-                egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24)).show(ui, |ui| {
-                    if self.selected.is_some() {
-                        egui::ScrollArea::vertical().id_salt("machine-detail").show(ui, |ui| self.details(ui));
-                    } else {
-                        ui.add_space(100.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(design::heading("Your own Linux workspace", 24.0));
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("Create a machine for your project. Open a terminal and get to work.").color(MUTED));
-                            ui.add_space(20.0);
-                            if ui.add_enabled(self.inventory_valid && self.pending.is_none(), design::primary("+  New machine")).clicked() {
-                                self.create = Some(NewMachine::default());
-                            }
-                        });
-                    }
-                });
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24))
+                    .show(ui, |ui| {
+                        if self.selected.is_some() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("machine-detail")
+                                .show(ui, |ui| self.details(ui));
+                        } else {
+                            ui.add_space(100.0);
+                            ui.vertical_centered(|ui| {
+                                design::empty_state(
+                                    ui,
+                                    Icon::Machine,
+                                    "A home for your next project",
+                                    "Create a Linux machine, open a terminal, and get to work.",
+                                );
+                                ui.add_space(20.0);
+                                if ui
+                                    .add_enabled(
+                                        self.inventory_valid && self.pending.is_none(),
+                                        design::primary("+  New machine"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.create = Some(NewMachine::default());
+                                }
+                            });
+                        }
+                    });
             }
         }
         self.dialogs(&ctx);

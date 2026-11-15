@@ -66,6 +66,36 @@ impl DockerView {
             terminal: None,
         }
     }
+    pub fn destination(&self) -> Option<Kind> {
+        if self.compose { None } else { Some(self.kind) }
+    }
+
+    pub fn navigating(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn navigate(&mut self, runtime: &Runtime, destination: Option<Kind>) {
+        if self.pending.is_some() {
+            return;
+        }
+        self.compose = destination.is_none();
+        if let Some(kind) = destination {
+            self.kind = kind;
+        }
+        self.query.clear();
+        self.storage = None;
+        self.storage_selected = None;
+        self.details = None;
+        self.stats = None;
+        self.rows.clear();
+        self.valid = false;
+        self.text.clear();
+        self.opened = true;
+        if !cfg!(windows) {
+            self.refresh(runtime);
+        }
+    }
+
     pub fn modal_open(&self) -> bool {
         self.confirm.is_some() || self.new_resource.is_some()
     }
@@ -268,26 +298,11 @@ impl DockerView {
             .max_size(380.0)
             .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
             .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .hint_text(format!("Search {}…", self.kind.label().to_lowercase()))
-                        .desired_width(f32::INFINITY)
-                        .margin(egui::Margin::symmetric(10, 9)),
+                design::search(
+                    ui,
+                    &mut self.query,
+                    &format!("Search {}…", self.kind.label().to_lowercase()),
                 );
-                if ui
-                    .add_enabled(
-                        self.pending.is_none(),
-                        egui::Button::new(if self.kind == Kind::Images {
-                            "+  Pull image…"
-                        } else {
-                            "+  Create volume…"
-                        }),
-                    )
-                    .clicked()
-                {
-                    self.resource_input.clear();
-                    self.new_resource = Some(self.kind);
-                }
                 ui.add_space(12.0);
                 design::eyebrow(ui, &self.kind.label().to_uppercase());
                 ui.add_space(8.0);
@@ -408,7 +423,7 @@ impl DockerView {
         let enabled = self.pending.is_none() && self.valid;
         egui::ScrollArea::vertical().id_salt("storage-detail-scroll").auto_shrink([false,false]).show(ui, |ui| {
             let title = if details.kind == Kind::Images { details.fields.first().map(|(_,v)|v.lines().next().unwrap_or("Image")).unwrap_or("Image") } else { &details.id };
-            ui.add(egui::Label::new(design::heading(title,22.0)).truncate()).on_hover_text(title);
+            design::resource_heading(ui, if details.kind == Kind::Images { design::Icon::Image } else { design::Icon::Volume }, title, if details.kind == Kind::Images { "Container image" } else { "Persistent volume" });
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.add_enabled(enabled && details.users.is_empty(), egui::Button::new(RichText::new("Remove…").color(design::RED))).clicked() {
@@ -429,11 +444,17 @@ impl DockerView {
                 });
             }
             ui.add_space(20.0); design::eyebrow(ui,"DETAILS");
-            for (label,value) in &details.fields {
-                ui.add_space(12.0);
-                ui.label(RichText::new(label).small().color(MUTED));
-                ui.add(egui::Label::new(if value.is_empty() { "Not reported" } else { value }).wrap().selectable(true));
-            }
+            ui.add_space(8.0);
+            design::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for (index, (label, value)) in details.fields.iter().enumerate() {
+                    if index > 0 { ui.add_space(6.0); ui.separator(); ui.add_space(6.0); }
+                    ui.horizontal_top(|ui| {
+                        ui.add_sized([88.0, 18.0], egui::Label::new(RichText::new(label).size(12.0).color(MUTED)).halign(egui::Align::LEFT));
+                        ui.add(egui::Label::new(RichText::new(if value.is_empty() { "Not reported" } else { value }).size(13.0)).wrap().selectable(true));
+                    });
+                }
+            });
         });
     }
     fn resource_dialog(&mut self, ctx: &egui::Context, runtime: &Runtime) {
@@ -516,21 +537,7 @@ impl DockerView {
             .max_size(380.0)
             .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
             .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.project_query)
-                        .hint_text("Search projects…")
-                        .desired_width(f32::INFINITY)
-                        .margin(egui::Margin::symmetric(10, 9)),
-                );
-                if ui
-                    .add_enabled(
-                        self.pending.is_none(),
-                        egui::Button::new("+  Open Compose file…"),
-                    )
-                    .clicked()
-                {
-                    self.compose_import = true;
-                }
+                design::search(ui, &mut self.project_query, "Search projects…");
                 ui.add_space(12.0);
                 design::eyebrow(ui, &format!("PROJECTS  /  {}", self.projects.len()));
                 ui.add_space(8.0);
@@ -659,12 +666,12 @@ impl DockerView {
             .id_salt("container-inspector-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add(egui::Label::new(design::heading(&details.name, 22.0)).truncate())
-                    .on_hover_text(&details.name);
-                ui.add(
-                    egui::Label::new(RichText::new(&details.image).small().color(MUTED)).truncate(),
-                )
-                .on_hover_text(&details.image);
+                design::resource_heading(
+                    ui,
+                    design::Icon::Containers,
+                    &details.name,
+                    &details.image,
+                );
                 ui.add_space(10.0);
                 design::badge(ui, &details.state);
                 if let Some(health) = &details.health {
@@ -866,11 +873,41 @@ impl DockerView {
                     ui.vertical(|ui| {
                         design::section_title(
                             ui,
-                            "Containers",
+                            if self.compose {
+                                "Projects"
+                            } else {
+                                self.kind.label()
+                            },
                             "Docker and Compose, powered by Smol.",
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.compose && !cfg!(windows) {
+                            if ui
+                                .add_enabled(
+                                    self.pending.is_none(),
+                                    design::primary("+  Open project"),
+                                )
+                                .clicked()
+                            {
+                                self.compose_import = true;
+                            }
+                        } else if matches!(self.kind, Kind::Images | Kind::Volumes)
+                            && !cfg!(windows)
+                            && ui
+                                .add_enabled(
+                                    self.pending.is_none(),
+                                    design::primary(if self.kind == Kind::Images {
+                                        "+  Pull image"
+                                    } else {
+                                        "+  Create volume"
+                                    }),
+                                )
+                                .clicked()
+                        {
+                            self.resource_input.clear();
+                            self.new_resource = Some(self.kind);
+                        }
                         if ui
                             .add_enabled(self.pending.is_none(), egui::Button::new("Refresh"))
                             .clicked()
@@ -906,34 +943,6 @@ impl DockerView {
                         error,
                     );
                 }
-                ui.add_space(8.0);
-                ui.add_enabled_ui(self.pending.is_none(), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for kind in [
-                            Kind::Containers,
-                            Kind::Images,
-                            Kind::Volumes,
-                            Kind::Networks,
-                        ] {
-                            if design::tab(ui, !self.compose && self.kind == kind, kind.label())
-                                .clicked()
-                            {
-                                self.compose = false;
-                                self.kind = kind;
-                                self.query.clear();
-                                self.storage = None;
-                                self.storage_selected = None;
-                                self.rows.clear();
-                                self.valid = false;
-                                self.submit(runtime, Action::List(kind));
-                            }
-                        }
-                        if design::tab(ui, self.compose, "Compose").clicked() {
-                            self.compose = true;
-                            self.submit(runtime, Action::Projects);
-                        }
-                    });
-                });
             });
         if !self.text.is_empty() {
             egui::Panel::bottom("docker-output")
@@ -977,12 +986,7 @@ impl DockerView {
                 .max_size(380.0)
                 .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("Search containers…")
-                            .desired_width(f32::INFINITY)
-                            .margin(egui::Margin::symmetric(10, 9)),
-                    );
+                    design::search(ui, &mut self.query, "Search containers…");
                     ui.add_space(12.0);
                     design::eyebrow(ui, &format!("CONTAINERS  /  {}", self.rows.len()));
                     ui.add_space(8.0);
