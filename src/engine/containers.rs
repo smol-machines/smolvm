@@ -2284,6 +2284,35 @@ pub(crate) async fn shutdown_all(engine: &Arc<Engine>) {
     }
 }
 
+/// End the owner's machine without asking its guest, for a supervisor whose
+/// engine state was deleted: the agent socket a stop goes through went with
+/// it. A machine whose own files are still there (only the engine's records
+/// were deleted) is deleted too, as no container is left to own it.
+pub(crate) async fn abandon_all(engine: &Arc<Engine>) {
+    let owned: Vec<Arc<Container>> = engine
+        .containers
+        .read()
+        .values()
+        .filter(|c| engine.owner.as_deref() == Some(c.id().as_str()))
+        .cloned()
+        .collect();
+    for c in owned {
+        let handle = c.running.lock().as_mut().and_then(|r| r.vm.take());
+        let machine = c.record().machine;
+        let e = engine.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let kept = crate::agent::vm_data_dir(&machine).exists();
+            if let Some(mut handle) = handle {
+                let _ = handle.stop_paused();
+            }
+            if kept && e.db.get_vm(&machine).ok().flatten().is_some() {
+                let _ = crate::embedded::control::delete_vm(&e.db, &machine);
+            }
+        })
+        .await;
+    }
+}
+
 // ============================================================================
 // Views
 // ============================================================================
