@@ -171,7 +171,7 @@ impl CloudView {
             .frame(
                 egui::Frame::new()
                     .fill(Color32::WHITE)
-                    .inner_margin(egui::Margin::symmetric(24, 20)),
+                    .inner_margin(egui::Margin::symmetric(22, 14)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -183,6 +183,9 @@ impl CloudView {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.pending {
+                            ui.spinner();
+                        }
                         if let Some(identity) = &self.snapshot.identity {
                             if ui
                                 .add_enabled(
@@ -207,13 +210,6 @@ impl CloudView {
                         }
                     });
                 });
-                if self.pending {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Connecting…").small().color(MUTED));
-                    });
-                }
                 if let Some(error) = &self.error {
                     ui.add_space(10.0);
                     design::error_notice(ui, "Your cloud connection needs attention.", error);
@@ -360,8 +356,8 @@ impl CloudView {
             });
         egui::Panel::left("cloud-list")
             .resizable(true)
-            .default_size(278.0)
-            .min_size(240.0)
+            .default_size(258.0)
+            .min_size(224.0)
             .max_size(380.0)
             .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
             .show(ui, |ui| {
@@ -393,7 +389,7 @@ impl CloudView {
                 }
                 egui::ScrollArea::vertical()
                     .id_salt("cloud-machines")
-                    .show_rows(ui, 64.0, rows.len(), |ui, range| {
+                    .show_rows(ui, 60.0, rows.len(), |ui, range| {
                         for &index in &rows[range] {
                             let m = &self.snapshot.machines[index];
                             let state = if m.is_started() && !m.is_ready() {
@@ -422,7 +418,7 @@ impl CloudView {
                     });
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(SURFACE).inner_margin(28))
+            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("cloud-detail")

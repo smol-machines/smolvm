@@ -1,4 +1,4 @@
-use crate::design::{self, MUTED, SURFACE};
+use crate::design::{self, MUTED};
 use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 use smol_studio::{
@@ -72,13 +72,20 @@ impl DockerView {
                     if self.kind == kind {
                         self.rows = rows;
                         self.valid = true;
-                        if kind == Kind::Containers
-                            && let Some(id) = self.selected.clone()
-                        {
-                            if self.rows.iter().any(|r| r["ID"].as_str() == Some(&id)) {
+                        if kind == Kind::Containers {
+                            self.selected = self
+                                .selected
+                                .take()
+                                .filter(|id| self.rows.iter().any(|r| r["ID"].as_str() == Some(id)))
+                                .or_else(|| {
+                                    self.rows
+                                        .first()
+                                        .and_then(|r| r["ID"].as_str())
+                                        .map(str::to_owned)
+                                });
+                            if let Some(id) = self.selected.clone() {
                                 self.submit(runtime, Action::Inspect(id));
                             } else {
-                                self.selected = None;
                                 self.details = None;
                                 self.stats = None;
                             }
@@ -100,7 +107,7 @@ impl DockerView {
                 Ok(Output::Completed) => {
                     self.details = None;
                     self.stats = None;
-                    self.text = "Operation completed.".into();
+                    self.text.clear();
                     self.submit(runtime, Action::List(self.kind));
                 }
                 Err(e) => {
@@ -120,16 +127,6 @@ impl DockerView {
         }
     }
     fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
-        ui.horizontal(|ui| {
-            design::eyebrow(ui, "CONTAINER");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Close").clicked() {
-                    self.selected = None;
-                    self.details = None;
-                    self.stats = None;
-                }
-            });
-        });
         let Some(details) = self.details.clone() else {
             ui.add_space(20.0);
             if self.pending.is_some() {
@@ -141,8 +138,8 @@ impl DockerView {
         };
         egui::ScrollArea::vertical()
             .id_salt("container-inspector-scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(10.0);
                 ui.add(egui::Label::new(design::heading(&details.name, 22.0)).truncate())
                     .on_hover_text(&details.name);
                 ui.add(
@@ -187,11 +184,35 @@ impl DockerView {
                     if ui.add_enabled(enabled, egui::Button::new("Logs")).clicked() {
                         self.submit(runtime, Action::Logs(details.id.clone()));
                     }
-                    if ui.small_button("Copy ID").clicked() {
-                        ui.ctx().copy_text(details.id.clone());
+                    if details.state == "running" {
+                        if ui.add_enabled(enabled, egui::Button::new("Stop")).clicked() {
+                            self.submit(runtime, Action::Stop(details.id.clone()));
+                        }
+                    } else if ui.add_enabled(enabled, design::primary("Start")).clicked() {
+                        self.submit(runtime, Action::Start(details.id.clone()));
                     }
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.menu_button("More", |ui| {
+                            if ui.button("Copy container ID").clicked() {
+                                ui.ctx().copy_text(details.id.clone());
+                                ui.close();
+                            }
+                            if details.state != "running" {
+                                ui.separator();
+                                if ui
+                                    .button(RichText::new("Remove container…").color(design::RED))
+                                    .clicked()
+                                {
+                                    self.confirm = Some(Action::Delete(details.id.clone()));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
                 });
-                ui.add_space(20.0);
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(16.0);
                 design::eyebrow(ui, "PUBLISHED PORTS");
                 if details.ports.is_empty() {
                     ui.label(
@@ -310,7 +331,7 @@ impl DockerView {
             .frame(
                 egui::Frame::new()
                     .fill(Color32::WHITE)
-                    .inner_margin(egui::Margin::symmetric(24, 20)),
+                    .inner_margin(egui::Margin::symmetric(22, 14)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -327,6 +348,9 @@ impl DockerView {
                             .clicked()
                         {
                             self.submit(runtime, Action::List(self.kind));
+                        }
+                        if self.pending.is_some() {
+                            ui.spinner();
                         }
                         ui.add_enabled_ui(self.pending.is_none(), |ui| {
                             ui.menu_button("Connection", |ui| {
@@ -354,14 +378,7 @@ impl DockerView {
                         error,
                     );
                 }
-                if self.pending.is_some() {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Working…").small().color(MUTED));
-                    });
-                }
-                ui.add_space(18.0);
+                ui.add_space(8.0);
                 ui.add_enabled_ui(self.pending.is_none(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         for kind in [
@@ -370,8 +387,7 @@ impl DockerView {
                             Kind::Volumes,
                             Kind::Networks,
                         ] {
-                            if ui
-                                .selectable_label(!self.compose && self.kind == kind, kind.label())
+                            if design::tab(ui, !self.compose && self.kind == kind, kind.label())
                                 .clicked()
                             {
                                 self.compose = false;
@@ -381,7 +397,7 @@ impl DockerView {
                                 self.submit(runtime, Action::List(kind));
                             }
                         }
-                        if ui.selectable_label(self.compose, "Compose").clicked() {
+                        if design::tab(ui, self.compose, "Compose").clicked() {
                             self.compose = true;
                         }
                     });
@@ -415,16 +431,75 @@ impl DockerView {
                         });
                 });
         }
-        if self.selected.is_some() && self.kind == Kind::Containers && !self.compose {
-            egui::Panel::right("container-inspector")
+        if self.kind == Kind::Containers && !self.compose && !cfg!(windows) {
+            egui::Panel::left("container-list")
                 .resizable(true)
-                .default_size(330.0)
-                .min_size(290.0)
-                .max_size(440.0)
-                .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(20))
-                .show(ui, |ui| self.inspector(ui, runtime));
+                .default_size(280.0)
+                .min_size(224.0)
+                .max_size(380.0)
+                .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.query)
+                            .hint_text("Search containers…")
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::Margin::symmetric(10, 9)),
+                    );
+                    ui.add_space(12.0);
+                    design::eyebrow(ui, &format!("CONTAINERS  /  {}", self.rows.len()));
+                    ui.add_space(8.0);
+                    let query = self.query.to_lowercase();
+                    let visible: Vec<_> = self
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| {
+                            ["Names", "Image", "ID"]
+                                .iter()
+                                .any(|key| text(r, key).to_lowercase().contains(&query))
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    if visible.is_empty() && self.valid {
+                        ui.label(
+                            RichText::new(if self.rows.is_empty() {
+                                "No containers yet"
+                            } else {
+                                "No matching containers"
+                            })
+                            .small()
+                            .color(MUTED),
+                        );
+                    }
+                    if self.pending.is_some() {
+                        ui.disable();
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("container-list-scroll")
+                        .show_rows(ui, 60.0, visible.len(), |ui, range| {
+                            for &index in &visible[range] {
+                                let row = self.rows[index].clone();
+                                let id = text(&row, "ID");
+                                if design::resource_row(
+                                    ui,
+                                    self.selected.as_ref() == Some(&id),
+                                    &text(&row, "Names"),
+                                    &text(&row, "Image"),
+                                    &text(&row, "State"),
+                                    design::Icon::Containers,
+                                )
+                                .clicked()
+                                {
+                                    self.selected = Some(id.clone());
+                                    self.details = None;
+                                    self.stats = None;
+                                    self.submit(runtime, Action::Inspect(id));
+                                }
+                            }
+                        });
+                });
         }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(SURFACE).inner_margin(24)).show(ui,|ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24)).show(ui,|ui| {
             if cfg!(windows){ui.label("The Docker API is available on macOS and Linux. Local and cloud machines are available on Windows.");return;}
             if self.compose {
                 egui::ScrollArea::vertical().id_salt("compose-form").show(ui,|ui| {
@@ -450,53 +525,53 @@ impl DockerView {
                 });
                 return;
             }
+            if self.kind == Kind::Containers && self.selected.is_some() {
+                self.inspector(ui, runtime);
+                return;
+            }
+            if self.kind != Kind::Containers {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.query).hint_text(format!("Search {}…",self.kind.label().to_lowercase())).desired_width(300.0).margin(egui::Margin::symmetric(10,9)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {ui.label(RichText::new(format!("{} {}",self.rows.len(),if self.rows.len()==1{"resource"}else{"resources"})).small().color(MUTED));});
             });
             ui.add_space(16.0);
+            }
             let query=self.query.to_lowercase();
             let visible: Vec<usize>=self.rows.iter().enumerate().filter(|(_,r)|["Names","Name","Repository","Image","ID"].iter().any(|key|text(r,key).to_lowercase().contains(&query))).map(|(i,_)|i).collect();
             if visible.is_empty() {
                 ui.add_space(70.0);
                 ui.vertical_centered(|ui| {
-                    ui.heading(if self.valid {"Nothing here yet"}else{"Connect your Docker tools"});
-                    ui.label(RichText::new(if self.valid {"Create resources with Docker, or start a Compose project."}else{"Set up Smol to use it with Docker, Buildx, and Compose."}).color(MUTED));
+                    ui.heading(if !query.is_empty() && self.valid {"No matching resources"}else if self.valid && self.kind == Kind::Containers {"Run your first container"}else if self.valid {"Nothing here yet"}else{"Connect your Docker tools"});
+                    ui.label(RichText::new(if !query.is_empty() && self.valid {"Try a different name or clear your search."}else if self.valid {"Use your Docker CLI, or open Compose to start a project."}else{"Set up Smol to use it with Docker, Buildx, and Compose."}).color(MUTED));
                     ui.add_space(16.0);
                     if !self.valid && ui.add_enabled(self.pending.is_none(),design::primary("Set up Docker with Smol…")).clicked(){self.confirm=Some(Action::Configure);}
                 });
             }
-            egui::ScrollArea::vertical().id_salt("docker-inventory").show_rows(ui,72.0,visible.len(),|ui,range| {
-                for index in range {
-                    let row=self.rows[visible[index]].clone();
-                    let id=text(&row,"ID");
-                    let title=match self.kind {Kind::Containers=>text(&row,"Names"),Kind::Images=>format!("{}:{}",text(&row,"Repository"),text(&row,"Tag")),_=>text(&row,"Name")};
-                    let detail=match self.kind {Kind::Containers=>format!("{}  ·  {}",text(&row,"Image"),text(&row,"Status")),Kind::Images=>text(&row,"Size"),_=>text(&row,"Driver")};
-                    egui::Frame::new().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0,design::LINE)).corner_radius(0).inner_margin(14).show(ui,|ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let text_width=(ui.available_width()-if self.kind==Kind::Containers{240.0}else{0.0}).max(100.0);
-                            ui.allocate_ui_with_layout(egui::vec2(text_width,44.0),egui::Layout::top_down(egui::Align::LEFT),|ui| {
-                                ui.add(egui::Label::new(RichText::new(&title).strong()).truncate()).on_hover_text(&title);
-                                ui.add(egui::Label::new(RichText::new(&detail).small().color(MUTED)).truncate()).on_hover_text(&detail);
-                            });
-                            if self.kind==Kind::Containers {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
-                                    ui.add_enabled_ui(self.valid&&self.pending.is_none(),|ui| {
-                                        if ui.button("Inspect").clicked(){self.selected=Some(id.clone());self.details=None;self.stats=None;self.submit(runtime,Action::Inspect(id.clone()));}
-                                        if text(&row,"State")=="running" {
-                                            if ui.button("Stop").clicked(){self.submit(runtime,Action::Stop(id.clone()));}
-                                        } else {
-                                            ui.menu_button("More",|ui|{if ui.button(RichText::new("Remove…").color(design::RED)).clicked(){self.confirm=Some(Action::Delete(id.clone()));ui.close();}});
-                                            if ui.add(design::primary("Start")).clicked(){self.submit(runtime,Action::Start(id.clone()));}
-                                        }
-                                    });
-                                });
-                            }
-                        });
+            if self.kind != Kind::Containers {
+                ui.horizontal(|ui| {
+                    design::eyebrow(ui, "NAME");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        design::eyebrow(ui, if self.kind == Kind::Images { "SIZE" } else { "DRIVER" });
                     });
-                }
-            });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().id_salt("docker-inventory").show_rows(ui, 44.0, visible.len(), |ui, range| {
+                    for index in range {
+                        let row = &self.rows[visible[index]];
+                        let title = if self.kind == Kind::Images { format!("{}:{}",text(row,"Repository"),text(row,"Tag")) } else { text(row,"Name") };
+                        let detail = if self.kind == Kind::Images { text(row,"Size") } else { text(row,"Driver") };
+                        ui.allocate_ui(egui::vec2(ui.available_width(), 38.0), |ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(detail).small().color(MUTED));
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.add(egui::Label::new(&title).truncate()).on_hover_text(&title);
+                                });
+                            });
+                        });
+                        ui.separator();
+                    }
+                });
+            }
         });
         if let Some(action) = self.confirm.clone() {
             let mut open = true;

@@ -16,7 +16,6 @@ pub enum Icon {
     Cloud,
     Containers,
     Settings,
-    Terminal,
 }
 
 pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color32) {
@@ -74,22 +73,25 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
                 painter.circle_stroke(point(x, y), 2.5, stroke);
             }
         }
-        Icon::Terminal => {
-            painter.line_segment([point(0.1, 0.2), point(0.4, 0.5)], stroke);
-            painter.line_segment([point(0.4, 0.5), point(0.1, 0.8)], stroke);
-            painter.line_segment([point(0.55, 0.8), point(0.95, 0.8)], stroke);
-        }
     }
 }
 
 pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::Response {
     let response = ui.add_sized(
         [ui.available_width(), 38.0],
-        egui::Button::selectable(selected, ""),
+        egui::Button::selectable(selected, "")
+            .fill(if selected {
+                SELECTED
+            } else {
+                Color32::TRANSPARENT
+            })
+            .stroke(Stroke::NONE)
+            .corner_radius(6),
     );
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, label)
     });
+    row_feedback(ui, &response, selected);
     let color = if selected { ACCENT } else { MUTED };
     let rect = response.rect;
     icon(
@@ -118,6 +120,52 @@ pub fn primary(label: &str) -> egui::Button<'_> {
         .min_size(egui::vec2(0.0, 34.0))
 }
 
+/// Navigation tabs retain button focus and accessibility while using a quiet underline.
+pub fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    let response = ui.add(
+        egui::Button::selectable(
+            selected,
+            RichText::new(label).color(if selected { INK } else { MUTED }),
+        )
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
+        .min_size(egui::vec2(0.0, 34.0)),
+    );
+    if selected {
+        let r = response.rect;
+        ui.painter().line_segment(
+            [
+                egui::pos2(r.left() + 8.0, r.bottom()),
+                egui::pos2(r.right() - 8.0, r.bottom()),
+            ],
+            Stroke::new(2.0, INK),
+        );
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            4,
+            Stroke::new(1.0, INK),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response
+}
+
+fn row_feedback(ui: &egui::Ui, response: &egui::Response, selected: bool) {
+    if response.hovered() && !selected {
+        ui.painter().rect_filled(response.rect, 6, SURFACE);
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            6,
+            Stroke::new(1.0, INK),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 pub fn state_color(state: &str) -> Color32 {
     match state {
         "running" | "started" | "ready" => GREEN,
@@ -131,8 +179,8 @@ pub fn badge(ui: &mut egui::Ui, state: &str) {
     let color = state_color(state);
     egui::Frame::new()
         .fill(color.gamma_multiply(0.09))
-        .corner_radius(2)
-        .inner_margin(egui::Margin::symmetric(10, 5))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.spacing_mut().interact_size.y = 16.0;
             ui.horizontal(|ui| {
@@ -161,14 +209,18 @@ pub fn card() -> egui::Frame {
 }
 
 pub fn metric(ui: &mut egui::Ui, label: &str, value: &str, unit: &str) {
-    card().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(RichText::new(label).size(12.0).color(MUTED));
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(value).size(26.0).strong());
-            ui.label(RichText::new(unit).size(12.0).color(MUTED));
+    egui::Frame::new()
+        .fill(SURFACE)
+        .inner_margin(16)
+        .corner_radius(6)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(label).size(12.0).color(MUTED));
+            ui.horizontal(|ui| {
+                ui.label(heading(value, 22.0));
+                ui.label(RichText::new(unit).size(12.0).color(MUTED));
+            });
         });
-    });
 }
 
 pub fn memory(mib: u64) -> String {
@@ -188,9 +240,27 @@ pub fn machine_row(
     subtitle: &str,
     state: &str,
 ) -> egui::Response {
+    resource_row(ui, selected, name, subtitle, state, Icon::Machine)
+}
+
+pub fn resource_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    name: &str,
+    subtitle: &str,
+    state: &str,
+    kind: Icon,
+) -> egui::Response {
     let response = ui.add_sized(
-        [ui.available_width(), 64.0],
-        egui::Button::selectable(selected, ""),
+        [ui.available_width(), 60.0],
+        egui::Button::selectable(selected, "")
+            .fill(if selected {
+                SELECTED
+            } else {
+                Color32::TRANSPARENT
+            })
+            .stroke(Stroke::NONE)
+            .corner_radius(6),
     );
     response.widget_info(|| {
         egui::WidgetInfo::selected(
@@ -200,6 +270,7 @@ pub fn machine_row(
             format!("{name}, {state}, {subtitle}"),
         )
     });
+    row_feedback(ui, &response, selected);
     let r = response.rect;
     if selected {
         ui.painter().rect_filled(
@@ -218,7 +289,7 @@ pub fn machine_row(
     icon(
         ui.painter(),
         icon_rect.shrink(6.0),
-        Icon::Machine,
+        kind,
         if selected { ACCENT } else { MUTED },
     );
     let left = r.left() + 49.0;
@@ -226,7 +297,7 @@ pub fn machine_row(
         egui::pos2(left, r.top()),
         egui::pos2(r.right() - 22.0, r.bottom()),
     ));
-    for (text, y, size, color) in [(name, 13.0, 14.0, INK), (subtitle, 36.0, 11.5, MUTED)] {
+    for (text, y, size, color) in [(name, 11.0, 13.0, INK), (subtitle, 33.0, 11.5, MUTED)] {
         let mut job = egui::text::LayoutJob::simple_singleline(
             text.to_owned(),
             FontId::proportional(size),
@@ -247,8 +318,7 @@ pub fn machine_row(
 }
 
 pub fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(heading(title, 24.0));
-    ui.label(RichText::new(subtitle).color(MUTED));
+    ui.label(heading(title, 18.0)).on_hover_text(subtitle);
 }
 
 pub fn notice(ui: &mut egui::Ui, message: &str) {
@@ -340,9 +410,9 @@ pub fn theme(ctx: &egui::Context) {
             egui::TextStyle::Heading,
             FontId::new(23.0, egui::FontFamily::Name("studio-heading".into())),
         );
-        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-        style.spacing.button_padding = Vec2::new(12.0, 7.0);
-        style.spacing.interact_size.y = 32.0;
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+        style.spacing.button_padding = Vec2::new(11.0, 6.0);
+        style.spacing.interact_size.y = 30.0;
         style.spacing.window_margin = egui::Margin::same(20);
         style.visuals.override_text_color = Some(INK);
         style.visuals.hyperlink_color = INK;
@@ -356,13 +426,13 @@ pub fn theme(ctx: &egui::Context) {
         style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
         style.visuals.widgets.inactive.weak_bg_fill = Color32::WHITE;
         style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
-        style.visuals.widgets.inactive.corner_radius = 0.into();
+        style.visuals.widgets.inactive.corner_radius = 5.into();
         style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(243, 243, 243);
         style.visuals.widgets.hovered.bg_stroke =
             Stroke::new(1.0, Color32::from_rgb(136, 136, 136));
-        style.visuals.widgets.hovered.corner_radius = 0.into();
+        style.visuals.widgets.hovered.corner_radius = 5.into();
         style.visuals.widgets.active.weak_bg_fill = SELECTED;
-        style.visuals.widgets.active.corner_radius = 0.into();
+        style.visuals.widgets.active.corner_radius = 5.into();
         style.visuals.extreme_bg_color = SURFACE;
     });
 }
