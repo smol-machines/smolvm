@@ -804,7 +804,7 @@ impl eframe::App for Studio {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.docker.terminal_ui(&ctx);
         if let Some(terminal) = &mut self.terminal
@@ -866,7 +866,7 @@ impl eframe::App for Studio {
         self.sidebar(ui);
         match self.workspace {
             Workspace::Cloud => self.cloud.ui(ui),
-            Workspace::Containers => self.docker.ui(ui, &self.runtime),
+            Workspace::Containers => self.docker.ui(ui, &self.runtime, frame),
             Workspace::Local => {
                 egui::Panel::top("local-heading")
                     .resizable(false)

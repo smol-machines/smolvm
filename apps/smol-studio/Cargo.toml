@@ -21,6 +21,7 @@ directories = "6"
 fs2 = "0.4"
 portable-pty = "0.9"
 vt100 = "0.18"
+rfd = "0.18"
 
 [profile.release]
 lto = "thin"

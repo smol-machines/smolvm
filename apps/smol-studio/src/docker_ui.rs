@@ -19,6 +19,8 @@ pub struct DockerView {
     text: String,
     activity: String,
     compose_file: String,
+    file_picker: crate::file_picker::FilePicker,
+    file_error: Option<String>,
     projects: Vec<smol_studio::compose::Project>,
     project_selected: Option<String>,
     project_query: String,
@@ -35,6 +37,17 @@ pub struct DockerView {
     terminal: Option<crate::terminal_ui::TerminalWindow>,
 }
 impl DockerView {
+    fn select_compose_file(&mut self, path: &std::path::Path) {
+        self.compose_import = true;
+        match path.to_str().filter(|_| path.is_absolute()) {
+            Some(path) => {
+                self.compose_file = path.to_owned();
+                self.file_error = None;
+            }
+            None => self.file_error = Some("Choose a file with an absolute, UTF-8 path.".into()),
+        }
+    }
+
     pub fn new(ctx: &egui::Context) -> Self {
         let ctx = ctx.clone();
         Self {
@@ -50,6 +63,8 @@ impl DockerView {
             text: String::new(),
             activity: "Docker context: smol".into(),
             compose_file: String::new(),
+            file_picker: crate::file_picker::FilePicker::default(),
+            file_error: None,
             projects: vec![],
             project_selected: None,
             project_query: String::new(),
@@ -97,7 +112,7 @@ impl DockerView {
     }
 
     pub fn modal_open(&self) -> bool {
-        self.confirm.is_some() || self.new_resource.is_some()
+        self.confirm.is_some() || self.new_resource.is_some() || self.file_picker.is_open()
     }
     pub fn mutating(&self) -> bool {
         self.pending.as_ref().is_some_and(Action::mutates)
@@ -848,8 +863,22 @@ impl DockerView {
                 });
             });
     }
-    pub fn ui(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, runtime: &Runtime, frame: &eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if let Some(Some(file)) = self.file_picker.poll(&ctx) {
+            self.select_compose_file(file.path());
+        }
+        if self.compose && ui.is_enabled() && self.pending.is_none() {
+            let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+            if !dropped.is_empty() {
+                if dropped.len() == 1 {
+                    self.select_compose_file(dropped[0].path());
+                } else {
+                    self.file_error = Some("Drop one Compose file at a time.".into());
+                    self.compose_import = true;
+                }
+            }
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.confirm = None;
             self.new_resource = None;
@@ -891,6 +920,8 @@ impl DockerView {
                                 .clicked()
                             {
                                 self.compose_import = true;
+                                self.file_picker
+                                    .open_compose(frame, &self.compose_file, &ctx);
                             }
                         } else if matches!(self.kind, Kind::Images | Kind::Volumes)
                             && !cfg!(windows)
@@ -1051,18 +1082,28 @@ impl DockerView {
                 egui::ScrollArea::vertical().id_salt("compose-form").show(ui,|ui| {
                     ui.add_space(12.0);
                     ui.heading("Open a Compose project");
-                    ui.label(RichText::new("Existing projects appear in the list. Use a Compose file to create or update services.").color(MUTED));
+                    ui.label(RichText::new("Choose or drop a Compose file to create or update its services.").color(MUTED));
                     ui.add_space(24.0);
                     design::card().show(ui,|ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new("Compose file").strong());
-                        ui.add(egui::TextEdit::singleline(&mut self.compose_file).hint_text("/path/to/project/compose.yaml").desired_width(f32::INFINITY).margin(egui::Margin::symmetric(10,10)));
-                        ui.label(RichText::new("Use the full path to your compose.yaml or docker-compose.yml file.").small().color(MUTED));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Compose file").strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add_enabled(self.pending.is_none(), egui::Button::new("Choose file…")).clicked() {
+                                    self.file_picker.open_compose(frame, &self.compose_file, &ctx);
+                                }
+                            });
+                        });
+                        if ui.add(egui::TextEdit::singleline(&mut self.compose_file).hint_text("Choose a file or paste its full path").desired_width(f32::INFINITY).margin(egui::Margin::symmetric(10,10))).changed() {
+                            self.file_error = None;
+                        }
+                        if let Some(error) = &self.file_error { design::notice(ui, error); }
+                        ui.label(RichText::new("Services start only when you apply the file.").small().color(MUTED));
                         ui.add_space(16.0);
-                        ui.add_enabled_ui(self.pending.is_none()&&!self.compose_file.trim().is_empty(),|ui| {
+                        ui.add_enabled_ui(self.pending.is_none() && self.file_error.is_none() && !self.compose_file.trim().is_empty(),|ui| {
                             ui.horizontal_wrapped(|ui| {
-                                if ui.add(design::primary("Apply Compose file…")).clicked(){self.confirm=Some(Action::Compose{file:self.compose_file.trim().into(),up:true});}
-                                if ui.button("Stop and remove project…").clicked(){self.confirm=Some(Action::Compose{file:self.compose_file.trim().into(),up:false});}
+                                if ui.add(design::primary("Apply Compose file…")).clicked(){self.confirm=Some(Action::Compose{file:self.compose_file.clone().into(),up:true});}
+                                if ui.button("Stop and remove project…").clicked(){self.confirm=Some(Action::Compose{file:self.compose_file.clone().into(),up:false});}
                             });
                         });
                     });
