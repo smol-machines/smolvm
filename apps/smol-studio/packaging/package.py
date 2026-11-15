@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import tomllib
 import zipfile
+from runtime_bundle import seal_runtime
 
 def runtime_filter(member, destination):
     # Absolute symlinks inside the guest filesystem are interpreted relative to
@@ -102,6 +103,11 @@ with tempfile.TemporaryDirectory() as temporary:
     shutil.copy2(app / 'assets/Inter-LICENSE.txt', resources / 'licenses/Inter.txt')
     shutil.copytree(cli, resources / 'runtime', symlinks=True)
     shutil.copytree(engine, resources / 'engine', symlinks=True)
+    if system == 'darwin':
+        # Runtime templates expand into the user cache instead of adding files
+        # inside the signed application on its first machine/container launch.
+        seal_runtime(resources / 'runtime')
+        seal_runtime(resources / 'engine')
     (root / 'build.json').write_text(json.dumps({
         'studioVersion': version, 'cliArchive': cli_archive.name, 'cliSha256': cli_digest,
         'runtimeArchive': archive.name, 'runtimeSha256': actual,
