@@ -1,6 +1,6 @@
 use eframe::egui::{self, Color32, Margin, RichText, Vec2};
 use smol_studio::{
-    model::{Machine, NewMachine, Operation, PublishedPort, SharedFolder},
+    model::{Machine, Operation},
     runtime::{Payload, Runtime, Worker},
     schedule::{REFRESH_INTERVAL, RefreshSchedule},
 };
@@ -52,11 +52,12 @@ pub struct Studio {
     error: Option<String>,
     refresh_error: bool,
     activity: String,
-    create: Option<NewMachine>,
+    create: Option<crate::new_machine_ui::Editor>,
     editing: Option<crate::machine_settings_ui::Editor>,
     settings_request: Option<String>,
     delete: Option<String>,
     settings: bool,
+    settings_error: Option<String>,
     runtime_path: String,
     command: String,
     output: Option<(String, String)>,
@@ -95,6 +96,7 @@ impl Studio {
             settings_request: None,
             delete: None,
             settings: false,
+            settings_error: None,
             runtime_path,
             command: String::new(),
             output: None,
@@ -113,7 +115,13 @@ impl Studio {
                 self.pending = Some(op);
             }
             Err(e) => {
-                self.error = Some(e);
+                if matches!(op, Operation::Create(_))
+                    && let Some(editor) = &mut self.create
+                {
+                    editor.error = Some(e);
+                } else {
+                    self.error = Some(e);
+                }
             }
         }
     }
@@ -184,6 +192,7 @@ impl Studio {
                         done.elapsed.as_secs_f64()
                     );
                     if let Operation::Create(m) = done.operation {
+                        self.create = None;
                         self.selected = Some(m.name);
                         self.tab = Tab::Overview;
                         self.logs = None;
@@ -193,6 +202,12 @@ impl Studio {
                 }
                 Err(e) => {
                     let mut shown_in_editor = false;
+                    if matches!(done.operation, Operation::Create(_))
+                        && let Some(editor) = &mut self.create
+                    {
+                        editor.error = Some(e.clone());
+                        shown_in_editor = true;
+                    }
                     if let Operation::ListFiles { name, .. }
                     | Operation::TransferFile { name, .. } = &done.operation
                     {
@@ -337,7 +352,7 @@ impl Studio {
                     )
                     .clicked()
                 {
-                    self.create = Some(NewMachine::default());
+                    self.create = Some(crate::new_machine_ui::Editor::default());
                 }
                 if ui
                     .add_enabled(self.pending.is_none(), egui::Button::new("Refresh"))
@@ -369,9 +384,15 @@ impl Studio {
             })
             .map(|(i, _)| i)
             .collect();
-        if !visible
-            .iter()
-            .any(|&i| self.selected.as_ref() == Some(&self.machines[i].name))
+        let awaiting_created_machine = matches!(self.pending, Some(Operation::Refresh))
+            && self
+                .selected
+                .as_ref()
+                .is_some_and(|name| !self.machines.iter().any(|m| &m.name == name));
+        if !awaiting_created_machine
+            && !visible
+                .iter()
+                .any(|&i| self.selected.as_ref() == Some(&self.machines[i].name))
         {
             self.selected = visible.first().map(|&i| self.machines[i].name.clone());
             self.tab = Tab::Overview;
@@ -389,8 +410,7 @@ impl Studio {
                 } else if self.machines.is_empty() {
                     ui.label(RichText::new("No machines yet").color(MUTED));
                 } else {
-                    ui.heading("No matching machines");
-                    ui.label("Try another search or choose All machines.");
+                    ui.label(RichText::new("No results").size(12.0).color(MUTED));
                 }
             });
             return;
@@ -707,6 +727,7 @@ impl Studio {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape))
             && !self.files.modal_open()
             && !self.editing.as_ref().is_some_and(|e| e.picking())
+            && !self.create.as_ref().is_some_and(|e| e.picking())
             && !self.pending.as_ref().is_some_and(Operation::is_mutation)
         {
             self.editing = None;
@@ -728,151 +749,19 @@ impl Studio {
                 self.submit(action);
             }
         }
-        if let Some(mut draft) = self.create.take() {
-            let mut open = true;
-            let mut submit = false;
-            let mut cancel = false;
-            egui::Window::new("New machine")
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .default_width(430.0)
-                .max_height((ctx.content_rect().height() - 100.0).max(300.0))
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    let (validation, duplicate) = egui::ScrollArea::vertical()
-                        .id_salt("new-machine-form")
-                        .max_height((ctx.content_rect().height() - 260.0).max(180.0))
-                        .show(ui, |ui| {
-                            ui.label("Create a Linux environment. Start it when you’re ready.");
-                            ui.add_space(16.0);
-                            ui.label("Name");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut draft.name)
-                                    .hint_text("my-project")
-                                    .desired_width(f32::INFINITY),
-                            );
-                            ui.add_space(10.0);
-                            ui.label("Container image or local image path");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut draft.image)
-                                    .hint_text("Leave empty for bare Linux")
-                                    .desired_width(f32::INFINITY),
-                            );
-                            ui.add_space(12.0);
-                            ui.horizontal(|ui| {
-                                ui.label("CPUs");
-                                ui.add(egui::DragValue::new(&mut draft.cpus).range(1..=64));
-                                ui.label("Memory");
-                                ui.add(
-                                    egui::DragValue::new(&mut draft.memory_mib)
-                                        .range(256..=262_144)
-                                        .speed(128)
-                                        .suffix(" MiB"),
-                                );
-                            });
-                            ui.add_space(12.0);
-                            ui.checkbox(&mut draft.network, "Allow outbound network access");
-                            ui.collapsing("Shared folders", |ui| {
-                                let mut remove = None;
-                                for (i, folder) in draft.folders.iter_mut().enumerate() {
-                                    ui.push_id(i, |ui| {
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut folder.host)
-                                                .hint_text("Absolute host folder path")
-                                                .desired_width(f32::INFINITY),
-                                        );
-                                        ui.horizontal(|ui| {
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut folder.guest)
-                                                    .hint_text("/workspace")
-                                                    .desired_width(180.0),
-                                            );
-                                            ui.checkbox(&mut folder.read_only, "Read only");
-                                            if ui.small_button("Remove").clicked() {
-                                                remove = Some(i);
-                                            }
-                                        });
-                                    });
-                                }
-                                if let Some(i) = remove {
-                                    draft.folders.remove(i);
-                                }
-                                if ui.button("Add shared folder").clicked() {
-                                    draft.folders.push(SharedFolder {
-                                        host: String::new(),
-                                        guest: "/workspace".into(),
-                                        read_only: true,
-                                    });
-                                }
-                            });
-                            ui.collapsing("Published ports", |ui| {
-                                let mut remove = None;
-                                for (i, port) in draft.ports.iter_mut().enumerate() {
-                                    ui.push_id(i, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Host");
-                                            ui.add(
-                                                egui::DragValue::new(&mut port.host)
-                                                    .range(1..=65535),
-                                            );
-                                            ui.label("Guest");
-                                            ui.add(
-                                                egui::DragValue::new(&mut port.guest)
-                                                    .range(1..=65535),
-                                            );
-                                            if ui.small_button("Remove").clicked() {
-                                                remove = Some(i);
-                                            }
-                                        });
-                                    });
-                                }
-                                if let Some(i) = remove {
-                                    draft.ports.remove(i);
-                                }
-                                if ui.button("Add port").clicked() {
-                                    draft.ports.push(PublishedPort {
-                                        host: 8080,
-                                        guest: 8080,
-                                    });
-                                }
-                                ui.label("Published ports enable networking for this machine.");
-                            });
-                            ui.add_space(12.0);
-                            let validation = draft.validate();
-                            let duplicate = self.machines.iter().any(|m| m.name == draft.name);
-                            if duplicate {
-                                ui.colored_label(
-                                    Color32::DARK_RED,
-                                    "A machine with this name already exists.",
-                                );
-                            } else if !draft.name.is_empty()
-                                && let Err(e) = &validation
-                            {
-                                ui.colored_label(Color32::DARK_RED, e);
-                            }
-                            (validation, duplicate)
-                        })
-                        .inner;
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        submit = ui
-                            .add_enabled(
-                                validation.is_ok()
-                                    && !duplicate
-                                    && self.pending.is_none()
-                                    && self.inventory_valid,
-                                design::primary("Create machine"),
-                            )
-                            .clicked();
-                        cancel = ui.button("Cancel").clicked();
-                    });
-                });
-            if submit {
-                self.submit(Operation::Create(draft));
-            } else if open && !cancel {
-                self.create = Some(draft);
+        if let Some(mut editor) = self.create.take() {
+            let (close, action) = editor.show(
+                ctx,
+                frame,
+                &self.machines,
+                self.pending.as_ref(),
+                self.inventory_valid,
+            );
+            if !close {
+                self.create = Some(editor);
+            }
+            if let Some(action) = action {
+                self.submit(action);
             }
         }
         if let Some(name) = self.delete.clone() {
@@ -895,28 +784,136 @@ impl Studio {
         }
         if self.settings {
             let mut open = true;
-            egui::Window::new("Settings").anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).collapsible(false).resizable(false).default_width(500.0).open(&mut open).show(ctx, |ui| {
-                ui.label("Smol CLI executable");
-                ui.add(egui::TextEdit::singleline(&mut self.runtime_path).desired_width(f32::INFINITY));
-                ui.label(RichText::new("Studio uses the Smol CLI bundled with the app or installed on your computer. The selected path is saved for your next launch.").small().color(MUTED));
-                if let Some(path) = &self.runtime.state_dir {
-                    ui.label(format!("State directory: {}", path.display()));
-                }
-                ui.add_space(16.0);
-                if ui.add_enabled(self.pending.is_none() && !self.runtime_path.trim().is_empty(), egui::Button::new("Connect")).clicked() {
-                    let mut preferences = match smol_studio::preferences::Preferences::load() { Ok(p) => p, Err(e) => { self.error = Some(e); return; } };
+            let mut close = false;
+            let mut connect = false;
+            egui::Window::new("Settings")
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(510.0)
+                .max_height((ctx.content_rect().height() - 80.0).max(300.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("studio-settings")
+                        .max_height((ctx.content_rect().height() - 220.0).max(200.0))
+                        .show(ui, |ui| {
+                            ui.label(design::heading("Local runtime", 16.0));
+                            ui.label(
+                                RichText::new(
+                                    "Studio connects to your machines through the Smol CLI.",
+                                )
+                                .size(12.0)
+                                .color(MUTED),
+                            );
+                            ui.add_space(12.0);
+                            design::card().show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                design::property(
+                                    ui,
+                                    "Connection",
+                                    if self.inventory_valid {
+                                        "Connected"
+                                    } else {
+                                        "Unavailable"
+                                    },
+                                );
+                                if self.inventory_valid {
+                                    ui.separator();
+                                    design::property(
+                                        ui,
+                                        "Local machines",
+                                        &self.machines.len().to_string(),
+                                    );
+                                }
+                                ui.separator();
+                                design::property(ui, "When Studio closes", "Machines keep running");
+                            });
+                            ui.add_space(16.0);
+                            ui.label(design::heading("CLI location", 14.0));
+                            ui.label(
+                                RichText::new(
+                                    "Use the included CLI, or choose your own installation.",
+                                )
+                                .size(12.0)
+                                .color(MUTED),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.runtime_path)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("Path to smol"),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Use detected CLI").clicked() {
+                                    self.runtime_path = Runtime::discover()
+                                        .executable
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    self.settings_error = None;
+                                }
+                                if ui.button("Copy path").clicked() {
+                                    ctx.copy_text(self.runtime_path.clone());
+                                }
+                            });
+                            if let Some(path) = &self.runtime.state_dir {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new(format!("State directory: {}", path.display()))
+                                        .small()
+                                        .color(MUTED),
+                                );
+                            }
+                            if let Some(error) = &self.settings_error {
+                                ui.add_space(12.0);
+                                design::error_notice(ui, "Settings could not be saved.", error);
+                            } else if !self.inventory_valid
+                                && let Some(error) = &self.error
+                            {
+                                ui.add_space(12.0);
+                                design::error_notice(
+                                    ui,
+                                    "Could not connect to the selected CLI.",
+                                    error,
+                                );
+                            }
+                        });
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        connect = ui
+                            .add_enabled(
+                                self.pending.is_none() && !self.runtime_path.trim().is_empty(),
+                                design::primary("Save & connect"),
+                            )
+                            .clicked();
+                        close = ui.button("Done").clicked();
+                    });
+                });
+            if connect {
+                let result = (|| -> Result<(), String> {
+                    let mut preferences = smol_studio::preferences::Preferences::load()?;
                     preferences.smol_cli = Some(self.runtime_path.trim().into());
-                    if let Err(e) = preferences.save() { self.error = Some(e); return; }
-                    self.runtime.executable = self.runtime_path.trim().into();
-                    self.inventory_valid = false;
-                    self.machines.clear(); self.selected = None; self.logs = None; self.error = None;
-                    self.activity = "Connecting to Smol…".into();
-                    self.settings = false;
-                    self.submit(Operation::Refresh);
+                    preferences.save()
+                })();
+                match result {
+                    Ok(()) => {
+                        self.runtime.executable = self.runtime_path.trim().into();
+                        self.inventory_valid = false;
+                        self.machines.clear();
+                        self.selected = None;
+                        self.logs = None;
+                        self.error = None;
+                        self.activity = "Connecting to Smol…".into();
+                        self.settings = false;
+                        self.settings_error = None;
+                        self.submit(Operation::Refresh);
+                    }
+                    Err(error) => self.settings_error = Some(error),
                 }
-            });
-            if !open {
+            }
+            if !open || close {
                 self.settings = false;
+                self.settings_error = None;
             }
         }
     }
@@ -1091,7 +1088,7 @@ impl eframe::App for Studio {
                                     )
                                     .clicked()
                                 {
-                                    self.create = Some(NewMachine::default());
+                                    self.create = Some(crate::new_machine_ui::Editor::default());
                                 }
                             });
                         }
