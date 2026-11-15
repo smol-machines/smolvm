@@ -133,6 +133,16 @@ impl NewMachine {
 pub enum Operation {
     Refresh,
     ReadSettings(String),
+    ListFiles {
+        name: String,
+        path: String,
+    },
+    TransferFile {
+        name: String,
+        guest: String,
+        local: std::path::PathBuf,
+        upload: bool,
+    },
     UpdateSettings {
         original: Box<crate::machine_settings::Settings>,
         updated: Box<crate::machine_settings::Settings>,
@@ -155,13 +165,24 @@ impl Operation {
     pub fn is_mutation(&self) -> bool {
         !matches!(
             self,
-            Self::Refresh | Self::ReadSettings(_) | Self::Logs(_) | Self::Stats(_)
+            Self::Refresh
+                | Self::ReadSettings(_)
+                | Self::ListFiles { .. }
+                | Self::Logs(_)
+                | Self::Stats(_)
         )
     }
 
     pub fn label(&self) -> String {
         match self {
             Self::Refresh => "Refreshing machines".into(),
+            Self::ListFiles { name, .. } => format!("Reading files in {name}"),
+            Self::TransferFile { upload, .. } => if *upload {
+                "Uploading file"
+            } else {
+                "Downloading file"
+            }
+            .into(),
             Self::ReadSettings(name) => format!("Reading settings for {name}"),
             Self::UpdateSettings { original, .. } => format!("Updating {}", original.name),
             Self::Logs(n) => format!("Reading logs for {n}"),

@@ -20,6 +20,7 @@ pub enum Icon {
     Image,
     Volume,
     Project,
+    File,
     Network,
 }
 
@@ -28,6 +29,20 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
     let stroke = Stroke::new(1.5, color);
     let point = |x: f32, y: f32| r.min + egui::vec2(x * r.width(), y * r.height());
     match kind {
+        Icon::File => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    point(0.15, 0.0),
+                    point(0.62, 0.0),
+                    point(0.88, 0.26),
+                    point(0.88, 1.0),
+                    point(0.15, 1.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment([point(0.62, 0.0), point(0.62, 0.26)], stroke);
+            painter.line_segment([point(0.62, 0.26), point(0.88, 0.26)], stroke);
+        }
         Icon::Project => {
             painter.add(egui::Shape::closed_line(
                 vec![

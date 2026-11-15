@@ -4,6 +4,7 @@ mod cloud_ui;
 mod design;
 mod docker_ui;
 mod file_picker;
+mod files_ui;
 mod machine_settings_ui;
 mod terminal_ui;
 mod ui;

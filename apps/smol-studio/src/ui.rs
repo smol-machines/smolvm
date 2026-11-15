@@ -18,6 +18,7 @@ enum Filter {
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Overview,
+    Files,
     Logs,
     Console,
 }
@@ -43,6 +44,7 @@ pub struct Studio {
     query: String,
     tab: Tab,
     logs: Option<(String, String)>,
+    files: crate::files_ui::FilesView,
     pending: Option<Operation>,
     schedule: RefreshSchedule,
     last_refresh: Option<Instant>,
@@ -80,6 +82,7 @@ impl Studio {
             query: String::new(),
             tab: Tab::Overview,
             logs: None,
+            files: crate::files_ui::FilesView::default(),
             pending: None,
             schedule: RefreshSchedule::default(),
             last_refresh: None,
@@ -123,6 +126,9 @@ impl Studio {
                 self.schedule.completed(Instant::now());
             }
             match done.result {
+                Ok(Payload::Files { name, listing }) => {
+                    self.files.receive(&name, listing);
+                }
                 Ok(Payload::Settings(settings)) => {
                     if self.settings_request.as_ref() == Some(&settings.name)
                         && self.selected.as_ref() == Some(&settings.name)
@@ -159,6 +165,15 @@ impl Studio {
                     self.output = Some((name, text));
                 }
                 Ok(Payload::Completed) => {
+                    if let Operation::TransferFile {
+                        name,
+                        local,
+                        upload,
+                        ..
+                    } = &done.operation
+                    {
+                        self.files.transferred(name, *upload, local);
+                    }
                     if matches!(done.operation, Operation::UpdateSettings { .. }) {
                         self.editing = None;
                     }
@@ -178,6 +193,12 @@ impl Studio {
                 }
                 Err(e) => {
                     let mut shown_in_editor = false;
+                    if let Operation::ListFiles { name, .. }
+                    | Operation::TransferFile { name, .. } = &done.operation
+                    {
+                        self.files.failed(name, e.clone());
+                        shown_in_editor = true;
+                    }
                     if matches!(
                         done.operation,
                         Operation::UpdateSettings { .. } | Operation::ReadSettings(_)
@@ -363,7 +384,7 @@ impl Studio {
             });
     }
 
-    fn details(&mut self, ui: &mut egui::Ui) {
+    fn details(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let Some(m) = self
             .machines
             .iter()
@@ -439,6 +460,7 @@ impl Studio {
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (Tab::Overview, "Overview"),
+                (Tab::Files, "Files"),
                 (Tab::Logs, "Logs"),
                 (Tab::Console, "Console"),
             ] {
@@ -453,6 +475,11 @@ impl Studio {
         ui.separator();
         ui.add_space(16.0);
         match self.tab {
+            Tab::Files => {
+                if let Some(action) = self.files.show(ui, frame, &m, enabled) {
+                    self.submit(action);
+                }
+            }
             Tab::Console => {
                 ui.label("Run a shell command (60 second limit)");
                 ui.add(
@@ -606,7 +633,11 @@ impl Studio {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if let Some(action) = self.files.dialog(ctx, self.pending.is_some()) {
+            self.submit(action);
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && !self.files.modal_open()
             && !self.editing.as_ref().is_some_and(|e| e.picking())
             && !self.pending.as_ref().is_some_and(Operation::is_mutation)
         {
@@ -845,6 +876,7 @@ impl eframe::App for Studio {
             Instant::now(),
             active && (self.workspace == Workspace::Local),
             self.pending.is_some()
+                || self.files.modal_open()
                 || self.settings
                 || self.create.is_some()
                 || self.editing.is_some()
@@ -865,7 +897,8 @@ impl eframe::App for Studio {
         {
             self.terminal = None;
         }
-        if self.create.is_some()
+        if self.files.modal_open()
+            || self.create.is_some()
             || self.editing.is_some()
             || self.delete.is_some()
             || self.settings
@@ -973,7 +1006,7 @@ impl eframe::App for Studio {
                         if self.selected.is_some() {
                             egui::ScrollArea::vertical()
                                 .id_salt("machine-detail")
-                                .show(ui, |ui| self.details(ui));
+                                .show(ui, |ui| self.details(ui, frame));
                         } else {
                             ui.add_space(100.0);
                             ui.vertical_centered(|ui| {

@@ -20,6 +20,39 @@ impl FilePicker {
         self.pending.is_some()
     }
 
+    pub fn open_file(
+        &mut self,
+        frame: &eframe::Frame,
+        save_name: Option<&str>,
+        ctx: &egui::Context,
+    ) {
+        if self.is_open() {
+            return;
+        }
+        let dialog = rfd::AsyncFileDialog::new().set_parent(frame);
+        self.pending = Some(match save_name {
+            Some(name) => {
+                let name = name.to_owned();
+                Box::pin(async move {
+                    dialog
+                        .set_title("Save file from machine")
+                        .set_file_name(name)
+                        .save_file()
+                        .await
+                        .map(|f| vec![f])
+                }) as Pin<Box<dyn Future<Output = Selection>>>
+            }
+            None => Box::pin(async move {
+                dialog
+                    .set_title("Upload a file")
+                    .pick_file()
+                    .await
+                    .map(|f| vec![f])
+            }),
+        });
+        ctx.request_repaint();
+    }
+
     pub fn open_folder(&mut self, frame: &eframe::Frame, current: &str, ctx: &egui::Context) {
         if self.is_open() {
             return;

@@ -38,11 +38,49 @@ impl Runtime {
         let mut args: Vec<OsString> = Vec::new();
         // The SDK documents this engine entry point for introspection that
         // the public machine noun does not expose without starting a guest.
-        if matches!(op, Operation::Logs(_) | Operation::Stats(_)) {
+        if matches!(
+            op,
+            Operation::Logs(_)
+                | Operation::Stats(_)
+                | Operation::ListFiles { .. }
+                | Operation::TransferFile { .. }
+        ) {
             args.push("_engine".into());
         }
         args.push("machine".into());
         match op {
+            Operation::ListFiles { name, path } => {
+                crate::files::validate_path(path)?;
+                args.extend([
+                    "files".into(),
+                    "--name".into(),
+                    name.into(),
+                    "list".into(),
+                    path.into(),
+                    "--json".into(),
+                ]);
+            }
+            Operation::TransferFile {
+                name,
+                guest,
+                local,
+                upload,
+            } => {
+                crate::files::validate_path(guest)?;
+                if !local.is_absolute() {
+                    return Err("Choose an absolute local file path.".into());
+                }
+                args.extend(["files".into(), "--name".into(), name.into()]);
+                if *upload {
+                    args.extend(["upload".into(), local.as_os_str().to_owned(), guest.into()]);
+                } else {
+                    args.extend([
+                        "download".into(),
+                        guest.into(),
+                        local.as_os_str().to_owned(),
+                    ]);
+                }
+            }
             Operation::ReadSettings(name) => args.extend([
                 "status".into(),
                 "--local".into(),
@@ -208,7 +246,9 @@ impl Runtime {
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let limit = match op {
-            Operation::Refresh | Operation::ReadSettings(_) => INVENTORY_LIMIT,
+            Operation::Refresh | Operation::ReadSettings(_) | Operation::ListFiles { .. } => {
+                INVENTORY_LIMIT
+            }
             Operation::Logs(_) | Operation::Exec { .. } => LOG_LIMIT,
             _ => ERROR_LIMIT,
         };
@@ -235,6 +275,12 @@ impl Runtime {
         let output = capture(&mut command, timeout, limit, shutdown)?;
         match op {
             Operation::Refresh => parse_machines(&output).map(Payload::Machines),
+            Operation::ListFiles { name, path } => {
+                crate::files::Listing::parse(&output, path).map(|listing| Payload::Files {
+                    name: name.clone(),
+                    listing,
+                })
+            }
             Operation::ReadSettings(name) => {
                 crate::machine_settings::Settings::parse(&output, name)
                     .map(|settings| Payload::Settings(Box::new(settings)))
@@ -421,9 +467,19 @@ pub(crate) fn runtime_error(bytes: &[u8], code: Option<i32>) -> String {
 #[derive(Debug)]
 pub enum Payload {
     Machines(Vec<Machine>),
+    Files {
+        name: String,
+        listing: crate::files::Listing,
+    },
     Settings(Box<crate::machine_settings::Settings>),
-    Logs { name: String, text: String },
-    Output { name: String, text: String },
+    Logs {
+        name: String,
+        text: String,
+    },
+    Output {
+        name: String,
+        text: String,
+    },
     Completed,
 }
 
@@ -730,6 +786,144 @@ mod tests {
             panic!("expected inventory")
         };
         assert!(machines.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires updated public Smol CLI, working hypervisor and registry access"]
+    fn live_files_browse_transfer_and_preserve_failed_download() {
+        let executable = std::env::var_os("SMOL_STUDIO_FILES_CLI").expect("SMOL_STUDIO_FILES_CLI");
+        #[cfg(target_os = "macos")]
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Runtime {
+            executable: executable.into(),
+            state_dir: Some(temp.path().join("state")),
+        };
+        let stop = AtomicBool::new(false);
+        struct Cleanup(Runtime, String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let stop = AtomicBool::new(false);
+                let _ = self.0.execute(&Operation::Stop(self.1.clone()), &stop);
+                let _ = self.0.execute(&Operation::Delete(self.1.clone()), &stop);
+            }
+        }
+        for (name, image) in [("files-bare", ""), ("files-image", "alpine:3.21")] {
+            runtime
+                .execute(
+                    &Operation::Create(NewMachine {
+                        name: name.into(),
+                        image: image.into(),
+                        network: !image.is_empty(),
+                        cpus: 1,
+                        memory_mib: 512,
+                        ..Default::default()
+                    }),
+                    &stop,
+                )
+                .unwrap();
+            let cleanup = Cleanup(runtime.clone(), name.into());
+            let list = |path: &str| Operation::ListFiles {
+                name: name.into(),
+                path: path.into(),
+            };
+            assert!(runtime.execute(&list("/workspace"), &stop).is_err());
+            let Payload::Machines(rows) = runtime.execute(&Operation::Refresh, &stop).unwrap()
+            else {
+                panic!("inventory")
+            };
+            assert_eq!(rows[0].state, "created");
+            runtime
+                .execute(&Operation::Start(name.into()), &stop)
+                .unwrap();
+            let Payload::Output { text, .. } = runtime.execute(&Operation::Exec { name: name.into(), command: "mkdir -p /workspace/folder; printf hidden > /workspace/.hidden; printf workload > /root/studio-file-probe; ln -s /missing /workspace/dangling; printf prepared".into() }, &stop).unwrap() else { panic!("output") };
+            assert!(text.contains("prepared"), "{text}");
+            let source = temp.path().join("payload ; $(true).bin");
+            let payload: Vec<u8> = (0..18 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+            std::fs::write(&source, &payload).unwrap();
+            let guest = "/workspace/payload ; $(true).bin";
+            let transfer = |guest: &str, local: &std::path::Path, upload| Operation::TransferFile {
+                name: name.into(),
+                guest: guest.into(),
+                local: local.into(),
+                upload,
+            };
+            runtime
+                .execute(&transfer(guest, &source, true), &stop)
+                .unwrap();
+            let Payload::Files { listing, .. } =
+                runtime.execute(&list("/workspace"), &stop).unwrap()
+            else {
+                panic!("listing")
+            };
+            assert!(
+                listing
+                    .entries
+                    .iter()
+                    .any(|e| e.name == "payload ; $(true).bin"
+                        && e.kind == "file"
+                        && e.size == payload.len() as u64)
+            );
+            assert!(listing.entries.iter().any(|e| e.name == ".hidden"));
+            assert!(
+                listing
+                    .entries
+                    .iter()
+                    .any(|e| e.name == "dangling" && e.kind == "symlink")
+            );
+            assert!(
+                listing
+                    .entries
+                    .iter()
+                    .any(|e| e.name == "folder" && e.kind == "dir")
+            );
+            let Payload::Files { listing, .. } = runtime.execute(&list("/root"), &stop).unwrap()
+            else {
+                panic!("root listing")
+            };
+            assert!(
+                listing
+                    .entries
+                    .iter()
+                    .any(|e| e.name == "studio-file-probe")
+            );
+            let download = temp.path().join("download.bin");
+            std::fs::write(&download, b"existing data").unwrap();
+            assert!(
+                runtime
+                    .execute(&transfer("/workspace/missing", &download, false), &stop)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&download).unwrap(), b"existing data");
+            runtime
+                .execute(&transfer(guest, &download, false), &stop)
+                .unwrap();
+            assert_eq!(std::fs::read(&download).unwrap(), payload);
+            assert!(
+                runtime
+                    .execute(
+                        &transfer("/workspace/no-directory-upload", temp.path(), true),
+                        &stop
+                    )
+                    .is_err()
+            );
+            assert!(!std::fs::read_dir(temp.path()).unwrap().any(|e| {
+                e.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".smol-download-")
+            }));
+            runtime
+                .execute(&Operation::Stop(name.into()), &stop)
+                .unwrap();
+            assert!(runtime.execute(&list("/workspace"), &stop).is_err());
+            drop(cleanup);
+        }
+        let Payload::Machines(rows) = runtime.execute(&Operation::Refresh, &stop).unwrap() else {
+            panic!("inventory")
+        };
+        assert!(rows.is_empty());
     }
 
     #[test]
