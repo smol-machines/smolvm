@@ -11,7 +11,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,6 +32,12 @@ impl Kind {
     }
 }
 #[derive(Clone, Debug)]
+pub enum ProjectAction {
+    Start,
+    Stop,
+    Logs,
+}
+#[derive(Clone, Debug)]
 pub enum Action {
     Status,
     Configure,
@@ -42,18 +48,30 @@ pub enum Action {
     Logs(String),
     Inspect(String),
     Stats(String),
+    Projects,
+    Project { name: String, action: ProjectAction },
     Compose { file: PathBuf, up: bool },
 }
 impl Action {
     pub fn mutates(&self) -> bool {
         !matches!(
             self,
-            Self::Status | Self::List(_) | Self::Logs(_) | Self::Inspect(_) | Self::Stats(_)
+            Self::Status
+                | Self::List(_)
+                | Self::Logs(_)
+                | Self::Inspect(_)
+                | Self::Stats(_)
+                | Self::Projects
+                | Self::Project {
+                    action: ProjectAction::Logs,
+                    ..
+                }
         )
     }
 }
 pub enum Output {
     Rows(Kind, Vec<Value>),
+    Projects(Vec<crate::compose::Project>),
     Text(String),
     Details(Box<crate::container_details::ContainerDetails>),
     Stats { id: String, value: Value },
@@ -73,6 +91,19 @@ pub fn validate_container_id(id: &str) -> Result<(), String> {
 fn docker_args(action: &Action) -> Result<Vec<String>, String> {
     let mut args = vec!["--context".into(), "smol".into()];
     match action {
+        Action::Projects => args.extend(
+            [
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                "label=com.docker.compose.project",
+                "--format",
+                crate::compose::LIST_FORMAT,
+            ]
+            .map(str::to_owned),
+        ),
         Action::List(kind) => {
             let prefix = match kind {
                 Kind::Containers => vec!["container", "ls", "--all", "--no-trunc"],
@@ -129,6 +160,9 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
     Ok(args)
 }
 fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<Output, String> {
+    if let Action::Project { name, action } = action {
+        return project_action(runtime, name, action, shutdown);
+    }
     let mut command;
     if matches!(action, Action::Status | Action::Configure) {
         command = Command::new(crate::runtime::find_tool(if cfg!(windows) {
@@ -190,6 +224,7 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
         shutdown,
     )?;
     match action {
+        Action::Projects => Ok(Output::Projects(crate::compose::parse(&bytes)?)),
         Action::List(kind) => {
             let rows = bytes
                 .split(|b| *b == b'\n')
@@ -223,6 +258,133 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
         }
         _ => Ok(Output::Completed),
     }
+}
+
+fn project_action(
+    runtime: &Runtime,
+    name: &str,
+    action: &ProjectAction,
+    shutdown: &AtomicBool,
+) -> Result<Output, String> {
+    // Resolve exact project membership again when the action executes, rather
+    // than trusting a stale UI selection or Docker's substring name filters.
+    let Output::Projects(projects) = execute(runtime, &Action::Projects, shutdown)? else {
+        unreachable!();
+    };
+    let project = projects
+        .into_iter()
+        .find(|p| p.name == name)
+        .ok_or("This Compose project no longer has containers. Refresh the project list.")?;
+    let deadline = Instant::now()
+        + Duration::from_secs(if matches!(action, ProjectAction::Logs) {
+            20
+        } else {
+            600
+        });
+    if matches!(action, ProjectAction::Logs) {
+        let mut text = String::new();
+        for container in &project.containers {
+            if text.len() >= 192 * 1024 || Instant::now() >= deadline {
+                text.push_str(
+                    "\nMore project logs are available from the individual containers.\n",
+                );
+                break;
+            }
+            text.push_str(&format!(
+                "\n── {} / {} ──\n",
+                container.service, container.name
+            ));
+            let mut command = docker_command();
+            command.args(docker_args(&Action::Logs(container.id.clone()))?);
+            match crate::runtime::capture_process(
+                &mut command,
+                deadline.saturating_duration_since(Instant::now()),
+                32 * 1024,
+                shutdown,
+            ) {
+                Ok(output) => {
+                    text.push_str(&String::from_utf8_lossy(&output.stdout));
+                    text.push_str(&String::from_utf8_lossy(&output.stderr));
+                    if !output.success {
+                        text.push_str("\nCould not load all logs for this container.\n");
+                    }
+                }
+                Err(error) => {
+                    text.push_str(&error);
+                    text.push('\n');
+                }
+            }
+            if shutdown.load(Ordering::Relaxed) {
+                return Err("Project logs cancelled.".into());
+            }
+            if text.len() > 256 * 1024 {
+                let mut end = 256 * 1024 - 100;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push_str(
+                    "\nProject output truncated. Open individual containers for more logs.\n",
+                );
+                break;
+            }
+        }
+        return Ok(Output::Text(text));
+    }
+    let ids: Vec<_> = project
+        .containers
+        .iter()
+        .filter(|c| match action {
+            ProjectAction::Start => c.can_start(),
+            ProjectAction::Stop => c.can_stop(),
+            ProjectAction::Logs => false,
+        })
+        .map(|c| c.id.as_str())
+        .collect();
+    // Bound command-line size; Docker accepts multiple explicit container IDs.
+    for batch in ids.chunks(128) {
+        let mut command = docker_command();
+        command.args([
+            "--context",
+            "smol",
+            "container",
+            if matches!(action, ProjectAction::Start) {
+                "start"
+            } else {
+                "stop"
+            },
+        ]);
+        command.args(batch);
+        capture(
+            &mut command,
+            deadline.saturating_duration_since(Instant::now()),
+            64 * 1024,
+            shutdown,
+        )
+        .map_err(|e| {
+            format!("Project operation did not finish; some containers may have changed. {e}")
+        })?;
+    }
+    Ok(Output::Completed)
+}
+
+fn docker_command() -> Command {
+    let mut command = Command::new(crate::runtime::find_tool(if cfg!(windows) {
+        "docker.exe"
+    } else {
+        "docker"
+    }));
+    command
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
 }
 pub struct DockerWorker {
     sender: Option<mpsc::SyncSender<(Runtime, Action)>>,
@@ -284,12 +446,104 @@ mod tests {
             Action::List(Kind::Containers),
             Action::Inspect("ab12".into()),
             Action::Stats("ab12".into()),
+            Action::Projects,
         ] {
             let args = docker_args(&action).unwrap();
             assert_eq!(&args[..2], ["--context", "smol"]);
             assert!(!args.iter().any(|a| a == "--force" || a == "-f"));
         }
         assert!(docker_args(&Action::Delete("--force".into())).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires two explicitly owned Compose projects in an isolated smol context"]
+    fn live_compose_project_isolation() {
+        let runtime = Runtime {
+            executable: std::env::var_os("SMOL_STUDIO_TEST_RUNTIME")
+                .expect("runtime")
+                .into(),
+            state_dir: None,
+        };
+        let name = std::env::var("SMOL_STUDIO_TEST_PROJECT").expect("owned project");
+        let other = std::env::var("SMOL_STUDIO_TEST_OTHER_PROJECT").expect("other owned project");
+        assert_ne!(name, other);
+        let shutdown = AtomicBool::new(false);
+        let inventory = || match execute(&runtime, &Action::Projects, &shutdown).unwrap() {
+            Output::Projects(projects) => projects,
+            _ => panic!("Expected Compose projects"),
+        };
+        let initial = inventory();
+        let project = initial.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(project.services()["web"].len(), 3); // two replicas and a completed one-off job
+        assert!(
+            project
+                .containers
+                .iter()
+                .any(|c| c.is_job() && c.state == "exited")
+        );
+        let other_running = initial.iter().find(|p| p.name == other).unwrap().running();
+        assert!(other_running > 0);
+        let action = |action| Action::Project {
+            name: name.clone(),
+            action,
+        };
+        execute(&runtime, &action(ProjectAction::Stop), &shutdown).unwrap();
+        let stopped = inventory();
+        assert_eq!(
+            stopped.iter().find(|p| p.name == name).unwrap().running(),
+            0
+        );
+        assert_eq!(
+            stopped.iter().find(|p| p.name == other).unwrap().running(),
+            other_running
+        );
+        execute(&runtime, &action(ProjectAction::Start), &shutdown).unwrap();
+        let started = inventory();
+        let project = started.iter().find(|p| p.name == name).unwrap();
+        assert!(
+            project
+                .containers
+                .iter()
+                .filter(|c| !c.is_job())
+                .all(|c| c.state == "running")
+        );
+        assert!(
+            project
+                .containers
+                .iter()
+                .filter(|c| c.is_job())
+                .all(|c| c.state == "exited")
+        );
+        assert_eq!(
+            started.iter().find(|p| p.name == other).unwrap().running(),
+            other_running
+        );
+        let Output::Text(logs) =
+            execute(&runtime, &action(ProjectAction::Logs), &shutdown).unwrap()
+        else {
+            panic!("Expected project logs");
+        };
+        assert!(logs.contains("studio-web-ready"), "{logs}");
+        assert!(logs.contains("migration-done"), "{logs}");
+        assert!(
+            execute(
+                &runtime,
+                &Action::Project {
+                    name: format!("{name}-missing"),
+                    action: ProjectAction::Stop
+                },
+                &shutdown
+            )
+            .is_err()
+        );
+        assert_eq!(
+            inventory()
+                .iter()
+                .find(|p| p.name == other)
+                .unwrap()
+                .running(),
+            other_running
+        );
     }
     #[test]
     fn compose_paths_preserve_spaces_and_do_not_remove_volumes() {

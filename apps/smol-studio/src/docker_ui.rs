@@ -2,7 +2,7 @@ use crate::design::{self, MUTED};
 use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 use smol_studio::{
-    docker::{Action, DockerWorker, Kind, Output},
+    docker::{Action, DockerWorker, Kind, Output, ProjectAction},
     runtime::Runtime,
 };
 
@@ -13,7 +13,13 @@ pub struct DockerView {
     pending: Option<Action>,
     error: Option<String>,
     text: String,
+    activity: String,
     compose_file: String,
+    projects: Vec<smol_studio::compose::Project>,
+    project_selected: Option<String>,
+    project_query: String,
+    projects_valid: bool,
+    compose_import: bool,
     confirm: Option<Action>,
     valid: bool,
     query: String,
@@ -34,7 +40,13 @@ impl DockerView {
             pending: None,
             error: None,
             text: String::new(),
+            activity: "Docker context: smol".into(),
             compose_file: String::new(),
+            projects: vec![],
+            project_selected: None,
+            project_query: String::new(),
+            projects_valid: false,
+            compose_import: false,
             confirm: None,
             valid: false,
             query: String::new(),
@@ -52,6 +64,34 @@ impl DockerView {
     pub fn mutating(&self) -> bool {
         self.pending.as_ref().is_some_and(Action::mutates)
     }
+    pub fn status(&self) -> &str {
+        match &self.pending {
+            Some(Action::Projects | Action::List(_)) => "Refreshing Docker resources…",
+            Some(
+                Action::Project {
+                    action: ProjectAction::Start,
+                    ..
+                }
+                | Action::Start(_),
+            ) => "Starting containers…",
+            Some(
+                Action::Project {
+                    action: ProjectAction::Stop,
+                    ..
+                }
+                | Action::Stop(_),
+            ) => "Stopping containers…",
+            Some(
+                Action::Project {
+                    action: ProjectAction::Logs,
+                    ..
+                }
+                | Action::Logs(_),
+            ) => "Loading logs…",
+            Some(_) => "Working…",
+            None => &self.activity,
+        }
+    }
     fn submit(&mut self, runtime: &Runtime, action: Action) {
         if self.pending.is_some() {
             return;
@@ -59,15 +99,36 @@ impl DockerView {
         match self.worker.submit(runtime.clone(), action.clone()) {
             Ok(()) => {
                 self.pending = Some(action);
-                self.error = None;
+                if self.error.take().is_some() {
+                    self.activity = "Docker context: smol".into();
+                }
             }
             Err(e) => self.error = Some(e),
         }
+    }
+    fn refresh(&mut self, runtime: &Runtime) {
+        self.submit(
+            runtime,
+            if self.compose {
+                Action::Projects
+            } else {
+                Action::List(self.kind)
+            },
+        );
     }
     pub fn logic(&mut self, runtime: &Runtime) {
         while let Ok(done) = self.worker.events.try_recv() {
             self.pending = None;
             match done.result {
+                Ok(Output::Projects(projects)) => {
+                    self.projects = projects;
+                    self.projects_valid = true;
+                    self.project_selected = self
+                        .project_selected
+                        .take()
+                        .filter(|name| self.projects.iter().any(|p| &p.name == name))
+                        .or_else(|| self.projects.first().map(|p| p.name.clone()));
+                }
                 Ok(Output::Rows(kind, rows)) => {
                     if self.kind == kind {
                         self.rows = rows;
@@ -105,16 +166,43 @@ impl DockerView {
                 }
                 Ok(Output::Text(text)) => self.text = text,
                 Ok(Output::Completed) => {
+                    self.activity = match done.action {
+                        Action::Compose { up: true, .. } => "Compose file applied.",
+                        Action::Compose { up: false, .. } => {
+                            "Compose project removed; named volumes retained."
+                        }
+                        Action::Project {
+                            action: ProjectAction::Start,
+                            ..
+                        }
+                        | Action::Start(_) => "Containers started.",
+                        Action::Project {
+                            action: ProjectAction::Stop,
+                            ..
+                        }
+                        | Action::Stop(_) => "Containers stopped.",
+                        Action::Delete(_) => "Container removed.",
+                        Action::Configure => "Docker connected to Smol.",
+                        _ => "Operation completed.",
+                    }
+                    .into();
                     self.details = None;
                     self.stats = None;
                     self.text.clear();
-                    self.submit(runtime, Action::List(self.kind));
+                    self.refresh(runtime);
                 }
                 Err(e) => {
-                    self.error = Some(e);
+                    self.activity = "Docker request failed; see details above.".into();
+                    if matches!(done.action, Action::Projects) || done.action.mutates() {
+                        self.projects_valid = false;
+                    }
                     if matches!(done.action, Action::List(_)) || done.action.mutates() {
                         self.valid = false;
                     }
+                    if done.action.mutates() {
+                        self.refresh(runtime);
+                    }
+                    self.error = Some(e);
                 }
             }
         }
@@ -125,6 +213,143 @@ impl DockerView {
         {
             self.terminal = None;
         }
+    }
+    fn project_list(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("compose-project-list")
+            .resizable(true)
+            .default_size(280.0)
+            .min_size(224.0)
+            .max_size(380.0)
+            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.project_query)
+                        .hint_text("Search projects…")
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(10, 9)),
+                );
+                if ui
+                    .add_enabled(
+                        self.pending.is_none(),
+                        egui::Button::new("+  Open Compose file…"),
+                    )
+                    .clicked()
+                {
+                    self.compose_import = true;
+                }
+                ui.add_space(12.0);
+                design::eyebrow(ui, &format!("PROJECTS  /  {}", self.projects.len()));
+                ui.add_space(8.0);
+                let query = self.project_query.to_lowercase();
+                let visible: Vec<_> = self
+                    .projects
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.name.to_lowercase().contains(&query))
+                    .map(|(i, _)| i)
+                    .collect();
+                if visible.is_empty() {
+                    ui.label(
+                        RichText::new(if !self.projects_valid {
+                            "Refresh to discover projects."
+                        } else if self.projects.is_empty() {
+                            "No Compose projects yet"
+                        } else {
+                            "No matching projects"
+                        })
+                        .small()
+                        .color(MUTED),
+                    );
+                }
+                if self.pending.is_some() {
+                    ui.disable();
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("compose-projects-scroll")
+                    .show_rows(ui, 60.0, visible.len(), |ui, range| {
+                        for &index in &visible[range] {
+                            let project = &self.projects[index];
+                            let subtitle = format!(
+                                "{} · {} running",
+                                count(project.services().len(), "service"),
+                                project.running()
+                            );
+                            if design::resource_row(
+                                ui,
+                                !self.compose_import
+                                    && self.project_selected.as_ref() == Some(&project.name),
+                                &project.name,
+                                &subtitle,
+                                project.state(),
+                                design::Icon::Containers,
+                            )
+                            .clicked()
+                            {
+                                self.project_selected = Some(project.name.clone());
+                                self.compose_import = false;
+                                self.text.clear();
+                            }
+                        }
+                    });
+            });
+    }
+    fn project_details(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|p| Some(&p.name) == self.project_selected.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        let enabled = self.projects_valid && self.pending.is_none();
+        egui::ScrollArea::vertical().id_salt("compose-project-detail").auto_shrink([false, false]).show(ui, |ui| {
+            ui.add(egui::Label::new(design::heading(&project.name, 22.0)).truncate()).on_hover_text(&project.name);
+            ui.label(RichText::new(format!("{} · {} · {} running", count(project.services().len(), "service"), count(project.containers.len(), "container"), project.running())).small().color(MUTED));
+            ui.add_space(12.0);
+            design::badge(ui, project.state());
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(enabled && project.containers.iter().any(|c| c.can_start()), design::primary("Start containers"))
+                    .on_hover_text("Starts existing stopped service containers. Apply your Compose file for dependency ordering, hooks, or configuration changes.").clicked() {
+                    self.submit(runtime, Action::Project { name: project.name.clone(), action: ProjectAction::Start });
+                }
+                if ui.add_enabled(enabled && project.containers.iter().any(|c| c.can_stop()), egui::Button::new("Stop containers")).clicked() {
+                    self.submit(runtime, Action::Project { name: project.name.clone(), action: ProjectAction::Stop });
+                }
+                if ui.add_enabled(enabled, egui::Button::new("Project logs")).clicked() {
+                    self.submit(runtime, Action::Project { name: project.name.clone(), action: ProjectAction::Logs });
+                }
+            });
+            ui.add_space(12.0);
+            ui.separator();
+            for (service, containers) in project.services() {
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.label(design::heading(service, 14.0));
+                    ui.label(RichText::new(count(containers.len(), "container")).small().color(MUTED));
+                });
+                for container in containers {
+                    let subtitle = if container.is_job() { format!("{} · one-off job", container.image) } else { container.image.clone() };
+                    ui.add_enabled_ui(enabled, |ui| {
+                        if design::resource_row(ui, false, &container.name, &subtitle, &container.state, design::Icon::Containers).clicked() {
+                            self.compose = false;
+                            self.kind = Kind::Containers;
+                            self.query.clear();
+                            self.selected = Some(container.id.clone());
+                            self.details = None;
+                            self.stats = None;
+                            self.text.clear();
+                            self.submit(runtime, Action::List(Kind::Containers));
+                        }
+                    });
+                }
+            }
+            if project.containers.iter().any(|c| c.is_job()) {
+                ui.add_space(16.0);
+                ui.label(RichText::new("Completed one-off jobs are kept stopped when you start containers.").small().color(MUTED));
+            }
+        });
     }
     fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
         let Some(details) = self.details.clone() else {
@@ -303,7 +528,12 @@ impl DockerView {
                 if let Some(project) = &details.project {
                     ui.add_space(12.0);
                     design::eyebrow(ui, "COMPOSE");
-                    ui.label(format!("Project: {project}"));
+                    if ui.link(format!("Project: {project}")).clicked() && self.pending.is_none() {
+                        self.compose = true;
+                        self.compose_import = false;
+                        self.project_selected = Some(project.clone());
+                        self.submit(runtime, Action::Projects);
+                    }
                     if let Some(service) = &details.service {
                         ui.label(format!("Service: {service}"));
                     }
@@ -347,7 +577,7 @@ impl DockerView {
                             .add_enabled(self.pending.is_none(), egui::Button::new("Refresh"))
                             .clicked()
                         {
-                            self.submit(runtime, Action::List(self.kind));
+                            self.refresh(runtime);
                         }
                         if self.pending.is_some() {
                             ui.spinner();
@@ -399,6 +629,7 @@ impl DockerView {
                         }
                         if design::tab(ui, self.compose, "Compose").clicked() {
                             self.compose = true;
+                            self.submit(runtime, Action::Projects);
                         }
                     });
                 });
@@ -430,6 +661,9 @@ impl DockerView {
                             );
                         });
                 });
+        }
+        if self.compose && !cfg!(windows) {
+            self.project_list(ui);
         }
         if self.kind == Kind::Containers && !self.compose && !cfg!(windows) {
             egui::Panel::left("container-list")
@@ -501,11 +735,15 @@ impl DockerView {
         }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24)).show(ui,|ui| {
             if cfg!(windows){ui.label("The Docker API is available on macOS and Linux. Local and cloud machines are available on Windows.");return;}
+            if self.compose && !self.compose_import && self.project_selected.is_some() {
+                self.project_details(ui, runtime);
+                return;
+            }
             if self.compose {
                 egui::ScrollArea::vertical().id_salt("compose-form").show(ui,|ui| {
                     ui.add_space(12.0);
-                    ui.heading("Run a Compose project");
-                    ui.label(RichText::new("Start your services from an existing Compose file.").color(MUTED));
+                    ui.heading("Open a Compose project");
+                    ui.label(RichText::new("Existing projects appear in the list. Use a Compose file to create or update services.").color(MUTED));
                     ui.add_space(24.0);
                     design::card().show(ui,|ui| {
                         ui.set_width(ui.available_width());
@@ -515,7 +753,7 @@ impl DockerView {
                         ui.add_space(16.0);
                         ui.add_enabled_ui(self.pending.is_none()&&!self.compose_file.trim().is_empty(),|ui| {
                             ui.horizontal_wrapped(|ui| {
-                                if ui.add(design::primary("Start project…")).clicked(){self.confirm=Some(Action::Compose{file:self.compose_file.trim().into(),up:true});}
+                                if ui.add(design::primary("Apply Compose file…")).clicked(){self.confirm=Some(Action::Compose{file:self.compose_file.trim().into(),up:true});}
                                 if ui.button("Stop and remove project…").clicked(){self.confirm=Some(Action::Compose{file:self.compose_file.trim().into(),up:false});}
                             });
                         });
@@ -596,4 +834,8 @@ impl DockerView {
 }
 fn text(row: &Value, key: &str) -> String {
     row[key].as_str().unwrap_or("").to_string()
+}
+
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }

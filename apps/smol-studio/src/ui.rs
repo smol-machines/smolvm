@@ -830,7 +830,7 @@ impl eframe::App for Studio {
                 ui.horizontal(|ui| {
                     let label = match self.workspace {
                         Workspace::Cloud => "Smol Cloud".to_string(),
-                        Workspace::Containers => "Docker context: smol".to_string(),
+                        Workspace::Containers => self.docker.status().to_owned(),
                         Workspace::Local => self
                             .pending
                             .as_ref()
