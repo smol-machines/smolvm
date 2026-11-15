@@ -10,6 +10,10 @@ pub struct DockerView {
     worker: DockerWorker,
     kind: Kind,
     rows: Vec<Value>,
+    storage_selected: Option<String>,
+    storage: Option<smol_studio::storage::Details>,
+    new_resource: Option<Kind>,
+    resource_input: String,
     pending: Option<Action>,
     error: Option<String>,
     text: String,
@@ -37,6 +41,10 @@ impl DockerView {
             worker: DockerWorker::new(move || ctx.request_repaint()),
             kind: Kind::Containers,
             rows: vec![],
+            storage_selected: None,
+            storage: None,
+            new_resource: None,
+            resource_input: String::new(),
             pending: None,
             error: None,
             text: String::new(),
@@ -59,7 +67,7 @@ impl DockerView {
         }
     }
     pub fn modal_open(&self) -> bool {
-        self.confirm.is_some()
+        self.confirm.is_some() || self.new_resource.is_some()
     }
     pub fn mutating(&self) -> bool {
         self.pending.as_ref().is_some_and(Action::mutates)
@@ -88,6 +96,9 @@ impl DockerView {
                 }
                 | Action::Logs(_),
             ) => "Loading logs…",
+            Some(Action::PullImage(_)) => "Pulling image…",
+            Some(Action::CreateVolume(_)) => "Creating volume…",
+            Some(Action::StorageRemove { .. }) => "Removing resource…",
             Some(_) => "Working…",
             None => &self.activity,
         }
@@ -120,6 +131,13 @@ impl DockerView {
         while let Ok(done) = self.worker.events.try_recv() {
             self.pending = None;
             match done.result {
+                Ok(Output::Storage(details)) => {
+                    if self.kind == details.kind
+                        && self.storage_selected.as_ref() == Some(&details.id)
+                    {
+                        self.storage = Some(details);
+                    }
+                }
                 Ok(Output::Projects(projects)) => {
                     self.projects = projects;
                     self.projects_valid = true;
@@ -133,6 +151,23 @@ impl DockerView {
                     if self.kind == kind {
                         self.rows = rows;
                         self.valid = true;
+                        if matches!(kind, Kind::Images | Kind::Volumes) {
+                            let key = if kind == Kind::Images { "ID" } else { "Name" };
+                            self.storage_selected = self
+                                .storage_selected
+                                .take()
+                                .filter(|id| self.rows.iter().any(|r| r[key].as_str() == Some(id)))
+                                .or_else(|| {
+                                    self.rows
+                                        .first()
+                                        .and_then(|r| r[key].as_str())
+                                        .map(str::to_owned)
+                                });
+                            self.storage = None;
+                            if let Some(id) = self.storage_selected.clone() {
+                                self.submit(runtime, Action::StorageInspect { kind, id });
+                            }
+                        }
                         if kind == Kind::Containers {
                             self.selected = self
                                 .selected
@@ -166,7 +201,17 @@ impl DockerView {
                 }
                 Ok(Output::Text(text)) => self.text = text,
                 Ok(Output::Completed) => {
+                    if let Action::CreateVolume(name) = &done.action {
+                        self.storage_selected = Some(name.clone());
+                        self.query.clear();
+                    }
                     self.activity = match done.action {
+                        Action::PullImage(_) => "Image pulled.",
+                        Action::CreateVolume(_) => "Volume created.",
+                        Action::StorageRemove {
+                            kind: Kind::Images, ..
+                        } => "Image removed from inventory; downloaded layers may remain cached.",
+                        Action::StorageRemove { .. } => "Volume removed.",
                         Action::Compose { up: true, .. } => "Compose file applied.",
                         Action::Compose { up: false, .. } => {
                             "Compose project removed; named volumes retained."
@@ -187,6 +232,7 @@ impl DockerView {
                     }
                     .into();
                     self.details = None;
+                    self.storage = None;
                     self.stats = None;
                     self.text.clear();
                     self.refresh(runtime);
@@ -212,6 +258,254 @@ impl DockerView {
             && !terminal.ui(ctx)
         {
             self.terminal = None;
+        }
+    }
+    fn storage_list(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
+        egui::Panel::left("storage-list")
+            .resizable(true)
+            .default_size(280.0)
+            .min_size(224.0)
+            .max_size(380.0)
+            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.query)
+                        .hint_text(format!("Search {}…", self.kind.label().to_lowercase()))
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(10, 9)),
+                );
+                if ui
+                    .add_enabled(
+                        self.pending.is_none(),
+                        egui::Button::new(if self.kind == Kind::Images {
+                            "+  Pull image…"
+                        } else {
+                            "+  Create volume…"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.resource_input.clear();
+                    self.new_resource = Some(self.kind);
+                }
+                ui.add_space(12.0);
+                design::eyebrow(ui, &self.kind.label().to_uppercase());
+                ui.add_space(8.0);
+                let query = self.query.to_lowercase();
+                let mut seen = std::collections::HashSet::new();
+                let rows: Vec<_> = self
+                    .rows
+                    .iter()
+                    .filter(|r| {
+                        ["Name", "Repository", "Tag", "ID"]
+                            .iter()
+                            .any(|key| text(r, key).to_lowercase().contains(&query))
+                    })
+                    .filter(|r| {
+                        seen.insert(text(
+                            r,
+                            if self.kind == Kind::Images {
+                                "ID"
+                            } else {
+                                "Name"
+                            },
+                        ))
+                    })
+                    .cloned()
+                    .collect();
+                if rows.is_empty() {
+                    ui.label(
+                        RichText::new(if !self.valid {
+                            "Refresh to load resources."
+                        } else if self.query.is_empty() {
+                            "Nothing here yet"
+                        } else {
+                            "No matching resources"
+                        })
+                        .small()
+                        .color(MUTED),
+                    );
+                }
+                if self.pending.is_some() {
+                    ui.disable();
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("storage-list-scroll")
+                    .show_rows(ui, 60.0, rows.len(), |ui, range| {
+                        for row in &rows[range] {
+                            let id = text(
+                                row,
+                                if self.kind == Kind::Images {
+                                    "ID"
+                                } else {
+                                    "Name"
+                                },
+                            );
+                            let title = if self.kind == Kind::Images
+                                && text(row, "Repository") != "<none>"
+                            {
+                                format!("{}:{}", text(row, "Repository"), text(row, "Tag"))
+                            } else {
+                                id.clone()
+                            };
+                            let subtitle = text(
+                                row,
+                                if self.kind == Kind::Images {
+                                    "Size"
+                                } else {
+                                    "Driver"
+                                },
+                            );
+                            if design::resource_row(
+                                ui,
+                                self.storage_selected.as_ref() == Some(&id),
+                                &title,
+                                &subtitle,
+                                "",
+                                if self.kind == Kind::Images {
+                                    design::Icon::Image
+                                } else {
+                                    design::Icon::Volume
+                                },
+                            )
+                            .clicked()
+                            {
+                                self.storage_selected = Some(id.clone());
+                                self.storage = None;
+                                self.submit(
+                                    runtime,
+                                    Action::StorageInspect {
+                                        kind: self.kind,
+                                        id,
+                                    },
+                                );
+                            }
+                        }
+                    });
+            });
+    }
+    fn storage_details(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
+        let Some(details) = self.storage.clone() else {
+            ui.add_space(80.0);
+            ui.vertical_centered(|ui| {
+                if self.pending.is_some() {
+                    ui.spinner();
+                }
+                ui.heading(if self.kind == Kind::Images {
+                    "Your local images"
+                } else {
+                    "Persistent storage"
+                });
+                ui.label(
+                    RichText::new(
+                        "Select a resource to inspect it and see which containers use it.",
+                    )
+                    .color(MUTED),
+                );
+            });
+            return;
+        };
+        let enabled = self.pending.is_none() && self.valid;
+        egui::ScrollArea::vertical().id_salt("storage-detail-scroll").auto_shrink([false,false]).show(ui, |ui| {
+            let title = if details.kind == Kind::Images { details.fields.first().map(|(_,v)|v.lines().next().unwrap_or("Image")).unwrap_or("Image") } else { &details.id };
+            ui.add(egui::Label::new(design::heading(title,22.0)).truncate()).on_hover_text(title);
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(enabled && details.users.is_empty(), egui::Button::new(RichText::new("Remove…").color(design::RED))).clicked() {
+                    self.confirm=Some(Action::StorageRemove {kind:details.kind,id:details.id.clone(),created:details.created.clone()});
+                }
+                if ui.button(if details.kind == Kind::Images { "Copy image ID" } else { "Copy volume name" }).clicked() { ui.ctx().copy_text(details.id.clone()); }
+            });
+            ui.add_space(12.0); ui.separator(); ui.add_space(12.0);
+            design::eyebrow(ui,"USED BY CONTAINERS");
+            if details.users.is_empty() { ui.label(RichText::new("No containers currently reference this resource.").small().color(MUTED)); }
+            else { ui.label(RichText::new("Includes stopped containers. Remove these references before deleting the resource.").small().color(MUTED)); }
+            for user in &details.users {
+                ui.add_enabled_ui(enabled, |ui| {
+                    if design::resource_row(ui,false,&user.name,&user.state,&user.state,design::Icon::Containers).clicked() {
+                        self.kind=Kind::Containers;self.selected=Some(user.id.clone());self.details=None;self.query.clear();
+                        self.submit(runtime,Action::List(Kind::Containers));
+                    }
+                });
+            }
+            ui.add_space(20.0); design::eyebrow(ui,"DETAILS");
+            for (label,value) in &details.fields {
+                ui.add_space(12.0);
+                ui.label(RichText::new(label).small().color(MUTED));
+                ui.add(egui::Label::new(if value.is_empty() { "Not reported" } else { value }).wrap().selectable(true));
+            }
+        });
+    }
+    fn resource_dialog(&mut self, ctx: &egui::Context, runtime: &Runtime) {
+        let Some(kind) = self.new_resource else {
+            return;
+        };
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new(if kind == Kind::Images {
+            "Pull image"
+        } else {
+            "Create volume"
+        })
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(420.0)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(if kind == Kind::Images {
+                "Image reference"
+            } else {
+                "Volume name"
+            });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.resource_input)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(if kind == Kind::Images {
+                        "alpine:3.22"
+                    } else {
+                        "project-data"
+                    }),
+            );
+            let valid = if kind == Kind::Images {
+                smol_studio::storage::validate_reference(self.resource_input.trim())
+            } else {
+                smol_studio::storage::validate_volume(self.resource_input.trim())
+            };
+            if !self.resource_input.is_empty()
+                && let Err(error) = &valid
+            {
+                ui.label(RichText::new(error).small().color(design::RED));
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                submit = ui
+                    .add_enabled(
+                        valid.is_ok() && self.pending.is_none(),
+                        design::primary(if kind == Kind::Images {
+                            "Pull image"
+                        } else {
+                            "Create volume"
+                        }),
+                    )
+                    .clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if submit {
+            self.new_resource = None;
+            let input = self.resource_input.trim().to_owned();
+            self.submit(
+                runtime,
+                if kind == Kind::Images {
+                    Action::PullImage(input)
+                } else {
+                    Action::CreateVolume(input)
+                },
+            );
+        } else if !open || cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.new_resource = None;
         }
     }
     fn project_list(&mut self, ui: &mut egui::Ui) {
@@ -549,6 +843,10 @@ impl DockerView {
     }
     pub fn ui(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
         let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.confirm = None;
+            self.new_resource = None;
+        }
         if !self.opened && !cfg!(windows) {
             self.opened = true;
             self.submit(runtime, Action::List(self.kind));
@@ -622,6 +920,9 @@ impl DockerView {
                             {
                                 self.compose = false;
                                 self.kind = kind;
+                                self.query.clear();
+                                self.storage = None;
+                                self.storage_selected = None;
                                 self.rows.clear();
                                 self.valid = false;
                                 self.submit(runtime, Action::List(kind));
@@ -661,6 +962,9 @@ impl DockerView {
                             );
                         });
                 });
+        }
+        if !self.compose && matches!(self.kind, Kind::Images | Kind::Volumes) && !cfg!(windows) {
+            self.storage_list(ui, runtime);
         }
         if self.compose && !cfg!(windows) {
             self.project_list(ui);
@@ -763,11 +1067,15 @@ impl DockerView {
                 });
                 return;
             }
+            if matches!(self.kind, Kind::Images | Kind::Volumes) {
+                self.storage_details(ui, runtime);
+                return;
+            }
             if self.kind == Kind::Containers && self.selected.is_some() {
                 self.inspector(ui, runtime);
                 return;
             }
-            if self.kind != Kind::Containers {
+            if self.kind == Kind::Networks {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.query).hint_text(format!("Search {}…",self.kind.label().to_lowercase())).desired_width(300.0).margin(egui::Margin::symmetric(10,9)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {ui.label(RichText::new(format!("{} {}",self.rows.len(),if self.rows.len()==1{"resource"}else{"resources"})).small().color(MUTED));});
@@ -785,19 +1093,19 @@ impl DockerView {
                     if !self.valid && ui.add_enabled(self.pending.is_none(),design::primary("Set up Docker with Smol…")).clicked(){self.confirm=Some(Action::Configure);}
                 });
             }
-            if self.kind != Kind::Containers {
+            if self.kind == Kind::Networks {
                 ui.horizontal(|ui| {
                     design::eyebrow(ui, "NAME");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        design::eyebrow(ui, if self.kind == Kind::Images { "SIZE" } else { "DRIVER" });
+                        design::eyebrow(ui, "DRIVER");
                     });
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().id_salt("docker-inventory").show_rows(ui, 44.0, visible.len(), |ui, range| {
                     for index in range {
                         let row = &self.rows[visible[index]];
-                        let title = if self.kind == Kind::Images { format!("{}:{}",text(row,"Repository"),text(row,"Tag")) } else { text(row,"Name") };
-                        let detail = if self.kind == Kind::Images { text(row,"Size") } else { text(row,"Driver") };
+                        let title = text(row,"Name");
+                        let detail = text(row,"Driver");
                         ui.allocate_ui(egui::vec2(ui.available_width(), 38.0), |ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(RichText::new(detail).small().color(MUTED));
@@ -811,18 +1119,33 @@ impl DockerView {
                 });
             }
         });
+        self.resource_dialog(&ctx, runtime);
         if let Some(action) = self.confirm.clone() {
             let mut open = true;
-            egui::Window::new("Confirm container operation").anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO).default_width(440.0).open(&mut open).collapsible(false).resizable(false).show(&ctx,|ui| {
+            egui::Window::new("Confirm operation").anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO).default_width(440.0).open(&mut open).collapsible(false).resizable(false).show(&ctx,|ui| {
                 match &action {
                     Action::Configure=>{ui.label("Register Smol’s on-demand Docker socket and select the smol context for your tools.");ui.add_space(8.0);ui.label("This changes your default Docker context and configures Buildx and Testcontainers.");}
                     Action::Delete(id)=>{ui.label(format!("Remove stopped container {id} and its writable filesystem?"));}
+                    Action::StorageRemove { kind, id, .. } => {
+                        ui.label(if *kind == Kind::Volumes { format!("Permanently delete volume “{id}” and all of its data?") } else { format!("Remove image {id} and its local tags from Smol?") });
+                        ui.add_space(8.0);
+                        ui.label(if *kind == Kind::Volumes { "This cannot be undone. Containers that reference the volume must be removed first." } else { "Downloaded layers may remain cached. This does not delete the image from its registry." });
+                    }
                     Action::Compose{file,up}=>{ui.label(format!("{} the project defined by {}?",if *up{"Start"}else{"Stop and remove"},file.display()));ui.add_space(8.0);ui.label(if *up{"This can build or pull images and start the project’s services."}else{"Project containers and networks are removed. Named volumes are retained."});}
                     _=>{}
                 }
                 ui.add_space(20.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(self.pending.is_none(),design::primary("Continue")).clicked(){self.confirm=None;self.submit(runtime,action);}
+                    let (label, destructive) = match &action {
+                        Action::StorageRemove { kind: Kind::Images, .. } => ("Remove image", true),
+                        Action::StorageRemove { .. } => ("Delete volume", true),
+                        Action::Delete(_) => ("Remove container", true),
+                        Action::Compose { up: false, .. } => ("Remove project", true),
+                        Action::Compose { up: true, .. } => ("Apply Compose file", false),
+                        _ => ("Connect Docker", false),
+                    };
+                    let button = design::primary(label).fill(if destructive { design::RED } else { design::ACCENT });
+                    if ui.add_enabled(self.pending.is_none(),button).clicked(){self.confirm=None;self.submit(runtime,action);}
                     if ui.button("Cancel").clicked(){self.confirm=None;}
                 });
             });

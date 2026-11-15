@@ -48,9 +48,26 @@ pub enum Action {
     Logs(String),
     Inspect(String),
     Stats(String),
+    StorageInspect {
+        kind: Kind,
+        id: String,
+    },
+    StorageRemove {
+        kind: Kind,
+        id: String,
+        created: String,
+    },
+    PullImage(String),
+    CreateVolume(String),
     Projects,
-    Project { name: String, action: ProjectAction },
-    Compose { file: PathBuf, up: bool },
+    Project {
+        name: String,
+        action: ProjectAction,
+    },
+    Compose {
+        file: PathBuf,
+        up: bool,
+    },
 }
 impl Action {
     pub fn mutates(&self) -> bool {
@@ -61,6 +78,7 @@ impl Action {
                 | Self::Logs(_)
                 | Self::Inspect(_)
                 | Self::Stats(_)
+                | Self::StorageInspect { .. }
                 | Self::Projects
                 | Self::Project {
                     action: ProjectAction::Logs,
@@ -72,6 +90,7 @@ impl Action {
 pub enum Output {
     Rows(Kind, Vec<Value>),
     Projects(Vec<crate::compose::Project>),
+    Storage(crate::storage::Details),
     Text(String),
     Details(Box<crate::container_details::ContainerDetails>),
     Stats { id: String, value: Value },
@@ -91,6 +110,37 @@ pub fn validate_container_id(id: &str) -> Result<(), String> {
 fn docker_args(action: &Action) -> Result<Vec<String>, String> {
     let mut args = vec!["--context".into(), "smol".into()];
     match action {
+        Action::StorageInspect { kind, id } | Action::StorageRemove { kind, id, .. } => {
+            let resource = match kind {
+                Kind::Images => {
+                    crate::storage::validate_image_id(id)?;
+                    "image"
+                }
+                Kind::Volumes => {
+                    crate::storage::validate_volume(id)?;
+                    "volume"
+                }
+                _ => return Err("Choose an image or volume.".into()),
+            };
+            args.push(resource.into());
+            if matches!(action, Action::StorageInspect { .. }) {
+                args.extend(["inspect".into(), "--format".into(), "{{json .}}".into()]);
+            } else {
+                args.push("rm".into());
+                if *kind == Kind::Images {
+                    args.push("--no-prune".into());
+                }
+            }
+            args.push(id.clone());
+        }
+        Action::PullImage(reference) => {
+            crate::storage::validate_reference(reference)?;
+            args.extend(["image".into(), "pull".into(), reference.clone()]);
+        }
+        Action::CreateVolume(name) => {
+            crate::storage::validate_volume(name)?;
+            args.extend(["volume".into(), "create".into(), name.clone()]);
+        }
         Action::Projects => args.extend(
             [
                 "container",
@@ -160,6 +210,27 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
     Ok(args)
 }
 fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<Output, String> {
+    if let Action::StorageRemove { kind, id, created } = action {
+        let Output::Storage(details) = execute(
+            runtime,
+            &Action::StorageInspect {
+                kind: *kind,
+                id: id.clone(),
+            },
+            shutdown,
+        )?
+        else {
+            unreachable!();
+        };
+        if !details.users.is_empty() {
+            return Err("This resource is still used by a container, including stopped containers. Remove those containers first.".into());
+        }
+        if *kind == Kind::Volumes && (created.is_empty() || details.created != *created) {
+            return Err(
+                "This volume changed since you selected it. Refresh and review it again.".into(),
+            );
+        }
+    }
     if let Action::Project { name, action } = action {
         return project_action(runtime, name, action, shutdown);
     }
@@ -224,6 +295,48 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
         shutdown,
     )?;
     match action {
+        Action::StorageInspect { kind, id } => {
+            let mut details = crate::storage::Details::parse(*kind, id, &bytes)?;
+            let mut command = docker_command();
+            command.args([
+                "--context",
+                "smol",
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+            ]);
+            command.arg(format!(
+                "{}={id}",
+                if *kind == Kind::Images {
+                    "ancestor"
+                } else {
+                    "volume"
+                }
+            ));
+            command.args(["--format", "{{json .}}"]);
+            let users = capture(
+                &mut command,
+                Duration::from_secs(20),
+                4 * 1024 * 1024,
+                shutdown,
+            )?;
+            for line in users.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                let row: Value = serde_json::from_slice(line)
+                    .map_err(|_| "Docker returned an invalid storage usage list.")?;
+                let id = row["ID"]
+                    .as_str()
+                    .ok_or("Container ID missing from usage list.")?;
+                validate_container_id(id)?;
+                details.users.push(crate::storage::User {
+                    id: id.into(),
+                    name: row["Names"].as_str().unwrap_or(id).into(),
+                    state: row["State"].as_str().unwrap_or("unknown").into(),
+                });
+            }
+            Ok(Output::Storage(details))
+        }
         Action::Projects => Ok(Output::Projects(crate::compose::parse(&bytes)?)),
         Action::List(kind) => {
             let rows = bytes
@@ -437,6 +550,196 @@ impl Drop for DockerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn storage_commands_are_explicit_and_never_force_or_prune() {
+        let id = format!("sha256:{}", "a".repeat(64));
+        for action in [
+            Action::StorageInspect {
+                kind: Kind::Images,
+                id: id.clone(),
+            },
+            Action::StorageRemove {
+                kind: Kind::Images,
+                id,
+                created: String::new(),
+            },
+            Action::StorageRemove {
+                kind: Kind::Volumes,
+                id: "app-data".into(),
+                created: "now".into(),
+            },
+            Action::CreateVolume("app-data".into()),
+            Action::PullImage("registry.example:5000/app:tag".into()),
+        ] {
+            let args = docker_args(&action).unwrap();
+            assert_eq!(&args[..2], ["--context", "smol"]);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "--force" | "-f" | "prune"))
+            );
+        }
+        assert!(docker_args(&Action::CreateVolume("--help".into())).is_err());
+        assert!(
+            docker_args(&Action::StorageInspect {
+                kind: Kind::Networks,
+                id: "app".into()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "pulls an image and creates/removes owned storage in an explicitly isolated smol context"]
+    fn live_storage_lifecycle() {
+        let runtime = Runtime {
+            executable: std::env::var_os("SMOL_STUDIO_TEST_RUNTIME")
+                .expect("runtime")
+                .into(),
+            state_dir: None,
+        };
+        let image = std::env::var("SMOL_STUDIO_TEST_STORAGE_IMAGE").expect("fixture image");
+        let name = "studio-storage-data";
+        let shutdown = AtomicBool::new(false);
+        execute(&runtime, &Action::PullImage(image.clone()), &shutdown).unwrap();
+        let mut command = docker_command();
+        command.args([
+            "--context",
+            "smol",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            &image,
+        ]);
+        let image_id = String::from_utf8(
+            capture(&mut command, Duration::from_secs(20), 4096, &shutdown).unwrap(),
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        execute(&runtime, &Action::CreateVolume(name.into()), &shutdown).unwrap();
+        let inspect = |kind, id: &str| match execute(
+            &runtime,
+            &Action::StorageInspect {
+                kind,
+                id: id.into(),
+            },
+            &shutdown,
+        )
+        .unwrap()
+        {
+            Output::Storage(details) => details,
+            _ => panic!("Expected storage details"),
+        };
+        let volume = inspect(Kind::Volumes, name);
+        let path = PathBuf::from(
+            &volume
+                .fields
+                .iter()
+                .find(|(key, _)| key == "Storage path")
+                .unwrap()
+                .1,
+        );
+        std::fs::write(path.join("keep.txt"), "retained until deletion").unwrap();
+        let mut command = docker_command();
+        command.args([
+            "--context",
+            "smol",
+            "container",
+            "create",
+            "--name",
+            "studio-storage-owner",
+            "--mount",
+            &format!("type=volume,source={name},target=/data"),
+            &image,
+            "sleep",
+            "300",
+        ]);
+        let id = String::from_utf8(
+            capture(&mut command, Duration::from_secs(60), 4096, &shutdown).unwrap(),
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        for (kind, key) in [(Kind::Images, image_id.as_str()), (Kind::Volumes, name)] {
+            let details = inspect(kind, key);
+            assert!(details.users.iter().any(|user| user.id == id)); // includes created/stopped containers
+            assert!(
+                execute(
+                    &runtime,
+                    &Action::StorageRemove {
+                        kind,
+                        id: key.into(),
+                        created: details.created
+                    },
+                    &shutdown
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep.txt")).unwrap(),
+            "retained until deletion"
+        );
+        execute(&runtime, &Action::Delete(id), &shutdown).unwrap();
+        assert!(
+            execute(
+                &runtime,
+                &Action::StorageRemove {
+                    kind: Kind::Volumes,
+                    id: name.into(),
+                    created: "stale creation time".into()
+                },
+                &shutdown
+            )
+            .is_err()
+        );
+        assert!(path.join("keep.txt").exists());
+        execute(
+            &runtime,
+            &Action::StorageRemove {
+                kind: Kind::Volumes,
+                id: name.into(),
+                created: volume.created,
+            },
+            &shutdown,
+        )
+        .unwrap();
+        assert!(!path.exists());
+        assert!(
+            execute(
+                &runtime,
+                &Action::StorageInspect {
+                    kind: Kind::Volumes,
+                    id: name.into()
+                },
+                &shutdown
+            )
+            .is_err()
+        );
+        execute(
+            &runtime,
+            &Action::StorageRemove {
+                kind: Kind::Images,
+                id: image_id.clone(),
+                created: String::new(),
+            },
+            &shutdown,
+        )
+        .unwrap();
+        assert!(
+            execute(
+                &runtime,
+                &Action::StorageInspect {
+                    kind: Kind::Images,
+                    id: image_id
+                },
+                &shutdown
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn docker_never_uses_ambient_context_or_forced_removal() {
         for action in [

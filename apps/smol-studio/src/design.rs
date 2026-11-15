@@ -16,6 +16,8 @@ pub enum Icon {
     Cloud,
     Containers,
     Settings,
+    Image,
+    Volume,
 }
 
 pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color32) {
@@ -23,6 +25,42 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
     let stroke = Stroke::new(1.5, color);
     let point = |x: f32, y: f32| r.min + egui::vec2(x * r.width(), y * r.height());
     match kind {
+        Icon::Image => {
+            painter.add(egui::Shape::line(
+                vec![
+                    point(0.5, 0.0),
+                    point(1.0, 0.25),
+                    point(0.5, 0.5),
+                    point(0.0, 0.25),
+                    point(0.5, 0.0),
+                ],
+                stroke,
+            ));
+            for y in [0.5, 0.75] {
+                painter.add(egui::Shape::line(
+                    vec![point(0.0, y), point(0.5, y + 0.25), point(1.0, y)],
+                    stroke,
+                ));
+            }
+        }
+        Icon::Volume => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(point(0.0, 0.4), point(1.0, 1.0)),
+                2,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    point(0.0, 0.4),
+                    point(0.2, 0.0),
+                    point(0.8, 0.0),
+                    point(1.0, 0.4),
+                ],
+                stroke,
+            ));
+            painter.circle_filled(point(0.75, 0.7), 1.5, color);
+        }
         Icon::Machine => {
             painter.rect_stroke(
                 egui::Rect::from_min_max(point(0.0, 0.05), point(1.0, 0.75)),
@@ -309,11 +347,13 @@ pub fn resource_row(
         let galley = ui.fonts_mut(|f| f.layout_job(job));
         painter.galley(egui::pos2(left, r.top() + y), galley, color);
     }
-    ui.painter().circle_filled(
-        egui::pos2(r.right() - 13.0, r.center().y),
-        3.0,
-        state_color(state),
-    );
+    if !state.is_empty() {
+        ui.painter().circle_filled(
+            egui::pos2(r.right() - 13.0, r.center().y),
+            3.0,
+            state_color(state),
+        );
+    }
     response.on_hover_text(format!("{name}\n{subtitle}\n{state}"))
 }
 

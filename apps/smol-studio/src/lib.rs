@@ -10,3 +10,4 @@ pub mod terminal;
 
 pub mod compose;
 pub mod container_details;
+pub mod storage;
