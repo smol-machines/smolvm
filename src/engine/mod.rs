@@ -29,6 +29,7 @@
 mod api;
 mod archive;
 mod build;
+pub mod builder;
 mod containers;
 mod events;
 mod exec;

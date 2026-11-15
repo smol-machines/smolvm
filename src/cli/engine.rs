@@ -47,6 +47,8 @@ enum EngineAction {
     #[command(hide = true)]
     Serve(SocketArg),
     #[command(hide = true)]
+    BuildkitServe(SocketArg),
+    #[command(hide = true)]
     Supervise {
         #[command(flatten)]
         socket: SocketArg,
@@ -104,9 +106,17 @@ impl EngineCmd {
                 runtime.block_on(smolvm::engine::supervise(config, id))
             }
             EngineAction::Serve(s) => serve(s.config()?),
+            EngineAction::BuildkitServe(s) => tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(smolvm::engine::builder::serve(s.config()?)),
             EngineAction::Start(s) => start(s.config()?),
-            EngineAction::Register(s) => super::engine_activation::install(&s.config()?),
-            EngineAction::Unregister(s) => super::engine_activation::uninstall(&s.config()?),
+            EngineAction::Register(s) => register(&s.config()?),
+            EngineAction::Unregister(s) => {
+                let config = s.config()?;
+                super::engine_activation::uninstall(&smolvm::engine::builder::config(&config))?;
+                super::engine_activation::uninstall(&config)
+            }
             EngineAction::Stop(s) => stop(s.config()?),
             EngineAction::Status { socket, json } => status(socket.config()?, json),
             EngineAction::LinkSocket {
@@ -132,7 +142,7 @@ fn pid_file(config: &smolvm::engine::EngineConfig) -> PathBuf {
 }
 
 fn start(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
-    super::engine_activation::install(&config)?;
+    register(&config)?;
     let home =
         dirs::home_dir().ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
     let docker_dir =
@@ -152,6 +162,10 @@ fn start(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
             }
         }
         Err(e) => eprintln!("warning: could not set up the docker context: {e}"),
+    }
+    let builder_config = smolvm::engine::builder::config(&config);
+    if let Err(error) = install_builder(&builder_config, &docker_dir) {
+        eprintln!("warning: Buildx setup did not complete: {error}");
     }
     let properties = home.join(".testcontainers.properties");
     match integration::ensure_testcontainers_host(&properties, &config.socket) {
@@ -256,5 +270,106 @@ fn link_socket(socket: &Path, print: bool, force: bool) -> smolvm::Result<()> {
             "link /var/run/docker.sock",
             "sudo ln failed",
         ))
+    }
+}
+
+/// Register one native builder with Buildx; ordinary Docker volumes are unaffected.
+fn install_builder(config: &smolvm::engine::EngineConfig, docker_dir: &Path) -> smolvm::Result<()> {
+    let endpoint = integration::socket_url(&config.socket);
+    let mut inspect = std::process::Command::new("docker");
+    let result = inspect
+        .env("DOCKER_CONFIG", docker_dir)
+        .args(["buildx", "inspect", "smol-builder"])
+        .output()?;
+    if result.status.success() {
+        if !matches_native_builder(&String::from_utf8_lossy(&result.stdout), &endpoint) {
+            return Err(smolvm::Error::config(
+                "Buildx registration",
+                "a different builder named smol-builder already exists; it was not replaced",
+            ));
+        }
+    } else {
+        let output = std::process::Command::new("docker")
+            .env("DOCKER_CONFIG", docker_dir)
+            .args([
+                "buildx",
+                "create",
+                "--name",
+                "smol-builder",
+                "--driver",
+                "remote",
+                "--driver-opt",
+                "default-load=true",
+                &endpoint,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(smolvm::Error::config(
+                "Buildx registration",
+                String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+    }
+    let output = std::process::Command::new("docker")
+        .env("DOCKER_CONFIG", docker_dir)
+        .args(["buildx", "use", "smol-builder"])
+        .output()?;
+    if !output.status.success() {
+        return Err(smolvm::Error::config(
+            "select Buildx builder",
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    println!("Buildx uses smol-builder: guest-local build cache, automatic image loading, and shutdown when idle.");
+    Ok(())
+}
+
+fn register(config: &smolvm::engine::EngineConfig) -> smolvm::Result<()> {
+    super::engine_activation::install(config)?;
+    super::engine_activation::install_command(
+        &smolvm::engine::builder::config(config),
+        "buildkit-serve",
+    )
+}
+
+// `buildx inspect` has no --format flag. Require exactly one matching endpoint;
+// never repurpose an existing builder that belongs to another engine or user.
+fn matches_native_builder(text: &str, endpoint: &str) -> bool {
+    let fields: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .collect();
+    fields
+        .iter()
+        .filter(|(key, _)| *key == "Driver")
+        .map(|(_, value)| *value)
+        .collect::<Vec<_>>()
+        == ["remote"]
+        && fields
+            .iter()
+            .filter(|(key, _)| *key == "Endpoint")
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>()
+            == [endpoint]
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::matches_native_builder;
+    #[test]
+    fn existing_builders_are_only_reused_for_the_same_single_endpoint() {
+        let text = "Name: smol-builder\nDriver: remote\nNodes:\nName: smol-builder0\nEndpoint: unix:///tmp/smol.sock\nStatus: running\n";
+        assert!(matches_native_builder(text, "unix:///tmp/smol.sock"));
+        assert!(!matches_native_builder(text, "unix:///tmp/other.sock"));
+        assert!(!matches_native_builder(
+            &text.replace("Driver: remote", "Driver: docker-container"),
+            "unix:///tmp/smol.sock"
+        ));
+        assert!(!matches_native_builder(
+            &format!("{text}Endpoint: unix:///tmp/smol.sock\n"),
+            "unix:///tmp/smol.sock"
+        ));
+        assert!(!matches_native_builder("", "unix:///tmp/smol.sock"));
     }
 }
