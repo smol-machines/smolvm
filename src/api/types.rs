@@ -873,7 +873,8 @@ pub struct CapacityResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_memory_available_mb: Option<u64>,
     /// Host memory (MB) a branch must leave free on this node. A branch of N
-    /// children is refused unless `host_memory_available_mb` covers this plus
+    /// children is refused unless `host_memory_available_mb`, less
+    /// `branch_growth_owed_mb`, covers this plus
     /// `N * (branch_child_overhead_mb + branch_child_growth_fraction * the
     /// source's guest RAM)` plus any fresh RAM generation it copies.
     /// Omitted when branch memory admission is off or host memory is unknown.
@@ -886,6 +887,11 @@ pub struct CapacityResponse {
     /// on top of `branch_child_overhead_mb`, for the pages it dirties later.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_child_growth_fraction: Option<f64>,
+    /// Growth (MB) branch admission has promised running branch children and
+    /// they have not yet taken: each child's charge less its private memory
+    /// now. Branch admission holds it back from `host_memory_available_mb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_growth_owed_mb: Option<u64>,
     /// Real disk (GB) consumed by VM storage + overlay files.
     pub used_disk_gb: u64,
     /// Disk space (bytes) the node's incremental checkpoint store held at its

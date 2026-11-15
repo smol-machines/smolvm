@@ -61,6 +61,10 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
             .ok()
             .flatten()
     });
+    let branch_growth_owed_mb = match branch_admission {
+        Some(params) => branch_growth_owed(&state, params).await,
+        None => None,
+    };
     let cuda_devices = state.cuda_devices().map(|devices| {
         devices
             .into_iter()
@@ -89,12 +93,39 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
         branch_reserve_mb: branch_admission.map(|params| params.reserve_mib),
         branch_child_overhead_mb: branch_admission.map(|params| params.child_overhead_mib),
         branch_child_growth_fraction: branch_admission.map(|params| params.child_growth_fraction),
+        branch_growth_owed_mb,
         used_disk_gb: utilization.disk_gb,
         checkpoint_store_bytes: crate::checkpoint_retention::store_bytes(),
         boot_id: boot_id().to_string(),
         cuda_devices,
     })
     .into_response()
+}
+
+/// Longest `/capacity` waits for the machine records behind
+/// `branch_growth_owed_mb`; past it the field is left out rather than holding
+/// up the poll that keeps the node schedulable.
+const OWED_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The growth branch admission holds back right now, read off the runtime.
+async fn branch_growth_owed(
+    state: &Arc<ApiState>,
+    params: crate::agent::fork::BranchAdmissionParams,
+) -> Option<u64> {
+    let state = state.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        let records = state.db().list_vms().ok()?;
+        Some(crate::agent::fork::branch_growth_owed_mib(
+            crate::agent::fork::running_branch_children(records.iter().map(|(_, r)| r)),
+            params.child_overhead_mib,
+            params.child_growth_fraction,
+        ))
+    });
+    tokio::time::timeout(OWED_READ_TIMEOUT, read)
+        .await
+        .ok()?
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]

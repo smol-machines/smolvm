@@ -743,6 +743,55 @@ fn branch_child_charge_mib(child_overhead_mib: u64, growth_fraction: f64, guest_
     child_overhead_mib.saturating_add(growth_mib)
 }
 
+/// Growth admission already promised to running branch children and not yet
+/// taken (MiB): for each, its charge less the private memory it holds now.
+/// Host free memory counts only what children have written so far, so a
+/// burst of batches admitted a minute apart each saw the same free memory and
+/// together promised far more than the host had (2026-11-15: 244 children of
+/// 16 GiB, 976 GiB of promised growth, on a host with 722 GiB free).
+/// Each child is `(guest_mib, private_mib)`.
+pub(crate) fn branch_growth_owed_mib(
+    children: impl IntoIterator<Item = (u64, u64)>,
+    child_overhead_mib: u64,
+    growth_fraction: f64,
+) -> u64 {
+    children
+        .into_iter()
+        .map(|(guest_mib, private_mib)| {
+            branch_child_charge_mib(child_overhead_mib, growth_fraction, guest_mib)
+                .saturating_sub(private_mib)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// The running branch children among `records`, as `(guest_mib, private_mib)`
+/// for [`branch_growth_owed_mib`]. Private memory is the VMM's anonymous
+/// resident memory from `/proc/<pid>/status`, which costs microseconds per
+/// VMM, unlike `smaps_rollup`.
+pub(crate) fn running_branch_children<'a>(
+    records: impl IntoIterator<Item = &'a VmRecord>,
+) -> Vec<(u64, u64)> {
+    const MIB: u64 = 1024 * 1024;
+    records
+        .into_iter()
+        .filter(|r| {
+            r.golden.is_some()
+                && !r.forkable
+                && r.state == crate::config::RecordState::Running
+                && r.is_process_alive()
+        })
+        .map(|r| {
+            let private_mib = r
+                .pid
+                .and_then(crate::process::process_memory_counters)
+                .and_then(|stats| stats.anon_bytes)
+                .map(|bytes| bytes / MIB)
+                .unwrap_or(0);
+            (u64::from(r.mem), private_mib)
+        })
+        .collect()
+}
+
 /// The branch admission parameters for a host with `total_mib` of effective
 /// memory, or `None` when admission is turned off with
 /// `SMOLVM_BRANCH_MEMORY_ADMISSION=0`.
@@ -803,19 +852,21 @@ fn branch_admission_required_mib(
 /// guest RAM for the private pages it will dirty (not its whole configured
 /// guest, which would erase COW density), on top of what a fresh shared
 /// generation copies—the source's private pages since its last capture. The
+/// growth already promised to running children (`owed_children`, see
+/// [`branch_growth_owed_mib`]) is held back from the free memory first. The
 /// VM slice's memory cap and the memory pressure guard bound what children
 /// write beyond that.
 fn admit_branch_memory(
     record: &VmRecord,
     children: usize,
     materializes_shared_generation: bool,
+    owed_children: &[(u64, u64)],
 ) -> Result<()> {
     let Some(memory) = crate::process::host_memory_stats() else {
         return Ok(());
     };
     const MIB: u64 = 1024 * 1024;
     let total_mib = memory.total_bytes / MIB;
-    let available_mib = memory.available_bytes / MIB;
     let Some(BranchAdmissionParams {
         reserve_mib,
         child_overhead_mib,
@@ -824,6 +875,12 @@ fn admit_branch_memory(
     else {
         return Ok(());
     };
+    let owed_mib = branch_growth_owed_mib(
+        owed_children.iter().copied(),
+        child_overhead_mib,
+        child_growth_fraction,
+    );
+    let available_mib = (memory.available_bytes / MIB).saturating_sub(owed_mib);
     let materialized_generation_mib = if materializes_shared_generation {
         record
             .pid
@@ -850,7 +907,7 @@ fn admit_branch_memory(
     .ok_or_else(|| Error::agent("fork memory admission", "memory estimate overflow"))?;
     if available_mib < required_mib {
         return Err(Error::vm_creation(format!(
-            "branch needs at least {required_mib} MiB of effective host headroom for {children} children, but only {available_mib} MiB is available; reduce the batch, free memory, or tune SMOLVM_HOST_MEMORY_RESERVE_MIB/SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD/SMOLVM_BRANCH_CHILD_GROWTH_FRACTION"
+            "branch needs at least {required_mib} MiB of effective host headroom for {children} children, but only {available_mib} MiB is available after {owed_mib} MiB promised to running branch children; reduce the batch, free memory, or tune SMOLVM_HOST_MEMORY_RESERVE_MIB/SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD/SMOLVM_BRANCH_CHILD_GROWTH_FRACTION"
         )));
     }
     tracing::debug!(
@@ -862,6 +919,7 @@ fn admit_branch_memory(
         child_growth_fraction,
         per_child_mib,
         materialized_generation_mib,
+        owed_mib,
         "branch memory admission passed"
     );
     Ok(())
@@ -2892,6 +2950,7 @@ pub(crate) fn prepare_forks_reusing(
         &golden_rec,
         specs.len(),
         reusable.is_none() && live_ram_mode == Some(LiveBranchRamMode::Shared),
+        &running_branch_children(recorded.iter().map(|(_, record)| record)),
     )?;
     let (snapshot_dir, snapshot_reused) = if let Some(snapshot) = reusable {
         tracing::info!(
@@ -4968,6 +5027,50 @@ tmpfs /tmp tmpfs rw 0 0
         let required = |n| branch_admission_required_mib(n, 8256, 46387, 0).unwrap();
         assert!(required(19) <= 200 * 1024);
         assert!(required(20) > 200 * 1024);
+    }
+
+    #[test]
+    fn growth_owed_is_each_childs_charge_less_what_it_already_holds() {
+        // 16 GiB children charged 64 MiB + 25%: 4160 MiB each.
+        let charge = branch_child_charge_mib(64, 0.25, 16384);
+        assert_eq!(charge, 4160);
+        // Fresh, half grown, and grown past its charge (owes nothing, never negative).
+        let children = [(16384, 0), (16384, 2080), (16384, 9000)];
+        assert_eq!(branch_growth_owed_mib(children, 64, 0.25), 4160 + 2080);
+        // No growth charge (laptops): only the boot overhead is owed until used.
+        assert_eq!(
+            branch_growth_owed_mib([(16384, 0), (16384, 100)], 64, 0.0),
+            64
+        );
+        assert_eq!(branch_growth_owed_mib(std::iter::empty(), 64, 0.25), 0);
+    }
+
+    #[test]
+    fn a_burst_of_batches_is_refused_once_promised_growth_fills_the_host() {
+        // 2026-11-15: 722 GiB free, 45 GiB reserve, 16 GiB children charged
+        // 4160 MiB each. Without the owed growth every batch saw 722 GiB free
+        // and all 244 children got in; with it admission stops near 162.
+        let available_mib = 722 * 1024;
+        let reserve_mib = 45 * 1024;
+        let per_child = branch_child_charge_mib(64, 0.25, 16384);
+        let mut running: Vec<(u64, u64)> = Vec::new();
+        let mut admitted = 0;
+        for _batch in 0..61 {
+            let owed = branch_growth_owed_mib(running.iter().copied(), 64, 0.25);
+            let free = u64::saturating_sub(available_mib, owed);
+            let required = branch_admission_required_mib(4, per_child, reserve_mib, 0).unwrap();
+            if free >= required {
+                running.extend([(16384, 0); 4]);
+                admitted += 4;
+            }
+        }
+        assert!(admitted < 244, "admitted {admitted}");
+        assert!(
+            admitted as u64 * per_child <= available_mib - reserve_mib,
+            "promised {} MiB of {} MiB",
+            admitted as u64 * per_child,
+            available_mib - reserve_mib
+        );
     }
 
     #[test]
