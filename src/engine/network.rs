@@ -393,11 +393,16 @@ impl Networks {
         Err(ApiError::internal("no free IPv6 subnet for a new network"))
     }
 
-    fn remove(&self, store: &Store, id: &str) {
-        if let Some(r) = self.records.write().remove(id) {
-            store.remove_object("networks", &r.id);
+    fn remove(&self, store: &Store, id: &str) -> ApiResult<()> {
+        let mut records = self.records.write();
+        if let Some(r) = records.get(id) {
+            store
+                .remove_object("networks", &r.id)
+                .map_err(ApiError::from)?;
             let _ = std::fs::remove_dir_all(self.dir.join("n").join(r.short()));
+            records.remove(id);
         }
+        Ok(())
     }
 }
 
@@ -1254,7 +1259,7 @@ async fn remove(
     }
     {
         let _lock = lock_network(&engine).await?;
-        engine.networks.remove(&engine.store, &n.id);
+        engine.networks.remove(&engine.store, &n.id)?;
     }
     network_event(&engine, "destroy", &n, None);
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1272,7 +1277,7 @@ async fn prune(
         }
         {
             let _lock = lock_network(&engine).await?;
-            engine.networks.remove(&engine.store, &n.id);
+            engine.networks.remove(&engine.store, &n.id)?;
         }
         network_event(&engine, "destroy", &n, None);
         deleted.push(n.name);
@@ -1455,6 +1460,43 @@ mod tests {
         assert_eq!(mode_network(""), "bridge");
         assert_eq!(mode_network("host"), "bridge");
         assert_eq!(mode_network("proj_default"), "proj_default");
+    }
+
+    #[test]
+    fn failed_record_removal_preserves_network_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let socket = dir.path().join("run/docker.sock");
+        let nets = Networks::load(&store, &socket).unwrap();
+        let network = nets
+            .create(
+                &store,
+                NetworkCreateRequest {
+                    name: "retained".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let records = dir.path().join("networks");
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = nets.remove(&store, &network.id);
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(nets.find("retained").is_some());
+        assert!(Networks::load(&store, &socket)
+            .unwrap()
+            .find("retained")
+            .is_some());
+        nets.remove(&store, &network.id).unwrap();
+        assert!(nets.find("retained").is_none());
+        assert!(Networks::load(&store, &socket)
+            .unwrap()
+            .find("retained")
+            .is_none());
     }
 
     #[test]

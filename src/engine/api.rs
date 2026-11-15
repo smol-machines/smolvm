@@ -1554,12 +1554,11 @@ async fn volume_prune(State(engine): S, Query(q): Q) -> ApiResult<Json<serde_jso
         if !f.labels_match("label", &v.labels) {
             continue;
         }
-        if engine.volumes.remove(&engine.store, &v.name).is_ok() {
-            engine
-                .events
-                .emit("volume", "destroy", &v.name, BTreeMap::new());
-            deleted.push(v.name);
-        }
+        engine.volumes.remove(&engine.store, &v.name)?;
+        engine
+            .events
+            .emit("volume", "destroy", &v.name, BTreeMap::new());
+        deleted.push(v.name);
     }
     Ok(Json(
         serde_json::json!({"VolumesDeleted": deleted, "SpaceReclaimed": 0}),
