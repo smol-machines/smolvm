@@ -25,6 +25,8 @@ impl TerminalWindow {
             .id(egui::Id::unique("guest-terminal"))
             .open(&mut open)
             .default_size([860.0, 500.0])
+            .default_pos(ctx.content_rect().center() - egui::vec2(430.0, 250.0))
+            .collapsible(false)
             .min_size([420.0, 240.0])
             .show(ctx, |ui| {
                 let mut state = self.terminal.state.lock().unwrap();

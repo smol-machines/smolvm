@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory() as temporary:
             plistlib.dump({'CFBundleName': 'Smol Studio', 'CFBundleDisplayName': 'Smol Studio',
                           'CFBundleIdentifier': 'com.smolmachines.studio', 'CFBundleExecutable': 'smol-studio',
                           'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version,
-                          'CFBundleVersion': version, 'NSHighResolutionCapable': True}, file)
+                          'CFBundleVersion': version, 'NSHighResolutionCapable': True, 'CFBundleIconFile': 'SmolStudio.icns'}, file)
     else:
         binaries = root
     studio = 'smol-studio.exe' if system == 'windows' else 'smol-studio'
@@ -108,6 +108,15 @@ with tempfile.TemporaryDirectory() as temporary:
         shutil.copy2(app / 'packaging' / 'smol-studio.svg', root)
         (root / 'smol-studio.desktop').write_text('[Desktop Entry]\nType=Application\nName=Smol Studio\nExec=smol-studio\nIcon=smol-studio\nTerminal=false\nCategories=Development;System;\n')
     if system == 'darwin':
+        iconset = temporary / 'SmolStudio.iconset'
+        iconset.mkdir()
+        for size in (16, 32, 128, 256, 512):
+            for scale in (1, 2):
+                label = f'icon_{size}x{size}' + ('@2x' if scale == 2 else '') + '.png'
+                subprocess.run(['sips', '-z', str(size * scale), str(size * scale),
+                                str(app / 'packaging/smol-studio.png'), '--out', str(iconset / label)],
+                               check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(['iconutil', '-c', 'icns', str(iconset), '-o', str(resources / 'SmolStudio.icns')], check=True)
         # Distribution signing/notarization is a release step; this enables local testing.
         subprocess.run(['codesign', '--force', '--sign', '-', str(bundle)], check=True)
     if system == 'linux':

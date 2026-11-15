@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod cloud_ui;
+mod design;
 mod docker_ui;
 mod terminal_ui;
 mod ui;
@@ -44,9 +45,12 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Smol Studio")
             .with_app_id("com.smolmachines.studio")
-            .with_inner_size([1120.0, 740.0])
-            .with_min_inner_size([900.0, 600.0])
-            .with_icon(egui::IconData::default()),
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([960.0, 640.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../packaging/smol-studio.png"))
+                    .expect("bundled Studio icon"),
+            ),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
