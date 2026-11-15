@@ -12,8 +12,8 @@ fn main() -> eframe::Result {
     let mut runtime = Runtime::discover();
     match smol_studio::preferences::Preferences::load() {
         Ok(p) => {
-            if std::env::var_os("SMOL_STUDIO_RUNTIME").is_none()
-                && let Some(path) = p.runtime
+            if std::env::var_os("SMOL_STUDIO_CLI").is_none()
+                && let Some(path) = p.smol_cli
             {
                 runtime.executable = path;
             }
@@ -23,13 +23,10 @@ fn main() -> eframe::Result {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--runtime") => runtime.executable = path_argument(&mut args, "--runtime"),
-            Some("--state-dir") => {
-                runtime.state_dir = Some(path_argument(&mut args, "--state-dir"))
-            }
+            Some("--cli") => runtime.executable = path_argument(&mut args, "--cli"),
             Some("--help" | "-h") => {
                 println!(
-                    "Smol Studio\n\nUsage: smol-studio [--runtime PATH] [--state-dir PATH]\n\nThe runtime is found beside Studio, on PATH, or through SMOL_STUDIO_RUNTIME.\nClosing Studio leaves machines running."
+                    "Smol Studio\n\nUsage: smol-studio [--cli PATH]\n\nThe Smol CLI is found beside Studio, on PATH, or through SMOL_STUDIO_CLI.\nClosing Studio leaves machines running."
                 );
                 return Ok(());
             }

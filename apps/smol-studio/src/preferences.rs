@@ -7,7 +7,7 @@ use std::{
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Preferences {
-    pub runtime: Option<PathBuf>,
+    pub smol_cli: Option<PathBuf>,
     #[serde(default)]
     pub use_cli_session: bool,
 }

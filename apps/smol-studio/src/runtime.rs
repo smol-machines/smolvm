@@ -25,7 +25,7 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn discover() -> Self {
-        let executable = std::env::var_os("SMOL_STUDIO_RUNTIME")
+        let executable = std::env::var_os("SMOL_STUDIO_CLI")
             .map(PathBuf::from)
             .unwrap_or_else(|| find_tool(executable_name()));
         Self {
@@ -35,14 +35,26 @@ impl Runtime {
     }
 
     pub fn args(&self, op: &Operation) -> Result<Vec<OsString>, String> {
-        let mut args: Vec<OsString> = vec!["--error-format".into(), "json".into()];
-        if let Some(path) = &self.state_dir {
-            args.extend(["--state-dir".into(), path.as_os_str().to_owned()]);
+        let mut args: Vec<OsString> = Vec::new();
+        // The SDK documents this engine entry point for introspection that
+        // the public machine noun does not expose without starting a guest.
+        if matches!(op, Operation::Logs(_) | Operation::Stats(_)) {
+            args.push("_engine".into());
         }
         args.push("machine".into());
         match op {
-            Operation::Resume(name) => args.extend(["resume".into(), "--name".into(), name.into()]),
-            Operation::Pause(name) => args.extend(["pause".into(), "--name".into(), name.into()]),
+            Operation::Resume(name) => args.extend([
+                "resume".into(),
+                "--local".into(),
+                "--name".into(),
+                name.into(),
+            ]),
+            Operation::Pause(name) => args.extend([
+                "pause".into(),
+                "--local".into(),
+                "--name".into(),
+                name.into(),
+            ]),
             Operation::Stats(name) => args.extend([
                 "stats".into(),
                 "--name".into(),
@@ -55,17 +67,18 @@ impl Runtime {
                 }
                 args.extend([
                     "exec".into(),
+                    "--local".into(),
                     "--name".into(),
                     name.into(),
                     "--timeout".into(),
-                    "60s".into(),
+                    "60".into(),
                     "--".into(),
                     "/bin/sh".into(),
                     "-lc".into(),
                     command.into(),
                 ]);
             }
-            Operation::Refresh => args.extend(["ls".into(), "--json".into()]),
+            Operation::Refresh => args.extend(["ls".into(), "--local".into(), "--json".into()]),
             Operation::Logs(name) => args.extend([
                 "logs".into(),
                 "--name".into(),
@@ -73,18 +86,30 @@ impl Runtime {
                 "--tail".into(),
                 "200".into(),
             ]),
-            Operation::Start(name) => args.extend(["start".into(), "--name".into(), name.into()]),
-            Operation::Stop(name) => args.extend(["stop".into(), "--name".into(), name.into()]),
-            Operation::Delete(name) => args.extend([
-                "delete".into(),
+            Operation::Start(name) => args.extend([
+                "start".into(),
+                "--local".into(),
                 "--name".into(),
                 name.into(),
-                "--force".into(),
+            ]),
+            Operation::Stop(name) => args.extend([
+                "stop".into(),
+                "--local".into(),
+                "--name".into(),
+                name.into(),
+            ]),
+            Operation::Delete(name) => args.extend([
+                "rm".into(),
+                "--local".into(),
+                "--name".into(),
+                name.into(),
+                "--yes".into(),
             ]),
             Operation::Create(m) => {
                 m.validate()?;
                 args.extend([
                     "create".into(),
+                    "--local".into(),
                     "--name".into(),
                     m.name.clone().into(),
                     "--cpus".into(),
@@ -128,10 +153,20 @@ impl Runtime {
             .extension()
             .is_none_or(|ext| !ext.eq_ignore_ascii_case("exe"))
         {
-            return Err("Choose smolvm.exe; script launchers are not supported.".into());
+            return Err("Choose smol.exe; script launchers are not supported.".into());
         }
         let args = self.args(op)?;
         let mut command = Command::new(&self.executable);
+        if let Some(path) = &self.state_dir {
+            command.env("SMOLVM_DATA_DIR", path);
+            // Released 1.35 CLIs predate the data-root entry-point fix.
+            // XDG paths also isolate those builds on Linux.
+            #[cfg(target_os = "linux")]
+            command
+                .env("XDG_DATA_HOME", path.join("data"))
+                .env("XDG_CONFIG_HOME", path.join("config"))
+                .env("XDG_CACHE_HOME", path.join("cache"));
+        }
         command
             .args(args)
             .env("NO_COLOR", "1")
@@ -202,6 +237,11 @@ pub fn find_tool(name: &str) -> PathBuf {
         }
 
         candidates.push(parent.join("runtime/bin").join(name));
+        candidates.push(parent.join("engine").join(name));
+        #[cfg(target_os = "macos")]
+        if let Some(contents) = parent.parent() {
+            candidates.push(contents.join("Resources/engine").join(name));
+        }
     }
     if let Some(path) = std::env::var_os("PATH") {
         candidates.extend(std::env::split_paths(&path).map(|p| p.join(name)));
@@ -230,11 +270,7 @@ pub fn find_tool(name: &str) -> PathBuf {
 }
 
 fn executable_name() -> &'static str {
-    if cfg!(windows) {
-        "smolvm.exe"
-    } else {
-        "smolvm"
-    }
+    if cfg!(windows) { "smol.exe" } else { "smol" }
 }
 
 /// File captures avoid pipe-reader threads and inherited pipes held open by
@@ -440,7 +476,8 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        assert_eq!(args[3], "/state with spaces");
+        assert!(args.contains(&"--local".into()));
+        assert!(!args.contains(&"--state-dir".into()));
         assert_eq!(args.last().unwrap(), "/images/a $(touch bad).tar");
         assert!(!args.iter().any(|a| a == "--net"));
         let logs = runtime
@@ -521,7 +558,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(args.last().unwrap(), script);
-        assert!(args.windows(2).any(|w| w == ["--timeout", "60s"]));
+        assert!(args.windows(2).any(|w| w == ["--timeout", "60"]));
     }
     #[test]
     #[cfg(unix)]
@@ -539,5 +576,69 @@ mod tests {
         assert_eq!(result.stderr, b"err");
         assert_eq!(result.code, Some(7));
         assert!(!result.success);
+    }
+    #[test]
+    #[ignore = "boots an isolated local VM through the Smol CLI"]
+    fn live_public_smol_cli_lifecycle() {
+        let executable = std::env::var_os("SMOL_STUDIO_TEST_CLI").expect("matching Smol CLI path");
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime {
+            executable: executable.into(),
+            state_dir: Some(directory.path().into()),
+        };
+        let shutdown = AtomicBool::new(false);
+        let rows = runtime.execute(&Operation::Refresh, &shutdown).unwrap();
+        assert!(
+            matches!(rows, Payload::Machines(rows) if rows.is_empty()),
+            "Fixture must be isolated before any mutation"
+        );
+        let name = "studio-cli-smoke".to_string();
+        let machine = NewMachine {
+            name: name.clone(),
+            image: "alpine:3.22".into(),
+            cpus: 1,
+            memory_mib: 512,
+            ..Default::default()
+        };
+        runtime
+            .execute(&Operation::Create(machine), &shutdown)
+            .unwrap();
+        let result: Result<(), String> = (|| {
+            runtime.execute(&Operation::Logs(name.clone()), &shutdown)?;
+            let rows = runtime.execute(&Operation::Refresh, &shutdown)?;
+            if !matches!(rows, Payload::Machines(rows) if rows.len() == 1 && rows[0].state == "created")
+            {
+                return Err("Reading logs changed machine state".into());
+            }
+            runtime.execute(&Operation::Start(name.clone()), &shutdown)?;
+            let output = runtime.execute(
+                &Operation::Exec {
+                    name: name.clone(),
+                    command: "printf studio-cli-ok; exit 7".into(),
+                },
+                &shutdown,
+            )?;
+            if !matches!(output, Payload::Output { text, .. } if text.contains("studio-cli-ok") && text.contains("Exit status: 7"))
+            {
+                return Err("Unexpected command output".into());
+            }
+            runtime.execute(&Operation::Stats(name.clone()), &shutdown)?;
+            runtime.execute(&Operation::Pause(name.clone()), &shutdown)?;
+            runtime.execute(&Operation::Resume(name.clone()), &shutdown)?;
+            runtime.execute(&Operation::Stop(name.clone()), &shutdown)?;
+            runtime.execute(&Operation::Logs(name.clone()), &shutdown)?;
+            Ok(())
+        })();
+        if let Err(error) = runtime.execute(&Operation::Delete(name), &shutdown) {
+            let retained = directory.keep();
+            panic!("Cleanup failed; retained {}: {error}", retained.display());
+        }
+        result.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(runtime.execute(&Operation::Refresh, &shutdown).unwrap(), Payload::Machines(rows) if rows.is_empty())
+        );
+        println!(
+            "Smol CLI create/start/exec/stats/pause/resume/stop/delete passed; logs did not start the guest."
+        );
     }
 }

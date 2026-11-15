@@ -87,7 +87,7 @@ impl Studio {
             inventory_valid: false,
             error: None,
             refresh_error: false,
-            activity: "Connecting to SmolVM…".into(),
+            activity: "Connecting to Smol…".into(),
             create: None,
             delete: None,
             settings: false,
@@ -139,7 +139,7 @@ impl Studio {
                         self.logs = None;
                         self.tab = Tab::Overview;
                     }
-                    if self.activity == "Connecting to SmolVM…" {
+                    if self.activity == "Connecting to Smol…" {
                         self.activity = "Ready".into();
                     }
                 }
@@ -347,8 +347,8 @@ impl Studio {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
                 if !self.inventory_valid {
-                    ui.heading("Connect to SmolVM");
-                    ui.label("Choose your installed runtime in Settings, then refresh.");
+                    ui.heading("Connect to Smol");
+                    ui.label("Choose your Smol CLI in Settings, then refresh.");
                     if ui.button("Open settings").clicked() {
                         self.settings = true;
                     }
@@ -761,21 +761,21 @@ impl Studio {
         if self.settings {
             let mut open = true;
             egui::Window::new("Settings").anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).collapsible(false).resizable(false).default_width(500.0).open(&mut open).show(ctx, |ui| {
-                ui.label("SmolVM executable");
+                ui.label("Smol CLI executable");
                 ui.add(egui::TextEdit::singleline(&mut self.runtime_path).desired_width(f32::INFINITY));
-                ui.label(RichText::new("Studio uses your existing SmolVM installation. The selected path is saved for your next launch.").small().color(MUTED));
+                ui.label(RichText::new("Studio uses the Smol CLI bundled with the app or installed on your computer. The selected path is saved for your next launch.").small().color(MUTED));
                 if let Some(path) = &self.runtime.state_dir {
                     ui.label(format!("State directory: {}", path.display()));
                 }
                 ui.add_space(16.0);
                 if ui.add_enabled(self.pending.is_none() && !self.runtime_path.trim().is_empty(), egui::Button::new("Connect")).clicked() {
                     let mut preferences = match smol_studio::preferences::Preferences::load() { Ok(p) => p, Err(e) => { self.error = Some(e); return; } };
-                    preferences.runtime = Some(self.runtime_path.trim().into());
+                    preferences.smol_cli = Some(self.runtime_path.trim().into());
                     if let Err(e) = preferences.save() { self.error = Some(e); return; }
                     self.runtime.executable = self.runtime_path.trim().into();
                     self.inventory_valid = false;
                     self.machines.clear(); self.selected = None; self.logs = None; self.error = None;
-                    self.activity = "Connecting to SmolVM…".into();
+                    self.activity = "Connecting to Smol…".into();
                     self.settings = false;
                     self.submit(Operation::Refresh);
                 }

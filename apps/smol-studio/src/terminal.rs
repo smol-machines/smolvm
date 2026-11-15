@@ -29,11 +29,16 @@ impl Terminal {
     pub fn start(runtime: Runtime, name: String, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let mut command = CommandBuilder::new(runtime.executable);
         if let Some(path) = runtime.state_dir {
-            command.arg("--state-dir");
-            command.arg(path);
+            command.env("SMOLVM_DATA_DIR", &path);
+            #[cfg(target_os = "linux")]
+            {
+                command.env("XDG_DATA_HOME", path.join("data"));
+                command.env("XDG_CONFIG_HOME", path.join("config"));
+                command.env("XDG_CACHE_HOME", path.join("cache"));
+            }
         }
         command.args([
-            "machine", "exec", "--name", &name, "-it", "--", "/bin/sh", "-l",
+            "machine", "exec", "--local", "--name", &name, "-it", "--", "/bin/sh", "-l",
         ]);
         command.env("TERM", "xterm-256color");
         command.env("RUST_LOG", "error");

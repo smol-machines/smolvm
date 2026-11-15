@@ -107,7 +107,11 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
 fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<Output, String> {
     let mut command;
     if matches!(action, Action::Status | Action::Configure) {
-        command = Command::new(&runtime.executable);
+        command = Command::new(crate::runtime::find_tool(if cfg!(windows) {
+            "smolvm.exe"
+        } else {
+            "smolvm"
+        }));
         command.args(["--error-format", "json"]);
         if let Some(path) = &runtime.state_dir {
             command.arg("--state-dir").arg(path);
