@@ -8,7 +8,7 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 
-type Selection = Option<rfd::FileHandle>;
+type Selection = Option<Vec<rfd::FileHandle>>;
 
 #[derive(Default)]
 pub struct FilePicker {
@@ -32,7 +32,7 @@ impl FilePicker {
         if let Some(parent) = Path::new(current).parent().filter(|p| p.is_absolute()) {
             dialog = dialog.set_directory(parent);
         }
-        self.pending = Some(Box::pin(dialog.pick_file()));
+        self.pending = Some(Box::pin(dialog.pick_files()));
         ctx.request_repaint();
     }
 

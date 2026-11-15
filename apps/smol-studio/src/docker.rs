@@ -3,7 +3,6 @@
 use crate::runtime::{Runtime, capture};
 use serde_json::Value;
 use std::{
-    path::PathBuf,
     process::Command,
     sync::{
         Arc,
@@ -65,9 +64,10 @@ pub enum Action {
         action: ProjectAction,
     },
     Compose {
-        file: PathBuf,
+        source: crate::compose::Source,
         up: bool,
     },
+    ForgetProject(String),
 }
 impl Action {
     pub fn mutates(&self) -> bool {
@@ -89,11 +89,18 @@ impl Action {
 }
 pub enum Output {
     Rows(Kind, Vec<Value>),
-    Projects(Vec<crate::compose::Project>),
+    Projects(Vec<crate::compose::Project>, Option<String>),
+    ComposeApplied {
+        name: String,
+        warning: Option<String>,
+    },
     Storage(crate::storage::Details),
     Text(String),
     Details(Box<crate::container_details::ContainerDetails>),
-    Stats { id: String, value: Value },
+    Stats {
+        id: String,
+        value: Value,
+    },
     Completed,
 }
 pub struct Completion {
@@ -190,15 +197,8 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
             }
             args.push(id.clone());
         }
-        Action::Compose { file, up } => {
-            if !file.is_absolute() || !file.is_file() {
-                return Err("Choose the absolute path to an existing Compose file.".into());
-            }
-            args.extend([
-                "compose".into(),
-                "--file".into(),
-                file.to_string_lossy().into_owned(),
-            ]);
+        Action::Compose { source, up } => {
+            args = source.args()?;
             if *up {
                 args.extend(["up".into(), "--detach".into()]);
             } else {
@@ -234,6 +234,13 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
     if let Action::Project { name, action } = action {
         return project_action(runtime, name, action, shutdown);
     }
+    if let Action::Compose { source, up } = action {
+        return apply_compose(runtime, source, *up, shutdown);
+    }
+    if let Action::ForgetProject(name) = action {
+        crate::compose::save_source(&crate::compose::source_store(runtime)?, name, None)?;
+        return Ok(Output::Completed);
+    }
     let mut command;
     if matches!(action, Action::Status | Action::Configure) {
         command = Command::new(crate::runtime::find_tool(if cfg!(windows) {
@@ -260,11 +267,6 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
         command
             .env_remove("DOCKER_HOST")
             .env_remove("DOCKER_CONTEXT");
-        if let Action::Compose { file, .. } = action
-            && let Some(parent) = file.parent()
-        {
-            command.current_dir(parent);
-        }
     }
     command.env("NO_COLOR", "1").env("RUST_LOG", "error");
     #[cfg(windows)]
@@ -337,7 +339,19 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
             }
             Ok(Output::Storage(details))
         }
-        Action::Projects => Ok(Output::Projects(crate::compose::parse(&bytes)?)),
+        Action::Projects => {
+            let mut projects = crate::compose::parse(&bytes)?;
+            let warning = match crate::compose::source_store(runtime)
+                .and_then(|path| crate::compose::load_sources(&path))
+            {
+                Ok(sources) => {
+                    crate::compose::attach_sources(&mut projects, sources);
+                    None
+                }
+                Err(error) => Some(error),
+            };
+            Ok(Output::Projects(projects, warning))
+        }
         Action::List(kind) => {
             let rows = bytes
                 .split(|b| *b == b'\n')
@@ -373,6 +387,73 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
     }
 }
 
+fn compose_command(source: &crate::compose::Source) -> Result<Command, String> {
+    let mut command = docker_command();
+    command.args(source.args()?);
+    command.current_dir(
+        source.files[0]
+            .parent()
+            .ok_or("Compose file has no parent directory.")?,
+    );
+    // The Studio form defines the files and identity; unrelated shell control
+    // variables must not silently change which project or services are applied.
+    for key in [
+        "COMPOSE_FILE",
+        "COMPOSE_PROJECT_NAME",
+        "COMPOSE_PROFILES",
+        "COMPOSE_ENV_FILES",
+        "COMPOSE_DISABLE_ENV_FILE",
+        "COMPOSE_PATH_SEPARATOR",
+    ] {
+        command.env_remove(key);
+    }
+    Ok(command)
+}
+
+fn apply_compose(
+    runtime: &Runtime,
+    source: &crate::compose::Source,
+    up: bool,
+    shutdown: &AtomicBool,
+) -> Result<Output, String> {
+    let mut source = source.clone();
+    if source.name.is_none() {
+        let mut command = compose_command(&source)?;
+        command.args(["config", "--format", "json"]);
+        let bytes = capture(
+            &mut command,
+            Duration::from_secs(30),
+            4 * 1024 * 1024,
+            shutdown,
+        )?;
+        // Deserialize only identity, never retain or display expanded environment.
+        source.name = Some(crate::compose::resolved_name(&bytes)?);
+    }
+    let name = source.name.clone().unwrap();
+    let mut command = compose_command(&source)?;
+    if up {
+        command.args(["up", "--detach"]);
+    } else {
+        command.arg("down");
+    }
+    capture(
+        &mut command,
+        Duration::from_secs(600),
+        4 * 1024 * 1024,
+        shutdown,
+    )?;
+    let warning = crate::compose::source_store(runtime)
+        .and_then(|path| crate::compose::save_source(&path, &name, Some(source)))
+        .err()
+        .map(|e| {
+            format!(
+                "Project {name} was {}, but Studio could not remember its files: {e}",
+                if up { "applied" } else { "removed" }
+            )
+        });
+    Ok(Output::ComposeApplied { name, warning })
+}
+
 fn project_action(
     runtime: &Runtime,
     name: &str,
@@ -381,7 +462,7 @@ fn project_action(
 ) -> Result<Output, String> {
     // Resolve exact project membership again when the action executes, rather
     // than trusting a stale UI selection or Docker's substring name filters.
-    let Output::Projects(projects) = execute(runtime, &Action::Projects, shutdown)? else {
+    let Output::Projects(projects, _) = execute(runtime, &Action::Projects, shutdown)? else {
         unreachable!();
     };
     let project = projects
@@ -550,6 +631,7 @@ impl Drop for DockerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     #[test]
     fn storage_commands_are_explicit_and_never_force_or_prune() {
         let id = format!("sha256:{}", "a".repeat(64));
@@ -772,7 +854,7 @@ mod tests {
         assert_ne!(name, other);
         let shutdown = AtomicBool::new(false);
         let inventory = || match execute(&runtime, &Action::Projects, &shutdown).unwrap() {
-            Output::Projects(projects) => projects,
+            Output::Projects(projects, _) => projects,
             _ => panic!("Expected Compose projects"),
         };
         let initial = inventory();
@@ -854,13 +936,150 @@ mod tests {
         let file = dir.path().join("project with spaces.yml");
         std::fs::write(&file, "services: {}").unwrap();
         let args = docker_args(&Action::Compose {
-            file: file.clone(),
+            source: crate::compose::Source::single(file.clone()),
             up: false,
         })
         .unwrap();
         assert_eq!(args[4], file.to_string_lossy());
         assert_eq!(args.last().unwrap(), "down");
         assert!(!args.iter().any(|a| a == "--volumes"));
+    }
+
+    #[test]
+    #[ignore = "creates and removes an explicitly owned multi-file Compose project in an isolated smol context"]
+    fn live_compose_sources() {
+        use crate::compose::{Source, load_sources, source_store};
+        let root = PathBuf::from(
+            std::env::var_os("SMOL_STUDIO_SOURCE_TEST_ROOT").expect("isolated state directory"),
+        );
+        let image = std::env::var("SMOL_STUDIO_SOURCE_TEST_IMAGE").expect("fixture image");
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime = Runtime {
+            executable: "unused-by-compose".into(),
+            state_dir: Some(root.clone()),
+        };
+        let shutdown = AtomicBool::new(false);
+        let base = root.join("base, with spaces.yaml");
+        let overlay = root.join("override.yaml");
+        std::fs::write(&base, format!("name: studio-sources-base\nservices:\n  web:\n    image: {image}\n    command: [sleep, '300']\n    environment:\n      SOURCE_VALUE: base\n")).unwrap();
+        std::fs::write(&overlay, "name: studio-sources-owned\nservices:\n  web:\n    environment:\n      SOURCE_VALUE: override\n").unwrap();
+        let source = Source {
+            files: vec![base.clone(), overlay.clone()],
+            name: None,
+        };
+        match execute(
+            &runtime,
+            &Action::Compose {
+                source: source.clone(),
+                up: true,
+            },
+            &shutdown,
+        )
+        .unwrap()
+        {
+            Output::ComposeApplied { name, warning } => {
+                assert_eq!(name, "studio-sources-owned");
+                assert!(warning.is_none());
+            }
+            _ => panic!("Expected resolved project identity"),
+        }
+        let stored = load_sources(&source_store(&runtime).unwrap())
+            .unwrap()
+            .remove("studio-sources-owned")
+            .unwrap();
+        assert_eq!(stored.files, source.files);
+        assert_eq!(stored.name.as_deref(), Some("studio-sources-owned"));
+        let Output::Projects(projects, None) =
+            execute(&runtime, &Action::Projects, &shutdown).unwrap()
+        else {
+            panic!("Expected projects")
+        };
+        let project = projects
+            .iter()
+            .find(|p| p.name == "studio-sources-owned")
+            .unwrap();
+        assert_eq!(project.source.as_ref(), Some(&stored));
+        assert_eq!(project.running(), 1);
+        let mut inspect = docker_command();
+        inspect.args([
+            "--context",
+            "smol",
+            "inspect",
+            &project.containers[0].id,
+            "--format",
+            "{{json .Config.Env}}",
+        ]);
+        let env: Vec<String> = serde_json::from_slice(
+            &capture(&mut inspect, Duration::from_secs(20), 4096, &shutdown).unwrap(),
+        )
+        .unwrap();
+        assert!(env.iter().any(|v| v == "SOURCE_VALUE=override"));
+        // A name edit in the source must not redirect a saved project's actions.
+        std::fs::write(&overlay, "name: studio-sources-unexpected\nservices:\n  web:\n    environment:\n      SOURCE_VALUE: changed\n").unwrap();
+        execute(
+            &runtime,
+            &Action::Compose {
+                source: stored.clone(),
+                up: true,
+            },
+            &shutdown,
+        )
+        .unwrap();
+        let Output::Projects(projects, _) =
+            execute(&runtime, &Action::Projects, &shutdown).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(
+            !projects
+                .iter()
+                .any(|p| p.name == "studio-sources-unexpected")
+        );
+        assert_eq!(
+            projects
+                .iter()
+                .find(|p| p.name == "studio-sources-owned")
+                .unwrap()
+                .running(),
+            1
+        );
+        execute(
+            &runtime,
+            &Action::Compose {
+                source: stored.clone(),
+                up: false,
+            },
+            &shutdown,
+        )
+        .unwrap();
+        let Output::Projects(projects, _) =
+            execute(&runtime, &Action::Projects, &shutdown).unwrap()
+        else {
+            unreachable!()
+        };
+        let project = projects
+            .iter()
+            .find(|p| p.name == "studio-sources-owned")
+            .unwrap();
+        assert!(project.containers.is_empty());
+        assert_eq!(project.source.as_ref(), Some(&stored));
+        assert!(
+            !std::fs::read_to_string(source_store(&runtime).unwrap())
+                .unwrap()
+                .contains("SOURCE_VALUE")
+        );
+        execute(
+            &runtime,
+            &Action::ForgetProject("studio-sources-owned".into()),
+            &shutdown,
+        )
+        .unwrap();
+        assert!(
+            load_sources(&source_store(&runtime).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(base.exists() && overlay.exists());
     }
     #[test]
     #[ignore = "uses a preconfigured isolated smol Docker context and test container"]
@@ -906,17 +1125,25 @@ mod tests {
         execute(&runtime, &Action::Stop(id.clone()), &shutdown).unwrap();
         execute(&runtime, &Action::Delete(id), &shutdown).unwrap();
         if let Some(file) = std::env::var_os("SMOL_STUDIO_TEST_COMPOSE") {
-            let file = PathBuf::from(file);
+            let file = std::path::PathBuf::from(file);
             execute(
                 &runtime,
                 &Action::Compose {
-                    file: file.clone(),
+                    source: crate::compose::Source::single(file.clone()),
                     up: true,
                 },
                 &shutdown,
             )
             .unwrap();
-            execute(&runtime, &Action::Compose { file, up: false }, &shutdown).unwrap();
+            execute(
+                &runtime,
+                &Action::Compose {
+                    source: crate::compose::Source::single(file),
+                    up: false,
+                },
+                &shutdown,
+            )
+            .unwrap();
         }
     }
 }

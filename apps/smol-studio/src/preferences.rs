@@ -11,7 +11,7 @@ pub struct Preferences {
     #[serde(default)]
     pub use_cli_session: bool,
 }
-fn directory() -> Result<PathBuf, String> {
+pub(crate) fn directory() -> Result<PathBuf, String> {
     directories::ProjectDirs::from("com", "smolmachines", "studio")
         .map(|d| d.config_dir().to_path_buf())
         .ok_or("Cannot locate the Studio settings directory.".into())
