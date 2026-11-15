@@ -182,6 +182,16 @@ mod tests {
 
     fn ask(port: u16, body: &str) -> String {
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        // A port from `free_port` can be taken by another test's listener
+        // before this test binds it. A reply that never comes then fails the
+        // test instead of hanging it: one hung here for four and a half hours
+        // and held the only macOS runner.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         stream.write_all(body.as_bytes()).unwrap();
         stream.shutdown(Shutdown::Write).unwrap();
         let mut reply = String::new();
