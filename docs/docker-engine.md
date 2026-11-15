@@ -219,7 +219,8 @@ What the clients send, for whoever adds builds:
 Against an isolated, registered test engine, set `DOCKER_HOST` and
 `SMOLVM_ENGINE_TEST_ROOT` to its socket and state directory, then run
 `python3 tests/test_engine_lifecycle.py`; it kills the adapter, checks workload survival,
-and verifies that supervisors exit after cleanup. On macOS, also run
+and verifies that supervisors exit after cleanup, on SIGTERM and when the engine's state
+directory is deleted (its last step deletes it). On macOS, also run
 `python3 tests/test_engine_warm_lifecycle.py` to check that a warm branch outlives its
 original workload owner and releases its base when the final branch is removed.
 Run these tests sequentially on an engine without other workloads.

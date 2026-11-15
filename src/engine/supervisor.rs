@@ -4,7 +4,7 @@
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -382,6 +382,17 @@ async fn dispatch_inner(
     Ok(next.run(req).await)
 }
 
+/// Whether `path` still names the directory `held` was opened on. Holding it
+/// open keeps its inode from being reused, so a directory that was deleted
+/// and made again never passes for the one that was there.
+fn same_directory(path: &Path, held: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(path), held.metadata()) {
+        (Ok(now), Ok(then)) => now.dev() == then.dev() && now.ino() == then.ino(),
+        _ => false,
+    }
+}
+
 /// Adopt the listener owned by the OS instead of unlinking its socket.
 pub(super) fn activated_listener() -> std::io::Result<Option<tokio::net::UnixListener>> {
     #[cfg(target_os = "linux")]
@@ -482,33 +493,64 @@ pub(super) async fn serve(config: EngineConfig, owner: Option<String>) -> crate:
     }
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let e = engine.clone();
+    let root = std::fs::File::open(&engine.config.root)?;
+    let state_deleted = Arc::new(AtomicBool::new(false));
+    let deleted = state_deleted.clone();
     let exit_socket = socket.clone();
     let shutdown = async move {
-        loop {
-            tokio::select! {
-                _ = term.recv() => return None,
-                _ = tokio::signal::ctrl_c() => return None,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                    let running = e.owner.as_deref().and_then(|id|e.find_container(id)).is_some_and(|c|c.is_running() || c.record().state.status=="restarting");
-                    if !running && !super::warm::has_live_dependents(&e) && e.activity.idle() {
-                        if let Some(id) = &e.owner {
-                            match lock(e.config.root.join(format!("spawn-{id}.lock"))).await {
-                                Ok(gate) => {
-                                    let warm = e.clone();
-                                    if e.activity.idle() && tokio::task::spawn_blocking(move || super::warm::prepare_idle_exit(&warm)).await.unwrap_or(false) {
-                                        let _ = std::fs::remove_file(&exit_socket);
-                                        return Some(gate);
-                                    }
+        // The idle check waits on locks other processes hold. A stop request
+        // must not wait behind it, so it is a branch of its own.
+        let idle = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Nothing can list, stop or remove a workload whose engine state
+                // was deleted, so its supervisor stops it instead of leaving
+                // both running out of reach.
+                if e.owner.is_some() && !same_directory(&e.config.root, &root) {
+                    deleted.store(true, Ordering::SeqCst);
+                    return None;
+                }
+                let running = e
+                    .owner
+                    .as_deref()
+                    .and_then(|id| e.find_container(id))
+                    .is_some_and(|c| c.is_running() || c.record().state.status == "restarting");
+                if !running && !super::warm::has_live_dependents(&e) && e.activity.idle() {
+                    if let Some(id) = &e.owner {
+                        match lock(e.config.root.join(format!("spawn-{id}.lock"))).await {
+                            Ok(gate) => {
+                                let warm = e.clone();
+                                if e.activity.idle()
+                                    && tokio::task::spawn_blocking(move || {
+                                        super::warm::prepare_idle_exit(&warm)
+                                    })
+                                    .await
+                                    .unwrap_or(false)
+                                {
+                                    let _ = std::fs::remove_file(&exit_socket);
+                                    return Some(gate);
                                 }
-                                // An idle, workload-free supervisor has nothing left to
-                                // coordinate when its engine state has been deleted.
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !e.config.root.exists() => return None,
-                                Err(_) => {}
                             }
-                        } else { return None; }
+                            // An idle, workload-free supervisor has nothing left to
+                            // coordinate when its engine state has been deleted.
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::NotFound
+                                    && !e.config.root.exists() =>
+                            {
+                                return None
+                            }
+                            Err(_) => {}
+                        }
+                    } else {
+                        return None;
                     }
                 }
             }
+        };
+        tokio::select! {
+            _ = term.recv() => None,
+            _ = tokio::signal::ctrl_c() => None,
+            gate = idle => gate,
         }
     };
     // On an explicit stop, bound the drain: an events stream may never end.
@@ -527,8 +569,13 @@ pub(super) async fn serve(config: EngineConfig, owner: Option<String>) -> crate:
         gate = shutdown => { let _ = stop.send(()); let _ = tokio::time::timeout(Duration::from_secs(5), &mut server).await; gate }
     };
     if engine.owner.is_some() {
-        super::containers::shutdown_all(&engine).await;
-        super::warm::shutdown(&engine).await;
+        if state_deleted.load(Ordering::SeqCst) {
+            super::containers::abandon_all(&engine).await;
+            super::warm::abandon(&engine).await;
+        } else {
+            super::containers::shutdown_all(&engine).await;
+            super::warm::shutdown(&engine).await;
+        }
     }
     if !os_owned {
         let _ = std::fs::remove_file(socket);
@@ -701,6 +748,20 @@ mod tests {
             .unwrap_err();
         child.kill().await.unwrap();
         assert!(error.message.contains("did not become ready"));
+    }
+
+    #[test]
+    fn a_state_directory_deleted_and_made_again_is_not_the_same_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("engine");
+        std::fs::create_dir(&root).unwrap();
+        let held = std::fs::File::open(&root).unwrap();
+        assert!(same_directory(&root, &held));
+        std::fs::remove_dir(&root).unwrap();
+        assert!(!same_directory(&root, &held));
+        // What a record saved after the deletion leaves behind.
+        std::fs::create_dir(&root).unwrap();
+        assert!(!same_directory(&root, &held));
     }
 
     #[test]
