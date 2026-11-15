@@ -1,4 +1,4 @@
-//! A bounded Docker log connection owned by the visible log view.
+//! Bounded Docker output readers owned by visible desktop views.
 use std::{
     collections::VecDeque,
     io::Read,
@@ -16,6 +16,12 @@ pub enum Status {
     Following,
     Finished(i32),
     Failed(String),
+}
+
+pub(crate) struct Activity {
+    pub revision: u64,
+    pub has_output: bool,
+    pub status: Status,
 }
 
 pub struct Snapshot {
@@ -100,7 +106,7 @@ impl LogStream {
         Self::spawn(command, wake)
     }
 
-    fn spawn(
+    pub(crate) fn spawn(
         mut command: Command,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, String> {
@@ -120,7 +126,7 @@ impl LogStream {
         }
         let mut child = command
             .spawn()
-            .map_err(|e| format!("Cannot follow container logs: {e}"))?;
+            .map_err(|e| format!("Cannot start Docker reader: {e}"))?;
         let stdout = child.stdout.take().expect("piped log stdout");
         let stderr = child.stderr.take().expect("piped log stderr");
         let state = Arc::new(Mutex::new(State::new()));
@@ -167,6 +173,16 @@ impl LogStream {
             state,
             child,
             stop: Some(stop),
+        })
+    }
+
+    /// Event observers need a change signal, without copying the retained text.
+    pub(crate) fn activity_after(&self, revision: u64) -> Option<Activity> {
+        let state = self.state.lock().unwrap();
+        (state.revision != revision).then(|| Activity {
+            revision: state.revision,
+            has_output: !state.bytes.is_empty(),
+            status: state.status.clone(),
         })
     }
 

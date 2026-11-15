@@ -1,5 +1,5 @@
 //! Docker/Compose commands always target Smol explicitly, never the user's
-//! current Docker context or DOCKER_HOST. No background inventory polling.
+//! current Docker context or DOCKER_HOST. Visible-workspace events trigger refreshes.
 use crate::runtime::{Runtime, capture};
 use serde_json::Value;
 use std::{

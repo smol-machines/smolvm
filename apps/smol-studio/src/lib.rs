@@ -18,3 +18,5 @@ pub mod files;
 pub mod log_stream;
 
 pub mod network;
+
+pub mod event_watch;

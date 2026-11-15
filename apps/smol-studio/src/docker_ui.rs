@@ -25,6 +25,7 @@ enum ContainerTab {
 
 pub struct DockerView {
     worker: DockerWorker,
+    events: smol_studio::event_watch::EventWatch,
     kind: Kind,
     rows: Vec<Value>,
     storage_selected: Option<String>,
@@ -106,6 +107,7 @@ impl DockerView {
         let ctx = ctx.clone();
         Self {
             worker: DockerWorker::new(move || ctx.request_repaint()),
+            events: smol_studio::event_watch::EventWatch::default(),
             kind: Kind::Containers,
             rows: vec![],
             storage_selected: None,
@@ -210,6 +212,7 @@ impl DockerView {
             Some(Action::CreateVolume(_)) => "Creating volume…",
             Some(Action::StorageRemove { .. }) => "Removing resource…",
             Some(_) => "Working…",
+            None if self.events.disconnected() => "Automatic updates interrupted · reconnecting…",
             None => &self.activity,
         }
     }
@@ -273,6 +276,7 @@ impl DockerView {
                         self.valid = true;
                         if matches!(kind, Kind::Images | Kind::Volumes | Kind::Networks) {
                             let key = if kind == Kind::Volumes { "Name" } else { "ID" };
+                            let previous = self.storage_selected.clone();
                             self.storage_selected = self
                                 .storage_selected
                                 .take()
@@ -283,8 +287,10 @@ impl DockerView {
                                         .and_then(|r| r[key].as_str())
                                         .map(str::to_owned)
                                 });
-                            self.storage = None;
-                            self.network = None;
+                            if self.storage_selected != previous {
+                                self.storage = None;
+                                self.network = None;
+                            }
                             if let Some(id) = self.storage_selected.clone() {
                                 self.submit(
                                     runtime,
@@ -411,6 +417,21 @@ impl DockerView {
                     self.error = Some(e);
                 }
             }
+        }
+    }
+    pub fn watch(&mut self, ctx: &egui::Context, runtime: &Runtime, visible: bool, modal: bool) {
+        let repaint = ctx.clone();
+        let poll = self.events.poll(
+            std::time::Instant::now(),
+            visible && self.opened && !cfg!(windows),
+            self.pending.is_some() || self.modal_open() || modal,
+            move || repaint.request_repaint_after(std::time::Duration::from_millis(33)),
+        );
+        if poll.refresh {
+            self.refresh(runtime);
+        }
+        if let Some(delay) = poll.wake_after {
+            ctx.request_repaint_after(delay);
         }
     }
     pub fn terminal_ui(&mut self, ctx: &egui::Context) {

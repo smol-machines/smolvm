@@ -923,10 +923,11 @@ impl eframe::App for Studio {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
         self.docker.logic(&self.runtime);
-        self.docker.logs_visibility(
-            self.workspace == Workspace::Containers
-                && ctx.input(|i| i.viewport().minimized != Some(true)),
-        );
+        let docker_visible = self.workspace == Workspace::Containers
+            && ctx.input(|i| i.viewport().minimized != Some(true));
+        self.docker.logs_visibility(docker_visible);
+        self.docker
+            .watch(ctx, &self.runtime, docker_visible, self.settings);
         if ctx.input(|i| i.viewport().close_requested())
             && (self.pending.as_ref().is_some_and(Operation::is_mutation)
                 || self.cloud.mutating()
