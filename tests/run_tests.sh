@@ -75,6 +75,7 @@ get_suite() {
         pack-quick)  echo "$SCRIPT_DIR/test_pack.sh --quick" ;;
         gpu)         echo "$SCRIPT_DIR/test_gpu.sh" ;;
         engine)      echo "$SCRIPT_DIR/test_engine.sh" ;;
+        engine-inventory) echo "$SCRIPT_DIR/test_engine_inventory.sh" ;;
         engine-builder) echo "$SCRIPT_DIR/test_engine_builder.sh" ;;
         scale)       echo "$SCRIPT_DIR/test_scale.sh" ;;
         connections) echo "$SCRIPT_DIR/test_connections.sh" ;;

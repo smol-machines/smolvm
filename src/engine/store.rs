@@ -48,6 +48,10 @@ impl Store {
         let _ = std::fs::remove_dir_all(self.container_dir(id));
     }
 
+    pub(crate) fn load_container(&self, id: &str) -> crate::Result<Option<ContainerRecord>> {
+        read_json(&self.container_dir(id).join("config.json"))
+    }
+
     pub(crate) fn load_containers(&self) -> crate::Result<Vec<ContainerRecord>> {
         let mut records = Vec::new();
         for entry in std::fs::read_dir(self.root.join("containers"))? {
