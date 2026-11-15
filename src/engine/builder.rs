@@ -38,6 +38,7 @@ fn boot(config: &EngineConfig) -> crate::Result<VmHandle> {
                 network_backend: Some(crate::network::NetworkBackend::VirtioNet),
                 entrypoint: Some(vec!["buildkitd".into()]),
                 cmd: Some(vec![
+                    "--allow-insecure-entitlement=network.host".into(),
                     "--addr".into(),
                     format!("unix://{GUEST_SOCKET}"),
                     "--root".into(),

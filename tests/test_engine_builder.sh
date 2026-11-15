@@ -24,7 +24,7 @@ cleanup() {
     docker buildx rm "$BUILDER" >/dev/null 2>&1 || true
     docker image rm -f "$IMAGE" "$BUILDER:fast" "$BUILDER:slow" >/dev/null 2>&1 || true
     "$SMOLVM" engine unregister --socket "$SOCKET" --root "$ROOT" >/dev/null 2>&1 || true
-    "$SMOLVM" machine delete --name "$MACHINE" >/dev/null 2>&1 || true
+    "$SMOLVM" machine delete --force --name "$MACHINE" >/dev/null 2>&1 || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -99,12 +99,12 @@ mkdir "$WORK/concurrent"
 cat > "$WORK/concurrent/Dockerfile" <<'DOCKERFILE'
 FROM alpine
 ARG DELAY
-RUN sleep "$DELAY" && echo "$DELAY" >/delay
+RUN --network=host sleep "$DELAY" && echo "$DELAY" >/delay
 CMD ["cat", "/delay"]
 DOCKERFILE
-docker buildx build --builder "$BUILDER" --build-arg DELAY=15 -t "$BUILDER:slow" "$WORK/concurrent" >>"$WORK/build.log" 2>&1 &
+docker buildx build --builder "$BUILDER" --allow network.host --build-arg DELAY=15 -t "$BUILDER:slow" "$WORK/concurrent" >>"$WORK/build.log" 2>&1 &
 slow=$!
-docker buildx build --builder "$BUILDER" --build-arg DELAY=0 -t "$BUILDER:fast" "$WORK/concurrent" >>"$WORK/build.log" 2>&1
+docker buildx build --builder "$BUILDER" --allow network.host --build-arg DELAY=0 -t "$BUILDER:fast" "$WORK/concurrent" >>"$WORK/build.log" 2>&1
 wait "$slow"
 [[ $(docker run --rm "$BUILDER:slow") == 15 ]]
 [[ $(docker run --rm "$BUILDER:fast") == 0 ]]

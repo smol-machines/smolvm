@@ -279,22 +279,10 @@ fn install_builder(config: &smolvm::engine::EngineConfig, docker_dir: &Path) -> 
     let mut inspect = std::process::Command::new("docker");
     let result = inspect
         .env("DOCKER_CONFIG", docker_dir)
-        .args([
-            "buildx",
-            "inspect",
-            "smol-builder",
-            "--format",
-            "{{json .}}",
-        ])
+        .args(["buildx", "inspect", "smol-builder"])
         .output()?;
     if result.status.success() {
-        let value: serde_json::Value = serde_json::from_slice(&result.stdout)
-            .map_err(|e| smolvm::Error::config("Buildx registration", e.to_string()))?;
-        let matches = value["Driver"] == "remote"
-            && value["Nodes"]
-                .as_array()
-                .is_some_and(|nodes| nodes.len() == 1 && nodes[0]["Endpoint"] == endpoint);
-        if !matches {
+        if !matches_native_builder(&String::from_utf8_lossy(&result.stdout), &endpoint) {
             return Err(smolvm::Error::config(
                 "Buildx registration",
                 "a different builder named smol-builder already exists; it was not replaced",
@@ -342,4 +330,46 @@ fn register(config: &smolvm::engine::EngineConfig) -> smolvm::Result<()> {
         &smolvm::engine::builder::config(config),
         "buildkit-serve",
     )
+}
+
+// `buildx inspect` has no --format flag. Require exactly one matching endpoint;
+// never repurpose an existing builder that belongs to another engine or user.
+fn matches_native_builder(text: &str, endpoint: &str) -> bool {
+    let fields: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .collect();
+    fields
+        .iter()
+        .filter(|(key, _)| *key == "Driver")
+        .map(|(_, value)| *value)
+        .collect::<Vec<_>>()
+        == ["remote"]
+        && fields
+            .iter()
+            .filter(|(key, _)| *key == "Endpoint")
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>()
+            == [endpoint]
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::matches_native_builder;
+    #[test]
+    fn existing_builders_are_only_reused_for_the_same_single_endpoint() {
+        let text = "Name: smol-builder\nDriver: remote\nNodes:\nName: smol-builder0\nEndpoint: unix:///tmp/smol.sock\nStatus: running\n";
+        assert!(matches_native_builder(text, "unix:///tmp/smol.sock"));
+        assert!(!matches_native_builder(text, "unix:///tmp/other.sock"));
+        assert!(!matches_native_builder(
+            &text.replace("Driver: remote", "Driver: docker-container"),
+            "unix:///tmp/smol.sock"
+        ));
+        assert!(!matches_native_builder(
+            &format!("{text}Endpoint: unix:///tmp/smol.sock\n"),
+            "unix:///tmp/smol.sock"
+        ));
+        assert!(!matches_native_builder("", "unix:///tmp/smol.sock"));
+    }
 }
