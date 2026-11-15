@@ -1988,15 +1988,24 @@ pub(crate) async fn remove(
     super::network::detach_all(engine, c).await;
     engine.containers.write().remove(&record.id);
     engine.store.remove_container(&record.id);
+    let mut volume_error = None;
     if volumes {
         for m in &record.mounts {
             if m.kind == "volume" {
                 if let Some(v) = engine.volumes.get(&m.source) {
                     if v.anonymous && !volume_in_use(engine, &v.name) {
-                        let _ = engine.volumes.remove(&engine.store, &v.name);
-                        engine
-                            .events
-                            .emit("volume", "destroy", &v.name, BTreeMap::new());
+                        match engine.volumes.remove(&engine.store, &v.name) {
+                            Ok(()) => {
+                                engine
+                                    .events
+                                    .emit("volume", "destroy", &v.name, BTreeMap::new())
+                            }
+                            Err(error) => {
+                                volume_error.get_or_insert_with(|| ApiError::internal(format!(
+                                    "Container removed, but volume {} could not be removed: {}. Repair the filesystem and retry volume removal.", v.name, error.message
+                                )));
+                            }
+                        }
                     }
                 }
             }
@@ -2005,7 +2014,7 @@ pub(crate) async fn remove(
     let _ = c.output.send(Output::End);
     c.emit(engine, "destroy", &[]);
     c.exits.send_modify(|s| s.removed = true);
-    Ok(())
+    volume_error.map_or(Ok(()), Err)
 }
 
 /// Whether any container mounts the volume.
