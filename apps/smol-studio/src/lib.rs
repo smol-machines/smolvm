@@ -7,3 +7,5 @@ pub mod schedule;
 pub mod docker;
 
 pub mod terminal;
+
+pub mod container_details;

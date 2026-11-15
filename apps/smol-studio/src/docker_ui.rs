@@ -19,6 +19,10 @@ pub struct DockerView {
     query: String,
     compose: bool,
     opened: bool,
+    selected: Option<String>,
+    details: Option<smol_studio::container_details::ContainerDetails>,
+    stats: Option<Value>,
+    terminal: Option<crate::terminal_ui::TerminalWindow>,
 }
 impl DockerView {
     pub fn new(ctx: &egui::Context) -> Self {
@@ -36,6 +40,10 @@ impl DockerView {
             query: String::new(),
             compose: false,
             opened: false,
+            selected: None,
+            details: None,
+            stats: None,
+            terminal: None,
         }
     }
     pub fn modal_open(&self) -> bool {
@@ -64,19 +72,229 @@ impl DockerView {
                     if self.kind == kind {
                         self.rows = rows;
                         self.valid = true;
+                        if kind == Kind::Containers
+                            && let Some(id) = self.selected.clone()
+                        {
+                            if self.rows.iter().any(|r| r["ID"].as_str() == Some(&id)) {
+                                self.submit(runtime, Action::Inspect(id));
+                            } else {
+                                self.selected = None;
+                                self.details = None;
+                                self.stats = None;
+                            }
+                        }
+                    }
+                }
+                Ok(Output::Details(details)) => {
+                    if self.selected.as_deref() == Some(&details.id) {
+                        self.details = Some(*details);
+                        self.stats = None;
+                    }
+                }
+                Ok(Output::Stats { id, value }) => {
+                    if self.selected.as_ref() == Some(&id) {
+                        self.stats = Some(value);
                     }
                 }
                 Ok(Output::Text(text)) => self.text = text,
                 Ok(Output::Completed) => {
+                    self.details = None;
+                    self.stats = None;
                     self.text = "Operation completed.".into();
                     self.submit(runtime, Action::List(self.kind));
                 }
                 Err(e) => {
                     self.error = Some(e);
-                    self.valid = false;
+                    if matches!(done.action, Action::List(_)) || done.action.mutates() {
+                        self.valid = false;
+                    }
                 }
             }
         }
+    }
+    pub fn terminal_ui(&mut self, ctx: &egui::Context) {
+        if let Some(terminal) = &mut self.terminal
+            && !terminal.ui(ctx)
+        {
+            self.terminal = None;
+        }
+    }
+    fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
+        ui.horizontal(|ui| {
+            design::eyebrow(ui, "CONTAINER");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Close").clicked() {
+                    self.selected = None;
+                    self.details = None;
+                    self.stats = None;
+                }
+            });
+        });
+        let Some(details) = self.details.clone() else {
+            ui.add_space(20.0);
+            if self.pending.is_some() {
+                ui.spinner();
+            } else {
+                ui.label("Refresh to load container details.");
+            }
+            return;
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("container-inspector-scroll")
+            .show(ui, |ui| {
+                ui.add_space(10.0);
+                ui.add(egui::Label::new(design::heading(&details.name, 22.0)).truncate())
+                    .on_hover_text(&details.name);
+                ui.add(
+                    egui::Label::new(RichText::new(&details.image).small().color(MUTED)).truncate(),
+                )
+                .on_hover_text(&details.image);
+                ui.add_space(10.0);
+                design::badge(ui, &details.state);
+                if let Some(health) = &details.health {
+                    ui.label(format!("Health: {health}"));
+                }
+                if details.state != "running"
+                    && let Some(code) = details.exit_code
+                {
+                    ui.label(format!("Exit code: {code}"));
+                }
+                if details.oom_killed {
+                    design::notice(ui, "Stopped after running out of memory.");
+                }
+                if !details.error.is_empty() {
+                    design::notice(ui, &details.error);
+                }
+                let enabled = self.valid && self.pending.is_none();
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            enabled && details.state == "running",
+                            design::primary("Terminal"),
+                        )
+                        .clicked()
+                    {
+                        match crate::terminal_ui::TerminalWindow::for_container(
+                            ui.ctx(),
+                            &details.id,
+                            &details.name,
+                        ) {
+                            Ok(t) => self.terminal = Some(t),
+                            Err(e) => self.error = Some(e),
+                        }
+                    }
+                    if ui.add_enabled(enabled, egui::Button::new("Logs")).clicked() {
+                        self.submit(runtime, Action::Logs(details.id.clone()));
+                    }
+                    if ui.small_button("Copy ID").clicked() {
+                        ui.ctx().copy_text(details.id.clone());
+                    }
+                });
+                ui.add_space(20.0);
+                design::eyebrow(ui, "PUBLISHED PORTS");
+                if details.ports.is_empty() {
+                    ui.label(
+                        RichText::new("No ports published to this computer.")
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+                for port in &details.ports {
+                    ui.push_id((&port.container, &port.host_ip, &port.host_port), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}:{} → {}",
+                                port.host_ip, port.host_port, port.container
+                            ))
+                            .monospace()
+                            .size(11.0),
+                        );
+                        if let Some(url) = port.browser_url() {
+                            ui.hyperlink_to("Open in browser", url).on_hover_text(
+                                "Opens this TCP port using HTTP. The service must speak HTTP.",
+                            );
+                        }
+                    });
+                }
+                ui.add_space(20.0);
+                design::eyebrow(ui, "RESOURCE USAGE");
+                if ui
+                    .add_enabled(
+                        enabled && details.state == "running",
+                        egui::Button::new("Measure now"),
+                    )
+                    .clicked()
+                {
+                    self.submit(runtime, Action::Stats(details.id.clone()));
+                }
+                if let Some(stats) = &self.stats {
+                    for (label, key) in [
+                        ("Machine CPU", "CPUPerc"),
+                        ("Guest memory / limit", "MemUsage"),
+                    ] {
+                        if let Some(value) = stats[key].as_str() {
+                            ui.label(format!("{label}: {value}"));
+                        }
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Network, disk I/O, and process counts are not available yet.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.label(
+                        RichText::new("Snapshot · not continuously polled")
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+                ui.add_space(20.0);
+                design::eyebrow(ui, "MOUNTS");
+                if details.mounts.is_empty() {
+                    ui.label(
+                        RichText::new("No shared folders or volumes.")
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+                for mount in &details.mounts {
+                    ui.label(RichText::new(&mount.target).monospace().size(12.0));
+                    ui.add(
+                        egui::Label::new(RichText::new(&mount.source).small().color(MUTED)).wrap(),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {}",
+                            mount.kind,
+                            if mount.writable {
+                                "Read & write"
+                            } else {
+                                "Read only"
+                            }
+                        ))
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                }
+                if let Some(project) = &details.project {
+                    ui.add_space(12.0);
+                    design::eyebrow(ui, "COMPOSE");
+                    ui.label(format!("Project: {project}"));
+                    if let Some(service) = &details.service {
+                        ui.label(format!("Service: {service}"));
+                    }
+                }
+                ui.add_space(16.0);
+                ui.collapsing("Command & diagnostics", |ui| {
+                    ui.label(format!("Restarts: {}", details.restarts));
+                    for arg in &details.command {
+                        ui.add(egui::Label::new(RichText::new(arg).monospace().size(11.0)).wrap());
+                    }
+                });
+            });
     }
     pub fn ui(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
         let ctx = ui.ctx().clone();
@@ -197,6 +415,15 @@ impl DockerView {
                         });
                 });
         }
+        if self.selected.is_some() && self.kind == Kind::Containers && !self.compose {
+            egui::Panel::right("container-inspector")
+                .resizable(true)
+                .default_size(330.0)
+                .min_size(290.0)
+                .max_size(440.0)
+                .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(20))
+                .show(ui, |ui| self.inspector(ui, runtime));
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(SURFACE).inner_margin(24)).show(ui,|ui| {
             if cfg!(windows){ui.label("The Docker API is available on macOS and Linux. Local and cloud machines are available on Windows.");return;}
             if self.compose {
@@ -225,7 +452,7 @@ impl DockerView {
             }
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.query).hint_text(format!("Search {}…",self.kind.label().to_lowercase())).desired_width(300.0).margin(egui::Margin::symmetric(10,9)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {ui.label(RichText::new(format!("{} resources",self.rows.len())).small().color(MUTED));});
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {ui.label(RichText::new(format!("{} {}",self.rows.len(),if self.rows.len()==1{"resource"}else{"resources"})).small().color(MUTED));});
             });
             ui.add_space(16.0);
             let query=self.query.to_lowercase();
@@ -245,18 +472,18 @@ impl DockerView {
                     let id=text(&row,"ID");
                     let title=match self.kind {Kind::Containers=>text(&row,"Names"),Kind::Images=>format!("{}:{}",text(&row,"Repository"),text(&row,"Tag")),_=>text(&row,"Name")};
                     let detail=match self.kind {Kind::Containers=>format!("{}  ·  {}",text(&row,"Image"),text(&row,"Status")),Kind::Images=>text(&row,"Size"),_=>text(&row,"Driver")};
-                    egui::Frame::new().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0,design::LINE)).corner_radius(8).inner_margin(14).show(ui,|ui| {
+                    egui::Frame::new().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0,design::LINE)).corner_radius(0).inner_margin(14).show(ui,|ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             let text_width=(ui.available_width()-if self.kind==Kind::Containers{240.0}else{0.0}).max(100.0);
-                            ui.allocate_ui(egui::vec2(text_width,44.0),|ui| {
+                            ui.allocate_ui_with_layout(egui::vec2(text_width,44.0),egui::Layout::top_down(egui::Align::LEFT),|ui| {
                                 ui.add(egui::Label::new(RichText::new(&title).strong()).truncate()).on_hover_text(&title);
                                 ui.add(egui::Label::new(RichText::new(&detail).small().color(MUTED)).truncate()).on_hover_text(&detail);
                             });
                             if self.kind==Kind::Containers {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
                                     ui.add_enabled_ui(self.valid&&self.pending.is_none(),|ui| {
-                                        if ui.button("Logs").clicked(){self.submit(runtime,Action::Logs(id.clone()));}
+                                        if ui.button("Inspect").clicked(){self.selected=Some(id.clone());self.details=None;self.stats=None;self.submit(runtime,Action::Inspect(id.clone()));}
                                         if text(&row,"State")=="running" {
                                             if ui.button("Stop").clicked(){self.submit(runtime,Action::Stop(id.clone()));}
                                         } else {

@@ -48,7 +48,7 @@ fn main() -> eframe::Result {
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([960.0, 640.0])
             .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!("../packaging/smol-studio.png"))
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/brand-mark.png"))
                     .expect("bundled Studio icon"),
             ),
         renderer: eframe::Renderer::Wgpu,

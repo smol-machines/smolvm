@@ -98,6 +98,8 @@ with tempfile.TemporaryDirectory() as temporary:
     studio = 'smol-studio.exe' if system == 'windows' else 'smol-studio'
     shutil.copy2(app / 'target' / 'release' / studio, binaries / studio)
     resources = contents / 'Resources' if system == 'darwin' else binaries
+    (resources / 'licenses').mkdir(parents=True, exist_ok=True)
+    shutil.copy2(app / 'assets/Inter-LICENSE.txt', resources / 'licenses/Inter.txt')
     shutil.copytree(cli, resources / 'runtime', symlinks=True)
     shutil.copytree(engine, resources / 'engine', symlinks=True)
     (root / 'build.json').write_text(json.dumps({

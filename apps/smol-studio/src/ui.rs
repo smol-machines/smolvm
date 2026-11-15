@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, FontId, Margin, RichText, Vec2};
+use eframe::egui::{self, Color32, Margin, RichText, Vec2};
 use smol_studio::{
     model::{Machine, NewMachine, Operation, PublishedPort, SharedFolder},
     runtime::{Payload, Runtime, Worker},
@@ -30,6 +30,7 @@ enum Workspace {
 }
 
 pub struct Studio {
+    brand: egui::TextureHandle,
     cloud: crate::cloud_ui::CloudView,
     workspace: Workspace,
     terminal: Option<crate::terminal_ui::TerminalWindow>,
@@ -64,6 +65,7 @@ impl Studio {
         let worker = Worker::new(move || ctx.request_repaint());
         let runtime_path = runtime.executable.to_string_lossy().into_owned();
         let mut app = Self {
+            brand: design::brand_texture(&cc.egui_ctx),
             cloud: crate::cloud_ui::CloudView::new(&cc.egui_ctx),
             workspace: Workspace::Local,
             terminal: None,
@@ -181,18 +183,10 @@ impl Studio {
             .show(ui, |ui| {
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 9, ACCENT);
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "s",
-                        FontId::proportional(26.0),
-                        Color32::WHITE,
-                    );
+                    ui.add(egui::Image::new((self.brand.id(), Vec2::splat(36.0))));
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new("smol").size(21.0).strong());
+                        ui.label(design::heading("smol machines", 14.0));
                         ui.label(RichText::new("STUDIO").size(9.0).color(MUTED));
                     });
                 });
@@ -349,7 +343,7 @@ impl Studio {
         };
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
-            ui.painter().rect_filled(r, 12, design::SELECTED);
+            ui.painter().rect_filled(r, 0, design::SELECTED);
             design::icon(ui.painter(), r.shrink(11.0), Icon::Machine, ACCENT);
             ui.add_space(4.0);
             ui.vertical(|ui| {
@@ -815,6 +809,7 @@ impl eframe::App for Studio {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.docker.terminal_ui(&ctx);
         if let Some(terminal) = &mut self.terminal
             && !terminal.ui(&ctx)
         {

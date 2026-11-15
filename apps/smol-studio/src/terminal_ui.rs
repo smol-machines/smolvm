@@ -19,10 +19,21 @@ impl TerminalWindow {
             error: None,
         }
     }
+    pub fn for_container(ctx: &egui::Context, id: &str, name: &str) -> Result<Self, String> {
+        let ctx = ctx.clone();
+        Ok(Self {
+            terminal: Terminal::container(id, move || {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16))
+            })?,
+            name: format!("{name} · container"),
+            size: (24, 80),
+            error: None,
+        })
+    }
     pub fn ui(&mut self, ctx: &egui::Context) -> bool {
         let mut open = true;
         egui::Window::new(format!("Terminal · {}", self.name))
-            .id(egui::Id::unique("guest-terminal"))
+            .id(egui::Id::unique(("terminal", &self.name)))
             .open(&mut open)
             .default_size([860.0, 500.0])
             .default_pos(ctx.content_rect().center() - egui::vec2(430.0, 250.0))

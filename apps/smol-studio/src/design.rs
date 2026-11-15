@@ -1,14 +1,14 @@
 //! Shared native UI primitives. Vector icons and bounded rows need no assets or web renderer.
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 
-pub const INK: Color32 = Color32::from_rgb(32, 38, 49);
-pub const MUTED: Color32 = Color32::from_rgb(112, 119, 133);
-pub const ACCENT: Color32 = Color32::from_rgb(105, 80, 220);
-pub const LINE: Color32 = Color32::from_rgb(228, 231, 237);
-pub const SURFACE: Color32 = Color32::from_rgb(247, 248, 250);
-pub const SELECTED: Color32 = Color32::from_rgb(238, 234, 253);
-pub const GREEN: Color32 = Color32::from_rgb(30, 132, 94);
-pub const RED: Color32 = Color32::from_rgb(184, 56, 62);
+pub const INK: Color32 = Color32::from_rgb(17, 17, 17);
+pub const MUTED: Color32 = Color32::from_rgb(85, 85, 85);
+pub const ACCENT: Color32 = Color32::from_rgb(17, 17, 17);
+pub const LINE: Color32 = Color32::from_rgb(226, 226, 227);
+pub const SURFACE: Color32 = Color32::from_rgb(249, 249, 249);
+pub const SELECTED: Color32 = Color32::from_rgb(237, 237, 237);
+pub const GREEN: Color32 = Color32::from_rgb(44, 122, 63);
+pub const RED: Color32 = Color32::from_rgb(179, 38, 30);
 
 #[derive(Clone, Copy)]
 pub enum Icon {
@@ -131,7 +131,7 @@ pub fn badge(ui: &mut egui::Ui, state: &str) {
     let color = state_color(state);
     egui::Frame::new()
         .fill(color.gamma_multiply(0.09))
-        .corner_radius(20)
+        .corner_radius(2)
         .inner_margin(egui::Margin::symmetric(10, 5))
         .show(ui, |ui| {
             ui.spacing_mut().interact_size.y = 16.0;
@@ -156,7 +156,7 @@ pub fn card() -> egui::Frame {
     egui::Frame::new()
         .fill(Color32::WHITE)
         .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(10)
+        .corner_radius(0)
         .inner_margin(18)
 }
 
@@ -254,7 +254,7 @@ pub fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 pub fn notice(ui: &mut egui::Ui, message: &str) {
     egui::Frame::new()
         .fill(Color32::from_rgb(255, 243, 242))
-        .corner_radius(8)
+        .corner_radius(0)
         .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -265,7 +265,7 @@ pub fn notice(ui: &mut egui::Ui, message: &str) {
 pub fn error_notice(ui: &mut egui::Ui, title: &str, detail: &str) {
     egui::Frame::new()
         .fill(Color32::from_rgb(255, 243, 242))
-        .corner_radius(8)
+        .corner_radius(0)
         .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -279,53 +279,41 @@ pub fn error_notice(ui: &mut egui::Ui, title: &str, detail: &str) {
         });
 }
 
-/// Read the platform typeface locally; OS fonts are never bundled or redistributed.
+/// The same licensed Inter font and monochrome tokens as smolmachines.com.
 fn fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    #[cfg(target_os = "macos")]
-    let candidates = ["/System/Library/Fonts/SFNS.ttf"];
-    #[cfg(target_os = "windows")]
-    let candidates = ["C:/Windows/Fonts/segoeui.ttf"];
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let candidates = [
-        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    ];
-    if let Some(bytes) = candidates.iter().find_map(|path| std::fs::read(path).ok()) {
-        let mut regular = egui::FontData::from_owned(bytes);
-        regular.tweak.coords = egui::epaint::text::VariationCoords::new([(b"wght", 400.0)]);
-        let mut semibold = regular.clone();
-        semibold.tweak.coords = egui::epaint::text::VariationCoords::new([(b"wght", 600.0)]);
-        #[cfg(target_os = "linux")]
-        if let Ok(bytes) = std::fs::read("/usr/share/fonts/noto/NotoSans-SemiBold.ttf") {
-            semibold = egui::FontData::from_owned(bytes);
-        }
-        #[cfg(target_os = "windows")]
-        if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/seguisb.ttf") {
-            semibold = egui::FontData::from_owned(bytes);
-        }
-        fonts.font_data.insert("studio-body".into(), regular.into());
-        fonts
-            .font_data
-            .insert("studio-heading".into(), semibold.into());
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Proportional)
-            .unwrap()
-            .insert(0, "studio-body".into());
-        let mut headings = fonts.families[&egui::FontFamily::Proportional].clone();
-        headings.insert(0, "studio-heading".into());
-        fonts
-            .families
-            .insert(egui::FontFamily::Name("studio-heading".into()), headings);
-    } else {
-        fonts.families.insert(
-            egui::FontFamily::Name("studio-heading".into()),
-            fonts.families[&egui::FontFamily::Proportional].clone(),
-        );
-    }
+    let mut regular = egui::FontData::from_static(include_bytes!("../assets/InterVariable.ttf"));
+    regular.tweak.coords = egui::epaint::text::VariationCoords::new([(b"wght", 400.0)]);
+    let mut semibold = regular.clone();
+    semibold.tweak.coords = egui::epaint::text::VariationCoords::new([(b"wght", 600.0)]);
+    fonts.font_data.insert("studio-body".into(), regular.into());
+    fonts
+        .font_data
+        .insert("studio-heading".into(), semibold.into());
+    fonts
+        .families
+        .get_mut(&egui::FontFamily::Proportional)
+        .unwrap()
+        .insert(0, "studio-body".into());
+    let mut headings = fonts.families[&egui::FontFamily::Proportional].clone();
+    headings.insert(0, "studio-heading".into());
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("studio-heading".into()), headings);
     ctx.set_fonts(fonts);
+}
+
+pub fn brand_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/brand-mark.png"))
+        .expect("bundled brand mark");
+    ctx.load_texture(
+        "smol-brand",
+        egui::ColorImage::from_rgba_unmultiplied(
+            [icon.width as usize, icon.height as usize],
+            &icon.rgba,
+        ),
+        egui::TextureOptions::LINEAR,
+    )
 }
 
 pub fn heading(text: &str, size: f32) -> RichText {
@@ -357,6 +345,7 @@ pub fn theme(ctx: &egui::Context) {
         style.spacing.interact_size.y = 32.0;
         style.spacing.window_margin = egui::Margin::same(20);
         style.visuals.override_text_color = Some(INK);
+        style.visuals.hyperlink_color = INK;
         style.visuals.panel_fill = Color32::WHITE;
         style.visuals.window_fill = Color32::WHITE;
         style.visuals.widgets.open.weak_bg_fill = SURFACE;
@@ -367,13 +356,13 @@ pub fn theme(ctx: &egui::Context) {
         style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
         style.visuals.widgets.inactive.weak_bg_fill = Color32::WHITE;
         style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
-        style.visuals.widgets.inactive.corner_radius = 6.into();
-        style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(242, 241, 248);
+        style.visuals.widgets.inactive.corner_radius = 0.into();
+        style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(243, 243, 243);
         style.visuals.widgets.hovered.bg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(198, 190, 225));
-        style.visuals.widgets.hovered.corner_radius = 6.into();
+            Stroke::new(1.0, Color32::from_rgb(136, 136, 136));
+        style.visuals.widgets.hovered.corner_radius = 0.into();
         style.visuals.widgets.active.weak_bg_fill = SELECTED;
-        style.visuals.widgets.active.corner_radius = 6.into();
+        style.visuals.widgets.active.corner_radius = 0.into();
         style.visuals.extreme_bg_color = SURFACE;
     });
 }

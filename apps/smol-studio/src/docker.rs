@@ -40,21 +40,35 @@ pub enum Action {
     Stop(String),
     Delete(String),
     Logs(String),
+    Inspect(String),
+    Stats(String),
     Compose { file: PathBuf, up: bool },
 }
 impl Action {
     pub fn mutates(&self) -> bool {
-        !matches!(self, Self::Status | Self::List(_) | Self::Logs(_))
+        !matches!(
+            self,
+            Self::Status | Self::List(_) | Self::Logs(_) | Self::Inspect(_) | Self::Stats(_)
+        )
     }
 }
 pub enum Output {
     Rows(Kind, Vec<Value>),
     Text(String),
+    Details(Box<crate::container_details::ContainerDetails>),
+    Stats { id: String, value: Value },
     Completed,
 }
 pub struct Completion {
     pub action: Action,
     pub result: Result<Output, String>,
+}
+pub fn validate_container_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Err("Invalid container ID.".into())
+    } else {
+        Ok(())
+    }
 }
 fn docker_args(action: &Action) -> Result<Vec<String>, String> {
     let mut args = vec!["--context".into(), "smol".into()];
@@ -69,19 +83,29 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
             args.extend(prefix.iter().map(|s| s.to_string()));
             args.extend(["--format".into(), "{{json .}}".into()]);
         }
-        Action::Start(id) | Action::Stop(id) | Action::Delete(id) | Action::Logs(id) => {
-            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("Invalid container ID.".into());
-            }
+        Action::Start(id)
+        | Action::Stop(id)
+        | Action::Delete(id)
+        | Action::Logs(id)
+        | Action::Inspect(id)
+        | Action::Stats(id) => {
+            validate_container_id(id)?;
             let command = match action {
                 Action::Start(_) => "start",
                 Action::Stop(_) => "stop",
                 Action::Delete(_) => "rm",
-                _ => "logs",
+                Action::Logs(_) => "logs",
+                Action::Inspect(_) => "inspect",
+                _ => "stats",
             };
             args.extend(["container".into(), command.into()]);
-            if matches!(action, Action::Logs(_)) {
-                args.extend(["--tail".into(), "200".into()]);
+            match action {
+                Action::Logs(_) => args.extend(["--tail".into(), "200".into()]),
+                Action::Inspect(_) => args.extend(["--format".into(), "{{json .}}".into()]),
+                Action::Stats(_) => {
+                    args.extend(["--no-stream".into(), "--format".into(), "{{json .}}".into()])
+                }
+                _ => {}
             }
             args.push(id.clone());
         }
@@ -175,6 +199,21 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
                 .map_err(|_| "Docker returned an invalid inventory.".to_string())?;
             Ok(Output::Rows(*kind, rows))
         }
+        Action::Inspect(id) => {
+            let details = crate::container_details::ContainerDetails::parse(&bytes)?;
+            if !details.id.starts_with(id) {
+                return Err("Docker returned details for a different container.".into());
+            }
+            Ok(Output::Details(Box::new(details)))
+        }
+        Action::Stats(id) => {
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|_| "Docker returned an invalid usage snapshot.")?;
+            Ok(Output::Stats {
+                id: id.clone(),
+                value,
+            })
+        }
         Action::Status => {
             let value: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| "Runtime returned an invalid engine status.".to_string())?;
@@ -243,6 +282,8 @@ mod tests {
             Action::Stop("ab12".into()),
             Action::Delete("ab12".into()),
             Action::List(Kind::Containers),
+            Action::Inspect("ab12".into()),
+            Action::Stats("ab12".into()),
         ] {
             let args = docker_args(&action).unwrap();
             assert_eq!(&args[..2], ["--context", "smol"]);
@@ -290,6 +331,20 @@ mod tests {
             }
         }
         execute(&runtime, &Action::Start(id.clone()), &shutdown).unwrap();
+        match execute(&runtime, &Action::Inspect(id.clone()), &shutdown).unwrap() {
+            Output::Details(d) => {
+                assert_eq!(d.id, id);
+                assert_eq!(d.state, "running");
+            }
+            _ => panic!("Expected details"),
+        }
+        match execute(&runtime, &Action::Stats(id.clone()), &shutdown).unwrap() {
+            Output::Stats { id: actual, value } => {
+                assert_eq!(actual, id);
+                assert!(value["MemUsage"].is_string());
+            }
+            _ => panic!("Expected stats"),
+        }
         execute(&runtime, &Action::Logs(id.clone()), &shutdown).unwrap();
         execute(&runtime, &Action::Stop(id.clone()), &shutdown).unwrap();
         execute(&runtime, &Action::Delete(id), &shutdown).unwrap();

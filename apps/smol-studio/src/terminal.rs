@@ -44,6 +44,27 @@ impl Terminal {
         command.env("RUST_LOG", "error");
         Self::spawn(command, wake)
     }
+    pub fn container(id: &str, wake: impl Fn() + Send + Sync + 'static) -> Result<Self, String> {
+        crate::docker::validate_container_id(id)?;
+        let mut command = CommandBuilder::new(crate::runtime::find_tool(if cfg!(windows) {
+            "docker.exe"
+        } else {
+            "docker"
+        }));
+        command.args([
+            "--context",
+            "smol",
+            "container",
+            "exec",
+            "-it",
+            id,
+            "/bin/sh",
+        ]);
+        command.env_remove("DOCKER_HOST");
+        command.env_remove("DOCKER_CONTEXT");
+        command.env("TERM", "xterm-256color");
+        Ok(Self::spawn(command, wake))
+    }
     fn spawn(command: CommandBuilder, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let state = Arc::new(Mutex::new(TerminalState {
             parser: vt100::Parser::new(nz(24), nz(80), 1000),
