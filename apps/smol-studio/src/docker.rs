@@ -46,6 +46,7 @@ pub enum Action {
     Delete(String),
     Logs(String),
     Inspect(String),
+    NetworkInspect(String),
     Stats(String),
     StorageInspect {
         kind: Kind,
@@ -77,6 +78,7 @@ impl Action {
                 | Self::List(_)
                 | Self::Logs(_)
                 | Self::Inspect(_)
+                | Self::NetworkInspect(_)
                 | Self::Stats(_)
                 | Self::StorageInspect { .. }
                 | Self::Projects
@@ -95,6 +97,7 @@ pub enum Output {
         warning: Option<String>,
     },
     Storage(crate::storage::Details),
+    Network(crate::network::Details),
     Text(String),
     Details(Box<crate::container_details::ContainerDetails>),
     Stats {
@@ -139,6 +142,16 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
                 }
             }
             args.push(id.clone());
+        }
+        Action::NetworkInspect(id) => {
+            crate::network::validate_id(id)?;
+            args.extend([
+                "network".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{json .}}".into(),
+                id.clone(),
+            ]);
         }
         Action::PullImage(reference) => {
             crate::storage::validate_reference(reference)?;
@@ -338,6 +351,9 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
                 });
             }
             Ok(Output::Storage(details))
+        }
+        Action::NetworkInspect(id) => {
+            Ok(Output::Network(crate::network::Details::parse(id, &bytes)?))
         }
         Action::Projects => {
             let mut projects = crate::compose::parse(&bytes)?;
@@ -831,6 +847,7 @@ mod tests {
             Action::List(Kind::Containers),
             Action::Inspect("ab12".into()),
             Action::Stats("ab12".into()),
+            Action::NetworkInspect("a".repeat(64)),
             Action::Projects,
         ] {
             let args = docker_args(&action).unwrap();
