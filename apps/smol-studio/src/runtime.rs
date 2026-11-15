@@ -196,6 +196,11 @@ pub fn find_tool(name: &str) -> PathBuf {
     {
         candidates.push(parent.join(name));
         candidates.push(parent.join("runtime").join(name));
+        #[cfg(target_os = "macos")]
+        if let Some(contents) = parent.parent() {
+            candidates.push(contents.join("Resources/runtime").join(name));
+        }
+
         candidates.push(parent.join("runtime/bin").join(name));
     }
     if let Some(path) = std::env::var_os("PATH") {
@@ -457,7 +462,11 @@ mod tests {
         let path = dir.path().join("runtime fixture");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        (dir, Command::new(path))
+        // Read fixture scripts through a stable interpreter: executing a newly
+        // written temporary file is filesystem-dependent on CI runners.
+        let mut command = Command::new("/bin/sh");
+        command.arg(path);
+        (dir, command)
     }
 
     #[cfg(unix)]
@@ -466,10 +475,10 @@ mod tests {
         let stop = AtomicBool::new(false);
         let (_dir, mut command) = fixture("exec sleep 10");
         let t = Instant::now();
+        let error = capture(&mut command, Duration::from_millis(60), 1024, &stop).unwrap_err();
         assert!(
-            capture(&mut command, Duration::from_millis(60), 1024, &stop)
-                .unwrap_err()
-                .contains("timed out")
+            error.contains("timed out"),
+            "Unexpected deadline failure: {error}"
         );
         assert!(t.elapsed() < Duration::from_secs(2));
         let (_dir, mut command) = fixture("printf 'too much output'");

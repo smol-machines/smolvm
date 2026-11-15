@@ -80,7 +80,8 @@ with tempfile.TemporaryDirectory() as temporary:
         binaries = root
     studio = 'smol-studio.exe' if system == 'windows' else 'smol-studio'
     shutil.copy2(app / 'target' / 'release' / studio, binaries / studio)
-    shutil.copytree(runtime, binaries / 'runtime', symlinks=True)
+    runtime_destination = contents / 'Resources/runtime' if system == 'darwin' else binaries / 'runtime'
+    shutil.copytree(runtime, runtime_destination, symlinks=True)
     (root / 'build.json').write_text(json.dumps({'studioVersion': version, 'runtimeArchive': archive.name,
                                                'runtimeSha256': actual, 'platform': system, 'architecture': arch}, indent=2))
     if system == 'linux':
