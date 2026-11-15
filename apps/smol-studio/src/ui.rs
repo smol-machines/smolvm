@@ -584,111 +584,125 @@ impl Studio {
                 .collapsible(false)
                 .resizable(false)
                 .default_width(430.0)
-                .vscroll(true)
                 .max_height((ctx.content_rect().height() - 100.0).max(300.0))
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.label("Create a Linux environment. Start it when you’re ready.");
-                    ui.add_space(16.0);
-                    ui.label("Name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.name)
-                            .hint_text("my-project")
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.add_space(10.0);
-                    ui.label("Container image or local image path");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.image)
-                            .hint_text("Leave empty for bare Linux")
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        ui.label("CPUs");
-                        ui.add(egui::DragValue::new(&mut draft.cpus).range(1..=64));
-                        ui.label("Memory");
-                        ui.add(
-                            egui::DragValue::new(&mut draft.memory_mib)
-                                .range(256..=262_144)
-                                .speed(128)
-                                .suffix(" MiB"),
-                        );
-                    });
-                    ui.add_space(12.0);
-                    ui.checkbox(&mut draft.network, "Allow outbound network access");
-                    ui.collapsing("Shared folders", |ui| {
-                        let mut remove = None;
-                        for (i, folder) in draft.folders.iter_mut().enumerate() {
-                            ui.push_id(i, |ui| {
+                    let (validation, duplicate) = egui::ScrollArea::vertical()
+                        .id_salt("new-machine-form")
+                        .max_height((ctx.content_rect().height() - 260.0).max(180.0))
+                        .show(ui, |ui| {
+                            ui.label("Create a Linux environment. Start it when you’re ready.");
+                            ui.add_space(16.0);
+                            ui.label("Name");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.name)
+                                    .hint_text("my-project")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.add_space(10.0);
+                            ui.label("Container image or local image path");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.image)
+                                    .hint_text("Leave empty for bare Linux")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                ui.label("CPUs");
+                                ui.add(egui::DragValue::new(&mut draft.cpus).range(1..=64));
+                                ui.label("Memory");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut folder.host)
-                                        .hint_text("Absolute host folder path")
-                                        .desired_width(f32::INFINITY),
+                                    egui::DragValue::new(&mut draft.memory_mib)
+                                        .range(256..=262_144)
+                                        .speed(128)
+                                        .suffix(" MiB"),
                                 );
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut folder.guest)
-                                            .hint_text("/workspace")
-                                            .desired_width(180.0),
-                                    );
-                                    ui.checkbox(&mut folder.read_only, "Read only");
-                                    if ui.small_button("Remove").clicked() {
-                                        remove = Some(i);
-                                    }
-                                });
                             });
-                        }
-                        if let Some(i) = remove {
-                            draft.folders.remove(i);
-                        }
-                        if ui.button("Add shared folder").clicked() {
-                            draft.folders.push(SharedFolder {
-                                host: String::new(),
-                                guest: "/workspace".into(),
-                                read_only: true,
+                            ui.add_space(12.0);
+                            ui.checkbox(&mut draft.network, "Allow outbound network access");
+                            ui.collapsing("Shared folders", |ui| {
+                                let mut remove = None;
+                                for (i, folder) in draft.folders.iter_mut().enumerate() {
+                                    ui.push_id(i, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut folder.host)
+                                                .hint_text("Absolute host folder path")
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut folder.guest)
+                                                    .hint_text("/workspace")
+                                                    .desired_width(180.0),
+                                            );
+                                            ui.checkbox(&mut folder.read_only, "Read only");
+                                            if ui.small_button("Remove").clicked() {
+                                                remove = Some(i);
+                                            }
+                                        });
+                                    });
+                                }
+                                if let Some(i) = remove {
+                                    draft.folders.remove(i);
+                                }
+                                if ui.button("Add shared folder").clicked() {
+                                    draft.folders.push(SharedFolder {
+                                        host: String::new(),
+                                        guest: "/workspace".into(),
+                                        read_only: true,
+                                    });
+                                }
                             });
-                        }
-                    });
-                    ui.collapsing("Published ports", |ui| {
-                        let mut remove = None;
-                        for (i, port) in draft.ports.iter_mut().enumerate() {
-                            ui.push_id(i, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Host");
-                                    ui.add(egui::DragValue::new(&mut port.host).range(1..=65535));
-                                    ui.label("Guest");
-                                    ui.add(egui::DragValue::new(&mut port.guest).range(1..=65535));
-                                    if ui.small_button("Remove").clicked() {
-                                        remove = Some(i);
-                                    }
-                                });
+                            ui.collapsing("Published ports", |ui| {
+                                let mut remove = None;
+                                for (i, port) in draft.ports.iter_mut().enumerate() {
+                                    ui.push_id(i, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Host");
+                                            ui.add(
+                                                egui::DragValue::new(&mut port.host)
+                                                    .range(1..=65535),
+                                            );
+                                            ui.label("Guest");
+                                            ui.add(
+                                                egui::DragValue::new(&mut port.guest)
+                                                    .range(1..=65535),
+                                            );
+                                            if ui.small_button("Remove").clicked() {
+                                                remove = Some(i);
+                                            }
+                                        });
+                                    });
+                                }
+                                if let Some(i) = remove {
+                                    draft.ports.remove(i);
+                                }
+                                if ui.button("Add port").clicked() {
+                                    draft.ports.push(PublishedPort {
+                                        host: 8080,
+                                        guest: 8080,
+                                    });
+                                }
+                                ui.label("Published ports enable networking for this machine.");
                             });
-                        }
-                        if let Some(i) = remove {
-                            draft.ports.remove(i);
-                        }
-                        if ui.button("Add port").clicked() {
-                            draft.ports.push(PublishedPort {
-                                host: 8080,
-                                guest: 8080,
-                            });
-                        }
-                        ui.label("Published ports enable networking for this machine.");
-                    });
-                    ui.add_space(12.0);
-                    let validation = draft.validate();
-                    let duplicate = self.machines.iter().any(|m| m.name == draft.name);
-                    if duplicate {
-                        ui.colored_label(
-                            Color32::DARK_RED,
-                            "A machine with this name already exists.",
-                        );
-                    } else if !draft.name.is_empty()
-                        && let Err(e) = &validation
-                    {
-                        ui.colored_label(Color32::DARK_RED, e);
-                    }
+                            ui.add_space(12.0);
+                            let validation = draft.validate();
+                            let duplicate = self.machines.iter().any(|m| m.name == draft.name);
+                            if duplicate {
+                                ui.colored_label(
+                                    Color32::DARK_RED,
+                                    "A machine with this name already exists.",
+                                );
+                            } else if !draft.name.is_empty()
+                                && let Err(e) = &validation
+                            {
+                                ui.colored_label(Color32::DARK_RED, e);
+                            }
+                            (validation, duplicate)
+                        })
+                        .inner;
+                    ui.add_space(10.0);
+                    ui.separator();
                     ui.horizontal(|ui| {
                         submit = ui
                             .add_enabled(

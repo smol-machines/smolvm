@@ -408,12 +408,12 @@ pub fn theme(ctx: &egui::Context) {
             .insert(egui::TextStyle::Small, FontId::proportional(11.5));
         style.text_styles.insert(
             egui::TextStyle::Heading,
-            FontId::new(23.0, egui::FontFamily::Name("studio-heading".into())),
+            FontId::new(18.0, egui::FontFamily::Name("studio-heading".into())),
         );
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(11.0, 6.0);
         style.spacing.interact_size.y = 30.0;
-        style.spacing.window_margin = egui::Margin::same(20);
+        style.spacing.window_margin = egui::Margin::same(16);
         style.visuals.override_text_color = Some(INK);
         style.visuals.hyperlink_color = INK;
         style.visuals.panel_fill = Color32::WHITE;
