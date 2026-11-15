@@ -49,4 +49,12 @@ docker rename "$ID" "$NAME-reused"
 docker rm "$NAME-reused" >/dev/null
 # All per-start readiness rendezvous are transient.
 if compgen -G "$WORK/w-*.ready" >/dev/null; then echo 'readiness socket leaked' >&2; exit 1; fi
+# Removing temporary engine state must not strand idle supervisors trying to lock it.
+"$SMOLVM" engine unregister --socket "$SOCKET" --root "$ROOT"
+rm -rf "$ROOT"
+for _ in $(seq 1 100); do
+    if ! compgen -G "$WORK/w-*.sock" >/dev/null; then break; fi
+    sleep 0.2
+done
+if compgen -G "$WORK/w-*.sock" >/dev/null; then echo 'supervisor survived removal of its engine state' >&2; exit 1; fi
 echo 'PASS: inventory-independent probes and reads, fresh rename/remove/name reuse, and supervisor readiness cleanup'

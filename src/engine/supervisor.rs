@@ -492,12 +492,18 @@ pub(super) async fn serve(config: EngineConfig, owner: Option<String>) -> crate:
                     let running = e.owner.as_deref().and_then(|id|e.find_container(id)).is_some_and(|c|c.is_running() || c.record().state.status=="restarting");
                     if !running && !super::warm::has_live_dependents(&e) && e.activity.idle() {
                         if let Some(id) = &e.owner {
-                            if let Ok(gate) = lock(e.config.root.join(format!("spawn-{id}.lock"))).await {
-                                let warm = e.clone();
-                                if e.activity.idle() && tokio::task::spawn_blocking(move || super::warm::prepare_idle_exit(&warm)).await.unwrap_or(false) {
-                                    let _ = std::fs::remove_file(&exit_socket);
-                                    return Some(gate);
+                            match lock(e.config.root.join(format!("spawn-{id}.lock"))).await {
+                                Ok(gate) => {
+                                    let warm = e.clone();
+                                    if e.activity.idle() && tokio::task::spawn_blocking(move || super::warm::prepare_idle_exit(&warm)).await.unwrap_or(false) {
+                                        let _ = std::fs::remove_file(&exit_socket);
+                                        return Some(gate);
+                                    }
                                 }
+                                // An idle, workload-free supervisor has nothing left to
+                                // coordinate when its engine state has been deleted.
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !e.config.root.exists() => return None,
+                                Err(_) => {}
                             }
                         } else { return None; }
                     }
