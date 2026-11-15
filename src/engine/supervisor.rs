@@ -324,7 +324,7 @@ async fn dispatch_inner(
 }
 
 /// Adopt the listener owned by the OS instead of unlinking its socket.
-fn activated_listener() -> std::io::Result<Option<tokio::net::UnixListener>> {
+pub(super) fn activated_listener() -> std::io::Result<Option<tokio::net::UnixListener>> {
     #[cfg(target_os = "linux")]
     let fd = {
         if std::env::var("LISTEN_PID").ok().as_deref() != Some(&std::process::id().to_string()) {
