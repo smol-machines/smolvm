@@ -13,6 +13,14 @@ enum PickMode {
     Append,
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum ContainerTab {
+    #[default]
+    Overview,
+    Logs,
+    Mounts,
+}
+
 pub struct DockerView {
     worker: DockerWorker,
     kind: Kind,
@@ -43,6 +51,9 @@ pub struct DockerView {
     selected: Option<String>,
     details: Option<smol_studio::container_details::ContainerDetails>,
     stats: Option<Value>,
+    container_tab: ContainerTab,
+    container_logs: Option<(String, String)>,
+    log_filter: String,
     terminal: Option<crate::terminal_ui::TerminalWindow>,
 }
 impl DockerView {
@@ -119,6 +130,9 @@ impl DockerView {
             selected: None,
             details: None,
             stats: None,
+            container_tab: ContainerTab::Overview,
+            container_logs: None,
+            log_filter: String::new(),
             terminal: None,
         }
     }
@@ -143,6 +157,9 @@ impl DockerView {
         self.storage_selected = None;
         self.details = None;
         self.stats = None;
+        self.container_logs = None;
+        self.container_tab = ContainerTab::Overview;
+        self.log_filter.clear();
         self.rows.clear();
         self.valid = false;
         self.text.clear();
@@ -258,6 +275,7 @@ impl DockerView {
                             }
                         }
                         if kind == Kind::Containers {
+                            let previous = self.selected.clone();
                             self.selected = self
                                 .selected
                                 .take()
@@ -268,6 +286,11 @@ impl DockerView {
                                         .and_then(|r| r["ID"].as_str())
                                         .map(str::to_owned)
                                 });
+                            if self.selected != previous {
+                                self.container_logs = None;
+                                self.container_tab = ContainerTab::Overview;
+                                self.log_filter.clear();
+                            }
                             if let Some(id) = self.selected.clone() {
                                 self.submit(runtime, Action::Inspect(id));
                             } else {
@@ -281,6 +304,10 @@ impl DockerView {
                     if self.selected.as_deref() == Some(&details.id) {
                         self.details = Some(*details);
                         self.stats = None;
+                        if self.container_tab == ContainerTab::Logs && self.container_logs.is_none()
+                        {
+                            self.submit(runtime, Action::Logs(self.selected.clone().unwrap()));
+                        }
                     }
                 }
                 Ok(Output::Stats { id, value }) => {
@@ -288,7 +315,15 @@ impl DockerView {
                         self.stats = Some(value);
                     }
                 }
-                Ok(Output::Text(text)) => self.text = text,
+                Ok(Output::Text(text)) => {
+                    if let Action::Logs(id) = &done.action {
+                        if self.selected.as_ref() == Some(id) {
+                            self.container_logs = Some((id.clone(), text));
+                        }
+                    } else {
+                        self.text = text;
+                    }
+                }
                 Ok(Output::ComposeApplied { name, warning }) => {
                     self.project_selected = Some(name);
                     self.compose_import = false;
@@ -342,6 +377,7 @@ impl DockerView {
                     self.details = None;
                     self.storage = None;
                     self.stats = None;
+                    self.container_logs = None;
                     self.text.clear();
                     self.refresh(runtime);
                 }
@@ -745,6 +781,9 @@ impl DockerView {
                             self.selected = Some(container.id.clone());
                             self.details = None;
                             self.stats = None;
+                            self.container_tab = ContainerTab::Overview;
+                            self.container_logs = None;
+                            self.log_filter.clear();
                             self.text.clear();
                             self.submit(runtime, Action::List(Kind::Containers));
                         }
@@ -757,6 +796,107 @@ impl DockerView {
             }
         });
     }
+    fn container_logs(&mut self, ui: &mut egui::Ui, runtime: &Runtime, id: &str) {
+        let enabled = self.valid && self.pending.is_none();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Recent output · snapshot")
+                    .size(11.5)
+                    .color(MUTED),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Reload logs"))
+                    .clicked()
+                {
+                    self.submit(runtime, Action::Logs(id.to_owned()));
+                }
+                if let Some((_, text)) = self
+                    .container_logs
+                    .as_ref()
+                    .filter(|(source, _)| source == id)
+                    && ui
+                        .add_enabled(!text.is_empty(), egui::Button::new("Copy all"))
+                        .clicked()
+                {
+                    ui.ctx().copy_text(text.clone());
+                }
+            });
+        });
+        ui.add_space(8.0);
+        design::search(ui, &mut self.log_filter, "Filter log lines…");
+        ui.add_space(12.0);
+        let Some((_, text)) = self
+            .container_logs
+            .as_ref()
+            .filter(|(source, _)| source == id)
+        else {
+            if matches!(&self.pending, Some(Action::Logs(source)) if source == id) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading logs…");
+                });
+            } else {
+                ui.label(RichText::new("Reload to read this container’s output.").color(MUTED));
+            }
+            return;
+        };
+        if text.is_empty() {
+            ui.label(RichText::new("This container has not written any output.").color(MUTED));
+            return;
+        }
+        let query = self.log_filter.to_lowercase();
+        let lines: Vec<_> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| query.is_empty() || line.to_lowercase().contains(&query))
+            .collect();
+        if lines.is_empty() {
+            ui.label(RichText::new("No log lines match this filter.").color(MUTED));
+            return;
+        }
+        ui.label(
+            RichText::new(count(lines.len(), "line"))
+                .size(11.0)
+                .color(MUTED),
+        );
+        egui::Frame::new()
+            .fill(Color32::WHITE)
+            .stroke(egui::Stroke::new(1.0, design::LINE))
+            .corner_radius(8)
+            .inner_margin(12)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().interact_size.y = 18.0;
+                egui::ScrollArea::both()
+                    .id_salt(("container-log-lines", id))
+                    .auto_shrink([false, true])
+                    .max_height((ui.clip_rect().bottom() - ui.cursor().top() - 16.0).max(100.0))
+                    .show_rows(ui, 18.0, lines.len(), |ui, range| {
+                        for index in range {
+                            let (number, line) = lines[index];
+                            ui.push_id(number, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("{:>3}", number + 1))
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(MUTED),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(line).monospace().size(12.0),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend)
+                                        .selectable(true),
+                                    );
+                                });
+                            });
+                        }
+                    });
+            });
+    }
+
     fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
         let Some(details) = self.details.clone() else {
             ui.add_space(20.0);
@@ -767,191 +907,130 @@ impl DockerView {
             }
             return;
         };
-        egui::ScrollArea::vertical()
-            .id_salt("container-inspector-scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                design::resource_heading(
-                    ui,
-                    design::Icon::Containers,
-                    &details.name,
-                    &details.image,
-                );
-                ui.add_space(10.0);
+        let enabled = self.valid && self.pending.is_none();
+        egui::ScrollArea::vertical().id_salt("container-inspector-scroll").auto_shrink([false, false]).show(ui, |ui| {
+            ui.add(egui::Label::new(design::heading(&details.name, 23.0)).truncate()).on_hover_text(&details.name);
+            ui.horizontal(|ui| {
                 design::badge(ui, &details.state);
-                if let Some(health) = &details.health {
-                    ui.label(format!("Health: {health}"));
-                }
-                if details.state != "running"
-                    && let Some(code) = details.exit_code
-                {
-                    ui.label(format!("Exit code: {code}"));
-                }
-                if details.oom_killed {
-                    design::notice(ui, "Stopped after running out of memory.");
-                }
-                if !details.error.is_empty() {
-                    design::notice(ui, &details.error);
-                }
-                let enabled = self.valid && self.pending.is_none();
-                ui.add_space(12.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            enabled && details.state == "running",
-                            design::primary("Terminal"),
-                        )
-                        .clicked()
-                    {
-                        match crate::terminal_ui::TerminalWindow::for_container(
-                            ui.ctx(),
-                            &details.id,
-                            &details.name,
-                        ) {
-                            Ok(t) => self.terminal = Some(t),
-                            Err(e) => self.error = Some(e),
+                ui.add(egui::Label::new(RichText::new(&details.image).size(12.0).color(MUTED)).truncate()).on_hover_text(&details.image);
+            });
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                if details.state == "running" {
+                    if ui.add_enabled(enabled, design::primary("Open terminal")).clicked() {
+                        match crate::terminal_ui::TerminalWindow::for_container(ui.ctx(), &details.id, &details.name) {
+                            Ok(t) => self.terminal = Some(t), Err(e) => self.error = Some(e),
                         }
                     }
-                    if ui.add_enabled(enabled, egui::Button::new("Logs")).clicked() {
-                        self.submit(runtime, Action::Logs(details.id.clone()));
-                    }
-                    if details.state == "running" {
-                        if ui.add_enabled(enabled, egui::Button::new("Stop")).clicked() {
-                            self.submit(runtime, Action::Stop(details.id.clone()));
-                        }
-                    } else if ui.add_enabled(enabled, design::primary("Start")).clicked() {
-                        self.submit(runtime, Action::Start(details.id.clone()));
-                    }
-                    ui.add_enabled_ui(enabled, |ui| {
-                        ui.menu_button("More", |ui| {
-                            if ui.button("Copy container ID").clicked() {
-                                ui.ctx().copy_text(details.id.clone());
-                                ui.close();
-                            }
-                            if details.state != "running" {
-                                ui.separator();
-                                if ui
-                                    .button(RichText::new("Remove container…").color(design::RED))
-                                    .clicked()
-                                {
-                                    self.confirm = Some(Action::Delete(details.id.clone()));
-                                    ui.close();
-                                }
-                            }
-                        });
-                    });
-                });
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(16.0);
-                design::eyebrow(ui, "PUBLISHED PORTS");
-                if details.ports.is_empty() {
-                    ui.label(
-                        RichText::new("No ports published to this computer.")
-                            .small()
-                            .color(MUTED),
-                    );
+                    if ui.add_enabled(enabled, egui::Button::new("Stop")).clicked() { self.submit(runtime, Action::Stop(details.id.clone())); }
+                } else if ui.add_enabled(enabled, design::primary("Start container")).clicked() {
+                    self.submit(runtime, Action::Start(details.id.clone()));
                 }
-                for port in &details.ports {
-                    ui.push_id((&port.container, &port.host_ip, &port.host_port), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{}:{} → {}",
-                                port.host_ip, port.host_port, port.container
-                            ))
-                            .monospace()
-                            .size(11.0),
-                        );
-                        if let Some(url) = port.browser_url() {
-                            ui.hyperlink_to("Open in browser", url).on_hover_text(
-                                "Opens this TCP port using HTTP. The service must speak HTTP.",
-                            );
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.menu_button("More", |ui| {
+                        if ui.button("Copy container ID").clicked() { ui.ctx().copy_text(details.id.clone()); ui.close(); }
+                        if details.state != "running" {
+                            ui.separator();
+                            if ui.button(RichText::new("Remove container…").color(design::RED)).clicked() { self.confirm = Some(Action::Delete(details.id.clone())); ui.close(); }
                         }
                     });
-                }
-                ui.add_space(20.0);
-                design::eyebrow(ui, "RESOURCE USAGE");
-                if ui
-                    .add_enabled(
-                        enabled && details.state == "running",
-                        egui::Button::new("Measure now"),
-                    )
-                    .clicked()
-                {
-                    self.submit(runtime, Action::Stats(details.id.clone()));
-                }
-                if let Some(stats) = &self.stats {
-                    for (label, key) in [
-                        ("Machine CPU", "CPUPerc"),
-                        ("Guest memory / limit", "MemUsage"),
-                    ] {
-                        if let Some(value) = stats[key].as_str() {
-                            ui.label(format!("{label}: {value}"));
-                        }
-                    }
-                    ui.label(
-                        RichText::new(
-                            "Network, disk I/O, and process counts are not available yet.",
-                        )
-                        .small()
-                        .color(MUTED),
-                    );
-                    ui.label(
-                        RichText::new("Snapshot · not continuously polled")
-                            .small()
-                            .color(MUTED),
-                    );
-                }
-                ui.add_space(20.0);
-                design::eyebrow(ui, "MOUNTS");
-                if details.mounts.is_empty() {
-                    ui.label(
-                        RichText::new("No shared folders or volumes.")
-                            .small()
-                            .color(MUTED),
-                    );
-                }
-                for mount in &details.mounts {
-                    ui.label(RichText::new(&mount.target).monospace().size(12.0));
-                    ui.add(
-                        egui::Label::new(RichText::new(&mount.source).small().color(MUTED)).wrap(),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · {}",
-                            mount.kind,
-                            if mount.writable {
-                                "Read & write"
-                            } else {
-                                "Read only"
-                            }
-                        ))
-                        .small()
-                        .color(MUTED),
-                    );
-                    ui.add_space(8.0);
-                }
-                if let Some(project) = &details.project {
-                    ui.add_space(12.0);
-                    design::eyebrow(ui, "COMPOSE");
-                    if ui.link(format!("Project: {project}")).clicked() && self.pending.is_none() {
-                        self.compose = true;
-                        self.compose_import = false;
-                        self.project_selected = Some(project.clone());
-                        self.submit(runtime, Action::Projects);
-                    }
-                    if let Some(service) = &details.service {
-                        ui.label(format!("Service: {service}"));
-                    }
-                }
-                ui.add_space(16.0);
-                ui.collapsing("Command & diagnostics", |ui| {
-                    ui.label(format!("Restarts: {}", details.restarts));
-                    for arg in &details.command {
-                        ui.add(egui::Label::new(RichText::new(arg).monospace().size(11.0)).wrap());
-                    }
                 });
             });
+            if details.oom_killed { ui.add_space(8.0); design::notice(ui, "Stopped after running out of memory."); }
+            if !details.error.is_empty() { ui.add_space(8.0); design::notice(ui, &details.error); }
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                for (tab, label) in [(ContainerTab::Overview, "Overview"), (ContainerTab::Logs, "Logs"), (ContainerTab::Mounts, "Mounts")] {
+                    if design::tab(ui, self.container_tab == tab, label).clicked() {
+                        self.container_tab = tab;
+                        if tab == ContainerTab::Logs && enabled { self.submit(runtime, Action::Logs(details.id.clone())); }
+                    }
+                }
+            });
+            ui.separator(); ui.add_space(16.0);
+            match self.container_tab {
+                ContainerTab::Logs => self.container_logs(ui, runtime, &details.id),
+                ContainerTab::Mounts => {
+                    ui.label(design::heading("Shared folders & volumes", 14.0)); ui.add_space(8.0);
+                    if details.mounts.is_empty() { ui.label(RichText::new("No folders or volumes are mounted in this container.").size(12.0).color(MUTED)); }
+                    for (index, mount) in details.mounts.iter().enumerate() {
+                        ui.push_id(index, |ui| {
+                            design::card().show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Label::new(RichText::new(&mount.target).monospace().size(13.0)).truncate()).on_hover_text(&mount.target);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("Copy path").clicked() { ui.ctx().copy_text(mount.target.clone()); }
+                                    });
+                                });
+                                ui.label(RichText::new(format!("{} · {}", mount.kind, if mount.writable { "Read & write" } else { "Read only" })).size(11.5).color(MUTED));
+                                ui.add_space(8.0);
+                                ui.add(egui::Label::new(RichText::new(&mount.source).size(12.0).color(MUTED)).wrap()).on_hover_text(&mount.source);
+                            });
+                            ui.add_space(8.0);
+                        });
+                    }
+                }
+                ContainerTab::Overview => {
+                    if details.health.is_some() || details.state != "running" {
+                        design::card().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if let Some(health) = &details.health { design::property(ui, "Health", health); }
+                            if details.state != "running" && let Some(code) = details.exit_code { design::property(ui, "Exit code", &code.to_string()); }
+                        }); ui.add_space(16.0);
+                    }
+                    ui.label(design::heading("Published ports", 14.0)); ui.add_space(8.0);
+                    if details.ports.is_empty() { ui.label(RichText::new("No ports published to this computer.").size(12.0).color(MUTED)); }
+                    else { design::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for (index, port) in details.ports.iter().enumerate() {
+                            ui.push_id(index, |ui| {
+                                if index > 0 { ui.separator(); }
+                                let binding = format!("{}:{} → {}", port.host_ip, port.host_port, port.container);
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Label::new(RichText::new(&binding).monospace().size(12.0)).truncate()).on_hover_text(&binding);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if let Some(url) = port.browser_url() {
+                                            if ui.small_button("Copy URL").clicked() { ui.ctx().copy_text(url.clone()); }
+                                            ui.hyperlink_to("Open", url).on_hover_text("Open this TCP port using HTTP; the service must speak HTTP.");
+                                        } else if ui.small_button("Copy binding").clicked() { ui.ctx().copy_text(binding.clone()); }
+                                    });
+                                });
+                            });
+                        }
+                    }); }
+                    ui.add_space(20.0);
+                    ui.horizontal(|ui| {
+                        ui.label(design::heading("Resource usage", 14.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add_enabled(enabled && details.state == "running", egui::Button::new("Measure now")).clicked() { self.submit(runtime, Action::Stats(details.id.clone())); }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    design::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if let Some(stats) = &self.stats {
+                            for (label, key) in [("Machine CPU", "CPUPerc"), ("Guest memory / limit", "MemUsage")] {
+                                if let Some(value) = stats[key].as_str() { design::property(ui, label, value); }
+                            }
+                            ui.label(RichText::new("Snapshot · network, disk I/O and process counts unavailable").size(11.0).color(MUTED));
+                        } else { ui.label(RichText::new(if details.state == "running" { "Measure to take a CPU and memory snapshot." } else { "Start this container to measure resource usage." }).size(12.0).color(MUTED)); }
+                    });
+                    if let Some(project) = &details.project {
+                        ui.add_space(20.0); ui.label(design::heading("Compose project", 14.0));
+                        if ui.link(project).clicked() && enabled {
+                            self.compose = true; self.compose_import = false; self.project_selected = Some(project.clone()); self.submit(runtime, Action::Projects);
+                        }
+                        if let Some(service) = &details.service { ui.label(RichText::new(format!("Service: {service}")).size(12.0).color(MUTED)); }
+                    }
+                    ui.add_space(20.0);
+                    ui.collapsing("Command & diagnostics", |ui| {
+                        design::property(ui, "Restarts", &details.restarts.to_string());
+                        for arg in &details.command { ui.add(egui::Label::new(RichText::new(arg).monospace().size(11.0)).wrap()); }
+                    });
+                }
+            }
+        });
     }
     pub fn ui(&mut self, ui: &mut egui::Ui, runtime: &Runtime, frame: &eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -1169,6 +1248,9 @@ impl DockerView {
                                     self.selected = Some(id.clone());
                                     self.details = None;
                                     self.stats = None;
+                                    self.container_logs = None;
+                                    self.container_tab = ContainerTab::Overview;
+                                    self.log_filter.clear();
                                     self.submit(runtime, Action::Inspect(id));
                                 }
                             }
