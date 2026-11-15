@@ -349,6 +349,7 @@ mod tests {
     /// process open take ephemeral ports too, so one could land on it before
     /// the test binds it. The range is below every ephemeral range (32768 on
     /// Linux, 49152 on macOS), as `smolvm-network`'s acceptor tests do.
+    #[cfg(unix)]
     fn unused_port() -> u16 {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let start = std::process::id() % 6_000;
