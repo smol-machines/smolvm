@@ -91,9 +91,6 @@ jobs:
     name: macOS (arm64)
     # Our own Mac mini: it keeps target/ between runs, so a build only recompiles what changed
     runs-on: [self-hosted, macOS, ARM64]
-    # One self-hosted macOS runner: a hung job holds every later macOS job
-    # until GitHub's six-hour limit. A full run takes about four minutes.
-    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:

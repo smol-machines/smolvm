@@ -343,6 +343,24 @@ fn write_state(path: &Path, state: &AutoPortsState) {
 mod tests {
     use super::*;
 
+    /// A port no listener holds, for a test that must publish that exact
+    /// number (host P to guest P). Not one the kernel picks with bind(0): that
+    /// is an ephemeral port, and the outbound connections other tests in this
+    /// process open take ephemeral ports too, so one could land on it before
+    /// the test binds it. The range is below every ephemeral range (32768 on
+    /// Linux, 49152 on macOS), as `smolvm-network`'s acceptor tests do.
+    fn unused_port() -> u16 {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let start = std::process::id() % 6_000;
+        loop {
+            let offset = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let port = (20_000 + (start + offset) % 12_000) as u16;
+            if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+                return port;
+            }
+        }
+    }
+
     /// A publisher double: refuses any set holding a port in `taken`, and
     /// records the last set it accepted.
     #[derive(Default)]
@@ -515,11 +533,7 @@ mod tests {
         });
         let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let taken_port = taken.local_addr().unwrap().port();
-        let free_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let free_port = unused_port();
 
         let forwarder = PortForwarder::new(&socket).unwrap();
         let mut auto = AutoPublisher::new(forwarder, &[], Vec::new);
@@ -529,6 +543,9 @@ mod tests {
         assert_eq!(state.skipped[0].port, taken_port);
 
         let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, free_port)).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
         let mut reply = String::new();
         client.read_to_string(&mut reply).unwrap();

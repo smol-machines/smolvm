@@ -172,20 +172,12 @@ mod tests {
         assert_eq!(forwarder.mappings(), vec![a, b]);
     }
 
-    fn free_port() -> u16 {
-        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     fn ask(port: u16, body: &str) -> String {
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        // A port from `free_port` can be taken by another test's listener
-        // before this test binds it. A reply that never comes then fails the
-        // test instead of hanging it: one hung here for four and a half hours
-        // and held the only macOS runner.
+        // Every port here stays bound from the moment the test has its number,
+        // so no other test can take it. A reply that still never comes fails
+        // the test instead of hanging it (a test that released its port before
+        // binding it again once hung here for four and a half hours).
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
@@ -205,21 +197,26 @@ mod tests {
         let socket = dir.path().join(PORT_FORWARD_SOCKET);
         fake_guest(&socket);
         let forwarder = PortForwarder::new(&socket).unwrap();
-        let (a, b) = (free_port(), free_port());
+        // Guest ports no other test here uses: a removed host port may be
+        // bound by another test at once, and its reply must not pass for ours.
 
-        forwarder.replace(&[PortMapping::new(a, 8080)]).unwrap();
+        // Ports the OS picks and the forwarder keeps bound: a port picked and
+        // released first could be taken by a parallel test before the
+        // forwarder bound it, and the request then reached that test instead.
+        let a = forwarder.publish_atomic(7101).unwrap();
         assert_eq!(
-            ask(a, "hello"),
-            "8080:hello",
+            ask(a.host, "hello"),
+            "7101:hello",
             "half-close lets the reply finish"
         );
 
-        forwarder
-            .replace(&[PortMapping::new(a, 8080), PortMapping::new(b, 9090)])
-            .unwrap();
-        assert_eq!(ask(b, "x"), "9090:x");
+        let b = forwarder.publish_atomic(7102).unwrap();
+        assert_eq!(ask(b.host, "x"), "7102:x");
+        assert_eq!(ask(a.host, "still"), "7101:still", "adding keeps the first");
 
-        forwarder.replace(&[PortMapping::new(b, 9090)]).unwrap();
+        forwarder.replace(&[b]).unwrap();
+        let a = a.host;
+        let b = b.host;
         // Closed by the time the change returns, not an accept poll later. The
         // freed port may already belong to another test's listener, so what is
         // checked is that nothing on it reaches this machine any more.
@@ -232,11 +229,11 @@ mod tests {
             let mut reply = String::new();
             let _ = stream.read_to_string(&mut reply);
             assert!(
-                !reply.starts_with("8080:"),
+                !reply.starts_with("7101:"),
                 "a removed port stops: {reply:?}"
             );
         }
-        assert_eq!(ask(b, "y"), "9090:y", "a kept port keeps serving");
+        assert_eq!(ask(b, "y"), "7102:y", "a kept port keeps serving");
     }
 
     /// Moving a published host port to another guest port keeps its listener
@@ -248,8 +245,7 @@ mod tests {
         let socket = dir.path().join(PORT_FORWARD_SOCKET);
         fake_guest(&socket);
         let forwarder = PortForwarder::new(&socket).unwrap();
-        let a = free_port();
-        forwarder.replace(&[PortMapping::new(a, 8080)]).unwrap();
+        let a = forwarder.publish_atomic(8080).unwrap().host;
         assert_eq!(ask(a, "one"), "8080:one");
         forwarder.replace(&[PortMapping::new(a, 9090)]).unwrap();
         assert_eq!(ask(a, "two"), "9090:two");
@@ -261,8 +257,7 @@ mod tests {
         let socket = dir.path().join(PORT_FORWARD_SOCKET);
         fake_guest(&socket);
         let forwarder = PortForwarder::new(&socket).unwrap();
-        let a = free_port();
-        forwarder.replace(&[PortMapping::new(a, 80)]).unwrap();
+        let a = forwarder.publish_atomic(80).unwrap().host;
         let err = forwarder
             .replace(&[PortMapping::with_protocol(a, 53, PortProtocol::Udp)])
             .unwrap_err();
@@ -276,12 +271,10 @@ mod tests {
         let socket = dir.path().join(PORT_FORWARD_SOCKET);
         fake_guest(&socket);
         let forwarder = PortForwarder::new(&socket).unwrap();
-        let (a, held) = (
-            free_port(),
-            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
-        );
+        let a = forwarder.publish_atomic(80).unwrap().host;
+        // held by this test for as long as it runs, so it stays taken
+        let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let taken = held.local_addr().unwrap().port();
-        forwarder.replace(&[PortMapping::new(a, 80)]).unwrap();
         assert!(forwarder.replace(&[PortMapping::new(taken, 81)]).is_err());
         assert_eq!(ask(a, "z"), "80:z");
     }
