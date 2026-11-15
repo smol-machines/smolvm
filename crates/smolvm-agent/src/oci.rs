@@ -1445,6 +1445,10 @@ fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
         // them means the workload doesn't have to mount them itself, and read-only
         // rootfs images still get writable runtime dirs. Omitted when unprivileged
         // (the workload can't mount, but also isn't expected to be an init system).
+        // The image's own files under /run are copied in (`tmpcopyup`): an
+        // image that ships a directory there, such as a database's socket
+        // directory owned by its service user, finds it as it would on a
+        // container engine that mounts nothing over /run.
         mounts.push(OciMount {
             destination: "/run".to_string(),
             mount_type: Some("tmpfs".to_string()),
@@ -1454,6 +1458,7 @@ fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
                 "nodev".to_string(),
                 "mode=0755".to_string(),
                 "size=65536k".to_string(),
+                "tmpcopyup".to_string(),
             ],
         });
         mounts.push(OciMount {
@@ -1545,6 +1550,16 @@ fn is_dns_label(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_run_tmpfs_starts_with_the_image_files_under_it() {
+        let run = super::default_mounts(false)
+            .into_iter()
+            .find(|mount| mount.destination == "/run")
+            .expect("/run is mounted");
+        assert_eq!(run.mount_type.as_deref(), Some("tmpfs"));
+        assert!(run.options.iter().any(|option| option == "tmpcopyup"));
+    }
+
     #[test]
     fn dev_shm_takes_half_the_guest_ram_unless_the_machine_sets_a_size() {
         let shm_size = |unprivileged| {
