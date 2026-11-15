@@ -23,6 +23,9 @@ portable-pty = "0.9"
 vt100 = "0.18"
 rfd = "0.18"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

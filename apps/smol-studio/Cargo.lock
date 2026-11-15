@@ -3892,6 +3892,7 @@ dependencies = [
  "eframe",
  "fs2",
  "keyring",
+ "libc",
  "portable-pty",
  "reqwest",
  "rfd",

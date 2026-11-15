@@ -52,8 +52,7 @@ pub struct DockerView {
     details: Option<smol_studio::container_details::ContainerDetails>,
     stats: Option<Value>,
     container_tab: ContainerTab,
-    container_logs: Option<(String, String)>,
-    log_filter: String,
+    live_logs: crate::live_logs_ui::LiveLogs,
     terminal: Option<crate::terminal_ui::TerminalWindow>,
 }
 impl DockerView {
@@ -131,8 +130,7 @@ impl DockerView {
             details: None,
             stats: None,
             container_tab: ContainerTab::Overview,
-            container_logs: None,
-            log_filter: String::new(),
+            live_logs: crate::live_logs_ui::LiveLogs::default(),
             terminal: None,
         }
     }
@@ -157,9 +155,8 @@ impl DockerView {
         self.storage_selected = None;
         self.details = None;
         self.stats = None;
-        self.container_logs = None;
+        self.live_logs.reset();
         self.container_tab = ContainerTab::Overview;
-        self.log_filter.clear();
         self.rows.clear();
         self.valid = false;
         self.text.clear();
@@ -287,9 +284,8 @@ impl DockerView {
                                         .map(str::to_owned)
                                 });
                             if self.selected != previous {
-                                self.container_logs = None;
+                                self.live_logs.reset();
                                 self.container_tab = ContainerTab::Overview;
-                                self.log_filter.clear();
                             }
                             if let Some(id) = self.selected.clone() {
                                 self.submit(runtime, Action::Inspect(id));
@@ -304,10 +300,6 @@ impl DockerView {
                     if self.selected.as_deref() == Some(&details.id) {
                         self.details = Some(*details);
                         self.stats = None;
-                        if self.container_tab == ContainerTab::Logs && self.container_logs.is_none()
-                        {
-                            self.submit(runtime, Action::Logs(self.selected.clone().unwrap()));
-                        }
                     }
                 }
                 Ok(Output::Stats { id, value }) => {
@@ -315,15 +307,7 @@ impl DockerView {
                         self.stats = Some(value);
                     }
                 }
-                Ok(Output::Text(text)) => {
-                    if let Action::Logs(id) = &done.action {
-                        if self.selected.as_ref() == Some(id) {
-                            self.container_logs = Some((id.clone(), text));
-                        }
-                    } else {
-                        self.text = text;
-                    }
-                }
+                Ok(Output::Text(text)) => self.text = text,
                 Ok(Output::ComposeApplied { name, warning }) => {
                     self.project_selected = Some(name);
                     self.compose_import = false;
@@ -377,7 +361,7 @@ impl DockerView {
                     self.details = None;
                     self.storage = None;
                     self.stats = None;
-                    self.container_logs = None;
+                    self.live_logs.reset();
                     self.text.clear();
                     self.refresh(runtime);
                 }
@@ -782,8 +766,7 @@ impl DockerView {
                             self.details = None;
                             self.stats = None;
                             self.container_tab = ContainerTab::Overview;
-                            self.container_logs = None;
-                            self.log_filter.clear();
+                            self.live_logs.reset();
                             self.text.clear();
                             self.submit(runtime, Action::List(Kind::Containers));
                         }
@@ -796,105 +779,13 @@ impl DockerView {
             }
         });
     }
-    fn container_logs(&mut self, ui: &mut egui::Ui, runtime: &Runtime, id: &str) {
-        let enabled = self.valid && self.pending.is_none();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Recent output · snapshot")
-                    .size(11.5)
-                    .color(MUTED),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Reload logs"))
-                    .clicked()
-                {
-                    self.submit(runtime, Action::Logs(id.to_owned()));
-                }
-                if let Some((_, text)) = self
-                    .container_logs
-                    .as_ref()
-                    .filter(|(source, _)| source == id)
-                    && ui
-                        .add_enabled(!text.is_empty(), egui::Button::new("Copy all"))
-                        .clicked()
-                {
-                    ui.ctx().copy_text(text.clone());
-                }
-            });
-        });
-        ui.add_space(8.0);
-        design::search(ui, &mut self.log_filter, "Filter log lines…");
-        ui.add_space(12.0);
-        let Some((_, text)) = self
-            .container_logs
-            .as_ref()
-            .filter(|(source, _)| source == id)
-        else {
-            if matches!(&self.pending, Some(Action::Logs(source)) if source == id) {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Loading logs…");
-                });
-            } else {
-                ui.label(RichText::new("Reload to read this container’s output.").color(MUTED));
-            }
-            return;
-        };
-        if text.is_empty() {
-            ui.label(RichText::new("This container has not written any output.").color(MUTED));
-            return;
-        }
-        let query = self.log_filter.to_lowercase();
-        let lines: Vec<_> = text
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| query.is_empty() || line.to_lowercase().contains(&query))
-            .collect();
-        if lines.is_empty() {
-            ui.label(RichText::new("No log lines match this filter.").color(MUTED));
-            return;
-        }
-        ui.label(
-            RichText::new(count(lines.len(), "line"))
-                .size(11.0)
-                .color(MUTED),
+    pub fn logs_visibility(&mut self, workspace_visible: bool) {
+        self.live_logs.set_visible(
+            workspace_visible
+                && !self.compose
+                && self.kind == Kind::Containers
+                && self.container_tab == ContainerTab::Logs,
         );
-        egui::Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(egui::Stroke::new(1.0, design::LINE))
-            .corner_radius(8)
-            .inner_margin(12)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().interact_size.y = 18.0;
-                egui::ScrollArea::both()
-                    .id_salt(("container-log-lines", id))
-                    .auto_shrink([false, true])
-                    .max_height((ui.clip_rect().bottom() - ui.cursor().top() - 16.0).max(100.0))
-                    .show_rows(ui, 18.0, lines.len(), |ui, range| {
-                        for index in range {
-                            let (number, line) = lines[index];
-                            ui.push_id(number, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("{:>3}", number + 1))
-                                            .monospace()
-                                            .size(11.0)
-                                            .color(MUTED),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(line).monospace().size(12.0),
-                                        )
-                                        .wrap_mode(egui::TextWrapMode::Extend)
-                                        .selectable(true),
-                                    );
-                                });
-                            });
-                        }
-                    });
-            });
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
@@ -943,13 +834,13 @@ impl DockerView {
                 for (tab, label) in [(ContainerTab::Overview, "Overview"), (ContainerTab::Logs, "Logs"), (ContainerTab::Mounts, "Mounts")] {
                     if design::tab(ui, self.container_tab == tab, label).clicked() {
                         self.container_tab = tab;
-                        if tab == ContainerTab::Logs && enabled { self.submit(runtime, Action::Logs(details.id.clone())); }
+                        self.live_logs.set_visible(tab == ContainerTab::Logs);
                     }
                 }
             });
             ui.separator(); ui.add_space(16.0);
             match self.container_tab {
-                ContainerTab::Logs => self.container_logs(ui, runtime, &details.id),
+                ContainerTab::Logs => self.live_logs.show(ui, &details.id, enabled),
                 ContainerTab::Mounts => {
                     ui.label(design::heading("Shared folders & volumes", 14.0)); ui.add_space(8.0);
                     if details.mounts.is_empty() { ui.label(RichText::new("No folders or volumes are mounted in this container.").size(12.0).color(MUTED)); }
@@ -1248,9 +1139,8 @@ impl DockerView {
                                     self.selected = Some(id.clone());
                                     self.details = None;
                                     self.stats = None;
-                                    self.container_logs = None;
+                                    self.live_logs.reset();
                                     self.container_tab = ContainerTab::Overview;
-                                    self.log_filter.clear();
                                     self.submit(runtime, Action::Inspect(id));
                                 }
                             }

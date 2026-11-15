@@ -14,3 +14,5 @@ pub mod container_details;
 pub mod storage;
 
 pub mod files;
+
+pub mod log_stream;
