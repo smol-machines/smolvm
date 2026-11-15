@@ -825,7 +825,9 @@ async fn container_attach(
                 }
             }
         }
-        if !stream || (!c2.is_running() && c2.record().state.status != "created") {
+        // `docker start -a` attaches before starting both new and exited
+        // containers. Keep a streaming attach open for the next execution.
+        if !stream {
             output.close().await;
             return;
         }
