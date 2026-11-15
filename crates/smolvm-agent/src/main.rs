@@ -2368,6 +2368,8 @@ fn handle_fsnotify(events: &[FsNotifyEvent]) -> AgentResponse {
 }
 
 fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
+    let mut wire = WireStream::new(stream);
+    let stream = &mut wire;
     let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
 
     // Per-connection streaming-upload session. `Option<WriteSession>`
@@ -2417,27 +2419,23 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // Parse request (Envelope wraps the request with an optional trace_id).
         // Falls back to bare AgentRequest for backward compatibility with old hosts.
         let (mut request, trace_id) =
-            match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
-                Ok(env) => (env.body, env.trace_id),
-                Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
-                    Ok(req) => (req, None),
-                    Err(e) => {
-                        warn!(error = %e, "invalid request");
-                        // Keep the "invalid request: " prefix stable: the host
-                        // recognizes "invalid request: unknown variant `…`" as
-                        // a protocol-version skew and rewrites it into an
-                        // update-the-agent message (client.rs
-                        // `describe_agent_error`).
-                        send_response(
-                            stream,
-                            &AgentResponse::error(
-                                format!("invalid request: {}", e),
-                                error_codes::INVALID_REQUEST,
-                            ),
-                        )?;
-                        continue;
+            match smolvm_protocol::binary_stream::decode_request(&buf[..len]) {
+                Ok(env) => {
+                    if env.binary_stream == Some(smolvm_protocol::binary_stream::VERSION) {
+                        stream.binary = true;
                     }
-                },
+                    (env.body, env.trace_id)
+                }
+                Err(e) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::error(
+                            format!("invalid request: {e}"),
+                            error_codes::INVALID_REQUEST,
+                        ),
+                    )?;
+                    continue;
+                }
             };
 
         // Work around serde flatten + internally-tagged enum limitation:
@@ -3878,7 +3876,7 @@ const FILE_FINALIZE_KEEPALIVE: std::time::Duration = std::time::Duration::from_s
 /// sends a progress frame every `period` until it returns, so a slow step
 /// never leaves the host with a silent connection.
 fn with_keepalive<S: Write, T: Send>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     period: std::time::Duration,
     work: impl FnOnce() -> T + Send,
 ) -> T {
@@ -3949,7 +3947,7 @@ fn handle_file_write_chunk(
 /// and returns the `io::Error` to the caller for producer-specific
 /// cleanup (e.g., killing a child process).
 fn send_data_chunks<R: Read>(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     reader: &mut R,
     chunk_size: usize,
     error_context: &str,
@@ -3969,7 +3967,7 @@ fn send_data_chunks<R: Read>(
 /// Send data chunks without the terminal frame so a producer can verify its
 /// final status before reporting a successful end-of-stream.
 fn send_data_chunks_body<R: Read>(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     reader: &mut R,
     chunk_size: usize,
     error_context: &str,
@@ -4016,7 +4014,7 @@ fn send_data_chunks_body<R: Read>(
 /// loop (not the generic `handle_request` match) so it can emit
 /// multiple responses per request.
 fn handle_streaming_file_read(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     path: &str,
     target: Option<&WorkloadTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4134,7 +4132,7 @@ fn handle_streaming_file_read(
 /// visible there even when an image workload is active, and no temporary
 /// archive needs to traverse virtiofs or occupy the guest disk.
 fn handle_streaming_archive_directory(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     path: &str,
     target: Option<&WorkloadTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4232,7 +4230,7 @@ fn handle_streaming_archive_directory(
 /// layer is written to a file on the storage disk first, since building it
 /// walks the whole upper directory, then sent in chunks.
 fn handle_streaming_container_diff(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     overlay_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let built = container::build_container_diff(overlay_id);
@@ -4279,7 +4277,7 @@ fn handle_streaming_container_diff(
 
 /// Handle an interactive run session with streaming I/O.
 fn handle_interactive_run(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
@@ -4730,7 +4728,7 @@ fn build_oci_spec(
 /// persist across exec sessions, which requires a named overlay.
 #[cfg(target_os = "linux")]
 fn handle_run_detached(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::path::Path;
@@ -5419,7 +5417,7 @@ mod stop_on_exit_tests {
 /// `cargo check` on macOS compiles the dispatch in `handle_connection`.
 #[cfg(not(target_os = "linux"))]
 fn handle_run_detached(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     _request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     send_response(
@@ -6430,8 +6428,7 @@ impl InteractiveFrame {
                     self.body.resize(len, 0);
                     continue;
                 }
-                let request = serde_json::from_slice(&self.body)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                let request = smolvm_protocol::binary_stream::decode_request(&self.body)?.body;
                 *self = Self::default();
                 return Ok(Some(request));
             }
@@ -6465,7 +6462,7 @@ impl InteractiveFrame {
 }
 
 fn run_interactive_loop(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     timeout_ms: Option<u64>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
@@ -6487,7 +6484,7 @@ fn run_interactive_loop(
 }
 
 fn run_interactive_loop_io(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     timeout_ms: Option<u64>,
     child_stdout: &mut Option<std::process::ChildStdout>,
@@ -6792,7 +6789,7 @@ fn run_interactive_loop_io(
 /// (PTY merges stdout and stderr) and supports terminal resize.
 #[cfg(unix)]
 fn run_interactive_loop_pty(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     pty_master: pty::PtyMaster,
     timeout_ms: Option<u64>,
@@ -7044,7 +7041,7 @@ fn run_interactive_loop_pty(
 
 /// Drain any remaining output from stdout/stderr after child exits.
 fn drain_remaining_output(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     child_stdout: &mut Option<std::process::ChildStdout>,
     child_stderr: &mut Option<std::process::ChildStderr>,
     stdout_buf: &mut [u8],
@@ -7953,7 +7950,7 @@ fn handle_run(
 
 /// Handle image pull request with progress streaming.
 fn handle_streaming_pull<S: Read + Write>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     image: &str,
     cache_as: Option<&str>,
     oci_platform: Option<&str>,
@@ -7996,7 +7993,7 @@ const PULL_PROGRESS_HEARTBEAT: std::time::Duration = std::time::Duration::from_s
 /// host's frame timeout, so while the pull is quiet this thread (the stream's
 /// only writer) repeats the latest update every `heartbeat`.
 fn pull_with_heartbeat<S: Write, T: Send>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     heartbeat: std::time::Duration,
     pull: impl FnOnce(&mut dyn FnMut(usize, usize, &str)) -> T + Send,
 ) -> Result<T, Box<dyn std::error::Error>> {
@@ -8150,7 +8147,7 @@ fn handle_flatten_layers(lowerdirs: &[String], output: &str) -> AgentResponse {
 /// image runs the helper out of space partway through. Streaming keeps the
 /// archive off the disk entirely, so only the source rootfs has to fit.
 fn handle_streaming_flatten_layers(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     lowerdirs: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
@@ -8247,7 +8244,7 @@ fn handle_format_storage() -> AgentResponse {
 /// chunks. No temp tar file is created — this allows exporting layers of any
 /// size without filling the storage disk.
 fn handle_streaming_export_layer(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     image_digest: &str,
     layer_index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -8902,7 +8899,7 @@ fn handle_vm_exec(
 
 /// Handle interactive VM-level exec with streaming I/O.
 fn handle_interactive_vm_exec(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (command, env, workdir, timeout_ms, tty) = match request {
@@ -9069,10 +9066,19 @@ fn spawn_direct_interactive_command(
 
 /// Send a response to the client.
 fn send_response(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     response: &AgentResponse,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_vec(response)?;
+    if stream.binary && smolvm_protocol::binary_stream::write_response(&mut stream.inner, response)?
+    {
+        stream.flush()?;
+        return Ok(());
+    }
+    let mut envelope = Envelope::new(response);
+    if stream.binary {
+        envelope.binary_stream = Some(smolvm_protocol::binary_stream::VERSION);
+    }
+    let json = serde_json::to_vec(&envelope)?;
     let len = json.len() as u32;
 
     stream.write_all(&len.to_be_bytes())?;
@@ -9081,6 +9087,39 @@ fn send_response(
 
     debug!(?response, "sent response");
     Ok(())
+}
+
+/// Negotiation belongs to this connection, never to a process or worker thread.
+struct WireStream<'a, T> {
+    inner: &'a mut T,
+    binary: bool,
+}
+
+impl<'a, T> WireStream<'a, T> {
+    fn new(inner: &'a mut T) -> Self {
+        Self {
+            inner,
+            binary: false,
+        }
+    }
+}
+impl<T: Read> Read for WireStream<'_, T> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(bytes)
+    }
+}
+impl<T: Write> Write for WireStream<'_, T> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl<T: AsRawFd> AsRawFd for WireStream<'_, T> {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.inner.as_raw_fd()
+    }
 }
 
 /// Trait for read+write streams with raw fd access.
@@ -9161,7 +9200,8 @@ mod work_slot_tests {
             .unwrap();
 
         let before = thread_cpu();
-        let code = run_interactive_loop(&mut guest, &mut child, None).unwrap();
+        let code =
+            run_interactive_loop(&mut WireStream::new(&mut guest), &mut child, None).unwrap();
         let spent = thread_cpu() - before;
 
         assert_eq!(code, 0);
@@ -10035,8 +10075,10 @@ mod tests {
                 )
                 .unwrap();
                 assert!(pty.is_none());
-                send_response(&mut agent, &AgentResponse::Started).unwrap();
-                let code = run_interactive_loop(&mut agent, &mut child, Some(500)).unwrap();
+                send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+                let code =
+                    run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(500))
+                        .unwrap();
                 finished.send(code).unwrap();
             });
 
@@ -10075,7 +10117,7 @@ mod tests {
         .unwrap();
         assert!(pty.is_none());
         assert_eq!(
-            run_interactive_loop(&mut agent, &mut child, Some(100)).unwrap(),
+            run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(100)).unwrap(),
             124
         );
 
@@ -10108,7 +10150,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100)).unwrap(),
+            run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty.unwrap(),
+                Some(100)
+            )
+            .unwrap(),
             124
         );
 
@@ -10127,6 +10175,12 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn streamed_cat_drains_stdout_while_writing_large_stdin() {
+        for binary in [false, true] {
+            streamed_cat_with_encoding(binary);
+        }
+    }
+
+    fn streamed_cat_with_encoding(binary: bool) {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
@@ -10138,6 +10192,8 @@ mod tests {
             .set_write_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let guest = std::thread::spawn(move || {
+            let mut agent = WireStream::new(&mut agent);
+            agent.binary = binary;
             let (mut child, pty) =
                 spawn_direct_interactive_command(&["cat".to_string()], &[], None, false).unwrap();
             assert!(pty.is_none());
@@ -10153,15 +10209,23 @@ mod tests {
             .unwrap();
         });
 
-        let input = vec![b'x'; 512 * 1024];
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
         let mut writer = client.try_clone().unwrap();
         let payload = input.clone();
         let sender = std::thread::spawn(move || {
+            let encode = |request: &AgentRequest| {
+                if binary {
+                    smolvm_protocol::binary_stream::encode_request(request, None)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    smolvm_protocol::encode_message(request).unwrap()
+                }
+            };
             for chunk in payload.chunks(32 * 1024) {
-                let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                let frame = encode(&AgentRequest::Stdin {
                     data: chunk.to_vec(),
-                })
-                .unwrap();
+                });
                 if chunk.as_ptr() == payload.as_ptr() {
                     // Fragments across both the prefix and payload must be
                     // assembled without losing the command's streamed output.
@@ -10175,10 +10239,7 @@ mod tests {
                 }
             }
             writer
-                .write_all(
-                    &smolvm_protocol::encode_message(&AgentRequest::Stdin { data: Vec::new() })
-                        .unwrap(),
-                )
+                .write_all(&encode(&AgentRequest::Stdin { data: Vec::new() }))
                 .unwrap();
         });
 
@@ -10188,7 +10249,10 @@ mod tests {
             client.read_exact(&mut header).unwrap();
             let mut body = vec![0; u32::from_be_bytes(header) as usize];
             client.read_exact(&mut body).unwrap();
-            match serde_json::from_slice::<AgentResponse>(&body).unwrap() {
+            match smolvm_protocol::binary_stream::decode_response(&body)
+                .unwrap()
+                .0
+            {
                 AgentResponse::Started => {}
                 AgentResponse::Stdout { data } => stdout.extend(data),
                 AgentResponse::Exited { exit_code, .. } => {
@@ -10229,10 +10293,16 @@ mod tests {
             )
             .unwrap();
             let pty = pty.unwrap();
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
-            let code = run_interactive_loop_pty(&mut agent, &mut child, pty, Some(5000)).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+            let code = run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty,
+                Some(5000),
+            )
+            .unwrap();
             send_response(
-                &mut agent,
+                &mut WireStream::new(&mut agent),
                 &AgentResponse::Exited {
                     exit_code: code,
                     oom: false,
@@ -10340,10 +10410,14 @@ mod tests {
                     true,
                 )
                 .unwrap();
-                send_response(&mut agent, &AgentResponse::Started).unwrap();
-                let code =
-                    run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100))
-                        .unwrap();
+                send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+                let code = run_interactive_loop_pty(
+                    &mut WireStream::new(&mut agent),
+                    &mut child,
+                    pty.unwrap(),
+                    Some(100),
+                )
+                .unwrap();
                 tx.send(code).unwrap();
             });
 
@@ -10383,9 +10457,15 @@ mod tests {
             )
             .unwrap();
             let pty = pty.unwrap();
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop_pty(&mut agent, &mut child, pty, Some(2000)).unwrap();
+            let code = run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty,
+                Some(2000),
+            )
+            .unwrap();
             (code, started.elapsed())
         });
 
@@ -10436,9 +10516,11 @@ mod tests {
             )
             .unwrap();
             assert!(pty.is_none());
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            let code =
+                run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(2000))
+                    .unwrap();
             (code, started.elapsed())
         });
 
@@ -10491,9 +10573,11 @@ mod tests {
             )
             .unwrap();
             assert!(pty.is_none());
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            let code =
+                run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(2000))
+                    .unwrap();
             (code, started.elapsed())
         });
 
@@ -10673,7 +10757,7 @@ mod tests {
         .unwrap();
         assert!(pty.is_none());
         assert_eq!(
-            run_interactive_loop(&mut agent, &mut child, None).unwrap(),
+            run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, None).unwrap(),
             0
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -10754,7 +10838,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let absent = tmp.path().join("absent");
         let (mut agent, mut client) = UnixStream::pair().unwrap();
-        handle_streaming_file_read(&mut agent, absent.to_str().unwrap(), None).unwrap();
+        handle_streaming_file_read(
+            &mut WireStream::new(&mut agent),
+            absent.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
         let mut header = [0u8; 4];
         client.read_exact(&mut header).unwrap();
         let mut frame = vec![0u8; u32::from_be_bytes(header) as usize];
@@ -10772,7 +10861,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut empty: &[u8] = &[];
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut empty,
             4096,
             "test",
@@ -10801,7 +10890,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut src = std::io::Cursor::new(payload.clone());
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut src,
             256,
             "test",
@@ -10840,7 +10929,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut src = std::io::Cursor::new(payload.clone());
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut src,
             256,
             "test",
@@ -11625,13 +11714,14 @@ mod pull_heartbeat_tests {
     fn a_quiet_pull_keeps_sending_its_latest_progress() {
         let heartbeat = Duration::from_millis(40);
         let mut stream = Vec::new();
-        let result = pull_with_heartbeat(&mut stream, heartbeat, |progress| {
-            std::thread::sleep(heartbeat * 5);
-            progress(1, 2, "sha256:big");
-            std::thread::sleep(heartbeat * 5);
-            "pulled"
-        })
-        .unwrap();
+        let result =
+            pull_with_heartbeat(&mut WireStream::new(&mut stream), heartbeat, |progress| {
+                std::thread::sleep(heartbeat * 5);
+                progress(1, 2, "sha256:big");
+                std::thread::sleep(heartbeat * 5);
+                "pulled"
+            })
+            .unwrap();
         assert_eq!(result, "pulled");
         let frames = progress_frames(&stream);
         let before = frames
@@ -11650,10 +11740,14 @@ mod pull_heartbeat_tests {
     #[test]
     fn a_pull_that_finishes_at_once_sends_nothing_extra() {
         let mut stream = Vec::new();
-        let result = pull_with_heartbeat(&mut stream, Duration::from_secs(60), |progress| {
-            progress(1, 1, "sha256:small");
-            7
-        })
+        let result = pull_with_heartbeat(
+            &mut WireStream::new(&mut stream),
+            Duration::from_secs(60),
+            |progress| {
+                progress(1, 1, "sha256:small");
+                7
+            },
+        )
         .unwrap();
         assert_eq!(result, 7);
         assert_eq!(

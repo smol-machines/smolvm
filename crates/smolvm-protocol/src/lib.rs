@@ -51,6 +51,7 @@ pub struct S3Volume {
 }
 
 pub mod auto_ports;
+pub mod binary_stream;
 pub mod credentials;
 pub mod disk_volume;
 pub mod egress_rule;
@@ -2067,6 +2068,9 @@ pub struct Envelope<T> {
     /// Trace ID for correlating host API requests to agent operations.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trace_id: Option<String>,
+    /// Binary streaming version understood by the sender. Old peers ignore it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub binary_stream: Option<u8>,
     /// The wrapped message.
     #[serde(flatten)]
     pub body: T,
@@ -2077,13 +2081,18 @@ impl<T> Envelope<T> {
     pub fn new(body: T) -> Self {
         Self {
             trace_id: None,
+            binary_stream: None,
             body,
         }
     }
 
     /// Create an envelope with an optional trace ID.
     pub fn with_trace_id(body: T, trace_id: Option<String>) -> Self {
-        Self { trace_id, body }
+        Self {
+            trace_id,
+            binary_stream: None,
+            body,
+        }
     }
 }
 
