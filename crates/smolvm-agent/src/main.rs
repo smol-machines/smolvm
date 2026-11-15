@@ -134,7 +134,9 @@ const REQUEST_BUFFER_SIZE: usize = 64 * 1024; // 64KB
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
 /// Buffer size for streaming stdout/stderr in interactive mode.
-const IO_BUFFER_SIZE: usize = 4096;
+/// Read larger ready chunks to amortize framing and socket writes; a short
+/// read is sent immediately, without waiting for the buffer to fill.
+const IO_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Default poll timeout in milliseconds for interactive I/O loop.
 const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;

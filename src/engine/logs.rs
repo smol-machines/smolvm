@@ -39,28 +39,36 @@ impl LogWriter {
 
     /// Log `data` written on `stream` (1 stdout, 2 stderr). Complete lines
     /// are logged at once; a trailing partial line waits for its end.
-    pub(crate) fn write(&mut self, stream: u8, data: &[u8]) {
+    pub(crate) fn write(&mut self, stream: u8, mut data: &[u8]) {
         let idx = (stream as usize).min(2);
         if self.tty {
             // A terminal's output is not line-structured; log it as it comes.
             self.entry(stream, data);
             return;
         }
-        let mut buf = std::mem::take(&mut self.partial[idx]);
-        buf.extend_from_slice(data);
-        let mut start = 0;
-        while let Some(pos) = buf[start..].iter().position(|b| *b == b'\n') {
-            let end = start + pos + 1;
-            self.entry(stream, &buf[start..end]);
-            start = end;
+        let mut partial = std::mem::take(&mut self.partial[idx]);
+        while !data.is_empty() {
+            let take = data.len().min(MAX_ENTRY - partial.len());
+            let end = data[..take]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(take, |pos| pos + 1);
+            let piece = &data[..end];
+            data = &data[end..];
+            let complete = piece.last() == Some(&b'\n') || partial.len() + end == MAX_ENTRY;
+            if partial.is_empty() && complete {
+                // Complete entries can be logged directly from the input;
+                // only an unfinished line needs an owned buffer.
+                self.entry(stream, piece);
+            } else {
+                partial.extend_from_slice(piece);
+                if complete {
+                    self.entry(stream, &partial);
+                    partial.clear();
+                }
+            }
         }
-        let mut rest = buf.split_off(start);
-        while rest.len() >= MAX_ENTRY {
-            let tail = rest.split_off(MAX_ENTRY);
-            self.entry(stream, &rest);
-            rest = tail;
-        }
-        self.partial[idx] = rest;
+        self.partial[idx] = partial;
     }
 
     /// Log whatever partial lines are left, at the process's exit.
@@ -235,6 +243,37 @@ mod tests {
             ..all.clone()
         };
         assert_eq!(read(&path, &tail).0[0].log, "two\n");
+    }
+
+    #[test]
+    fn long_lines_have_the_same_entries_for_every_input_chunk_size() {
+        let mut output = b"first\n".to_vec();
+        output.extend(vec![b'x'; MAX_ENTRY * 3 + 7]);
+        output.extend_from_slice(b"\nlast");
+        let expected = vec![
+            "first\n".to_string(),
+            "x".repeat(MAX_ENTRY),
+            "x".repeat(MAX_ENTRY),
+            "x".repeat(MAX_ENTRY),
+            "xxxxxxx\n".to_string(),
+            "last".to_string(),
+        ];
+        for chunk_size in [1, 4096, MAX_ENTRY, 64 * 1024] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("c-json.log");
+            let mut writer = LogWriter::open(&path, false).unwrap();
+            for chunk in output.chunks(chunk_size) {
+                writer.write(1, chunk);
+                assert!(writer.partial[1].len() < MAX_ENTRY);
+            }
+            writer.flush();
+            let query = LogQuery {
+                stdout: true,
+                ..Default::default()
+            };
+            let logs: Vec<_> = read(&path, &query).0.into_iter().map(|e| e.log).collect();
+            assert_eq!(logs, expected, "input chunk size {chunk_size}");
+        }
     }
 
     #[test]
