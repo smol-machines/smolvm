@@ -132,6 +132,11 @@ impl NewMachine {
 #[derive(Clone, Debug)]
 pub enum Operation {
     Refresh,
+    ReadSettings(String),
+    UpdateSettings {
+        original: Box<crate::machine_settings::Settings>,
+        updated: Box<crate::machine_settings::Settings>,
+    },
     Logs(String),
     Start(String),
     Stop(String),
@@ -140,17 +145,25 @@ pub enum Operation {
     Resume(String),
     Pause(String),
     Stats(String),
-    Exec { name: String, command: String },
+    Exec {
+        name: String,
+        command: String,
+    },
 }
 
 impl Operation {
     pub fn is_mutation(&self) -> bool {
-        !matches!(self, Self::Refresh | Self::Logs(_) | Self::Stats(_))
+        !matches!(
+            self,
+            Self::Refresh | Self::ReadSettings(_) | Self::Logs(_) | Self::Stats(_)
+        )
     }
 
     pub fn label(&self) -> String {
         match self {
             Self::Refresh => "Refreshing machines".into(),
+            Self::ReadSettings(name) => format!("Reading settings for {name}"),
+            Self::UpdateSettings { original, .. } => format!("Updating {}", original.name),
             Self::Logs(n) => format!("Reading logs for {n}"),
             Self::Start(n) => format!("Starting {n}"),
             Self::Stop(n) => format!("Stopping {n}"),

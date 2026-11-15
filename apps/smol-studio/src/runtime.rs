@@ -43,6 +43,26 @@ impl Runtime {
         }
         args.push("machine".into());
         match op {
+            Operation::ReadSettings(name) => args.extend([
+                "status".into(),
+                "--local".into(),
+                "--name".into(),
+                name.into(),
+                "--json".into(),
+            ]),
+            Operation::UpdateSettings { original, updated } => {
+                args.extend([
+                    "update".into(),
+                    "--local".into(),
+                    "--name".into(),
+                    original.name.clone().into(),
+                ]);
+                let changes = original.update_args(updated)?;
+                if changes.is_empty() {
+                    return Err("No settings have changed.".into());
+                }
+                args.extend(changes);
+            }
             Operation::Resume(name) => args.extend([
                 "resume".into(),
                 "--local".into(),
@@ -147,6 +167,16 @@ impl Runtime {
     }
 
     fn execute(&self, op: &Operation, shutdown: &AtomicBool) -> Result<Payload, String> {
+        if let Operation::UpdateSettings { original, .. } = op {
+            let Payload::Settings(current) =
+                self.execute(&Operation::ReadSettings(original.name.clone()), shutdown)?
+            else {
+                return Err("Cannot recheck the machine's current settings.".into());
+            };
+            if current.as_ref() != original.as_ref() {
+                return Err("This machine changed since you opened its settings. Reload before applying changes.".into());
+            }
+        }
         #[cfg(windows)]
         if self
             .executable
@@ -178,7 +208,7 @@ impl Runtime {
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let limit = match op {
-            Operation::Refresh => INVENTORY_LIMIT,
+            Operation::Refresh | Operation::ReadSettings(_) => INVENTORY_LIMIT,
             Operation::Logs(_) | Operation::Exec { .. } => LOG_LIMIT,
             _ => ERROR_LIMIT,
         };
@@ -205,6 +235,10 @@ impl Runtime {
         let output = capture(&mut command, timeout, limit, shutdown)?;
         match op {
             Operation::Refresh => parse_machines(&output).map(Payload::Machines),
+            Operation::ReadSettings(name) => {
+                crate::machine_settings::Settings::parse(&output, name)
+                    .map(|settings| Payload::Settings(Box::new(settings)))
+            }
             Operation::Stats(name) => {
                 let value: serde_json::Value = serde_json::from_slice(&output)
                     .map_err(|e| format!("Cannot read machine statistics: {e}"))?;
@@ -387,6 +421,7 @@ pub(crate) fn runtime_error(bytes: &[u8], code: Option<i32>) -> String {
 #[derive(Debug)]
 pub enum Payload {
     Machines(Vec<Machine>),
+    Settings(Box<crate::machine_settings::Settings>),
     Logs { name: String, text: String },
     Output { name: String, text: String },
     Completed,
@@ -462,6 +497,240 @@ impl Drop for Worker {
 mod tests {
     use super::*;
     use crate::model::NewMachine;
+
+    #[test]
+    #[ignore = "requires an updated public Smol CLI and a working local hypervisor"]
+    fn live_machine_settings_preserve_data_and_reject_stale_edits() {
+        use crate::machine_settings::{Folder, FolderMode, Port, Protocol, Settings};
+        let executable =
+            std::env::var_os("SMOL_STUDIO_SETTINGS_CLI").expect("SMOL_STUDIO_SETTINGS_CLI");
+        // macOS's default temporary directory is too long for a nested vsock
+        // socket; keep this isolated hypervisor fixture under the short /tmp.
+        #[cfg(target_os = "macos")]
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let host = temp.path().join("host folder with spaces");
+        let staged = temp.path().join("staged folder");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(host.join("input"), "host-input").unwrap();
+        std::fs::write(staged.join("input"), "staged-input").unwrap();
+        let runtime = Runtime {
+            executable: executable.into(),
+            state_dir: Some(state.clone()),
+        };
+        let name = "studio-settings-owned".to_string();
+        let stop = AtomicBool::new(false);
+        struct Cleanup(Runtime, String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let stop = AtomicBool::new(false);
+                let _ = self.0.execute(&Operation::Stop(self.1.clone()), &stop);
+                let _ = self.0.execute(&Operation::Delete(self.1.clone()), &stop);
+            }
+        }
+        let read = |runtime: &Runtime| -> Settings {
+            let Payload::Settings(settings) = runtime
+                .execute(&Operation::ReadSettings(name.clone()), &stop)
+                .unwrap()
+            else {
+                panic!("expected settings")
+            };
+            *settings
+        };
+        let mut create = Command::new(&runtime.executable);
+        create
+            .args(
+                runtime
+                    .args(&Operation::Create(NewMachine {
+                        name: name.clone(),
+                        cpus: 1,
+                        memory_mib: 512,
+                        folders: vec![crate::model::SharedFolder {
+                            host: host.to_str().unwrap().into(),
+                            guest: "/shared".into(),
+                            read_only: true,
+                        }],
+                        ..Default::default()
+                    }))
+                    .unwrap(),
+            )
+            .args([
+                "--storage",
+                "1",
+                "--overlay",
+                "1",
+                "--label",
+                "studio-settings-kept=retained",
+            ])
+            .env("SMOLVM_DATA_DIR", &state);
+        #[cfg(target_os = "linux")]
+        create
+            .env("XDG_DATA_HOME", state.join("data"))
+            .env("XDG_CONFIG_HOME", state.join("config"))
+            .env("XDG_CACHE_HOME", state.join("cache"));
+        capture(&mut create, Duration::from_secs(120), ERROR_LIMIT, &stop).unwrap();
+        let cleanup = Cleanup(runtime.clone(), name.clone());
+        let labels = || {
+            let mut status = Command::new(&runtime.executable);
+            status
+                .args(
+                    runtime
+                        .args(&Operation::ReadSettings(name.clone()))
+                        .unwrap(),
+                )
+                .envs(
+                    create
+                        .get_envs()
+                        .filter_map(|(key, value)| value.map(|value| (key, value))),
+                );
+            let bytes =
+                capture(&mut status, Duration::from_secs(15), INVENTORY_LIMIT, &stop).unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["labels"].clone()
+        };
+        assert_eq!(labels()["studio-settings-kept"], "retained");
+        runtime
+            .execute(&Operation::Start(name.clone()), &stop)
+            .unwrap();
+        runtime
+            .execute(
+                &Operation::Exec {
+                    name: name.clone(),
+                    command: "printf before-growth > /workspace/before-growth".into(),
+                },
+                &stop,
+            )
+            .unwrap();
+        runtime
+            .execute(&Operation::Stop(name.clone()), &stop)
+            .unwrap();
+        let original = read(&runtime);
+        assert_eq!(original.shared_folders[0].mode, FolderMode::ReadOnly);
+        let mut updated = original.clone();
+        updated.cpus = 2;
+        updated.memory_mib = 768;
+        updated.network = true;
+        updated.storage_gb = Some(2);
+        updated.overlay_gb = Some(2);
+        updated.shared_folders[0].mode = FolderMode::ReadWrite;
+        updated.shared_folders.push(Folder {
+            host: std::fs::canonicalize(&staged)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .into(),
+            guest: "/staged".into(),
+            mode: FolderMode::Staged,
+        });
+        let (listener, udp, host_port) = (0..32)
+            .find_map(|_| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let port = listener.local_addr().ok()?.port();
+                let udp = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).ok()?;
+                Some((listener, udp, port))
+            })
+            .expect("an unused TCP and UDP port");
+        updated.port_mappings = vec![
+            Port {
+                host: host_port,
+                guest: 8080,
+                protocol: Protocol::Tcp,
+            },
+            Port {
+                host: host_port,
+                guest: 5353,
+                protocol: Protocol::Udp,
+            },
+        ];
+        runtime
+            .execute(
+                &Operation::UpdateSettings {
+                    original: Box::new(original.clone()),
+                    updated: Box::new(updated.clone()),
+                },
+                &stop,
+            )
+            .unwrap();
+        assert_eq!(labels()["studio-settings-kept"], "retained");
+        let saved = read(&runtime);
+        assert_eq!(saved, updated);
+        let error = runtime
+            .execute(
+                &Operation::UpdateSettings {
+                    original: Box::new(original),
+                    updated: Box::new(updated.clone()),
+                },
+                &stop,
+            )
+            .unwrap_err();
+        assert!(error.contains("changed since"), "{error}");
+        drop((listener, udp));
+        runtime
+            .execute(&Operation::Start(name.clone()), &stop)
+            .unwrap();
+        let error = runtime
+            .execute(
+                &Operation::UpdateSettings {
+                    original: Box::new(updated.clone()),
+                    updated: Box::new(updated.clone()),
+                },
+                &stop,
+            )
+            .unwrap_err();
+        assert!(error.contains("changed since"), "{error}");
+        let Payload::Output { text, .. } = runtime.execute(&Operation::Exec { name: name.clone(), command: "set -x; test \"$(cat /workspace/before-growth)\" = before-growth && test \"$(cat /shared/input)\" = host-input && test \"$(cat /staged/input)\" = staged-input && printf shared-write > /shared/output && printf staged-write > /staged/output && printf persistent-data > /workspace/settings-payload && printf settings-ok".into() }, &stop).unwrap() else { panic!("expected output") };
+        assert!(text.contains("settings-ok"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(host.join("output")).unwrap(),
+            "shared-write"
+        );
+        runtime
+            .execute(&Operation::Stop(name.clone()), &stop)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(staged.join("output")).unwrap(),
+            "staged-write"
+        );
+        let original = read(&runtime);
+        let mut updated = original.clone();
+        updated.shared_folders.clear();
+        updated.port_mappings.clear();
+        updated.network = false;
+        runtime
+            .execute(
+                &Operation::UpdateSettings {
+                    original: Box::new(original),
+                    updated: Box::new(updated.clone()),
+                },
+                &stop,
+            )
+            .unwrap();
+        assert_eq!(read(&runtime), updated);
+        runtime
+            .execute(&Operation::Start(name.clone()), &stop)
+            .unwrap();
+        let Payload::Output { text, .. } = runtime
+            .execute(
+                &Operation::Exec {
+                    name: name.clone(),
+                    command: "set -x; cat /workspace/settings-payload".into(),
+                },
+                &stop,
+            )
+            .unwrap()
+        else {
+            panic!("expected output")
+        };
+        assert!(text.contains("persistent-data"), "{text}");
+        drop(cleanup);
+        let Payload::Machines(machines) = runtime.execute(&Operation::Refresh, &stop).unwrap()
+        else {
+            panic!("expected inventory")
+        };
+        assert!(machines.is_empty());
+    }
 
     #[test]
     fn arguments_preserve_spaces_and_metacharacters_without_shell() {

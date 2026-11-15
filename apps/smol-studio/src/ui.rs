@@ -51,6 +51,8 @@ pub struct Studio {
     refresh_error: bool,
     activity: String,
     create: Option<NewMachine>,
+    editing: Option<crate::machine_settings_ui::Editor>,
+    settings_request: Option<String>,
     delete: Option<String>,
     settings: bool,
     runtime_path: String,
@@ -86,6 +88,8 @@ impl Studio {
             refresh_error: false,
             activity: "Connecting to Smol…".into(),
             create: None,
+            editing: None,
+            settings_request: None,
             delete: None,
             settings: false,
             runtime_path,
@@ -119,6 +123,14 @@ impl Studio {
                 self.schedule.completed(Instant::now());
             }
             match done.result {
+                Ok(Payload::Settings(settings)) => {
+                    if self.settings_request.as_ref() == Some(&settings.name)
+                        && self.selected.as_ref() == Some(&settings.name)
+                    {
+                        self.editing = Some(crate::machine_settings_ui::Editor::new(*settings));
+                    }
+                    self.settings_request = None;
+                }
                 Ok(Payload::Machines(machines)) => {
                     if self.refresh_error {
                         self.error = None;
@@ -147,6 +159,9 @@ impl Studio {
                     self.output = Some((name, text));
                 }
                 Ok(Payload::Completed) => {
+                    if matches!(done.operation, Operation::UpdateSettings { .. }) {
+                        self.editing = None;
+                    }
                     self.error = None;
                     self.activity = format!(
                         "{} completed in {:.1}s",
@@ -162,11 +177,22 @@ impl Studio {
                     }
                 }
                 Err(e) => {
+                    let mut shown_in_editor = false;
+                    if matches!(
+                        done.operation,
+                        Operation::UpdateSettings { .. } | Operation::ReadSettings(_)
+                    ) {
+                        self.settings_request = None;
+                        if let Some(editor) = &mut self.editing {
+                            editor.error = Some(e.clone());
+                            shown_in_editor = true;
+                        }
+                    }
                     self.refresh_error = matches!(done.operation, Operation::Refresh);
                     if matches!(done.operation, Operation::Refresh) {
                         self.inventory_valid = false;
                     }
-                    self.error = Some(e);
+                    self.error = if shown_in_editor { None } else { Some(e) };
                 }
             }
             if mutation {
@@ -473,7 +499,16 @@ impl Studio {
                 }
             }
             Tab::Overview => {
-                eyebrow(ui, "RESOURCES");
+                ui.horizontal(|ui| {
+                    eyebrow(ui, "RESOURCES");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(enabled && matches!(m.state.as_str(), "created" | "stopped"), egui::Button::new("Edit settings…"))
+                            .on_disabled_hover_text("Stop this machine to change resources, shared folders and published ports.").clicked() {
+                            self.settings_request = Some(m.name.clone());
+                            self.submit(Operation::ReadSettings(m.name.clone()));
+                        }
+                    });
+                });
                 ui.add_space(10.0);
                 ui.columns(2, |columns| {
                     design::metric(
@@ -570,12 +605,29 @@ impl Studio {
         }
     }
 
-    fn dialogs(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    fn dialogs(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && !self.editing.as_ref().is_some_and(|e| e.picking())
+            && !self.pending.as_ref().is_some_and(Operation::is_mutation)
+        {
+            self.editing = None;
+            self.settings_request = None;
             self.create = None;
             self.delete = None;
             self.settings = false;
             return;
+        }
+        if let Some(mut editor) = self.editing.take() {
+            let (close, action) = editor.show(ctx, frame, self.pending.is_some());
+            if !close {
+                self.editing = Some(editor);
+            }
+            if let Some(action) = action {
+                if let Operation::ReadSettings(name) = &action {
+                    self.settings_request = Some(name.clone());
+                }
+                self.submit(action);
+            }
         }
         if let Some(mut draft) = self.create.take() {
             let mut open = true;
@@ -795,6 +847,7 @@ impl eframe::App for Studio {
             self.pending.is_some()
                 || self.settings
                 || self.create.is_some()
+                || self.editing.is_some()
                 || self.delete.is_some(),
         ) {
             self.submit(Operation::Refresh);
@@ -813,6 +866,7 @@ impl eframe::App for Studio {
             self.terminal = None;
         }
         if self.create.is_some()
+            || self.editing.is_some()
             || self.delete.is_some()
             || self.settings
             || self.cloud.modal_open()
@@ -944,7 +998,7 @@ impl eframe::App for Studio {
                     });
             }
         }
-        self.dialogs(&ctx);
+        self.dialogs(&ctx, frame);
     }
 }
 

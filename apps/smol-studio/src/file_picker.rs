@@ -20,6 +20,22 @@ impl FilePicker {
         self.pending.is_some()
     }
 
+    pub fn open_folder(&mut self, frame: &eframe::Frame, current: &str, ctx: &egui::Context) {
+        if self.is_open() {
+            return;
+        }
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Share a folder with this machine");
+        if Path::new(current).is_absolute() {
+            dialog = dialog.set_directory(current);
+        }
+        self.pending = Some(Box::pin(async move {
+            dialog.pick_folder().await.map(|folder| vec![folder])
+        }));
+        ctx.request_repaint();
+    }
+
     pub fn open_compose(&mut self, frame: &eframe::Frame, current: &str, ctx: &egui::Context) {
         if self.is_open() {
             return;
