@@ -3,11 +3,11 @@ use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 
 pub const INK: Color32 = Color32::from_rgb(17, 17, 17);
 pub const MUTED: Color32 = Color32::from_rgb(104, 106, 111);
-pub const SIDEBAR: Color32 = Color32::from_rgb(245, 245, 246);
+pub const SIDEBAR: Color32 = Color32::from_rgb(243, 243, 245);
 pub const ACCENT: Color32 = Color32::from_rgb(17, 17, 17);
 pub const LINE: Color32 = Color32::from_rgb(226, 226, 227);
-pub const SURFACE: Color32 = Color32::from_rgb(249, 249, 249);
-pub const SELECTED: Color32 = Color32::from_rgb(235, 236, 238);
+pub const SURFACE: Color32 = Color32::from_rgb(248, 248, 250);
+pub const SELECTED: Color32 = Color32::from_rgb(230, 231, 234);
 pub const GREEN: Color32 = Color32::from_rgb(44, 122, 63);
 pub const RED: Color32 = Color32::from_rgb(179, 38, 30);
 
@@ -165,18 +165,14 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
 
 pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::Response {
     let response = ui.add_sized(
-        [ui.available_width(), 34.0],
+        [ui.available_width(), 36.0],
         egui::Button::selectable(selected, "")
             .fill(if selected {
-                Color32::WHITE
+                SELECTED
             } else {
                 Color32::TRANSPARENT
             })
-            .stroke(if selected {
-                Stroke::new(1.0, LINE)
-            } else {
-                Stroke::NONE
-            })
+            .stroke(Stroke::NONE)
             .corner_radius(6),
     );
     response.widget_info(|| {
@@ -188,14 +184,14 @@ pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::
     icon(
         ui.painter(),
         egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 22.0, rect.center().y),
-            Vec2::splat(20.0),
+            egui::pos2(rect.left() + 18.0, rect.center().y),
+            Vec2::splat(18.0),
         ),
         kind,
         color,
     );
     ui.painter().text(
-        egui::pos2(rect.left() + 42.0, rect.center().y),
+        egui::pos2(rect.left() + 36.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         FontId::proportional(13.0),
@@ -207,7 +203,7 @@ pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::
 pub fn nav_group(ui: &mut egui::Ui, label: &str) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        ui.label(RichText::new(label).size(9.5).color(MUTED));
+        ui.label(heading(label, 11.0).color(MUTED));
     });
     ui.add_space(4.0);
 }
@@ -216,7 +212,7 @@ pub fn primary(label: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(Color32::WHITE))
         .fill(ACCENT)
         .stroke(Stroke::NONE)
-        .min_size(egui::vec2(0.0, 34.0))
+        .min_size(egui::vec2(0.0, 32.0))
 }
 
 /// Navigation tabs retain button focus and accessibility while using a quiet underline.
@@ -278,8 +274,8 @@ pub fn badge(ui: &mut egui::Ui, state: &str) {
     let color = state_color(state);
     egui::Frame::new()
         .fill(color.gamma_multiply(0.09))
-        .corner_radius(4)
-        .inner_margin(egui::Margin::symmetric(8, 4))
+        .corner_radius(12)
+        .inner_margin(egui::Margin::symmetric(9, 4))
         .show(ui, |ui| {
             ui.spacing_mut().interact_size.y = 16.0;
             ui.horizontal(|ui| {
@@ -308,19 +304,66 @@ pub fn card() -> egui::Frame {
 }
 
 pub fn metric(ui: &mut egui::Ui, label: &str, value: &str, unit: &str) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new(label).size(12.0).color(MUTED));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(heading(value, 26.0));
+            ui.label(RichText::new(unit).size(12.0).color(MUTED));
+        });
+    });
+}
+
+/// Equal-width filters keep the inventory toolbar quiet and easy to scan.
+pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) {
     egui::Frame::new()
-        .fill(Color32::WHITE)
-        .stroke(Stroke::new(1.0, LINE))
-        .inner_margin(16)
-        .corner_radius(8)
+        .fill(SELECTED.gamma_multiply(0.5))
+        .corner_radius(7)
+        .inner_margin(3)
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(label).size(12.0).color(MUTED));
+            let width =
+                (ui.available_width() - 4.0 * (options.len() - 1) as f32) / options.len() as f32;
+            ui.spacing_mut().item_spacing.x = 4.0;
             ui.horizontal(|ui| {
-                ui.label(heading(value, 22.0));
-                ui.label(RichText::new(unit).size(12.0).color(MUTED));
+                for (candidate, label) in options {
+                    let selected = *value == *candidate;
+                    if ui
+                        .add_sized(
+                            [width, 26.0],
+                            egui::Button::selectable(
+                                selected,
+                                RichText::new(*label).size(11.5).color(if selected {
+                                    INK
+                                } else {
+                                    MUTED
+                                }),
+                            )
+                            .fill(if selected {
+                                Color32::WHITE
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(Stroke::NONE)
+                            .corner_radius(5),
+                        )
+                        .clicked()
+                    {
+                        *value = *candidate;
+                    }
+                }
             });
         });
+}
+
+pub fn property(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(28.0);
+        ui.label(RichText::new(label).size(13.0).color(MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(RichText::new(value).size(13.0)).truncate())
+                .on_hover_text(value);
+        });
+    });
 }
 
 pub fn memory(mib: u64) -> String {
@@ -374,7 +417,11 @@ pub fn resource_row(
     let r = response.rect;
     let icon_rect =
         egui::Rect::from_center_size(egui::pos2(r.left() + 25.0, r.center().y), Vec2::splat(30.0));
-    ui.painter().rect_filled(icon_rect, 7, Color32::TRANSPARENT);
+    ui.painter().rect_filled(
+        icon_rect,
+        8,
+        if selected { Color32::WHITE } else { SURFACE },
+    );
     icon(
         ui.painter(),
         icon_rect.shrink(6.0),
@@ -386,7 +433,7 @@ pub fn resource_row(
         egui::pos2(left, r.top()),
         egui::pos2(r.right() - 22.0, r.bottom()),
     ));
-    for (text, y, size, color) in [(name, 11.0, 13.0, INK), (subtitle, 33.0, 11.5, MUTED)] {
+    for (text, y, size, color) in [(name, 12.0, 13.0, INK), (subtitle, 33.0, 11.5, MUTED)] {
         let mut job = egui::text::LayoutJob::simple_singleline(
             text.to_owned(),
             FontId::proportional(size),
@@ -467,10 +514,13 @@ pub fn empty_state(ui: &mut egui::Ui, kind: Icon, title: &str, message: &str) {
 
 pub fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.allocate_ui_with_layout(
-        egui::vec2(0.0, 34.0),
-        egui::Layout::left_to_right(egui::Align::Center),
+        egui::vec2(230.0_f32.min(ui.available_width()), 44.0),
+        egui::Layout::top_down(egui::Align::LEFT),
         |ui| {
-            ui.label(heading(title, 16.0)).on_hover_text(subtitle);
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.label(heading(title, 19.0));
+            ui.add(egui::Label::new(RichText::new(subtitle).size(11.5).color(MUTED)).truncate())
+                .on_hover_text(subtitle);
         },
     );
 }
@@ -567,6 +617,7 @@ pub fn theme(ctx: &egui::Context) {
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(11.0, 6.0);
         style.spacing.interact_size.y = 30.0;
+        style.visuals.widgets.noninteractive.corner_radius = 6.into();
         style.spacing.window_margin = egui::Margin::same(16);
         style.visuals.override_text_color = Some(INK);
         style.visuals.hyperlink_color = INK;

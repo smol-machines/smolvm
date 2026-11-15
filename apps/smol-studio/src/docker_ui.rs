@@ -1,4 +1,4 @@
-use crate::design::{self, MUTED};
+use crate::design::{self, MUTED, SURFACE};
 use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 use smol_studio::{
@@ -371,7 +371,7 @@ impl DockerView {
     fn storage_list(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
         egui::Panel::left("storage-list")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(248.0)
             .min_size(224.0)
             .max_size(380.0)
             .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
@@ -610,7 +610,7 @@ impl DockerView {
     fn project_list(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("compose-project-list")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(248.0)
             .min_size(224.0)
             .max_size(380.0)
             .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
@@ -1115,7 +1115,7 @@ impl DockerView {
         if self.kind == Kind::Containers && !self.compose && !cfg!(windows) {
             egui::Panel::left("container-list")
                 .resizable(true)
-                .default_size(280.0)
+                .default_size(248.0)
                 .min_size(224.0)
                 .max_size(380.0)
                 .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
@@ -1175,7 +1175,7 @@ impl DockerView {
                         });
                 });
         }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24)).show(ui,|ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(SURFACE).inner_margin(24)).show(ui,|ui| {
             if cfg!(windows){ui.label("The Docker API is available on macOS and Linux. Local and cloud machines are available on Windows.");return;}
             if self.compose && !self.compose_import && self.project_selected.is_some() {
                 self.project_details(ui, runtime);

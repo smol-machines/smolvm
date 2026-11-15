@@ -356,7 +356,7 @@ impl CloudView {
             });
         egui::Panel::left("cloud-list")
             .resizable(true)
-            .default_size(258.0)
+            .default_size(248.0)
             .min_size(224.0)
             .max_size(380.0)
             .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
@@ -418,7 +418,7 @@ impl CloudView {
                     });
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24))
+            .frame(egui::Frame::new().fill(SURFACE).inner_margin(24))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("cloud-detail")
@@ -537,35 +537,38 @@ impl CloudView {
                         });
                         ui.add_space(24.0);
                         if let Some(resources) = &machine.resources {
-                            design::eyebrow(ui, "ALLOCATED RESOURCES");
+                            ui.label(design::heading("Configuration", 14.0));
                             ui.add_space(10.0);
-                            ui.columns(2, |columns| {
-                                design::metric(
-                                    &mut columns[0],
-                                    "CPU limit",
-                                    &resources
-                                        .cpus
-                                        .map(|n| n.to_string())
-                                        .unwrap_or_else(|| "—".into()),
-                                    "cores",
-                                );
-                                design::metric(
-                                    &mut columns[1],
-                                    "Memory limit",
-                                    &resources
-                                        .memory_mb
-                                        .map(|n| n.to_string())
-                                        .unwrap_or_else(|| "—".into()),
-                                    "MB",
-                                );
+                            design::card().show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.columns(2, |columns| {
+                                    design::metric(
+                                        &mut columns[0],
+                                        "CPU limit",
+                                        &resources
+                                            .cpus
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_else(|| "—".into()),
+                                        "cores",
+                                    );
+                                    design::metric(
+                                        &mut columns[1],
+                                        "Memory limit",
+                                        &resources
+                                            .memory_mb
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_else(|| "—".into()),
+                                        "MB",
+                                    );
+                                });
+                                if let Some(disk) = resources.disk_gb {
+                                    ui.label(
+                                        RichText::new(format!("Disk limit: {disk} GB"))
+                                            .small()
+                                            .color(MUTED),
+                                    );
+                                }
                             });
-                            if let Some(disk) = resources.disk_gb {
-                                ui.label(
-                                    RichText::new(format!("Disk limit: {disk} GB"))
-                                        .small()
-                                        .color(MUTED),
-                                );
-                            }
                             ui.add_space(24.0);
                         }
                         design::eyebrow(ui, "CONSOLE");
