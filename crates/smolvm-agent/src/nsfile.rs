@@ -292,7 +292,7 @@ pub(crate) fn attach_in_every_container(
     in_every_container(|pid| {
         // Each container gets the share as a new container of its user would
         // (see `storage::add_volume_bind_mounts`).
-        let source = match container_user(pid) {
+        let source = match container_user(Path::new(crate::paths::CRUN_ROOT_DIR), pid) {
             Some((uid, gid)) => crate::mount_owner::bind_source(source, uid, gid),
             None => source.to_path_buf(),
         };
@@ -309,24 +309,26 @@ pub(crate) fn attach_in_every_container(
     })
 }
 
-/// The uid and gid a container's first process runs as, which is the user the
-/// container was created for.
-#[cfg(target_os = "linux")]
-fn container_user(pid: u32) -> Option<(u32, u32)> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    Some((status_id(&status, "Uid:")?, status_id(&status, "Gid:")?))
-}
-
-/// The real id on the `Uid:` or `Gid:` line of a `/proc/<pid>/status`.
+/// The uid and gid the workload of the container whose first process is `pid`
+/// runs as, read from the container's bundle: that process may be the
+/// keep-alive init, which runs as root whatever the workload's user is. The
+/// bundle is found through the `status` file crun keeps for each container
+/// under `state_root`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn status_id(status: &str, field: &str) -> Option<u32> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix(field))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
+fn container_user(state_root: &Path, pid: u32) -> Option<(u32, u32)> {
+    std::fs::read_dir(state_root)
+        .ok()?
+        .flatten()
+        .find_map(|container| {
+            let status = std::fs::read(container.path().join("status")).ok()?;
+            let status: serde_json::Value = serde_json::from_slice(&status).ok()?;
+            if status["pid"].as_u64() != Some(u64::from(pid)) {
+                return None;
+            }
+            let bundle = Path::new(status["bundle"].as_str()?);
+            let config = std::fs::read(bundle.join("config.json")).ok()?;
+            crate::oci::workload_user_of_config(&serde_json::from_slice(&config).ok()?)
+        })
 }
 
 /// Unmount `target` in every workload container.
@@ -1182,12 +1184,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_container_user_is_the_real_id_of_its_first_process() {
-        let status =
-            "Name:\tsmolvm-agent\nUid:\t1000\t1001\t1002\t1003\nGid:\t100\t101\t102\t103\n";
-        assert_eq!(status_id(status, "Uid:"), Some(1000));
-        assert_eq!(status_id(status, "Gid:"), Some(100));
-        assert_eq!(status_id("Name:\tx\n", "Uid:"), None);
+    fn a_container_user_is_the_workload_user_its_bundle_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("crun");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(state_root.join("smolvm-a")).unwrap();
+        std::fs::create_dir_all(state_root.join("smolvm-b")).unwrap();
+        std::fs::create_dir_all(&bundle).unwrap();
+        // The keep-alive init (the container's process) runs as root.
+        std::fs::write(
+            bundle.join("config.json"),
+            serde_json::json!({
+                "process": { "user": { "uid": 0, "gid": 0 } },
+                "annotations": { crate::oci::WORKLOAD_USER_ANNOTATION: "405:100" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let status = |pid: u32| {
+            serde_json::json!({ "pid": pid, "bundle": bundle.to_str().unwrap() }).to_string()
+        };
+        std::fs::write(state_root.join("smolvm-a/status"), status(7)).unwrap();
+        std::fs::write(state_root.join("smolvm-b/status"), status(42)).unwrap();
+
+        assert_eq!(container_user(&state_root, 42), Some((405, 100)));
+        // No container with that pid, or no crun state at all.
+        assert_eq!(container_user(&state_root, 9), None);
+        assert_eq!(container_user(&temp.path().join("none"), 42), None);
     }
 
     #[cfg(target_os = "linux")]

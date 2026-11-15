@@ -290,6 +290,25 @@ pub fn user_spec_of(identity: &ProcessIdentity) -> String {
     format!("{}:{}", identity.user.uid, identity.user.gid)
 }
 
+/// The ids of a numeric `uid:gid`, as [`user_spec_of`] writes it.
+fn parse_numeric_user(user: &str) -> Option<(u32, u32)> {
+    let (uid, gid) = user.split_once(':')?;
+    Some((uid.parse().ok()?, gid.parse().ok()?))
+}
+
+/// [`OciSpec::workload_user`] of a bundle's `config.json` read back as JSON,
+/// or `None` when it names no user.
+pub fn workload_user_of_config(config: &serde_json::Value) -> Option<(u32, u32)> {
+    let annotated = config["annotations"][WORKLOAD_USER_ANNOTATION]
+        .as_str()
+        .and_then(parse_numeric_user);
+    annotated.or_else(|| {
+        let user = &config["process"]["user"];
+        let id = |field: &str| u32::try_from(user[field].as_u64()?).ok();
+        Some((id("uid")?, id("gid")?))
+    })
+}
+
 fn parse_user_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
     match spec.split_once(':') {
         Some((user, group)) => {
@@ -841,8 +860,6 @@ impl OciSpec {
         });
     }
 
-    /// Write the OCI spec to a config.json file in the bundle directory.
-    ///
     /// Record who the workload runs as ([`WORKLOAD_USER_ANNOTATION`]), for a
     /// bundle whose own process may be the keep-alive init instead.
     pub fn set_workload_user(&mut self, identity: &ProcessIdentity) {
@@ -850,6 +867,18 @@ impl OciSpec {
             .insert(WORKLOAD_USER_ANNOTATION.to_string(), user_spec_of(identity));
     }
 
+    /// The `uid:gid` the workload runs as: the one [`Self::set_workload_user`]
+    /// recorded, else the spec's own process user (a spec that runs the
+    /// workload itself, or one written before the record existed).
+    pub fn workload_user(&self) -> (u32, u32) {
+        self.annotations
+            .get(WORKLOAD_USER_ANNOTATION)
+            .and_then(|user| parse_numeric_user(user))
+            .unwrap_or((self.process.user.uid, self.process.user.gid))
+    }
+
+    /// Write the OCI spec to a config.json file in the bundle directory.
+    ///
     /// When the bundle sits in an overlay (an [`OVERLAY_UPPER_DIR`] beside it)
     /// whose boot prepared the upper layer's /tmp (no [`TMP_KEEP_TMPFS_MARKER`]
     /// beside it), the written spec leaves /tmp to the root filesystem (see
@@ -1868,6 +1897,33 @@ mod tests {
         assert!(runner.user.has_supplementary_groups());
         let loner = resolve_process_identity(rootfs.path(), Some("loner")).unwrap();
         assert!(!loner.user.has_supplementary_groups());
+    }
+
+    #[test]
+    fn the_workload_user_is_the_annotated_one_not_the_keepalive_init() {
+        let rootfs = tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("etc")).unwrap();
+        let workload = resolve_process_identity(rootfs.path(), Some("405:100")).unwrap();
+        let spec_for = |process: &ProcessIdentity| {
+            OciSpec::new(&["true".to_string()], &[], "/", false, process, false)
+        };
+
+        // The keep-alive init runs as root; the workload is who it records.
+        let mut keepalive = spec_for(&ProcessIdentity::root());
+        keepalive.set_workload_user(&workload);
+        assert_eq!(keepalive.workload_user(), (405, 100));
+
+        // A spec with no record is its own process's user, as bundles written
+        // before the annotation existed ran the workload as the process.
+        assert_eq!(spec_for(&workload).workload_user(), (405, 100));
+        assert_eq!(spec_for(&ProcessIdentity::root()).workload_user(), (0, 0));
+
+        // The same answer from the bundle's config.json, as other code reads it.
+        let config = serde_json::to_value(&keepalive).unwrap();
+        assert_eq!(workload_user_of_config(&config), Some((405, 100)));
+        let config = serde_json::to_value(spec_for(&workload)).unwrap();
+        assert_eq!(workload_user_of_config(&config), Some((405, 100)));
+        assert_eq!(workload_user_of_config(&serde_json::json!({})), None);
     }
 
     #[test]

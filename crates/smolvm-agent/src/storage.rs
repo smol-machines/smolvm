@@ -368,9 +368,10 @@ pub fn volume_bind_source(tag: &str) -> PathBuf {
 /// goes ahead of those nested below it (see [`mounts_parents_first`]).
 ///
 /// A host directory is bound through [`crate::mount_owner::bind_source`], so a
-/// container whose process is not root sees it owned by its own user.
+/// container whose workload is not root sees it owned by the workload's user,
+/// also when the container's own process is the keep-alive init (root).
 pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
-    let (uid, gid) = (spec.process.user.uid, spec.process.user.gid);
+    let (uid, gid) = spec.workload_user();
     for (tag, container_path, read_only) in mounts_parents_first(mounts) {
         let source = crate::mount_owner::bind_source(&volume_bind_source(tag), uid, gid);
         spec.add_bind_mount(&source.to_string_lossy(), container_path, *read_only);

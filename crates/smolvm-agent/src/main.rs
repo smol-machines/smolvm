@@ -3522,20 +3522,9 @@ fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
     let Ok(spec) = serde_json::from_str::<serde_json::Value>(&text) else {
         return (None, None);
     };
-    let annotated = spec["annotations"][oci::WORKLOAD_USER_ANNOTATION]
-        .as_str()
-        .and_then(|user| user.split_once(':'))
-        .and_then(|(uid, gid)| Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?)));
-    let (uid, gid) = match annotated {
-        Some((uid, gid)) => (Some(uid), Some(gid)),
-        None => (
-            spec["process"]["user"]["uid"].as_u64().map(|u| u as u32),
-            spec["process"]["user"]["gid"].as_u64().map(|g| g as u32),
-        ),
-    };
-    match uid {
-        Some(0) | None => (None, None),
-        Some(uid) => (Some(uid), gid),
+    match oci::workload_user_of_config(&spec) {
+        Some((uid, gid)) if uid != 0 => (Some(uid), Some(gid)),
+        _ => (None, None),
     }
 }
 
