@@ -1,0 +1,44 @@
+name: Smol Studio
+
+on:
+  pull_request:
+    paths: ["apps/smol-studio/**", ".github/workflows/studio.yml"]
+  push:
+    branches: [main]
+    paths: ["apps/smol-studio/**", ".github/workflows/studio.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: apps/smol-studio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libvulkan-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: studio-debug-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            apps/smol-studio/target/debug/smol-studio
+            apps/smol-studio/target/debug/smol-studio.exe
+          if-no-files-found: error
