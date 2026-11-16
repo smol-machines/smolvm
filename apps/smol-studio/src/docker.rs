@@ -90,6 +90,7 @@ impl Action {
     }
 }
 pub enum Output {
+    Connection(crate::docker_connection::Connection),
     Rows(Kind, Vec<Value>),
     Projects(Vec<crate::compose::Project>, Option<String>),
     ComposeApplied {
@@ -254,8 +255,13 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
         crate::compose::save_source(&crate::compose::source_store(runtime)?, name, None)?;
         return Ok(Output::Completed);
     }
+    if matches!(action, Action::Status) {
+        return Ok(Output::Connection(crate::docker_connection::check(
+            shutdown,
+        )));
+    }
     let mut command;
-    if matches!(action, Action::Status | Action::Configure) {
+    if matches!(action, Action::Configure) {
         command = Command::new(crate::runtime::find_tool(if cfg!(windows) {
             "smolvm.exe"
         } else {
@@ -266,9 +272,6 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
             command.arg("--state-dir").arg(path);
         }
         command.arg("engine");
-        if matches!(action, Action::Status) {
-            command.args(["status", "--json"]);
-        }
     } else {
         command = Command::new(crate::runtime::find_tool(if cfg!(windows) {
             "docker.exe"
@@ -391,13 +394,6 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
                 id: id.clone(),
                 value,
             })
-        }
-        Action::Status => {
-            let value: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| "Runtime returned an invalid engine status.".to_string())?;
-            Ok(Output::Text(
-                serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?,
-            ))
         }
         _ => Ok(Output::Completed),
     }

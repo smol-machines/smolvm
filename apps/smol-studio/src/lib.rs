@@ -20,3 +20,5 @@ pub mod log_stream;
 pub mod network;
 
 pub mod event_watch;
+
+pub mod docker_connection;

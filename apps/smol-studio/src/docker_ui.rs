@@ -1,3 +1,4 @@
+mod connection;
 mod resources;
 
 use crate::design::{self, MUTED, SURFACE};
@@ -25,6 +26,10 @@ enum ContainerTab {
 
 pub struct DockerView {
     worker: DockerWorker,
+    connection: Option<smol_studio::docker_connection::Connection>,
+    connection_open: bool,
+    connection_error: Option<String>,
+    refresh_after_check: bool,
     events: smol_studio::event_watch::EventWatch,
     kind: Kind,
     rows: Vec<Value>,
@@ -107,6 +112,10 @@ impl DockerView {
         let ctx = ctx.clone();
         Self {
             worker: DockerWorker::new(move || ctx.request_repaint()),
+            connection: None,
+            connection_open: false,
+            connection_error: None,
+            refresh_after_check: false,
             events: smol_studio::event_watch::EventWatch::default(),
             kind: Kind::Containers,
             rows: vec![],
@@ -179,13 +188,17 @@ impl DockerView {
     }
 
     pub fn modal_open(&self) -> bool {
-        self.confirm.is_some() || self.new_resource.is_some() || self.file_picker.is_open()
+        self.connection_open
+            || self.confirm.is_some()
+            || self.new_resource.is_some()
+            || self.file_picker.is_open()
     }
     pub fn mutating(&self) -> bool {
         self.pending.as_ref().is_some_and(Action::mutates)
     }
     pub fn status(&self) -> &str {
         match &self.pending {
+            Some(Action::Status) => "Checking Docker connection…",
             Some(Action::Projects | Action::List(_)) => "Refreshing Docker resources…",
             Some(
                 Action::Project {
@@ -222,6 +235,9 @@ impl DockerView {
         }
         match self.worker.submit(runtime.clone(), action.clone()) {
             Ok(()) => {
+                if matches!(action, Action::Configure) {
+                    self.connection_error = None;
+                }
                 self.pending = Some(action);
                 if self.error.take().is_some() {
                     self.activity = "Docker context: smol".into();
@@ -231,6 +247,10 @@ impl DockerView {
         }
     }
     fn refresh(&mut self, runtime: &Runtime) {
+        if !self.connected() {
+            self.check_connection(runtime, true);
+            return;
+        }
         self.submit(
             runtime,
             if self.compose {
@@ -244,6 +264,17 @@ impl DockerView {
         while let Ok(done) = self.worker.events.try_recv() {
             self.pending = None;
             match done.result {
+                Ok(Output::Connection(connection)) => {
+                    let ready = connection.state == smol_studio::docker_connection::State::Ready;
+                    self.activity = connection.title().into();
+                    self.connection = Some(connection);
+                    if ready {
+                        self.connection_error = None;
+                    }
+                    if std::mem::take(&mut self.refresh_after_check) && ready {
+                        self.refresh(runtime);
+                    }
+                }
                 Ok(Output::Network(details)) => {
                     if self.kind == Kind::Networks
                         && self.storage_selected.as_ref() == Some(&details.id)
@@ -364,6 +395,9 @@ impl DockerView {
                         self.storage_selected = Some(name.clone());
                         self.query.clear();
                     }
+                    if matches!(done.action, Action::Configure) {
+                        self.connection = None;
+                    }
                     self.activity = match done.action {
                         Action::PullImage(_) => "Image pulled.",
                         Action::CreateVolume(_) => "Volume created.",
@@ -401,8 +435,15 @@ impl DockerView {
                     self.refresh(runtime);
                 }
                 Err(e) => {
+                    if matches!(done.action, Action::Configure) {
+                        self.connection_error = Some(e.clone());
+                    }
                     if matches!(done.action, Action::PullImage(_) | Action::CreateVolume(_)) {
                         self.resource_error = Some(e.clone());
+                    }
+                    if matches!(done.action, Action::List(_) | Action::Projects) {
+                        self.connection = None;
+                        self.check_connection(runtime, false);
                     }
                     self.activity = "Docker request failed; see details above.".into();
                     if matches!(done.action, Action::Projects) || done.action.mutates() {
@@ -423,7 +464,7 @@ impl DockerView {
         let repaint = ctx.clone();
         let poll = self.events.poll(
             std::time::Instant::now(),
-            visible && self.opened && !cfg!(windows),
+            visible && self.opened && self.connected() && !cfg!(windows),
             self.pending.is_some() || self.modal_open() || modal,
             move || repaint.request_repaint_after(std::time::Duration::from_millis(33)),
         );
@@ -730,6 +771,7 @@ impl DockerView {
     pub fn logs_visibility(&mut self, workspace_visible: bool) {
         self.live_logs.set_visible(
             workspace_visible
+                && self.connected()
                 && !self.compose
                 && self.kind == Kind::Containers
                 && self.container_tab == ContainerTab::Logs,
@@ -899,13 +941,14 @@ impl DockerView {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.confirm = None;
+            self.connection_open = false;
             if self.pending.is_none() {
                 self.new_resource = None;
             }
         }
         if !self.opened && !cfg!(windows) {
             self.opened = true;
-            self.submit(runtime, Action::List(self.kind));
+            self.refresh(runtime);
         }
         if self.confirm.is_some() {
             ui.disable();
@@ -934,7 +977,7 @@ impl DockerView {
                         if self.compose && !cfg!(windows) {
                             if ui
                                 .add_enabled(
-                                    self.pending.is_none(),
+                                    self.pending.is_none() && self.connected(),
                                     design::primary("+  Open project"),
                                 )
                                 .clicked()
@@ -950,7 +993,7 @@ impl DockerView {
                             && !cfg!(windows)
                             && ui
                                 .add_enabled(
-                                    self.pending.is_none(),
+                                    self.pending.is_none() && self.connected(),
                                     design::primary(if self.kind == Kind::Images {
                                         "+  Pull image"
                                     } else {
@@ -972,21 +1015,15 @@ impl DockerView {
                         if self.pending.is_some() {
                             ui.spinner();
                         }
-                        ui.add_enabled_ui(self.pending.is_none(), |ui| {
-                            ui.menu_button("Connection", |ui| {
-                                if ui.button("Check engine status").clicked() {
-                                    self.submit(runtime, Action::Status);
-                                    ui.close();
-                                }
-                                if ui.button("Set up Docker with Smol…").clicked() {
-                                    self.confirm = Some(Action::Configure);
-                                    ui.close();
-                                }
-                            });
-                        });
+                        if ui.button("Connection").clicked() {
+                            self.connection_open = true;
+                            self.check_connection(runtime, false);
+                        }
                     });
                 });
-                if let Some(error) = &self.error {
+                if let Some(error) = &self.error
+                    && self.connected()
+                {
                     ui.add_space(10.0);
                     design::error_notice(
                         ui,
@@ -1030,13 +1067,14 @@ impl DockerView {
         if !self.compose
             && matches!(self.kind, Kind::Images | Kind::Volumes | Kind::Networks)
             && !cfg!(windows)
+            && self.connected()
         {
             self.resource_list(ui, runtime);
         }
-        if self.compose && !cfg!(windows) {
+        if self.compose && !cfg!(windows) && self.connected() {
             self.project_list(ui);
         }
-        if self.kind == Kind::Containers && !self.compose && !cfg!(windows) {
+        if self.kind == Kind::Containers && !self.compose && !cfg!(windows) && self.connected() {
             egui::Panel::left("container-list")
                 .resizable(true)
                 .default_size(248.0)
@@ -1103,6 +1141,10 @@ impl DockerView {
         }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(SURFACE).inner_margin(24)).show(ui,|ui| {
             if cfg!(windows){ui.label("The Docker API is available on macOS and Linux. Local and cloud machines are available on Windows.");return;}
+            if !self.connected() && !cfg!(windows) {
+                self.connection_content(ui, runtime);
+                return;
+            }
             if self.compose && !self.compose_import && self.project_selected.is_some() {
                 self.project_details(ui, runtime);
                 return;
@@ -1176,18 +1218,32 @@ impl DockerView {
             if visible.is_empty() {
                 ui.add_space(70.0);
                 ui.vertical_centered(|ui| {
-                    ui.heading(if !query.is_empty() && self.valid {"No matching resources"}else if self.valid && self.kind == Kind::Containers {"Run your first container"}else if self.valid {"Nothing here yet"}else{"Connect your Docker tools"});
-                    ui.label(RichText::new(if !query.is_empty() && self.valid {"Try a different name or clear your search."}else if self.valid {"Use your Docker CLI, or open Compose to start a project."}else{"Set up Smol to use it with Docker, Buildx, and Compose."}).color(MUTED));
+                    ui.heading(if !query.is_empty() && self.valid {"No matching resources"}else if self.valid && self.kind == Kind::Containers {"Run your first container"}else if self.valid {"Nothing here yet"}else if self.pending.is_some() {"Loading containers…"}else{"Couldn’t load containers"});
+                    ui.label(RichText::new(if !query.is_empty() && self.valid {"Try a different name or clear your search."}else if self.valid {"Use your Docker CLI, or open Compose to start a project."}else{"Check the connection details above, then refresh to try again."}).color(MUTED));
                     ui.add_space(16.0);
-                    if !self.valid && ui.add_enabled(self.pending.is_none(),design::primary("Set up Docker with Smol…")).clicked(){self.confirm=Some(Action::Configure);}
+                    if !self.valid && ui.add_enabled(self.pending.is_none(),design::primary("Refresh")).clicked(){self.refresh(runtime);}
                 });
             }
 
         });
+        self.connection_dialog(&ctx, runtime);
         self.resource_dialog(&ctx, runtime);
         if let Some(action) = self.confirm.clone() {
             let mut open = true;
-            egui::Window::new("Confirm operation").anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO).default_width(440.0).open(&mut open).collapsible(false).resizable(false).show(&ctx,|ui| {
+            let title = match &action {
+                Action::Configure => "Connect Docker to Smol?",
+                Action::Delete(_) => "Remove container?",
+                Action::StorageRemove {
+                    kind: Kind::Volumes,
+                    ..
+                } => "Delete volume?",
+                Action::StorageRemove { .. } => "Remove image?",
+                Action::Compose { up: true, .. } => "Apply project?",
+                Action::Compose { .. } => "Remove project containers?",
+                Action::ForgetProject(_) => "Forget project?",
+                _ => "Confirm operation",
+            };
+            egui::Window::new(title).id(egui::Id::unique("docker-confirm")).anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO).default_width(440.0).open(&mut open).collapsible(false).resizable(false).show(&ctx,|ui| {
                 match &action {
                     Action::Configure=>{ui.label("Register Smol’s on-demand Docker socket and select the smol context for your tools.");ui.add_space(8.0);ui.label("This changes your default Docker context and configures Buildx and Testcontainers.");}
                     Action::Delete(id)=>{ui.label(format!("Remove stopped container {id} and its writable filesystem?"));}
@@ -1208,6 +1264,7 @@ impl DockerView {
                 }
                 ui.add_space(20.0);
                 ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (label, destructive) = match &action {
                         Action::StorageRemove { kind: Kind::Images, .. } => ("Remove image", true),
                         Action::StorageRemove { .. } => ("Delete volume", true),
@@ -1220,6 +1277,7 @@ impl DockerView {
                     let button = design::primary(label).fill(if destructive { design::RED } else { design::ACCENT });
                     if ui.add_enabled(self.pending.is_none(),button).clicked(){self.confirm=None;self.submit(runtime,action);}
                     if ui.button("Cancel").clicked(){self.confirm=None;}
+                    });
                 });
             });
             if !open {
