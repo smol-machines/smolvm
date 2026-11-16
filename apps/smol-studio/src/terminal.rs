@@ -12,6 +12,7 @@ pub struct TerminalState {
     pub parser: vt100::Parser,
     pub status: String,
     pub exited: bool,
+    pub revision: u64,
 }
 enum Input {
     Bytes(Vec<u8>),
@@ -70,6 +71,7 @@ impl Terminal {
             parser: vt100::Parser::new(nz(24), nz(80), 1000),
             status: "Connecting…".into(),
             exited: false,
+            revision: 0,
         }));
         let (input, incoming) = mpsc::sync_channel(32);
         let (stop, stopped) = mpsc::channel();
@@ -101,7 +103,10 @@ impl Terminal {
                         if n == 0 {
                             break;
                         }
-                        read_view.lock().unwrap().parser.process(&bytes[..n]);
+                        let mut state = read_view.lock().unwrap();
+                        state.parser.process(&bytes[..n]);
+                        state.revision = state.revision.wrapping_add(1);
+                        drop(state);
                         read_wake();
                     }
                 });
@@ -146,7 +151,9 @@ impl Terminal {
                                     pixel_height: 0,
                                 })
                                 .map_err(|e| e.to_string())?;
-                            view.lock().unwrap().parser.set_size(nz(rows), nz(cols));
+                            let mut state = view.lock().unwrap();
+                            state.parser.set_size(nz(rows), nz(cols));
+                            state.revision = state.revision.wrapping_add(1);
                         }
                     }
                 }
