@@ -122,7 +122,7 @@ impl Details {
         })
     }
 }
-fn display_time(value: &str) -> String {
+pub(crate) fn display_time(value: &str) -> String {
     if let Some((date, time)) = value.strip_suffix('Z').and_then(|v| v.split_once('T')) {
         format!("{date} {} UTC", time.split('.').next().unwrap_or(time))
     } else {

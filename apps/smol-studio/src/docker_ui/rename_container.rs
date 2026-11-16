@@ -69,7 +69,11 @@ impl DockerView {
                         ui.add_space(12.0);
                         design::error_notice(
                             ui,
-                            "Could not confirm the rename. Check the current name before retrying.",
+                            if error.contains("already in use by container") {
+                                "That name is already in use. Choose another name."
+                            } else {
+                                "Could not confirm the rename. Check the current name before retrying."
+                            },
                             error,
                         );
                     }

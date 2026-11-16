@@ -296,8 +296,8 @@ fn row_feedback(ui: &egui::Ui, response: &egui::Response, selected: bool) {
 
 pub fn state_color(state: &str) -> Color32 {
     match state {
-        "running" | "started" | "ready" => GREEN,
-        "failed" | "unreachable" | "error" => RED,
+        "running" | "started" | "ready" | "healthy" => GREEN,
+        "failed" | "unreachable" | "error" | "unhealthy" => RED,
         "paused" | "frozen" | "pausing" | "starting" => ACCENT,
         _ => MUTED,
     }

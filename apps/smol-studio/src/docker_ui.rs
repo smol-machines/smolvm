@@ -1,4 +1,5 @@
 mod connection;
+mod diagnostics;
 mod image_archive;
 mod image_tag;
 mod project_form;
@@ -1226,6 +1227,11 @@ impl DockerView {
                         .on_hover_text(&details.name);
                     ui.horizontal(|ui| {
                         design::badge(ui, &details.state);
+                        if details.state == "running"
+                            && let Some(health) = &details.health
+                        {
+                            design::badge(ui, health);
+                        }
                         ui.add(
                             egui::Label::new(RichText::new(&details.image).size(12.0).color(MUTED))
                                 .truncate(),
@@ -1297,15 +1303,7 @@ impl DockerView {
             }
             ui.add_space(12.0);
         }
-                    if details.oom_killed { ui.add_space(8.0); design::notice(ui, "Stopped after running out of memory."); }
-                    if !details.error.is_empty() { ui.add_space(8.0); design::notice(ui, &details.error); }
-                    if details.health.is_some() || (matches!(details.state.as_str(), "exited" | "dead") && details.exit_code.is_some()) {
-                        design::card().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            if let Some(health) = &details.health { design::property(ui, "Health", health); }
-                            if matches!(details.state.as_str(), "exited" | "dead") && let Some(code) = details.exit_code { design::property(ui, "Exit code", &code.to_string()); }
-                        }); ui.add_space(16.0);
-                    }
+                    self.container_diagnostics(ui, runtime, &details, enabled);
                     ui.label(design::heading(if details.state == "running" { "Published ports" } else { "Configured ports" }, 14.0)); ui.add_space(8.0);
                     if details.ports.is_empty() { ui.label(RichText::new(if details.state == "running" { "No ports published to this computer." } else { "No host ports configured." }).size(12.0).color(MUTED)); }
                     else { design::card().show(ui, |ui| {
