@@ -51,8 +51,7 @@ use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
 use crate::process::{
-    is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
-    VM_SIGTERM_TIMEOUT,
+    is_alive, is_our_process_strict, process_start_time, VM_SIGKILL_TIMEOUT, VM_SIGTERM_TIMEOUT,
 };
 use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::util::generate_machine_name;
@@ -2608,9 +2607,10 @@ async fn reconcile_confirmed_stopped_machine(
 
     state
         .update_vm(name, move |record| {
-            record.state = RecordState::Stopped;
-            record.pid = None;
-            record.pid_start_time = None;
+            // Keeps the PID of a process the kernel is holding after SIGKILL,
+            // as the CLI and the embedded runtime do, so a later start is
+            // refused while that process has the machine's disks open.
+            record.mark_process_stopped();
             if explicitly_stopped {
                 // An explicit stop must suppress the restart supervisor even when
                 // the process had already exited before this request arrived.
@@ -2623,6 +2623,33 @@ async fn reconcile_confirmed_stopped_machine(
                 "machine '{name}' disappeared from database while reconciling its stopped state"
             ))
         })
+}
+
+/// The machine's recorded process, when it is this machine's and the kernel is
+/// holding it after SIGKILL.
+fn held_machine_process(
+    pid: Option<i32>,
+    pid_start_time: Option<u64>,
+) -> Option<crate::process::HeldProcess> {
+    let pid = pid?;
+    if !crate::process::is_our_process(pid, pid_start_time) {
+        return None;
+    }
+    crate::process::held_after_kill(pid)
+}
+
+/// Refuse an API start while the kernel still holds the machine's previous
+/// process, with the text the CLI and the embedded runtime use, and forget
+/// that process once it is gone.
+async fn refuse_start_while_held(state: &Arc<ApiState>, name: &str) -> Result<(), ApiError> {
+    let db = state.db().clone();
+    let machine = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::agent::state_probe::refuse_start_while_held(&db, &machine)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    .map_err(|error| ApiError::Conflict(error.to_string()))
 }
 
 /// How long to wait for a SIGKILLed VM process to exit before a delete gives up.
@@ -2665,6 +2692,12 @@ fn shutdown_machine_process(
             sweep_machine_scope(name);
             return true;
         }
+        // A process already killed and held by the kernel has no guest left
+        // to acknowledge anything, and no later request can stop it either.
+        if let Some(held) = held_machine_process(pid, pid_start_time) {
+            tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+            return true;
+        }
         tracing::warn!(
             name,
             "guest shutdown was not acknowledged; preserving the live VM and its disks"
@@ -2690,7 +2723,15 @@ fn shutdown_machine_process(
                 Duration::ZERO
             };
             crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(name), pid);
-            let _ = stop_vm_process(pid, sigterm, VM_SIGKILL_TIMEOUT);
+            if let Ok(crate::process::VmStop::Held(held)) =
+                crate::process::stop_vm_process_bounded(pid, sigterm, VM_SIGKILL_TIMEOUT)
+            {
+                // The kernel will not let the process exit and it runs no
+                // more code. Report the machine stopped instead of failing
+                // every later stop and delete until the host reboots.
+                tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+                return true;
+            }
         } else {
             tracing::debug!(pid, name, "PID already dead");
         }
@@ -2700,6 +2741,10 @@ fn shutdown_machine_process(
         // killing the systemd transient scope — its cgroup owns every process the
         // VM spawned — then wait briefly for the SIGKILL to land. Only give up if
         // STILL alive.
+        if let Some(held) = held_machine_process(Some(pid), pid_start_time) {
+            tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+            return true;
+        }
         if is_alive(pid) {
             let _ = crate::systemd_scope::kill_scope(name);
             let deadline = std::time::Instant::now() + KILLED_VM_EXIT_TIMEOUT;
@@ -3927,6 +3972,10 @@ pub async fn start_machine(
             )));
         }
     }
+
+    // A stop, or the recovery above, can end with the machine's process held
+    // by the kernel. The machine is not started on top of it.
+    refuse_start_while_held(&state, &name).await?;
 
     // A successful unreachable recovery, a Running record resolved Stopped by
     // PID+agent probing, or a durable Stopped record written by an out-of-process
@@ -5943,9 +5992,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
                 }
                 let _ = state
                     .update_vm(&name, |r| {
-                        r.state = RecordState::Stopped;
-                        r.pid = None;
-                        r.pid_start_time = None;
+                        r.mark_process_stopped();
                         // A drain is a deliberate decommission: mark the machine
                         // user-stopped so the restart supervisor does not resurrect it
                         // in the window before the host is terminated (or if drain is
@@ -8877,5 +8924,173 @@ mod tests {
             Err(ApiError::BadRequest(_))
         ));
         assert!(require_mediated_interceptor(&record, true).is_ok());
+    }
+}
+
+/// The API server's stop, start and delete around a process the kernel holds
+/// after SIGKILL, stood in for by `process::fake_held`.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use crate::db::SmolvmDb;
+    use crate::process::fake_held;
+    use tempfile::TempDir;
+
+    fn state() -> (TempDir, Arc<ApiState>) {
+        let dir = TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, Arc::new(ApiState::with_db(db)))
+    }
+
+    fn running(state: &ApiState, name: &str, pid: i32, start_time: Option<u64>) {
+        let mut record = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = start_time;
+        state.db().insert_vm(name, &record).unwrap();
+    }
+
+    /// The two steps of the stop handler: end the process, then record it.
+    async fn api_stop(state: &Arc<ApiState>, name: &str) -> VmRecord {
+        let record = state.db().get_vm(name).unwrap().unwrap();
+        let machine = name.to_string();
+        let started = std::time::Instant::now();
+        let stopped = tokio::task::spawn_blocking(move || {
+            shutdown_machine_process(&machine, record.pid, record.pid_start_time, true)
+        })
+        .await
+        .unwrap();
+        assert!(stopped, "the stop must complete around a held process");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        reconcile_confirmed_stopped_machine(state, name, true)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_stop_of_a_held_machine_records_it_stopped_and_keeps_its_pid() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-stop";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+
+        let record = api_stop(&state, name).await;
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, Some(held.pid));
+        assert_eq!(record.pid_start_time, Some(fake_held::START_TIME));
+        assert!(record.restart.user_stopped);
+        assert_eq!(record_to_info(name, &record).state, "stopped");
+    }
+
+    /// A second stop takes the handler's "not running" branch, which
+    /// reconciles again. That is where the PID used to be cleared.
+    #[tokio::test]
+    async fn api_stop_repeated_on_a_held_machine_still_keeps_its_pid() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-stop-twice";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+
+        let record = reconcile_confirmed_stopped_machine(&state, name, true)
+            .await
+            .unwrap();
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, Some(held.pid));
+        assert_eq!(
+            state.db().get_vm(name).unwrap().unwrap().pid,
+            Some(held.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_start_is_refused_while_held_with_the_text_the_cli_uses() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-start";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+
+        let error = refuse_start_while_held(&state, name).await.unwrap_err();
+
+        match error {
+            ApiError::Conflict(message) => assert!(
+                message.contains(&fake_held::held(held.pid).start_refusal()),
+                "{message}"
+            ),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert_eq!(
+            state.db().get_vm(name).unwrap().unwrap().pid,
+            Some(held.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_start_is_allowed_and_the_pid_forgotten_once_the_process_is_gone() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-then-gone";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+        assert!(refuse_start_while_held(&state, name).await.is_err());
+
+        held.disappear();
+
+        refuse_start_while_held(&state, name).await.unwrap();
+        let stored = state.db().get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, None);
+        assert_eq!(stored.pid_start_time, None);
+    }
+
+    /// Delete discards the disks, so it kills at once. A held process must
+    /// not make it wait or fail, with or without a recorded start time.
+    #[tokio::test]
+    async fn api_delete_of_a_held_machine_completes_without_waiting_for_the_process() {
+        for start_time in [Some(fake_held::START_TIME), None] {
+            let held = fake_held::hold();
+            let pid = held.pid;
+            let started = std::time::Instant::now();
+            let stopped = tokio::task::spawn_blocking(move || {
+                shutdown_machine_process("api-held-delete", Some(pid), start_time, false)
+            })
+            .await
+            .unwrap();
+            assert!(stopped);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn api_stop_of_an_exited_machine_forgets_its_pid() {
+        let (_dir, state) = state();
+        let name = "api-exited-stop";
+        // No such process: Linux pids never reach 2^31.
+        running(&state, name, 0x7fff_fff0, Some(1));
+
+        let record = reconcile_confirmed_stopped_machine(&state, name, true)
+            .await
+            .unwrap();
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, None);
+        assert_eq!(record.pid_start_time, None);
+    }
+
+    /// A held process is not counted as a running machine or a live worker.
+    #[test]
+    fn a_held_process_does_not_count_as_running() {
+        let held = fake_held::hold();
+        let mut record = VmRecord::new("api-held-count".to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Stopped;
+        record.pid = Some(held.pid);
+        record.pid_start_time = Some(fake_held::START_TIME);
+        assert!(record.is_process_alive());
+        assert!(!record.process_can_run());
+        held.disappear();
+        assert!(!record.is_process_alive());
     }
 }

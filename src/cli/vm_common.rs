@@ -1722,6 +1722,9 @@ fn start_vm_named_with_db(
         registry_auth,
     } = options;
 
+    // A machine whose previous process the kernel is still holding is not
+    // started; once that process is gone its PID is forgotten here.
+    smolvm::agent::state_probe::refuse_start_while_held(db, name)?;
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
     require_host_credential_values(name, &record, external_interceptor.is_some())?;
@@ -2613,11 +2616,7 @@ pub fn stop_vm_named_with_timeout(
         ));
     }
 
-    config.update_vm(name, |r| {
-        r.state = RecordState::Stopped;
-        r.pid = None;
-        r.pid_start_time = None;
-    });
+    config.update_vm(name, VmRecord::mark_process_stopped);
 
     println!("Stopped machine: {}", name);
     Ok(())
@@ -2714,11 +2713,7 @@ pub fn stop_vm_default(stop_timeout: Option<std::time::Duration>) -> smolvm::Res
                 &smolvm::agent::machine_layers_cache_dir("default"),
             );
         }
-        config.update_vm("default", |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-        });
+        config.update_vm("default", VmRecord::mark_process_stopped);
     }
 
     println!("Machine 'default' stopped");
@@ -2881,6 +2876,37 @@ fn ensure_fork_base_delete_is_safe(
     ))
 }
 
+/// Decide whether a delete may go ahead around a process the kernel is
+/// holding after SIGKILL.
+///
+/// Such a process cannot be made to exit, by this or any later delete.
+/// Removing the machine around it leaves that process behind with the
+/// machine's files open, so it needs `--force`: with it the held process is
+/// returned for the caller to name, and without it the machine is recorded
+/// stopped and the delete is refused with the reason.
+fn held_process_delete_gate(
+    db: &SmolvmDb,
+    name: &str,
+    record: &VmRecord,
+    force: bool,
+) -> smolvm::Result<Option<smolvm::process::HeldProcess>> {
+    let Some(held) = record.held_process() else {
+        return Ok(None);
+    };
+    if force {
+        return Ok(Some(held));
+    }
+    db.update_vm(name, VmRecord::mark_process_stopped)?;
+    Err(smolvm::Error::agent(
+        "delete machine",
+        format!(
+            "machine '{name}' is stopped, but {}; pass --force to delete the \
+             machine and leave that process behind",
+            held.explain()
+        ),
+    ))
+}
+
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
     let fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
@@ -2966,7 +2992,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 // The machine is being deleted, so its workload has nothing
                 // to save: kill it at once rather than wait out its timeout.
                 manager.stop_with_timeout(std::time::Duration::ZERO)?;
-                if record.pid.is_some_and(smolvm::process::is_alive) {
+                if record.pid.is_some_and(smolvm::process::can_still_run) {
                     return Err(smolvm::Error::agent(
                         "delete machine",
                         format!("machine '{name}' process is still alive after stop"),
@@ -2987,6 +3013,14 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             }
             _ => {}
         }
+    }
+
+    if let Some(held) = held_process_delete_gate(&db, name, &record, force)? {
+        eprintln!(
+            "Deleting machine '{name}' and leaving PID {} behind: {}.",
+            held.pid,
+            held.explain()
+        );
     }
 
     // If the machine was created from a .smolmachine, detach its case-sensitive
@@ -5151,5 +5185,119 @@ mod status_dns_tests {
             status["dns_options"],
             serde_json::json!(["timeout:1", "use-vc"])
         );
+    }
+}
+
+/// The CLI's start and delete around a process the kernel holds after
+/// SIGKILL, stood in for by `process::fake_held`. `machine stop` reaches such
+/// a machine through `state_probe::recover_unreachable_machine_in_db`, which
+/// is tested with the same stand-in in that module.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use smolvm::process::fake_held;
+
+    fn db() -> (tempfile::TempDir, SmolvmDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    /// A machine as `machine stop` leaves it when its process is held.
+    fn stopped_with_held_process(db: &SmolvmDb, name: &str, pid: i32) -> VmRecord {
+        let mut record = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = Some(fake_held::START_TIME);
+        db.insert_vm(name, &record).unwrap();
+        smolvm::agent::state_probe::recover_unreachable_machine_in_db(&record, db).unwrap();
+        db.get_vm(name).unwrap().unwrap()
+    }
+
+    #[test]
+    fn cli_stop_of_a_held_machine_leaves_it_stopped_with_its_pid() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let record = stopped_with_held_process(&db, "cli-held-stop", held.pid);
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, Some(held.pid));
+        // The update `machine stop` applies last keeps it too.
+        let mut again = record.clone();
+        again.mark_process_stopped();
+        assert_eq!(again.pid, Some(held.pid));
+    }
+
+    #[test]
+    fn cli_start_is_refused_while_the_process_is_held() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "cli-held-start";
+        stopped_with_held_process(&db, name, held.pid);
+
+        let error = start_vm_named_with_db(
+            &db,
+            name,
+            None,
+            None,
+            false,
+            ForkLaunch::default(),
+            StartOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains(&fake_held::held(held.pid).start_refusal()),
+            "{error}"
+        );
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+    }
+
+    #[test]
+    fn cli_delete_of_a_held_machine_needs_force_and_says_why() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "cli-held-delete";
+        let record = stopped_with_held_process(&db, name, held.pid);
+
+        let error = held_process_delete_gate(&db, name, &record, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "process {} is still present after SIGKILL",
+                held.pid
+            )),
+            "{error}"
+        );
+        assert!(error.contains("pass --force"), "{error}");
+        // The refused delete leaves the machine in place, stopped.
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+
+        // With --force the delete goes ahead and names what it leaves.
+        let left = held_process_delete_gate(&db, name, &record, true).unwrap();
+        assert_eq!(left.map(|held| held.pid), Some(held.pid));
+    }
+
+    #[test]
+    fn cli_delete_needs_no_force_once_the_process_is_gone() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "cli-held-then-gone";
+        let record = stopped_with_held_process(&db, name, held.pid);
+        assert!(held_process_delete_gate(&db, name, &record, false).is_err());
+
+        held.disappear();
+
+        assert_eq!(
+            held_process_delete_gate(&db, name, &record, false).unwrap(),
+            None
+        );
+        smolvm::agent::state_probe::refuse_start_while_held(&db, name).unwrap();
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, None);
     }
 }
