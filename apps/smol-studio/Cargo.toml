@@ -10,7 +10,7 @@ description = "Native desktop companion for Smol Machines"
 [workspace]
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "wgpu", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "system_fonts", "wgpu", "wayland", "x11"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
