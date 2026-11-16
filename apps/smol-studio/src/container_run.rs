@@ -77,16 +77,17 @@ impl Draft {
             {
                 return Err("Choose an existing host folder using its absolute path.".into());
             }
-            let target = Path::new(&mount.container);
-            if !target.is_absolute()
-                || !target
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::Normal(_)))
+            // Container paths are Linux paths even when Studio is compiled on Windows.
+            let parts: Vec<_> = mount
+                .container
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .collect();
+            if !mount.container.starts_with('/')
+                || parts.is_empty()
                 || mount.container.contains(['\0', '\n', '\r'])
-                || target
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                || !targets.insert(target)
+                || parts.contains(&"..")
+                || !targets.insert(parts.join("/"))
             {
                 return Err("Shared folders need distinct absolute container paths other than /, without .. components.".into());
             }
@@ -304,6 +305,25 @@ mod tests {
         });
         assert!(d.validate().is_err());
     }
+    #[test]
+    fn container_mount_paths_use_linux_rules_on_every_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut d = draft();
+        let mount = |target: &str| Mount {
+            host: temp.path().to_str().unwrap().into(),
+            container: target.into(),
+            read_only: false,
+        };
+        d.mounts = vec![mount("/data")];
+        d.validate().unwrap();
+        for target in ["//", "/.", "/a/../b", "relative", "C:\\data"] {
+            d.mounts = vec![mount(target)];
+            assert!(d.validate().is_err(), "{target}");
+        }
+        d.mounts = vec![mount("/data"), mount("//data/./")];
+        assert!(d.validate().is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn failed_start_returns_created_id_and_removes_temporary_environment() {
