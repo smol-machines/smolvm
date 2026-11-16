@@ -6,15 +6,18 @@ impl DockerView {
         details: &smol_studio::container_details::ContainerDetails,
     ) {
         if details.state != "running" {
-            ui.label(
-                RichText::new(match details.state.as_str() {
-                    "paused" => "Resume this container to measure resource usage.",
-                    "created" | "exited" => "Start this container to measure resource usage.",
-                    _ => "Resource usage is available while this container is running.",
-                })
-                .size(12.0)
-                .color(MUTED),
-            );
+            design::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(match details.state.as_str() {
+                        "paused" => "Resume this container to measure resource usage.",
+                        "created" | "exited" => "Start this container to measure resource usage.",
+                        _ => "Resource usage is available while this container is running.",
+                    })
+                    .size(12.0)
+                    .color(MUTED),
+                );
+            });
             return;
         }
         let sample = self.usage.sample.as_ref();
@@ -40,7 +43,7 @@ impl DockerView {
                 sample.map(|(_, s)| s.cpu.as_str()).unwrap_or("—"),
             ),
             (
-                "Guest memory / limit",
+                "Machine memory",
                 sample.map(|(_, s)| s.memory.as_str()).unwrap_or("—"),
             ),
         ];
@@ -49,7 +52,21 @@ impl DockerView {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(label).size(11.5).color(MUTED));
                 ui.add_space(6.0);
-                ui.add(egui::Label::new(design::heading(value, 20.0)).wrap());
+                let (value, limit) = value
+                    .split_once('/')
+                    .map_or((value, None), |(used, limit)| {
+                        (used.trim(), Some(limit.trim()))
+                    });
+                ui.add(egui::Label::new(design::heading(value, 24.0)).wrap());
+                ui.label(
+                    RichText::new(
+                        limit
+                            .map(|limit| format!("of {limit} limit"))
+                            .unwrap_or_else(|| " ".into()),
+                    )
+                    .size(11.5)
+                    .color(MUTED),
+                );
             });
         };
         if ui.available_width() >= 420.0 {
@@ -73,6 +90,10 @@ impl DockerView {
             );
         }
         ui.add_space(8.0);
-        ui.label(RichText::new("CPU and memory describe the backing machine. Network, disk I/O and process counts are unavailable.").size(11.0).color(MUTED));
+        ui.label(
+            RichText::new("Usage is measured for the backing machine.")
+                .size(11.0)
+                .color(MUTED),
+        );
     }
 }

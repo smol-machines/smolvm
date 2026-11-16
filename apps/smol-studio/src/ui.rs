@@ -633,18 +633,14 @@ impl Studio {
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.set_min_width(title_width);
-                    ui.add(egui::Label::new(design::heading(&m.name, 23.0)).truncate())
-                        .on_hover_text(&m.name);
-                    ui.horizontal(|ui| {
-                        design::badge(ui, &m.state);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(m.image_label()).size(12.0).color(MUTED),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(m.image_label());
-                    });
+                    design::workload_heading(
+                        ui,
+                        Icon::Machine,
+                        &m.name,
+                        m.image_label(),
+                        &m.state,
+                        None,
+                    );
                 },
             );
             if wide {

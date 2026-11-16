@@ -1235,21 +1235,17 @@ impl DockerView {
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.set_min_width(title_width);
-                    ui.add(egui::Label::new(design::heading(&details.name, 23.0)).truncate())
-                        .on_hover_text(&details.name);
-                    ui.horizontal(|ui| {
-                        design::badge(ui, &details.state);
-                        if details.state == "running"
-                            && let Some(health) = &details.health
-                        {
-                            design::badge(ui, health);
-                        }
-                        ui.add(
-                            egui::Label::new(RichText::new(&details.image).size(12.0).color(MUTED))
-                                .truncate(),
-                        )
-                        .on_hover_text(&details.image);
-                    });
+                    design::workload_heading(
+                        ui,
+                        design::Icon::Containers,
+                        &details.name,
+                        &details.image,
+                        &details.state,
+                        details
+                            .health
+                            .as_deref()
+                            .filter(|_| details.state == "running"),
+                    );
                 },
             );
             if wide {
@@ -1320,10 +1316,17 @@ impl DockerView {
             ui.add_space(12.0);
         }
                     self.container_diagnostics(ui, runtime, &details, enabled);
-                    ui.label(design::heading(if details.state == "running" { "Published ports" } else { "Configured ports" }, 14.0)); ui.add_space(8.0);
-                    if details.ports.is_empty() { ui.label(RichText::new(if details.state == "running" { "No ports published to this computer." } else { "No host ports configured." }).size(12.0).color(MUTED)); }
-                    else { design::card().show(ui, |ui| {
+                    ui.label(design::heading("Resource usage", 14.0));
+                    ui.add_space(8.0);
+                    self.container_usage_ui(ui, &details);
+                    ui.add_space(20.0);
+                    design::card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
+                        ui.label(design::heading(if details.state == "running" { "Published ports" } else { "Configured ports" }, 14.0));
+                        ui.add_space(8.0);
+                        if details.ports.is_empty() {
+                            ui.label(RichText::new("No host ports configured").size(12.0).color(MUTED));
+                        }
                         for (index, port) in details.ports.iter().enumerate() {
                             ui.push_id(index, |ui| {
                                 if index > 0 { ui.separator(); }
@@ -1343,11 +1346,7 @@ impl DockerView {
                                 });
                             });
                         }
-                    }); }
-                    ui.add_space(20.0);
-                    ui.label(design::heading("Resource usage", 14.0));
-                    ui.add_space(8.0);
-                    self.container_usage_ui(ui, &details);
+                    });
                     if let Some(project) = &details.project {
                         ui.add_space(20.0); ui.label(design::heading("Compose project", 14.0));
                         if ui.link(project).clicked() && enabled {
@@ -1356,9 +1355,12 @@ impl DockerView {
                         if let Some(service) = &details.service { ui.label(RichText::new(format!("Service: {service}")).size(12.0).color(MUTED)); }
                     }
                     ui.add_space(20.0);
-                    ui.collapsing("Command & diagnostics", |ui| {
-                        design::property(ui, "Restarts", &details.restarts.to_string());
-                        for arg in &details.command { ui.add(egui::Label::new(RichText::new(arg).monospace().size(11.0)).wrap()); }
+                    design::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.collapsing("Command & diagnostics", |ui| {
+                            design::property(ui, "Restarts", &details.restarts.to_string());
+                            for arg in &details.command { ui.add(egui::Label::new(RichText::new(arg).monospace().size(11.0)).wrap()); }
+                        });
                     });
                 }
             }

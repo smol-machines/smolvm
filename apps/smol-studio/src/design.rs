@@ -3,11 +3,11 @@ use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 
 pub const INK: Color32 = Color32::from_rgb(17, 17, 17);
 pub const MUTED: Color32 = Color32::from_rgb(104, 106, 111);
-pub const SIDEBAR: Color32 = Color32::from_rgb(245, 245, 246);
+pub const SIDEBAR: Color32 = Color32::from_rgb(243, 244, 246);
 pub const ACCENT: Color32 = Color32::from_rgb(17, 17, 17);
 pub const LINE: Color32 = Color32::from_rgb(226, 226, 227);
 pub const SURFACE: Color32 = Color32::from_rgb(249, 249, 250);
-pub const SELECTED: Color32 = Color32::from_rgb(230, 231, 234);
+pub const SELECTED: Color32 = Color32::from_rgb(232, 235, 239);
 pub const GREEN: Color32 = Color32::from_rgb(44, 122, 63);
 pub const RED: Color32 = Color32::from_rgb(179, 38, 30);
 
@@ -430,7 +430,11 @@ pub fn resource_row(
     let response = ui.add_sized(
         [ui.available_width(), 60.0],
         egui::Button::selectable(selected, "")
-            .fill(if selected { INK } else { Color32::TRANSPARENT })
+            .fill(if selected {
+                SELECTED
+            } else {
+                Color32::TRANSPARENT
+            })
             .stroke(Stroke::NONE)
             .corner_radius(6),
     );
@@ -447,27 +451,19 @@ pub fn resource_row(
         ui.painter().rect_stroke(
             response.rect.shrink(2.0),
             4,
-            Stroke::new(1.0, Color32::WHITE),
+            Stroke::new(1.0, INK),
             egui::StrokeKind::Inside,
         );
     }
     let r = response.rect;
     let icon_rect =
         egui::Rect::from_center_size(egui::pos2(r.left() + 25.0, r.center().y), Vec2::splat(30.0));
-    ui.painter().rect_filled(
-        icon_rect,
-        8,
-        if selected {
-            Color32::from_rgb(48, 48, 50)
-        } else {
-            Color32::WHITE
-        },
-    );
+    ui.painter().rect_filled(icon_rect, 8, Color32::WHITE);
     icon(
         ui.painter(),
         icon_rect.shrink(6.0),
         kind,
-        if selected { Color32::WHITE } else { MUTED },
+        if selected { INK } else { MUTED },
     );
     let left = r.left() + 49.0;
     let painter = ui.painter_at(egui::Rect::from_min_max(
@@ -489,22 +485,8 @@ pub fn resource_row(
         }
     };
     for (text, y, size, color) in [
-        (
-            name,
-            12.0,
-            13.0,
-            if selected { Color32::WHITE } else { INK },
-        ),
-        (
-            subtitle.as_str(),
-            33.0,
-            11.5,
-            if selected {
-                Color32::from_rgb(196, 197, 201)
-            } else {
-                MUTED
-            },
-        ),
+        (name, 12.0, 13.0, INK),
+        (subtitle.as_str(), 33.0, 11.5, MUTED),
     ] {
         let mut job = egui::text::LayoutJob::simple_singleline(
             text.to_owned(),
@@ -525,18 +507,41 @@ pub fn resource_row(
         ui.painter().circle_filled(
             egui::pos2(r.right() - 13.0, r.center().y),
             3.0,
-            if selected && matches!(state, "running" | "started" | "ready") {
-                Color32::from_rgb(113, 209, 137)
-            } else if selected && state_color(state) == RED {
-                Color32::from_rgb(255, 141, 134)
-            } else if selected && matches!(state_color(state), MUTED | ACCENT) {
-                Color32::from_rgb(169, 171, 177)
-            } else {
-                state_color(state)
-            },
+            state_color(state),
         );
     }
     response.on_hover_text(format!("{name}\n{subtitle}\n{state}"))
+}
+
+/// A shared identity block keeps machine and container inspectors aligned.
+pub fn workload_heading(
+    ui: &mut egui::Ui,
+    kind: Icon,
+    name: &str,
+    image: &str,
+    state: &str,
+    health: Option<&str>,
+) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 9, SURFACE);
+        ui.painter()
+            .rect_stroke(rect, 9, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+        icon(ui.painter(), rect.shrink(10.0), kind, INK);
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.add(egui::Label::new(heading(name, 21.0)).truncate())
+                .on_hover_text(name);
+            ui.horizontal(|ui| {
+                badge(ui, state);
+                if let Some(health) = health {
+                    badge(ui, health);
+                }
+                ui.add(egui::Label::new(RichText::new(image).size(12.0).color(MUTED)).truncate())
+                    .on_hover_text(image);
+            });
+        });
+    });
 }
 
 pub fn resource_heading(ui: &mut egui::Ui, kind: Icon, title: &str, subtitle: &str) {
