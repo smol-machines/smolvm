@@ -48,6 +48,77 @@ pub struct ImageFeed {
     pub attached: bool,
 }
 
+/// Host publication state; guest import readiness must be checked separately.
+#[derive(Debug, Serialize)]
+pub struct ImageFeedStatus {
+    /// Whether the selected cluster has this feed mounted read-only.
+    pub attached: bool,
+    /// Tagged host images and their current publication state.
+    pub images: Vec<PublishedImage>,
+}
+
+/// One tagged host image, without reading or modifying its archive contents.
+#[derive(Debug, Serialize)]
+pub struct PublishedImage {
+    /// Image configuration digest.
+    pub id: String,
+    /// Current image tags, sorted and deduplicated.
+    pub tags: Vec<String>,
+    /// Whether an archive for this exact image and tag set has been published.
+    pub published: bool,
+}
+
+/// Observe the catalog without acquiring a publication lock or changing archives.
+pub fn inspect(root: &Path, machine: Option<&str>) -> crate::Result<ImageFeedStatus> {
+    let config = crate::config::SmolvmConfig::load()?;
+    let attached = match machine {
+        Some(name) => {
+            let record = config
+                .get_vm(name)
+                .filter(|record| managed(record))
+                .ok_or_else(|| {
+                    invalid("image feed requires an owned managed Kubernetes machine")
+                })?;
+            root.join(DIRECTORY)
+                .canonicalize()
+                .is_ok_and(|path| consumes(record, &path))
+        }
+        None => false,
+    };
+    inspect_catalog(root, attached)
+}
+
+fn inspect_catalog(root: &Path, attached: bool) -> crate::Result<ImageFeedStatus> {
+    let mut images = Vec::new();
+    for record in read_images(root)?
+        .into_iter()
+        .filter(|record| !record.repo_tags.is_empty())
+    {
+        let mut tags = record.repo_tags.clone();
+        tags.sort();
+        tags.dedup();
+        let path = root.join(DIRECTORY).join(archive_name(&record, &tags)?);
+        let published = match fs::symlink_metadata(path) {
+            Ok(meta) => meta.file_type().is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        images.push(PublishedImage {
+            id: record.id,
+            tags,
+            published,
+        });
+    }
+    images.sort_by(|left, right| left.tags.cmp(&right.tags).then(left.id.cmp(&right.id)));
+    Ok(ImageFeedStatus { attached, images })
+}
+
+fn archive_name(record: &ImageRecord, tags: &[String]) -> crate::Result<String> {
+    let key =
+        serde_json::to_vec(&(&record.id, &record.pull_ref, tags)).map_err(std::io::Error::other)?;
+    Ok(format!("{}.tar", hex::encode(Sha256::digest(key))))
+}
+
 /// Prepare the default feed without starting the engine or fetching images.
 pub fn prepare(root: &Path, machine: Option<&str>) -> crate::Result<ImageFeed> {
     fs::create_dir_all(root)?;
@@ -223,9 +294,7 @@ fn reconcile(
         tags.dedup();
         // A different name for every tag set avoids K3s's whole-second mtime
         // cache missing a rebuild/retag of equal size within the same second.
-        let key = serde_json::to_vec(&(&record.id, &record.pull_ref, &tags))
-            .map_err(std::io::Error::other)?;
-        let name = format!("{}.tar", hex::encode(Sha256::digest(key)));
+        let name = archive_name(record, &tags)?;
         desired.insert(name.clone());
         pending.push((name, source, record, tags));
     }
@@ -403,6 +472,42 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn observing_an_absent_feed_does_not_create_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("engine");
+        assert!(inspect_catalog(&root, false).unwrap().images.is_empty());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn observed_publication_requires_the_current_tag_set_without_reconciling() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(DIRECTORY)).unwrap();
+        fs::create_dir(root.path().join("images")).unwrap();
+        let (record, source) = fixture(root.path(), "v1", &["app:dev"]);
+        reconcile(root.path(), std::slice::from_ref(&record), |_| {
+            Some(source.clone())
+        })
+        .unwrap();
+        let catalog = root.path().join("images/image.json");
+        let mut value = serde_json::json!({"id":record.id,"repo_tags":record.repo_tags,"pull_ref":record.pull_ref});
+        fs::write(&catalog, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(inspect_catalog(root.path(), true).unwrap().images[0].published);
+        value["repo_tags"] = serde_json::json!(["app:dev", "app:stable"]);
+        fs::write(&catalog, serde_json::to_vec(&value).unwrap()).unwrap();
+        let before = archives(root.path());
+        let status = inspect_catalog(root.path(), true).unwrap();
+        assert!(!status.images[0].published);
+        assert_eq!(status.images[0].tags, ["app:dev", "app:stable"]);
+        assert_eq!(
+            archives(root.path()),
+            before,
+            "observation reconciled archives"
+        );
+        assert!(!root.path().join("image-feed.lock").exists());
+    }
 
     #[test]
     fn only_managed_clusters_with_a_live_readonly_mount_keep_the_feed() {

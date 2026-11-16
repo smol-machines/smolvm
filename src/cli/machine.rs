@@ -365,6 +365,9 @@ fn try_spawn_detached_cleanup(vm_name: &str, pid: i32, start_time: Option<u64>) 
 /// Prepare the managed Kubernetes image feed using the selected engine's state.
 #[derive(Args, Debug)]
 pub struct ImageFeedCmd {
+    /// Observe publication and mount state without changing the feed
+    #[arg(long)]
+    status: bool,
     #[arg(long)]
     machine: Option<String>,
     #[arg(long, hide = true)]
@@ -377,11 +380,18 @@ impl ImageFeedCmd {
             Some(root) => root,
             None => smolvm::image_feed::default_root()?,
         };
-        let feed = smolvm::image_feed::prepare(&root, self.machine.as_deref())?;
-        println!(
-            "{}",
-            serde_json::to_string(&feed).map_err(std::io::Error::other)?
-        );
+        let json = if self.status {
+            serde_json::to_string(&smolvm::image_feed::inspect(
+                &root,
+                self.machine.as_deref(),
+            )?)
+        } else {
+            serde_json::to_string(&smolvm::image_feed::prepare(
+                &root,
+                self.machine.as_deref(),
+            )?)
+        };
+        println!("{}", json.map_err(std::io::Error::other)?);
         Ok(())
     }
 }
